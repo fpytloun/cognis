@@ -172,7 +172,46 @@ export interface StepTodoWritePresentation {
   nonTerminalCount: number | null;
 }
 
+export type ToolOutputHelperKind =
+  | 'read_tool_output'
+  | 'search_tool_output'
+  | 'list_tool_output_anchors'
+  | 'read_tool_output_anchor';
+
+export interface ToolOutputHelperPresentation {
+  kind: 'tool_output_helper';
+  helperKind: ToolOutputHelperKind;
+  title: string;
+  summary: string;
+  sourceCallId: string;
+  queryEntries: StructuredToolEntry[];
+  receivedSummary: string;
+  receivedDetails: StructuredToolEntry[];
+  continuationHint: string;
+}
+
 export type WorkflowToolPresentation = WriteDeliverablePresentation | StepCompletePresentation | StepTodoWritePresentation;
+
+const toolOutputHelperTitles: Record<ToolOutputHelperKind, string> = {
+  read_tool_output: 'Read stored tool output',
+  search_tool_output: 'Search stored tool output',
+  list_tool_output_anchors: 'List stored output anchors',
+  read_tool_output_anchor: 'Read stored output anchor',
+};
+
+const normalizedToolOutputHelpers: Record<string, ToolOutputHelperKind> = {
+  readtooloutput: 'read_tool_output',
+  searchtooloutput: 'search_tool_output',
+  listtooloutputanchors: 'list_tool_output_anchors',
+  readtooloutputanchor: 'read_tool_output_anchor',
+};
+
+export function delegationToolCallDisplayTitle(argumentsValue: Record<string, unknown> | null | undefined): string {
+  if (!argumentsValue) return '';
+  return stringField(argumentsValue.title)
+    || stringField(argumentsValue.task_title)
+    || stringField(argumentsValue.task);
+}
 
 export function workflowToolPresentation(item: ToolCallSummaryInput): WorkflowToolPresentation | null {
   if (!successfulToolResult(item)) return null;
@@ -239,6 +278,140 @@ export function workflowToolPresentation(item: ToolCallSummaryInput): WorkflowTo
   }
 
   return null;
+}
+
+function numberField(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function addQueryEntry(entries: StructuredToolEntry[], key: string, value: unknown): void {
+  if (value == null || value === '') return;
+  entries.push({ key, value });
+}
+
+function toolOutputHelperSummary(kind: ToolOutputHelperKind, args: Record<string, unknown>): string {
+  const sourceCallId = stringField(args.call_id);
+  if (kind === 'search_tool_output') {
+    const pattern = stringField(args.pattern);
+    return pattern ? `Search ${sourceCallId} for “${pattern}”` : `Search ${sourceCallId}`;
+  }
+  if (kind === 'read_tool_output_anchor') {
+    const anchor = stringField(args.anchor);
+    return anchor ? `Read anchor ${anchor} from ${sourceCallId}` : `Read an anchor from ${sourceCallId}`;
+  }
+  if (kind === 'list_tool_output_anchors') {
+    return `List anchors for ${sourceCallId}`;
+  }
+  const offset = numberField(args.offset);
+  const limit = numberField(args.limit);
+  if (offset !== null || limit !== null) {
+    const parts = [
+      offset !== null ? `from line ${offset}` : '',
+      limit !== null ? `${limit} lines` : '',
+    ].filter(Boolean);
+    return `Read ${sourceCallId} ${parts.join(', ')}`.trim();
+  }
+  return `Read ${sourceCallId}`;
+}
+
+function toolOutputQueryEntries(kind: ToolOutputHelperKind, args: Record<string, unknown>): StructuredToolEntry[] {
+  const entries: StructuredToolEntry[] = [];
+  addQueryEntry(entries, 'source call', stringField(args.call_id));
+  if (kind === 'search_tool_output') {
+    addQueryEntry(entries, 'pattern', stringField(args.pattern));
+    addQueryEntry(entries, 'context lines', numberField(args.context_lines));
+  }
+  if (kind === 'read_tool_output_anchor') {
+    addQueryEntry(entries, 'anchor', stringField(args.anchor));
+    addQueryEntry(entries, 'before lines', numberField(args.before_lines));
+    addQueryEntry(entries, 'after lines', numberField(args.after_lines));
+  }
+  if (kind === 'read_tool_output') {
+    addQueryEntry(entries, 'offset', numberField(args.offset));
+    addQueryEntry(entries, 'limit', numberField(args.limit));
+  }
+  return entries;
+}
+
+function lineCount(value: string): number {
+  if (!value) return 0;
+  return value.split('\n').length;
+}
+
+function firstOutputLine(value: string): string {
+  return value.split('\n').map((line) => line.trim()).find(Boolean) ?? '';
+}
+
+function receivedSummary(item: ToolCallSummaryInput): {
+  summary: string;
+  details: StructuredToolEntry[];
+  continuationHint: string;
+} {
+  const cleaned = cleanToolResult(item.result);
+  if (item.status === 'started' && !cleaned.trim()) {
+    return { summary: 'Waiting for stored tool output.', details: [], continuationHint: '' };
+  }
+  if (item.isError) {
+    const error = firstOutputLine(cleaned);
+    return {
+      summary: error ? `Tool output query failed: ${error}` : 'Tool output query failed.',
+      details: [],
+      continuationHint: '',
+    };
+  }
+  if (!cleaned.trim()) {
+    return { summary: 'No output was returned.', details: [], continuationHint: '' };
+  }
+
+  const details: StructuredToolEntry[] = [];
+  const showing = cleaned.match(/Showing lines\s+([\d,]+)[–-]([\d,]+)\s+of\s+([\d,]+)/i);
+  const total = cleaned.match(/\(Total:\s*([\d,]+)\s+lines?\)/i);
+  const nextOffset = cleaned.match(/Use offset=([\d,]+)/i);
+  const count = lineCount(cleaned);
+
+  if (showing) {
+    details.push({ key: 'page', value: `lines ${showing[1]}–${showing[2]} of ${showing[3]}` });
+  }
+  if (total) {
+    details.push({ key: 'returned lines', value: total[1] });
+  } else {
+    details.push({ key: 'received lines', value: count });
+  }
+  if (nextOffset) {
+    details.push({ key: 'next offset', value: nextOffset[1] });
+  }
+
+  const summary = showing
+    ? `Received lines ${showing[1]}–${showing[2]} of ${showing[3]}.`
+    : total
+      ? `Received ${total[1]} output lines.`
+      : `Received ${count} output line${count === 1 ? '' : 's'}.`;
+
+  return {
+    summary,
+    details,
+    continuationHint: nextOffset ? `Use offset=${nextOffset[1]} to continue.` : '',
+  };
+}
+
+export function toolOutputHelperPresentation(item: ToolCallSummaryInput): ToolOutputHelperPresentation | null {
+  const helperKind = normalizedToolOutputHelpers[normalizedToolName(item.toolName)];
+  if (!helperKind) return null;
+  const args = item.arguments ?? {};
+  const sourceCallId = stringField(args.call_id);
+  if (!sourceCallId) return null;
+  const received = receivedSummary(item);
+  return {
+    kind: 'tool_output_helper',
+    helperKind,
+    title: toolOutputHelperTitles[helperKind],
+    summary: toolOutputHelperSummary(helperKind, args),
+    sourceCallId,
+    queryEntries: toolOutputQueryEntries(helperKind, args),
+    receivedSummary: received.summary,
+    receivedDetails: received.details,
+    continuationHint: received.continuationHint,
+  };
 }
 
 export function skillLoadDisplayName(item: ToolCallSummaryInput): string {

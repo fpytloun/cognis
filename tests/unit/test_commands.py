@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.commands import CommandDispatcher, is_system_slash_command_message
+from cognis.core.session_cache import SessionCache
 from cognis.models.agent import AgentDefinition, AgentLLMConfig
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
+    EventAppendResult,
     IntarisSession,
+    SessionEvent,
     SessionModel,
+)
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.queries import (
+    create_skill,
+    create_skill_version,
+    create_user,
+    set_current_version,
+    update_skill,
 )
 from cognis.tools.executor.lsp.runtime import LSPStatusConfig, LSPStatusReport, LSPStatusTotals
 
@@ -59,6 +72,8 @@ class _TurnScheduler:
         self.submitted: list[tuple[str, str, str]] = []
         self.submit_error: object | None = None
         self.checkpoints: dict[str, dict[str, str | None]] = {}
+        self._agent_loop: object | None = None
+        self.runtime: tuple[ConversationModel, SessionModel, AgentDefinition, bool] | None = None
 
     async def cancel_turn(self, conversation_id: str) -> bool:
         self.calls.append(conversation_id)
@@ -72,6 +87,12 @@ class _TurnScheduler:
 
     def active_turn_checkpoint(self, conversation_id: str) -> dict[str, str | None] | None:
         return self.checkpoints.get(conversation_id)
+
+    async def _load_conversation_runtime(
+        self, conversation_id: str, user_message: str | None = None
+    ) -> tuple[ConversationModel, SessionModel, AgentDefinition, bool] | None:
+        del conversation_id, user_message
+        return self.runtime
 
 
 class _TaskQueue:
@@ -88,14 +109,32 @@ class _CompactionStrategy:
     def __init__(self) -> None:
         self.compaction_threshold = 0.85
         self.calls: list[dict[str, object]] = []
+        self.lock_probe: object | None = None
 
     async def compact(self, session: SessionModel, **kwargs: object) -> object:
+        if callable(self.lock_probe):
+            self.lock_probe()
         self.calls.append({"session": session, **kwargs})
         return SimpleNamespace(
             compacted=False,
             method="skipped",
             reason="nothing_to_compact",
         )
+
+
+class _LockingAgentLoop:
+    def __init__(self) -> None:
+        self.locked = False
+        self.locked_session_ids: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def hold_session_lock(self, session_id: str):
+        self.locked = True
+        self.locked_session_ids.append(session_id)
+        try:
+            yield
+        finally:
+            self.locked = False
 
 
 class _SessionCache:
@@ -107,12 +146,26 @@ class _SessionCache:
         self.usage = usage
         self.tool_runtime_info = tool_runtime_info
         self.reasoning_effort_override: str | None = None
+        self.model_override: str | None = None
+        self.model_override_provider_id: str | None = None
 
     def get_context_usage(self, _: str) -> dict[str, object] | None:
         return self.usage
 
-    def get_model_override(self, _: str) -> None:
-        return None
+    def get_model_override(self, _: str) -> str | None:
+        return self.model_override
+
+    def get_model_override_provider_id(self, _: str) -> str | None:
+        return self.model_override_provider_id
+
+    def set_model_override(
+        self,
+        _: str,
+        model: str | None,
+        provider_id: str | None = None,
+    ) -> None:
+        self.model_override = model
+        self.model_override_provider_id = provider_id
 
     def get_reasoning_effort_override(self, _: str) -> str | None:
         return self.reasoning_effort_override
@@ -143,6 +196,83 @@ class _GuardrailsProvider:
             escalated_count=0,
             created_at="2026-04-12T10:00:00Z",
             updated_at="2026-04-12T10:05:00Z",
+        )
+
+
+class _LLMProvider:
+    async def list_model_ids(self) -> list[str]:
+        return ["gpt-5", "claude-sonnet-4-5", "gemini-3-pro"]
+
+    async def list_model_references(
+        self,
+        acting_user_email: str | None = None,
+    ) -> list[dict[str, object]]:
+        del acting_user_email
+        return [
+            {
+                "provider_id": "openai",
+                "provider_display_name": "OpenAI",
+                "model_id": "gpt-5",
+                "value": "openai/gpt-5",
+                "is_default_provider": True,
+            },
+            {
+                "provider_id": "anthropic-sub",
+                "provider_display_name": "Claude Subscription",
+                "model_id": "claude-sonnet-4-5",
+                "value": "anthropic-sub/claude-sonnet-4-5",
+                "is_default_provider": False,
+            },
+            {
+                "provider_id": "google",
+                "provider_display_name": "Google",
+                "model_id": "gemini-3-pro",
+                "value": "google/gemini-3-pro",
+                "is_default_provider": False,
+            },
+        ]
+
+    async def resolve_model_reference(
+        self,
+        reference: str,
+        acting_user_email: str | None = None,
+    ) -> tuple[str, str | None]:
+        del acting_user_email
+        refs = await self.list_model_references()
+        for ref in refs:
+            if ref["value"] == reference:
+                return str(ref["model_id"]), str(ref["provider_id"])
+        matches = [ref for ref in refs if ref["model_id"] == reference]
+        if len(matches) == 1:
+            return str(matches[0]["model_id"]), str(matches[0]["provider_id"])
+        if matches:
+            raise ValueError(f"Model {reference!r} is ambiguous")
+        raise ValueError(f"Model {reference!r} is not present in configured providers")
+
+    async def get_model_info(self, model_id: str) -> object:
+        del model_id
+        return SimpleNamespace(reasoning_efforts=["low", "medium", "high"])
+
+
+class _RecordingGuardrailsProvider:
+    def __init__(self) -> None:
+        self.events: list[SessionEvent] = []
+        self.calls: list[dict[str, object]] = []
+
+    async def record_events(
+        self,
+        session_id: str,
+        events: list[SessionEvent],
+        **kwargs: object,
+    ) -> EventAppendResult:
+        self.calls.append({"session_id": session_id, **kwargs})
+        first_seq = len(self.events) + 1
+        self.events.extend(events)
+        return EventAppendResult(
+            ok=True,
+            count=len(events),
+            first_seq=first_seq,
+            last_seq=first_seq + len(events) - 1,
         )
 
 
@@ -278,6 +408,621 @@ def _agent() -> AgentDefinition:
     return AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
 
 
+async def _create_skill(
+    session_factory: Any,
+    *,
+    skill_id: str,
+    name: str,
+    description: str = "Skill description.",
+    instructions: str = "Follow this skill.",
+    linked_tool_ids: list[str] | None = None,
+    auto_load: bool = False,
+) -> None:
+    async with session_factory() as session:
+        row = await create_skill(
+            session,
+            skill_id=skill_id,
+            name=name,
+            description=description,
+            instructions=instructions,
+            linked_tool_ids=linked_tool_ids,
+            auto_load=auto_load,
+            owner_email="user@example.com",
+        )
+        version = await create_skill_version(
+            session,
+            skill_id=row.skill_id,
+            version_number=1,
+            content_hash=f"hash-{skill_id}",
+            instructions=instructions,
+            linked_tool_ids=linked_tool_ids,
+        )
+        await set_current_version(session, row.skill_id, version.version_id)
+        await session.commit()
+
+
+async def _skill_command_dispatcher(tmp_path: Any) -> tuple[CommandDispatcher, Any, SessionCache]:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/skills-command.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    async with session_factory() as session:
+        await create_user(
+            session,
+            email="user@example.com",
+            name="User",
+            password_hash="hashed",
+        )
+        await session.commit()
+    guardrails = _RecordingGuardrailsProvider()
+    session_cache = SessionCache(guardrails)
+    dispatcher = CommandDispatcher(
+        session_factory=session_factory,
+        session_manager=_SessionManager(),
+        session_cache=session_cache,
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(guardrails=guardrails),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    return dispatcher, session_factory, session_cache
+
+
+def test_skill_command_is_recognized() -> None:
+    assert is_system_slash_command_message("/skill")
+    assert is_system_slash_command_message("/skill Cognis Coding")
+    assert is_system_slash_command_message("/compact")
+    assert not is_system_slash_command_message("/compact now")
+    assert not is_system_slash_command_message("/help extra")
+    assert is_system_slash_command_message("/approve ok")
+    assert not is_system_slash_command_message("/approveok")
+
+
+def test_system_slash_command_boundary_matrix() -> None:
+    exact_only_commands = [
+        "/help",
+        "/context",
+        "/info",
+        "/lsp",
+        "/compact",
+        "/summarize",
+        "/new",
+        "/reset",
+        "/clear",
+        "/undo",
+        "/redo",
+        "/plan",
+        "/build",
+        "/default",
+    ]
+    prefix_commands = [
+        "/fork",
+        "/model",
+        "/thinking",
+        "/profile",
+        "/skill",
+        "/executor",
+        "/task",
+        "/research",
+        "/implement",
+        "/delegate",
+        "/approve",
+        "/deny",
+        "/retry",
+        "/continue",
+        "/stop",
+        "/cancel",
+    ]
+
+    for command in exact_only_commands:
+        assert is_system_slash_command_message(command), command
+        assert not is_system_slash_command_message(f"{command} extra"), command
+    for command in prefix_commands:
+        assert is_system_slash_command_message(command), command
+        assert is_system_slash_command_message(f"{command} extra"), command
+        assert not is_system_slash_command_message(f"{command}extra"), command
+
+
+@pytest.mark.asyncio
+async def test_approve_deny_prefix_requires_command_boundary() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=_SessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=_SessionCache(),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/approveok",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_slash_suggestions_include_command_and_dynamic_model_options() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=_SessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=_SessionCache(usage={"model": "gpt-5"}),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(llm=_LLMProvider()),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    command_suggestions = await dispatcher.suggest(
+        "/sk",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert [item.command for item in command_suggestions] == ["/skill"]
+    assert command_suggestions[0].suffix == "space"
+
+    model_suggestions = await dispatcher.suggest(
+        "/model cla",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert [(item.kind, item.value, item.insert_text) for item in model_suggestions] == [
+        (
+            "parameter",
+            "anthropic-sub/claude-sonnet-4-5",
+            "/model anthropic-sub/claude-sonnet-4-5",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_command_uses_provider_qualified_references() -> None:
+    cache = _SessionCache(usage={"model": "gpt-5", "provider_id": "openai"})
+    dispatcher = CommandDispatcher(
+        session_factory=_SessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=cache,
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(llm=_LLMProvider()),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    session = _session()
+
+    listed = await dispatcher.dispatch(
+        "/model",
+        conversation=_conversation(),
+        session=session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert listed is not None
+    assert "openai/gpt-5 * [default provider]" in listed.text
+    assert "anthropic-sub/claude-sonnet-4-5" in listed.text
+    assert "Usage: /model <provider_id/model_name>" in listed.text
+
+    switched = await dispatcher.dispatch(
+        "/model anthropic-sub/claude-sonnet-4-5",
+        conversation=_conversation(),
+        session=session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert switched is not None
+    assert "Model switched to: anthropic-sub/claude-sonnet-4-5" in switched.text
+    assert cache.model_override == "claude-sonnet-4-5"
+    assert cache.model_override_provider_id == "anthropic-sub"
+
+
+@pytest.mark.asyncio
+async def test_slash_suggestions_include_thinking_and_profile_options() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=_SessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=_SessionCache(usage={"model": "gpt-5"}),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(llm=_LLMProvider()),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        agent_profiles={
+            "default": {"description": "Default profile"},
+            "code": {"description": "Coding profile"},
+            "disabled": {"description": "Disabled profile", "enabled": False},
+        },
+        default_agent_profile_id="default",
+    )
+
+    thinking_suggestions = await dispatcher.suggest(
+        "/thinking m",
+        conversation=_conversation(),
+        session=_session(),
+        agent=agent,
+        user_email="user@example.com",
+    )
+    assert thinking_suggestions[0].value == "medium"
+    assert thinking_suggestions[0].insert_text == "/thinking medium"
+
+    profile_suggestions = await dispatcher.suggest(
+        "/profile co",
+        conversation=_conversation(),
+        session=_session(),
+        agent=agent,
+        user_email="user@example.com",
+    )
+    assert [(item.value, item.description) for item in profile_suggestions] == [
+        ("code", "Coding profile")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_skill_command_lists_available_skills_with_statuses(tmp_path) -> None:
+    dispatcher, session_factory, _ = await _skill_command_dispatcher(tmp_path)
+    await _create_skill(
+        session_factory,
+        skill_id="skill_backend",
+        name="Backend Skill",
+        description="Backend implementation guidance.",
+    )
+    await _create_skill(
+        session_factory,
+        skill_id="skill_global",
+        name="Global Skill",
+        description="Global guidance.",
+        auto_load=True,
+    )
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        skills={"items": [{"skill_id": "skill_backend", "auto_load_instructions": True}]},
+    )
+
+    result = await dispatcher.dispatch(
+        "/skill",
+        conversation=_conversation(),
+        session=_session(),
+        agent=agent,
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text is not None
+    assert "Backend Skill (skill_backend) [attached, loaded]" in result.text
+    assert "Global Skill (skill_global) [attached]" in result.text
+    assert "Usage: /skill <skill name or id>" in result.text
+
+
+@pytest.mark.asyncio
+async def test_slash_suggestions_include_skill_options(tmp_path) -> None:
+    dispatcher, session_factory, _ = await _skill_command_dispatcher(tmp_path)
+    await _create_skill(
+        session_factory,
+        skill_id="cognis-coding",
+        name="Cognis Coding",
+        description="Coding discipline for implementation work.",
+    )
+    await _create_skill(
+        session_factory,
+        skill_id="cognis-task-manager",
+        name="Cognis Task Manager",
+        description="Task management workflow.",
+    )
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        skills={"items": [{"skill_id": "cognis-coding"}]},
+    )
+
+    suggestions = await dispatcher.suggest(
+        "/skill coding",
+        conversation=_conversation(),
+        session=_session(),
+        agent=agent,
+        user_email="user@example.com",
+    )
+
+    assert [(item.value, item.label, item.insert_text) for item in suggestions] == [
+        ("cognis-coding", "Cognis Coding", "/skill cognis-coding")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_skill_command_loads_skill_by_name_and_is_idempotent(tmp_path) -> None:
+    dispatcher, session_factory, session_cache = await _skill_command_dispatcher(tmp_path)
+    await _create_skill(
+        session_factory,
+        skill_id="skill_backend",
+        name="Backend Skill",
+        description="Backend implementation guidance.",
+        instructions="Use the backend runbook.",
+        linked_tool_ids=["builtin:read"],
+    )
+    guardrails = cast(_RecordingGuardrailsProvider, dispatcher._providers.guardrails)
+    command_session = _session().model_copy(update={"intaris_session_id": "intaris-sess-1"})
+
+    result = await dispatcher.dispatch(
+        "/skill backend skill",
+        conversation=_conversation(),
+        session=command_session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text is not None
+    assert "Loaded skill: Backend Skill (skill_backend)" in result.text
+    assert "Activated tools: builtin:read" in result.text
+    assert "Takes effect on the next message." in result.text
+    assert len(guardrails.events) == 1
+    assert guardrails.calls[0]["session_id"] == "intaris-sess-1"
+    event = guardrails.events[0]
+    assert event.type == "developer_message"
+    assert event.data["kind"] == "loaded_skill"
+    assert event.data["skill_id"] == "skill_backend"
+    assert event.data["context_injection"] is True
+    assert "<loaded_skill>" in str(event.data["content"])
+    assert "skill_backend" in session_cache.get_loaded_skill_ids("sess-1")
+    assert "skill_backend" in session_cache.get_activated_skill_ids("sess-1")
+    assert "builtin:read" in session_cache.get_activated_skill_tool_ids("sess-1")
+
+    second = await dispatcher.dispatch(
+        "/skill skill_backend",
+        conversation=_conversation(),
+        session=command_session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert second is not None
+    assert second.type == "system_message"
+    assert second.text is not None
+    assert "already loaded" in second.text
+    assert len(guardrails.events) == 1
+
+
+@pytest.mark.asyncio
+async def test_skill_command_reload_supersedes_previous_loaded_context(tmp_path) -> None:
+    dispatcher, session_factory, session_cache = await _skill_command_dispatcher(tmp_path)
+    await _create_skill(
+        session_factory,
+        skill_id="skill_backend",
+        name="Backend Skill",
+        instructions="Use the old backend runbook.",
+        linked_tool_ids=["builtin:bash"],
+    )
+    await _create_skill(
+        session_factory,
+        skill_id="skill_other",
+        name="Other Skill",
+        instructions="Use the other runbook.",
+        linked_tool_ids=["builtin:read"],
+    )
+    guardrails = cast(_RecordingGuardrailsProvider, dispatcher._providers.guardrails)
+
+    first = await dispatcher.dispatch(
+        "/skill skill_backend",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert first is not None
+    assert first.type == "system_message"
+    assert len(guardrails.events) == 1
+
+    other = await dispatcher.dispatch(
+        "/skill skill_other",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+    assert other is not None
+    assert other.type == "system_message"
+    assert len(guardrails.events) == 2
+    assert "builtin:bash" in session_cache.get_activated_skill_tool_ids("sess-1")
+    assert "builtin:read" in session_cache.get_activated_skill_tool_ids("sess-1")
+
+    async with session_factory() as session:
+        await update_skill(
+            session,
+            "skill_backend",
+            owner_email="user@example.com",
+            instructions="Use the new backend runbook.",
+            linked_tool_ids=["builtin:grep"],
+        )
+        version = await create_skill_version(
+            session,
+            skill_id="skill_backend",
+            version_number=2,
+            content_hash="hash-skill_backend-v2",
+            instructions="Use the new backend runbook.",
+            linked_tool_ids=["builtin:grep"],
+        )
+        await set_current_version(session, "skill_backend", version.version_id)
+        await session.commit()
+
+    second = await dispatcher.dispatch(
+        "/skill skill_backend",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert second is not None
+    assert second.type == "system_message"
+    assert len(guardrails.events) == 3
+    entry = session_cache.get_entry("sess-1")
+    assert entry is not None
+    loaded_events = [
+        event
+        for event in entry.events
+        if event.type == "developer_message"
+        and event.data.get("kind") == "loaded_skill"
+        and event.data.get("skill_id") == "skill_backend"
+    ]
+    assert len(loaded_events) == 1
+    assert loaded_events[0].data["content_hash"] == "hash-skill_backend-v2"
+    assert "Use the new backend runbook." in str(loaded_events[0].data["content"])
+    assert "Use the old backend runbook." not in str(loaded_events[0].data["content"])
+    assert "builtin:grep" in session_cache.get_activated_skill_tool_ids("sess-1")
+    assert "builtin:read" in session_cache.get_activated_skill_tool_ids("sess-1")
+    assert "builtin:bash" not in session_cache.get_activated_skill_tool_ids("sess-1")
+
+
+@pytest.mark.asyncio
+async def test_session_cache_raw_prefix_rebuild_keeps_latest_loaded_skill() -> None:
+    session_cache = SessionCache(_RecordingGuardrailsProvider())
+    entry = await session_cache._ensure_entry(_session())
+
+    session_cache._replace_from_intaris_events(
+        entry,
+        [
+            {
+                "seq": 1,
+                "type": "developer_message",
+                "data": {
+                    "role": "system",
+                    "source": "loaded_skill",
+                    "content": "old skill context",
+                    "kind": "loaded_skill",
+                    "skill_id": "skill_backend",
+                    "content_hash": "old-hash",
+                    "activated_tool_ids": ["builtin:read"],
+                    "context_injection": True,
+                    "replayable": True,
+                    "visibility": "agent_context",
+                },
+            },
+            {
+                "seq": 2,
+                "type": "developer_message",
+                "data": {
+                    "role": "system",
+                    "source": "loaded_skill",
+                    "content": "new skill context",
+                    "kind": "loaded_skill",
+                    "skill_id": "skill_backend",
+                    "content_hash": "new-hash",
+                    "activated_tool_ids": ["builtin:grep"],
+                    "context_injection": True,
+                    "replayable": True,
+                    "visibility": "agent_context",
+                },
+            },
+            {
+                "seq": 3,
+                "type": "context_snapshot",
+                "data": {
+                    "source": "test",
+                    "entries": [
+                        {"role": "system", "source": "loaded_skill", "seq": 1},
+                        {"role": "system", "source": "loaded_skill", "seq": 2},
+                    ],
+                },
+            },
+        ],
+    )
+
+    loaded_prefix_entries = [item for item in entry.prefix_entries if item.source == "loaded_skill"]
+    assert len(loaded_prefix_entries) == 1
+    assert loaded_prefix_entries[0].seq == 2
+    assert loaded_prefix_entries[0].content == "new skill context"
+    assert session_cache.get_loaded_skill_context_hash("sess-1", "skill_backend") == "new-hash"
+
+    await session_cache.append_recorded_events(
+        _session(),
+        [
+            SessionEvent(
+                type="developer_message",
+                data={
+                    "role": "system",
+                    "source": "loaded_skill",
+                    "content": "newest skill context",
+                    "kind": "loaded_skill",
+                    "skill_id": "skill_backend",
+                    "content_hash": "newest-hash",
+                    "activated_tool_ids": ["builtin:bash"],
+                    "context_injection": True,
+                    "replayable": True,
+                    "visibility": "agent_context",
+                },
+            )
+        ],
+        EventAppendResult(ok=True, count=1, first_seq=4, last_seq=4),
+    )
+
+    assert [item for item in entry.prefix_entries if item.source == "loaded_skill"] == []
+    loaded_events = [
+        event
+        for event in entry.events
+        if event.type == "developer_message" and event.data.get("kind") == "loaded_skill"
+    ]
+    assert len(loaded_events) == 1
+    assert loaded_events[0].seq == 4
+    assert loaded_events[0].data["content_hash"] == "newest-hash"
+
+
+@pytest.mark.asyncio
+async def test_skill_command_reports_ambiguous_name(tmp_path) -> None:
+    dispatcher, session_factory, _ = await _skill_command_dispatcher(tmp_path)
+    await _create_skill(session_factory, skill_id="skill_one", name="Shared Skill")
+    await _create_skill(session_factory, skill_id="skill_two", name="Shared Skill")
+
+    result = await dispatcher.dispatch(
+        "/skill shared skill",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data["code"] == "ambiguous_skill"
+    assert result.text is not None
+    assert "skill_one" in result.text
+    assert "skill_two" in result.text
+
+
+@pytest.mark.asyncio
+async def test_skill_command_reports_missing_skill(tmp_path) -> None:
+    dispatcher, _, _ = await _skill_command_dispatcher(tmp_path)
+
+    result = await dispatcher.dispatch(
+        "/skill missing-skill",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data["code"] == "skill_not_found"
+    assert result.text is not None
+    assert "Use /skill to list available skills." in result.text
+
+
 @pytest.mark.asyncio
 async def test_manual_compact_resolves_same_session_model_from_default_route() -> None:
     strategy = _CompactionStrategy()
@@ -353,6 +1098,93 @@ async def test_manual_compact_preserves_explicit_agent_model_context() -> None:
     assert model_context.model == "agent-model"
     assert model_context.provider_id == "agent-provider"
     assert model_context.reasoning_effort == "none"
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_holds_session_lock_and_reloads_runtime() -> None:
+    strategy = _CompactionStrategy()
+    agent_loop = _LockingAgentLoop()
+    scheduler = _TurnScheduler(cancelled=False)
+    scheduler._agent_loop = agent_loop
+    reloaded_session = _session()
+    scheduler.runtime = (_conversation(), reloaded_session, _agent(), False)
+
+    def _assert_locked() -> None:
+        assert agent_loop.locked
+
+    strategy.lock_probe = _assert_locked
+
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/compact",
+        conversation=_conversation(),
+        session=reloaded_session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert agent_loop.locked_session_ids == [reloaded_session.session_id]
+    assert (
+        cast(SessionModel, strategy.calls[0]["session"]).session_id == reloaded_session.session_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_transfers_lock_when_reload_changes_active_session() -> None:
+    strategy = _CompactionStrategy()
+    agent_loop = _LockingAgentLoop()
+    scheduler = _TurnScheduler(cancelled=False)
+    scheduler._agent_loop = agent_loop
+    initial_session = _session().model_copy(update={"session_id": "old-session"})
+    reloaded_session = _session().model_copy(update={"session_id": "new-session"})
+    scheduler.runtime = (_conversation(), reloaded_session, _agent(), False)
+
+    def _assert_new_session_locked() -> None:
+        assert agent_loop.locked
+        assert agent_loop.locked_session_ids[-1] == reloaded_session.session_id
+
+    strategy.lock_probe = _assert_new_session_locked
+
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/compact",
+        conversation=_conversation(),
+        session=initial_session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert agent_loop.locked_session_ids == [
+        initial_session.session_id,
+        reloaded_session.session_id,
+    ]
+    assert (
+        cast(SessionModel, strategy.calls[0]["session"]).session_id == reloaded_session.session_id
+    )
 
 
 @pytest.mark.asyncio

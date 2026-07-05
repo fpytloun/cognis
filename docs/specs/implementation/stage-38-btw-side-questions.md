@@ -56,9 +56,11 @@ These are hard rules. The implementation MUST NOT violate them.
    or rebuild a bespoke full transcript when the normal cached context path can
    be used.
 
-7. **Transport neutral.** The command is implemented in the transport-agnostic
-   command layer. WebSocket, REST, and channel-bound callers should receive the
-   same command result semantics, with UI-specific rendering layered on top.
+7. **Transport neutral core.** The command is implemented in the
+   transport-agnostic command layer. WebSocket and channel-bound callers should
+   receive the same command result semantics, with UI-specific rendering layered
+   on top. Chat v2 REST remains the canonical timeline read/send contract and
+   does not execute slash commands in this stage.
 
 ## Event Metadata
 
@@ -233,12 +235,9 @@ Add `/btw` as a prefix command:
 
 ## API and UI
 
-REST:
-
-- `POST /api/v1/conversations/:id/messages` with `/btw ...` returns
-  `command_executed` and `result.type="side_question_answer"`.
-- `GET /api/v1/conversations/:id/messages` returns side-lane message metadata so
-  clients can render side panels and resume side threads.
+REST chat message routes were removed in favor of Chat v2. Side-question command
+execution should use the WebSocket command path; canonical timeline reads should
+use Chat v2 snapshot/sync/timeline endpoints.
 
 WebSocket:
 
@@ -291,14 +290,15 @@ Unit tests:
 
 Integration tests:
 
-- REST `/btw` records side-lane user/assistant messages and returns
-  `side_question_answer`;
+- WebSocket `/btw` records side-lane user/assistant messages and emits a
+  distinguishable `side_question_answer` command result/frame;
 - subsequent normal main turn does not include side-lane messages in prompt
   assembly;
 - subsequent `/btw` in the same `side_thread_id` sees previous side messages;
 - unrelated side thread does not see previous side messages;
 - compaction input excludes raw side-lane messages;
-- reload/history API returns side metadata for UI rendering.
+- Chat v2 snapshot/sync/timeline projections preserve side metadata for UI
+  rendering once the UI opts into side-lane views.
 
 Regression tests:
 
@@ -316,7 +316,7 @@ Regression tests:
 3. Add side-question context assembly that reuses normal cache/prefix handling.
 4. Add `/btw` command dispatch, side-thread resolution, no-tools LLM call, and
    side-lane event persistence.
-5. Extend REST/WebSocket response models and message-history serialization with
+5. Extend WebSocket command result frames and Chat v2 timeline projection with
    lane metadata.
 6. Add minimal UI support: autocomplete, side answer rendering, follow-up
    `side_thread_id`.

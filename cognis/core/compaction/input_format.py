@@ -7,8 +7,19 @@ from typing import Any
 
 from cognis.core.attachment_utils import merge_content_and_attachment_note
 
-_TOOL_CALL_ARGUMENT_MAX_CHARS = 1_000
+_MESSAGE_MAX_CHARS = 12_000
+_TOOL_CALL_REMAINDER_MAX_CHARS = 1_000
 _TOOL_RESULT_MAX_CHARS = 2_000
+_IDENTIFYING_TOOL_ARG_KEYS = (
+    "file_path",
+    "path",
+    "command",
+    "pattern",
+    "url",
+    "query",
+    "agent_id",
+    "title",
+)
 
 
 def format_events_for_compaction(events: list[Any]) -> str:
@@ -23,13 +34,13 @@ def format_events_for_compaction(events: list[Any]) -> str:
                 str(data.get("content", "")),
                 [a for a in data.get("attachments", []) if isinstance(a, dict)],
             )
+            payload = _truncate_middle(payload, _MESSAGE_MAX_CHARS)
         elif etype == "tool_call":
             name = data.get("name", "unknown")
             args = data.get("arguments", "")
-            args_text = _stringify(args)
-            args_text = _truncate(args_text, _TOOL_CALL_ARGUMENT_MAX_CHARS)
             metadata = _tool_event_metadata(data)
-            payload = f"{name}{metadata} args={args_text}"
+            args_text = _format_tool_call_arguments(args)
+            payload = f"{name}{metadata} {args_text}".rstrip()
         elif etype == "tool_result":
             name = data.get("name", "")
             result = data.get("result") or data.get("output", "")
@@ -63,6 +74,66 @@ def _stringify(value: Any) -> str:
         return json.dumps(value, default=str, sort_keys=True)
     except TypeError:
         return str(value)
+
+
+def _parse_json_object(value: str) -> dict[str, Any] | None:
+    stripped = value.strip()
+    if not stripped or not stripped.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _format_tool_call_arguments(arguments: Any) -> str:
+    """Render tool arguments with identifying keys preserved before truncation."""
+
+    args_obj: dict[str, Any] | None
+    if isinstance(arguments, dict):
+        args_obj = dict(arguments)
+    elif isinstance(arguments, str):
+        args_obj = _parse_json_object(arguments)
+    else:
+        args_obj = None
+
+    if args_obj is None:
+        return f"args={_truncate(_stringify(arguments), _TOOL_CALL_REMAINDER_MAX_CHARS)}"
+
+    rest = dict(args_obj)
+    identifying_parts: list[str] = []
+    for key in _IDENTIFYING_TOOL_ARG_KEYS:
+        if key not in rest:
+            continue
+        value = rest.pop(key)
+        identifying_parts.append(f"{key}={_stringify_identifier_value(value)}")
+
+    rest_text = _truncate(_stringify(rest), _TOOL_CALL_REMAINDER_MAX_CHARS)
+    if identifying_parts:
+        return f"{' '.join(identifying_parts)} args={rest_text}"
+    return f"args={rest_text}"
+
+
+def _stringify_identifier_value(value: Any) -> str:
+    if isinstance(value, str):
+        return repr(value)
+    return repr(_stringify(value))
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    """Cap long message payloads while retaining both the opening and ending."""
+
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    marker = f"\n[truncated for compaction: omitted {omitted:,} chars from middle]\n"
+    if max_chars <= len(marker):
+        return text[:max_chars]
+    remaining_chars = max_chars - len(marker)
+    head_chars = remaining_chars // 2
+    tail_chars = remaining_chars - head_chars
+    return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
 
 
 def _truncate(

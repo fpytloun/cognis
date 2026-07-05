@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.10.0"
+version = "0.11.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "TBD" }
@@ -108,6 +108,7 @@ filterwarnings = [
 markers = [
     "integration: marks tests that require live Mnemory + Intaris (started via uvx)",
     "live_server: marks tests that require a running Cognis server (not TestClient) for WebSocket/LLM flows",
+    "e2e: marks tests that require the full e2e stack (live_stack + mock-llm)",
 ]
 
 [tool.ruff]

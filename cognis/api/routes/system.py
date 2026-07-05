@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -15,6 +15,58 @@ from cognis.api.models import HealthResponse, SystemDiagnosticsResponse
 from cognis.store.queries import list_agents, list_llm_providers
 
 router = APIRouter()
+
+PWA_RESET_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <title>Reset Cognis app cache</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #020617; color: #e2e8f0; }
+      main { max-width: 34rem; padding: 2rem; }
+      h1 { margin: 0 0 0.75rem; font-size: 1.5rem; }
+      p { color: #94a3b8; line-height: 1.5; }
+      a { color: #7dd3fc; }
+      code { color: #fbbf24; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Resetting Cognis app cache…</h1>
+      <p id="status">Clearing the installed PWA shell and reloading Cognis from the network.</p>
+      <p>If this page does not continue automatically, <a href="/">open Cognis</a>.</p>
+    </main>
+    <script>
+      (async () => {
+        const status = document.getElementById('status');
+        try {
+          if ('serviceWorker' in navigator) {
+            const registrations = await navigator.serviceWorker.getRegistrations();
+            await Promise.all(registrations.map((registration) => registration.unregister()));
+          }
+          if ('caches' in window) {
+            const names = await caches.keys();
+            await Promise.all(
+              names
+                .filter((name) => name.startsWith('cognis-'))
+                .map((name) => caches.delete(name))
+            );
+          }
+          location.replace('/?pwa-reset=' + Date.now());
+        } catch (error) {
+          console.error(error);
+          if (status) {
+            status.innerHTML = 'Automatic reset failed. Close this app window, reopen Cognis in a browser, and use the link below.';
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
+"""
 
 
 def _database_summary(database_url: str) -> dict[str, str | None]:
@@ -50,10 +102,47 @@ async def health(request: Request) -> HealthResponse:
     )
 
 
+@router.get("/api/livez", include_in_schema=False)
+async def livez() -> dict[str, str]:
+    """Cheap process liveness probe for Kubernetes.
+
+    This endpoint intentionally avoids provider, database, executor, memory,
+    and LLM checks. Kubernetes liveness should only verify that the HTTP stack
+    can serve traffic; expensive dependency diagnostics belong to /api/health.
+    """
+
+    return {"status": "alive"}
+
+
+@router.get("/api/readyz", include_in_schema=False)
+async def readyz() -> dict[str, str]:
+    """Cheap readiness probe for Kubernetes traffic routing.
+
+    Keep this endpoint independent of optional/degraded providers so transient
+    Mnemory, Intaris, executor, or LLM slowness does not remove Cognis from
+    service when it can still serve traffic.
+    """
+
+    return {"status": "ready"}
+
+
 @router.get("/api/health/providers")
 async def health_providers(request: Request) -> dict[str, object]:
     providers = await request.app.state.providers.health()
     return {name: provider.model_dump() for name, provider in providers.items()}
+
+
+@router.get("/api/v1/pwa-reset", response_class=HTMLResponse, include_in_schema=False)
+async def pwa_reset() -> HTMLResponse:
+    """Serve a non-SW recovery page for installed clients with stuck app shells."""
+
+    return HTMLResponse(
+        PWA_RESET_HTML,
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @router.get("/api/v1/system/diagnostics", response_model=SystemDiagnosticsResponse)

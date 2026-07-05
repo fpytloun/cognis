@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
+from cognis.core.chat_modes import CHAT_MODES, ChatMode
 from cognis.logging import get_logger
 from cognis.store import queries
 
@@ -45,6 +46,14 @@ class _SessionCandidate:
     intaris_session_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedConversationRetryMessage:
+    """User message data needed to retry a managed conversation turn."""
+
+    content: str
+    one_shot_chat_mode: ChatMode | None = None
+
+
 def _event_type(event: Any) -> str | None:
     raw_type = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
     return raw_type if isinstance(raw_type, str) else None
@@ -55,7 +64,19 @@ def _event_data(event: Any) -> dict[str, Any] | None:
     return raw_data if isinstance(raw_data, dict) else None
 
 
-def _last_user_message_from_events(events: list[Any]) -> str | None:
+def _one_shot_chat_mode_from_event_data(data: dict[str, Any]) -> ChatMode | None:
+    if data.get("chat_mode_source") != "one_shot":
+        return None
+    raw_mode = data.get("chat_mode")
+    if not isinstance(raw_mode, str):
+        return None
+    mode = raw_mode.strip().lower()
+    if mode not in CHAT_MODES:
+        return None
+    return cast(ChatMode, mode)
+
+
+def _last_user_message_from_events(events: list[Any]) -> ManagedConversationRetryMessage | None:
     for event in reversed(events):
         if _event_type(event) != "user_message":
             continue
@@ -64,7 +85,10 @@ def _last_user_message_from_events(events: list[Any]) -> str | None:
             continue
         content = str(data.get("content") or "").strip()
         if content:
-            return content
+            return ManagedConversationRetryMessage(
+                content=content,
+                one_shot_chat_mode=_one_shot_chat_mode_from_event_data(data),
+            )
     return None
 
 
@@ -154,7 +178,7 @@ async def last_managed_conversation_user_message_for_retry(
     guardrails: Any,
     session_factory: Callable[[], Any],
     link: Any,
-) -> str | None:
+) -> ManagedConversationRetryMessage | None:
     """Return the newest durable target user message available for retry."""
 
     read_events: Callable[..., Awaitable[Any]] | None = getattr(guardrails, "read_events", None)

@@ -18,14 +18,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md build.py ./
+COPY pyproject.toml uv.lock README.md build.py ./
 COPY cognis/ ./cognis/
 COPY docs/ ./docs/
 COPY scripts/ ./scripts/
 COPY ui/ ./ui/
 COPY --from=ui-build /app/ui/build ./ui/build
 
-RUN pip install --no-cache-dir ".[postgres,s3,redis,knowledgebase]"
+ENV UV_PROJECT_ENVIRONMENT=/usr/local
+
+RUN pip install --no-cache-dir uv \
+    && uv sync --locked --no-dev --extra postgres --extra s3 --extra redis --extra knowledgebase
 
 EXPOSE 8080
 

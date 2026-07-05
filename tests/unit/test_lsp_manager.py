@@ -14,6 +14,11 @@ from cognis.tools.executor.lsp.manager import (
     _should_skip_server_for_path,
 )
 from cognis.tools.executor.lsp.servers import GOPLS, PYRIGHT, RUST_ANALYZER
+from cognis.tools.executor.lsp.types import (
+    DiagnosticFreshness,
+    DiagnosticSnapshot,
+    DiagnosticWaitResult,
+)
 
 
 class TestFindProjectRoot:
@@ -102,7 +107,7 @@ class TestLSPManagerBasic:
             mock_client.is_alive = True
             mock_client_class.return_value = mock_client
 
-            await manager.touch_file(str(target), wait=True)
+            await manager._clients_for_file(str(target), wait=True, purpose="semantic")
 
         spawned_servers = [call.kwargs["server_id"] for call in mock_client_class.call_args_list]
         assert "pyright" not in spawned_servers
@@ -132,7 +137,7 @@ class TestLSPManagerBasic:
             mock_client.is_alive = True
             mock_client_class.return_value = mock_client
 
-            await manager.touch_file(str(target), wait=True)
+            await manager._clients_for_file(str(target), wait=True, purpose="semantic")
 
         kwargs = next(
             call.kwargs
@@ -146,6 +151,118 @@ class TestLSPManagerBasic:
             "openFilesOnly"
         )
         assert "**/.worktrees" in kwargs["workspace_configuration"]["python"]["analysis"]["exclude"]
+
+    @pytest.mark.asyncio()
+    async def test_python_edit_diagnostics_use_ruff_only(self, tmp_path: Path) -> None:
+        """Edit-time Python diagnostics should avoid spawning Pyright."""
+        project = tmp_path / "diagnostics"
+        project.mkdir()
+        target = project / "module.py"
+        target.write_text("x = 1\n")
+        manager = LSPManager(enabled=True)
+
+        with (
+            patch(
+                "cognis.tools.executor.lsp.manager.resolve_command",
+                new=AsyncMock(return_value="cmd"),
+            ),
+            patch("cognis.tools.executor.lsp.manager.LSPClient") as mock_client_class,
+            patch(
+                "cognis.tools.executor.lsp.manager._should_skip_server_for_path",
+                return_value=False,
+            ),
+        ):
+            mock_client = MagicMock()
+            mock_client.is_alive = True
+            mock_client.start = AsyncMock()
+            mock_client.did_open = AsyncMock()
+            mock_client.did_save = AsyncMock()
+            mock_client.wait_for_diagnostics.return_value = MagicMock(
+                server_id="ruff",
+                uri="file:///tmp/module.py",
+                status=MagicMock(value="fresh_unversioned"),
+                snapshot=None,
+            )
+            mock_client.get_diagnostic_snapshots.return_value = {}
+            mock_client_class.return_value = mock_client
+
+            await manager.touch_file(str(target), wait=True, purpose="diagnostics")
+
+        spawned_servers = [call.kwargs["server_id"] for call in mock_client_class.call_args_list]
+        assert spawned_servers == ["ruff"]
+
+    @pytest.mark.asyncio()
+    async def test_edit_diagnostic_collection_excludes_unselected_active_clients(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "module.py"
+        target.write_text("x = 1\n")
+        uri = f"file://{target}"
+        manager = LSPManager(enabled=True)
+        manager._opened_files["ruff:/project"] = {uri}
+        manager._opened_files["pyright:/project"] = {uri}
+        manager._file_versions[("ruff:/project", uri)] = 0
+
+        ruff_client = MagicMock()
+        ruff_client.server_id = "ruff"
+        ruff_client.is_alive = True
+        ruff_client.did_change = AsyncMock()
+        ruff_client.did_save = AsyncMock()
+        ruff_snapshot = DiagnosticSnapshot(
+            server_id="ruff",
+            uri=uri,
+            document_version=1,
+            diagnostic_version=1,
+            received_sequence=1,
+            received_at_monotonic=0.0,
+            diagnostics=[],
+            freshness=DiagnosticFreshness.FRESH,
+        )
+        ruff_client.wait_for_diagnostics = AsyncMock(
+            return_value=DiagnosticWaitResult(
+                server_id="ruff",
+                uri=uri,
+                target_version=1,
+                status=DiagnosticFreshness.FRESH,
+                duration_ms=1,
+                snapshot=ruff_snapshot,
+            )
+        )
+        pyright_client = MagicMock()
+        pyright_client.server_id = "pyright"
+        pyright_client.is_alive = True
+        pyright_snapshot = DiagnosticSnapshot(
+            server_id="pyright",
+            uri=uri,
+            document_version=99,
+            diagnostic_version=99,
+            received_sequence=99,
+            received_at_monotonic=0.0,
+            diagnostics=[],
+            freshness=DiagnosticFreshness.FRESH,
+        )
+        pyright_client.get_diagnostic_snapshots.return_value = {uri: pyright_snapshot}
+        manager._clients["ruff:/project"] = ruff_client
+        manager._clients["pyright:/project"] = pyright_client
+
+        server_def = MagicMock()
+        server_def.server_id = "ruff"
+        server_def.root_markers = ()
+        server_def.language_id.return_value = "python"
+        with (
+            patch(
+                "cognis.tools.executor.lsp.manager.get_servers_for_extension",
+                return_value=[server_def],
+            ),
+            patch(
+                "cognis.tools.executor.lsp.manager._find_project_root",
+                return_value="/project",
+            ),
+        ):
+            collection = await manager.touch_file(str(target), wait=True, purpose="diagnostics")
+
+        snapshots = collection.snapshots_by_path[str(target)]
+        assert [snapshot.server_id for snapshot in snapshots] == ["ruff"]
 
     def test_pyright_project_config_takes_precedence(self, tmp_path: Path) -> None:
         """Native Pyright project config should suppress Cognis defaults."""

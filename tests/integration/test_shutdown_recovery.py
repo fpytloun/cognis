@@ -46,8 +46,10 @@ def test_graceful_shutdown_completes_without_error(live_stack: LiveStack) -> Non
     health = live.get("/api/health")
     assert health.status_code == 200
 
-    # Send SIGTERM
-    cognis_proc.send_signal(signal.SIGTERM)
+    # Send SIGTERM to the service process group. The command is launched
+    # through uv, so signalling only the parent wrapper can leave the server
+    # child alive and poison subsequent live_stack tests.
+    os.killpg(cognis_proc.pid, signal.SIGTERM)
 
     # Wait for clean exit
     try:
@@ -59,6 +61,14 @@ def test_graceful_shutdown_completes_without_error(live_stack: LiveStack) -> Non
     # Exit code 0 means clean shutdown
     # uvicorn may return 0 or a small signal-based exit code
     assert exit_code is not None, "Process did not terminate"
+
+    live.cognis_process = _start_service(
+        live.cognis_command,
+        live.cognis_env,
+        label="cognis",
+        clean_env=live.clean_env,
+    )
+    _wait_healthy(f"{live.cognis_url}/api", timeout=120)
 
 
 @pytest.mark.integration
@@ -168,7 +178,7 @@ def test_stale_session_recovery_on_restart(
 
     # Start Cognis (first time)
     cognis_proc = _start_service(
-        [uv_path, "run", "cognis", "serve"],
+        [uv_path, "run", "cognis-controller", "serve"],
         cognis_env,
         label="cognis",
         clean_env=clean_env,
@@ -197,7 +207,7 @@ def test_stale_session_recovery_on_restart(
                 "display_name": "OpenAI (recovery test)",
                 "location": "controller",
                 "backend": "litellm",
-                "config": {"default_model": llm_model},
+                "config": {"scope": "system", "default_model": llm_model},
             },
         )
         http.put(
@@ -207,11 +217,12 @@ def test_stale_session_recovery_on_restart(
         )
 
         # Lower stale threshold so recovery triggers faster
-        http.put(
+        stale_setting = http.put(
             f"{cognis_url}/api/v1/settings/session.stale_after_seconds",
             headers=headers,
             json={"value": 5},
         )
+        assert stale_setting.status_code == 200
 
         # Create agent and conversation
         agent_resp = http.post(
@@ -223,6 +234,7 @@ def test_stale_session_recovery_on_restart(
                 "display_name": "Recovery Agent",
                 "description": "Recovery test agent",
                 "system_prompt": "You are a test assistant. Keep responses brief.",
+                "execution": {"executor_id": "default_inprocess"},
                 "personality": {
                     "tone": "concise",
                     "temperament": "cooperative",
@@ -280,7 +292,7 @@ def test_stale_session_recovery_on_restart(
         assert len(sessions) >= 1
 
         # KILL Cognis (simulate crash — no graceful shutdown)
-        cognis_proc.kill()
+        os.killpg(cognis_proc.pid, signal.SIGKILL)
         cognis_proc.wait(timeout=5)
 
         # Wait for sessions to become stale (> stale_after_seconds)
@@ -288,7 +300,7 @@ def test_stale_session_recovery_on_restart(
 
         # Restart Cognis (same data dir, so it has the old DB)
         cognis_proc = _start_service(
-            [uv_path, "run", "cognis", "serve"],
+            [uv_path, "run", "cognis-controller", "serve"],
             cognis_env,
             label="cognis",
             clean_env=clean_env,

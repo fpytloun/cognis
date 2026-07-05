@@ -46,9 +46,15 @@ def _make_loop() -> AgentLoop:
     return AgentLoop.__new__(AgentLoop)
 
 
-def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> object:
+def _ctx(
+    pool: ExecutorPool,
+    *,
+    active_executor_id: str | None = None,
+    parent_session_id: str | None = None,
+) -> object:
     """Build a minimal StepContext-like object."""
     return SimpleNamespace(
+        session=SimpleNamespace(parent_session_id=parent_session_id),
         executor_pool=pool,
         active_executor_id=active_executor_id,
         agent=SimpleNamespace(
@@ -66,6 +72,7 @@ def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> object
         ),
         orchestration_mode=MagicMock(),
         interaction_mode="step_requests",
+        controller_tool_surface="workflow",
         step_definition=SimpleNamespace(allow_questions=False, metadata_contract=None),
         deliverable_step_run_id=None,
         post_deliverable_pending=False,
@@ -126,6 +133,37 @@ def test_switch_executor_visible_with_two_usable() -> None:
     enum_values = schema["function"]["parameters"]["properties"]["executor_id"]["enum"]
     # Must contain only the USABLE assigned executors, sorted
     assert enum_values == ["exec-a", "exec-add", "exec-b"]
+
+
+def test_switch_executor_hidden_for_delegated_child_session() -> None:
+    """Child sessions may switch routing locally but must not mutate the parent conversation."""
+    loop = _make_loop()
+    loop._deliverable_owner_step_run_id = lambda c: None
+    pool = ExecutorPool(primary=[_target("exec-a"), _target("exec-b")])
+
+    schemas = loop._build_controller_tool_schemas(
+        _ctx(pool, active_executor_id="exec-a", parent_session_id="sess-parent")
+    )
+
+    assert _switch_tool(schemas) is None
+
+
+def test_child_executor_install_can_remain_session_local() -> None:
+    loop = _make_loop()
+    ctx = SimpleNamespace(
+        active_executor_id="exec-a",
+        conversation=SimpleNamespace(active_executor_id="exec-a"),
+    )
+
+    ok = loop._install_active_executor_target(
+        ctx,
+        _target("exec-b", executor_type="local"),
+        update_conversation=False,
+    )
+
+    assert ok is False
+    assert ctx.active_executor_id == "exec-b"
+    assert ctx.conversation.active_executor_id == "exec-a"
 
 
 def test_switch_executor_enum_excludes_offline() -> None:

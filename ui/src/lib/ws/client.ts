@@ -3,11 +3,13 @@ import { writable, get } from 'svelte/store';
 import { getWebSocketUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
 import { auth } from '$lib/stores/auth';
+import type { ChatRealtimeFrame } from '$lib/chat-v2/types';
 import type { AttachmentRef, CognisWebSocketEvent, QuestionSetReply } from '$lib/types/api';
 import { clamp } from '$lib/utils';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'stalled';
-type EventListener = (event: CognisWebSocketEvent) => void;
+type CognisWebSocketClientEvent = CognisWebSocketEvent | ChatRealtimeFrame;
+type EventListener = (event: CognisWebSocketClientEvent) => void;
 
 interface WebSocketState {
   status: ConnectionStatus;
@@ -18,6 +20,7 @@ interface WebSocketState {
 interface ConversationSubscription {
   lastSeq: number;
   sessionId: string | null;
+  chatV2Cursor: string | null;
 }
 
 interface SubscribeConversationOptions {
@@ -38,6 +41,8 @@ class CognisWebSocketClient {
   private reconnectTimer: number | null = null;
   private heartbeatTimer: number | null = null;
   private pongTimeout: number | null = null;
+  private chatV2FrameFlushHandle: number | null = null;
+  private pendingChatV2Frames: ChatRealtimeFrame[] = [];
   private reconnectAttempts = 0;
   private authenticated = false;
   private manualDisconnect = false;
@@ -117,6 +122,7 @@ class CognisWebSocketClient {
     }
     this.clearHeartbeat();
     this.clearPongTimeout();
+    this.clearChatV2FrameFlush();
     this.socket?.close();
     this.socket = null;
     this.authenticated = false;
@@ -133,8 +139,8 @@ class CognisWebSocketClient {
     const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId : null;
     const shouldReplaceCursor = options.replaceCursor === true;
     const next: ConversationSubscription = previous && previous.sessionId === normalizedSessionId && !shouldReplaceCursor
-      ? { lastSeq: Math.max(previous.lastSeq, lastSeq), sessionId: normalizedSessionId }
-      : { lastSeq, sessionId: normalizedSessionId };
+      ? { ...previous, lastSeq: Math.max(previous.lastSeq, lastSeq), sessionId: normalizedSessionId }
+      : { lastSeq, sessionId: normalizedSessionId, chatV2Cursor: previous?.chatV2Cursor ?? null };
     this.subscriptions.set(conversationId, next);
     if (this.authenticated) {
       this.sendRaw({
@@ -142,6 +148,7 @@ class CognisWebSocketClient {
         conversation_id: conversationId,
         last_seq: next.lastSeq,
         session_id: next.sessionId,
+        chat_v2_cursor: next.chatV2Cursor,
       });
       return;
     }
@@ -150,19 +157,67 @@ class CognisWebSocketClient {
   }
 
   unsubscribeConversation(conversationId: string): void {
+    const previous = this.subscriptions.get(conversationId);
+    if (this.authenticated && previous?.chatV2Cursor) {
+      this.sendRaw({ type: 'chat_v2_unsubscribe', conversation_id: conversationId });
+    }
     this.subscriptions.delete(conversationId);
+  }
+
+  subscribeChatV2Conversation(conversationId: string, cursor: string): void {
+    const previous = this.subscriptions.get(conversationId);
+    const next: ConversationSubscription = {
+      lastSeq: previous?.lastSeq ?? 0,
+      sessionId: previous?.sessionId ?? null,
+      chatV2Cursor: cursor
+    };
+    this.subscriptions.set(conversationId, next);
+    if (this.authenticated) {
+      this.sendRaw({
+        type: 'chat_v2_subscribe',
+        conversation_id: conversationId,
+        cursor
+      });
+      return;
+    }
+    this.connect();
+  }
+
+  updateChatV2Cursor(conversationId: string, cursor: string): void {
+    const previous = this.subscriptions.get(conversationId);
+    if (!previous) {
+      this.subscriptions.set(conversationId, {
+        lastSeq: 0,
+        sessionId: null,
+        chatV2Cursor: cursor
+      });
+      return;
+    }
+    this.subscriptions.set(conversationId, { ...previous, chatV2Cursor: cursor });
+  }
+
+  clearChatV2Cursor(conversationId: string): void {
+    const previous = this.subscriptions.get(conversationId);
+    if (!previous) return;
+    this.subscriptions.set(conversationId, { ...previous, chatV2Cursor: null });
+    this.sendRaw({ type: 'chat_v2_unsubscribe', conversation_id: conversationId });
   }
 
   updateConversationSeq(conversationId: string, lastSeq: number, sessionId: string | null = null): void {
     const previous = this.subscriptions.get(conversationId);
     const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId : null;
     if (!previous || previous.sessionId !== normalizedSessionId) {
-      this.subscriptions.set(conversationId, { lastSeq, sessionId: normalizedSessionId });
+      this.subscriptions.set(conversationId, {
+        lastSeq,
+        sessionId: normalizedSessionId,
+        chatV2Cursor: previous?.chatV2Cursor ?? null
+      });
       return;
     }
     this.subscriptions.set(conversationId, {
       lastSeq: Math.max(previous.lastSeq, lastSeq),
       sessionId: previous.sessionId,
+      chatV2Cursor: previous.chatV2Cursor
     });
   }
 
@@ -175,18 +230,6 @@ class CognisWebSocketClient {
     }
     this.sendRaw({ type: 'message', conversation_id: conversationId, content, attachments, client_message_id: resolvedClientMessageId });
     return resolvedClientMessageId;
-  }
-
-  cancelTurn(conversationId: string): void {
-    this.sendRaw({ type: 'cancel', conversation_id: conversationId });
-  }
-
-  cancelQueuedMessage(conversationId: string, queueId: string): void {
-    this.sendRaw({ type: 'cancel_queued_message', conversation_id: conversationId, queue_id: queueId });
-  }
-
-  updateQueuedMessage(conversationId: string, queueId: string, content: string): void {
-    this.sendRaw({ type: 'update_queued_message', conversation_id: conversationId, queue_id: queueId, content });
   }
 
   resolveEscalation(callId: string, decision: string, note?: string): void {
@@ -254,7 +297,7 @@ class CognisWebSocketClient {
 
   private handleMessage(raw: string): void {
     try {
-      const payload = JSON.parse(raw) as CognisWebSocketEvent;
+      const payload = JSON.parse(raw) as CognisWebSocketClientEvent;
       if (payload.type === 'authenticated') {
         this.authenticated = true;
         this.reconnectAttempts = 0;
@@ -267,6 +310,7 @@ class CognisWebSocketClient {
             conversation_id: conversationId,
             last_seq: subscription.lastSeq,
             session_id: subscription.sessionId,
+            chat_v2_cursor: subscription.chatV2Cursor,
           });
         }
         this.flushQueue();
@@ -294,12 +338,62 @@ class CognisWebSocketClient {
         this.clearPongTimeout();
       }
 
-      for (const listener of this.listeners) {
-        listener(payload);
+      if (payload.type === 'chat_v2_frame') {
+        this.enqueueChatV2Frame(payload);
+        return;
       }
+
+      this.flushChatV2Frames();
+      this.dispatch(payload);
     } catch (error) {
       reportError('Failed to process WebSocket payload', error);
     }
+  }
+
+  private dispatch(payload: CognisWebSocketClientEvent): void {
+    for (const listener of this.listeners) {
+      listener(payload);
+    }
+  }
+
+  private enqueueChatV2Frame(frame: ChatRealtimeFrame): void {
+    this.pendingChatV2Frames.push(frame);
+    if (typeof window === 'undefined') {
+      this.flushChatV2Frames();
+      return;
+    }
+    if (this.chatV2FrameFlushHandle !== null) {
+      return;
+    }
+    this.chatV2FrameFlushHandle = window.requestAnimationFrame(() => {
+      this.chatV2FrameFlushHandle = null;
+      this.flushChatV2Frames();
+    });
+  }
+
+  private flushChatV2Frames(): void {
+    if (this.pendingChatV2Frames.length === 0) return;
+    if (this.chatV2FrameFlushHandle !== null && typeof window !== 'undefined') {
+      window.cancelAnimationFrame(this.chatV2FrameFlushHandle);
+      this.chatV2FrameFlushHandle = null;
+    }
+    const frames = this.pendingChatV2Frames;
+    this.pendingChatV2Frames = [];
+    try {
+      for (const pendingFrame of frames) {
+        this.dispatch(pendingFrame);
+      }
+    } catch (error) {
+      reportError('Failed to dispatch Chat v2 frame batch', error);
+    }
+  }
+
+  private clearChatV2FrameFlush(): void {
+    if (this.chatV2FrameFlushHandle !== null && typeof window !== 'undefined') {
+      window.cancelAnimationFrame(this.chatV2FrameFlushHandle);
+    }
+    this.chatV2FrameFlushHandle = null;
+    this.pendingChatV2Frames = [];
   }
 
   private scheduleReconnect(): void {
@@ -377,4 +471,87 @@ export const wsState = wsClient.state;
 
 export function getWebSocketState(): WebSocketState {
   return get(wsState);
+}
+
+// ---------------------------------------------------------------------------
+// Dev-only WS frame recorder
+//
+// Activated by ?recordWs=1 in the URL (or window.__cognisWsRecorder.start()).
+// Records every incoming WS event to an in-memory buffer and exposes a
+// download() method that saves a JSONL file for use as a golden replay input.
+//
+// Usage (browser console):
+//   window.__cognisWsRecorder.start()   // begin recording
+//   window.__cognisWsRecorder.stop()    // stop recording
+//   window.__cognisWsRecorder.download() // save as ws-recording-<timestamp>.jsonl
+//   window.__cognisWsRecorder.clear()   // clear buffer
+//   window.__cognisWsRecorder.count     // number of events recorded
+// ---------------------------------------------------------------------------
+
+class WsFrameRecorder {
+  private _recording = false;
+  private _frames: CognisWebSocketClientEvent[] = [];
+  private _unsubscribe: (() => void) | null = null;
+
+  get recording(): boolean { return this._recording; }
+  get count(): number { return this._frames.length; }
+
+  start(): void {
+    if (this._recording) return;
+    this._recording = true;
+    this._frames = [];
+    this._unsubscribe = wsClient.subscribe((event) => {
+      if (this._recording) {
+        this._frames.push(event);
+      }
+    });
+    console.info('[WsRecorder] Recording started. Call window.__cognisWsRecorder.download() to save.');
+  }
+
+  stop(): void {
+    this._recording = false;
+    this._unsubscribe?.();
+    this._unsubscribe = null;
+    console.info(`[WsRecorder] Recording stopped. ${this._frames.length} events captured.`);
+  }
+
+  clear(): void {
+    this._frames = [];
+    console.info('[WsRecorder] Buffer cleared.');
+  }
+
+  download(filename?: string): void {
+    if (this._frames.length === 0) {
+      console.warn('[WsRecorder] No events recorded.');
+      return;
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const name = filename ?? `ws-recording-${ts}.jsonl`;
+    const content = this._frames.map((e) => JSON.stringify(e)).join('\n') + '\n';
+    const blob = new Blob([content], { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+    console.info(`[WsRecorder] Downloaded ${this._frames.length} events as ${name}`);
+  }
+
+  /** Return the raw frames array (for programmatic use). */
+  frames(): CognisWebSocketClientEvent[] {
+    return [...this._frames];
+  }
+}
+
+export const wsRecorder = new WsFrameRecorder();
+
+// Auto-start recording if ?recordWs=1 is in the URL (dev/debug only).
+if (typeof window !== 'undefined') {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('recordWs') === '1') {
+    wsRecorder.start();
+  }
+  // Expose on window for console access.
+  (window as unknown as Record<string, unknown>)['__cognisWsRecorder'] = wsRecorder;
 }

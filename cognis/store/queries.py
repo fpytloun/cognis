@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import sqlalchemy as sa
 from sqlalchemy import case, delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -28,7 +29,9 @@ from cognis.store.models import (
     ChannelContact,
     ChannelDeliveryOutboxRow,
     ChannelPairingRequest,
+    ChatClientTransactionRow,
     Conversation,
+    ConversationTodo,
     CredentialRow,
     DeliverableRow,
     ExecutorRow,
@@ -51,6 +54,7 @@ from cognis.store.models import (
     Schedule,
     Secret,
     Session,
+    SessionTodo,
     Setting,
     SkillAssetRow,
     SkillRow,
@@ -119,7 +123,9 @@ def _conversation_list_filters(
     user_email: str,
     *,
     context_type: str | None = None,
+    context_types: list[str] | None = None,
     agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
     status: str = "active",
     project_id: str | None = None,
     include_agent_direct: bool = True,
@@ -138,10 +144,16 @@ def _conversation_list_filters(
         )
     elif status != "all":
         raise ValueError(f"Unsupported conversation status filter: {status}")
-    if context_type is not None:
-        filters.append(Conversation.context_type == context_type)
-    if agent_id is not None:
-        filters.append(Conversation.agent_id == agent_id)
+    context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
+    agent_values = sorted({value for value in [agent_id, *(agent_ids or [])] if value})
+    if len(context_values) == 1:
+        filters.append(Conversation.context_type == context_values[0])
+    elif len(context_values) > 1:
+        filters.append(Conversation.context_type.in_(context_values))
+    if len(agent_values) == 1:
+        filters.append(Conversation.agent_id == agent_values[0])
+    elif len(agent_values) > 1:
+        filters.append(Conversation.agent_id.in_(agent_values))
     if project_id is not None:
         filters.append(Conversation.project_id == project_id)
     if not include_agent_direct:
@@ -931,6 +943,7 @@ async def create_agent(
     tools: dict[str, Any] | None = None,
     permissions: dict[str, Any] | None = None,
     llm_config: dict[str, Any] | None = None,
+    capabilities: dict[str, Any] | None = None,
     agent_profiles: dict[str, Any] | None = None,
     default_agent_profile_id: str | None = None,
     execution: dict[str, Any] | None = None,
@@ -952,6 +965,7 @@ async def create_agent(
         tools=tools,
         permissions=permissions,
         llm_config=llm_config,
+        capabilities=capabilities,
         agent_profiles=agent_profiles,
         default_agent_profile_id=default_agent_profile_id,
         execution=execution,
@@ -984,6 +998,7 @@ async def update_agent(
         "tools",
         "permissions",
         "llm_config",
+        "capabilities",
         "agent_profiles",
         "default_agent_profile_id",
         "execution",
@@ -1483,6 +1498,87 @@ async def get_conversation(session: AsyncSession, conversation_id: str) -> Conve
     return result.scalar_one_or_none()
 
 
+async def get_chat_client_transaction(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    principal_id: str,
+    client_txn_id: str,
+    operation: str,
+) -> ChatClientTransactionRow | None:
+    """Return a Chat v2 client transaction by its idempotency key."""
+
+    result = await session.execute(
+        select(ChatClientTransactionRow).where(
+            ChatClientTransactionRow.conversation_id == conversation_id,
+            ChatClientTransactionRow.principal_id == principal_id,
+            ChatClientTransactionRow.client_txn_id == client_txn_id,
+            ChatClientTransactionRow.operation == operation,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def claim_chat_client_transaction(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    principal_id: str,
+    client_txn_id: str,
+    operation: str,
+    payload_hash: str,
+) -> tuple[ChatClientTransactionRow, bool]:
+    """Claim a Chat v2 client transaction before executing side effects.
+
+    Returns ``(row, created)``. A duplicate concurrent claim rolls back the
+    failed INSERT and returns the already-existing row.
+    """
+
+    row = ChatClientTransactionRow(
+        conversation_id=conversation_id,
+        principal_id=principal_id,
+        client_txn_id=client_txn_id,
+        operation=operation,
+        payload_hash=payload_hash,
+        status="pending",
+    )
+    session.add(row)
+    try:
+        await session.flush()
+        return row, True
+    except IntegrityError:
+        await session.rollback()
+        existing = await get_chat_client_transaction(
+            session,
+            conversation_id=conversation_id,
+            principal_id=principal_id,
+            client_txn_id=client_txn_id,
+            operation=operation,
+        )
+        if existing is None:
+            raise
+        return existing, False
+
+
+async def complete_chat_client_transaction(
+    session: AsyncSession,
+    row: ChatClientTransactionRow,
+    *,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+) -> ChatClientTransactionRow:
+    """Persist the final visible result for a Chat v2 client transaction."""
+
+    row.status = status
+    row.result = result
+    row.error = error
+    row.updated_at = _utcnow()
+    row.completed_at = row.updated_at
+    await session.flush()
+    return row
+
+
 async def get_conversation_channel_route(
     session: AsyncSession,
     conversation_id: str,
@@ -1530,7 +1626,9 @@ async def list_conversations(
     user_email: str,
     *,
     context_type: str | None = None,
+    context_types: list[str] | None = None,
     agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
     status: str = "active",
     project_id: str | None = None,
     include_agent_direct: bool = True,
@@ -1551,7 +1649,9 @@ async def list_conversations(
     filters = _conversation_list_filters(
         user_email,
         context_type=context_type,
+        context_types=context_types,
         agent_id=agent_id,
+        agent_ids=agent_ids,
         status=status,
         project_id=project_id,
         include_agent_direct=include_agent_direct,
@@ -2513,6 +2613,174 @@ async def get_latest_active_session_for_conversation(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+def _normalize_session_todo_items(todos: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Normalize controller-owned TODO rows before persistence."""
+
+    if not isinstance(todos, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in todos:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        status = item.get("status")
+        priority = item.get("priority")
+        normalized.append(
+            {
+                "content": content,
+                "status": status if isinstance(status, str) and status else "pending",
+                **({"priority": priority} if isinstance(priority, str) and priority else {}),
+            }
+        )
+    return normalized
+
+
+async def _lock_todo_replacement(session: AsyncSession, scope: str, identifier: str) -> None:
+    """Serialize PostgreSQL TODO full-replacements for one TODO owner.
+
+    The replace helpers intentionally use DELETE + INSERT to preserve full
+    replacement semantics. Under PostgreSQL concurrent transactions can both
+    miss the other transaction's uncommitted DELETE/INSERT state and collide on
+    the composite primary key. A transaction-scoped advisory lock keeps those
+    replacements ordered without changing SQLite/local behavior.
+    """
+
+    bind = session.get_bind()
+    dialect_name = getattr(getattr(bind, "dialect", None), "name", "")
+    if dialect_name != "postgresql":
+        return
+    await session.execute(
+        sa.text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"todo-replace:{scope}:{identifier}"},
+    )
+
+
+async def list_session_todos(
+    session: AsyncSession,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Return authoritative TODO state for a session."""
+
+    result = await session.execute(
+        select(SessionTodo)
+        .where(SessionTodo.session_id == session_id)
+        .order_by(SessionTodo.position.asc())
+    )
+    todos: list[dict[str, Any]] = []
+    for row in result.scalars().all():
+        item: dict[str, Any] = {
+            "content": row.content,
+            "status": row.status,
+        }
+        if row.priority:
+            item["priority"] = row.priority
+        todos.append(item)
+    return todos
+
+
+async def list_conversation_todos(
+    session: AsyncSession,
+    conversation_id: str,
+) -> list[dict[str, Any]]:
+    """Return authoritative TODO state for a conversation."""
+
+    result = await session.execute(
+        select(ConversationTodo)
+        .where(ConversationTodo.conversation_id == conversation_id)
+        .order_by(ConversationTodo.position.asc())
+    )
+    todos: list[dict[str, Any]] = []
+    for row in result.scalars().all():
+        item: dict[str, Any] = {
+            "content": row.content,
+            "status": row.status,
+        }
+        if row.priority:
+            item["priority"] = row.priority
+        todos.append(item)
+    return todos
+
+
+async def replace_session_todos(
+    session: AsyncSession,
+    session_id: str,
+    todos: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Atomically replace session-scoped TODO state.
+
+    An empty list is an explicit clear, matching OpenCode's TODO semantics.
+    The returned list is the normalized persisted shape.
+    """
+
+    normalized = _normalize_session_todo_items(todos)
+    await _lock_todo_replacement(session, "session", session_id)
+    await session.execute(delete(SessionTodo).where(SessionTodo.session_id == session_id))
+    if normalized:
+        now = datetime.now(UTC)
+        session.add_all(
+            SessionTodo(
+                session_id=session_id,
+                position=position,
+                content=item["content"],
+                status=item["status"],
+                priority=item.get("priority"),
+                created_at=now,
+                updated_at=now,
+            )
+            for position, item in enumerate(normalized)
+        )
+    await session.flush()
+    return normalized
+
+
+async def replace_conversation_todos(
+    session: AsyncSession,
+    conversation_id: str,
+    todos: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Atomically replace conversation-scoped TODO state.
+
+    An empty list is an explicit clear, matching OpenCode's TODO semantics.
+    The returned list is the normalized persisted shape.
+    """
+
+    normalized = _normalize_session_todo_items(todos)
+    await _lock_todo_replacement(session, "conversation", conversation_id)
+    await session.execute(
+        delete(ConversationTodo).where(ConversationTodo.conversation_id == conversation_id)
+    )
+    if normalized:
+        now = datetime.now(UTC)
+        session.add_all(
+            ConversationTodo(
+                conversation_id=conversation_id,
+                position=position,
+                content=item["content"],
+                status=item["status"],
+                priority=item.get("priority"),
+                created_at=now,
+                updated_at=now,
+            )
+            for position, item in enumerate(normalized)
+        )
+    await session.flush()
+    return normalized
+
+
+async def copy_session_todos(
+    session: AsyncSession,
+    *,
+    source_session_id: str,
+    target_session_id: str,
+) -> list[dict[str, Any]]:
+    """Copy authoritative TODO state between sessions."""
+
+    todos = await list_session_todos(session, source_session_id)
+    return await replace_session_todos(session, target_session_id, todos)
 
 
 async def set_session_intaris_session_id(
@@ -4898,6 +5166,31 @@ async def update_executor_runtime_state(
     return row
 
 
+async def bump_executor_reconfigure_generation(
+    session: AsyncSession,
+    executor_id: str,
+    *,
+    runtime_state: str,
+) -> bool:
+    """Atomically increment an executor config generation for reconfiguration."""
+
+    result = await session.execute(
+        update(ExecutorRow)
+        .where(ExecutorRow.executor_id == executor_id)
+        .values(
+            desired_config_version=sa.func.coalesce(
+                ExecutorRow.desired_config_version,
+                0,
+            )
+            + 1,
+            runtime_state=runtime_state,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.flush()
+    return bool(getattr(result, "rowcount", 0))
+
+
 async def get_tool_classification_rows(
     session: AsyncSession,
     *,
@@ -5886,6 +6179,18 @@ async def get_artifact_record(session: AsyncSession, artifact_id: str) -> Artifa
         select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id == artifact_id)
     )
     return result.scalar_one_or_none()
+
+
+async def get_artifact_records(
+    session: AsyncSession,
+    artifact_ids: list[str],
+) -> list[ArtifactRecordRow]:
+    if not artifact_ids:
+        return []
+    result = await session.execute(
+        select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
+    )
+    return list(result.scalars().all())
 
 
 def _artifact_discovery_stmt(
@@ -6933,6 +7238,32 @@ async def mark_channel_delivery_uncertain(
         )
     )
     return bool(getattr(result, "rowcount", 0))
+
+
+async def suppress_channel_delivery_outbox(
+    session: AsyncSession,
+    *,
+    delivery_ids: list[str],
+    reason: str | None = None,
+) -> int:
+    if not delivery_ids:
+        return 0
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id.in_(delivery_ids),
+            ChannelDeliveryOutboxRow.status.in_(["pending", "failed", "sending"]),
+        )
+        .values(
+            status="suppressed",
+            lease_token=None,
+            lease_expires_at=None,
+            last_error=reason,
+            updated_at=_utcnow(),
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 async def list_channel_delivery_outbox_due(

@@ -23,6 +23,7 @@ from typing import Any
 
 from prometheus_client import Counter, Gauge
 
+from cognis.core.context_budget import LOOP_PRESSURE_THRESHOLD_RATIO
 from cognis.core.immutable_prefix import (
     PREFIX_EVENT_TYPES,
     ImmutablePrefixEntry,
@@ -102,8 +103,17 @@ class ActiveThinkingState:
     session_id: str
     message_id: str
     turn_id: str | None
+    assistant_phase_index: int = 0
+    turn_cycle_index: int | None = None
     blocks: dict[str, ActiveThinkingBlock] = field(default_factory=dict)
     updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    # Stable anchor: the block_id of the FIRST block ever added to this segment.
+    # Set once on the first update_active_thinking call; never changed even as
+    # completed blocks are popped.  The runtime projector uses this to form the
+    # thinking item id (thinking:{message_id}:phase:{phase}:{first_block_id})
+    # so the id stays stable across the entire segment lifetime and matches the
+    # history projector's id (which keys on the first block in event order).
+    first_block_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -116,6 +126,7 @@ class CachedSessionState:
     last_event_seq: int = 0
     last_compaction_seq: int = 0
     last_compaction_summary: str | None = None
+    auto_compaction_cooldown_turns: int = 0
     intention: str | None = None
     intention_updated_at: str | None = None
     touched_at: float = field(default_factory=monotonic)
@@ -140,8 +151,13 @@ class CachedSessionState:
     context_reserve_clamp_warned: bool = False
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
     model_override: str | None = None
+    model_override_provider_id: str | None = None
     reasoning_effort_override: str | None = None
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
+    loaded_skill_ids: set[str] = field(default_factory=set)
+    loaded_skill_context_hashes: dict[str, str] = field(default_factory=dict)
+    activated_skill_ids: set[str] = field(default_factory=set)
+    activated_skill_tool_ids_by_skill: dict[str, set[str]] = field(default_factory=dict)
     activated_skill_tool_ids: set[str] = field(default_factory=set)
     skill_tool_classifications: dict[str, list[str]] = field(default_factory=dict)
     # Per-session memo of resolved tool classification results.
@@ -186,6 +202,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "last_event_seq": entry.last_event_seq,
             "last_compaction_seq": entry.last_compaction_seq,
             "last_compaction_summary": entry.last_compaction_summary,
+            "auto_compaction_cooldown_turns": entry.auto_compaction_cooldown_turns,
             "intention": entry.intention,
             "intention_updated_at": entry.intention_updated_at,
             "initialized": entry.initialized,
@@ -214,7 +231,16 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "context_metadata": entry.context_metadata,
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
+            "model_override_provider_id": entry.model_override_provider_id,
             "reasoning_effort_override": entry.reasoning_effort_override,
+            "loaded_skill_ids": sorted(entry.loaded_skill_ids),
+            "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
+            "activated_skill_ids": sorted(entry.activated_skill_ids),
+            "activated_skill_tool_ids_by_skill": {
+                skill_id: sorted(tool_ids)
+                for skill_id, tool_ids in sorted(entry.activated_skill_tool_ids_by_skill.items())
+            },
+            "activated_skill_tool_ids": sorted(entry.activated_skill_tool_ids),
             "discovered_tool_handles": [
                 _serialize_discovered_tool_handle(item)
                 for item in sorted(
@@ -265,6 +291,7 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         last_event_seq=data.get("last_event_seq", 0),
         last_compaction_seq=data.get("last_compaction_seq", 0),
         last_compaction_summary=data.get("last_compaction_summary"),
+        auto_compaction_cooldown_turns=int(data.get("auto_compaction_cooldown_turns") or 0),
         intention=data.get("intention"),
         intention_updated_at=data.get("intention_updated_at"),
         initialized=data.get("initialized", False),
@@ -302,7 +329,33 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         ),
         context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
+        model_override_provider_id=data.get("model_override_provider_id"),
         reasoning_effort_override=data.get("reasoning_effort_override"),
+        loaded_skill_ids={
+            str(item)
+            for item in data.get("loaded_skill_ids", [])
+            if isinstance(item, str) and item.strip()
+        },
+        loaded_skill_context_hashes={
+            str(key): str(value)
+            for key, value in data.get("loaded_skill_context_hashes", {}).items()
+            if isinstance(key, str) and isinstance(value, str)
+        },
+        activated_skill_ids={
+            str(item)
+            for item in data.get("activated_skill_ids", [])
+            if isinstance(item, str) and item.strip()
+        },
+        activated_skill_tool_ids_by_skill={
+            str(key): {str(item) for item in value if isinstance(item, str) and item.strip()}
+            for key, value in data.get("activated_skill_tool_ids_by_skill", {}).items()
+            if isinstance(key, str) and isinstance(value, list)
+        },
+        activated_skill_tool_ids={
+            str(item)
+            for item in data.get("activated_skill_tool_ids", [])
+            if isinstance(item, str) and item.strip()
+        },
         discovered_tool_handles={
             handle.tool_id: handle
             for handle in (
@@ -455,6 +508,10 @@ class SessionCache:
         self._entries: dict[str, CachedSessionState] = {}
         self._entries_lock = asyncio.Lock()
         self._active_thinking: dict[str, ActiveThinkingState] = {}
+        # Tracks (session_id, turn_id) pairs that have been torn down via
+        # clear_active_thinking so that a late thinking delta cannot re-create
+        # the state after teardown.  Bounded to avoid unbounded growth.
+        self._cleared_thinking_turns: set[tuple[str, str | None]] = set()
         self._redis: Any | None = None
         self._redis_ttl = redis_ttl_seconds
         if redis_url:
@@ -498,8 +555,19 @@ class SessionCache:
         duration_ms: int | None = None,
         source: str | None = None,
         provider_block_index: int | None = None,
+        assistant_phase_index: int = 0,
+        turn_cycle_index: int | None = None,
     ) -> None:
         """Store an in-memory thinking delta for live, unpersisted session logs."""
+
+        # Guard: refuse to re-create state for a turn that has been torn down.
+        # clear_active_thinking records the (session_id, turn_id) of cleared
+        # states. A late thinking delta arriving after cancel teardown (due to
+        # the coalesce-buffer race) would otherwise re-populate _active_thinking,
+        # causing the thinking block to stream in after cancel and the runtime
+        # snapshot to re-emit it as streaming:true.
+        if (session_id, turn_id) in self._cleared_thinking_turns:
+            return
 
         state = self._active_thinking.get(session_id)
         if state is None or state.message_id != message_id or state.turn_id != turn_id:
@@ -507,8 +575,13 @@ class SessionCache:
                 session_id=session_id,
                 message_id=message_id,
                 turn_id=turn_id,
+                assistant_phase_index=assistant_phase_index,
+                turn_cycle_index=turn_cycle_index,
             )
             self._active_thinking[session_id] = state
+        else:
+            state.assistant_phase_index = assistant_phase_index
+            state.turn_cycle_index = turn_cycle_index
         block = state.blocks.get(block_id)
         if block is None:
             block = ActiveThinkingBlock(
@@ -519,6 +592,10 @@ class SessionCache:
                 provider_block_index=provider_block_index,
             )
             state.blocks[block_id] = block
+            # Set the stable anchor on the FIRST block ever added to this state.
+            # Never overwrite — this is the id anchor for the whole segment.
+            if state.first_block_id is None:
+                state.first_block_id = block_id
         if content is not None:
             block.content = content
         elif delta:
@@ -538,10 +615,77 @@ class SessionCache:
         block.complete = complete
         state.updated_at = datetime.now(UTC).isoformat()
         if complete:
-            # Completed blocks are persisted by the agent loop; keep only live blocks here.
+            # Completed blocks are persisted by the agent loop; remove them from
+            # the live snapshot so they are not re-sent as streaming:true.
+            # Do NOT remove the state itself when blocks become empty — the state
+            # retains the stable assistant_phase_index and first_block_id anchor
+            # so the on_thinking finalize path (PATH B) can emit the correct
+            # thinking item id (thinking:{message_id}:phase:{phase}:{anchor})
+            # instead of inferring phase=0 and using the current block as anchor.
+            # The state is cleared at turn teardown via clear_active_thinking().
             state.blocks.pop(block_id, None)
-            if not state.blocks:
-                self._active_thinking.pop(session_id, None)
+
+    def get_active_thinking_metadata(self, session_id: str) -> dict[str, Any] | None:
+        """Return phase and anchor metadata for the active thinking segment.
+
+        Unlike ``active_thinking_snapshots`` (which returns ``[]`` when all
+        blocks have been popped), this method returns the stable metadata even
+        when the block dict is empty.  Used by the ``on_thinking`` finalize path
+        (PATH B) to emit the correct thinking item id when the last block
+        completes and is removed from the live snapshot.
+
+        Returns a dict with ``assistant_phase_index`` and ``first_block_id``,
+        or ``None`` if no active thinking state exists for the session.
+        """
+        state = self._active_thinking.get(session_id)
+        if state is None:
+            return None
+        return {
+            "assistant_phase_index": state.assistant_phase_index,
+            "turn_cycle_index": state.turn_cycle_index,
+            "first_block_id": state.first_block_id,
+            "message_id": state.message_id,
+            "turn_id": state.turn_id,
+        }
+
+    def discard_incomplete_active_thinking(self, session_id: str) -> None:
+        """Drop incomplete live thinking blocks after a mid-stream retry.
+
+        A failed stream attempt leaves its never-completed blocks in the live
+        snapshot; the retried attempt streams NEW block ids, so runtime
+        snapshots would carry both attempts' blocks until turn teardown.
+        Completed blocks were already popped when persisted. Unlike
+        ``clear_active_thinking`` this does NOT mark the turn as cleared —
+        the retried attempt's thinking deltas must keep flowing.
+        """
+        state = self._active_thinking.get(session_id)
+        if state is None:
+            return
+        state.blocks = {
+            block_id: block for block_id, block in state.blocks.items() if block.complete
+        }
+        state.updated_at = datetime.now(UTC).isoformat()
+
+    def clear_active_thinking(self, session_id: str) -> None:
+        """Remove all live thinking state for a session.
+
+        Called at turn teardown (completion, error, cancellation) so that a
+        subsequent ``conversation_runtime_snapshot`` on reconnect never
+        re-emits stale ``streaming:true`` thinking items for a finished turn.
+
+        Also records the (session_id, turn_id) of the cleared state so that
+        a late thinking delta (arriving after cancel teardown due to the
+        coalesce-buffer race) cannot re-create the state.
+        """
+        state = self._active_thinking.pop(session_id, None)
+        if state is not None:
+            self._cleared_thinking_turns.add((session_id, state.turn_id))
+            # Bound the cleared-turns set to avoid unbounded growth.
+            if len(self._cleared_thinking_turns) > 1024:
+                # Discard half the set (arbitrary eviction — cleared turns are
+                # only needed for the brief post-teardown race window).
+                to_remove = set(list(self._cleared_thinking_turns)[:512])
+                self._cleared_thinking_turns -= to_remove
 
     def active_thinking_snapshots(self, session_id: str) -> list[dict[str, Any]]:
         """Return live thinking snapshots for a session's currently running turn."""
@@ -566,15 +710,21 @@ class SessionCache:
         ]
         if not blocks:
             return []
-        return [
-            {
-                "session_id": state.session_id,
-                "message_id": state.message_id,
-                "turn_id": state.turn_id,
-                "blocks": blocks,
-                "updated_at": state.updated_at,
-            }
-        ]
+        snapshot = {
+            "session_id": state.session_id,
+            "message_id": state.message_id,
+            "turn_id": state.turn_id,
+            "assistant_phase_index": state.assistant_phase_index,
+            # Stable anchor: the first block_id ever added to this segment.
+            # The runtime projector uses this to form the thinking item id so
+            # it stays stable even after completed blocks are popped.
+            "first_block_id": state.first_block_id,
+            "blocks": blocks,
+            "updated_at": state.updated_at,
+        }
+        if state.turn_cycle_index is not None:
+            snapshot["turn_cycle_index"] = state.turn_cycle_index
+        return [snapshot]
 
     # ------------------------------------------------------------------
     # Redis L2 helpers (best-effort, never raise)
@@ -737,16 +887,55 @@ class SessionCache:
         entry = await self._ensure_entry(session)
         async with entry.lock:
             was_initialized = entry.initialized
+            existing_seqs = {item.seq for item in entry.events}
+            # Gap detection: a seq jump means another writer recorded events
+            # this cache has not fetched (e.g. a concurrent direct write into
+            # the same session). Blindly advancing last_event_seq past the gap
+            # would skip those seqs forever, because warm refresh fetches only
+            # after_seq=last_event_seq. Keep last_event_seq at the contiguous
+            # watermark so the next warm refresh backfills the gap; duplicate
+            # re-fetches of the events appended here are dropped by seq dedup.
+            has_gap = (
+                was_initialized
+                and entry.last_event_seq > 0
+                and append_result.first_seq > entry.last_event_seq + 1
+            )
+            pre_append_watermark = entry.last_event_seq
             next_seq = append_result.first_seq
             recorded_events: list[CachedEvent] = []
             for event in events:
+                if next_seq in existing_seqs:
+                    # Intaris deduplicated this batch (idempotency-key replay)
+                    # or a concurrent refresh already fetched these seqs. Do
+                    # not re-append duplicates out of position.
+                    next_seq += 1
+                    continue
                 cached_event = CachedEvent(seq=next_seq, type=event.type, data=dict(event.data))
                 recorded_events.append(cached_event)
                 self._apply_cached_event(entry, cached_event)
+                existing_seqs.add(next_seq)
                 next_seq += 1
             if any(item.type in PREFIX_EVENT_TYPES for item in recorded_events):
                 self._rebuild_prefix_from_cached_events(entry, recorded_events)
-            entry.last_event_seq = max(entry.last_event_seq, append_result.last_seq)
+            if has_gap:
+                # _apply_cached_event bumps last_event_seq to each appended
+                # seq; restore the pre-append watermark so the next warm
+                # refresh (after_seq=watermark) backfills the gap.
+                entry.last_event_seq = pre_append_watermark
+                logger.info(
+                    "cache: seq gap detected on append; deferring watermark for backfill",
+                    extra={
+                        "extra_data": {
+                            "session_id": entry.session_id,
+                            "cached_last_seq": pre_append_watermark,
+                            "append_first_seq": append_result.first_seq,
+                            "append_last_seq": append_result.last_seq,
+                        }
+                    },
+                )
+            else:
+                entry.last_event_seq = max(entry.last_event_seq, append_result.last_seq)
+            self._ensure_events_seq_ordered(entry)
             # If the first event seen by a fresh in-memory cache has a sequence greater than
             # one, the controller restarted and recorded a new event before hydrating old
             # history. Keep the entry cold so the next refresh performs a full Intaris load.
@@ -754,6 +943,19 @@ class SessionCache:
             entry.touched_at = monotonic()
         await self._redis_set(entry)
         return entry
+
+    @staticmethod
+    def _ensure_events_seq_ordered(entry: CachedSessionState) -> None:
+        """Keep the cached event list ordered by seq.
+
+        Concurrent writers (turn flushes vs. delegation/task direct writes)
+        can land cache appends out of seq order. The cached list is consumed
+        in list order by context assembly and compaction, so out-of-order
+        entries produce wrong grouping in the LLM context.
+        """
+        events = entry.events
+        if any(events[i].seq > events[i + 1].seq for i in range(len(events) - 1)):
+            events.sort(key=lambda item: item.seq)
 
     async def seed_events(
         self,
@@ -946,7 +1148,7 @@ class SessionCache:
                 entry.reserve_output_tokens != entry.effective_reserve_output_tokens
             ),
             "effective_prompt_budget": effective_prompt_budget,
-            "loop_pressure_threshold": int(effective_prompt_budget * 0.95),
+            "loop_pressure_threshold": int(effective_prompt_budget * LOOP_PRESSURE_THRESHOLD_RATIO),
             "compaction_threshold": entry.context_metadata.get("compaction_threshold"),
             "projection_policy": entry.context_metadata.get("projection_policy"),
             "last_llm_usage": dict(entry.last_llm_usage),
@@ -981,6 +1183,24 @@ class SessionCache:
         if entry is None:
             return set()
         return set(entry.activated_skill_tool_ids)
+
+    def get_activated_skill_ids(self, session_id: str) -> set[str]:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return set()
+        return set(entry.activated_skill_ids)
+
+    def get_loaded_skill_ids(self, session_id: str) -> set[str]:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return set()
+        return set(entry.loaded_skill_ids)
+
+    def get_loaded_skill_context_hash(self, session_id: str, skill_id: str) -> str | None:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return None
+        return entry.loaded_skill_context_hashes.get(skill_id)
 
     def get_discovered_tool_ids(self, session_id: str) -> set[str]:
         """Return stable tool ids discovered by ``search_tools`` in this session."""
@@ -1052,7 +1272,13 @@ class SessionCache:
         entry = self.get_entry(session_id)
         if entry is None:
             return
-        entry.activated_skill_tool_ids.update(tool_ids)
+        if skill_id and tool_ids:
+            entry.activated_skill_ids.add(skill_id)
+            entry.activated_skill_tool_ids_by_skill[skill_id] = set(tool_ids)
+        elif skill_id:
+            entry.activated_skill_ids.discard(skill_id)
+            entry.activated_skill_tool_ids_by_skill.pop(skill_id, None)
+        self._rebuild_activated_skill_tool_union(entry)
 
     def get_skill_tool_classification(self, session_id: str, cache_key: str) -> list[str] | None:
         entry = self.get_entry(session_id)
@@ -1126,16 +1352,27 @@ class SessionCache:
         entry.context_reserve_clamp_warned = True
         return True
 
-    def set_model_override(self, session_id: str, model: str | None) -> None:
+    def set_model_override(
+        self,
+        session_id: str,
+        model: str | None,
+        provider_id: str | None = None,
+    ) -> None:
         """Set per-session model override (from /model command)."""
         entry = self._entries.get(session_id)
         if entry is not None:
             entry.model_override = model
+            entry.model_override_provider_id = provider_id if model is not None else None
 
     def get_model_override(self, session_id: str) -> str | None:
         """Get per-session model override, or ``None`` for default."""
         entry = self._entries.get(session_id)
         return entry.model_override if entry is not None else None
+
+    def get_model_override_provider_id(self, session_id: str) -> str | None:
+        """Get per-session model override provider id, or ``None`` when unpinned."""
+        entry = self._entries.get(session_id)
+        return entry.model_override_provider_id if entry is not None else None
 
     def set_reasoning_effort_override(self, session_id: str, effort: str | None) -> None:
         """Set per-session reasoning effort override (from /thinking command)."""
@@ -1446,15 +1683,28 @@ class SessionCache:
     def _apply_intaris_events(
         self, entry: CachedSessionState, raw_events: list[dict[str, Any]]
     ) -> None:
+        # Seq dedup: after a gap-deferred append the warm refresh re-fetches
+        # events that are already cached (see append_recorded_events). Skip
+        # them so the backfill only inserts the missing seqs.
+        existing_seqs = {item.seq for item in entry.events}
+        applied = False
         for raw_event in sorted(raw_events, key=lambda item: int(item.get("seq", 0))):
+            seq = int(raw_event.get("seq", 0))
+            if seq in existing_seqs:
+                entry.last_event_seq = max(entry.last_event_seq, seq)
+                continue
             cached_event = CachedEvent(
-                seq=int(raw_event.get("seq", 0)),
+                seq=seq,
                 type=str(raw_event.get("type", "")),
                 data=dict(raw_event.get("data", {})),
                 source=raw_event.get("source"),
                 ts=raw_event.get("ts"),
             )
             self._apply_cached_event(entry, cached_event)
+            existing_seqs.add(seq)
+            applied = True
+        if applied:
+            self._ensure_events_seq_ordered(entry)
         entry.initialized = True
 
     def _rebuild_prefix_from_cached_events(
@@ -1469,6 +1719,16 @@ class SessionCache:
         )
         if latest_snapshot is None:
             return
+
+        latest_loaded_skill_seq: dict[str, int] = {}
+        event_by_seq = {event.seq: event for event in cached_events}
+        for event in cached_events:
+            loaded_skill_id = self._loaded_skill_id_from_event(event)
+            if loaded_skill_id is not None:
+                latest_loaded_skill_seq[loaded_skill_id] = max(
+                    latest_loaded_skill_seq.get(loaded_skill_id, 0),
+                    event.seq,
+                )
 
         existing_by_seq = {item.seq: item for item in entry.prefix_entries}
         for event in cached_events:
@@ -1491,6 +1751,14 @@ class SessionCache:
             if not isinstance(item, dict):
                 continue
             seq = int(item.get("seq", 0))
+            referenced_event = event_by_seq.get(seq)
+            loaded_skill_id = (
+                self._loaded_skill_id_from_event(referenced_event)
+                if referenced_event is not None
+                else None
+            )
+            if loaded_skill_id is not None and latest_loaded_skill_seq.get(loaded_skill_id) != seq:
+                continue
             prefix_entry = existing_by_seq.get(seq)
             if prefix_entry is not None:
                 rebuilt_entries.append(prefix_entry)
@@ -1549,11 +1817,23 @@ class SessionCache:
                 )
             return
 
+        latest_loaded_skill_seq: dict[str, int] = {}
         seq_to_message: dict[int, dict[str, Any]] = {}
         for raw_event in raw_events:
             if raw_event.get("type") not in {"system_message", "developer_message"}:
                 continue
-            seq_to_message[int(raw_event.get("seq", 0))] = raw_event
+            seq = int(raw_event.get("seq", 0))
+            seq_to_message[seq] = raw_event
+            data = raw_event.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            if raw_event.get("type") == "developer_message" and data.get("kind") == "loaded_skill":
+                skill_id = data.get("skill_id")
+                if isinstance(skill_id, str) and skill_id.strip():
+                    latest_loaded_skill_seq[skill_id] = max(
+                        latest_loaded_skill_seq.get(skill_id, 0),
+                        seq,
+                    )
 
         snapshot_data = latest_snapshot.get("data", {})
         rebuilt_entries: list[ImmutablePrefixEntry] = []
@@ -1567,6 +1847,18 @@ class SessionCache:
                 missing_refs.append(seq)
                 continue
             data = message.get("data", {})
+            if (
+                isinstance(data, dict)
+                and message.get("type") == "developer_message"
+                and data.get("kind") == "loaded_skill"
+            ):
+                skill_id = data.get("skill_id")
+                if (
+                    isinstance(skill_id, str)
+                    and skill_id.strip()
+                    and latest_loaded_skill_seq.get(skill_id) != seq
+                ):
+                    continue
             content = data.get("content")
             source = data.get("source") or item.get("source")
             role = data.get("role") or item.get("role")
@@ -1630,6 +1922,23 @@ class SessionCache:
             )
 
     def _apply_cached_event(self, entry: CachedSessionState, event: CachedEvent) -> None:
+        loaded_skill_id = self._loaded_skill_id_from_event(event)
+        if loaded_skill_id is not None:
+            superseded_event_seqs = {
+                existing.seq
+                for existing in entry.events
+                if self._loaded_skill_id_from_event(existing) == loaded_skill_id
+            }
+            entry.events = [
+                existing
+                for existing in entry.events
+                if self._loaded_skill_id_from_event(existing) != loaded_skill_id
+            ]
+            if superseded_event_seqs:
+                entry.prefix_entries = [
+                    item for item in entry.prefix_entries if item.seq not in superseded_event_seqs
+                ]
+            self._apply_loaded_skill_event(entry, event, loaded_skill_id)
         if event.type in PREFIX_EVENT_TYPES:
             project_metadata = project_metadata_from_event_data(event.data, seq=event.seq)
             if project_metadata is not None:
@@ -1692,6 +2001,50 @@ class SessionCache:
         elif event.seq > entry.last_compaction_seq:
             entry.events.append(event)
         entry.last_event_seq = max(entry.last_event_seq, event.seq)
+
+    @staticmethod
+    def _loaded_skill_id_from_event(event: CachedEvent) -> str | None:
+        if event.type != "developer_message":
+            return None
+        data = event.data
+        if data.get("kind") != "loaded_skill":
+            return None
+        skill_id = data.get("skill_id")
+        if not isinstance(skill_id, str) or not skill_id.strip():
+            return None
+        return skill_id
+
+    def _apply_loaded_skill_event(
+        self,
+        entry: CachedSessionState,
+        event: CachedEvent,
+        skill_id: str,
+    ) -> None:
+        data = event.data
+        if not skill_id:
+            return
+        entry.loaded_skill_ids.add(skill_id)
+        content_hash = data.get("content_hash")
+        if isinstance(content_hash, str):
+            entry.loaded_skill_context_hashes[skill_id] = content_hash
+        raw_tool_ids = data.get("activated_tool_ids")
+        if isinstance(raw_tool_ids, list):
+            tool_ids = {item for item in raw_tool_ids if isinstance(item, str) and item.strip()}
+            if tool_ids:
+                entry.activated_skill_ids.add(skill_id)
+                entry.activated_skill_tool_ids_by_skill[skill_id] = tool_ids
+            else:
+                entry.activated_skill_ids.discard(skill_id)
+                entry.activated_skill_tool_ids_by_skill.pop(skill_id, None)
+            self._rebuild_activated_skill_tool_union(entry)
+
+    @staticmethod
+    def _rebuild_activated_skill_tool_union(entry: CachedSessionState) -> None:
+        entry.activated_skill_tool_ids = {
+            tool_id
+            for tool_ids in entry.activated_skill_tool_ids_by_skill.values()
+            for tool_id in tool_ids
+        }
 
     async def _evict_oldest_unlocked(self) -> None:
         if self.max_entries <= 0 or len(self._entries) < self.max_entries:

@@ -46,7 +46,9 @@ function buildApi(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     tasks: {
       detail: vi.fn().mockResolvedValue(taskDetail),
-      listAll: vi.fn().mockResolvedValue([{ task_id: 'task-1', title: 'Task' }])
+      summary: vi.fn().mockResolvedValue(taskDetail),
+      stepSummaries: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
+      list: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
     },
     agents: {
       listAll: vi.fn().mockResolvedValue([{ agent_id: 'agent-1', name: 'Agent' }])
@@ -56,7 +58,8 @@ function buildApi(overrides: Partial<Record<string, unknown>> = {}) {
       detail: vi.fn().mockResolvedValue({ workflow_id: 'wf-1', name: 'Workflow' })
     },
     conversations: {
-      listAll: vi.fn().mockResolvedValue([{ conversation_id: 'conv-1', agent_id: 'agent-1' }])
+      list: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
+      detail: vi.fn().mockResolvedValue({ conversation_id: 'conv-1', agent_id: 'agent-1' })
     },
     ...overrides
   };
@@ -81,8 +84,10 @@ describe('task detail helpers', () => {
   it('fails the whole load when task detail is missing', async () => {
     const api = buildApi({
       tasks: {
-        detail: vi.fn().mockRejectedValue(new ApiError('Task not found', { status: 404 })),
-        listAll: vi.fn().mockResolvedValue([])
+        detail: vi.fn().mockResolvedValue(taskDetail),
+        summary: vi.fn().mockRejectedValue(new ApiError('Task not found', { status: 404 })),
+        stepSummaries: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
+        list: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
       }
     });
 
@@ -92,11 +97,13 @@ describe('task detail helpers', () => {
     });
   });
 
-  it('preserves the currently rendered task list when refresh auxiliary load fails', async () => {
+  it('preserves the currently rendered task list during refresh', async () => {
     const api = buildApi({
       tasks: {
         detail: vi.fn().mockResolvedValue(taskDetail),
-        listAll: vi.fn().mockRejectedValue(new ApiError('Task board unavailable', { status: 503 }))
+        summary: vi.fn().mockResolvedValue(taskDetail),
+        stepSummaries: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
+        list: vi.fn().mockResolvedValue({ items: [], next_cursor: null, has_more: false }),
       }
     });
 
@@ -106,7 +113,7 @@ describe('task detail helpers', () => {
 
     expect(data.task.task_id).toBe('task-1');
     expect(data.allTasks).toEqual([{ task_id: 'existing-task', title: 'Existing' }]);
-    expect(data.auxiliaryError).toBe('Task board unavailable');
+    expect(data.auxiliaryError).toBe('');
   });
 
   it('only clears the task view for actual not-found detail errors', () => {

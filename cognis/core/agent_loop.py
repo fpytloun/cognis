@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote, urlparse
 
 from prometheus_client import Counter, Histogram
@@ -51,6 +52,7 @@ from cognis.core.chat_modes import ResolvedChatMode, normalize_chat_mode, plan_m
 from cognis.core.compaction import ROTATION_TOTAL, CompactionModelContext, CompactionResult
 from cognis.core.context import _native_attachment_blocks
 from cognis.core.context_budget import (
+    LOOP_PRESSURE_THRESHOLD_RATIO,
     prompt_serialization_margin_ratio_for_model,
     resolve_context_budget,
 )
@@ -75,9 +77,13 @@ from cognis.core.decision import build_routing_reminder
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
+    LLM_CYCLE_CEILING_CONTINUATION_REASON,
+    STEP_TIMEOUT_CONTINUATION_REASON,
+    TOOL_CALL_CEILING_CONTINUATION_REASON,
+    ContinuationFollowUp,
     FollowUpMetadata,
-    FollowUpMode,
     FollowUpPolicy,
+    build_automatic_continuation_follow_up,
     build_history_boundary_message,
     render_follow_up_block,
 )
@@ -88,13 +94,16 @@ from cognis.core.harness_guards import (
     check_loop_guard,
     loop_guard_rejection_payload,
     record_tool_call,
+    record_tool_result,
 )
 from cognis.core.json_utils import extract_json_object, extract_visible_text_from_response
 from cognis.core.managed_conversations import (
+    ManagedConversationRetryMessage,
     is_allowed_managed_conversation_target,
     last_managed_conversation_user_message_for_retry,
     managed_conversation_target_error,
 )
+from cognis.core.message_markers import TOKEN_ESTIMATE, TURN_BOUNDARY
 from cognis.core.orchestration_policy import (
     is_managed_agent_conversation_context,
     orchestration_surface_policy,
@@ -222,6 +231,8 @@ from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 logger = get_logger(__name__)
 
+_TERMINAL_SESSION_STATUSES = {"completed", "failed", "cancelled", "terminated"}
+
 _SAME_EXECUTOR_AUTO_RETRY_TOOL_ALLOWLIST = frozenset(
     {
         "glob",
@@ -234,7 +245,17 @@ _SAME_EXECUTOR_AUTO_RETRY_TOOL_ALLOWLIST = frozenset(
         "web_search",
     }
 )
-_COGNIS_ARTIFACT_URL_RE = re.compile(r"https://cognis\.fpy\.cz/api/v1/artifacts/content/[^\s\"']+")
+
+
+def _artifact_url_pattern() -> re.Pattern[str]:
+    configured_base_url = (os.getenv("COGNIS_PUBLIC_BASE_URL") or "").rstrip("/")
+    if configured_base_url:
+        escaped_base = re.escape(configured_base_url)
+        return re.compile(rf"{escaped_base}/api/v1/artifacts/content/[^\s\"']+")
+    return re.compile(r"https://cognis\.fpy\.cz/api/v1/artifacts/content/[^\s\"']+")
+
+
+_COGNIS_ARTIFACT_URL_RE = _artifact_url_pattern()
 _BACKGROUND_SHELL_STATUS_REMINDER_LIMIT = 3
 _BACKGROUND_WORK_STATUS_REMINDER_LIMIT = 3
 _BACKGROUND_WORK_REUSABLE_REMINDER_LIMIT = 5
@@ -247,6 +268,7 @@ _ASYNC_ORCHESTRATION_OUTPUT_REMINDER = (
 
 _DELEGATION_RESULT_MAX_CHARS = 120_000
 _DELEGATION_RESULT_INLINE_MAX_CHARS = 50_000
+_DELEGATION_INPUT_PREVIEW_CHARS = 4_000
 _DELEGATION_SALVAGE_MAX_TOOL_RESULTS = 20
 _DELEGATION_SALVAGE_RESULT_PREVIEW_CHARS = 2_000
 _DELEGATION_RESULT_TRUNCATION_TEMPLATE = "\n\n[Output truncated: original length {original_length} chars, stored first {max_chars} chars.]"
@@ -500,6 +522,11 @@ LLM_TOOL_ARGUMENT_PARSE_FAILURES_TOTAL = Counter(
     "Malformed streamed tool-call arguments rejected before tool dispatch.",
     labelnames=("provider_id", "tool"),
 )
+RESPONSES_OUTPUT_ITEMS_PERSIST_SKIPPED_TOTAL = Counter(
+    "cognis_responses_output_items_persist_skipped_total",
+    "Responses output item persistence skips by reason.",
+    labelnames=("reason",),
+)
 AGENT_CYCLE_PREP_DURATION = Histogram(
     "cognis_agent_cycle_prep_duration_seconds",
     "Duration of per-cycle model/tool exposure and prompt projection before LLM dispatch.",
@@ -526,6 +553,7 @@ TOOL_EXECUTION_DURATION = Histogram(
     labelnames=("tool_name", "route", "outcome"),
 )
 AUTO_COMPACTION_TIMEOUT_SECONDS = 300
+COMPACTION_RECURSION_COOLDOWN_TURNS = 3
 LLM_STREAM_REASONING_IDLE_MULTIPLIER = 3
 LLM_STREAM_MAX_REASONING_IDLE_TIMEOUT_SECONDS = 900
 
@@ -596,12 +624,174 @@ def _allowed_finalization_tools(instruction: dict[str, str]) -> frozenset[str]:
     return frozenset({STEP_TODO_WRITE, STEP_COMPLETE})
 
 
+def _is_delegated_child_context(ctx: StepContext) -> bool:
+    """Return true when this turn runs in a delegated child session.
+
+    Delegated sessions share a conversation id with their parent for UI/history
+    linkage, but they must not consume or mutate conversation-scoped execution
+    state owned by the parent chat.
+    """
+
+    return bool(getattr(getattr(ctx, "session", None), "parent_session_id", None))
+
+
+def _visible_allowed_tool_names(
+    allowed_tools: frozenset[str],
+    exposure: ControllerToolExposure,
+) -> list[str]:
+    """Render canonical controller tool names through the current visible surface."""
+
+    exposed_canonical = {
+        str(schema.get("function", {}).get("name"))
+        for schema in exposure.schemas
+        if isinstance(schema.get("function"), dict)
+    }
+    visible_by_canonical = {canonical: visible for visible, canonical in exposure.alias_map.items()}
+    names: list[str] = []
+    for tool_name in sorted(allowed_tools):
+        visible_name = visible_by_canonical.get(tool_name)
+        if visible_name is not None:
+            names.append(visible_name)
+        elif tool_name in exposed_canonical:
+            names.append(tool_name)
+    return sorted(names)
+
+
 # Callback types
-TokenCallback = Callable[[str], Coroutine[Any, Any, None]]
-ToolCallCallback = Callable[[str, str, dict[str, Any]], Coroutine[Any, Any, None]]
+TokenCallback = Callable[..., Coroutine[Any, Any, None]]
+ToolCallCallback = Callable[..., Coroutine[Any, Any, None]]
 ToolResultCallback = Callable[..., Coroutine[Any, Any, None]]
 ToolOutputChunkCallback = Callable[..., Coroutine[Any, Any, None]]
 ToolProgressCallback = Callable[..., Coroutine[Any, Any, None]]
+ContextUsageCallback = Callable[[dict[str, Any]], Coroutine[Any, Any, None]]
+
+
+def _callback_accepts_turn_cycle_index(callback: Callable[..., Any]) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= 2
+
+
+async def _emit_token(
+    on_token: TokenCallback,
+    token: str,
+    turn_cycle_index: int | None,
+) -> None:
+    if _callback_accepts_turn_cycle_index(on_token):
+        await on_token(token, turn_cycle_index)
+    else:
+        await on_token(token)
+
+
+async def _emit_with_optional_trailing_arg(
+    callback: Callable[..., Coroutine[Any, Any, None]],
+    args: tuple[Any, ...],
+    optional_arg: Any,
+) -> None:
+    if _callback_accepts_positional_count(callback, len(args) + 1):
+        await callback(*args, optional_arg)
+    else:
+        await callback(*args)
+
+
+async def _emit_tool_result_callback(
+    callback: ToolResultCallback,
+    *,
+    call_id: str,
+    tool_name: str,
+    result: str,
+    is_error: bool,
+    duration_ms: int | None,
+    evaluation: dict[str, Any] | None,
+    attachments: list[dict[str, Any]] | None = None,
+    file_diffs: list[dict[str, Any]] | None = None,
+    presentation: dict[str, Any] | None = None,
+    turn_cycle_index: int | None = None,
+) -> None:
+    extended_args = (
+        call_id,
+        tool_name,
+        result,
+        is_error,
+        duration_ms,
+        evaluation,
+        attachments,
+        file_diffs,
+        presentation,
+    )
+    base_args = extended_args[:6]
+    if _callback_accepts_keyword(
+        callback, "turn_cycle_index"
+    ) and _callback_accepts_positional_count(callback, len(extended_args)):
+        await callback(*extended_args, turn_cycle_index=turn_cycle_index)
+    elif _callback_accepts_keyword(callback, "turn_cycle_index"):
+        await callback(*base_args, turn_cycle_index=turn_cycle_index)
+    elif _callback_declares_positional_count(callback, len(extended_args) + 1):
+        await callback(*extended_args, turn_cycle_index)
+    elif _callback_accepts_positional_count(callback, len(extended_args)):
+        await callback(*extended_args)
+    else:
+        await callback(*base_args)
+
+
+def _callback_accepts_keyword(callback: Callable[..., Any], name: str) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.name == name and parameter.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
+
+
+def _callback_declares_positional_count(callback: Callable[..., Any], count: int) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= count
+
+
+def _callback_accepts_positional_count(callback: Callable[..., Any], count: int) -> bool:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    positional_count = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_count += 1
+    return positional_count >= count
+
 
 # Default limits
 DEFAULT_MAX_TOOL_CALLS = 200
@@ -610,8 +800,11 @@ DEFAULT_STEP_TIMEOUT_SECONDS = 3600  # 1 hour
 # optional cap counts LLM iterations, not individual tool calls. No default cap
 # is applied; cancellation, timeout, and context pressure remain safety rails.
 DELEGATION_MAX_STEPS_KEYS = ("steps", "delegation_max_steps", "max_steps")
-DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 60
+DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS = 120
 DEFAULT_LLM_STREAM_MAX_RETRIES = 3
+DEFAULT_ANTHROPIC_CACHE_TTL = "5m"
+_ANTHROPIC_CACHE_TTL_ORDER = {"1h": 2, "5m": 1}
+_MAX_RETRY_AFTER_SLEEP_SECONDS = 120.0
 _MAX_TOOL_DATA_BYTES = 10_240  # 10 KB truncation limit for WS events
 _MAX_AGENT_VISIBLE_TOOL_RESULT = 50_000
 _MAX_INTARIS_TOOL_RESULT = _MAX_AGENT_VISIBLE_TOOL_RESULT
@@ -751,7 +944,10 @@ def _artifact_failures_from_error_payload(
 
     if not isinstance(payload, dict):
         return []
-    if payload.get("category") != MidStreamErrorCategory.ARTIFACT_FETCH.value:
+    if payload.get("category") not in {
+        MidStreamErrorCategory.ARTIFACT_FETCH.value,
+        MidStreamErrorCategory.ATTACHMENT_INPUT.value,
+    }:
         return []
     urls = [url for url in payload.get("artifact_urls") or [] if isinstance(url, str)]
     ids = [
@@ -777,8 +973,51 @@ def _artifact_failures_from_error_payload(
     return failures
 
 
+def _native_image_failures_from_messages(
+    messages: list[dict[str, Any]],
+    *,
+    artifact_ids: set[str] | None = None,
+) -> list[_ArtifactFetchFailure]:
+    """Extract native image attachment URLs from assembled prompt messages."""
+
+    failures: list[_ArtifactFetchFailure] = []
+    seen_urls: set[str] = set()
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            image_part = part.get("image_url")
+            if isinstance(image_part, dict):
+                url = image_part.get("url")
+            elif isinstance(image_part, str):
+                url = image_part
+            else:
+                url = None
+            if not isinstance(url, str) or not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            artifact_id: str | None = None
+            filename: str | None = None
+            path_parts = [unquote(item) for item in urlparse(url).path.split("/") if item]
+            with contextlib.suppress(ValueError):
+                content_index = path_parts.index("content")
+                if len(path_parts) > content_index + 2:
+                    artifact_id = path_parts[content_index + 2]
+                if len(path_parts) > content_index + 3:
+                    filename = path_parts[content_index + 3]
+            if artifact_ids and artifact_id not in artifact_ids:
+                continue
+            failures.append(
+                _ArtifactFetchFailure(url=url, artifact_id=artifact_id, filename=filename)
+            )
+    return failures
+
+
 def _artifact_fetch_failure_notice(failures: list[_ArtifactFetchFailure]) -> str | None:
-    """Build an LLM-facing notice for attachments removed after provider fetch failures."""
+    """Build an LLM-facing notice for attachments removed after native input failures."""
 
     lines: list[str] = []
     seen: set[tuple[str | None, str | None]] = set()
@@ -799,7 +1038,7 @@ def _artifact_fetch_failure_notice(failures: list[_ArtifactFetchFailure]) -> str
         return None
     return (
         "The following attachment(s) were removed from native model input because the "
-        "provider failed to download their artifact URL:\n" + "\n".join(lines)
+        "provider could not read their native attachment payload:\n" + "\n".join(lines)
     )
 
 
@@ -856,7 +1095,14 @@ def _llm_stream_chunk_has_activity(chunk: dict[str, Any]) -> bool:
                     return True
     return any(
         _llm_stream_value_has_activity(chunk.get(key))
-        for key in ("content", "reasoning_content", "tool_calls", "function_call")
+        for key in (
+            "content",
+            "reasoning_content",
+            "provider_thinking_blocks",
+            "thinking_blocks",
+            "tool_calls",
+            "function_call",
+        )
     )
 
 
@@ -1092,7 +1338,8 @@ def _should_auto_continue_after_mid_stream_failure(message: str) -> bool:
     return True
 
 
-_MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS = 1
+_MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS = 2
+_MAX_LLM_CYCLES_PER_TURN = 150
 _IDLE_TIMEOUT_CONTINUATION_MAX_ATTEMPTS = 3
 _IDLE_TIMEOUT_CATEGORIES = {
     MidStreamErrorCategory.IDLE_TIMEOUT_RAW.value,
@@ -1101,10 +1348,10 @@ _IDLE_TIMEOUT_CATEGORIES = {
 }
 _RECOVERY_RETRYABLE_CATEGORIES = {
     MidStreamErrorCategory.ARTIFACT_FETCH.value,
+    MidStreamErrorCategory.ATTACHMENT_INPUT.value,
     MidStreamErrorCategory.RATE_LIMIT.value,
     MidStreamErrorCategory.PROVIDER_5XX.value,
     MidStreamErrorCategory.CONNECTION.value,
-    MidStreamErrorCategory.OTHER.value,
     *_IDLE_TIMEOUT_CATEGORIES,
 }
 _RECOVERY_NON_RETRYABLE_CATEGORIES = {
@@ -1158,7 +1405,9 @@ def _mid_stream_retry_after_seconds(
         retry_after = float(value)
     except (TypeError, ValueError):
         return None
-    return retry_after if retry_after >= 0 else None
+    if retry_after < 0 or retry_after > _MAX_RETRY_AFTER_SLEEP_SECONDS:
+        return None
+    return retry_after
 
 
 def _mid_stream_retry_notice(
@@ -1208,6 +1457,34 @@ def _should_emit_mid_stream_retry_notice(
     return reason_class not in _IDLE_TIMEOUT_CATEGORIES
 
 
+def _system_notice_data(
+    message: str,
+    *,
+    kind: str,
+    turn_id: str | None = None,
+    notice_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build durable system_notice payloads with stable Chat v2 identity."""
+
+    data: dict[str, Any] = {
+        "event": "system_notice",
+        "message": message,
+        "content": message,
+        "kind": kind,
+    }
+    if turn_id:
+        data["turn_id"] = turn_id
+        data["notice_id"] = notice_id or f"{kind}:{turn_id}"
+    elif notice_id:
+        data["notice_id"] = notice_id
+    if metadata:
+        for key, value in metadata.items():
+            if value is not None and key not in data:
+                data[key] = value
+    return data
+
+
 def _should_continue_after_exhausted_mid_stream_failure(
     message: str,
     details: dict[str, Any] | MidStreamErrorPayload | None,
@@ -1241,6 +1518,21 @@ def _echo_todos_bounded(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             bounded.append(todo)
     return bounded
+
+
+def _current_todos_reminder(todos: list[dict[str, Any]]) -> str | None:
+    """Build a compact model-facing reminder from authoritative TODO state."""
+
+    normalized = _normalize_todos(todos)
+    if not normalized:
+        return None
+    return (
+        "Current session TODOs are controller-owned state and survive retry, "
+        "compaction, and projected transcript pruning. Treat this list as "
+        "authoritative; do not infer active TODOs from older transcript tool "
+        "results.\n"
+        f"{json.dumps({'todos': _echo_todos_bounded(normalized)}, ensure_ascii=False)}"
+    )
 
 
 def _truncate_tool_data(text: str) -> str:
@@ -1306,7 +1598,9 @@ def _context_pressure_metadata(context_result: Any) -> dict[str, Any]:
         getattr(context_result, "loop_pressure_threshold_prompt_tokens", 0) or 0
     )
     if loop_pressure_threshold_prompt_tokens <= 0 and available_prompt_tokens > 0:
-        loop_pressure_threshold_prompt_tokens = int(available_prompt_tokens * 0.95)
+        loop_pressure_threshold_prompt_tokens = int(
+            available_prompt_tokens * LOOP_PRESSURE_THRESHOLD_RATIO
+        )
     return {
         "prompt_tokens": prompt_tokens,
         "max_context_tokens": max_context_tokens,
@@ -1438,6 +1732,13 @@ def _compaction_model_context(ctx: StepContext) -> CompactionModelContext:
     )
 
 
+def _resolved_provider_id(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    provider_id = getattr(value, "provider_id", None)
+    return provider_id if isinstance(provider_id, str) else None
+
+
 def _file_diffs_from_metadata(metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return sanitized file diff metadata safe for API/UI payloads."""
 
@@ -1494,16 +1795,22 @@ def _delegation_title(arguments: dict[str, Any]) -> str:
 
 
 def _parent_visible_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Return parent-log-safe arguments without delegated prompt content."""
+    """Return parent-log-safe arguments with bounded delegated prompt content."""
 
-    if tool_name != "delegate":
+    if tool_name not in {"delegate", "agent_conversation_create"}:
         return _bounded_tool_arguments(arguments)
-    return {
-        "title": _delegation_title(arguments),
-        "agent_id": arguments.get("agent_id"),
-        "wait": bool(arguments.get("wait", False)),
-        "input_redacted": True,
-    }
+    bounded: dict[str, Any] = {"title": _delegation_title(arguments)}
+    for key, value in arguments.items():
+        if isinstance(value, str):
+            bounded[key] = value[:_DELEGATION_INPUT_PREVIEW_CHARS]
+            if len(value) > _DELEGATION_INPUT_PREVIEW_CHARS:
+                bounded[f"{key}_truncated"] = True
+            continue
+        bounded[key] = value
+    bounded["_bounded"] = (
+        f"{tool_name} input limited to {_DELEGATION_INPUT_PREVIEW_CHARS} chars per string field"
+    )
+    return bounded
 
 
 class StepMetadataContractError(ValueError):
@@ -1715,8 +2022,12 @@ def _append_tool_call_event(
     tc: ToolCall,
     tool_id: str | None = None,
     visible_name: str | None = None,
+    turn_cycle_index: int | None = None,
 ) -> None:
     """Record a tool_call event to the Intaris event batch."""
+    if turn_cycle_index is None:
+        runtime_cycle = getattr(tc, "runtime_metadata", {}).get("turn_cycle_index")
+        turn_cycle_index = runtime_cycle if isinstance(runtime_cycle, int) else None
     data: dict[str, Any] = {
         "name": tc.name,
         "tool_id": tool_id,
@@ -1726,6 +2037,21 @@ def _append_tool_call_event(
     if visible_name and visible_name != tc.name:
         data["visible_name"] = visible_name
         data["canonical_name"] = tc.name
+    if turn_cycle_index is not None:
+        data["turn_cycle_index"] = turn_cycle_index
+    # Persist the assistant phase the live runtime overlay used for this call
+    # so the canonical projection groups the tool under the same assistant
+    # segment as the live view (streaming vs reload parity).
+    runtime_phase = getattr(tc, "runtime_metadata", {}).get("assistant_phase_index")
+    if isinstance(runtime_phase, int):
+        data["assistant_phase_index"] = runtime_phase
+    responses_output_items = getattr(tc, "runtime_metadata", {}).get(
+        RESPONSES_OUTPUT_ITEMS_EVENT_FIELD
+    )
+    if isinstance(responses_output_items, list) and responses_output_items:
+        data[RESPONSES_OUTPUT_ITEMS_EVENT_FIELD] = [
+            dict(item) for item in responses_output_items if isinstance(item, dict)
+        ]
     events.append(
         SessionEvent(
             type="tool_call",
@@ -1746,30 +2072,40 @@ def _append_tool_result_event(
     output_size: int | None = None,
     has_full_output: bool = False,
     agent_visible_truncated: bool = False,
+    turn_cycle_index: int | None = None,
 ) -> None:
     """Record a tool_result event to the Intaris event batch.
 
     Intaris stores the exact model-visible tool result, not the raw full
     output. Full output is recoverable through the tool output store.
     """
+    if turn_cycle_index is None:
+        runtime_cycle = getattr(tc, "runtime_metadata", {}).get("turn_cycle_index")
+        turn_cycle_index = runtime_cycle if isinstance(runtime_cycle, int) else None
+    data: dict[str, Any] = {
+        "call_id": tc.call_id,
+        "name": tc.name,
+        "tool_id": tool_id,
+        "is_error": is_error,
+        "duration_ms": duration_ms,
+        "result": output,
+        "output_size": output_size if output_size is not None else len(output),
+        "has_full_output": has_full_output,
+        "recovery_call_id": recovery_call_id,
+        "protect_from_pruning": protect_from_pruning,
+        "agent_visible": True,
+        "view_kind": "model_tool_result",
+        "agent_visible_truncated": agent_visible_truncated,
+    }
+    if turn_cycle_index is not None:
+        data["turn_cycle_index"] = turn_cycle_index
+    runtime_phase = getattr(tc, "runtime_metadata", {}).get("assistant_phase_index")
+    if isinstance(runtime_phase, int):
+        data["assistant_phase_index"] = runtime_phase
     events.append(
         SessionEvent(
             type="tool_result",
-            data={
-                "call_id": tc.call_id,
-                "name": tc.name,
-                "tool_id": tool_id,
-                "is_error": is_error,
-                "duration_ms": duration_ms,
-                "result": output,
-                "output_size": output_size if output_size is not None else len(output),
-                "has_full_output": has_full_output,
-                "recovery_call_id": recovery_call_id,
-                "protect_from_pruning": protect_from_pruning,
-                "agent_visible": True,
-                "view_kind": "model_tool_result",
-                "agent_visible_truncated": agent_visible_truncated,
-            },
+            data=data,
         )
     )
 
@@ -1862,42 +2198,302 @@ def _tool_call_id_tuple(message: dict[str, Any]) -> tuple[str, ...]:
     return tuple(ids)
 
 
+RESPONSES_OUTPUT_ITEMS_EVENT_FIELD = "responses_output_items"
+RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD = "_responses_output_items"
+RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES = 256 * 1024
+RESPONSES_OUTPUT_ITEMS_PERSIST_TYPES = {"reasoning", "function_call", "apply_patch_call"}
+
+
+def _safe_responses_function_call_arguments_for_persistence(
+    tool_name: str,
+    arguments: Any,
+) -> str:
+    raw_arguments = str(arguments or "{}")
+    try:
+        parsed_arguments = json.loads(raw_arguments) if raw_arguments else {}
+    except json.JSONDecodeError:
+        parsed_arguments = {"_raw_arguments": raw_arguments}
+    if not isinstance(parsed_arguments, dict):
+        parsed_arguments = {"value": parsed_arguments}
+    safe_arguments = _parent_visible_tool_arguments(tool_name, parsed_arguments)
+    return json.dumps(safe_arguments, separators=(",", ":"), default=str)
+
+
+def _responses_output_item_for_persistence(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "")
+    if item_type not in RESPONSES_OUTPUT_ITEMS_PERSIST_TYPES:
+        return None
+    copied = dict(item)
+    if item_type == "function_call":
+        tool_name = str(copied.get("name") or "unknown_tool")
+        copied["arguments"] = _safe_responses_function_call_arguments_for_persistence(
+            tool_name,
+            copied.get("arguments"),
+        )
+    return copied
+
+
+def _responses_output_items_content_hash(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if content in (None, "", []):
+        return None
+    payload = json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _reminder_signature(content: str, *, ignore_elapsed_fields: bool = False) -> str:
+    normalized = content
+    if ignore_elapsed_fields:
+        normalized = re.sub(r"(running_for|idle_for):\s*[^\n]+", r"\1: <elapsed>", normalized)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _superseding_reminder_content(content: str, *, superseding: bool) -> str:
+    if not superseding:
+        return content
+    if content.startswith("(supersedes earlier reminder)"):
+        return content
+    return f"(supersedes earlier reminder)\n{content}"
+
+
+def _responses_output_item_key(message: dict[str, Any]) -> tuple[str, ...] | None:
+    if message.get("role") != "assistant":
+        return None
+    tool_call_ids = _tool_call_id_tuple(message)
+    if tool_call_ids:
+        return ("tool_calls", *tool_call_ids)
+    content_hash = _responses_output_items_content_hash(message)
+    if content_hash:
+        return ("content", content_hash)
+    return None
+
+
+def _responses_output_items_for_persistence(
+    items: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    durable_items = [
+        durable_item
+        for item in items
+        if isinstance(item, dict)
+        for durable_item in [_responses_output_item_for_persistence(item)]
+        if durable_item is not None
+    ]
+    if not durable_items:
+        return []
+    encoded = json.dumps(durable_items, separators=(",", ":"), ensure_ascii=False, default=str)
+    encoded_bytes = len(encoded.encode("utf-8"))
+    if encoded_bytes > RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES:
+        RESPONSES_OUTPUT_ITEMS_PERSIST_SKIPPED_TOTAL.labels(reason="too_large").inc()
+        logger.warning(
+            "Skipping Responses output item persistence because serialized payload exceeds cap",
+            extra={
+                "responses_output_item_count": len(durable_items),
+                "responses_output_items_bytes": encoded_bytes,
+                "responses_output_items_cap_bytes": RESPONSES_OUTPUT_ITEMS_PERSIST_MAX_BYTES,
+            },
+        )
+        return []
+    return durable_items
+
+
+def _attach_responses_output_items(
+    target: dict[str, Any],
+    items: list[dict[str, Any]] | None,
+    *,
+    durable: bool,
+) -> None:
+    if not items:
+        return
+    if durable:
+        durable_items = _responses_output_items_for_persistence(items)
+        if durable_items:
+            target[RESPONSES_OUTPUT_ITEMS_EVENT_FIELD] = durable_items
+        return
+    target[RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD] = [dict(item) for item in items]
+
+
+def _attach_responses_output_items_to_first_tool_call(
+    tool_calls: list[ToolCall],
+    items: list[dict[str, Any]] | None,
+) -> None:
+    if not tool_calls:
+        return
+    durable_items = _responses_output_items_for_persistence(items)
+    if durable_items:
+        tool_calls[0].runtime_metadata[RESPONSES_OUTPUT_ITEMS_EVENT_FIELD] = durable_items
+
+
 def _reattach_responses_output_items(
     projected_messages: list[dict[str, Any]],
     source_messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Restore transient Responses output items after projection strips private metadata.
 
-    These items are intentionally in-memory only; they are needed to continue a
-    Responses tool loop with reasoning/function-call items intact, but they must
-    not be persisted durably in session events.
+    These items may come from the current in-memory tool loop or from durable
+    session-event rehydration. They are provider-private and must be matched
+    back after provider-facing projection removes underscore-prefixed fields.
     """
 
-    raw_items_by_tool_ids: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    raw_items_by_key: dict[tuple[str, ...], list[list[dict[str, Any]]]] = {}
     for source in source_messages:
-        if source.get("role") != "assistant":
-            continue
-        key = _tool_call_id_tuple(source)
-        raw_items = source.get("_responses_output_items")
-        if not key or not isinstance(raw_items, list):
+        key = _responses_output_item_key(source)
+        raw_items = source.get(RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD)
+        if key is None or not isinstance(raw_items, list):
             continue
         copied_items = [dict(item) for item in raw_items if isinstance(item, dict)]
         if copied_items:
-            raw_items_by_tool_ids.setdefault(key, copied_items)
+            raw_items_by_key.setdefault(key, []).append(copied_items)
 
-    if not raw_items_by_tool_ids:
+    if not raw_items_by_key:
         return projected_messages
 
     restored: list[dict[str, Any]] = []
     for message in projected_messages:
         copied = dict(message)
-        if copied.get("role") == "assistant":
-            key = _tool_call_id_tuple(copied)
-            raw_items = raw_items_by_tool_ids.get(key)
-            if raw_items:
-                copied["_responses_output_items"] = [dict(item) for item in raw_items]
+        key = _responses_output_item_key(copied)
+        if key is not None:
+            raw_item_sets = raw_items_by_key.get(key)
+            if raw_item_sets:
+                raw_items = raw_item_sets.pop(0)
+                copied[RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD] = [dict(item) for item in raw_items]
         restored.append(copied)
     return restored
+
+
+def _copy_anthropic_thinking_blocks(value: Any) -> list[dict[str, Any]]:
+    """Return sanitized Anthropic thinking blocks for same-turn provider replay."""
+
+    if not isinstance(value, list):
+        return []
+    copied: list[dict[str, Any]] = []
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "thinking":
+            thinking = block.get("thinking")
+            signature = block.get("signature")
+            if not isinstance(thinking, str) or not thinking:
+                continue
+            next_block: dict[str, Any] = {"type": "thinking", "thinking": thinking}
+            if isinstance(signature, str) and signature:
+                next_block["signature"] = signature
+            copied.append(next_block)
+        elif block_type == "redacted_thinking":
+            data = block.get("data")
+            if not isinstance(data, str) or not data:
+                continue
+            copied.append({"type": "redacted_thinking", "data": data})
+    return copied
+
+
+def _attach_anthropic_thinking_blocks(
+    message: dict[str, Any],
+    blocks: list[dict[str, Any]],
+) -> None:
+    copied = _copy_anthropic_thinking_blocks(blocks)
+    if copied:
+        message["_anthropic_thinking_blocks"] = copied
+
+
+def _reattach_anthropic_thinking_blocks(
+    projected_messages: list[dict[str, Any]],
+    source_messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Restore signed Anthropic thinking blocks after projection strips metadata."""
+
+    blocks_by_tool_ids: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    content_only_blocks: list[tuple[str | None, list[dict[str, Any]]]] = []
+    for source in source_messages:
+        if source.get("role") != "assistant":
+            continue
+        raw_blocks = _copy_anthropic_thinking_blocks(source.get("_anthropic_thinking_blocks"))
+        if not raw_blocks:
+            continue
+        key = _tool_call_id_tuple(source)
+        if key:
+            blocks_by_tool_ids.setdefault(key, raw_blocks)
+            continue
+        content = source.get("content")
+        content_only_blocks.append((content if isinstance(content, str) else None, raw_blocks))
+
+    if not blocks_by_tool_ids and not content_only_blocks:
+        return projected_messages
+
+    restored: list[dict[str, Any]] = []
+    remaining_content_blocks = list(content_only_blocks)
+    for message in projected_messages:
+        copied = dict(message)
+        if copied.get("role") == "assistant":
+            key = _tool_call_id_tuple(copied)
+            matched_blocks = blocks_by_tool_ids.get(key) if key else None
+            if matched_blocks:
+                _attach_anthropic_thinking_blocks(copied, matched_blocks)
+            elif remaining_content_blocks:
+                content = copied.get("content")
+                for index, (source_content, candidate_blocks) in enumerate(
+                    remaining_content_blocks
+                ):
+                    if source_content is None or source_content == content:
+                        _attach_anthropic_thinking_blocks(copied, candidate_blocks)
+                        remaining_content_blocks.pop(index)
+                        break
+        restored.append(copied)
+    return restored
+
+
+def _normalize_anthropic_cache_ttl(value: Any) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _ANTHROPIC_CACHE_TTL_ORDER:
+            return normalized
+    return DEFAULT_ANTHROPIC_CACHE_TTL
+
+
+def _cache_ttl_rank(ttl: str) -> int:
+    return _ANTHROPIC_CACHE_TTL_ORDER.get(_normalize_anthropic_cache_ttl(ttl), 0)
+
+
+def _cycle_cache_breakpoints(
+    messages: list[dict[str, Any]],
+    *,
+    prefix_index: int | None,
+    ttl: str,
+) -> list[dict[str, Any]]:
+    """Return ordered Anthropic cache breakpoints for one projected LLM cycle."""
+
+    normalized_ttl = _normalize_anthropic_cache_ttl(ttl)
+    prefix_ttl = "1h" if normalized_ttl == "1h" else "5m"
+    seen: set[int] = set()
+    breakpoints: list[dict[str, Any]] = []
+
+    def add(index: int | None, breakpoint_ttl: str) -> None:
+        if index is None or index < 0 or index >= len(messages) or index in seen:
+            return
+        seen.add(index)
+        breakpoints.append({"index": index, "ttl": _normalize_anthropic_cache_ttl(breakpoint_ttl)})
+
+    add(prefix_index, prefix_ttl)
+
+    turn_boundaries = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and bool(message.get(TURN_BOUNDARY))
+    ]
+    if turn_boundaries:
+        current_turn_start = turn_boundaries[-1]
+        add(current_turn_start - 1, "5m")
+
+    if messages:
+        add(len(messages) - 1, "5m")
+
+    breakpoints.sort(key=lambda item: int(item["index"]))
+    for left, right in zip(breakpoints, breakpoints[1:], strict=False):
+        if _cache_ttl_rank(str(left["ttl"])) < _cache_ttl_rank(str(right["ttl"])):
+            left["ttl"] = str(right["ttl"])
+    return breakpoints
 
 
 @dataclass
@@ -2117,6 +2713,31 @@ class ThinkingBlockState:
         """Return accumulated content as a single string."""
         return "".join(self.content_parts)
 
+    def append_content(self, value: str) -> str:
+        """Append reasoning text and return only the newly added delta.
+
+        Most providers stream reasoning summaries as deltas, but some transports
+        surface cumulative snapshots for the current reasoning block. Treating
+        those snapshots as deltas duplicates the same paragraph in both live
+        thinking and persisted replay.
+        """
+
+        if not value:
+            return ""
+        existing = self.get_content()
+        if not existing:
+            self.content_parts.append(value)
+            return value
+        if value == existing:
+            return ""
+        if value.startswith(existing):
+            delta = value[len(existing) :]
+            if delta:
+                self.content_parts.append(delta)
+            return delta
+        self.content_parts.append(value)
+        return value
+
     def get_title(self) -> str:
         """Return the best available title for this block."""
         if self.title:
@@ -2217,7 +2838,11 @@ class StreamAccumulator:
         self.content_parts: list[str] = []
         self.internal_content_parts: list[str] = []
         self.responses_output_items: list[dict[str, Any]] = []
+        self.anthropic_thinking_blocks: list[dict[str, Any]] = []
         self.tool_calls: dict[int, dict[str, Any]] = {}
+        # Partial tool calls restored from a failed previous attempt, held
+        # aside keyed by call id until the retried stream re-emits them.
+        self._restored_tool_calls: dict[str, dict[str, Any]] = {}
         self.usage: dict[str, int] | None = None
         self.finish_reason: str = "stop"
         # Thinking-block state
@@ -2236,8 +2861,31 @@ class StreamAccumulator:
         return {idx: dict(entry) for idx, entry in self.tool_calls.items()}
 
     def restore_tool_call_state(self, state: dict[int, dict[str, Any]] | None) -> None:
-        """Restore accumulated tool-call state from a previous attempt."""
-        self.tool_calls = {idx: dict(entry) for idx, entry in (state or {}).items()}
+        """Seed replay-dedup state from a previous attempt's partial tool calls.
+
+        Restored entries are held aside keyed by call id. They are merged into
+        the live accumulator only when the retried stream re-emits a tool call
+        with the same id (a resumed/replayed stream). A fresh retry sample with
+        new call ids never sees them, so a failed attempt cannot inject phantom
+        tool calls or corrupt arguments into the retried response. Stream
+        indexes are not stable across attempts (the item mix can differ), so
+        restoring by raw index is never safe.
+        """
+        self.tool_calls = {}
+        self._restored_tool_calls = {}
+        for entry in (state or {}).values():
+            call_id = str(entry.get("id") or "").strip()
+            if call_id:
+                self._restored_tool_calls[call_id] = dict(entry)
+
+    def _seed_from_restored(self, call_id: str | None) -> dict[str, Any] | None:
+        """Pop a restored partial entry matching the given call id, if any."""
+        if not call_id:
+            return None
+        restored = self._restored_tool_calls.pop(str(call_id).strip(), None)
+        if restored is None:
+            return None
+        return dict(restored)
 
     # ------------------------------------------------------------------
     # Thinking-block internals
@@ -2345,6 +2993,14 @@ class StreamAccumulator:
         if isinstance(finish_reason, str) and finish_reason:
             self.finish_reason = finish_reason
 
+        if isinstance(delta, dict):
+            raw_provider_blocks = delta.get("provider_thinking_blocks") or delta.get(
+                "thinking_blocks"
+            )
+            provider_blocks = _copy_anthropic_thinking_blocks(raw_provider_blocks)
+            if provider_blocks:
+                self.anthropic_thinking_blocks.extend(provider_blocks)
+
         # ---------------------------------------------------------------
         # Reasoning part boundary markers from responses_bridge
         # ---------------------------------------------------------------
@@ -2404,14 +3060,34 @@ class StreamAccumulator:
             for tc_delta in tc_deltas:
                 idx = tc_delta.get("index", 0)
                 if idx not in self.tool_calls:
-                    self.tool_calls[idx] = {
-                        "id": tc_delta.get("id", ""),
-                        "name": "",
-                        "arguments": "",
-                    }
+                    restored = self._seed_from_restored(tc_delta.get("id"))
+                    if restored is not None:
+                        # Resumed/replayed stream: seed with the previous
+                        # attempt's partial so prefix-merge dedups the replay.
+                        self.tool_calls[idx] = {
+                            "id": str(restored.get("id") or tc_delta.get("id", "")),
+                            "name": str(restored.get("name") or ""),
+                            "arguments": str(restored.get("arguments") or ""),
+                        }
+                        for extra_key in ("argument_oversized", "argument_length"):
+                            if extra_key in restored:
+                                self.tool_calls[idx][extra_key] = restored[extra_key]
+                    else:
+                        self.tool_calls[idx] = {
+                            "id": tc_delta.get("id", ""),
+                            "name": "",
+                            "arguments": "",
+                        }
                 entry = self.tool_calls[idx]
                 if tc_delta.get("id"):
                     entry["id"] = tc_delta["id"]
+                    if not entry.get("arguments") and not entry.get("name"):
+                        # The id arrived after the entry was created — a
+                        # restored partial may still apply.
+                        late_restored = self._seed_from_restored(tc_delta["id"])
+                        if late_restored is not None:
+                            entry["name"] = str(late_restored.get("name") or "")
+                            entry["arguments"] = str(late_restored.get("arguments") or "")
                 func = tc_delta.get("function", {})
                 if func.get("name"):
                     entry["name"] = func["name"]
@@ -2485,18 +3161,19 @@ class StreamAccumulator:
                     )
                 block = self._current_thinking_block
                 assert block is not None  # always set above
-                block.content_parts.append(reasoning_text)
-                self._pending_thinking_events.append(
-                    ThinkingEvent(
-                        block_id=block.block_id,
-                        delta=reasoning_text,
-                        title=block.get_title(),
-                        source=source,
-                        complete=False,
-                        started_at=block.started_at.isoformat(),
-                        provider_block_index=block.provider_block_index,
+                reasoning_delta = block.append_content(reasoning_text)
+                if reasoning_delta:
+                    self._pending_thinking_events.append(
+                        ThinkingEvent(
+                            block_id=block.block_id,
+                            delta=reasoning_delta,
+                            title=block.get_title(),
+                            source=source,
+                            complete=False,
+                            started_at=block.started_at.isoformat(),
+                            provider_block_index=block.provider_block_index,
+                        )
                     )
-                )
 
         return text_delta
 
@@ -2513,6 +3190,11 @@ class StreamAccumulator:
         """Return raw Responses output items needed for same-turn continuation."""
 
         return [dict(item) for item in self.responses_output_items]
+
+    def get_anthropic_thinking_blocks(self) -> list[dict[str, Any]]:
+        """Return signed Anthropic thinking blocks needed for same-turn continuation."""
+
+        return _copy_anthropic_thinking_blocks(self.anthropic_thinking_blocks)
 
     def get_tool_calls(self) -> list[ToolCall | ToolArgumentParseFailure]:
         """Return finalized tool calls or structured argument parse failures."""
@@ -2622,6 +3304,8 @@ class StreamAccumulator:
         """Reset for the next LLM turn."""
         self.content_parts.clear()
         self.internal_content_parts.clear()
+        self.responses_output_items.clear()
+        self.anthropic_thinking_blocks.clear()
         self.tool_calls.clear()
         self.usage = None
         self._current_thinking_block = None
@@ -3057,6 +3741,7 @@ class StepContext:
     policy: ExecutionPolicy = field(default_factory=lambda: CHAT_POLICY)
     is_retry: bool = False  # True for re-attempt within the same step
     user_message: str = ""
+    client_message_id: str | None = None
     user_attachments: list[AttachmentRef] = field(default_factory=list)
     attachment_notice: str | None = None
     attachment_context: str | None = None
@@ -3073,6 +3758,7 @@ class StepContext:
     executor_pool: Any = None  # Optional[ExecutorPool]
     active_executor_id: str | None = None
     runtime_info: dict[str, Any] = field(default_factory=dict)
+    finalized_by_recovery: bool = False
     workflow_state: WorkflowState | None = None
     workflow_steps: list[StepDefinition] | None = None  # All steps for source resolution
     step_index: int = 0  # Index of current step in workflow
@@ -3120,7 +3806,24 @@ class StepContext:
     controller_tool_surface: str = CONTROLLER_TOOL_SURFACE_WORKFLOW
     on_tool_progress: ToolProgressCallback | None = None
     on_tool_output_chunk: ToolOutputChunkCallback | None = None
+    on_context_usage: ContextUsageCallback | None = None
     consume_boundary_batch: Callable[[str], Coroutine[Any, Any, list[dict[str, Any]]]] | None = None
+    # Callable that returns the current assistant_phase_index for this turn,
+    # as tracked by the scheduler's per-turn phase counter.  Set by the
+    # scheduler before handing off to the agent loop so that persisted
+    # assistant_message events carry the same phase the live stream used.
+    get_current_assistant_phase: Callable[[], int] | None = None
+    # Callable that resolves (bump-once semantics) the assistant phase a tool
+    # call belongs to, keyed by call_id.  Backed by the scheduler's idempotent
+    # per-tool phase assignment so persisted tool_call/tool_result events carry
+    # the exact phase the live runtime overlay used for the same call.
+    get_assistant_phase_for_tool: Callable[[str], int | None] | None = None
+    # Zero-based model invocation index within the current user turn.  Set by
+    # the agent loop immediately after incrementing its low-level cycle counter
+    # and before projection/model dispatch.  This is distinct from
+    # assistant_phase_index, which is a UI/projection phase counter advanced by
+    # tool boundaries.
+    current_turn_cycle_index: int | None = None
     # True after a successful write_deliverable until step_complete is called
     # or a follow-up reminder has been emitted twice.  Used to nudge models
     # that wrote the artifact and forgot to finalize the step.
@@ -3130,6 +3833,9 @@ class StepContext:
     # recurses back into _execute_step.  Bounded by session.compaction_max_recursion
     # (default 2) to prevent infinite loops when compaction cannot reduce context.
     compaction_recursion_depth: int = 0
+    # Monotonic per-step batch counter used to disambiguate idempotency keys
+    # for distinct batches that happen to have byte-identical content.
+    intaris_batch_counter: int = 0
 
     @property
     def last_projection_policy(self) -> ProjectionPolicy | None:
@@ -3182,6 +3888,7 @@ class ProjectedMessages:
     snapshot: ContextPressureSnapshot | None
     mode: str = "normal"
     policy: ProjectionPolicy | None = None
+    cache_breakpoints: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -3292,6 +3999,7 @@ class AgentLoop:
         default_step_timeout_seconds: int = DEFAULT_STEP_TIMEOUT_SECONDS,
         default_llm_stream_idle_timeout_seconds: int = DEFAULT_LLM_STREAM_IDLE_TIMEOUT_SECONDS,
         default_llm_stream_max_retries: int = DEFAULT_LLM_STREAM_MAX_RETRIES,
+        default_anthropic_cache_ttl: str = DEFAULT_ANTHROPIC_CACHE_TTL,
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
         step_runtime_factory: Any = None,
@@ -3314,6 +4022,9 @@ class AgentLoop:
             1, int(default_llm_stream_idle_timeout_seconds)
         )
         self.default_llm_stream_max_retries = max(0, int(default_llm_stream_max_retries))
+        self.default_anthropic_cache_ttl = _normalize_anthropic_cache_ttl(
+            default_anthropic_cache_ttl
+        )
         self.tool_output_store = tool_output_store
         self.artifact_store = getattr(tool_router, "artifact_store", None)
         self.notification_service: Any = None
@@ -3338,6 +4049,22 @@ class AgentLoop:
         """Wire the turn scheduler after construction for managed conversations."""
 
         self._turn_scheduler = turn_scheduler
+
+    @contextlib.asynccontextmanager
+    async def hold_session_lock(self, session_id: str) -> AsyncIterator[None]:
+        """Hold the per-session execution lock for external critical sections."""
+
+        await self.session_lock.acquire(session_id)
+        try:
+            yield
+        finally:
+            self.session_lock.release(session_id)
+
+    async def wait_for_session_unlock(self, session_id: str) -> None:
+        """Wait until the session lock is free, then release it immediately."""
+
+        async with self.hold_session_lock(session_id):
+            return
 
     async def _record_agent_work_context(
         self,
@@ -3494,6 +4221,7 @@ class AgentLoop:
         on_tool_result: ToolResultCallback | None = None,
         on_tool_progress: ToolProgressCallback | None = None,
         on_tool_output_chunk: ToolOutputChunkCallback | None = None,
+        on_context_usage: ContextUsageCallback | None = None,
     ) -> StepOutput | None:
         """Run a single step as a full agentic loop.
 
@@ -3505,6 +4233,31 @@ class AgentLoop:
         start_time = datetime.now(UTC)
         ctx.on_tool_progress = on_tool_progress
         ctx.on_tool_output_chunk = on_tool_output_chunk
+        ctx.on_context_usage = on_context_usage
+        # Non-scheduler contexts (workflow steps, delegated child sessions)
+        # have no scheduler-backed phase counter. Install a local one so
+        # persisted assistant/thinking/tool events still carry distinct
+        # phases per segment — otherwise every multi-phase run collapses to
+        # phase 0 and the projector merges distinct segments into one item.
+        if ctx.get_current_assistant_phase is None and ctx.get_assistant_phase_for_tool is None:
+            _local_phase = {"value": 0}
+            _local_phase_by_call: dict[str, int] = {}
+
+            def _local_current_phase() -> int:
+                return _local_phase["value"]
+
+            def _local_phase_for_tool(call_id: str) -> int | None:
+                if not call_id:
+                    return None
+                if call_id in _local_phase_by_call:
+                    return _local_phase_by_call[call_id]
+                phase = _local_phase["value"]
+                _local_phase_by_call[call_id] = phase
+                _local_phase["value"] = phase + 1
+                return phase
+
+            ctx.get_current_assistant_phase = _local_current_phase
+            ctx.get_assistant_phase_for_tool = _local_phase_for_tool
         logger.info(
             "agent: step started",
             extra={
@@ -3518,6 +4271,7 @@ class AgentLoop:
         await self.session_lock.acquire(ctx.session.session_id)
         timeout_seconds = self._resolve_step_timeout_seconds(ctx)
         try:
+            await self._load_session_todos(ctx)
             while True:
                 try:
                     return await asyncio.wait_for(
@@ -3549,7 +4303,17 @@ class AgentLoop:
                     pending_events.append(
                         SessionEvent(
                             type="lifecycle",
-                            data={"event": "system_notice", "message": notice},
+                            data=_system_notice_data(
+                                notice,
+                                kind="timeout_continuation",
+                                turn_id=ctx.turn_id,
+                                notice_id=(
+                                    f"timeout_continuation:{ctx.turn_id}:"
+                                    f"{ctx.timeout_continuation_count}"
+                                )
+                                if ctx.turn_id
+                                else None,
+                            ),
                         )
                     )
                     await self._emergency_flush_events(ctx, pending_events)
@@ -3576,13 +4340,24 @@ class AgentLoop:
             pending_events.append(
                 SessionEvent(
                     type="lifecycle",
-                    data={"event": "system_notice", "message": error_msg},
+                    data=_system_notice_data(
+                        error_msg,
+                        kind="step_timeout",
+                        turn_id=ctx.turn_id,
+                    ),
                 )
             )
             await self._emergency_flush_events(ctx, pending_events)
             STEPS_TOTAL.labels(step_type=ctx.step_definition.type, status="error").inc()
             return StepOutput(
                 summary="Step timed out",
+                metadata={
+                    "continuation_reason": STEP_TIMEOUT_CONTINUATION_REASON,
+                    "timeout_seconds": timeout_seconds,
+                    "pending_todos": _pending_todos_snapshot(ctx),
+                    "timeout_continuation_count": ctx.timeout_continuation_count,
+                    "max_timeout_continuations": ctx.max_timeout_continuations,
+                },
                 error=error_msg,
                 session_id=ctx.session.session_id,
                 intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
@@ -3611,10 +4386,11 @@ class AgentLoop:
             pending_events.append(
                 SessionEvent(
                     type="lifecycle",
-                    data={
-                        "event": "system_notice",
-                        "message": f"Step failed: {error_msg[:500]}",
-                    },
+                    data=_system_notice_data(
+                        f"Step failed: {error_msg[:500]}",
+                        kind="step_failure",
+                        turn_id=ctx.turn_id,
+                    ),
                 )
             )
             # Emergency flush: persist any accumulated events (including
@@ -3750,6 +4526,77 @@ class AgentLoop:
     # Child session execution
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _prepare_child_context_for_continuation(
+        child_ctx: StepContext, follow_up: ContinuationFollowUp
+    ) -> None:
+        """Reset per-turn child state before an automatic continuation run."""
+
+        if follow_up.reason == TOOL_CALL_CEILING_CONTINUATION_REASON:
+            boundary = "tool-call ceiling"
+        elif follow_up.reason == LLM_CYCLE_CEILING_CONTINUATION_REASON:
+            boundary = "LLM cycle ceiling"
+        else:
+            boundary = "automatic continuation boundary"
+        continuation_message = (
+            f"The previous delegated turn stopped after reaching the {boundary}. "
+            "Continue the delegated work from the recorded session history and saved tool "
+            "results. Do not restart the task or repeat completed tool work unless the "
+            "needed detail is unavailable. Review and update todos if appropriate, then "
+            "finish the delegated result."
+        )
+        child_ctx.follow_up = follow_up
+        child_ctx.is_retry = True
+        child_ctx.user_message = continuation_message
+        child_ctx.turn_id = None
+        child_ctx.pending_events = None
+        child_ctx.pending_tool_calls.clear()
+        child_ctx.loop_guard_state = LoopGuardState()
+        child_ctx.timeout_continuation_message = continuation_message
+        child_ctx.timeout_continuation_count = 0
+        child_ctx.projection_state = None
+        child_ctx.last_projection_snapshot = None
+        child_ctx.last_projection_exceeded_selected_budget = None
+        child_ctx.remember_user_event_seq = None
+        child_ctx.remember_assistant_event_seq = None
+
+    async def _record_parent_session_events(
+        self,
+        *,
+        parent_session: SessionModel | None,
+        parent_intaris_session_id: str,
+        events: list[SessionEvent],
+        idempotency_key: str | None,
+    ) -> None:
+        """Record events into a parent session's Intaris stream, cache-aware.
+
+        Direct Intaris writes that bypass the session cache create permanent
+        seq gaps: warm refresh fetches only ``after_seq=last_event_seq``, so a
+        seq recorded here and then jumped over by a later cache-known append
+        is never fetched again. Always pairing the write with a cache append
+        keeps the parent's cached history complete and ordered.
+        """
+        append_result = await self.providers.guardrails.record_events(
+            session_id=parent_intaris_session_id,
+            events=events,
+            source="cognis",
+            idempotency_key=idempotency_key,
+        )
+        if parent_session is None or not getattr(append_result, "ok", False):
+            return
+        try:
+            await self.session_cache.append_recorded_events(parent_session, events, append_result)
+        except Exception:
+            logger.warning(
+                "delegation: cache append failed after parent-session write",
+                extra={
+                    "extra_data": {
+                        "parent_intaris_session_id": parent_intaris_session_id,
+                    }
+                },
+                exc_info=True,
+            )
+
     async def _run_child_session(
         self,
         *,
@@ -3767,6 +4614,13 @@ class AgentLoop:
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
+        parent_tool_call_id: str | None = None,
+        parent_turn_id: str | None = None,
+        parent_assistant_phase_index: int | None = None,
+        parent_turn_cycle_index: int | None = None,
+        parent_session: SessionModel | None = None,
+        wait: bool | None = None,
+        delegation_started_at: str | None = None,
     ) -> StepOutput | None:
         """Run a delegated child session.
 
@@ -3784,6 +4638,16 @@ class AgentLoop:
         """
         conversation_id = conversation.conversation_id
         child_session_id = child_session.session_id
+        delegation_started_at = delegation_started_at or datetime.now(UTC).isoformat()
+
+        def _delegation_duration_ms() -> int | None:
+            with contextlib.suppress(ValueError):
+                started_at_dt = datetime.fromisoformat(delegation_started_at)
+                return max(
+                    0,
+                    int((datetime.now(UTC) - started_at_dt).total_seconds() * 1000),
+                )
+            return None
 
         output: StepOutput | None = None
         child_runtime: ResolvedStepRuntime | None = None
@@ -3832,14 +4696,12 @@ class AgentLoop:
             # delegation and user-defined primary-to-primary) keep the full
             # DELEGATION_POLICY so they retain identity, memory, and the
             # write_deliverable / step_complete requirement.
-            if controller_tool_surface == CONTROLLER_TOOL_SURFACE_DIRECT_CHAT:
+            if resolved_agent.agent_type == "secondary":
+                child_policy = SECONDARY_AGENT_DELEGATION_POLICY
+            elif controller_tool_surface == CONTROLLER_TOOL_SURFACE_DIRECT_CHAT:
                 child_policy = DIRECT_CHAT_DELEGATION_POLICY
             else:
-                child_policy = (
-                    SECONDARY_AGENT_DELEGATION_POLICY
-                    if resolved_agent.agent_type == "secondary"
-                    else DELEGATION_POLICY
-                )
+                child_policy = DELEGATION_POLICY
             child_ctx = StepContext(
                 step_definition=child_step,
                 session=child_session,
@@ -3874,12 +4736,58 @@ class AgentLoop:
                 effective_working_directory=working_directory,
                 access_context=child_access_context,
             ):
-                output = await self.run_step(
-                    child_ctx,
-                    on_token=on_token,
-                    on_tool_call=on_tool_call,
-                    on_tool_result=on_tool_result,
-                )
+                continuation_follow_up: ContinuationFollowUp | None = None
+                while True:
+                    output = await self.run_step(
+                        child_ctx,
+                        on_token=on_token,
+                        on_tool_call=on_tool_call,
+                        on_tool_result=on_tool_result,
+                    )
+                    metadata = (
+                        output.metadata if output and isinstance(output.metadata, dict) else {}
+                    )
+                    continuation_reason = metadata.get("continuation_reason")
+                    if continuation_reason not in {
+                        TOOL_CALL_CEILING_CONTINUATION_REASON,
+                        LLM_CYCLE_CEILING_CONTINUATION_REASON,
+                    }:
+                        break
+
+                    turn_ref = child_ctx.turn_id or child_session_id
+                    continuation_follow_up = build_automatic_continuation_follow_up(
+                        conversation_id=conversation_id,
+                        turn_id=turn_ref,
+                        reason=str(continuation_reason),
+                        metadata=metadata,
+                        prior_follow_up=continuation_follow_up,
+                    )
+                    if continuation_follow_up is None:
+                        raise RuntimeError(
+                            f"Delegation stopped after repeated automatic continuations ({continuation_reason}); "
+                            "partial work was preserved in the child session."
+                        )
+
+                    logger.info(
+                        "delegation: continuing child session after automatic continuation boundary",
+                        extra={
+                            "extra_data": {
+                                "child_session_id": child_session_id,
+                                "parent_session_id": parent_intaris_session_id,
+                                "reason": continuation_reason,
+                                "attempt": continuation_follow_up.attempt,
+                                "max_attempts": continuation_follow_up.max_attempts,
+                                "tool_call_count": metadata.get("tool_call_count"),
+                                "max_tool_calls": metadata.get("max_tool_calls"),
+                                "cycle_count": metadata.get("cycle_count"),
+                                "max_llm_cycles": metadata.get("max_llm_cycles"),
+                            }
+                        },
+                    )
+                    self._prepare_child_context_for_continuation(
+                        child_ctx,
+                        continuation_follow_up,
+                    )
                 if output is None or output.error is not None:
                     error_text = output.error if output and output.error else "no step output"
                     salvage_selection = await self._select_delegation_result_content(
@@ -3945,10 +4853,12 @@ class AgentLoop:
                     )
 
                 delegation_title = _delegation_title({"task": task_description})
+                duration_ms = _delegation_duration_ms()
                 # Record result in parent Intaris session — guarded
                 try:
-                    await self.providers.guardrails.record_events(
-                        session_id=parent_intaris_session_id,
+                    await self._record_parent_session_events(
+                        parent_session=parent_session,
+                        parent_intaris_session_id=parent_intaris_session_id,
                         events=with_session_events_turn_id(
                             [
                                 SessionEvent(
@@ -3960,6 +4870,13 @@ class AgentLoop:
                                         "title": delegation_title,
                                         "task_title": delegation_title,
                                         "input_redacted": True,
+                                        "call_id": parent_tool_call_id,
+                                        "turn_id": parent_turn_id,
+                                        "assistant_phase_index": parent_assistant_phase_index,
+                                        "turn_cycle_index": parent_turn_cycle_index,
+                                        "wait": wait,
+                                        "started_at": delegation_started_at,
+                                        "duration_ms": duration_ms,
                                         "agent_id": child_session.agent_id,
                                         "used_agent_id": child_session.agent_id,
                                         "result_summary": result_summary,
@@ -3997,6 +4914,13 @@ class AgentLoop:
                             "title": delegation_title,
                             "task_title": delegation_title,
                             "input_redacted": True,
+                            "call_id": parent_tool_call_id,
+                            "turn_id": parent_turn_id,
+                            "assistant_phase_index": parent_assistant_phase_index,
+                            "turn_cycle_index": parent_turn_cycle_index,
+                            "wait": wait,
+                            "started_at": delegation_started_at,
+                            "duration_ms": duration_ms,
                             "result_summary": result_summary,
                             "result_content": result_content,
                             "result_source": result_selection.source,
@@ -4019,6 +4943,7 @@ class AgentLoop:
         except asyncio.CancelledError:
             # Parent task was cancelled while waiting on a sync child session.
             # Mark the child cancelled so the DB row is not left active.
+            duration_ms = _delegation_duration_ms()
             logger.info(
                 "delegation: child session cancelled (parent cancellation)",
                 extra={
@@ -4037,8 +4962,9 @@ class AgentLoop:
                 logger.warning("delegation: failed to mark child session cancelled", exc_info=True)
 
             try:
-                await self.providers.guardrails.record_events(
-                    session_id=parent_intaris_session_id,
+                await self._record_parent_session_events(
+                    parent_session=parent_session,
+                    parent_intaris_session_id=parent_intaris_session_id,
                     events=with_session_events_turn_id(
                         [
                             SessionEvent(
@@ -4050,6 +4976,13 @@ class AgentLoop:
                                     "title": _delegation_title({"task": task_description}),
                                     "task_title": _delegation_title({"task": task_description}),
                                     "input_redacted": True,
+                                    "call_id": parent_tool_call_id,
+                                    "turn_id": parent_turn_id,
+                                    "assistant_phase_index": parent_assistant_phase_index,
+                                    "turn_cycle_index": parent_turn_cycle_index,
+                                    "wait": wait,
+                                    "started_at": delegation_started_at,
+                                    "duration_ms": duration_ms,
                                     "agent_id": child_session.agent_id,
                                     "used_agent_id": child_session.agent_id,
                                 },
@@ -4079,6 +5012,13 @@ class AgentLoop:
                         "title": _delegation_title({"task": task_description}),
                         "task_title": _delegation_title({"task": task_description}),
                         "input_redacted": True,
+                        "call_id": parent_tool_call_id,
+                        "turn_id": parent_turn_id,
+                        "assistant_phase_index": parent_assistant_phase_index,
+                        "turn_cycle_index": parent_turn_cycle_index,
+                        "wait": wait,
+                        "started_at": delegation_started_at,
+                        "duration_ms": duration_ms,
                         "reason": "Cancelled",
                     },
                 )
@@ -4088,6 +5028,7 @@ class AgentLoop:
         except Exception as exc:
             error_summary = f"{type(exc).__name__}: {str(exc)[:500]}"
             failed_summary = f"Delegation failed: {error_summary}"
+            duration_ms = _delegation_duration_ms()
             logger.exception(
                 "delegation: child session failed",
                 extra={
@@ -4107,8 +5048,9 @@ class AgentLoop:
                 logger.warning("delegation: failed to mark child session as failed", exc_info=True)
 
             try:
-                await self.providers.guardrails.record_events(
-                    session_id=parent_intaris_session_id,
+                await self._record_parent_session_events(
+                    parent_session=parent_session,
+                    parent_intaris_session_id=parent_intaris_session_id,
                     events=with_session_events_turn_id(
                         [
                             SessionEvent(
@@ -4120,6 +5062,13 @@ class AgentLoop:
                                     "title": _delegation_title({"task": task_description}),
                                     "task_title": _delegation_title({"task": task_description}),
                                     "input_redacted": True,
+                                    "call_id": parent_tool_call_id,
+                                    "turn_id": parent_turn_id,
+                                    "assistant_phase_index": parent_assistant_phase_index,
+                                    "turn_cycle_index": parent_turn_cycle_index,
+                                    "wait": wait,
+                                    "started_at": delegation_started_at,
+                                    "duration_ms": duration_ms,
                                     "agent_id": child_session.agent_id,
                                     "used_agent_id": child_session.agent_id,
                                     "error": error_summary,
@@ -4177,6 +5126,13 @@ class AgentLoop:
                         "title": _delegation_title({"task": task_description}),
                         "task_title": _delegation_title({"task": task_description}),
                         "input_redacted": True,
+                        "call_id": parent_tool_call_id,
+                        "turn_id": parent_turn_id,
+                        "assistant_phase_index": parent_assistant_phase_index,
+                        "turn_cycle_index": parent_turn_cycle_index,
+                        "wait": wait,
+                        "started_at": delegation_started_at,
+                        "duration_ms": duration_ms,
                         "reason": error_summary,
                         "recoverable": True,
                     },
@@ -4500,6 +5456,13 @@ class AgentLoop:
         working_directory_explicit: bool = False,
         deliverable_step_run_id: str | None = None,
         controller_tool_surface: str = CONTROLLER_TOOL_SURFACE_WORKFLOW,
+        parent_tool_call_id: str | None = None,
+        parent_turn_id: str | None = None,
+        parent_assistant_phase_index: int | None = None,
+        parent_turn_cycle_index: int | None = None,
+        parent_session: SessionModel | None = None,
+        wait: bool | None = None,
+        delegation_started_at: str | None = None,
     ) -> None:
         """Async wrapper for _run_child_session that triggers follow-up turns.
 
@@ -4511,6 +5474,49 @@ class AgentLoop:
         child_session_id = child_session.session_id
         conversation_id = conversation.conversation_id
         child_tool_call_count = 0
+        child_seen_tool_calls: set[str] = set()
+        delegation_started_at = delegation_started_at or datetime.now(UTC).isoformat()
+
+        async def _publish_child_progress(
+            *,
+            tool_call_count: int,
+            last_tool: str | None = None,
+            todos: list[dict[str, Any]] | None = None,
+        ) -> None:
+            await self.event_bus.publish(
+                Event(
+                    type=EventType.DELEGATION_PROGRESS,
+                    data={
+                        "conversation_id": conversation_id,
+                        "parent_session_id": parent_session_id,
+                        "child_session_id": child_session_id,
+                        "call_id": parent_tool_call_id,
+                        "turn_id": parent_turn_id,
+                        "assistant_phase_index": parent_assistant_phase_index,
+                        "turn_cycle_index": parent_turn_cycle_index,
+                        "wait": wait,
+                        "started_at": delegation_started_at,
+                        "status": "running",
+                        "tool_call_count": tool_call_count,
+                        "last_tool": last_tool,
+                        "todos": todos or [],
+                    },
+                )
+            )
+
+        async def _child_tool_call_callback(
+            tool_name: str,
+            call_id: str,
+            _arguments: dict[str, Any],
+        ) -> None:
+            nonlocal child_tool_call_count
+            if call_id not in child_seen_tool_calls:
+                child_seen_tool_calls.add(call_id)
+                child_tool_call_count += 1
+            await _publish_child_progress(
+                tool_call_count=child_tool_call_count,
+                last_tool=tool_name,
+            )
 
         async def _child_progress_callback(
             call_id: str,
@@ -4519,7 +5525,9 @@ class AgentLoop:
             **_kw: Any,
         ) -> None:
             nonlocal child_tool_call_count
-            child_tool_call_count += 1
+            if call_id not in child_seen_tool_calls:
+                child_seen_tool_calls.add(call_id)
+                child_tool_call_count += 1
             progress_todos: list[dict[str, Any]] = []
             result_content = _rest[0] if _rest and isinstance(_rest[0], str) else None
             if tool_name in {STEP_TODO_WRITE, STEP_TODO_LIST} and result_content:
@@ -4536,17 +5544,10 @@ class AgentLoop:
                 or tool_name in {STEP_TODO_WRITE, STEP_TODO_LIST}
             )
             if progress_due or progress_todos:
-                await self.event_bus.publish(
-                    Event(
-                        type=EventType.DELEGATION_PROGRESS,
-                        data={
-                            "conversation_id": conversation_id,
-                            "child_session_id": child_session_id,
-                            "tool_call_count": child_tool_call_count,
-                            "last_tool": tool_name,
-                            "todos": progress_todos,
-                        },
-                    )
+                await _publish_child_progress(
+                    tool_call_count=child_tool_call_count,
+                    last_tool=tool_name,
+                    todos=progress_todos,
                 )
 
         try:
@@ -4562,7 +5563,15 @@ class AgentLoop:
                 working_directory_explicit=working_directory_explicit,
                 deliverable_step_run_id=deliverable_step_run_id,
                 controller_tool_surface=controller_tool_surface,
+                on_tool_call=_child_tool_call_callback,
                 on_tool_result=_child_progress_callback,
+                parent_tool_call_id=parent_tool_call_id,
+                parent_turn_id=parent_turn_id,
+                parent_assistant_phase_index=parent_assistant_phase_index,
+                parent_turn_cycle_index=parent_turn_cycle_index,
+                parent_session=parent_session,
+                wait=wait,
+                delegation_started_at=delegation_started_at,
             )
             status = "completed" if output else "failed"
             result_summary = output.summary if output else None
@@ -4654,8 +5663,12 @@ class AgentLoop:
         # that re-enters _execute_step increments ctx.compaction_recursion_depth.
         # When the cap is exceeded we surface a classified failure rather than
         # looping indefinitely.
+        refresh_compaction_settings = getattr(self.compaction_strategy, "refresh_settings", None)
+        if callable(refresh_compaction_settings):
+            await refresh_compaction_settings()
         _max_compaction_recursion = int(getattr(self.compaction_strategy, "max_recursion", 2) or 2)
         if ctx.compaction_recursion_depth >= _max_compaction_recursion:
+            self._set_auto_compaction_cooldown(ctx.session.session_id)
             notice = (
                 "Compaction is not reducing context further; this conversation may need "
                 "to be split. Try /new or rephrase the request."
@@ -4742,58 +5755,57 @@ class AgentLoop:
                 # recording of evaluation feedback failed, deliver it inline.
                 if ctx.timeout_continuation_message:
                     effective_user_message = ctx.timeout_continuation_message
-                    retry_reason = None
                 else:
                     retry_reason = getattr(ctx.workflow_state, "last_retry_reason", None)
-                deliverable_step_run_id = self._deliverable_owner_step_run_id(ctx)
-                if retry_reason == "execution_failed":
-                    effective_user_message = (
-                        "The previous attempt ended before producing a final response. "
-                        "Its recorded tool calls and results are still in the session "
-                        "history. Continue from that evidence; do not restart the step "
-                        "or re-read files unless the needed detail is unavailable. If a "
-                        "prior tool result is truncated or cleared, prefer "
-                        "read_tool_output/search_tool_output with the recorded call_id. "
-                        "When done, call step_complete."
-                    )
-                elif ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
-                    if self._deliverable_owner_step_run_id(ctx) is not None:
+                    deliverable_step_run_id = self._deliverable_owner_step_run_id(ctx)
+                    if retry_reason == "execution_failed":
                         effective_user_message = (
-                            "The evaluator has reviewed your previous attempt and "
-                            "requested revisions:\n\n"
-                            f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
-                            "Please revise your work based on this feedback. "
-                            "When done, write_deliverable with the updated artifact "
-                            "and then call step_complete."
+                            "The previous attempt ended before producing a final response. "
+                            "Its recorded tool calls and results are still in the session "
+                            "history. Continue from that evidence; do not restart the step "
+                            "or re-read files unless the needed detail is unavailable. If a "
+                            "prior tool result is truncated or cleared, prefer "
+                            "read_tool_output/search_tool_output with the recorded call_id. "
+                            "When done, call step_complete."
                         )
+                    elif ctx.workflow_state and ctx.workflow_state.last_evaluation_feedback:
+                        if self._deliverable_owner_step_run_id(ctx) is not None:
+                            effective_user_message = (
+                                "The evaluator has reviewed your previous attempt and "
+                                "requested revisions:\n\n"
+                                f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
+                                "Please revise your work based on this feedback. "
+                                "When done, write_deliverable with the updated artifact "
+                                "and then call step_complete."
+                            )
+                        else:
+                            effective_user_message = (
+                                "The evaluator has reviewed your previous attempt and "
+                                "requested revisions:\n\n"
+                                f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
+                                "Please revise your work based on this feedback. "
+                                "When done, return the updated result as a normal assistant "
+                                "message and then call step_complete."
+                            )
                     else:
-                        effective_user_message = (
-                            "The evaluator has reviewed your previous attempt and "
-                            "requested revisions:\n\n"
-                            f"{ctx.workflow_state.last_evaluation_feedback}\n\n"
-                            "Please revise your work based on this feedback. "
-                            "When done, return the updated result as a normal assistant "
-                            "message and then call step_complete."
-                        )
-                else:
-                    # Feedback was recorded to Intaris — it's already in the
-                    # session history.  Send a minimal revision directive.
-                    if deliverable_step_run_id is not None:
-                        effective_user_message = (
-                            "The evaluator has reviewed your previous attempt and "
-                            "requested revisions. Review the evaluation feedback "
-                            "above and revise your work accordingly. When done, "
-                            "write_deliverable with the updated artifact and then call "
-                            "step_complete."
-                        )
-                    else:
-                        effective_user_message = (
-                            "The evaluator has reviewed your previous attempt and "
-                            "requested revisions. Review the evaluation feedback "
-                            "above and revise your work accordingly. When done, "
-                            "return the updated result as a normal assistant message and "
-                            "then call step_complete."
-                        )
+                        # Feedback was recorded to Intaris — it's already in the
+                        # session history.  Send a minimal revision directive.
+                        if deliverable_step_run_id is not None:
+                            effective_user_message = (
+                                "The evaluator has reviewed your previous attempt and "
+                                "requested revisions. Review the evaluation feedback "
+                                "above and revise your work accordingly. When done, "
+                                "write_deliverable with the updated artifact and then call "
+                                "step_complete."
+                            )
+                        else:
+                            effective_user_message = (
+                                "The evaluator has reviewed your previous attempt and "
+                                "requested revisions. Review the evaluation feedback "
+                                "above and revise your work accordingly. When done, "
+                                "return the updated result as a normal assistant message and "
+                                "then call step_complete."
+                            )
             else:
                 # First attempt — build the full rich prompt with task context
                 # and prior step outputs.
@@ -4837,6 +5849,7 @@ class AgentLoop:
                     "content_type": "text",
                     "source": recorded_user_source,
                     "turn_id": ctx.turn_id,
+                    "client_message_id": ctx.client_message_id,
                     "chat_mode": ctx.chat_mode.mode if ctx.chat_mode else "default",
                     "chat_mode_source": ctx.chat_mode.source if ctx.chat_mode else "system_default",
                     "hash": hashlib.sha256(
@@ -4878,7 +5891,7 @@ class AgentLoop:
                         reasoning_result.intention,
                         updated_at=reasoning_result.updated_at,
                     )
-                    if updated and reasoning_result.title:
+                    if updated and reasoning_result.title and not _is_delegated_child_context(ctx):
                         try:
                             async with self.session_manager.session_factory() as db_session:
                                 ok = await sync_intaris_title(
@@ -4925,10 +5938,6 @@ class AgentLoop:
             _prompt_ctx = PromptContext.TASK_STEP
         elif ctx.policy is DELEGATION_POLICY or ctx.policy is SECONDARY_AGENT_DELEGATION_POLICY:
             _prompt_ctx = PromptContext.DELEGATION
-        elif ctx.follow_up is not None and ctx.follow_up.mode is FollowUpMode.INTEGRATE:
-            _prompt_ctx = PromptContext.FOLLOW_UP_INTEGRATE
-        elif ctx.follow_up is not None:
-            _prompt_ctx = PromptContext.FOLLOW_UP_NOTIFY
         else:
             _prompt_ctx = PromptContext.CHAT
 
@@ -5008,6 +6017,11 @@ class AgentLoop:
                 ),
                 disabled_artifact_urls=set(ctx.runtime_info.get("disabled_artifact_urls", [])),
                 disabled_artifact_ids=set(ctx.runtime_info.get("disabled_artifact_ids", [])),
+                tool_schema_tokens_override=(
+                    (self.session_cache.get_tool_runtime_info(ctx.session.session_id) or {}).get(
+                        "tool_schema_tokens"
+                    )
+                ),
             )
         except ImmutablePrefixUnavailable:
             await self._record_system_notice_audit(
@@ -5078,7 +6092,21 @@ class AgentLoop:
         # Capture cache breakpoint for prompt caching (Anthropic cache_control)
         cache_breakpoint = getattr(context_result, "cache_breakpoint_index", None)
 
-        if _should_run_pre_turn_auto_compaction(ctx, context_result):
+        auto_compaction_cooldown_remaining = self._auto_compaction_cooldown_remaining_for_turn(ctx)
+        if auto_compaction_cooldown_remaining > 0 and _should_run_pre_turn_auto_compaction(
+            ctx, context_result
+        ):
+            logger.info(
+                "agent: pre-turn compaction skipped during recursion cooldown",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
+                        "cooldown_turns_remaining": auto_compaction_cooldown_remaining,
+                    }
+                },
+            )
+        elif _should_run_pre_turn_auto_compaction(ctx, context_result):
             compaction_run = CompactionRunContext.from_context_result(
                 context_result,
                 trigger="pre_turn_auto",
@@ -5240,6 +6268,10 @@ class AgentLoop:
         idle_timeout_continuation_count = 0
         max_idle_timeout_continuations = _IDLE_TIMEOUT_CONTINUATION_MAX_ATTEMPTS
         saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
+        # True when a failed stream attempt already emitted visible text to
+        # clients; the retried stream then needs a leading separator because
+        # the partial is dropped server-side but remains on screen live.
+        mid_stream_partial_streamed = False
         promoted_tool_ids = self._get_initial_promoted_tool_ids(ctx)
         activated_tool_ids = self._get_initial_activated_tool_ids(ctx)
         queued_discovery_guidance_mode: ToolDiscoveryMode | None = None
@@ -5252,8 +6284,11 @@ class AgentLoop:
         last_cycle_end_at: float | None = None
         workflow_step_reminder_added = False
         background_work_reminder_added = False
-        queued_edit_guidance: str | None = None
-        edit_guidance_message_index: int | None = None
+        todos_reminder_seeded = False
+        queued_edit_guidance_signature: str | None = None
+        non_primary_reminder_signature: str | None = None
+        background_shell_reminder_signature: str | None = None
+        context_pressure_thresholds_emitted: set[int] = set()
 
         # Seed per-turn projection state from the cross-turn assembly result.
         # This initialises committed_preservations so the first within-turn
@@ -5298,6 +6333,40 @@ class AgentLoop:
         while True:
             self._raise_if_cancelled(ctx)
             agentic_step_count += 1
+            ctx.current_turn_cycle_index = agentic_step_count - 1
+            if agentic_step_count > _MAX_LLM_CYCLES_PER_TURN:
+                events_to_record.append(
+                    SessionEvent(
+                        type="lifecycle",
+                        data={
+                            "event": "llm_cycle_ceiling_reached",
+                            "cycle_count": agentic_step_count - 1,
+                            "max_llm_cycles": _MAX_LLM_CYCLES_PER_TURN,
+                            "step_name": ctx.step_definition.name,
+                        },
+                    )
+                )
+                await self._flush_events_incremental(
+                    ctx,
+                    events_to_record,
+                    reason=LLM_CYCLE_CEILING_CONTINUATION_REASON,
+                    on_token=on_token,
+                )
+                return StepOutput(
+                    summary=(
+                        f"LLM cycle ceiling reached ({_MAX_LLM_CYCLES_PER_TURN}); "
+                        "turn requires continuation."
+                    ),
+                    content="\n\n".join(assistant_content_parts),
+                    metadata={
+                        "interrupted": True,
+                        "continuation_reason": LLM_CYCLE_CEILING_CONTINUATION_REASON,
+                        "cycle_count": agentic_step_count - 1,
+                        "max_llm_cycles": _MAX_LLM_CYCLES_PER_TURN,
+                        "pending_todos": _pending_todos_snapshot(ctx),
+                    },
+                    attachments=list(collected_attachments),
+                )
             cycle_started_at = monotonic()
             cycle_step_type = _agent_loop_step_type(ctx)
             if last_cycle_end_at is not None:
@@ -5326,6 +6395,21 @@ class AgentLoop:
                     messages.append(workflow_step_reminder)
                 workflow_step_reminder_added = True
 
+            if not todos_reminder_seeded:
+                current_todos_reminder = _current_todos_reminder(ctx.todos or [])
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": current_todos_reminder
+                        or (
+                            "Current session TODOs are empty. Do not infer active TODOs "
+                            "from older transcript tool results."
+                        ),
+                        "_todos_reminder": True,
+                    }
+                )
+                todos_reminder_seeded = True
+
             # Stage 36: non-primary active executor reminder. Injected on every
             # LLM turn while the active executor is in the agent's *additional*
             # set. Primaries are by definition legitimate hosts and need no
@@ -5333,11 +6417,58 @@ class AgentLoop:
             # via the standard internal-fields prefix convention.
             non_primary_reminder = self._build_non_primary_active_reminder(ctx)
             if non_primary_reminder is not None:
-                messages.append(non_primary_reminder)
+                reminder_content = str(non_primary_reminder.get("content") or "")
+                reminder_signature = _reminder_signature(reminder_content)
+                if reminder_signature != non_primary_reminder_signature:
+                    reminder_message = dict(non_primary_reminder)
+                    reminder_message["_non_primary_executor_reminder"] = True
+                    reminder_message["content"] = _superseding_reminder_content(
+                        reminder_content,
+                        superseding=non_primary_reminder_signature is not None,
+                    )
+                    messages.append(reminder_message)
+                    non_primary_reminder_signature = reminder_signature
+            elif non_primary_reminder_signature is not None:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "(supersedes earlier reminder)\n"
+                            "Active executor is back on a primary executor; no non-primary executor reminder applies."
+                        ),
+                        "_non_primary_executor_reminder": True,
+                    }
+                )
+                non_primary_reminder_signature = None
 
             background_shell_reminder = await self._build_background_shell_status_reminder(ctx)
             if background_shell_reminder is not None:
-                messages.append(background_shell_reminder)
+                reminder_content = str(background_shell_reminder.get("content") or "")
+                reminder_signature = _reminder_signature(
+                    reminder_content,
+                    ignore_elapsed_fields=True,
+                )
+                if reminder_signature != background_shell_reminder_signature:
+                    reminder_message = dict(background_shell_reminder)
+                    reminder_message["_background_shell_reminder"] = True
+                    reminder_message["content"] = _superseding_reminder_content(
+                        reminder_content,
+                        superseding=background_shell_reminder_signature is not None,
+                    )
+                    messages.append(reminder_message)
+                    background_shell_reminder_signature = reminder_signature
+            elif background_shell_reminder_signature is not None:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "(supersedes earlier reminder)\n"
+                            "No tracked background shell jobs currently need status attention."
+                        ),
+                        "_background_shell_reminder": True,
+                    }
+                )
+                background_shell_reminder_signature = None
 
             if not background_work_reminder_added:
                 background_work_reminder = await self._build_background_work_status_reminder(ctx)
@@ -5371,13 +6502,25 @@ class AgentLoop:
 
             # Resolve model and reasoning effort for this turn.
             # Chain: session override → agent profile → agent config → provider default.
-            model_for_llm = self.session_cache.get_model_override(ctx.session.session_id) or (
-                resolved_agent_profile.model
-                or (ctx.agent.llm_config.model if ctx.agent.llm_config else None)
+            model_override = self.session_cache.get_model_override(ctx.session.session_id)
+            get_model_override_provider_id = getattr(
+                self.session_cache, "get_model_override_provider_id", None
             )
-            provider_for_llm = resolved_agent_profile.provider_id or (
-                ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
+            model_override_provider_id = (
+                get_model_override_provider_id(ctx.session.session_id)
+                if callable(get_model_override_provider_id)
+                else None
             )
+            if model_override:
+                model_for_llm = model_override
+                provider_for_llm = model_override_provider_id
+            else:
+                model_for_llm = resolved_agent_profile.model or (
+                    ctx.agent.llm_config.model if ctx.agent.llm_config else None
+                )
+                provider_for_llm = resolved_agent_profile.provider_id or (
+                    ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
+                )
 
             reasoning_effort = (
                 self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
@@ -5547,6 +6690,7 @@ class AgentLoop:
                 promoted_tool_ids=promoted_tool_ids,
                 default_visible_tool_ids=default_visible_tool_ids,
                 allow_tool_search=allow_tool_search,
+                anthropic_cache_ttl=self.default_anthropic_cache_ttl,
             )
             if controller_tool_exposure.alias_map:
                 exposure.alias_map.update(controller_tool_exposure.alias_map)
@@ -5579,6 +6723,11 @@ class AgentLoop:
                 ),
                 "inventory_tool_count": exposure.debug_metadata.get("inventory_tool_count"),
                 "visible_tool_count": exposure.debug_metadata.get("visible_tool_count"),
+                "tool_schema_tokens": sum(
+                    len(json.dumps(schema, default=str)) // 4
+                    for schema in exposure.tools
+                    if isinstance(schema, dict)
+                ),
                 "policy_visible_count": exposure.debug_metadata.get("policy_visible_count"),
                 "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
                 "promoted_requested_count": exposure.debug_metadata.get("promoted_requested_count"),
@@ -5673,27 +6822,36 @@ class AgentLoop:
                 visible_tool_names,
                 model_id=current_model,
             )
-            if edit_guidance is None and edit_guidance_message_index is not None:
+            if edit_guidance is None and queued_edit_guidance_signature is not None:
                 edit_guidance = (
                     "Turn-local edit guidance: no dedicated edit tools are currently visible. "
                     "Do not call `apply_patch`, `edit`, `multiedit`, or `write` unless one becomes "
                     "visible in a later turn."
                 )
-            if edit_guidance is not None and edit_guidance != queued_edit_guidance:
-                if edit_guidance_message_index is None:
-                    edit_guidance_message_index = len(messages)
-                    messages.append({"role": "system", "content": edit_guidance})
-                else:
-                    messages[edit_guidance_message_index] = {
+            if edit_guidance is not None:
+                edit_guidance_signature = _reminder_signature(edit_guidance)
+            else:
+                edit_guidance_signature = None
+            if (
+                edit_guidance is not None
+                and edit_guidance_signature != queued_edit_guidance_signature
+            ):
+                messages.append(
+                    {
                         "role": "system",
-                        "content": edit_guidance,
+                        "content": _superseding_reminder_content(
+                            edit_guidance,
+                            superseding=queued_edit_guidance_signature is not None,
+                        ),
+                        "_edit_guidance_reminder": True,
                     }
+                )
                 _queue_audit_message(
                     role="developer",
                     source="edit_tool_guidance",
                     content=edit_guidance,
                 )
-                queued_edit_guidance = edit_guidance
+                queued_edit_guidance_signature = edit_guidance_signature
             logger.debug(
                 "Prepared tool exposure",
                 extra={
@@ -5716,12 +6874,37 @@ class AgentLoop:
                     tool_schemas=exposure.tools,
                     resolved_model=current_model,
                     max_context_tokens=context_result.max_context_tokens,
+                    cache_breakpoint_index=cache_breakpoint,
+                    anthropic_cache_ttl=self.default_anthropic_cache_ttl,
                 )
             model_messages = projected_model.messages
             if str(exposure_contract.llm_api).strip().lower() == "responses":
                 model_messages = _reattach_responses_output_items(model_messages, messages)
+            else:
+                model_messages = _reattach_anthropic_thinking_blocks(model_messages, messages)
             pre_call_snapshot = projected_model.snapshot
-            self._store_context_usage_snapshot(
+            if pre_call_snapshot is not None and pre_call_snapshot.available_prompt_tokens > 0:
+                context_used_percent = round(
+                    (pre_call_snapshot.prompt_tokens / pre_call_snapshot.available_prompt_tokens)
+                    * 100
+                )
+                for threshold in (70, 85):
+                    if (
+                        context_used_percent >= threshold
+                        and threshold not in context_pressure_thresholds_emitted
+                    ):
+                        pressure_message = {
+                            "role": "system",
+                            "content": (
+                                f"Context is {context_used_percent}% used; prioritize consolidating "
+                                "findings, updating todos, and writing deliverables over further broad exploration."
+                            ),
+                            "_context_pressure_reminder": True,
+                        }
+                        messages.append(pressure_message)
+                        model_messages.append(pressure_message)
+                        context_pressure_thresholds_emitted.add(threshold)
+            await self._store_context_usage_snapshot(
                 ctx,
                 snapshot=pre_call_snapshot,
                 provider_id=current_provider_id,
@@ -5738,7 +6921,7 @@ class AgentLoop:
             ctx.last_projection_exceeded_selected_budget = (
                 pre_call_projection_exceeded if pre_call_snapshot is not None else None
             )
-            if pre_call_projection_exceeded:
+            if pre_call_projection_exceeded and pre_call_snapshot is not None:
                 pressure_run = CompactionRunContext.from_snapshot(
                     pre_call_snapshot,
                     trigger="pre_model_pressure",
@@ -5777,6 +6960,12 @@ class AgentLoop:
                 )
                 if ctx.policy.enable_auto_compaction:
                     pressure_run.phase = "pre_model"
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="pre_model_context_pressure",
+                        on_token=on_token,
+                    )
                     compaction_result = await self._auto_compact(
                         ctx,
                         run=pressure_run,
@@ -5870,10 +7059,14 @@ class AgentLoop:
             # Multiple assistant_message segments can be produced within a single turn
             # (for example after tool calls or reprompts). The live WebSocket stream
             # reuses one message_id for the whole turn, so inject a paragraph break
-            # before the first token of each later visible segment.
+            # before the first token of each later visible segment. A mid-stream
+            # retry drops the failed attempt's partial text server-side, but the
+            # partial was already streamed to clients — separate the retried
+            # stream from it too.
             needs_stream_separator = (
                 bool(assistant_content_parts) and not continued_assistant_content
-            )
+            ) or mid_stream_partial_streamed
+            mid_stream_partial_streamed = False
             await self._record_outgoing_audit_messages(
                 ctx,
                 pending_audit_messages,
@@ -5901,6 +7094,8 @@ class AgentLoop:
                 # In force-summary mode (delegation budget exhausted) strip all
                 # executor tools so the model can only write a text response.
                 _effective_tools = [] if _force_summary_mode else exposure.tools
+                llm_call_kwargs = dict(llm_kwargs)
+                llm_call_kwargs["max_retries"] = 0
                 stream = self.providers.llm.stream_generate(
                     model_messages,
                     model=model_for_llm,
@@ -5910,9 +7105,9 @@ class AgentLoop:
                     cognis_llm_request_id=llm_request_id,
                     cognis_session_id=ctx.session.session_id,
                     tools=_effective_tools,
-                    cache_breakpoint_index=cache_breakpoint,
+                    cache_breakpoint_index=projected_model.cache_breakpoints,
                     cognis_openai_apply_patch_tool_type=exposure_contract.native_apply_patch_tool_type,
-                    **llm_kwargs,
+                    **llm_call_kwargs,
                 )
                 async for chunk in _iterate_llm_stream_with_idle_timeout(
                     stream,
@@ -5952,25 +7147,29 @@ class AgentLoop:
                     text_delta = accumulator.feed(chunk)
                     if text_delta and on_token:
                         if needs_stream_separator:
-                            await on_token("\n\n")
+                            await _emit_token(on_token, "\n\n", ctx.current_turn_cycle_index)
                             needs_stream_separator = False
-                            await on_token(text_delta)
+                            await _emit_token(on_token, text_delta, ctx.current_turn_cycle_index)
                         else:
-                            await on_token(text_delta)
+                            await _emit_token(on_token, text_delta, ctx.current_turn_cycle_index)
                     # Drain thinking events accumulated during this chunk
                     if on_thinking:
                         for thinking_evt in accumulator.pop_thinking_events():
-                            await on_thinking(
-                                thinking_evt.block_id,
-                                thinking_evt.delta,
-                                thinking_evt.title,
-                                thinking_evt.complete,
-                                thinking_evt.content,
-                                thinking_evt.started_at,
-                                thinking_evt.completed_at,
-                                thinking_evt.duration_ms,
-                                thinking_evt.source,
-                                thinking_evt.provider_block_index,
+                            await _emit_with_optional_trailing_arg(
+                                on_thinking,
+                                (
+                                    thinking_evt.block_id,
+                                    thinking_evt.delta,
+                                    thinking_evt.title,
+                                    thinking_evt.complete,
+                                    thinking_evt.content,
+                                    thinking_evt.started_at,
+                                    thinking_evt.completed_at,
+                                    thinking_evt.duration_ms,
+                                    thinking_evt.source,
+                                    thinking_evt.provider_block_index,
+                                ),
+                                ctx.current_turn_cycle_index,
                             )
                     if ctx.on_tool_progress is not None:
                         for progress_evt in accumulator.pop_tool_progress_events():
@@ -6044,6 +7243,8 @@ class AgentLoop:
                         on_tool_call=on_tool_call,
                         on_tool_result=on_tool_result,
                     )
+                    if step_output.metadata.get("finalized_by_recovery"):
+                        ctx.finalized_by_recovery = True
                     break
                 llm_status = "provider_error"
                 mid_stream_error = f"{type(exc).__name__}: {exc}"
@@ -6081,6 +7282,8 @@ class AgentLoop:
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 )
+                if step_output.metadata.get("finalized_by_recovery"):
+                    ctx.finalized_by_recovery = True
                 break
             except Exception as exc:
                 if not is_context_overflow_error(exc):
@@ -6100,6 +7303,8 @@ class AgentLoop:
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 )
+                if step_output.metadata.get("finalized_by_recovery"):
+                    ctx.finalized_by_recovery = True
                 break
 
             llm_finished_at = monotonic()
@@ -6150,6 +7355,27 @@ class AgentLoop:
                 artifact_fetch_failures = _artifact_failures_from_error_payload(
                     mid_stream_error_details
                 ) or _artifact_failures_from_provider_fetch_error(mid_stream_error)
+                if (
+                    _mid_stream_reason_class(mid_stream_error_details)
+                    == MidStreamErrorCategory.ATTACHMENT_INPUT.value
+                ):
+                    payload_artifact_ids = {
+                        failure.artifact_id
+                        for failure in artifact_fetch_failures
+                        if failure.artifact_id
+                    }
+                    message_failures = _native_image_failures_from_messages(
+                        messages,
+                        artifact_ids=payload_artifact_ids or None,
+                    )
+                    existing = {
+                        (failure.url, failure.artifact_id) for failure in artifact_fetch_failures
+                    }
+                    artifact_fetch_failures.extend(
+                        failure
+                        for failure in message_failures
+                        if (failure.url, failure.artifact_id) not in existing
+                    )
                 if artifact_fetch_failures:
                     transcript_mutated_for_retry = True
                     artifact_fetch_failure_urls = {
@@ -6191,6 +7417,18 @@ class AgentLoop:
                         None if transcript_mutated_for_retry else projected_model
                     )
                     saved_partial_tool_calls = accumulator.clone_tool_call_state()
+                    if accumulator.get_content():
+                        mid_stream_partial_streamed = True
+                    # Discard the failed attempt's incomplete live thinking
+                    # blocks: the retried attempt streams NEW block ids, so
+                    # runtime snapshots would otherwise carry both attempts'
+                    # blocks (duplicated, unordered thinking live; absent on
+                    # reload) until turn teardown.
+                    if hasattr(self.session_cache, "discard_incomplete_active_thinking"):
+                        with contextlib.suppress(Exception):
+                            self.session_cache.discard_incomplete_active_thinking(
+                                ctx.session.session_id
+                            )
                     mid_stream_retries += 1
                     reason_class = _mid_stream_reason_class(mid_stream_error_details, "other")
                     retry_after_seconds = _mid_stream_retry_after_seconds(mid_stream_error_details)
@@ -6299,7 +7537,8 @@ class AgentLoop:
                         }
                     },
                 )
-                is_idle_timeout_failure = _is_llm_idle_timeout_error(mid_stream_error)
+                reason_class = _mid_stream_reason_class(mid_stream_error_details, "other")
+                is_idle_timeout_failure = reason_class.startswith("idle_timeout")
                 continuation_count = (
                     idle_timeout_continuation_count
                     if is_idle_timeout_failure
@@ -6323,7 +7562,6 @@ class AgentLoop:
                     else:
                         model_error_continuation_count += 1
                         continuation_count = model_error_continuation_count
-                    reason_class = _mid_stream_reason_class(mid_stream_error_details, "other")
                     continuation_notice = (
                         "Model stream failed after saved work. Cognis preserved the work "
                         "and is continuing from the saved state."
@@ -6390,7 +7628,7 @@ class AgentLoop:
                     mid_stream_retries = 0
                     saved_partial_tool_calls = None
                     continue
-                if _is_llm_idle_timeout_error(mid_stream_error):
+                if is_idle_timeout_failure:
                     error_notice = (
                         "Turn failed: the model did not produce output for "
                         f"{llm_stream_idle_timeout_seconds} seconds after "
@@ -6405,7 +7643,11 @@ class AgentLoop:
                 events_to_record.append(
                     SessionEvent(
                         type="lifecycle",
-                        data={"event": "system_notice", "message": error_notice},
+                        data=_system_notice_data(
+                            error_notice,
+                            kind="model_error",
+                            turn_id=ctx.turn_id,
+                        ),
                     )
                 )
                 if events_to_record:
@@ -6433,20 +7675,37 @@ class AgentLoop:
             # Drain any remaining thinking events (e.g. the final close event)
             if on_thinking:
                 for thinking_evt in accumulator.pop_thinking_events():
-                    await on_thinking(
-                        thinking_evt.block_id,
-                        thinking_evt.delta,
-                        thinking_evt.title,
-                        thinking_evt.complete,
-                        thinking_evt.content,
-                        thinking_evt.started_at,
-                        thinking_evt.completed_at,
-                        thinking_evt.duration_ms,
-                        thinking_evt.source,
-                        thinking_evt.provider_block_index,
+                    await _emit_with_optional_trailing_arg(
+                        on_thinking,
+                        (
+                            thinking_evt.block_id,
+                            thinking_evt.delta,
+                            thinking_evt.title,
+                            thinking_evt.complete,
+                            thinking_evt.content,
+                            thinking_evt.started_at,
+                            thinking_evt.completed_at,
+                            thinking_evt.duration_ms,
+                            thinking_evt.source,
+                            thinking_evt.provider_block_index,
+                        ),
+                        ctx.current_turn_cycle_index,
                     )
             # Record completed thinking blocks to Intaris
             if completed_thinking_blocks and mid_stream_error is None:
+                # Stamp the current assistant phase on every persisted thinking
+                # block. Blocks completed in this loop iteration share the phase
+                # of the assistant message recorded alongside them. The canonical
+                # projector keys thinking item ids on this phase, so persisting
+                # it (default 0) keeps the canonical id byte-identical to the
+                # runtime overlay id (thinking:{message_id}:phase:{phase}:{block_id}).
+                # Without it the canonical id omitted :phase: and never merged
+                # with the runtime per-block item, duplicating on refresh.
+                thinking_phase = (
+                    ctx.get_current_assistant_phase()
+                    if ctx.get_current_assistant_phase is not None
+                    else 0
+                )
                 for block in completed_thinking_blocks:
                     if block.content_parts:  # skip empty blocks
                         events_to_record.append(
@@ -6465,6 +7724,8 @@ class AgentLoop:
                                     else None,
                                     "duration_ms": block.duration_ms,
                                     "turn_id": ctx.turn_id,
+                                    "assistant_phase_index": thinking_phase,
+                                    "turn_cycle_index": ctx.current_turn_cycle_index,
                                 },
                             )
                         )
@@ -6472,127 +7733,57 @@ class AgentLoop:
             content = continued_assistant_content + accumulator.get_content()
             raw_tool_calls = accumulator.get_tool_calls()
             responses_output_items = accumulator.get_responses_output_items()
+            if continuation_message_index is not None:
+                previous_continuation_message = messages[continuation_message_index]
+                previous_responses_output_items = previous_continuation_message.get(
+                    RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD
+                )
+                if isinstance(previous_responses_output_items, list):
+                    responses_output_items = [
+                        dict(item)
+                        for item in previous_responses_output_items
+                        if isinstance(item, dict)
+                    ] + [dict(item) for item in responses_output_items if isinstance(item, dict)]
+            anthropic_thinking_blocks = accumulator.get_anthropic_thinking_blocks()
             tool_parse_failures = [
                 item for item in raw_tool_calls if isinstance(item, ToolArgumentParseFailure)
             ]
             tool_calls = [item for item in raw_tool_calls if isinstance(item, ToolCall)]
-            if tool_parse_failures:
-                failed_tool_calls: list[tuple[ToolArgumentParseFailure, ToolCall, str]] = []
-                for failure in tool_parse_failures:
-                    failed_tc = ToolCall(
-                        call_id=failure.call_id,
-                        name=failure.name or "unknown_tool",
-                        arguments=_tool_argument_failure_arguments(failure),
-                    )
-                    failed_tool_calls.append(
-                        (failure, failed_tc, _tool_id_for_call(failed_tc.name, registry))
-                    )
-
-                assistant_tool_message = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [
-                        {
-                            "id": failed_tc.call_id,
-                            "type": "function",
-                            "function": {
-                                "name": failed_tc.name,
-                                "arguments": json.dumps(failed_tc.arguments),
-                            },
-                        }
-                        for _failure, failed_tc, _tool_id in failed_tool_calls
-                    ],
-                }
-                if content:
-                    events_to_record.append(
-                        SessionEvent(
-                            type="assistant_message",
-                            data={
-                                "content": content,
-                                "turn_id": ctx.turn_id,
-                                "runtime": assistant_runtime,
-                                "attachments": strip_attachment_payload_bytes(
-                                    pending_assistant_attachments
-                                ),
-                            },
-                        )
-                    )
-                    assistant_content_parts.append(content)
-                    last_assistant_content = content
-                    continued_assistant_content = ""
-
-                if continuation_message_index is not None:
-                    messages[continuation_message_index] = assistant_tool_message
-                    continuation_message_index = None
-                else:
-                    messages.append(assistant_tool_message)
-
-                for failure, failed_tc, tool_id in failed_tool_calls:
-                    LLM_TOOL_ARGUMENT_PARSE_FAILURES_TOTAL.labels(
-                        provider_id=current_provider_id or "default",
-                        tool=failure.name,
-                    ).inc()
-                    payload = json.dumps(
-                        _tool_argument_failure_payload(failure),
-                        separators=(",", ":"),
-                    )
-                    if on_tool_call:
-                        await on_tool_call(
-                            failed_tc.name,
-                            failed_tc.call_id,
-                            _parent_visible_tool_arguments(failed_tc.name, failed_tc.arguments),
-                        )
-                    _append_tool_call_event(events_to_record, failed_tc, tool_id)
-                    messages.append(
-                        _tool_result_message(
-                            failed_tc,
-                            payload,
-                            protected=True,
-                            is_error=True,
-                        )
-                    )
-                    _append_tool_result_event(
-                        events_to_record,
-                        failed_tc,
-                        payload,
-                        True,
-                        tool_id=tool_id,
-                        protect_from_pruning=True,
-                    )
-                    if on_tool_result:
-                        await on_tool_result(
-                            failed_tc.call_id,
-                            failed_tc.name,
-                            payload,
-                            True,
-                            None,
-                            None,
-                        )
-                    events_to_record.append(
-                        SessionEvent(
-                            type="lifecycle",
-                            data={
-                                "event": "tool_argument_parse_failure",
-                                "tool_name": failure.name,
-                                "call_id": failure.call_id,
-                                "reason": _tool_argument_failure_reason(failure),
-                                "argument_length": failure.argument_length
-                                if failure.argument_length is not None
-                                else len(failure.raw),
-                                "raw_preview_chars": len(failure.raw),
-                                "recovery_attempts": list(failure.recovery_attempts),
-                            },
-                        )
-                    )
-                continue
+            failed_tool_calls: list[tuple[ToolArgumentParseFailure, ToolCall, str | None]] = []
+            failed_tool_call_by_id: dict[
+                str, tuple[ToolArgumentParseFailure, ToolCall, str | None]
+            ] = {}
+            for failure in tool_parse_failures:
+                failed_tc = ToolCall(
+                    call_id=failure.call_id,
+                    name=failure.name or "unknown_tool",
+                    arguments=_tool_argument_failure_arguments(failure),
+                )
+                failed_entry = (failure, failed_tc, _tool_id_for_call(failed_tc.name, registry))
+                failed_tool_calls.append(failed_entry)
+                failed_tool_call_by_id[failed_tc.call_id] = failed_entry
+            all_emitted_tool_calls: list[ToolCall] = []
+            for raw_tool_call in raw_tool_calls:
+                if isinstance(raw_tool_call, ToolCall):
+                    all_emitted_tool_calls.append(raw_tool_call)
+                elif isinstance(raw_tool_call, ToolArgumentParseFailure):
+                    parsed_failed_entry: (
+                        tuple[ToolArgumentParseFailure, ToolCall, str | None] | None
+                    ) = failed_tool_call_by_id.get(raw_tool_call.call_id)
+                    if parsed_failed_entry is not None:
+                        all_emitted_tool_calls.append(parsed_failed_entry[1])
             if continuation_reminder_index is not None and continuation_reminder_index < len(
                 messages
             ):
-                reminder = messages[continuation_reminder_index]
-                if reminder.get("role") == "system":
-                    messages.pop(continuation_reminder_index)
+                reminder_message = messages[continuation_reminder_index]
+                if reminder_message.get("role") == "system":
+                    reminder_message["content"] = (
+                        "[Continuation reminder superseded; no-op placeholder retained to preserve transcript indices.]"
+                    )
                 continuation_reminder_index = None
             for _tc_index, tc in enumerate(tool_calls):
+                if ctx.current_turn_cycle_index is not None:
+                    tc.runtime_metadata["turn_cycle_index"] = ctx.current_turn_cycle_index
                 mapped_name = exposure.alias_map.get(tc.name, tc.name)
                 if mapped_name != tc.name:
                     tool_call_visible_names[tc.call_id] = tc.name
@@ -6614,6 +7805,12 @@ class AgentLoop:
                         argument_alias_tree,
                     )
 
+            if tool_calls and not content:
+                _attach_responses_output_items_to_first_tool_call(
+                    all_emitted_tool_calls,
+                    responses_output_items,
+                )
+
             if finish_reason == "content_filter":
                 error_notice = (
                     "The model response was blocked by the provider content filter. "
@@ -6622,7 +7819,11 @@ class AgentLoop:
                 events_to_record.append(
                     SessionEvent(
                         type="lifecycle",
-                        data={"event": "system_notice", "message": error_notice},
+                        data=_system_notice_data(
+                            error_notice,
+                            kind="content_filter",
+                            turn_id=ctx.turn_id,
+                        ),
                     )
                 )
                 await self._flush_events_incremental(
@@ -6634,11 +7835,17 @@ class AgentLoop:
                 break
 
             if finish_reason == "length" and not tool_calls:
+                continuation_message = {"role": "assistant", "content": content}
+                _attach_responses_output_items(
+                    continuation_message,
+                    responses_output_items,
+                    durable=False,
+                )
                 if continuation_message_index is None:
                     continuation_message_index = len(messages)
-                    messages.append({"role": "assistant", "content": content})
+                    messages.append(continuation_message)
                 else:
-                    messages[continuation_message_index] = {"role": "assistant", "content": content}
+                    messages[continuation_message_index] = continuation_message
                 continued_assistant_content = content
                 continuation_reminder_index = len(messages)
                 messages.append(
@@ -6661,34 +7868,71 @@ class AgentLoop:
 
             current_assistant_message_index: int | None = None
 
+            stale_session_output = await self._stale_session_step_output(
+                ctx, phase="before_assistant_or_tool_dispatch"
+            )
+            if stale_session_output is not None:
+                step_output = stale_session_output
+                break
+
             # Record assistant message.
             # turn_id is included so that multiple assistant_message events within
             # the same turn are merged into one bubble during history replay
             # (matching the live-WS experience driven by message_complete).
+            # message_id is persisted explicitly (= turn_id for main chat) so the
+            # history projector uses the same stable identity as the live stream
+            # without derivation guesswork. This is the canonical dedup anchor.
+            # assistant_phase_index is always persisted (default 0) so replay
+            # never infers a phase that can disagree with the live counter.
             if content or pending_assistant_attachments:
+                _assistant_event_data_main: dict[str, Any] = {
+                    "content": content,
+                    "turn_id": ctx.turn_id,
+                    "message_id": ctx.turn_id,
+                    "assistant_phase_index": ctx.get_current_assistant_phase()
+                    if ctx.get_current_assistant_phase is not None
+                    else 0,
+                    "turn_cycle_index": ctx.current_turn_cycle_index,
+                    "runtime": assistant_runtime,
+                    "attachments": strip_attachment_payload_bytes(pending_assistant_attachments),
+                    # Persist chat_mode so the history projector can stamp
+                    # the plan-mode marker on assistant messages after refresh.
+                    "chat_mode": ctx.chat_mode.mode if ctx.chat_mode else "default",
+                    "chat_mode_source": ctx.chat_mode.source if ctx.chat_mode else "system_default",
+                }
+                _attach_responses_output_items(
+                    _assistant_event_data_main,
+                    responses_output_items,
+                    durable=True,
+                )
                 events_to_record.append(
-                    SessionEvent(
-                        type="assistant_message",
-                        data={
-                            "content": content,
-                            "turn_id": ctx.turn_id,
-                            "runtime": assistant_runtime,
-                            "attachments": strip_attachment_payload_bytes(
-                                pending_assistant_attachments
-                            ),
-                        },
-                    )
+                    SessionEvent(type="assistant_message", data=_assistant_event_data_main)
                 )
                 if content:
                     if continuation_message_index is not None:
                         current_assistant_message_index = continuation_message_index
-                        messages[continuation_message_index] = {
-                            "role": "assistant",
-                            "content": content,
-                        }
+                        assistant_message = {"role": "assistant", "content": content}
+                        _attach_anthropic_thinking_blocks(
+                            assistant_message, anthropic_thinking_blocks
+                        )
+                        _attach_responses_output_items(
+                            assistant_message,
+                            responses_output_items,
+                            durable=False,
+                        )
+                        messages[continuation_message_index] = assistant_message
                     else:
                         current_assistant_message_index = len(messages)
-                        messages.append({"role": "assistant", "content": content})
+                        assistant_message = {"role": "assistant", "content": content}
+                        _attach_anthropic_thinking_blocks(
+                            assistant_message, anthropic_thinking_blocks
+                        )
+                        _attach_responses_output_items(
+                            assistant_message,
+                            responses_output_items,
+                            durable=False,
+                        )
+                        messages.append(assistant_message)
                     assistant_content_parts.append(content)
                     last_assistant_content = content
                     continued_assistant_content = ""
@@ -6708,7 +7952,7 @@ class AgentLoop:
                 pending_assistant_attachments.clear()
 
             # No tool calls — check if step is complete
-            if not tool_calls:
+            if not all_emitted_tool_calls:
                 if await self._consume_boundary_batch_if_available(
                     ctx,
                     messages=messages,
@@ -6863,10 +8107,11 @@ class AgentLoop:
                         events_to_record.append(
                             SessionEvent(
                                 type="lifecycle",
-                                data={
-                                    "event": "system_notice",
-                                    "message": f"Step failed: {error_msg}",
-                                },
+                                data=_system_notice_data(
+                                    f"Step failed: {error_msg}",
+                                    kind="empty_assistant_response",
+                                    turn_id=ctx.turn_id,
+                                ),
                             )
                         )
                         step_output = StepOutput(
@@ -6931,7 +8176,7 @@ class AgentLoop:
                     break
 
             # Process tool calls
-            if tool_calls and content:
+            if all_emitted_tool_calls and content:
                 # Add assistant message with tool calls for chat history
                 target_index = current_assistant_message_index
                 if target_index is None:
@@ -6949,12 +8194,13 @@ class AgentLoop:
                                 "arguments": json.dumps(tc.arguments),
                             },
                         }
-                        for tc in tool_calls
+                        for tc in all_emitted_tool_calls
                     ],
                 }
                 if responses_output_items:
                     messages[target_index]["_responses_output_items"] = responses_output_items
-            elif tool_calls:
+                _attach_anthropic_thinking_blocks(messages[target_index], anthropic_thinking_blocks)
+            elif all_emitted_tool_calls:
                 assistant_tool_message = {
                     "role": "assistant",
                     "content": None,
@@ -6967,12 +8213,132 @@ class AgentLoop:
                                 "arguments": json.dumps(tc.arguments),
                             },
                         }
-                        for tc in tool_calls
+                        for tc in all_emitted_tool_calls
                     ],
                 }
                 if responses_output_items:
                     assistant_tool_message["_responses_output_items"] = responses_output_items
+                _attach_anthropic_thinking_blocks(assistant_tool_message, anthropic_thinking_blocks)
                 messages.append(assistant_tool_message)
+
+            # Resolve (bump-once) the assistant phase each tool call belongs to
+            # and stamp it into runtime metadata so every persisted
+            # tool_call/tool_result event carries the exact phase the live
+            # runtime overlay uses.  This must happen AFTER this cycle's
+            # assistant_message event was recorded (its phase is the pre-bump
+            # counter value) and BEFORE any tool events are appended.
+            if ctx.get_assistant_phase_for_tool is not None:
+                for tc in all_emitted_tool_calls:
+                    try:
+                        _tool_phase = ctx.get_assistant_phase_for_tool(tc.call_id)
+                    except Exception:
+                        _tool_phase = None
+                    if isinstance(_tool_phase, int):
+                        tc.runtime_metadata["assistant_phase_index"] = _tool_phase
+
+            async def _emit_synthetic_tool_error(
+                tc: ToolCall,
+                payload: str,
+                *,
+                tool_id: str | None = None,
+                lifecycle_data: dict[str, Any] | None = None,
+                registry_snapshot: Any = registry,
+            ) -> None:
+                if on_tool_call:
+                    await _emit_with_optional_trailing_arg(
+                        on_tool_call,
+                        (
+                            tool_call_visible_names.get(tc.call_id, tc.name),
+                            tc.call_id,
+                            _parent_visible_tool_arguments(tc.name, tc.arguments),
+                        ),
+                        ctx.current_turn_cycle_index,
+                    )
+                _append_tool_call_event(
+                    events_to_record,
+                    tc,
+                    tool_id or _tool_id_for_call(tc.name, registry_snapshot),
+                    turn_cycle_index=ctx.current_turn_cycle_index,
+                )
+                messages.append(
+                    _tool_result_message(
+                        tc,
+                        payload,
+                        protected=True,
+                        is_error=True,
+                    )
+                )
+                record_tool_result(ctx.loop_guard_state, tc.name, tc.arguments, payload)
+                _append_tool_result_event(
+                    events_to_record,
+                    tc,
+                    payload,
+                    True,
+                    tool_id=tool_id or _tool_id_for_call(tc.name, registry_snapshot),
+                    protect_from_pruning=True,
+                    turn_cycle_index=ctx.current_turn_cycle_index,
+                )
+                if on_tool_result:
+                    await _emit_tool_result_callback(
+                        on_tool_result,
+                        call_id=tc.call_id,
+                        tool_name=tool_call_visible_names.get(tc.call_id, tc.name),
+                        result=payload,
+                        is_error=True,
+                        duration_ms=None,
+                        evaluation=None,
+                        turn_cycle_index=ctx.current_turn_cycle_index,
+                    )
+                if lifecycle_data is not None:
+                    events_to_record.append(SessionEvent(type="lifecycle", data=lifecycle_data))
+
+            if finish_reason == "length" and all_emitted_tool_calls:
+                length_payload = json.dumps(
+                    {
+                        "error": "output limit hit mid-call; re-issue the complete tool call in a new response",
+                        "is_error": True,
+                    },
+                    separators=(",", ":"),
+                )
+                for tc in all_emitted_tool_calls:
+                    await _emit_synthetic_tool_error(
+                        tc,
+                        length_payload,
+                        tool_id=_tool_id_for_call(tc.name, registry),
+                        lifecycle_data={
+                            "event": "tool_call_rejected_output_limit",
+                            "tool_name": tc.name,
+                            "call_id": tc.call_id,
+                            "reason": "output limit hit mid-call; re-issue",
+                        },
+                    )
+                continue
+
+            for failure, failed_tc, tool_id in failed_tool_calls:
+                LLM_TOOL_ARGUMENT_PARSE_FAILURES_TOTAL.labels(
+                    provider_id=current_provider_id or "default",
+                    tool=failure.name,
+                ).inc()
+                payload = json.dumps(
+                    _tool_argument_failure_payload(failure),
+                    separators=(",", ":"),
+                )
+                await _emit_synthetic_tool_error(
+                    failed_tc,
+                    payload,
+                    tool_id=tool_id,
+                    lifecycle_data={
+                        "event": "tool_argument_parse_failure",
+                        "tool_name": failure.name,
+                        "call_id": failure.call_id,
+                        "reason": _tool_argument_failure_reason(failure),
+                        "argument_length": failure.argument_length
+                        if failure.argument_length is not None
+                        else len(failure.raw),
+                        "raw_preview_chars": len(failure.raw),
+                        "recovery_attempts": list(failure.recovery_attempts),
+                    },
+                )
 
             async_orchestration_spawned = False
             restart_llm_cycle = False
@@ -6982,29 +8348,43 @@ class AgentLoop:
                 str, ProjectContextEntry | ProjectMetadataEntry
             ] = {}
             queued_project_context_hashes: set[str] = set()
-            # Pre-compute parallel delegate batches so that multiple
-            # delegate calls in one assistant turn fan out via
-            # asyncio.gather. ``parallel_delegate_results[index]`` holds
-            # the precomputed ToolResult for indices that were absorbed
+            # Pre-compute safe parallel orchestration batches so that
+            # independent child-work calls emitted in one assistant turn fan
+            # out via asyncio.gather. ``parallel_orchestration_results[index]``
+            # holds the precomputed ToolResult for indices that were absorbed
             # into a batch by an earlier index in the same run.
-            parallel_delegate_results = await self._precompute_parallel_delegate_batches(
-                ctx,
-                tool_calls,
-                events_to_record=events_to_record,
-                on_token=on_token,
-                on_tool_call=on_tool_call,
-                on_tool_result=on_tool_result,
-            )
+            precompute_finalization_instruction = await self._finalization_instruction(ctx)
+            if precompute_finalization_instruction is None:
+                parallel_orchestration_results = (
+                    await self._precompute_parallel_orchestration_batches(
+                        ctx,
+                        tool_calls,
+                        events_to_record=events_to_record,
+                        tool_call_visible_names=tool_call_visible_names,
+                        on_token=on_token,
+                        on_tool_call=on_tool_call,
+                        on_tool_result=on_tool_result,
+                    )
+                )
+            else:
+                # Preserve the per-tool finalization guard below.  Parallel
+                # precompute executes side effects before the main loop reaches
+                # that guard, so disable fanout while finalization is required.
+                parallel_orchestration_results = {}
             for tc_index, tc in enumerate(tool_calls):
                 self._raise_if_cancelled(ctx)
                 tool_id = _tool_id_for_call(tc.name, registry)
                 STEP_TOOL_CALLS.labels(tool_name=tool_id).inc()
 
                 if on_tool_call:
-                    await on_tool_call(
-                        tc.name,
-                        tc.call_id,
-                        _parent_visible_tool_arguments(tc.name, tc.arguments),
+                    await _emit_with_optional_trailing_arg(
+                        on_tool_call,
+                        (
+                            tc.name,
+                            tc.call_id,
+                            _parent_visible_tool_arguments(tc.name, tc.arguments),
+                        ),
+                        ctx.current_turn_cycle_index,
                     )
 
                 finalization_instruction = await self._finalization_instruction(ctx)
@@ -7049,10 +8429,22 @@ class AgentLoop:
                                 f"{finalization_instruction['message']}"
                             ),
                             "required_action": finalization_instruction["required_action"],
-                            "allowed_tools": sorted(allowed_finalization_tools),
+                            "allowed_tools": _visible_allowed_tool_names(
+                                allowed_finalization_tools,
+                                controller_tool_exposure,
+                            ),
                         }
                     )
                     messages.append(_tool_result_message(tc, payload, protected=True))
+                    todo_write_tool_name = next(
+                        iter(
+                            _visible_allowed_tool_names(
+                                frozenset({STEP_TODO_WRITE}),
+                                controller_tool_exposure,
+                            )
+                        ),
+                        STEP_TODO_WRITE,
+                    )
                     _append_tool_result_event(
                         events_to_record,
                         tc,
@@ -7067,7 +8459,8 @@ class AgentLoop:
                             "content": (
                                 "Internal controller reminder — this is not a new user "
                                 "message. All step todos are terminal. "
-                                f"{finalization_instruction['reminder']} Use step_todo_write "
+                                f"{finalization_instruction['reminder']} Use "
+                                f"{todo_write_tool_name} "
                                 "only if the todo state is wrong."
                             ),
                             "_workflow_step_reminder": True,
@@ -7087,6 +8480,7 @@ class AgentLoop:
                     if on_tool_result:
                         await on_tool_result(tc.call_id, tc.name, payload, True, None, None)
                     record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+                    record_tool_result(ctx.loop_guard_state, tc.name, tc.arguments, payload)
                     continue
                 if finalization_instruction is not None and tc.name in {
                     WRITE_DELIVERABLE,
@@ -7144,6 +8538,7 @@ class AgentLoop:
                     # fails (streak keeps incrementing). This matters when
                     # the model ignores the teach-back.
                     record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+                    record_tool_result(ctx.loop_guard_state, tc.name, tc.arguments, loop_payload)
                     continue
 
                 # Argument sanity gate — applies only to real executor-
@@ -7197,6 +8592,12 @@ class AgentLoop:
                                 tc.call_id, tc.name, sanity_payload, True, None, None
                             )
                         record_tool_call(ctx.loop_guard_state, tc.name, tc.arguments)
+                        record_tool_result(
+                            ctx.loop_guard_state,
+                            tc.name,
+                            tc.arguments,
+                            sanity_payload,
+                        )
                         continue
 
                 if tc.name in _PROJECT_TOUCH_TOOL_NAMES:
@@ -7245,7 +8646,7 @@ class AgentLoop:
                             loaded_project_context
                         )
                         content_hash = loaded_project_context.content_hash
-                        if content_hash not in queued_project_context_hashes:
+                        if content_hash and content_hash not in queued_project_context_hashes:
                             queued_project_context_hashes.add(content_hash)
                             post_tool_system_messages.append(
                                 {
@@ -7291,7 +8692,7 @@ class AgentLoop:
                             }
                         )
                         content_hash = loaded_project_context.content_hash
-                        if content_hash not in queued_project_context_hashes:
+                        if content_hash and content_hash not in queued_project_context_hashes:
                             queued_project_context_hashes.add(content_hash)
                             post_tool_system_messages.append(
                                 {
@@ -7302,6 +8703,12 @@ class AgentLoop:
                             )
                         _append_tool_result_event(
                             events_to_record, tc, rejection_payload, True, tool_id=tool_id
+                        )
+                        record_tool_result(
+                            ctx.loop_guard_state,
+                            tc.name,
+                            tc.arguments,
+                            rejection_payload,
                         )
                         if on_tool_result:
                             await on_tool_result(
@@ -7326,10 +8733,14 @@ class AgentLoop:
                                 }
                             )
                             if on_tool_call:
-                                await on_tool_call(
-                                    trailing_call.name,
-                                    trailing_call.call_id,
-                                    trailing_call.arguments,
+                                await _emit_with_optional_trailing_arg(
+                                    on_tool_call,
+                                    (
+                                        trailing_call.name,
+                                        trailing_call.call_id,
+                                        trailing_call.arguments,
+                                    ),
+                                    ctx.current_turn_cycle_index,
                                 )
                             _append_tool_call_event(
                                 events_to_record, trailing_call, trailing_tool_id
@@ -7631,19 +9042,57 @@ class AgentLoop:
 
                     from cognis.core.executor_switching import perform_executor_switch
 
-                    outcome = await perform_executor_switch(
-                        conversation_id=ctx.conversation.conversation_id,
-                        pool=pool,
-                        executor_id=target_executor_id_arg.strip(),
-                        actor="agent",
-                        session_factory=self.session_manager.session_factory,
-                        reason=reason_arg if isinstance(reason_arg, str) else None,
-                        task_id=ctx.task_id,
-                    )
-                    is_error = outcome.status == "error"
-                    if not is_error and outcome.target is not None:
-                        self._install_active_executor_target(ctx, outcome.target)
-                    result_content = json.dumps(outcome.to_tool_result())
+                    if _is_delegated_child_context(ctx):
+                        target = pool.by_id(target_executor_id_arg.strip())
+                        if target is not None and target.usable:
+                            self._install_active_executor_target(
+                                ctx,
+                                target,
+                                update_conversation=False,
+                            )
+                            outcome_payload = {
+                                "status": "ok",
+                                "executor_id": target.executor_id,
+                                "executor_type": target.executor_type,
+                                "is_primary": target.is_primary,
+                                "state": target.state.value,
+                                "description": target.description,
+                                "available_tools": sorted(target.observed_tool_names),
+                                "scope": "session",
+                            }
+                            is_error = False
+                            result_content = json.dumps(outcome_payload)
+                        else:
+                            outcome_payload = {
+                                "status": "error",
+                                "reason": "unavailable" if target is not None else "not_assigned",
+                                "detail": (
+                                    f"Executor '{target_executor_id_arg.strip()}' is not usable."
+                                    if target is not None
+                                    else (
+                                        f"Executor '{target_executor_id_arg.strip()}' is not "
+                                        "in the agent's assigned pool."
+                                    )
+                                ),
+                                "executor_id": target_executor_id_arg.strip(),
+                                "scope": "session",
+                            }
+                            is_error = True
+                            result_content = json.dumps(outcome_payload)
+                    else:
+                        outcome = await perform_executor_switch(
+                            conversation_id=ctx.conversation.conversation_id,
+                            pool=pool,
+                            executor_id=target_executor_id_arg.strip(),
+                            actor="agent",
+                            session_factory=self.session_manager.session_factory,
+                            reason=reason_arg if isinstance(reason_arg, str) else None,
+                            task_id=ctx.task_id,
+                        )
+                        is_error = outcome.status == "error"
+                        if not is_error and outcome.target is not None:
+                            self._install_active_executor_target(ctx, outcome.target)
+                        result_content = json.dumps(outcome.to_tool_result())
                     messages.append(_tool_result_message(tc, result_content, protected=True))
                     _append_tool_result_event(
                         events_to_record, tc, result_content, is_error, tool_id=tool_id
@@ -8123,15 +9572,21 @@ class AgentLoop:
                     previous_normalized = _normalize_todos(ctx.todos or [])
                     new_normalized = _normalize_todos(requested_todos)
                     unchanged = previous_normalized == new_normalized
-                    ctx.todos = requested_todos
-                    await self._persist_step_todos(ctx)
-                    if not unchanged and ctx.task_id and ctx.step_run_id:
+                    ctx.todos = new_normalized
+                    await self._persist_todos(ctx)
+                    if not unchanged:
                         await self.event_bus.publish(
                             Event(
                                 type=EventType.CONVERSATION_STATE_CHANGED,
                                 data={
-                                    "source_kind": "task_step.todos.changed",
+                                    "source_kind": (
+                                        "task_step.todos.changed"
+                                        if ctx.task_id and ctx.step_run_id
+                                        else "session.todos.changed"
+                                    ),
                                     "user_email": ctx.session.user_email,
+                                    "conversation_id": ctx.conversation.conversation_id,
+                                    "session_id": ctx.session.session_id,
                                     "task_id": ctx.task_id,
                                     "step_run_id": ctx.step_run_id,
                                 },
@@ -8192,13 +9647,14 @@ class AgentLoop:
                             "guidance": guidance,
                         }
                     )
-                    messages.append(_tool_result_message(tc, result_content))
+                    messages.append(_tool_result_message(tc, result_content, protected=True))
                     _append_tool_result_event(
                         events_to_record,
                         tc,
                         result_content,
                         False,
                         tool_id=tool_id,
+                        protect_from_pruning=True,
                     )
                     await self._flush_events_incremental(
                         ctx,
@@ -8245,11 +9701,14 @@ class AgentLoop:
                             "non_terminal_count": list_non_terminal,
                         }
                     )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
-                    )
+                    messages.append(_tool_result_message(tc, result_content, protected=True))
                     _append_tool_result_event(
-                        events_to_record, tc, result_content, False, tool_id=tool_id
+                        events_to_record,
+                        tc,
+                        result_content,
+                        False,
+                        tool_id=tool_id,
+                        protect_from_pruning=True,
                     )
                     await self._flush_events_incremental(
                         ctx,
@@ -8393,7 +9852,20 @@ class AgentLoop:
                         },
                     )
                     try:
-                        resolution = await self.pause_waiter.wait(pause_id, timeout=300.0)
+                        async with self.session_manager.session_factory() as db:
+                            step_request_timeout_raw: int = await get_setting_value(  # type: ignore[assignment]
+                                db,
+                                "session.step_request_questions_timeout_seconds",
+                                3600,
+                            )
+                        step_request_timeout_seconds = max(
+                            1.0,
+                            float(step_request_timeout_raw or 3600),
+                        )
+                        resolution = await self.pause_waiter.wait(
+                            pause_id,
+                            timeout=step_request_timeout_seconds,
+                        )
                         await self._clear_interactive_pause_state(ctx)
                         if resolution.decision == "cancel":
                             # No tool_result event needed: StepInterrupted propagates
@@ -8425,7 +9897,15 @@ class AgentLoop:
                                 pause_id,
                                 reason="timeout",
                             )
-                        timeout_content = json.dumps({"error": "Input request timed out."})
+                        timeout_content = json.dumps(
+                            {
+                                "error": "Input request timed out.",
+                                "prescribed_action": (
+                                    "State your assumption and proceed, or call step_complete "
+                                    "with outcome=rejected."
+                                ),
+                            }
+                        )
                         messages.append(
                             {"role": "tool", "tool_call_id": tc.call_id, "content": timeout_content}
                         )
@@ -8858,7 +10338,7 @@ class AgentLoop:
                     # executed in parallel up-front; in that case the
                     # tool_call event is already recorded and we just
                     # surface the precomputed result.
-                    precomputed_orch = parallel_delegate_results.get(tc_index)
+                    precomputed_orch = parallel_orchestration_results.get(tc_index)
                     if precomputed_orch is not None:
                         orch_result = precomputed_orch
                     else:
@@ -8991,9 +10471,11 @@ class AgentLoop:
                 tool_schemas=exposure.tools,
                 resolved_model=resolved_model,
                 max_context_tokens=context_result.max_context_tokens,
+                cache_breakpoint_index=cache_breakpoint,
+                anthropic_cache_ttl=self.default_anthropic_cache_ttl,
             )
             post_tool_snapshot = post_tool_projection.snapshot
-            self._store_context_usage_snapshot(
+            await self._store_context_usage_snapshot(
                 ctx,
                 snapshot=post_tool_snapshot,
                 provider_id=current_provider_id,
@@ -9066,12 +10548,12 @@ class AgentLoop:
                 events_to_record.append(
                     SessionEvent(
                         type="lifecycle",
-                        data={
-                            "event": "system_notice",
-                            "message": notice,
-                            "turn_id": ctx.turn_id,
-                            **pressure_run.event_data(),
-                        },
+                        data=_system_notice_data(
+                            notice,
+                            kind="tool_call_context_pressure",
+                            turn_id=ctx.turn_id,
+                            metadata=pressure_run.event_data(),
+                        ),
                     )
                 )
                 await self._emit_compaction_notice(
@@ -9207,7 +10689,11 @@ class AgentLoop:
         # unresolved after model-facing projection.  Raw cross-turn assembly may
         # recommend compaction for the unprojected transcript, but an effective
         # projection should not cause a visible session rotation.
-        if events_recorded and _should_run_post_turn_auto_compaction(ctx, context_result):
+        if (
+            events_recorded
+            and self._auto_compaction_cooldown_remaining_for_turn(ctx) <= 0
+            and _should_run_post_turn_auto_compaction(ctx, context_result)
+        ):
             compaction_run = CompactionRunContext.from_context_result(
                 context_result,
                 trigger="post_turn_auto",
@@ -9302,6 +10788,9 @@ class AgentLoop:
         # task-originated escalations, the service resolves the target
         # to the task's source conversation so the user sees the
         # escalation in their chat, not in the invisible task step.
+        # For managed-conversation escalations (no task_id), the service
+        # walks the ManagedConversationLink chain to the channel-bound
+        # parent so the approval request reaches the user's channel.
         # The intaris_call_id is used as notification_id so the existing
         # /escalations/{call_id}/resolve endpoint can find it.
         await self.notification_service.create(
@@ -9478,103 +10967,185 @@ class AgentLoop:
     # high enough to deliver real wall-clock speedups, low enough to
     # avoid resource contention on the controller and child executors.
     _DELEGATE_PARALLEL_DEFAULT_MAX = 3
+    _MANAGED_CONVERSATION_PARALLEL_DEFAULT_MAX = 3
+    _MANAGED_CONVERSATION_PARALLEL_TOOL_NAMES = frozenset(
+        {
+            "agent_conversation_create",
+            "agent_conversation_send",
+            "agent_conversation_wait",
+            "agent_conversation_interrupt",
+            "agent_conversation_retry",
+            "agent_conversation_fork",
+            "agent_conversation_close",
+            "agent_conversation_get",
+        }
+    )
 
-    async def _precompute_parallel_delegate_batches(
+    async def _precompute_parallel_orchestration_batches(
         self,
         ctx: StepContext,
         tool_calls: list[ToolCall],
         *,
         events_to_record: list[SessionEvent],
+        tool_call_visible_names: dict[str, str] | None = None,
         on_token: TokenCallback | None = None,
         on_tool_call: ToolCallCallback | None = None,
         on_tool_result: ToolResultCallback | None = None,
     ) -> dict[int, ToolResult]:
-        """Run consecutive ``delegate`` tool calls in parallel.
+        """Run safe parallel orchestration batches from the tool-call prefix.
 
-        When the model emits multiple ``delegate`` calls in a single
-        assistant turn (e.g. fanning out to ``system:explore`` for a
-        broad investigation), executing them sequentially defeats the
-        whole point. This helper finds runs of consecutive delegate
-        calls and runs each run via ``asyncio.gather``. Tool-call
-        events are appended to the in-flight batch in input order; tool
-        results land in the returned mapping keyed by index for the
-        outer for-loop to surface.
-
-        Single delegate calls (the common case) are left to the
-        sequential path so we don't pay gather overhead unnecessarily.
+        Precomputing executes side effects before the outer per-tool loop
+        reaches them. To preserve source-order semantics and guards whose state
+        may change after earlier tools, only precompute batches while every
+        preceding call in the assistant turn was also precomputed.
         """
 
         results: dict[int, ToolResult] = {}
         i = 0
         n = len(tool_calls)
-        max_concurrency = max(
-            1,
-            int(getattr(ctx, "_delegate_parallel_max", 0)) or self._DELEGATE_PARALLEL_DEFAULT_MAX,
-        )
         while i < n:
             tc = tool_calls[i]
-            if tc.name != "delegate":
-                i += 1
-                continue
-            # Find the contiguous run of delegate calls starting at i.
-            run_end = i + 1
-            while run_end < n and tool_calls[run_end].name == "delegate":
-                run_end += 1
-            run = tool_calls[i:run_end]
-            if len(run) <= 1:
-                i = run_end
-                continue
-
-            self._raise_if_cancelled(ctx)
-
-            # Record tool_call events for the whole batch before
-            # spawning so the in-flight stream of events stays ordered.
-            for child_tc in run:
-                child_tool_id = _tool_id_for_call(child_tc.name, ctx.tool_registry)
-                _append_tool_call_event(events_to_record, child_tc, child_tool_id)
-            await self._flush_events_incremental(
-                ctx,
-                events_to_record,
-                reason="tool_call:delegate_batch",
-                on_token=on_token,
-            )
-
-            # Cap concurrency so a single turn cannot fan out
-            # arbitrarily many child sessions at once.
-            semaphore = asyncio.Semaphore(max_concurrency)
-
-            async def _bounded(
-                child_tc: ToolCall, sem: asyncio.Semaphore = semaphore
-            ) -> ToolResult:
-                async with sem:
-                    try:
-                        return await self._handle_orchestration_tool(
-                            child_tc,
-                            ctx=ctx,
+            if tc.name == "delegate":
+                run_end = i + 1
+                while run_end < n and tool_calls[run_end].name == "delegate":
+                    run_end += 1
+                if run_end - i > 1:
+                    results.update(
+                        await self._execute_parallel_orchestration_run(
+                            ctx,
+                            [(index, tool_calls[index]) for index in range(i, run_end)],
                             events_to_record=events_to_record,
+                            reason="tool_call:delegate_batch",
+                            error_label="delegate",
+                            max_concurrency=max(
+                                1,
+                                int(getattr(ctx, "_delegate_parallel_max", 0))
+                                or self._DELEGATE_PARALLEL_DEFAULT_MAX,
+                            ),
+                            tool_call_visible_names=tool_call_visible_names,
                             on_token=on_token,
                             on_tool_call=on_tool_call,
                             on_tool_result=on_tool_result,
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        # Convert to a structured error so siblings still
-                        # complete; the outer loop surfaces it via the
-                        # normal tool_result path.
-                        return ToolResult(
-                            output=json.dumps(
-                                {
-                                    "status": "error",
-                                    "message": f"delegate failed: {exc!s}",
-                                }
-                            ),
-                            is_error=True,
-                        )
+                    )
+                    i = run_end
+                    continue
+                break
 
-            gathered = await asyncio.gather(*(_bounded(child) for child in run))
-            for offset, child_result in enumerate(gathered):
-                results[i + offset] = child_result
-            i = run_end
+            key = self._managed_conversation_parallel_target_key(tc)
+            if key is not None:
+                run: list[tuple[int, ToolCall]] = []
+                seen_targets: set[str] = set()
+                run_end = i
+                while run_end < n:
+                    child_tc = tool_calls[run_end]
+                    child_key = self._managed_conversation_parallel_target_key(child_tc)
+                    if child_key is None or child_key in seen_targets:
+                        break
+                    seen_targets.add(child_key)
+                    run.append((run_end, child_tc))
+                    run_end += 1
+                if len(run) > 1:
+                    results.update(
+                        await self._execute_parallel_orchestration_run(
+                            ctx,
+                            run,
+                            events_to_record=events_to_record,
+                            reason="tool_call:managed_conversation_batch",
+                            error_label="managed conversation tool",
+                            max_concurrency=max(
+                                1,
+                                int(getattr(ctx, "_managed_conversation_parallel_max", 0))
+                                or self._MANAGED_CONVERSATION_PARALLEL_DEFAULT_MAX,
+                            ),
+                            tool_call_visible_names=tool_call_visible_names,
+                            on_token=on_token,
+                            on_tool_call=on_tool_call,
+                            on_tool_result=on_tool_result,
+                        )
+                    )
+                    i = run_end
+                    continue
+                break
+
+            break
         return results
+
+    async def _execute_parallel_orchestration_run(
+        self,
+        ctx: StepContext,
+        run: list[tuple[int, ToolCall]],
+        *,
+        events_to_record: list[SessionEvent],
+        reason: str,
+        error_label: str,
+        max_concurrency: int,
+        tool_call_visible_names: dict[str, str] | None = None,
+        on_token: TokenCallback | None = None,
+        on_tool_call: ToolCallCallback | None = None,
+        on_tool_result: ToolResultCallback | None = None,
+    ) -> dict[int, ToolResult]:
+        """Execute a prevalidated orchestration run concurrently."""
+
+        self._raise_if_cancelled(ctx)
+        visible_names = tool_call_visible_names or {}
+        for _index, child_tc in run:
+            child_tool_id = _tool_id_for_call(child_tc.name, ctx.tool_registry)
+            _append_tool_call_event(
+                events_to_record,
+                child_tc,
+                child_tool_id,
+                visible_name=visible_names.get(child_tc.call_id),
+            )
+        await self._flush_events_incremental(
+            ctx,
+            events_to_record,
+            reason=reason,
+            on_token=on_token,
+        )
+
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def _bounded(child_tc: ToolCall, sem: asyncio.Semaphore = semaphore) -> ToolResult:
+            async with sem:
+                try:
+                    return await self._handle_orchestration_tool(
+                        child_tc,
+                        ctx=ctx,
+                        events_to_record=events_to_record,
+                        on_token=on_token,
+                        on_tool_call=on_tool_call,
+                        on_tool_result=on_tool_result,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    return ToolResult(
+                        output=json.dumps(
+                            {
+                                "status": "error",
+                                "message": f"{error_label} {child_tc.name} failed: {exc!s}",
+                            }
+                        ),
+                        is_error=True,
+                    )
+
+        gathered = await asyncio.gather(*(_bounded(child_tc) for _index, child_tc in run))
+        return {
+            index: child_result
+            for (index, _child_tc), child_result in zip(run, gathered, strict=True)
+        }
+
+    def _managed_conversation_parallel_target_key(self, tc: ToolCall) -> str | None:
+        """Return a conflict key for safe managed-conversation fanout."""
+
+        if tc.name not in self._MANAGED_CONVERSATION_PARALLEL_TOOL_NAMES:
+            return None
+        if tc.name == "agent_conversation_create":
+            return f"create:{json.dumps(tc.arguments, sort_keys=True, default=str)}"
+        conversation_id = str(tc.arguments.get("conversation_id") or "").strip()
+        if not conversation_id:
+            # Invalid calls will fail independently during normal validation.
+            return f"invalid:{tc.name}:{tc.call_id}"
+        return f"conversation:{conversation_id}"
 
     async def _handle_orchestration_tool(
         self,
@@ -9709,6 +11280,18 @@ class AgentLoop:
         child_working_directory = (
             ctx.working_directory if ctx.working_directory_explicit else child_workspace_root
         )
+        _raw_tool_phase = tc.runtime_metadata.get("assistant_phase_index")
+        parent_tool_phase: int | None = (
+            _raw_tool_phase if isinstance(_raw_tool_phase, int) else None
+        )
+        _raw_tool_cycle = tc.runtime_metadata.get("turn_cycle_index")
+        parent_tool_cycle: int | None = (
+            _raw_tool_cycle
+            if isinstance(_raw_tool_cycle, int)
+            else ctx.current_turn_cycle_index
+            if isinstance(ctx.current_turn_cycle_index, int)
+            else None
+        )
 
         result, child_session = await handle_delegate_tool_call(
             tc,
@@ -9730,6 +11313,8 @@ class AgentLoop:
                         "status": "failed",
                         "mode": "delegate",
                         "call_id": tc.call_id,
+                        "assistant_phase_index": parent_tool_phase,
+                        "turn_cycle_index": parent_tool_cycle,
                         "title": _delegation_title(tc.arguments),
                         "task_title": _delegation_title(tc.arguments),
                         "agent_id": tc.arguments.get("agent_id"),
@@ -9746,6 +11331,7 @@ class AgentLoop:
         child_intaris_id = (
             getattr(child_session, "intaris_session_id", None) or child_session.session_id
         )
+        delegation_started_at = datetime.now(UTC).isoformat()
 
         # Persist the started event immediately. Synchronous delegations can run
         # for minutes; buffering this in the parent batch makes completion arrive
@@ -9756,6 +11342,8 @@ class AgentLoop:
                 "status": "started",
                 "mode": "delegate",
                 "call_id": tc.call_id,
+                "assistant_phase_index": parent_tool_phase,
+                "turn_cycle_index": parent_tool_cycle,
                 "title": _delegation_title(tc.arguments),
                 "task_title": _delegation_title(tc.arguments),
                 "input_redacted": True,
@@ -9764,7 +11352,9 @@ class AgentLoop:
                 "agent_profile_id": getattr(child_session, "agent_profile_id", None),
                 "child_session_id": child_session.session_id,
                 "child_intaris_session_id": child_intaris_id,
+                "tool_call_count": 0,
                 "wait": wait,
+                "started_at": delegation_started_at,
             },
         )
         try:
@@ -9790,6 +11380,9 @@ class AgentLoop:
                     "parent_session_id": ctx.session.session_id,
                     "turn_id": ctx.turn_id,
                     "child_session_id": child_session.session_id,
+                    "call_id": tc.call_id,
+                    "assistant_phase_index": parent_tool_phase,
+                    "turn_cycle_index": parent_tool_cycle,
                     "mode": "delegate",
                     "agent_id": child_session.agent_id,
                     "used_agent_id": child_session.agent_id,
@@ -9797,7 +11390,9 @@ class AgentLoop:
                     "title": _delegation_title(tc.arguments),
                     "task_title": _delegation_title(tc.arguments),
                     "input_redacted": True,
+                    "tool_call_count": 0,
                     "wait": wait,
+                    "started_at": delegation_started_at,
                 },
             )
         )
@@ -9816,6 +11411,51 @@ class AgentLoop:
             _child_session_id = child_session.session_id
             _event_bus = self.event_bus
             _conv_id = ctx.conversation.conversation_id
+            _parent_session_id = ctx.session.session_id
+            _parent_turn_id = ctx.turn_id
+            _parent_tool_call_id = tc.call_id
+            _child_seen_tool_calls: set[str] = set()
+
+            async def _publish_child_progress(
+                *,
+                tool_call_count: int,
+                last_tool: str | None = None,
+                todos: list[dict[str, Any]] | None = None,
+            ) -> None:
+                await _event_bus.publish(
+                    Event(
+                        type=EventType.DELEGATION_PROGRESS,
+                        data={
+                            "conversation_id": _conv_id,
+                            "parent_session_id": _parent_session_id,
+                            "child_session_id": _child_session_id,
+                            "call_id": _parent_tool_call_id,
+                            "turn_id": _parent_turn_id,
+                            "assistant_phase_index": parent_tool_phase,
+                            "turn_cycle_index": parent_tool_cycle,
+                            "wait": wait,
+                            "started_at": delegation_started_at,
+                            "status": "running",
+                            "tool_call_count": tool_call_count,
+                            "last_tool": last_tool,
+                            "todos": todos or [],
+                        },
+                    )
+                )
+
+            async def _child_tool_call_callback(
+                tool_name: str,
+                call_id: str,
+                _arguments: dict[str, Any],
+            ) -> None:
+                nonlocal _child_tool_call_count
+                if call_id not in _child_seen_tool_calls:
+                    _child_seen_tool_calls.add(call_id)
+                    _child_tool_call_count += 1
+                await _publish_child_progress(
+                    tool_call_count=_child_tool_call_count,
+                    last_tool=tool_name,
+                )
 
             async def _child_progress_callback(
                 call_id: str,
@@ -9831,7 +11471,9 @@ class AgentLoop:
                 # step_todo_write/list snapshots are parsed from the tool result
                 # payload below.
                 nonlocal _child_tool_call_count
-                _child_tool_call_count += 1
+                if call_id not in _child_seen_tool_calls:
+                    _child_seen_tool_calls.add(call_id)
+                    _child_tool_call_count += 1
                 progress_todos: list[dict[str, Any]] = []
                 result_content = _rest[0] if _rest and isinstance(_rest[0], str) else None
                 if tool_name in {STEP_TODO_WRITE, STEP_TODO_LIST} and result_content:
@@ -9848,17 +11490,10 @@ class AgentLoop:
                     or tool_name in {STEP_TODO_WRITE, STEP_TODO_LIST}
                 )
                 if progress_due or progress_todos:
-                    await _event_bus.publish(
-                        Event(
-                            type=EventType.DELEGATION_PROGRESS,
-                            data={
-                                "conversation_id": _conv_id,
-                                "child_session_id": _child_session_id,
-                                "tool_call_count": _child_tool_call_count,
-                                "last_tool": tool_name,
-                                "todos": progress_todos,
-                            },
-                        )
+                    await _publish_child_progress(
+                        tool_call_count=_child_tool_call_count,
+                        last_tool=tool_name,
+                        todos=progress_todos,
                     )
 
             output = await self._run_child_session(
@@ -9873,7 +11508,15 @@ class AgentLoop:
                 working_directory_explicit=ctx.working_directory_explicit,
                 deliverable_step_run_id=ctx.step_run_id,
                 controller_tool_surface=ctx.controller_tool_surface,
+                on_tool_call=_child_tool_call_callback,
                 on_tool_result=_child_progress_callback,
+                parent_tool_call_id=tc.call_id,
+                parent_turn_id=ctx.turn_id,
+                parent_assistant_phase_index=parent_tool_phase,
+                parent_turn_cycle_index=parent_tool_cycle,
+                parent_session=ctx.session,
+                wait=wait,
+                delegation_started_at=delegation_started_at,
             )
             duration_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
             if output:
@@ -9898,6 +11541,7 @@ class AgentLoop:
                     "status": "completed",
                     "session_id": child_session.session_id,
                     "duration_ms": duration_ms,
+                    "started_at": delegation_started_at,
                     "summary": output.summary,
                     "result": result_text,
                     "outputs": output.outputs,
@@ -9933,6 +11577,7 @@ class AgentLoop:
                             "status": "failed",
                             "session_id": child_session.session_id,
                             "duration_ms": duration_ms,
+                            "started_at": delegation_started_at,
                             "message": "Sub-session failed to complete.",
                         }
                     ),
@@ -9954,6 +11599,13 @@ class AgentLoop:
                     working_directory_explicit=ctx.working_directory_explicit,
                     deliverable_step_run_id=ctx.step_run_id,
                     controller_tool_surface=ctx.controller_tool_surface,
+                    parent_tool_call_id=tc.call_id,
+                    parent_turn_id=ctx.turn_id,
+                    parent_assistant_phase_index=parent_tool_phase,
+                    parent_turn_cycle_index=parent_tool_cycle,
+                    parent_session=ctx.session,
+                    wait=wait,
+                    delegation_started_at=delegation_started_at,
                 )
             )
             child_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
@@ -10119,8 +11771,12 @@ class AgentLoop:
         user_email = ctx.session.user_email
         controller_conversation_id = ctx.conversation.conversation_id
         controller_session_id = ctx.session.session_id
+        surface_policy = orchestration_surface_policy(getattr(ctx.conversation, "context", None))
 
         def _row_payload(row: Any) -> dict[str, Any]:
+            control_metadata = (
+                row.control_metadata if isinstance(row.control_metadata, dict) else {}
+            )
             return {
                 "link_id": row.link_id,
                 "conversation_id": row.target_conversation_id,
@@ -10135,11 +11791,24 @@ class AgentLoop:
                 "controller_session_id": row.controller_session_id,
                 "last_result_summary": row.last_result_summary,
                 "last_error": row.last_error,
+                "control_metadata": control_metadata,
+                "follow_up_conversation_id": control_metadata.get("follow_up_conversation_id"),
+                "follow_up_session_id": control_metadata.get("follow_up_session_id"),
+                "closed_reason": control_metadata.get("closed_reason"),
                 "created_at": str(row.created_at) if row.created_at else None,
                 "updated_at": str(row.updated_at) if row.updated_at else None,
                 "completed_at": str(row.completed_at) if row.completed_at else None,
                 "closed_at": str(row.closed_at) if row.closed_at else None,
             }
+
+        def _control_metadata_for_new_managed_turn(row: Any) -> dict[str, Any]:
+            control_metadata = (
+                row.control_metadata if isinstance(row.control_metadata, dict) else {}
+            )
+            next_metadata = dict(control_metadata)
+            for key in ("cancelled_by_user", "cancel_source", "cancelled_at"):
+                next_metadata.pop(key, None)
+            return next_metadata
 
         async def _get_link_for_target(conversation_id: str) -> Any | None:
             async with self.session_manager.session_factory() as db:
@@ -10165,6 +11834,29 @@ class AgentLoop:
             )
 
         _WAIT_UNSET = object()
+
+        def _managed_wait_arg() -> bool | ToolResult:
+            raw_wait = tc.arguments.get("wait", _WAIT_UNSET)
+            if raw_wait is _WAIT_UNSET:
+                return not surface_policy.expose_managed_conversation_wait_option
+            wait = bool(raw_wait)
+            if wait is False and not surface_policy.allow_managed_conversation_wait_false:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "code": "managed_conversation_async_not_allowed",
+                            "message": (
+                                "agent_conversation_*(wait=false) is not available in "
+                                "this conversation context. Use joined managed-conversation "
+                                "work or choose a valid conversation-specific orchestration "
+                                "option."
+                            ),
+                        }
+                    ),
+                    is_error=True,
+                )
+            return wait
 
         self_outer = self
 
@@ -10211,7 +11903,7 @@ class AgentLoop:
                     return _noop
                 raise AttributeError(name)
 
-        async def _last_user_message_for_retry(link: Any) -> str | None:
+        async def _last_user_message_for_retry(link: Any) -> ManagedConversationRetryMessage | None:
             return await last_managed_conversation_user_message_for_retry(
                 session_cache=self.session_cache,
                 guardrails=self.providers.guardrails,
@@ -10345,7 +12037,9 @@ class AgentLoop:
                 )
             title = str(tc.arguments.get("title") or "").strip()
             initial_message = str(tc.arguments.get("initial_message") or "").strip()
-            wait = bool(tc.arguments.get("wait", False))
+            wait = _managed_wait_arg()
+            if isinstance(wait, ToolResult):
+                return wait
             if not agent_id or not title or not initial_message:
                 return ToolResult(
                     output=json.dumps(
@@ -10523,7 +12217,9 @@ class AgentLoop:
                     ),
                     is_error=True,
                 )
-            wait = bool(tc.arguments.get("wait", False))
+            wait = _managed_wait_arg()
+            if isinstance(wait, ToolResult):
+                return wait
             was_active = self._turn_scheduler.has_active_turn(conversation_id)
             queued_completion: asyncio.Future[Any] | None = None
             turn_observers: tuple[Any, ...] = ()
@@ -10560,6 +12256,7 @@ class AgentLoop:
                         turn_state="running",
                         notify_on_completion=not wait,
                         last_error=None,
+                        control_metadata=_control_metadata_for_new_managed_turn(link),
                     )
                     await db.commit()
             error = await self._turn_scheduler.submit_turn(
@@ -10666,8 +12363,8 @@ class AgentLoop:
                     ),
                     is_error=True,
                 )
-            message = await _last_user_message_for_retry(link)
-            if not message:
+            retry_message = await _last_user_message_for_retry(link)
+            if retry_message is None:
                 return ToolResult(
                     output=json.dumps(
                         {
@@ -10679,7 +12376,9 @@ class AgentLoop:
                     ),
                     is_error=True,
                 )
-            wait = bool(tc.arguments.get("wait", False))
+            wait = _managed_wait_arg()
+            if isinstance(wait, ToolResult):
+                return wait
             async with self.session_manager.session_factory() as db:
                 link = await queries.update_managed_conversation_link(
                     db,
@@ -10688,12 +12387,14 @@ class AgentLoop:
                     turn_state="running",
                     notify_on_completion=not wait,
                     last_error=None,
+                    control_metadata=_control_metadata_for_new_managed_turn(link),
                 )
                 await db.commit()
             error = await self._turn_scheduler.submit_turn(
                 conversation_id,
-                message,
+                retry_message.content,
                 user_email=user_email,
+                one_shot_chat_mode=retry_message.one_shot_chat_mode,
             )
             active_turn_id = self._turn_scheduler.active_turn_id(conversation_id)
             if error is not None or active_turn_id is not None:
@@ -10918,7 +12619,9 @@ class AgentLoop:
                     is_error=True,
                 )
             message = str(tc.arguments.get("message") or "").strip()
-            wait = bool(tc.arguments.get("wait", False))
+            wait = _managed_wait_arg()
+            if isinstance(wait, ToolResult):
+                return wait
             async with self.session_manager.session_factory() as db:
                 new_link = await queries.create_managed_conversation_link(
                     db,
@@ -11208,12 +12911,16 @@ class AgentLoop:
 
                 # Record delegation event so the card appears in session
                 # history on page refresh.
+                _task_tool_phase = tc.runtime_metadata.get("assistant_phase_index")
                 events_to_record.append(
                     SessionEvent(
                         type="delegation",
                         data={
                             "mode": "task",
                             "call_id": tc.call_id,
+                            "assistant_phase_index": _task_tool_phase
+                            if isinstance(_task_tool_phase, int)
+                            else None,
                             "task": task.title,
                             "agent_profile_id": task.agent_profile_id,
                             "child_session_id": task.task_id,
@@ -11231,6 +12938,10 @@ class AgentLoop:
                             "conversation_id": ctx.conversation.conversation_id,
                             "parent_session_id": ctx.session.session_id,
                             "turn_id": ctx.turn_id,
+                            "call_id": tc.call_id,
+                            "assistant_phase_index": _task_tool_phase
+                            if isinstance(_task_tool_phase, int)
+                            else None,
                             "child_session_id": task.task_id,
                             "mode": "task",
                             "agent_id": task.agent_id,
@@ -11649,12 +13360,14 @@ class AgentLoop:
                         ),
                         is_error=True,
                     )
-                if (
-                    not pauses
-                    and task_row.status in ("failed", "paused")
-                    and requested_action == "retry"
-                ):
-                    await task_queue.retry_failed_task(task_id)
+                if not pauses and task_row.status == "failed" and requested_action == "retry":
+                    try:
+                        await task_queue.retry_failed_task(task_id)
+                    except ValueError as retry_exc:
+                        return ToolResult(
+                            output=json.dumps({"error": str(retry_exc)}),
+                            is_error=True,
+                        )
                     return ToolResult(
                         output=json.dumps(
                             {
@@ -13094,12 +14807,16 @@ class AgentLoop:
                 await _cleanup_created_workflows()
                 return ToolResult(output=json.dumps({"error": str(exc)}), is_error=True)
             task_id = task.task_id
+            _compose_tool_phase = tc.runtime_metadata.get("assistant_phase_index")
             events_to_record.append(
                 SessionEvent(
                     type="delegation",
                     data={
                         "mode": "task",
                         "call_id": tc.call_id,
+                        "assistant_phase_index": _compose_tool_phase
+                        if isinstance(_compose_tool_phase, int)
+                        else None,
                         "task": task.title,
                         "child_session_id": task.task_id,
                         "status": "started",
@@ -13113,6 +14830,10 @@ class AgentLoop:
                         "conversation_id": ctx.conversation.conversation_id,
                         "parent_session_id": ctx.session.session_id,
                         "turn_id": ctx.turn_id,
+                        "call_id": tc.call_id,
+                        "assistant_phase_index": _compose_tool_phase
+                        if isinstance(_compose_tool_phase, int)
+                        else None,
                         "child_session_id": task.task_id,
                         "mode": "task",
                         "agent_id": task.agent_id,
@@ -13222,6 +14943,7 @@ class AgentLoop:
         events: list[SessionEvent],
         *,
         reason: str,
+        nonce: int | None = None,
     ) -> str:
         payload = json.dumps(
             [{"type": event.type, "data": event.data} for event in events],
@@ -13229,24 +14951,33 @@ class AgentLoop:
             separators=(",", ":"),
         )
         digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]  # noqa: S324
-        return f"{session_id}:{reason}:{digest}"
+        if nonce is None:
+            return f"{session_id}:{reason}:{digest}"
+        # The nonce distinguishes two DISTINCT batches with byte-identical
+        # content in the same step (e.g. two identical system notices).
+        # Without it, Intaris's idempotency ledger silently drops the second
+        # batch. Retries of the same batch reuse the key because it is
+        # computed once per _record_events_strict call.
+        return f"{session_id}:{reason}:{digest}:{nonce}"
 
     async def _wait_for_intaris_recovery(
         self,
         ctx: StepContext,
         *,
         operation: str,
+        max_wait_seconds: float = _INTARIS_MAX_RECOVERY_WAIT_SECONDS,
         on_token: TokenCallback | None = None,
     ) -> None:
         notified = False
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _INTARIS_MAX_RECOVERY_WAIT_SECONDS
+        bounded_wait_seconds = max(1.0, min(max_wait_seconds, _INTARIS_MAX_RECOVERY_WAIT_SECONDS))
+        deadline = loop.time() + bounded_wait_seconds
         while True:
             self._raise_if_cancelled(ctx)
             if loop.time() >= deadline:
                 raise TimeoutError(
                     f"Timed out waiting for Intaris recovery during {operation} after "
-                    f"{int(_INTARIS_MAX_RECOVERY_WAIT_SECONDS)}s"
+                    f"{int(bounded_wait_seconds)}s"
                 )
             try:
                 health = await self.providers.guardrails.health()
@@ -13265,7 +14996,12 @@ class AgentLoop:
                     },
                 )
                 if on_token is not None:
-                    await on_token("\n\n[Paused waiting for Intaris to recover.]\n\n")
+                    await _emit_token(
+                        on_token,
+                        "\n\n"
+                        f"[Paused waiting for Intaris to recover; retrying for up to {int(bounded_wait_seconds)}s.]\n\n",
+                        ctx.current_turn_cycle_index,
+                    )
                 notified = True
             if ctx.cancel_event is None:
                 await asyncio.sleep(_INTARIS_RETRY_POLL_SECONDS)
@@ -13288,7 +15024,10 @@ class AgentLoop:
             return False
         batch = with_session_events_turn_id(events, ctx.turn_id)
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
-        idempotency_key = self._intaris_batch_idempotency_key(intaris_id, batch, reason=reason)
+        ctx.intaris_batch_counter += 1
+        idempotency_key = self._intaris_batch_idempotency_key(
+            intaris_id, batch, reason=reason, nonce=ctx.intaris_batch_counter
+        )
         while True:
             self._raise_if_cancelled(ctx)
             try:
@@ -13308,7 +15047,11 @@ class AgentLoop:
                         ctx.remember_assistant_event_seq = next_seq
                     next_seq += 1
                 await self.session_cache.append_recorded_events(ctx.session, batch, append_result)
-                events.clear()
+                # Delete only the snapshotted prefix: the Intaris append (and
+                # a potentially minutes-long recovery wait) may have allowed
+                # concurrent orchestration handlers to append new events to
+                # the shared list. events.clear() would silently drop them.
+                del events[: len(batch)]
                 return True
             except Exception as exc:
                 if not is_retryable_http_error(exc):
@@ -13324,7 +15067,15 @@ class AgentLoop:
                     },
                     exc_info=True,
                 )
-                await self._wait_for_intaris_recovery(ctx, operation=reason, on_token=on_token)
+                await self._wait_for_intaris_recovery(
+                    ctx,
+                    operation=reason,
+                    max_wait_seconds=min(
+                        _INTARIS_MAX_RECOVERY_WAIT_SECONDS,
+                        max(1.0, self.default_step_timeout_seconds / 4),
+                    ),
+                    on_token=on_token,
+                )
 
     async def _record_outgoing_audit_messages(
         self,
@@ -13554,6 +15305,16 @@ class AgentLoop:
                                 for key, value in {
                                     "comment_id": item.get("comment_id"),
                                     "author_email": item.get("author_email"),
+                                    # Persist the client/queue identity so the
+                                    # canonical projection produces the same
+                                    # item id (user:{client_message_id}) as the
+                                    # optimistic bubble and the live WS event.
+                                    # Without it the optimistic message never
+                                    # confirms — duplicating or vanishing on
+                                    # refresh.
+                                    "client_message_id": item.get("client_message_id"),
+                                    "queue_id": item.get("queue_id"),
+                                    "message_id": item.get("client_message_id"),
                                 }.items()
                                 if value is not None
                             },
@@ -13644,6 +15405,11 @@ class AgentLoop:
         *,
         on_token: TokenCallback | None = None,
     ) -> Any:
+        # Skip reasoning report when guardrails are disabled for this agent.
+        capabilities = getattr(ctx.agent, "capabilities", None)
+        if capabilities is not None and not capabilities.guardrails_enabled:
+            return None
+
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
         while True:
             self._raise_if_cancelled(ctx)
@@ -13751,7 +15517,7 @@ class AgentLoop:
             return False
 
         ctx.todos = cancelled
-        await self._persist_step_todos(ctx)
+        await self._persist_todos(ctx)
 
         tc = ToolCall(
             call_id=f"controller_cancel_todos_{uuid.uuid4().hex[:12]}",
@@ -14503,7 +16269,13 @@ class AgentLoop:
         except Exception:
             return None
 
-    def _install_active_executor_target(self, ctx: StepContext, target: Any) -> bool:
+    def _install_active_executor_target(
+        self,
+        ctx: StepContext,
+        target: Any,
+        *,
+        update_conversation: bool = True,
+    ) -> bool:
         """Update turn-local runtime routing after a successful executor switch."""
 
         target_executor_id = getattr(target, "executor_id", None)
@@ -14514,8 +16286,9 @@ class AgentLoop:
         target_executor_type = target_executor_type if isinstance(target_executor_type, str) else ""
 
         ctx.active_executor_id = target_executor_id
-        with contextlib.suppress(Exception):
-            ctx.conversation.active_executor_id = target_executor_id
+        if update_conversation:
+            with contextlib.suppress(Exception):
+                ctx.conversation.active_executor_id = target_executor_id
 
         if target_executor_type != "websocket":
             return False
@@ -14637,7 +16410,17 @@ class AgentLoop:
             "anchor_count": anchor_count if isinstance(anchor_count, int) else 0,
             "transport_truncated": False,
         }
-        normalized_result_attachments = normalize_attachment_refs(result.attachments or [])
+        # Collect artifact_ids flagged as inspection-only BEFORE normalization strips the flag.
+        # These are injected into the next LLM cycle but must not reach channel delivery.
+        _raw_attachments = result.attachments or []
+        _inspection_only_ids: set[str] = {
+            str(a["artifact_id"])
+            for a in _raw_attachments
+            if isinstance(a, dict)
+            and a.get("native_inspection_only")
+            and isinstance(a.get("artifact_id"), str)
+        }
+        normalized_result_attachments = normalize_attachment_refs(_raw_attachments)
         safe_result_attachments = strip_attachment_payload_bytes(normalized_result_attachments)
         events_to_record.append(
             SessionEvent(
@@ -14665,6 +16448,7 @@ class AgentLoop:
                     "attachments": safe_result_attachments,
                     "agent_visible": True,
                     "view_kind": "model_tool_result",
+                    "turn_cycle_index": tc.runtime_metadata.get("turn_cycle_index"),
                     "agent_visible_truncated": bool(
                         result.metadata and result.metadata.get("truncated")
                     )
@@ -14692,18 +16476,30 @@ class AgentLoop:
         )
         ws_preview = ws_presentation.result
         if on_tool_result:
-            await on_tool_result(
-                tc.call_id,
-                tc.name,
-                ws_preview,
-                result.is_error,
-                result.duration_ms,
-                eval_meta,
-                safe_result_attachments or None,
-                file_diffs or None,
-                ws_presentation.event_fields(),
+            await _emit_tool_result_callback(
+                on_tool_result,
+                call_id=tc.call_id,
+                tool_name=tc.name,
+                result=ws_preview,
+                is_error=result.is_error,
+                duration_ms=result.duration_ms,
+                evaluation=eval_meta,
+                attachments=safe_result_attachments or None,
+                file_diffs=file_diffs or None,
+                presentation=ws_presentation.event_fields(),
+                turn_cycle_index=tc.runtime_metadata.get("turn_cycle_index"),
             )
         if normalized_result_attachments:
+            # Inspection-only attachments (e.g. artifact_read native path) are
+            # injected into the next LLM cycle via _build_tool_attachment_context
+            # but must NOT be echoed back to the channel as outbound media.
+            deliverable_attachments = [
+                a
+                for a in normalized_result_attachments
+                if not (
+                    isinstance(a, dict) and str(a.get("artifact_id", "")) in _inspection_only_ids
+                )
+            ]
             # Deduplicate by artifact_id against what the user already sent and what
             # has been collected earlier in this turn.  This prevents artifact_get_url
             # and similar tools from echoing an artifact that the user originally
@@ -14720,12 +16516,12 @@ class AgentLoop:
             )
             new_result_attachments = [
                 a
-                for a in normalized_result_attachments
+                for a in deliverable_attachments
                 if not (isinstance(a, dict) and str(a.get("artifact_id", "")) in seen_ids)
             ]
-            # Always track in collected_attachments (used for step_output.attachments and
-            # message_complete WS event) but only promote NEW artifacts to the message.
-            collected_attachments.extend(normalized_result_attachments)
+            # Only track deliverable (non-inspection) attachments in collected_attachments
+            # (used for step_output.attachments and message_complete WS event).
+            collected_attachments.extend(deliverable_attachments)
             pending_assistant_attachments.extend(new_result_attachments)
         activation_notice: str | None = None
         if result.metadata:
@@ -14767,6 +16563,7 @@ class AgentLoop:
                 or agent_visible_truncated,
             }
         )
+        record_tool_result(ctx.loop_guard_state, tc.name, tc.arguments, result.output)
         attachment_context = self._build_tool_attachment_context(ctx, tc, result.attachments)
         if attachment_context is not None:
             attachment_context["_recovery_call_id"] = recovery_call_id
@@ -14873,7 +16670,9 @@ class AgentLoop:
         pressure_mode: ProjectionPressureMode = "normal",
         available_prompt_tokens: int | None = None,
         prior_turn_state: ProjectionTurnState | None = None,
-    ) -> list[dict[str, Any]]:
+        cache_breakpoint_index: int | None = None,
+        anthropic_cache_ttl: str = DEFAULT_ANTHROPIC_CACHE_TTL,
+    ) -> ProjectedMessages:
         """Project rich working history into a compact model-facing transcript."""
 
         policy = ProjectionPolicy.from_budget(
@@ -14888,11 +16687,13 @@ class AgentLoop:
             policy=policy,
             prior_state=prior_turn_state,
         )
-        token_counter = None
+        token_counter: Callable[[str], int] | None = None
         if resolved_model:
 
-            def token_counter(text: str, _m: str = resolved_model) -> int:
-                return self.providers.llm.count_tokens(text, _m)
+            def _llm_token_counter(text: str, _m: str = resolved_model) -> int:
+                return int(self.providers.llm.count_tokens(text, _m))
+
+            token_counter = _llm_token_counter
 
         pruned = prune_tool_outputs(
             projection.messages,
@@ -14900,7 +16701,17 @@ class AgentLoop:
             token_counter=token_counter,
             policy=policy,
         )
-        return [_strip_internal_message_fields(message) for message in pruned]
+        return ProjectedMessages(
+            messages=[_strip_internal_message_fields(message) for message in pruned],
+            snapshot=None,
+            mode=pressure_mode,
+            policy=policy,
+            cache_breakpoints=_cycle_cache_breakpoints(
+                pruned,
+                prefix_index=cache_breakpoint_index,
+                ttl=anthropic_cache_ttl,
+            ),
+        )
 
     def _project_model_messages_for_budget(
         self,
@@ -14910,6 +16721,8 @@ class AgentLoop:
         tool_schemas: list[dict[str, Any]],
         resolved_model: str,
         max_context_tokens: int,
+        cache_breakpoint_index: int | None = None,
+        anthropic_cache_ttl: str = DEFAULT_ANTHROPIC_CACHE_TTL,
     ) -> ProjectedMessages:
         """Project messages using the conditional within-turn pipeline.
 
@@ -14957,13 +16770,37 @@ class AgentLoop:
             len(json.dumps(t, default=str)) // 4 for t in tool_schemas if isinstance(t, dict)
         )
         total_estimated = estimated_tokens + tool_schema_tokens
+        new_tail_for_estimate = (
+            messages[turn_state.last_message_count :]
+            if turn_state.last_result is not None
+            else messages
+        )
+        new_tail_estimated_tokens = _estimated_messages_tokens(new_tail_for_estimate)
+        projected_base_tokens = (
+            turn_state.last_projected_token_estimate
+            if turn_state.last_projected_token_estimate > 0
+            else estimated_tokens
+        )
+        skip_candidate_estimate = (
+            projected_base_tokens + new_tail_estimated_tokens + tool_schema_tokens
+        )
+        last_appended_tool_estimate = 0
+        for tail_message in reversed(new_tail_for_estimate):
+            if tail_message.get("role") == "tool":
+                try:
+                    last_appended_tool_estimate = int(tail_message.get(TOKEN_ESTIMATE) or 0)
+                except (TypeError, ValueError):
+                    last_appended_tool_estimate = 0
+                break
 
         pressure_snap = PressureSnapshot(
             prompt_tokens=total_estimated,
             available_prompt_tokens=budget.available_prompt_tokens,
             steady_target_tokens=turn_state.policy.steady_target_tokens,
             hard_prompt_tokens=turn_state.policy.hard_prompt_tokens,
-            oversized_result_appended=False,  # refined below if needed
+            oversized_result_appended=(
+                last_appended_tool_estimate > turn_state.policy.max_historical_tool_result_tokens
+            ),
             cycle_index=turn_state.reproject_count + turn_state.skip_count,
         )
 
@@ -14980,7 +16817,7 @@ class AgentLoop:
         decision = should_reproject(
             new_message_count=len(messages),
             last_message_count=turn_state.last_message_count,
-            new_token_estimate=total_estimated,
+            new_token_estimate=skip_candidate_estimate,
             steady_target_tokens=turn_state.policy.steady_target_tokens,
             pressure_mode=new_mode,
             prior_pressure_mode=prior_mode,
@@ -15011,11 +16848,22 @@ class AgentLoop:
                     max_context_tokens=max_context_tokens,
                 )
                 skipped_projection = ProjectedMessages(
-                    messages=result.messages, snapshot=snapshot, mode=str(new_mode), policy=policy
+                    messages=result.messages,
+                    snapshot=snapshot,
+                    mode=str(new_mode),
+                    policy=policy,
+                    cache_breakpoints=_cycle_cache_breakpoints(
+                        messages,
+                        prefix_index=cache_breakpoint_index,
+                        ttl=anthropic_cache_ttl,
+                    ),
                 )
                 if not self._projection_exceeded_selected_budget(skipped_projection):
                     turn_state.last_result = result
                     turn_state.last_message_count = len(messages)
+                    turn_state.last_projected_token_estimate = _estimated_messages_tokens(
+                        skipped_projection.messages
+                    )
                     turn_state.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(
                         messages
                     )
@@ -15090,19 +16938,21 @@ class AgentLoop:
                 messages=messages,
                 resolved_model=resolved_model,
                 max_context_tokens=max_context_tokens,
-                pressure_mode=str(mode),
+                pressure_mode=cast(Any, mode),
                 available_prompt_tokens=budget.available_prompt_tokens,
                 prior_turn_state=turn_state,
+                cache_breakpoint_index=cache_breakpoint_index,
+                anthropic_cache_ttl=anthropic_cache_ttl,
             )
             snapshot = self._context_pressure_snapshot(
                 ctx,
-                messages=projected,
+                messages=projected.messages,
                 tool_schemas=tool_schemas,
                 max_context_tokens=max_context_tokens,
             )
-            last_projection = ProjectedMessages(
-                messages=projected, snapshot=snapshot, mode=str(mode), policy=policy
-            )
+            projected.snapshot = snapshot
+            projected.policy = policy
+            last_projection = projected
             if not self._projection_exceeded_selected_budget(last_projection):
                 if mode != PressureMode.normal:
                     self._log_projection_pressure_recovery(ctx, projection=last_projection)
@@ -15115,6 +16965,9 @@ class AgentLoop:
 
         # Update turn state.
         turn_state.last_message_count = len(messages)
+        turn_state.last_projected_token_estimate = _estimated_messages_tokens(
+            last_projection.messages
+        )
         turn_state.last_prefix_fingerprint = tool_transcript_prefix_fingerprint(messages)
         turn_state.reproject_count += 1
         if last_projection.policy is not None:
@@ -15227,7 +17080,7 @@ class AgentLoop:
                 reason="no_budget",
                 reserve_clamped=budget.reserve_clamped,
             )
-        threshold_prompt_tokens = int(available_prompt_tokens * 0.95)
+        threshold_prompt_tokens = int(available_prompt_tokens * LOOP_PRESSURE_THRESHOLD_RATIO)
         return ContextPressureSnapshot(
             prompt_tokens=prompt_tokens,
             max_context_tokens=max_context_tokens,
@@ -15241,7 +17094,7 @@ class AgentLoop:
             reserve_clamped=budget.reserve_clamped,
         )
 
-    def _store_context_usage_snapshot(
+    async def _store_context_usage_snapshot(
         self,
         ctx: StepContext,
         *,
@@ -15288,6 +17141,13 @@ class AgentLoop:
                 available_prompt_tokens=snapshot.available_prompt_tokens,
                 model=ctx.current_model or "",
             )
+        if ctx.on_context_usage is not None:
+            if hasattr(self.session_cache, "get_context_usage"):
+                usage = self.session_cache.get_context_usage(ctx.session.session_id)
+            else:
+                usage = None
+            if usage is not None:
+                await ctx.on_context_usage(usage)
 
     def _maybe_log_context_reserve_clamp(
         self,
@@ -15315,6 +17175,120 @@ class AgentLoop:
                     "available_prompt_tokens": snapshot.available_prompt_tokens,
                 }
             },
+        )
+
+    async def _stale_session_step_output(
+        self,
+        ctx: StepContext,
+        *,
+        phase: str,
+    ) -> StepOutput | None:
+        """Stop stale root turns before they persist output or dispatch tools.
+
+        Session rotation completes the old root session and moves the
+        conversation active pointer to a new root.  A concurrent old agent loop
+        can still receive an LLM response after that happens.  It must not run
+        that response against the now-completed Intaris session.
+        """
+
+        if getattr(ctx.session, "parent_session_id", None) is not None:
+            return None
+
+        session_factory = getattr(self.session_manager, "session_factory", None)
+        if session_factory is None:
+            return None
+
+        try:
+            from cognis.store.queries import get_conversation, get_session_row
+
+            async with session_factory() as db_session:
+                conversation_row = await get_conversation(
+                    db_session, ctx.conversation.conversation_id
+                )
+                session_row = await get_session_row(db_session, ctx.session.session_id)
+                active_session_id = (
+                    getattr(conversation_row, "active_session_id", None)
+                    if conversation_row is not None
+                    else getattr(ctx.conversation, "active_session_id", None)
+                )
+                session_status = (
+                    str(getattr(session_row, "status", "") or "")
+                    if session_row is not None
+                    else str(getattr(ctx.session, "status", "") or "")
+                )
+                completion_reason = (
+                    getattr(session_row, "completion_reason", None)
+                    if session_row is not None
+                    else getattr(ctx.session, "completion_reason", None)
+                )
+        except Exception:
+            logger.warning(
+                "agent: failed to verify active session before continuing step",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "conversation_id": ctx.conversation.conversation_id,
+                        "phase": phase,
+                    }
+                },
+                exc_info=True,
+            )
+            return None
+
+        rotated = bool(active_session_id and active_session_id != ctx.session.session_id)
+        terminal = session_status in _TERMINAL_SESSION_STATUSES
+        if not rotated and not terminal:
+            return None
+
+        reason = "session_rotated" if rotated else "session_terminal"
+        message = (
+            "Stopped a stale turn before tool dispatch because the conversation "
+            "has already moved to a fresh session."
+            if rotated
+            else "Stopped a stale turn before tool dispatch because the session is terminal."
+        )
+        logger.warning(
+            "agent: stale session blocked before step continuation",
+            extra={
+                "extra_data": {
+                    "session_id": ctx.session.session_id,
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "active_session_id": active_session_id,
+                    "session_status": session_status,
+                    "completion_reason": completion_reason,
+                    "phase": phase,
+                    "reason": reason,
+                }
+            },
+        )
+        await self.event_bus.publish(
+            Event(
+                type=EventType.SYSTEM_NOTICE,
+                data={
+                    "conversation_id": ctx.conversation.conversation_id,
+                    "session_id": ctx.session.session_id,
+                    "turn_id": ctx.turn_id,
+                    "message": message,
+                    "text": message,
+                    "active_session_id": active_session_id,
+                    "reason": reason,
+                },
+            )
+        )
+        return StepOutput(
+            summary=message,
+            content="",
+            metadata={
+                "interrupted": True,
+                "continuation_reason": reason,
+                "phase": phase,
+                "active_session_id": active_session_id,
+                "session_status": session_status,
+                "completion_reason": completion_reason,
+            },
+            session_id=ctx.session.session_id,
+            intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+            completed_at=datetime.now(UTC),
         )
 
     async def _execute_regular_tool_batch(
@@ -15469,15 +17443,23 @@ class AgentLoop:
     ) -> None:
         """Emit a visible recovery notice and optionally persist it durably."""
 
-        notice_data = {
-            "conversation_id": ctx.conversation.conversation_id,
-            "session_id": ctx.session.session_id,
-            "turn_id": ctx.turn_id,
-            "message": message,
-            "text": message,
-        }
-        if metadata:
-            notice_data.update(metadata)
+        kind = str((metadata or {}).get("kind") or "model_recovery")
+        raw_notice_id = (metadata or {}).get("notice_id")
+        notice_id = raw_notice_id if isinstance(raw_notice_id, str) and raw_notice_id else None
+        notice_data = _system_notice_data(
+            message,
+            kind=kind,
+            turn_id=ctx.turn_id,
+            notice_id=notice_id,
+            metadata=metadata,
+        )
+        notice_data.update(
+            {
+                "conversation_id": ctx.conversation.conversation_id,
+                "session_id": ctx.session.session_id,
+                "text": message,
+            }
+        )
         await self.event_bus.publish(
             Event(
                 type=EventType.SYSTEM_NOTICE,
@@ -15486,15 +17468,12 @@ class AgentLoop:
         )
         if not persist:
             return
-        lifecycle_data = {"event": "system_notice", "message": message, "turn_id": ctx.turn_id}
-        if metadata:
-            lifecycle_data.update(metadata)
         await self._record_events_strict(
             ctx,
             [
                 SessionEvent(
                     type="lifecycle",
-                    data=lifecycle_data,
+                    data=notice_data,
                 )
             ],
             reason=record_reason,
@@ -15621,13 +17600,16 @@ class AgentLoop:
         if not compaction_result.compacted:
             return None
         try:
-            new_session = await self.session_manager.rotate_session(
-                conversation_id=ctx.conversation.conversation_id,
-                current_session=ctx.session,
-                intention="Continued conversation",
-                completion_reason="compacted",
-                compaction_summary=compaction_result.summary,
-                tail_events=getattr(compaction_result, "preserved_tail_events", None),
+            new_session = cast(
+                SessionModel,
+                await self.session_manager.rotate_session(
+                    conversation_id=ctx.conversation.conversation_id,
+                    current_session=ctx.session,
+                    intention="Continued conversation",
+                    completion_reason="compacted",
+                    compaction_summary=compaction_result.summary,
+                    tail_events=getattr(compaction_result, "preserved_tail_events", None),
+                ),
             )
             ROTATION_TOTAL.labels(trigger=trigger).inc()
         except Exception:
@@ -15695,6 +17677,29 @@ class AgentLoop:
                         exc_info=True,
                     )
 
+        try:
+            from cognis.store.queries import copy_session_todos
+
+            async with self.session_manager.session_factory() as db_session:
+                copied_todos = await copy_session_todos(
+                    db_session,
+                    source_session_id=ctx.session.session_id,
+                    target_session_id=new_session.session_id,
+                )
+                await db_session.commit()
+            ctx.todos = _normalize_todos(copied_todos)
+        except Exception:
+            logger.warning(
+                "agent: failed to copy session todos after compaction",
+                extra={
+                    "extra_data": {
+                        "old_session_id": ctx.session.session_id,
+                        "new_session_id": new_session.session_id,
+                    }
+                },
+                exc_info=True,
+            )
+
         summary_preview = (compaction_result.summary or "")[:500]
         if run is not None:
             run.status = "compacted"
@@ -15734,6 +17739,13 @@ class AgentLoop:
         like automatic compaction — running compaction after a failed write
         would lose the current turn's events.
         """
+        if ctx.finalized_by_recovery:
+            logger.info(
+                "Skipping duplicate step finalization after recovery for step %s in session %s",
+                ctx.step_definition.name,
+                ctx.session.session_id,
+            )
+            return True
         if not events:
             # Events may have been flushed incrementally — still dispatch
             # Mnemory remember using the accumulated assistant content.
@@ -15803,6 +17815,91 @@ class AgentLoop:
                 extra={"extra_data": {"session_id": ctx.session.session_id}},
                 exc_info=True,
             )
+
+    async def _resolve_compaction_model_context(
+        self,
+        ctx: StepContext,
+    ) -> CompactionModelContext:
+        """Return a concrete model context for same-session compaction routes.
+
+        Pre-turn auto-compaction can run before the normal model-call path sets
+        ``ctx.current_model``/``ctx.current_provider_id``. The compaction route
+        may still be configured as ``__same_session_model__``; resolve the
+        default turn model here so compaction never forwards the sentinel to the
+        provider layer.
+        """
+
+        model_context = _compaction_model_context(ctx)
+        if model_context.model:
+            return model_context
+
+        resolved_agent_profile = resolve_agent_profile(
+            ctx.agent,
+            requested_agent_profile_id(ctx.session, ctx.conversation),
+            source="conversation",
+        )
+        model_override = self.session_cache.get_model_override(ctx.session.session_id)
+        model_override_provider_id = self.session_cache.get_model_override_provider_id(
+            ctx.session.session_id
+        )
+        if model_override:
+            model_for_llm = model_override
+            provider_for_llm = model_override_provider_id
+        else:
+            model_for_llm = resolved_agent_profile.model or (
+                ctx.agent.llm_config.model if ctx.agent.llm_config else None
+            )
+            provider_for_llm = resolved_agent_profile.provider_id or (
+                ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
+            )
+        reasoning_effort = (
+            self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
+            or getattr(ctx.step_definition, "reasoning_effort", None)
+            or resolved_agent_profile.reasoning_effort
+            or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
+        )
+        if reasoning_effort:
+            ctx.runtime_info["current_reasoning_effort"] = reasoning_effort
+
+        current_provider_id: str | None = None
+        if hasattr(self.providers.llm, "resolve_model_target"):
+            try:
+                current_model, raw_provider_id = await self.providers.llm.resolve_model_target(
+                    explicit_model=model_for_llm,
+                    task_type="default",
+                    explicit_provider_id=provider_for_llm,
+                    acting_user_email=ctx.session.user_email,
+                )
+            except TypeError:
+                current_model, raw_provider_id = await self.providers.llm.resolve_model_target(
+                    explicit_model=model_for_llm,
+                    task_type="default",
+                )
+            current_provider_id = _resolved_provider_id(raw_provider_id)
+        else:
+            try:
+                current_model = await self.providers.llm.resolve_model(
+                    explicit_model=model_for_llm,
+                    task_type="default",
+                    explicit_provider_id=provider_for_llm,
+                    acting_user_email=ctx.session.user_email,
+                )
+            except TypeError:
+                current_model = await self.providers.llm.resolve_model(
+                    explicit_model=model_for_llm,
+                    task_type="default",
+                )
+
+        if not current_model:
+            raise RuntimeError("Could not resolve model context for same-session compaction")
+
+        ctx.current_model = current_model
+        ctx.current_provider_id = current_provider_id
+        return CompactionModelContext(
+            model=current_model,
+            provider_id=current_provider_id,
+            reasoning_effort=reasoning_effort,
+        )
 
     async def _auto_compact(
         self,
@@ -15897,21 +17994,59 @@ class AgentLoop:
 
         with AUTO_COMPACTION_DURATION.time():
             try:
-                model_context = _compaction_model_context(ctx)
-                compaction_result = await asyncio.wait_for(
-                    self.compaction_strategy.compact(
-                        ctx.session,
-                        trigger=trigger,
-                        model_context=model_context,
-                        long_lived_chat=long_lived_chat,
+                model_context = await self._resolve_compaction_model_context(ctx)
+            except Exception:
+                logger.warning(
+                    "agent: auto-compaction model context resolution failed",
+                    extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    exc_info=True,
+                )
+                await publish_compaction_status(
+                    EventType.SESSION_COMPACTION_FINISHED,
+                    "failed",
+                    fallback_reason="model_context_resolution_failed",
+                )
+                return None
+
+            try:
+                compaction_result = cast(
+                    CompactionResult,
+                    await asyncio.wait_for(
+                        self.compaction_strategy.compact(
+                            ctx.session,
+                            trigger=trigger,
+                            model_context=model_context,
+                            long_lived_chat=long_lived_chat,
+                        ),
+                        timeout=AUTO_COMPACTION_TIMEOUT_SECONDS,
                     ),
-                    timeout=AUTO_COMPACTION_TIMEOUT_SECONDS,
                 )
             except TimeoutError:
                 # The outer wait_for fired before compact()'s own retry loop
-                # could complete.  Fall back to mechanical directly.
+                # could complete.  Fall back to mechanical directly only when
+                # fallback compaction is explicitly enabled.
                 if run is not None:
                     run.used_timeout_fallback = True
+                fallback_enabled = bool(getattr(self.compaction_strategy, "fallback_enabled", True))
+                if not fallback_enabled:
+                    logger.warning(
+                        "agent: auto-compaction timed out; mechanical fallback disabled",
+                        extra={"extra_data": {"session_id": ctx.session.session_id}},
+                    )
+                    if emit_timeout_notice:
+                        await self._emit_compaction_notice(
+                            ctx,
+                            "LLM compaction timed out; mechanical compaction fallback is disabled.",
+                            on_token=on_token,
+                            persist=True,
+                            metadata=(run.event_data() if run is not None else None),
+                        )
+                    await publish_compaction_status(
+                        EventType.SESSION_COMPACTION_FINISHED,
+                        "failed",
+                        fallback_reason="timeout",
+                    )
+                    return None
                 logger.warning(
                     "agent: auto-compaction timed out; using mechanical fallback",
                     extra={"extra_data": {"session_id": ctx.session.session_id}},
@@ -15928,10 +18063,13 @@ class AgentLoop:
                         metadata=(run.event_data() if run is not None else None),
                     )
                 try:
-                    compaction_result = await self.compaction_strategy.compact_with_fallback(
-                        ctx.session,
-                        trigger=f"{trigger}_timeout_fallback",
-                        model_context=model_context,
+                    compaction_result = cast(
+                        CompactionResult,
+                        await self.compaction_strategy.compact_with_fallback(
+                            ctx.session,
+                            trigger=f"{trigger}_timeout_fallback",
+                            model_context=model_context,
+                        ),
                     )
                 except Exception:
                     logger.warning(
@@ -15986,6 +18124,34 @@ class AgentLoop:
 
         return self.session_lock.is_locked(session_id)
 
+    def _consume_auto_compaction_cooldown(self, session_id: str) -> int:
+        entry = self.session_cache.get_entry(session_id)
+        if entry is None:
+            return 0
+        remaining = int(getattr(entry, "auto_compaction_cooldown_turns", 0) or 0)
+        if remaining <= 0:
+            return 0
+        entry.auto_compaction_cooldown_turns = remaining - 1
+        return remaining
+
+    def _set_auto_compaction_cooldown(self, session_id: str) -> None:
+        entry = self.session_cache.get_entry(session_id)
+        if entry is None:
+            return
+        current = int(getattr(entry, "auto_compaction_cooldown_turns", 0) or 0)
+        entry.auto_compaction_cooldown_turns = max(
+            current,
+            COMPACTION_RECURSION_COOLDOWN_TURNS,
+        )
+
+    def _auto_compaction_cooldown_remaining_for_turn(self, ctx: StepContext) -> int:
+        key = "auto_compaction_cooldown_remaining"
+        if key in ctx.runtime_info:
+            return int(ctx.runtime_info.get(key) or 0)
+        remaining = self._consume_auto_compaction_cooldown(ctx.session.session_id)
+        ctx.runtime_info[key] = remaining
+        return remaining
+
     async def run_idle_checkpoint_compaction(
         self,
         *,
@@ -15996,45 +18162,44 @@ class AgentLoop:
     ) -> SessionModel | None:
         """Compact and rotate an idle long-lived chat session when it is substantial."""
 
-        if self.session_is_locked(session.session_id):
-            return None
-        try:
-            await self.session_cache.refresh(session)
-        except Exception:
-            logger.warning(
-                "agent: idle checkpoint cache refresh failed",
-                extra={"extra_data": {"session_id": session.session_id}},
-                exc_info=True,
-            )
-            return None
+        async with self.hold_session_lock(session.session_id):
+            try:
+                await self.session_cache.refresh(session)
+            except Exception:
+                logger.warning(
+                    "agent: idle checkpoint cache refresh failed",
+                    extra={"extra_data": {"session_id": session.session_id}},
+                    exc_info=True,
+                )
+                return None
 
-        ctx = StepContext(
-            step_definition=StepDefinition(name="direct", type="run", prompt=""),
-            session=session,
-            conversation=conversation,
-            agent=agent,
-            policy=CHAT_POLICY,
-        )
-        run = CompactionRunContext(
-            trigger="idle_checkpoint",
-            reason="long_lived_chat_idle",
-        )
-        compaction_result = await self._auto_compact(
-            ctx,
-            run=run,
-            trigger="idle_checkpoint",
-            min_relevant_events=min_events,
-            long_lived_chat=True,
-            emit_timeout_notice=False,
-        )
-        if compaction_result is None:
-            return None
-        return await self._rotate_after_compaction(
-            ctx,
-            compaction_result,
-            trigger="idle_checkpoint",
-            run=run,
-        )
+            ctx = StepContext(
+                step_definition=StepDefinition(name="direct", type="run", prompt=""),
+                session=session,
+                conversation=conversation,
+                agent=agent,
+                policy=CHAT_POLICY,
+            )
+            run = CompactionRunContext(
+                trigger="idle_checkpoint",
+                reason="long_lived_chat_idle",
+            )
+            compaction_result = await self._auto_compact(
+                ctx,
+                run=run,
+                trigger="idle_checkpoint",
+                min_relevant_events=min_events,
+                long_lived_chat=True,
+                emit_timeout_notice=False,
+            )
+            if compaction_result is None:
+                return None
+            return await self._rotate_after_compaction(
+                ctx,
+                compaction_result,
+                trigger="idle_checkpoint",
+                run=run,
+            )
 
     def _raise_if_cancelled(self, ctx: StepContext) -> None:
         """Abort the current step when external control requested interruption."""
@@ -16099,17 +18264,55 @@ class AgentLoop:
             )
             await db_session.commit()
 
-    async def _persist_step_todos(self, ctx: StepContext) -> None:
-        """Persist step todos so pause/resume and retries keep task state."""
+    async def _load_session_todos(self, ctx: StepContext) -> None:
+        """Seed runtime context from authoritative conversation TODO state."""
 
-        if ctx.step_run_id is None:
+        if ctx.todos:
+            await self._persist_todos(ctx)
             return
-        from cognis.store.queries import update_step_run
+        if _is_delegated_child_context(ctx):
+            from cognis.store.queries import list_session_todos
+
+            async with self.session_manager.session_factory() as db_session:
+                if not hasattr(db_session, "execute"):
+                    return
+                ctx.todos = _normalize_todos(
+                    await list_session_todos(db_session, ctx.session.session_id)
+                )
+            return
+        from cognis.store.queries import list_conversation_todos
 
         async with self.session_manager.session_factory() as db_session:
-            await update_step_run(
-                db_session, ctx.step_run_id, todos=_normalize_todos(ctx.todos or [])
+            if not hasattr(db_session, "execute"):
+                return
+            ctx.todos = _normalize_todos(
+                await list_conversation_todos(db_session, ctx.session.conversation_id)
             )
+            if ctx.todos:
+                await self._persist_todos(ctx)
+
+    async def _persist_todos(self, ctx: StepContext) -> None:
+        """Persist controller-owned TODO state for conversation, session, and step APIs."""
+
+        from cognis.store.queries import (
+            replace_conversation_todos,
+            replace_session_todos,
+            update_step_run,
+        )
+
+        normalized = _normalize_todos(ctx.todos or [])
+        async with self.session_manager.session_factory() as db_session:
+            if not hasattr(db_session, "execute"):
+                return
+            if not _is_delegated_child_context(ctx):
+                await replace_conversation_todos(
+                    db_session,
+                    ctx.session.conversation_id,
+                    normalized,
+                )
+            await replace_session_todos(db_session, ctx.session.session_id, normalized)
+            if ctx.step_run_id is not None:
+                await update_step_run(db_session, ctx.step_run_id, todos=normalized)
             await db_session.commit()
 
     def _clear_cached_deliverable(self, ctx: StepContext) -> None:
@@ -16667,7 +18870,7 @@ class AgentLoop:
                             workspace_root=workspace_root,
                             working_directory=working_directory,
                         )
-                else:
+                elif not _is_delegated_child_context(ctx):
                     from cognis.store.queries import update_conversation_context_data
 
                     platform_data = dict(
@@ -16681,6 +18884,8 @@ class AgentLoop:
                         context_data=platform_data,
                     )
                     ctx.conversation.context.platform_data = platform_data
+                else:
+                    return
                 await db_session.commit()
         except Exception:
             logger.debug(
@@ -17439,7 +19644,7 @@ class AgentLoop:
             ctx.conversation, "active_executor_id", None
         )
         targets: list[Any] = []
-        if pool is not None:
+        if pool is not None and not _is_delegated_child_context(ctx):
             seen: set[str] = set()
             for target in pool.all:
                 executor_id = getattr(target, "executor_id", None)
@@ -17530,6 +19735,9 @@ class AgentLoop:
 
     @staticmethod
     def _background_shell_status_matches_context(ctx: StepContext, status: dict[str, Any]) -> bool:
+        if _is_delegated_child_context(ctx):
+            session_id = status.get("session_id")
+            return isinstance(session_id, str) and session_id == ctx.session.session_id
         conversation_id = status.get("conversation_id")
         if isinstance(conversation_id, str) and conversation_id:
             return conversation_id == ctx.conversation.conversation_id
@@ -17956,6 +20164,7 @@ class AgentLoop:
             ctx.orchestration_mode,
             expose_delegate_wait_option=surface_policy.expose_delegate_wait_option,
             expose_managed_conversation_tools=surface_policy.expose_managed_conversation_tools,
+            expose_managed_conversation_wait_option=surface_policy.expose_managed_conversation_wait_option,
             expose_task_tools=surface_policy.expose_task_tools,
             expose_workflow_tools=surface_policy.expose_workflow_tools,
             expose_compose_workflow_tool=surface_policy.expose_compose_workflow_tool,
@@ -17966,7 +20175,7 @@ class AgentLoop:
         # least two USABLE assigned executors. Hiding it when fewer are
         # usable avoids offering a no-op tool to the LLM.
         pool = getattr(ctx, "executor_pool", None)
-        if pool is not None:
+        if pool is not None and not _is_delegated_child_context(ctx):
             usable_ids = sorted(t.executor_id for t in pool.all if t.usable and t.executor_id)
             if len(usable_ids) >= 2:
                 import copy as _copy

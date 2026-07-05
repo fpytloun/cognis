@@ -42,7 +42,7 @@
   let sessionLog = $state<SessionLogState | null>(null);
   let pollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
   let currentSessionStatus = $state<string | null>(null);
-  let chatTodoDrawerOpen = $state(true);
+  let chatTodoDrawerOpen = $state(false);
   let escalations = $state<Escalation[]>([]);
   let escalationBusyCallId = $state<string | null>(null);
 
@@ -176,11 +176,6 @@
     };
   });
 
-  $effect(() => {
-    if (shouldShowTodoDrawer) {
-      chatTodoDrawerOpen = true;
-    }
-  });
 </script>
 
 <svelte:window onkeydown={handleKeydown} />

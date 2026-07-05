@@ -6,6 +6,7 @@ information loss so the model (and user) know continuity may be degraded.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from cognis.core.compaction.recovery import recoverable_tool_output_lines
@@ -26,13 +27,18 @@ _FALLBACK_HEADER = (
 )
 
 
-def build_sliding_window_summary(events: list[Any]) -> str:
+def build_sliding_window_summary(
+    events: list[Any],
+    *,
+    previous_summary: str | None = None,
+) -> str:
     """Build a sliding-window mechanical summary from session events.
 
     Keeps the last N user messages, assistant finals, and deliverables
     verbatim, followed by a counts trailer and recoverable-handle block.
     """
     type_counts: dict[str, int] = {}
+    original_user_messages: list[str] = []
     user_messages: list[str] = []
     assistant_finals: list[str] = []
     deliverables: list[str] = []
@@ -45,7 +51,10 @@ def build_sliding_window_summary(events: list[Any]) -> str:
         if etype == "user_message":
             content = data.get("content")
             if isinstance(content, str) and content.strip():
-                user_messages.append(content.strip()[:_PER_MESSAGE_MAX_CHARS])
+                cleaned = content.strip()[:_PER_MESSAGE_MAX_CHARS]
+                if len(original_user_messages) < 2:
+                    original_user_messages.append(cleaned)
+                user_messages.append(cleaned)
 
         elif etype == "assistant_message":
             content = data.get("content")
@@ -54,17 +63,29 @@ def build_sliding_window_summary(events: list[Any]) -> str:
             if isinstance(content, str) and content.strip() and not tool_calls:
                 assistant_finals.append(content.strip()[:_PER_MESSAGE_MAX_CHARS])
 
-        elif etype == "tool_result":
-            # Capture write_deliverable outputs as high-signal artifacts.
+        elif etype == "tool_call":
+            # Capture write_deliverable content from the call arguments.  The
+            # result event is only a confirmation receipt in the real tool path.
             name = data.get("name", "")
             if name == "write_deliverable":
-                result = data.get("result") or data.get("output", "")
-                if isinstance(result, str) and result.strip():
-                    deliverables.append(result.strip()[:_PER_MESSAGE_MAX_CHARS])
+                content = _extract_write_deliverable_content(data.get("arguments"))
+                if content:
+                    deliverables.append(content[:_PER_MESSAGE_MAX_CHARS])
 
     recoverable_lines = recoverable_tool_output_lines(events)
 
     lines: list[str] = [_FALLBACK_HEADER, ""]
+
+    if previous_summary:
+        lines.append("## Previous anchored summary (verbatim):")
+        lines.append(previous_summary.strip())
+        lines.append("")
+
+    if original_user_messages:
+        lines.append("## Original request (verbatim):")
+        for msg in original_user_messages:
+            lines.append(f"- {msg}")
+        lines.append("")
 
     if user_messages:
         lines.append("## Recent user messages (verbatim, most recent last):")
@@ -94,3 +115,20 @@ def build_sliding_window_summary(events: list[Any]) -> str:
         lines.extend(recoverable_lines)
 
     return "\n".join(lines)
+
+
+def _extract_write_deliverable_content(arguments: Any) -> str | None:
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            arguments = parsed
+    if not isinstance(arguments, dict):
+        return None
+    for key in ("content", "text", "markdown", "body"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None

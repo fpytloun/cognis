@@ -1,130 +1,147 @@
-.PHONY: dev serve test lint format typecheck build clean ui ui-dev help local-compose-build local-compose-up local-compose-seed local-compose-executor-up local-compose-logs local-compose-down local-compose-reset local-compose-wait
+# Cognis development and e2e test targets
+#
+# E2E test workflow:
+#   make e2e-up      # Start the deterministic e2e stack
+#   make e2e-seed    # Seed e2e agent + scenarios
+#   make e2e-events  # Run L2 golden event-stream tests (fast, no browser)
+#   make e2e-browser # Run L3 Playwright browser tests
+#   make e2e-down    # Stop the e2e stack
+#
+# Interactive debugging workflow:
+#   make e2e-up && make e2e-seed
+#   # Attach Playwright MCP to http://localhost:8080
+#   # Use POST http://localhost:8090/__mock/active to inject scenarios
+#   # Edit code, run: make e2e-ui-build (or make e2e-ui-dev for hot-reload)
+#   make e2e-down
 
-PYTHON ?= uv run python
-COGNIS ?= uv run cognis-controller
-LOCAL_COMPOSE ?= docker compose -f compose.local.yml
-
-help: ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+# Use docker-compose (v1 standalone) if available, otherwise docker compose (v2 plugin)
+DOCKER_COMPOSE := $(shell which docker-compose 2>/dev/null || echo "docker compose")
+COMPOSE_BASE := $(DOCKER_COMPOSE) -f compose.local.yml
+COMPOSE_E2E  := $(COMPOSE_BASE) -f compose.e2e.yml
+PYTHON ?= python3
 
 # ---------------------------------------------------------------------------
-# Development setup
+# E2E stack lifecycle
 # ---------------------------------------------------------------------------
 
-dev: ## Install Python + UI deps, build UI, stage assets
-	uv pip install -e ".[dev]"
-	cd ui && npm ci
-	$(MAKE) ui
+.PHONY: e2e-up
+e2e-up:
+	$(COMPOSE_E2E) up -d --build
+	@echo ""
+	@echo "E2E stack started:"
+	@echo "  Cognis:   http://localhost:8080"
+	@echo "  Mock LLM: http://localhost:8090"
+	@echo "  Mock LLM control plane: http://localhost:8090/__mock/scenarios"
+	@echo ""
+	@echo "Next: make e2e-seed"
+
+.PHONY: e2e-seed
+e2e-seed:
+	COGNIS_LOCAL_HOST_TOKEN_UID=$$(id -u) COGNIS_LOCAL_HOST_TOKEN_GID=$$(id -g) $(COMPOSE_E2E) run --rm seed-e2e
+	$(COMPOSE_E2E) up -d --force-recreate --no-deps cognis-executor
+	@EMAIL=$${COGNIS_LOCAL_ADMIN_EMAIL:-admin@cognis-e2e.localdev.me}; \
+	PASSWORD=$${COGNIS_LOCAL_ADMIN_PASSWORD:-cognis-local-admin}; \
+	READY=0; \
+	for i in $$(seq 1 24); do \
+		TOKEN=$$(curl -s -X POST http://localhost:8080/api/auth/login -H 'Content-Type: application/json' --data "{\"email\":\"$$EMAIL\",\"password\":\"$$PASSWORD\"}" | $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null || true); \
+		STATE=$$(curl -s -H "Authorization: Bearer $$TOKEN" http://localhost:8080/api/v1/executors | $(PYTHON) -c 'import json,sys; data=json.load(sys.stdin); print(next((e.get("runtime_state") for e in data if e.get("executor_id")=="local-compose-executor"), "missing"))' 2>/dev/null || true); \
+		echo "E2E executor state: $$STATE"; \
+		if [ "$$STATE" = "active" ]; then READY=1; break; fi; \
+		sleep 5; \
+	done; \
+	if [ "$$READY" != "1" ]; then \
+		echo "Timed out waiting for local-compose-executor to become active"; \
+		exit 1; \
+	fi
+	$(PYTHON) scripts/wait_e2e_chat_ready.py
+	@echo "E2E environment seeded."
+
+.PHONY: e2e-down
+e2e-down:
+	$(COMPOSE_E2E) down
+
+.PHONY: e2e-logs
+e2e-logs:
+	$(COMPOSE_E2E) logs -f
+
+.PHONY: e2e-status
+e2e-status:
+	$(COMPOSE_E2E) ps
 
 # ---------------------------------------------------------------------------
-# UI build
+# L2: Golden event-stream tests (fast, no browser)
 # ---------------------------------------------------------------------------
 
-ui: ## Build SvelteKit UI and stage into cognis/ui_dist
+.PHONY: e2e-events
+e2e-events: e2e-events-capture e2e-events-replay
+
+.PHONY: e2e-events-capture
+e2e-events-capture:
+	@echo "Capturing golden event streams from live stack..."
+	uv run pytest tests/e2e/ -m e2e -v --tb=short
+
+.PHONY: e2e-events-replay
+e2e-events-replay:
+	@echo "Replaying golden streams through ChatTimeline store..."
+	cd ui && npm test -- --reporter=verbose --run src/lib/chat-timeline.golden.test.ts
+
+# ---------------------------------------------------------------------------
+# L3: Playwright browser tests
+# ---------------------------------------------------------------------------
+
+.PHONY: e2e-browser
+e2e-browser:
+	cd ui && npx playwright test e2e/ --workers=1
+
+.PHONY: e2e-browser-ui
+e2e-browser-ui:
+	cd ui && npx playwright test e2e/ --ui
+
+# ---------------------------------------------------------------------------
+# UI iteration during interactive debugging
+# ---------------------------------------------------------------------------
+
+.PHONY: e2e-ui-build
+e2e-ui-build:
+	@echo "Building UI (served by Cognis)..."
 	cd ui && npm run build
-	@# Stage built assets so the Python server can serve them
-	rm -rf cognis/ui_dist
-	cp -r ui/build cognis/ui_dist
-	@echo "UI built and staged in cognis/ui_dist"
+	@echo "UI built. Cognis serves the updated assets at http://localhost:8080"
 
-ui-dev: ## Run SvelteKit dev server (hot reload on :5173)
-	cd ui && npm run dev
-
-ui-check: ## Run SvelteKit checks (types, lint)
-	cd ui && npm run check
+.PHONY: e2e-ui-dev
+e2e-ui-dev:
+	@echo "Starting Vite dev server (hot-reload, proxies /api to localhost:8080)..."
+	cd ui && npm run dev -- --port 5173
 
 # ---------------------------------------------------------------------------
-# Server
+# Promote an interactively-reproduced scenario to a static test
 # ---------------------------------------------------------------------------
 
-serve: dev ## Install deps, build UI, and start Cognis (text logs)
-	COGNIS_LOG_FORMAT=text $(COGNIS) serve
-
-run: ## Start Cognis with text logs (assumes deps already installed)
-	COGNIS_LOG_FORMAT=text $(COGNIS) serve
+.PHONY: e2e-promote
+e2e-promote:
+	@if [ -z "$(SCENARIO)" ]; then \
+		echo "Usage: make e2e-promote SCENARIO=my-scenario-name"; \
+		exit 1; \
+	fi
+	python scripts/promote_e2e_scenario.py $(SCENARIO)
 
 # ---------------------------------------------------------------------------
-# Testing
+# Regular test targets
 # ---------------------------------------------------------------------------
 
-test: ## Run unit tests
+.PHONY: test
+test:
 	uv run pytest tests/unit/ -v
 
-test-integration: ## Run integration tests (requires Mnemory + Intaris)
-	uv run pytest tests/integration/ -v
+.PHONY: test-ui
+test-ui:
+	cd ui && npm test
 
-test-contract: ## Run contract tests (requires Mnemory + Intaris)
-	uv run pytest tests/contract/ -v
-
-test-all: ## Run all tests
-	uv run pytest -v
-
-# ---------------------------------------------------------------------------
-# Local Compose deployment
-# ---------------------------------------------------------------------------
-
-local-compose-build: ## Build local Cognis/controller and executor images
-	$(LOCAL_COMPOSE) build cognis cognis-executor seed
-
-local-compose-up: ## Start the Local Compose deployment
-	mkdir -p .local/cognis-compose/executor-token
-	$(LOCAL_COMPOSE) up -d qdrant mnemory intaris cognis
-
-local-compose-seed: ## Seed the Local Compose deployment and write executor token files
-	$(LOCAL_COMPOSE) --profile seed run --rm seed
-
-local-compose-executor-up: ## Start the Docker sidecar WebSocket executor
-	$(LOCAL_COMPOSE) up -d cognis-executor
-
-local-compose-wait: ## Wait for Local Compose services to be reachable on localhost
-	uv run python scripts/local_compose_wait.py
-
-local-compose-logs: ## Follow Local Compose logs
-	$(LOCAL_COMPOSE) logs -f
-
-local-compose-down: ## Stop the Local Compose deployment without deleting volumes
-	$(LOCAL_COMPOSE) down
-
-local-compose-reset: ## Stop Local Compose and destroy all local volumes/state
-	$(LOCAL_COMPOSE) --profile seed down -v
-	rm -rf .local/cognis-compose
-
-# ---------------------------------------------------------------------------
-# Code quality
-# ---------------------------------------------------------------------------
-
-lint: ## Lint Python code
+.PHONY: lint
+lint:
 	uv run ruff check cognis/ tests/
+	uv run ruff format --check cognis/ tests/
 
-format: ## Format Python code
-	uv run ruff format cognis/ tests/
-
-typecheck: ## Type-check Python code
+.PHONY: typecheck
+typecheck:
 	uv run mypy cognis/
-
-check: lint typecheck ui-check ## Run all checks (lint + types + UI)
-
-# ---------------------------------------------------------------------------
-# Database
-# ---------------------------------------------------------------------------
-
-db-migrate: ## Apply all database migrations
-	uv run alembic -c cognis/store/migrations/alembic.ini upgrade head
-
-db-revision: ## Create a new migration (usage: make db-revision MSG="description")
-	uv run alembic -c cognis/store/migrations/alembic.ini revision --autogenerate -m "$(MSG)"
-
-db-downgrade: ## Rollback one migration
-	uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
-
-# ---------------------------------------------------------------------------
-# Packaging
-# ---------------------------------------------------------------------------
-
-build: dev ## Build Python wheel (includes bundled UI)
-	COGNIS_SKIP_UI_BUILD=1 uv build
-
-clean: ## Remove build artifacts
-	rm -rf cognis/ui_dist ui/build ui/.svelte-kit dist .pytest_cache .mypy_cache
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	cd ui && npm run check

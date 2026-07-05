@@ -34,13 +34,39 @@ class _Guardrails:
                 {
                     "events": [
                         {"seq": 1, "type": "user_message", "data": {"content": "old"}},
-                        {"seq": 2, "type": "assistant_message", "data": {"content": "older"}},
+                        {
+                            "seq": 2,
+                            "type": "assistant_message",
+                            "data": {
+                                "content": "older",
+                                "responses_output_items": [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "rs_cached",
+                                        "encrypted_content": "opaque",
+                                    }
+                                ],
+                            },
+                        },
                         {
                             "seq": 3,
                             "type": "compaction_summary",
                             "data": {"summary": "compact"},
                         },
-                        {"seq": 4, "type": "user_message", "data": {"content": "recent"}},
+                        {
+                            "seq": 4,
+                            "type": "assistant_message",
+                            "data": {
+                                "content": "recent",
+                                "responses_output_items": [
+                                    {
+                                        "type": "reasoning",
+                                        "id": "rs_tail",
+                                        "encrypted_content": "opaque-tail",
+                                    }
+                                ],
+                            },
+                        },
                         {
                             "seq": 10,
                             "type": "developer_message",
@@ -182,6 +208,7 @@ async def test_session_cache_cold_and_warm_paths() -> None:
     assert entry.last_compaction_seq == 3
     assert entry.last_compaction_summary == "compact"
     assert [event.seq for event in entry.events] == [4]
+    assert entry.events[0].data["responses_output_items"][0]["encrypted_content"] == "opaque-tail"
     assert [item.source for item in cache.get_prefix_entries("session-1")] == [
         "memory_instructions",
         "core_memories",
@@ -272,6 +299,161 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
     await cache.apply_compaction(session, summary="fresh summary", compaction_seq=6)
     assert cache.get_compaction_summary(session.session_id) == "fresh summary"
     assert cache.get_events_since_compaction(session.session_id) == []
+
+
+class _GapGuardrails:
+    """Simulates a direct write (seq 6) recorded by another writer.
+
+    Cold load returns seqs 1-4 (last_seq 4). The warm refresh after the
+    gap-deferred append returns the externally written seq 6 plus the
+    already-cached seqs 7-8.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    async def read_events(
+        self,
+        session_id: str,
+        after_seq: int = 0,
+        limit: int = 0,
+        types: list[str] | None = None,
+        last_n: int | None = None,
+        allow_missing_stream: bool = False,
+    ) -> object:
+        del session_id, allow_missing_stream, limit, types, last_n
+        self.calls.append(after_seq)
+        if after_seq == 0:
+            return type(
+                "EventRead",
+                (),
+                {
+                    "events": [
+                        {
+                            "seq": 1,
+                            "type": "developer_message",
+                            "data": {
+                                "role": "developer",
+                                "source": "core_memories",
+                                "content": "Identity.",
+                            },
+                        },
+                        {
+                            "seq": 2,
+                            "type": "context_snapshot",
+                            "data": {
+                                "source": "bootstrap",
+                                "entries": [
+                                    {
+                                        "role": "developer",
+                                        "source": "core_memories",
+                                        "seq": 1,
+                                    }
+                                ],
+                            },
+                        },
+                        {"seq": 3, "type": "user_message", "data": {"content": "delegate this"}},
+                        {"seq": 4, "type": "tool_call", "data": {"name": "delegate"}},
+                    ],
+                    "last_seq": 4,
+                    "has_more": False,
+                },
+            )()
+        return type(
+            "EventRead",
+            (),
+            {
+                "events": [
+                    {
+                        "seq": 6,
+                        "type": "delegation",
+                        "data": {"status": "completed", "child_session_id": "child-1"},
+                    },
+                    {"seq": 7, "type": "tool_result", "data": {"name": "delegate"}},
+                    {"seq": 8, "type": "assistant_message", "data": {"content": "done"}},
+                ],
+                "last_seq": 8,
+                "has_more": False,
+            },
+        )()
+
+
+@pytest.mark.asyncio
+async def test_session_cache_gap_deferred_append_backfills_missing_seqs() -> None:
+    """A seq gap on append must not permanently skip externally written events.
+
+    Scenario: a delegation-completed event is written directly to Intaris
+    (seq 6, bypassing the cache) while the parent turn's next flush lands at
+    seqs 7-8. Advancing the watermark to 8 would make warm refresh
+    (after_seq=8) skip seq 6 forever.
+    """
+    guardrails = _GapGuardrails()
+    cache = SessionCache(guardrails, max_entries=10)
+    session = _session()
+    await cache.refresh(session)  # cold load, watermark=4
+
+    # Parent flush lands at seqs 7-8 — seq 6 was written by another writer.
+    await cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(type="tool_result", data={"name": "delegate"}),
+            SessionEvent(type="assistant_message", data={"content": "done"}),
+        ],
+        EventAppendResult(ok=True, count=2, first_seq=7, last_seq=8),
+    )
+
+    entry = await cache.refresh(session)
+
+    # Warm refresh fetched after the deferred watermark (4), not after 8.
+    assert guardrails.calls == [0, 4]
+    seqs = [event.seq for event in cache.get_events_since_compaction(session.session_id)]
+    assert seqs == [3, 4, 6, 7, 8]
+    assert entry.last_event_seq == 8
+    # No duplicates from the re-fetched seqs 7-8.
+    assert len(seqs) == len(set(seqs))
+
+
+@pytest.mark.asyncio
+async def test_session_cache_skips_duplicate_seqs_on_idempotent_replay() -> None:
+    """Re-appending a batch whose seqs are already cached must be a no-op.
+
+    Intaris idempotency-key dedup returns the FIRST batch's seqs when a
+    byte-identical batch is replayed; re-appending would duplicate the
+    events out of position at the end of the cached list.
+    """
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    events = [SessionEvent(type="assistant_message", data={"content": "notice"})]
+    result = EventAppendResult(ok=True, count=1, first_seq=6, last_seq=6)
+    await cache.append_recorded_events(session, events, result)
+    await cache.append_recorded_events(session, events, result)
+
+    seqs = [event.seq for event in cache.get_events_since_compaction(session.session_id)]
+    assert seqs.count(6) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_cache_orders_out_of_order_appends_by_seq() -> None:
+    """Cache appends landing out of seq order must be consumed in seq order."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    entry = await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="assistant_message", data={"content": "later"})],
+        EventAppendResult(ok=True, count=1, first_seq=8, last_seq=8),
+    )
+    entry = await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="delegation", data={"status": "completed"})],
+        EventAppendResult(ok=True, count=1, first_seq=6, last_seq=6),
+    )
+
+    seqs = [event.seq for event in entry.events]
+    assert seqs == sorted(seqs)
 
 
 @pytest.mark.asyncio
@@ -568,3 +750,465 @@ async def test_invalidate_classified_inventory_clears_memo() -> None:
     cache.invalidate_classified_inventory(session.session_id)
 
     assert cache.get_classified_inventory(session.session_id, "fp1") is None
+
+
+# ---------------------------------------------------------------------------
+# active_thinking lifecycle — reconnect re-injection bug regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_clear_active_thinking_removes_state() -> None:
+    """clear_active_thinking removes all blocks for a session."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-thinking-clear"
+
+    # Seed an incomplete thinking block (simulates a cancelled turn)
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="partial content",
+        title="Thinking",
+        complete=False,
+    )
+    assert cache.active_thinking_snapshots(session_id) != []
+
+    # clear_active_thinking must remove it
+    cache.clear_active_thinking(session_id)
+    assert cache.active_thinking_snapshots(session_id) == []
+
+
+def test_discard_incomplete_active_thinking_drops_failed_attempt_blocks() -> None:
+    """Mid-stream retry: the failed attempt's incomplete blocks are dropped,
+    but the retried attempt's deltas are NOT blocked (unlike clear)."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-thinking-retry"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="thk_attempt1_1",
+        delta="partial reasoning",
+        title="Thinking",
+        complete=False,
+    )
+    assert cache.active_thinking_snapshots(session_id) != []
+
+    cache.discard_incomplete_active_thinking(session_id)
+    assert cache.active_thinking_snapshots(session_id) == []
+
+    # The retried attempt's new blocks must flow (turn NOT marked cleared).
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="thk_attempt2_1",
+        delta="fresh reasoning",
+        title="Thinking",
+        complete=False,
+    )
+    snapshots = cache.active_thinking_snapshots(session_id)
+    assert len(snapshots) == 1
+    assert [block["block_id"] for block in snapshots[0]["blocks"]] == ["thk_attempt2_1"]
+
+
+def test_discard_incomplete_active_thinking_is_idempotent() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    cache.discard_incomplete_active_thinking("sess-nonexistent")
+    assert cache.active_thinking_snapshots("sess-nonexistent") == []
+
+
+def test_clear_active_thinking_is_idempotent() -> None:
+    """clear_active_thinking on an already-empty session is a no-op."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    # Should not raise even if session has no active thinking
+    cache.clear_active_thinking("sess-nonexistent")
+    assert cache.active_thinking_snapshots("sess-nonexistent") == []
+
+
+def test_clear_active_thinking_does_not_affect_other_sessions() -> None:
+    """clear_active_thinking only clears the specified session."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+
+    cache.update_active_thinking(
+        "sess-a",
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="content a",
+        title="Thinking A",
+        complete=False,
+    )
+    cache.update_active_thinking(
+        "sess-b",
+        message_id="msg2",
+        turn_id="turn2",
+        block_id="blk2",
+        delta="content b",
+        title="Thinking B",
+        complete=False,
+    )
+
+    cache.clear_active_thinking("sess-a")
+
+    assert cache.active_thinking_snapshots("sess-a") == []
+    assert cache.active_thinking_snapshots("sess-b") != []
+
+
+def test_active_thinking_cleared_by_complete_true() -> None:
+    """Normal drain path: complete=True removes the block (existing behaviour)."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-drain"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="content",
+        title="Thinking",
+        complete=False,
+    )
+    assert cache.active_thinking_snapshots(session_id) != []
+
+    # Drain with complete=True (normal finalize_thinking path)
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="",
+        title="Thinking",
+        complete=True,
+    )
+    assert cache.active_thinking_snapshots(session_id) == []
+
+
+def test_active_thinking_snapshots_empty_after_clear_then_new_turn() -> None:
+    """After clear, a new turn can populate active_thinking normally."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-new-turn"
+
+    # Old turn leaves stale state
+    cache.update_active_thinking(
+        session_id,
+        message_id="old-msg",
+        turn_id="old-turn",
+        block_id="blk-old",
+        delta="stale content",
+        title="Old Thinking",
+        complete=False,
+    )
+    cache.clear_active_thinking(session_id)
+
+    # New turn starts
+    cache.update_active_thinking(
+        session_id,
+        message_id="new-msg",
+        turn_id="new-turn",
+        block_id="blk-new",
+        delta="fresh content",
+        title="New Thinking",
+        complete=False,
+    )
+    snapshots = cache.active_thinking_snapshots(session_id)
+    assert len(snapshots) == 1
+    assert snapshots[0]["message_id"] == "new-msg"
+    assert snapshots[0]["blocks"][0]["block_id"] == "blk-new"
+
+
+# ---------------------------------------------------------------------------
+# first_block_id anchor stability (the fix for duplicate thinking blocks)
+# ---------------------------------------------------------------------------
+
+
+def test_first_block_id_anchor_set_on_first_block() -> None:
+    """The anchor is set to the first block_id ever added to the state."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-anchor"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_first",
+        delta="content",
+        title="Thinking",
+        complete=False,
+    )
+    meta = cache.get_active_thinking_metadata(session_id)
+    assert meta is not None
+    assert meta["first_block_id"] == "blk_first"
+
+
+def test_first_block_id_anchor_stable_after_second_block_added() -> None:
+    """The anchor does not change when a second block is added."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-anchor-stable"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_first",
+        delta="block 1 content",
+        title="T",
+        complete=False,
+    )
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_second",
+        delta="block 2 content",
+        title="T",
+        complete=False,
+    )
+    meta = cache.get_active_thinking_metadata(session_id)
+    assert meta is not None
+    assert meta["first_block_id"] == "blk_first"  # anchor unchanged
+
+
+def test_first_block_id_anchor_stable_after_first_block_completes_and_is_popped() -> None:
+    """THE KEY TEST: anchor stays blk_first even after blk_first is popped.
+
+    This is the exact scenario that caused duplicate thinking blocks:
+    - blk_first streams, then completes → popped from state.blocks
+    - blk_second becomes blocks[0]
+    - Without the anchor, the runtime projector would use blk_second as
+      first_block_id → id changes → orphan (stuck) + duplicate.
+    - With the anchor, first_block_id stays blk_first throughout.
+    """
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-pop-stable"
+
+    # blk_first streams
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_first",
+        delta="block 1",
+        title="T",
+        complete=False,
+    )
+    # blk_second starts streaming
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_second",
+        delta="block 2",
+        title="T",
+        complete=False,
+    )
+    # blk_first completes → popped from state.blocks
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_first",
+        delta="",
+        title="T",
+        complete=True,
+    )
+
+    # State still exists (not removed when blocks empty — retained for anchor)
+    meta = cache.get_active_thinking_metadata(session_id)
+    assert meta is not None, "State must be retained after first block pops"
+    # Anchor must still be blk_first, not blk_second
+    assert meta["first_block_id"] == "blk_first", (
+        f"Anchor shifted to {meta['first_block_id']!r} after pop — "
+        "this would cause duplicate thinking blocks"
+    )
+    # Phase must be preserved
+    assert meta["assistant_phase_index"] == 0
+
+    # active_thinking_snapshots still returns blk_second (the live block)
+    snapshots = cache.active_thinking_snapshots(session_id)
+    assert len(snapshots) == 1
+    assert snapshots[0]["blocks"][0]["block_id"] == "blk_second"
+    # And the snapshot carries the stable anchor
+    assert snapshots[0]["first_block_id"] == "blk_first"
+
+
+def test_first_block_id_anchor_reset_on_new_message_id() -> None:
+    """Anchor resets when a new message_id/turn starts (new segment)."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-anchor-reset"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_old",
+        delta="old",
+        title="T",
+        complete=False,
+    )
+    # New message_id → state recreated → anchor reset
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg2",
+        turn_id="turn2",
+        block_id="blk_new",
+        delta="new",
+        title="T",
+        complete=False,
+    )
+    meta = cache.get_active_thinking_metadata(session_id)
+    assert meta is not None
+    assert meta["first_block_id"] == "blk_new"
+    assert meta["message_id"] == "msg2"
+
+
+def test_get_active_thinking_metadata_returns_none_when_no_state() -> None:
+    """Returns None when no active thinking state exists."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    assert cache.get_active_thinking_metadata("sess-nonexistent") is None
+
+
+def test_get_active_thinking_metadata_returns_phase_after_all_blocks_popped() -> None:
+    """Metadata (phase + anchor) is accessible even after all blocks are popped.
+
+    This is the PATH B fix: the on_thinking finalize handler reads the metadata
+    to emit the correct thinking item id even when active_thinking_snapshots
+    returns [] (all blocks completed and popped).
+    """
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-pathb"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_only",
+        delta="content",
+        title="T",
+        complete=False,
+        assistant_phase_index=2,
+    )
+    # Block completes → popped
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk_only",
+        delta="",
+        title="T",
+        complete=True,
+        assistant_phase_index=2,
+    )
+
+    # active_thinking_snapshots returns [] (no live blocks)
+    assert cache.active_thinking_snapshots(session_id) == []
+
+    # But metadata is still accessible for PATH B
+    meta = cache.get_active_thinking_metadata(session_id)
+    assert meta is not None
+    assert meta["assistant_phase_index"] == 2
+    assert meta["first_block_id"] == "blk_only"
+    assert meta["message_id"] == "msg1"
+
+
+# ---------------------------------------------------------------------------
+# Cancel teardown guards (Issue B)
+# ---------------------------------------------------------------------------
+
+
+def test_update_active_thinking_blocked_after_clear_for_same_turn() -> None:
+    """A late thinking delta must not re-create state for a torn-down turn.
+
+    This is the cancel-teardown race: clear_active_thinking runs (turn cancelled),
+    then a late thinking delta arrives (from the coalesce buffer). Without the
+    guard, update_active_thinking would re-create the state, causing the thinking
+    block to stream in after cancel and the runtime snapshot to re-emit it.
+    """
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-cancel-guard"
+
+    # Turn starts, thinking streams
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="thinking...",
+        title="T",
+        complete=False,
+    )
+    assert cache.active_thinking_snapshots(session_id) != []
+
+    # Turn cancelled → clear_active_thinking records the turn
+    cache.clear_active_thinking(session_id)
+    assert cache.active_thinking_snapshots(session_id) == []
+
+    # Late thinking delta arrives after cancel (the coalesce race)
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="late delta",
+        title="T",
+        complete=False,
+    )
+    # Must remain empty — the guard blocked re-creation
+    assert cache.active_thinking_snapshots(session_id) == [], (
+        "Late thinking delta re-created state after cancel — "
+        "this would cause thinking to stream in after cancel"
+    )
+
+
+def test_update_active_thinking_allowed_for_new_turn_after_cancel() -> None:
+    """A new turn can start normally after a previous turn was cancelled."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-new-turn-after-cancel"
+
+    # Old turn cancelled
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn1",
+        block_id="blk1",
+        delta="old",
+        title="T",
+        complete=False,
+    )
+    cache.clear_active_thinking(session_id)
+
+    # New turn starts (different turn_id)
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg2",
+        turn_id="turn2",
+        block_id="blk2",
+        delta="new thinking",
+        title="T",
+        complete=False,
+    )
+    snapshots = cache.active_thinking_snapshots(session_id)
+    assert len(snapshots) == 1
+    assert snapshots[0]["message_id"] == "msg2"
+
+
+def test_clear_active_thinking_records_cleared_turn_id() -> None:
+    """clear_active_thinking records the (session_id, turn_id) for the guard."""
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session_id = "sess-record-turn"
+
+    cache.update_active_thinking(
+        session_id,
+        message_id="msg1",
+        turn_id="turn_abc",
+        block_id="blk1",
+        delta="content",
+        title="T",
+        complete=False,
+    )
+    cache.clear_active_thinking(session_id)
+
+    # The cleared turn is recorded
+    assert (session_id, "turn_abc") in cache._cleared_thinking_turns

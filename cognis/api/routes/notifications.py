@@ -112,7 +112,7 @@ async def resolve_notification(
 
     For escalations: ``decision`` is ``approve`` or ``deny``, ``note`` is optional.
     For gates: ``decision`` is ``continue`` or ``cancel``, ``feedback`` is optional.
-    For step questions: ``decision`` is ``continue``, ``response`` is the answer.
+    For step questions: ``decision`` is ``continue`` or ``cancel``, ``response`` is the answer.
     """
     user = require_current_user(request)
     svc = _get_service(request)
@@ -125,13 +125,18 @@ async def resolve_notification(
         notification.notification_type == "auth_challenge"
         and isinstance(notification.payload, dict)
         and notification.payload.get("kind") == "oauth_authorization"
+        and payload.decision not in {"cancel", "deny"}
     ):
         raise HTTPException(
             status_code=400,
             detail="OAuth authorization challenges are completed by the provider authorization flow",
         )
 
-    if notification.notification_type == "step_question" and notification.task_id is None:
+    if (
+        notification.notification_type == "step_question"
+        and notification.task_id is None
+        and payload.decision not in {"cancel", "deny"}
+    ):
         pause = request.app.state.pause_waiter.get(notification_id)
         if pause is None or pause.pause_type != "step_question" or pause.task_id is not None:
             raise HTTPException(status_code=409, detail="Step question can no longer be resumed")

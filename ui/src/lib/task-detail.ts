@@ -1,12 +1,14 @@
 import { asApiError } from '$lib/api/client';
-import type { Agent, Conversation, Task, TaskDetail, Workflow } from '$lib/types/api';
+import type { Agent, Conversation, CursorPage, StepRun, Task, TaskDetail, Workflow } from '$lib/types/api';
 
 const RERUNNABLE_TASK_STATUSES = new Set(['paused', 'completed', 'failed', 'cancelled']);
 
 type TaskDetailApi = {
   tasks: {
     detail(taskId: string): Promise<TaskDetail>;
-    listAll(): Promise<Task[]>;
+    summary(taskId: string): Promise<TaskDetail>;
+    stepSummaries(taskId: string): Promise<CursorPage<StepRun>>;
+    list(params?: { limit?: number }): Promise<CursorPage<Task>>;
   };
   agents: {
     listAll(): Promise<Agent[]>;
@@ -16,7 +18,16 @@ type TaskDetailApi = {
     detail(workflowId: string): Promise<Workflow>;
   };
   conversations: {
-    listAll(): Promise<Conversation[]>;
+    list(
+      cursor?: string | null,
+      filters?: {
+        contextType?: string | null;
+        agentId?: string | null;
+        status?: string | null;
+        includeAgentDirect?: boolean | null;
+      }
+    ): Promise<CursorPage<Conversation>>;
+    detail(conversationId: string): Promise<Conversation>;
   };
 };
 
@@ -36,13 +47,25 @@ export type TaskPageRefresh = {
 };
 
 export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Promise<TaskPageData> {
-  const task = await api.tasks.detail(taskId);
-  const [agentsResult, workflowsResult, conversationsResult, tasksResult] = await Promise.allSettled([
-    api.agents.listAll(),
-    api.workflows.listAll(),
-    api.conversations.listAll(),
-    api.tasks.listAll()
-  ]);
+  const summary = await api.tasks.summary(taskId);
+  const stepRunsResult = await Promise.allSettled([api.tasks.stepSummaries(taskId)]);
+  const task = {
+    ...summary,
+    step_runs:
+      stepRunsResult[0].status === 'fulfilled' ? stepRunsResult[0].value.items : summary.step_runs
+  };
+  const sourceConversationPromise =
+    task.source_ref && (task.source_type === 'chat' || task.source_type === 'agent')
+      ? api.conversations.detail(task.source_ref)
+      : Promise.resolve(null);
+  const [agentsResult, workflowsResult, conversationsResult, sourceConversationResult] =
+    await Promise.allSettled([
+      api.agents.listAll(),
+      api.workflows.listAll(),
+      api.conversations.list(null, { status: 'all', includeAgentDirect: true }),
+      sourceConversationPromise
+    ]);
+  const dependencyCandidatesResult = await Promise.allSettled([api.tasks.list({ limit: 100 })]);
 
   let workflows = workflowsResult.status === 'fulfilled' ? workflowsResult.value : [];
   if (task.workflow_id && !workflows.some((workflow) => workflow.workflow_id === task.workflow_id)) {
@@ -57,11 +80,39 @@ export async function loadTaskPageData(api: TaskDetailApi, taskId: string): Prom
     task,
     agents: agentsResult.status === 'fulfilled' ? agentsResult.value : [],
     workflows,
-    conversations: conversationsResult.status === 'fulfilled' ? conversationsResult.value : [],
-    allTasks: tasksResult.status === 'fulfilled' ? tasksResult.value : [],
+    conversations: mergeConversationChoices(
+      conversationsResult.status === 'fulfilled' ? conversationsResult.value.items : [],
+      sourceConversationResult.status === 'fulfilled' ? sourceConversationResult.value : null
+    ),
+    allTasks:
+      dependencyCandidatesResult[0].status === 'fulfilled'
+        ? dependencyCandidatesResult[0].value.items
+        : [],
     auxiliaryError:
-      firstAuxiliaryError(agentsResult, workflowsResult, conversationsResult, tasksResult) ?? ''
+      firstAuxiliaryError(
+        agentsResult,
+        workflowsResult,
+        conversationsResult,
+        sourceConversationResult,
+        dependencyCandidatesResult[0],
+        stepRunsResult[0]
+      ) ?? ''
   };
+}
+
+function mergeConversationChoices(
+  conversations: Conversation[],
+  sourceConversation: Conversation | null
+): Conversation[] {
+  if (!sourceConversation) return conversations;
+  if (
+    conversations.some(
+      (conversation) => conversation.conversation_id === sourceConversation.conversation_id
+    )
+  ) {
+    return conversations;
+  }
+  return [sourceConversation, ...conversations];
 }
 
 export async function refreshTaskPageData(
@@ -69,18 +120,10 @@ export async function refreshTaskPageData(
   taskId: string,
   currentTasks: Task[]
 ): Promise<TaskPageRefresh> {
-  const task = await api.tasks.detail(taskId);
-
-  try {
-    const allTasks = await api.tasks.listAll();
-    return { task, allTasks, auxiliaryError: '' };
-  } catch (error) {
-    return {
-      task,
-      allTasks: currentTasks,
-      auxiliaryError: asApiError(error).message
-    };
-  }
+  const summary = await api.tasks.summary(taskId);
+  const stepRuns = await api.tasks.stepSummaries(taskId);
+  const task = { ...summary, step_runs: stepRuns.items };
+  return { task, allTasks: currentTasks, auxiliaryError: '' };
 }
 
 export function shouldClearTaskFromError(error: unknown): boolean {

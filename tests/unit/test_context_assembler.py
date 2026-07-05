@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
@@ -13,6 +14,9 @@ from cognis.core.context import (
     _build_channel_context_info,
     _build_environment_info,
     _build_web_main_chat_context_info,
+    _build_web_topic_context_info,
+    _find_cache_breakpoint,
+    _is_protected_context_message,
     _load_project_instructions,
     events_to_messages,
 )
@@ -26,8 +30,19 @@ from cognis.core.followups import (
     TaskResultFollowUp,
 )
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
+from cognis.core.message_markers import (
+    AUDIT_METADATA,
+    IMMUTABLE_PREFIX,
+    LATEST_MEMORY_RECALL_CONTEXT,
+    PROJECT_CONTEXT,
+    TURN_BOUNDARY,
+)
 from cognis.core.project_context import ProjectContextEntry, build_project_instruction_message
-from cognis.core.prompts import PromptContext
+from cognis.core.prompts import (
+    PromptContext,
+    build_follow_up_guidance,
+    build_system_instructions,
+)
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
 from cognis.core.step_profiles import (
     resolve_step_profile,
@@ -47,12 +62,21 @@ class _CacheEntry:
         self.intention = "cached intention"
         self.events = []
         self.initialized = True
+        self.last_event_seq = 0
 
 
 class _SessionCache:
-    def __init__(self, fail_refresh: bool = False, cold: bool = False) -> None:
+    def __init__(
+        self,
+        fail_refresh: bool = False,
+        cold: bool = False,
+        model_override: str | None = None,
+        model_override_provider_id: str | None = None,
+    ) -> None:
         self.fail_refresh = fail_refresh
         self.cold = cold
+        self.model_override = model_override
+        self.model_override_provider_id = model_override_provider_id
         self.entry = None if cold else _CacheEntry()
         self.refresh_calls = 0
         self.prefix_entries: list[ImmutablePrefixEntry] = []
@@ -82,8 +106,10 @@ class _SessionCache:
         del session_id
         return "cached intention"
 
-    async def update_intention(self, session_id: str, intention: str | None) -> None:
-        del session_id
+    async def update_intention(
+        self, session_id: str, intention: str | None, **kwargs: object
+    ) -> None:
+        del session_id, kwargs
         if self.entry is not None:
             self.entry.intention = intention
 
@@ -167,7 +193,11 @@ class _SessionCache:
 
     def get_model_override(self, session_id: str) -> str | None:
         del session_id
-        return None
+        return self.model_override
+
+    def get_model_override_provider_id(self, session_id: str) -> str | None:
+        del session_id
+        return self.model_override_provider_id
 
     def update_context_usage(
         self, session: object, *, prompt_tokens: int, max_context_tokens: int, model: str
@@ -218,6 +248,9 @@ class _Memory:
 
 
 class _Guardrails:
+    def __init__(self) -> None:
+        self.record_event_calls: list[dict[str, object]] = []
+
     async def get_session(self, session_id: str) -> object:
         del session_id
         await asyncio.sleep(0.1)
@@ -229,6 +262,7 @@ class _Guardrails:
 
     async def record_events(self, **kwargs: object) -> object:
         events = list(kwargs.get("events", []))
+        self.record_event_calls.append(dict(kwargs))
         return type(
             "AppendResult",
             (),
@@ -239,6 +273,32 @@ class _Guardrails:
                 "last_seq": len(events),
             },
         )()
+
+
+class _TitleGuardrails(_Guardrails):
+    async def get_session(self, session_id: str) -> object:
+        del session_id
+        await asyncio.sleep(0.1)
+        return type(
+            "IntarisSession",
+            (),
+            {
+                "intention": "child intention",
+                "title": "Child task title",
+                "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
+            },
+        )()
+
+
+class _FailingSessionFactory:
+    def __call__(self) -> _FailingSessionFactory:
+        return self
+
+    async def __aenter__(self) -> object:
+        raise AssertionError("child session must not sync title to conversation state")
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
 
 
 class _LLM:
@@ -320,6 +380,64 @@ class _FileLLM(_LLM):
             supports_pdf_input=True,
             supports_file_input=True,
         )
+
+
+def test_cache_breakpoint_extends_through_project_context() -> None:
+    messages = [
+        {"role": "system", "content": "immutable", IMMUTABLE_PREFIX: True},
+        {"role": "system", "content": "project", PROJECT_CONTEXT: True},
+        {"role": "system", "content": "environment"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    assert _find_cache_breakpoint(messages) == 1
+
+
+def test_only_latest_memory_recall_block_is_protected() -> None:
+    stale_recall = {
+        "role": "system",
+        "content": "old recall",
+        AUDIT_METADATA: {
+            "context_injection": True,
+            "replayable": True,
+            "visibility": "agent_context",
+        },
+    }
+    latest_recall = {**stale_recall, LATEST_MEMORY_RECALL_CONTEXT: True}
+
+    assert not _is_protected_context_message(stale_recall)
+    assert _is_protected_context_message(latest_recall)
+
+
+def test_pruning_protects_current_turn_boundary_over_later_user_attachment() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    current_turn = {"role": "user", "content": "current instruction", TURN_BOUNDARY: True}
+    messages = [
+        {"role": "system", "content": "prefix", IMMUTABLE_PREFIX: True},
+        {"role": "user", "content": "old history " * 200},
+        current_turn,
+        {"role": "user", "content": "attachment context " * 200},
+        {"role": "system", "content": "tail reminder"},
+    ]
+
+    pruned = assembler._prune_messages(
+        messages=messages,
+        resolved_model="test-model",
+        max_prompt_tokens=20,
+        tool_schema_tokens=0,
+    )
+
+    assert current_turn in pruned
+    assert all("old history" not in str(message.get("content", "")) for message in pruned)
+    assert all("attachment context" not in str(message.get("content", "")) for message in pruned)
 
 
 class _SessionManager:
@@ -470,6 +588,41 @@ def _session(mnemory_session_id: str | None = None) -> SessionModel:
     )
 
 
+def _child_session() -> SessionModel:
+    return SessionModel(
+        session_id="child-1",
+        conversation_id="conv-1",
+        parent_session_id="parent-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intaris_session_id="child-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_does_not_sync_child_session_title() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_TitleGuardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+        session_factory=_FailingSessionFactory(),
+    )
+
+    result = await assembler.assemble(
+        session=_child_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="review this",
+        tool_definitions=[],
+    )
+
+    assert result.messages
+
+
 def test_build_channel_context_info_is_channel_only() -> None:
     assert _build_channel_context_info(ConversationContext(type="web")) is None
     assert _build_channel_context_info(ConversationContext(type="task", ref="task-1")) is None
@@ -497,7 +650,14 @@ def test_build_channel_context_info_is_channel_only() -> None:
     assert "Do not optimize for finishing the whole job inside the parent turn" in content
     assert "parent chat as the command bridge" in content
     assert "delegate(wait=false) for bounded, non-interactive worker-style lookup" in content
-    assert "agent_conversation_create(wait=false) for visible iterative work loops" in content
+    assert "prefer reusing an existing relevant managed conversation" in content
+    assert "Use agent_conversation_send(wait=false) to continue it" in content
+    assert (
+        "agent_conversation_create(wait=false) only for a new visible iterative work loop"
+        in content
+    )
+    assert "continue the same managed conversation" in content
+    assert "instead of creating a duplicate" in content
     assert 'chat_mode="plan"' in content
     assert 'chat_mode="build"' in content
     assert "wait=false means fire-and-follow-up, not fire-and-duplicate" in content
@@ -524,7 +684,12 @@ def test_build_web_main_chat_context_info_is_web_main_only() -> None:
     assert "DM-like main chat" in content
     assert "delegate(wait=false)" in content
     assert "delegate(wait=true)" in content
+    assert "prefer reusing an existing relevant managed conversation" in content
+    assert "Use agent_conversation_send(wait=false) to continue it" in content
     assert "agent_conversation_create(wait=false)" in content
+    assert "only for a new visible implementation" in content
+    assert "continue the same managed conversation" in content
+    assert "instead of creating a duplicate" in content
     assert 'chat_mode="plan"' in content
     assert 'chat_mode="build"' in content
     assert "fire-and-follow-up" in content
@@ -536,6 +701,38 @@ def test_build_web_main_chat_context_info_is_web_main_only() -> None:
     )
     assert web_main_content is not None
     assert "Web main chat context:" in web_main_content
+
+
+def test_build_web_topic_context_info_is_topic_only() -> None:
+    assert _build_web_topic_context_info(ConversationContext(type="signal")) is None
+    assert (
+        _build_web_topic_context_info(
+            ConversationContext(type="web", ref="web:user:user@example.com:default")
+        )
+        is None
+    )
+    assert (
+        _build_web_topic_context_info(
+            ConversationContext(
+                type="web",
+                ref="web:agent_direct:user@example.com:agent-1",
+                platform_data={"kind": "agent_direct"},
+            )
+        )
+        is None
+    )
+
+    content = _build_web_topic_context_info(ConversationContext(type="web"))
+
+    assert content is not None
+    assert "Web topic chat context:" in content
+    assert "- Main web chat: no" in content
+    assert "normal topic chat, not the DM-like main chat" in content
+    assert "Do not start background managed conversations" in content
+    assert "managed-conversation tools are available without a wait parameter" in content
+    assert "agent_conversation_create(wait=false)" in content
+    assert "reserved for main/channel chat surfaces" in content
+    assert "Keep this chat responsive" not in content
 
 
 def test_build_agent_work_context_info_lists_only_valid_managed_options() -> None:
@@ -593,7 +790,12 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
         for message in signal_messages
     )
     assert any(
-        "agent_conversation_create(wait=false) for visible iterative work loops" in message
+        "agent_conversation_create(wait=false) only for a new visible iterative work loop"
+        in message
+        for message in signal_messages
+    )
+    assert any(
+        "Use agent_conversation_send(wait=false) to continue it" in message
         for message in signal_messages
     )
     assert any(
@@ -633,6 +835,10 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     assert any("Web main chat context:" in message for message in web_main_messages)
     assert any("Keep this chat responsive" in message for message in web_main_messages)
     assert any("agent_conversation_create(wait=false)" in message for message in web_main_messages)
+    assert any(
+        "Use agent_conversation_send(wait=false) to continue it" in message
+        for message in web_main_messages
+    )
 
     web_result = await assembler.assemble(
         session=_session(),
@@ -645,6 +851,10 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
 
     assert not any("Conversation channel context:" in message for message in web_messages)
     assert not any("Web main chat context:" in message for message in web_messages)
+    assert any("Web topic chat context:" in message for message in web_messages)
+    assert any(
+        "Do not start background managed conversations" in message for message in web_messages
+    )
     assert not any("Keep the channel unblocked" in message for message in web_messages)
     assert not any("Keep this direct chat responsive" in message for message in web_messages)
     assert not any(
@@ -683,6 +893,35 @@ async def test_context_assembler_passes_actor_scope_to_model_resolution() -> Non
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_model_override_does_not_inherit_agent_provider() -> None:
+    llm = _ScopedLLM()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_SessionCache(model_override="claude-sonnet-5"),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    agent = _agent().model_copy(
+        update={"llm_config": AgentLLMConfig(model="gpt-5", provider_id="codex")}
+    )
+
+    await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=agent,
+        user_message="please help",
+        tool_definitions=[],
+    )
+
+    assert llm.resolve_calls[0]["explicit_model"] == "claude-sonnet-5"
+    assert llm.resolve_calls[0]["explicit_provider_id"] is None
+    assert llm.info_calls[0]["provider_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_session() -> None:
     memory = _Memory()
     session_manager = _SessionManager()
@@ -694,6 +933,7 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
         session_manager=session_manager,
         max_context_tokens=4096,
         compaction_threshold=0.85,
+        recall_ttl_seconds=123,
     )
 
     started_at = monotonic()
@@ -717,6 +957,7 @@ async def test_context_assembler_runs_fetches_in_parallel_and_attaches_memory_se
         }
     ]
     assert memory.recall_calls[0]["session_id"] == "mem-1"
+    assert memory.recall_calls[0]["ttl"] == 123
     assert session_manager.attached == [("session-1", "mem-1")]
     assert any('trust="untrusted"' in str(message["content"]) for message in result.messages)
 
@@ -941,12 +1182,15 @@ async def test_context_assembler_loads_root_project_instructions(tmp_path: Path)
     assert not any("README.md" in content for content in system_messages)
     assert "Instructions for project at" in str(result.messages[1]["content"])
     assert "AGENTS.md" in str(result.messages[1]["content"])
+    assert result.cache_breakpoint_index == 1
 
 
-def test_project_instruction_loader_prefers_agents_over_nested_readme(tmp_path: Path) -> None:
+def test_project_instruction_loader_merges_agent_files_over_nested_readme(tmp_path: Path) -> None:
+    intermediate = tmp_path / "src"
     nested = tmp_path / "src" / "feature"
     nested.mkdir(parents=True)
     (tmp_path / "AGENTS.md").write_text("# Project instructions\nUse pytest.\n")
+    (intermediate / "CLAUDE.md").write_text("# Source instructions\nUse type hints.\n")
     (nested / "README.md").write_text("# Feature readme\nNested overview.\n")
 
     instructions = _load_project_instructions(
@@ -961,10 +1205,33 @@ def test_project_instruction_loader_prefers_agents_over_nested_readme(tmp_path: 
         ),
     )
 
-    assert len(instructions) == 1
+    assert len(instructions) == 2
     assert "AGENTS.md" in instructions[0]
     assert "Use pytest" in instructions[0]
-    assert "Nested overview" not in instructions[0]
+    assert "CLAUDE.md" in instructions[1]
+    assert "Use type hints" in instructions[1]
+    assert all("Nested overview" not in instruction for instruction in instructions)
+
+
+def test_project_instruction_loader_marks_truncation(tmp_path: Path) -> None:
+    nested = tmp_path / "src"
+    nested.mkdir()
+    (tmp_path / "AGENTS.md").write_text("A" * 40000)
+
+    instructions = _load_project_instructions(
+        workspace_root=str(tmp_path),
+        effective_working_directory=str(nested),
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True,
+            executor_id="exec-1",
+            executor_type="in_process",
+            cwd=str(nested),
+            home=str(tmp_path),
+        ),
+    )
+
+    assert len(instructions) == 1
+    assert instructions[0].endswith("[truncated]")
 
 
 @pytest.mark.asyncio
@@ -1399,6 +1666,31 @@ async def test_context_assembler_raises_on_cold_cache_event_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_skip_memory_degrades_on_warm_cache_event_failure() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(fail_refresh=True, cold=False),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="warm failure",
+        tool_definitions=[],
+        skip_memory=True,
+    )
+
+    assert "events" in result.degraded_sources
+    assert result.messages[-1]["content"] == "warm failure"
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
     class _SmallWindowLLM(_LLM):
         async def get_model_info(self, model_id: str) -> ModelInfo:
@@ -1442,14 +1734,17 @@ async def test_context_assembler_accounts_for_tool_schema_budget() -> None:
 
 
 def test_build_environment_info_contains_required_fields() -> None:
-    """Environment info must include stable executor context, not wall-clock time."""
+    """Environment info must include stable executor context and day-granularity date."""
     info = _build_environment_info()
     assert "Home directory:" in info
     assert "Working directory:" in info
+    assert "Date:" in info
+    assert "Git repository:" in info
     assert "Platform:" in info
     assert "Hostname:" in info
     assert "System user:" in info
     assert "get_current_datetime" in info
+    assert "Assigned executors" not in info
     # Must contain the actual home directory, not a generic placeholder
     assert str(Path.home()) in info
     # Must instruct the LLM about ~ expansion
@@ -1490,7 +1785,8 @@ def test_build_environment_info_marks_unavailable_remote_environment() -> None:
     assert "get_current_datetime" in info
 
 
-def test_build_environment_info_warns_additional_executors_are_not_fallback() -> None:
+@pytest.mark.asyncio
+async def test_context_assembler_appends_executor_pool_tail_reminder() -> None:
     pool = ExecutorPool(
         primary=[
             ResolvedExecutorTarget(
@@ -1514,17 +1810,40 @@ def test_build_environment_info_warns_additional_executors_are_not_fallback() ->
         ],
     )
 
-    info = _build_environment_info(
-        ExecutorEnvironmentSnapshot(available=True, executor_id="exec-primary"),
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="hello",
+        tool_definitions=[],
+        executor_environment=ExecutorEnvironmentSnapshot(
+            available=True, executor_id="exec-primary"
+        ),
         executor_pool=pool,
         active_executor_id="exec-primary",
     )
 
-    assert "Assigned executors" in info
-    assert "Use primary executors for normal work" in info
-    assert "do not use them as fallback capacity" in info
-    assert "only when the task explicitly requires that specific machine" in info
-    assert "switch back to a primary executor before unrelated or generic" in info
+    environment_message = next(
+        str(message.get("content", ""))
+        for message in result.messages
+        if str(message.get("content", "")).startswith("Environment:")
+    )
+    assert "Assigned executors" not in environment_message
+    contents = [str(message.get("content", "")) for message in result.messages]
+    reminder = next(content for content in contents if "Assigned executors" in content)
+    assert "Use primary executors for normal work" in reminder
+    assert "do not use them as fallback capacity" in reminder
+    assert "only when the task explicitly requires that specific machine" in reminder
+    assert "switch back to a primary executor before unrelated or generic" in reminder
 
 
 @pytest.mark.asyncio
@@ -1665,6 +1984,44 @@ async def test_context_assembler_includes_artifact_ids_with_native_image_blocks(
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_does_not_project_svg_as_native_image() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_VisionLLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Please inspect this diagram",
+        user_attachments=[
+            {
+                "artifact_id": "att_svg",
+                "kind": "image",
+                "mime_type": "image/svg+xml",
+                "filename": "diagram.svg",
+                "size_bytes": 123,
+                "url": "https://example.test/diagram.svg",
+            }
+        ],
+        tool_definitions=[],
+    )
+
+    user_messages = [message for message in result.messages if message.get("role") == "user"]
+    current_turn = user_messages[-1]
+    assert isinstance(current_turn["content"], str)
+    assert "artifact_id=att_svg" in current_turn["content"]
+    assert "diagram.svg" in current_turn["content"]
+    assert "image_url" not in current_turn["content"]
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_keeps_native_attachments_on_user_role_for_system_turns() -> None:
     assembler = ContextAssembler(
         memory=_Memory(),
@@ -1750,6 +2107,46 @@ async def test_context_assembler_includes_composed_identity_prompt() -> None:
 
 
 @pytest.mark.asyncio
+async def test_immutable_prefix_idempotency_key_includes_counter_and_content_hash() -> None:
+    cache = _SessionCache()
+    assert cache.entry is not None
+    cache.entry.last_event_seq = 42
+    guardrails = _Guardrails()
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=guardrails,
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="hello",
+        tool_definitions=[],
+    )
+
+    keys = [
+        str(call.get("idempotency_key"))
+        for call in guardrails.record_event_calls
+        if call.get("idempotency_key")
+    ]
+    assert any(":immutable_prefix:bootstrap:42:" in key for key in keys)
+    suffix_parts = [key.split(":")[-4:] for key in keys]
+    assert all(parts[0] == "bootstrap" for parts in suffix_parts)
+    assert all(parts[1] == "42" for parts in suffix_parts)
+    assert all(
+        len(parts[2]) == 16 and all(char in "0123456789abcdef" for char in parts[2])
+        for parts in suffix_parts
+    )
+    assert {parts[3] for parts in suffix_parts} == {"messages", "snapshot"}
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_consolidates_immutable_prefix_into_first_message() -> None:
     class _MemoryWithInstructions:
         async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
@@ -1802,9 +2199,9 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "<skills_guidance>" in content
     assert "skill_write" not in content
     assert "<critical_rules>" in content
-    assert "IMPORTANT: If the task names a skill" in content
+    assert "If the task names a skill" in content
     assert "Skills are managed exclusively through Cognis-provided skill tools" in content
-    assert "Do not create or edit filesystem SKILL.md files" in content
+    assert "not filesystem SKILL.md files or other filesystem skill manifests" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "Mutable recalled memory" not in content
@@ -1916,7 +2313,7 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
     assert "<critical_rules>" in content
-    assert "IMPORTANT: If the task names a skill" in content
+    assert "If the task names a skill" in content
     assert "Skills are managed exclusively through Cognis-provided skill tools" in content
     assert "task teaches a durable reusable procedure" in content
     assert "Prefer updating an existing relevant skill over creating a new one" in content
@@ -2091,6 +2488,7 @@ async def test_context_assembler_renders_follow_up_boundary_and_active_block() -
     contents = [str(message.get("content", "")) for message in result.messages]
     assert any("historical conversation context" in content for content in contents)
     assert any('<follow_up_event mode="notify"' in content for content in contents)
+    assert any("system-initiated follow-up" in content for content in contents)
     assert all(message.get("content") != "" for message in result.messages)
 
 
@@ -2139,6 +2537,26 @@ async def test_context_assembler_keeps_follow_up_data_out_of_immutable_prefix() 
     )
     assert "Implement auth" not in immutable_contents
     assert "Refresh token support implemented." not in immutable_contents
+    assert "follow-up result" not in immutable_contents
+
+    suffix_contents = "\n".join(
+        str(message.get("content", "")) for message in result.messages[breakpoint + 1 :]
+    )
+    assert "follow-up result" in suffix_contents
+
+
+def test_follow_up_prompt_guidance_is_suffix_only() -> None:
+    integrate_prefix = build_system_instructions(PromptContext.FOLLOW_UP_INTEGRATE)
+    notify_prefix = build_system_instructions(PromptContext.FOLLOW_UP_NOTIFY)
+
+    assert integrate_prefix == notify_prefix
+    assert integrate_prefix is not None
+    assert "follow-up result" not in integrate_prefix
+    assert "system-initiated follow-up" not in integrate_prefix
+    assert "follow-up result" in (build_follow_up_guidance(PromptContext.FOLLOW_UP_INTEGRATE) or "")
+    assert "system-initiated follow-up" in (
+        build_follow_up_guidance(PromptContext.FOLLOW_UP_NOTIFY) or ""
+    )
 
 
 @pytest.mark.asyncio

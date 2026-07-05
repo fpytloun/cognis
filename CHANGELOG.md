@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-07-05
+
+### Added
+
+- Added the Chat v2 realtime sync architecture with runtime overlay frames, REST snapshot/sync/backfill endpoints, and invariant coverage for ordering, deduplication, reconnection, and final-state preservation.
+- Added a deterministic mock-LLM E2E harness, browser replay scenarios, and expanded golden streams for streaming, tool-output, reconnect, and multi-phase assistant flows.
+- Added Matrix channel support and richer channel/account controls, including group-room handling, authenticated media download, thread overrides, and improved formatting.
+- Added Anthropic subscription OAuth support, executor-routed inference fields, live context-usage streaming, chat display preferences, and rich Chat v2 tool/thinking/delegation rendering.
+
+### Changed
+
+- Reworked chat rendering around native Chat v2 projection, grouped activity/tool segments, stable runtime ordering, scroll stability, and consolidated timeline/session-log rendering.
+- Improved MCP OAuth, executor reconfiguration, provider routing, Responses/Anthropic request handling, prompt-cache assembly, and tool-call loop hygiene.
+- Improved task board/detail performance, PWA update handling, sidebar/conversation state reconciliation, structured question UX, and mobile chat controls.
+- Expanded backend and UI tests across Chat v2, channels, MCP OAuth, provider routing, notifications, executor runtime, and E2E streaming scenarios.
+
+### Fixed
+
+- Fixed Chat v2 streaming races that caused duplicate, disappearing, stale, or incorrectly ordered messages across tools, thinking blocks, compaction, reconnects, and refreshes.
+- Fixed notification retry idempotency, managed conversation delivery, channel attachment handling, Matrix room classification, and known Matrix thread follow-ups.
+- Fixed LLM/provider edge cases for Responses transcript persistence, cache breakpoint lists, provider kwargs sanitization, stream failure continuations, and model discovery.
+- Fixed executor/tool hardening issues around skill asset materialization, rejected OAuth-token recovery, MCP server changes, artifact refs, file diagnostics freshness, and legacy MCP category disables.
+
 ## [0.10.0] - 2026-06-21
 
 ### Added

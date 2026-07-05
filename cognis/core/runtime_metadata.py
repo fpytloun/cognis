@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from cognis.models.agent import AgentDefinition
-
 
 def _string_value(value: Any) -> str | None:
     if isinstance(value, str):
@@ -22,16 +20,16 @@ def _bool_value(value: Any) -> bool | None:
 
 
 def assistant_message_runtime_metadata(
-    agent: AgentDefinition,
+    agent: object,
     runtime_info: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return non-secret runtime identity/inference metadata for one assistant turn."""
 
     info = runtime_info or {}
     metadata: dict[str, Any] = {
-        "agent_id": agent.agent_id,
-        "agent_name": agent.name,
-        "agent_display_name": agent.display_name,
+        "agent_id": _string_value(getattr(agent, "agent_id", None)),
+        "agent_name": _string_value(getattr(agent, "name", None)),
+        "agent_display_name": _string_value(getattr(agent, "display_name", None)),
         "requested_agent_profile_id": _string_value(info.get("requested_agent_profile_id")),
         "agent_profile_id": _string_value(info.get("resolved_agent_profile_id")),
         "agent_profile_source": _string_value(info.get("agent_profile_source")),

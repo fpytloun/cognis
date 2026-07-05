@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 # Token thresholds match OpenCode's ``compaction.ts`` constants so the
 # behaviour is comparable across the two harnesses.
-PRUNE_MINIMUM = 20_000
 PRUNE_PROTECT = 40_000
 PRUNE_MIN_USER_TURNS = 2
 

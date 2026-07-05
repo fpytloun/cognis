@@ -52,6 +52,7 @@ def build_intaris_tool_definition(
             raw_tool_name=raw_tool_name,
         ),
         category="mcp",
+        content_trust="untrusted",
         timeout_seconds=30,
     )
 

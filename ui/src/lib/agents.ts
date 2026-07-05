@@ -60,6 +60,8 @@ export interface AgentFormState {
   maxTokens: string;
   reasoningEffort: string;
   voice: string;
+  memoryBackend: 'mnemory' | 'none';
+  guardrailsBackend: 'intaris' | 'none';
   agentProfiles: AgentRuntimeProfileFormState[];
   defaultAgentProfileId: string;
   availableWorkflowIds: string[];
@@ -120,6 +122,16 @@ export function slugify(text: string): string {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
     .slice(0, 64) || 'unnamed';
+}
+
+const LEGACY_HIDDEN_DISABLED_CATEGORIES = new Set(['mcp']);
+
+function activeDisabledCategories(categories: unknown): string[] {
+  if (!Array.isArray(categories)) return [];
+  return categories.filter(
+    (value): value is string =>
+      typeof value === 'string' && !LEGACY_HIDDEN_DISABLED_CATEGORIES.has(value)
+  );
 }
 
 function normalizeProfileId(value: string): string {
@@ -244,6 +256,8 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     maxTokens: '',
     reasoningEffort: '',
     voice: '',
+    memoryBackend: 'mnemory',
+    guardrailsBackend: 'intaris',
     agentProfiles: [],
     defaultAgentProfileId: '',
     availableWorkflowIds: systemWorkflowIds,
@@ -315,6 +329,10 @@ export function agentToFormState(agent: Agent): AgentFormState {
     reasoningEffort:
       typeof llmConfig.reasoning_effort === 'string' ? llmConfig.reasoning_effort : '',
     voice: typeof llmConfig.voice === 'string' ? llmConfig.voice : '',
+    memoryBackend:
+      agent.capabilities?.memory_backend === 'none' ? 'none' : 'mnemory',
+    guardrailsBackend:
+      agent.capabilities?.guardrails_backend === 'none' ? 'none' : 'intaris',
     agentProfiles: profileFormStateFromAgentProfiles(agent.agent_profiles),
     defaultAgentProfileId:
       typeof agent.default_agent_profile_id === 'string' ? agent.default_agent_profile_id : '',
@@ -377,9 +395,7 @@ export function agentToFormState(agent: Agent): AgentFormState {
     intarisMcpServers: Array.isArray(tools.intaris_mcp_servers)
       ? tools.intaris_mcp_servers.filter((v): v is string => typeof v === 'string')
       : [],
-    disabledCategories: Array.isArray(tools.disabled_categories)
-      ? tools.disabled_categories.filter((value): value is string => typeof value === 'string')
-      : [],
+    disabledCategories: activeDisabledCategories(tools.disabled_categories),
     disabledTools: Array.isArray(tools.disabled_tools)
       ? tools.disabled_tools.filter((value): value is string => typeof value === 'string')
       : [],
@@ -506,6 +522,7 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       })
       .filter(([key, value]) => Boolean(key) && Boolean(value))
   );
+  const disabledCategories = [...new Set(activeDisabledCategories(form.disabledCategories))];
 
   const payload: Record<string, unknown> = {
     agent_id: form.agentId || undefined, // let backend auto-generate if empty
@@ -531,8 +548,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
     tools: {
       ...preservedTools,
       delegation_tools: form.canDelegate,
-      ...(form.disabledCategories.length > 0
-        ? { disabled_categories: [...new Set(form.disabledCategories)] }
+      ...(disabledCategories.length > 0
+        ? { disabled_categories: disabledCategories }
         : {}),
       ...(form.disabledTools.length > 0
         ? { disabled_tools: [...new Set(form.disabledTools)] }
@@ -575,6 +592,10 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
       reasoning_effort: form.reasoningEffort || undefined,
       voice: form.voice || undefined
+    },
+    capabilities: {
+      memory_backend: form.memoryBackend,
+      guardrails_backend: form.guardrailsBackend
     },
     agent_profiles: agentProfiles,
     default_agent_profile_id: defaultAgentProfileId,

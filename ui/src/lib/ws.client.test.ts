@@ -168,4 +168,84 @@ describe('ws client heartbeat', () => {
     expect(reconnects.at(-1)?.last_seq).toBe(12);
     wsClient.disconnect();
   });
+
+  it('opts into Chat v2 frames with an explicit cursor and preserves it across legacy reconnects', async () => {
+    const { wsClient } = await import('./ws/client');
+
+    wsClient.connect();
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+
+    wsClient.subscribeConversation('conv-1', 7, 'sess-1');
+    wsClient.subscribeChatV2Conversation('conv-1', 'cursor-a');
+    wsClient.updateConversationSeq('conv-1', 11, 'sess-1');
+    wsClient.subscribeConversation('conv-1', 11, 'sess-1', { replaceCursor: true });
+
+    const frames = socket.sent.map((payload) => JSON.parse(payload) as Record<string, unknown>);
+    expect(frames).toContainEqual({
+      type: 'chat_v2_subscribe',
+      conversation_id: 'conv-1',
+      cursor: 'cursor-a'
+    });
+    const reconnects = frames.filter((payload) => payload.type === 'reconnect');
+    expect(reconnects.at(-1)).toMatchObject({
+      conversation_id: 'conv-1',
+      last_seq: 11,
+      session_id: 'sess-1',
+      chat_v2_cursor: 'cursor-a'
+    });
+    wsClient.disconnect();
+  });
+
+  it('clears Chat v2 server opt-in without dropping the legacy conversation subscription', async () => {
+    const { wsClient } = await import('./ws/client');
+
+    wsClient.connect();
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+
+    wsClient.subscribeConversation('conv-1', 4, 'sess-1');
+    wsClient.subscribeChatV2Conversation('conv-1', 'cursor-a');
+    wsClient.clearChatV2Cursor('conv-1');
+    wsClient.subscribeConversation('conv-1', 5, 'sess-1', { replaceCursor: true });
+
+    const frames = socket.sent.map((payload) => JSON.parse(payload) as Record<string, unknown>);
+    expect(frames).toContainEqual({
+      type: 'chat_v2_unsubscribe',
+      conversation_id: 'conv-1'
+    });
+    expect(frames.at(-1)).toMatchObject({
+      type: 'reconnect',
+      conversation_id: 'conv-1',
+      last_seq: 5,
+      session_id: 'sess-1',
+      chat_v2_cursor: null
+    });
+    wsClient.disconnect();
+  });
+
+  it('unsubscribes Chat v2 on full conversation unsubscribe when v2 was active', async () => {
+    const { wsClient } = await import('./ws/client');
+
+    wsClient.connect();
+    await Promise.resolve();
+    const socket = FakeWebSocket.instances[0];
+    socket.onopen?.();
+    socket.onmessage?.({ data: JSON.stringify({ type: 'authenticated' }) } as MessageEvent<string>);
+
+    wsClient.subscribeConversation('conv-1', 1, 'sess-1');
+    wsClient.subscribeChatV2Conversation('conv-1', 'cursor-a');
+    wsClient.unsubscribeConversation('conv-1');
+
+    const frames = socket.sent.map((payload) => JSON.parse(payload) as Record<string, unknown>);
+    expect(frames).toContainEqual({
+      type: 'chat_v2_unsubscribe',
+      conversation_id: 'conv-1'
+    });
+    wsClient.disconnect();
+  });
 });

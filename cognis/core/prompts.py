@@ -41,19 +41,6 @@ class PromptContext(Enum):
 # ---------------------------------------------------------------------------
 
 _CRITICAL_RULES = """\
-- IMPORTANT: If the task names a skill shown in <available_skills>, call \
-skill_load for that skill before any other discovery or tool exploration \
-unless the skill is already marked as loaded.
-- IMPORTANT: Skills are managed exclusively through Cognis-provided skill \
-tools. When creating, updating, deleting, importing, exporting, attaching, or \
-editing assets for skills, use the available skill-management tools. Do not \
-create or edit filesystem SKILL.md files or other filesystem skill manifests \
-as a substitute for Cognis skill management.
-- IMPORTANT: When a task teaches a durable reusable procedure, consider \
-updating or creating a Cognis skill with the available skill-management tools. \
-Prefer updating an existing relevant skill over creating a new one, and create \
-new skills only for recurring class-level workflows rather than one-off task \
-progress, transient failures, or narrow bug fixes.
 - IMPORTANT: Never invent placeholder identifiers. Values like "noop", \
 "dummy", "invalid", "example", "...", or bare URLs where an ID is expected \
 are always wrong. Use real IDs returned by prior tool calls, or discover \
@@ -91,14 +78,7 @@ _CORE_BEHAVIOR = """\
 validation.
 - Prioritize technical accuracy over agreement. Disagree when warranted.
 - When uncertain, investigate before answering — do not guess or fabricate.
-- Use the user's language for conversation and natural-language documents. In \
-delegated sub-sessions, resolve the user's language from the delegated task or \
-latest user message, not from account, caller, or memory preferences; default \
-to English if it is ambiguous. Preserve correct orthography and diacritics in \
-user-facing prose. Keep code identifiers and code comments in English unless \
-the user or project explicitly requires otherwise.
-- When referencing code, include file paths and line numbers \
-(e.g. `src/main.py:42`)."""
+"""
 
 _WORKSPACE_HYGIENE = """\
 ## Workspace hygiene
@@ -155,6 +135,14 @@ _TOOL_GUIDANCE_TEMPLATE = """\
 - Make independent tool calls in parallel when possible for efficiency.
 - Large outputs are automatically truncated. Use offset/limit parameters \
   or search tools to navigate large files.
+- When a tool needs Cognis artifact content or metadata, do not inline base64 \
+  and do not pass local filesystem paths to remote tools. Publish local files \
+  with `artifact_publish` first, then use exact artifact value refs in tool \
+  arguments: `$artifact:<artifact_id>.content_b64`, \
+  `$artifact:<artifact_id>.filename`, `$artifact:<artifact_id>.mime_type`, \
+  `$artifact:<artifact_id>.size_bytes`, `$artifact:<artifact_id>.signed_url`, \
+  or `$artifact:<artifact_id>.public_url`. These refs are resolved by the \
+  controller at execution time and must be the entire string value.
 - When using Tavily-backed web search, prefer structured parameters over query syntax hacks: \
 use `include_domains` and `exclude_domains` instead of `site:` operators whenever possible.
 - Keep Tavily `query` values focused on the actual subject or identifier \
@@ -276,6 +264,12 @@ visible tool schema. If no such guidance is present, prefer joined delegation \
 or direct completion for bounded work, and use managed conversations or tasks \
 only when they clearly fit the requested lifecycle.
 
+Do not use managed conversations merely to keep a normal topic/direct chat \
+responsive. Managed-conversation `wait=false` is valid only when the current \
+context explicitly exposes a `wait` parameter and async routing guidance for \
+that tool. If a managed-conversation tool is visible without `wait`, the \
+started turn is joined before returning.
+
 When the current context explicitly exposes `wait=false`, treat it as \
 fire-and-follow-up, not fire-and-duplicate. After starting async delegate or \
 managed-conversation work, do not keep investigating or implementing the same \
@@ -315,12 +309,13 @@ turn must synthesize the result before replying.
   continue chatting.
 
 ### Chat todos and questions
-- Chat todos are optional, rare, and only help you manage execution within \
-the current turn.
+- Chat todos are optional, rare, and represent first-class session state. \
+Once you create them, keep them accurate until they are completed, cancelled, \
+or explicitly cleared.
 - Do not create todos while only presenting a plan, options, or \
 clarifying questions.
-- Create todos only when you are starting concrete work that you still \
-intend to continue in this turn.
+- Create todos only when you are starting concrete work that benefits from \
+stateful progress tracking.
 - Prefer delegation for non-trivial work. If the work would benefit from \
 structured tracking, delegate or create a task instead of using chat todos.
 - Do not create chat todos for generic cognitive steps like "explore", \
@@ -328,7 +323,8 @@ structured tracking, delegate or create a task instead of using chat todos.
 - If the work is simple enough to keep in working memory, do not create \
 chat todos.
 - Do not use chat todos as long-lived tracking for background tasks or \
-delegated work owned elsewhere.
+delegated work owned elsewhere; clear them when they no longer represent \
+active session work.
 - If part of the work is delegated or turned into a background task, keep \
 only the remaining current-turn work in your chat todos.
 - When `request_user_input` is available, use it for targeted \
@@ -337,6 +333,15 @@ scope, UX/API behavior, safety, persistence or migration, irreversible side \
 effects, cost/time, or acceptance criteria. Plan-mode turns may ask earlier \
 to turn ambiguous requests into a concrete plan, but do not ask when a safe \
 default is obvious or the user requested autonomous execution."""
+
+_WORK_ROUTING_NO_DELEGATE = """\
+## Work routing
+
+- Handle small, bounded work inline.
+- Use tasks for durable, substantial, workflow-shaped work that needs lifecycle,
+  deliverables, review, or longer background persistence.
+- Do not claim delegated specialist work is available when the current session
+  does not expose or permit delegation."""
 
 _STEP_EXECUTION = """\
 ## Step execution
@@ -442,6 +447,50 @@ You are handling a system-initiated follow-up that should be presented as a sepa
 - Do not resume or continue an older conversation thread unless the follow-up explicitly requires it.
 - Present the update clearly and concisely as a new notification.
 - If the follow-up indicates failure or pause, explain the issue and any user options without pretending the old thread is still active."""
+
+
+def build_skill_guidance(*, visible_tool_names: set[str] | frozenset[str] | None = None) -> str:
+    """Return the single source of skill-management guidance."""
+
+    guidance = (
+        "You have skills that extend your capabilities. Review the "
+        "list above and use skill_load only when a skill adds procedure "
+        "needed for the current task or workflow step and is not already "
+        "marked as loaded. Skills marked as attached are preferred defaults "
+        "for this agent, but loaded skill instructions are subordinate to "
+        "workflow step contracts and controller completion requirements. "
+        "If the task names a skill shown in <available_skills>, call "
+        "skill_load for that skill before any other discovery or tool "
+        "exploration unless the skill is already marked as loaded. "
+        "Skills are managed exclusively through Cognis-provided skill "
+        "tools, not filesystem SKILL.md files or other filesystem skill "
+        "manifests. When a task teaches a durable reusable procedure, "
+        "consider updating or creating a Cognis skill. Prefer updating "
+        "an existing relevant skill over creating a new one. Create new "
+        "skills only for recurring class-level workflows, not one-off "
+        "task progress, transient failures, or narrow bug fixes. "
+        "Skills are procedural memory; facts and preferences belong in "
+        "memory."
+    )
+    if visible_tool_names is not None and "skill_write" in visible_tool_names:
+        guidance += (
+            " Use skill_write to create or update skills for future use "
+            "when the task reveals reusable workflow, tool, safety, or "
+            "style guidance; use skill_asset_write for reusable "
+            "references, templates, or scripts; do not create SKILL.md "
+            "files instead."
+        )
+    return guidance
+
+
+def build_follow_up_guidance(context: PromptContext) -> str | None:
+    """Return mutable follow-up guidance for suffix injection."""
+
+    if context == PromptContext.FOLLOW_UP_INTEGRATE:
+        return _FOLLOW_UP_INTEGRATE
+    if context == PromptContext.FOLLOW_UP_NOTIFY:
+        return _FOLLOW_UP_NOTIFY
+    return None
 
 
 def _build_tool_guidance(model_id: str | None) -> str:
@@ -551,13 +600,11 @@ def build_system_instructions(
         sections.append(_EXECUTION_BIAS)
         if include_work_routing:
             sections.append(_WORK_ROUTING)
+        else:
+            sections.append(_WORK_ROUTING_NO_DELEGATE)
     elif context == PromptContext.TASK_STEP:
         sections.append(_STEP_EXECUTION)
     elif context == PromptContext.DELEGATION:
         sections.append(_DELEGATION_FOCUS)
-    elif context == PromptContext.FOLLOW_UP_INTEGRATE:
-        sections.append(_FOLLOW_UP_INTEGRATE)
-    elif context == PromptContext.FOLLOW_UP_NOTIFY:
-        sections.append(_FOLLOW_UP_NOTIFY)
 
     return "\n\n".join(sections)

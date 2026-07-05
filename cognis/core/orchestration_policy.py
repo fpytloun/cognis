@@ -34,6 +34,8 @@ class OrchestrationSurfacePolicy:
     allow_delegate_wait_false: bool
     expose_delegate_wait_option: bool
     expose_managed_conversation_tools: bool
+    allow_managed_conversation_wait_false: bool
+    expose_managed_conversation_wait_option: bool
     expose_task_tools: bool = True
     expose_workflow_tools: bool = True
     expose_compose_workflow_tool: bool = True
@@ -90,6 +92,8 @@ def orchestration_surface_policy(
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
             expose_managed_conversation_tools=False,
+            allow_managed_conversation_wait_false=False,
+            expose_managed_conversation_wait_option=False,
             expose_task_tools=False,
             expose_workflow_tools=False,
             expose_compose_workflow_tool=False,
@@ -100,6 +104,8 @@ def orchestration_surface_policy(
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
             expose_managed_conversation_tools=False,
+            allow_managed_conversation_wait_false=False,
+            expose_managed_conversation_wait_option=False,
             expose_task_tools=False,
             expose_workflow_tools=False,
             expose_compose_workflow_tool=False,
@@ -110,6 +116,8 @@ def orchestration_surface_policy(
             allow_delegate_wait_false=False,
             expose_delegate_wait_option=False,
             expose_managed_conversation_tools=True,
+            allow_managed_conversation_wait_false=False,
+            expose_managed_conversation_wait_option=False,
         )
     if surface in {OrchestrationSurface.WEB_MAIN_CHAT, OrchestrationSurface.CHANNEL}:
         return OrchestrationSurfacePolicy(
@@ -117,12 +125,16 @@ def orchestration_surface_policy(
             allow_delegate_wait_false=True,
             expose_delegate_wait_option=True,
             expose_managed_conversation_tools=True,
+            allow_managed_conversation_wait_false=True,
+            expose_managed_conversation_wait_option=True,
         )
     return OrchestrationSurfacePolicy(
         surface=surface,
         allow_delegate_wait_false=False,
         expose_delegate_wait_option=False,
         expose_managed_conversation_tools=True,
+        allow_managed_conversation_wait_false=False,
+        expose_managed_conversation_wait_option=False,
     )
 
 

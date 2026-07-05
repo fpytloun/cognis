@@ -287,6 +287,7 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         "tools": payload.tools,
         "permissions": payload.permissions,
         "llm_config": payload.llm_config,
+        "capabilities": payload.capabilities,
         "agent_profiles": payload.agent_profiles or {},
         "default_agent_profile_id": payload.default_agent_profile_id,
         "execution": payload.execution,
@@ -313,6 +314,7 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
             tools=payload.tools,
             permissions=payload.permissions,
             llm_config=payload.llm_config,
+            capabilities=definition.capabilities.model_dump(mode="json"),
             agent_profiles=payload.agent_profiles,
             default_agent_profile_id=payload.default_agent_profile_id,
             execution=payload.execution,
@@ -398,10 +400,17 @@ async def update_agent_route(
         identity_changed = any(
             field in updates and getattr(row, field) != updates[field] for field in identity_fields
         )
-        if {"agent_profiles", "default_agent_profile_id", "llm_config"} & updates.keys():
+        if {
+            "agent_profiles",
+            "default_agent_profile_id",
+            "llm_config",
+            "capabilities",
+        } & updates.keys():
             candidate = agent_to_response(row).model_dump()
             candidate.update(updates)
-            _validate_agent_definition_payload(candidate)
+            candidate_definition = _validate_agent_definition_payload(candidate)
+            if "capabilities" in updates:
+                updates["capabilities"] = candidate_definition.capabilities.model_dump(mode="json")
         ok = await update_agent(
             session,
             agent_id,
@@ -598,6 +607,7 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
                 llm_config=definition.llm_config.model_dump(mode="json", exclude_none=True)
                 if definition.llm_config
                 else None,
+                capabilities=definition.capabilities.model_dump(mode="json"),
                 agent_profiles={
                     profile_id: profile.model_dump(mode="json", exclude_none=True)
                     for profile_id, profile in definition.agent_profiles.items()

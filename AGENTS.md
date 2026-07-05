@@ -207,9 +207,9 @@ cognis/
 
 11. **Follows mnemory/intaris conventions**: Same build tooling (hatchling/uv), config pattern (env vars, no config files), error handling, and code style. Compatible ecosystem.
 
-12. **Compaction creates new sessions**: When context exceeds 85% capacity, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) defers session creation until the next user message; automatic compaction creates it immediately since the user message is available. Long-lived ambient chats (web agent-direct and external channel conversations) can also idle-checkpoint before the next user message after `session.long_lived_chat_idle_compaction_seconds` (default 6h) if at least `session.long_lived_chat_idle_compaction_min_events` uncompacted events exist. The old session is marked completed with `completion_reason="compacted"`. Compaction input is assembled using a three-band strategy (head 20% / middle-drop / tail 60%) token-budgeted against the compaction model's `max_input_tokens`. The LLM is retried once on transient errors before falling back to a sliding-window mechanical summary (last 8 user messages + 4 assistant finals + 4 deliverables verbatim). The mechanical fallback is a last resort — the `cognis_compaction_fallback_used_total` counter is alert-worthy. Compaction recursion is bounded at `session.compaction_max_recursion` (default 2); exceeding it surfaces a `compaction_recursion_exhausted` classified failure. The deferred-rotation path re-fetches preserved tail events from the old session's Intaris stream (using `tail_start_seq` from the `compaction_summary` event) and seeds them into the new session so continuity is preserved.
+ 12. **Compaction creates new sessions**: When context reaches the configured hard-pressure band (currently about 92% of the selected model budget) or a user runs manual `/compact`, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) runs compact→rotate immediately under the agent-loop per-session lock; concurrent turns wait and re-resolve the new active session before recording. Long-lived ambient chats (web agent-direct and external channel conversations) can also idle-checkpoint before the next user message after `session.long_lived_chat_idle_compaction_seconds` (default 6h) if at least `session.long_lived_chat_idle_compaction_min_events` uncompacted events exist. The old session is marked completed with `completion_reason="compacted"`. Compaction input is assembled using a three-band strategy with exact token checks, middle-band user messages preserved verbatim, and a preserved tail walked backwards on user-turn boundaries up to 30% of the session model prompt budget; `session.compaction_preserve_turns` is a maximum cap, not a target. The LLM retries transient errors including 429 before falling back to a sliding-window mechanical summary that prepends the prior anchored summary and original request. The mechanical fallback is a last resort — the `cognis_compaction_fallback_used_total` counter is alert-worthy. Compaction recursion is bounded at `session.compaction_max_recursion` (default 2); exceeding it surfaces a `compaction_recursion_exhausted` classified failure and starts a short auto-compaction cooldown. The deferred-rotation path is crash-recovery only: it re-fetches preserved tail events from the old session's Intaris stream (using `tail_start_seq` from the `compaction_summary` event) and seeds them into the new session so continuity is preserved.
 
-13. **Prompt caching via immutable prefix**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary) followed by a mutable suffix (environment → history → recalled memories → delegations → user message). The immutable prefix benefits from LLM prompt caching (Anthropic `cache_control`, OpenAI automatic prefix caching). Memory instructions and core memories are cached for the lifetime of the session cache entry. Refresh is triggered only by explicit repair signals: Mnemory session adoption, missing entries after a cold load, or post-compaction prefix repair. There is no time-based TTL — the cache is valid until one of these signals fires. Tool schemas are kept stable across turns — the tool exposure layer uses provider-specific mechanisms (`allowed_tools`, `defer_loading`, `tool_search`) to vary tool visibility without changing the cached `tools` array. Within-turn re-projection only fires when real context pressure exists (≥ 92% of available tokens, or an oversized tool result was appended); ordinary turns skip re-projection entirely to preserve the provider prefix cache. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
+ 13. **Prompt caching via provider breakpoints**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary), optional frozen project-context messages, then a mutable suffix (stable environment → history → recalled memories → delegations → current user/tool loop transcript → volatile tail reminders). Follow-up guidance is suffix-only and does not rewrite the immutable prefix. Anthropic requests use up to four `cache_control` breakpoints, recomputed for every LLM cycle: the last tool schema, the last cached prefix/project-context message, the end of prior-turn history, and the current request tail. `session.anthropic_cache_ttl` defaults to `5m`; when set to `1h`, only tools and cached prefix/project context use `1h`, while moving breakpoints stay `5m`, and the extended-cache-ttl beta is sent. OpenAI/ChatGPT uses automatic prefix caching unless explicit prompt cache keys are opted in. Refresh of the immutable prefix is still triggered only by explicit repair signals: Mnemory session adoption, missing entries after a cold load, or post-compaction prefix repair. Within-turn re-projection now occurs when real context pressure exists (≥ 92% of available tokens, exact-pressure projection trigger, or an oversized tool result was appended); ordinary turns skip re-projection. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
 
 14. **External channel senders must be verifiable**: Channel accounts should default to `pairing` so unknown remote senders cannot talk to an agent until they redeem a short-lived verification code in the Cognis UI.
 
@@ -301,6 +301,165 @@ instance with all providers connected.
 - After changing the agent loop or delegation logic
 - After changing context assembly or compaction
 - Before releases
+
+### E2E tests (streaming chat timeline)
+
+E2E tests reproduce streaming-chat bugs deterministically using a mock LLM
+provider and a self-contained stack. See `docs/specs/33-e2e-test-harness.md`
+for the full design.
+
+**IMPORTANT — current chat protocol (Chat v2):** the backend no longer emits
+`timeline_patch` / `conversation_view_refresh` (removed with the legacy
+timeline projection). The live protocol is `chat_v2_frame` (runtime overlay
+frames coalesced ~60 ms) + `conversation_runtime_snapshot` + REST
+snapshot/sync/backfill (`cognis/api/chat_v2/`). Production chat renders from
+`ChatV2Store` (`ui/src/lib/chat-v2/store.svelte.ts` over the pure
+`sync-engine.ts`). The legacy `ChatTimeline` store is used only by its own
+tests and legacy golden replays; the sub-session detail panel uses
+`session-log.ts` + `chat.ts` builders.
+
+**Three test layers:**
+
+| Layer | Command | Speed | What it tests |
+|---|---|---|---|
+| L1 unit | `cd ui && npm test` | ms | ChatV2 sync-engine + invariant scenarios (`src/lib/chat-v2/`) and legacy ChatTimeline store logic |
+| L2 golden replay | `uv run pytest tests/e2e/ -v` then `cd ui && npm test src/lib/chat-timeline.golden.test.ts` | ~2 min + ms | Backend event stream + legacy client store invariants |
+| L3 browser | `cd ui && npx playwright test e2e/` | ~1 min | Rendered DOM (spinner, no flicker, scroll stability) |
+
+**Chat v2 invariant suite (primary for ordering/grouping bugs):**
+`ui/src/lib/chat-v2/sync-engine.invariants.test.ts` replays frame sequences
+(streaming frames, completion frames, settle frames, canonical syncs,
+snapshot refreshes, cross-turn queued messages, reconnects) through the same
+pure functions the production store uses and asserts after every step:
+INV-NO-HANG, INV-NO-DUP, INV-STABLE-ORDER (relative order of visible items
+never flips), INV-FINAL-PRESENCE, INV-REFRESH-NO-DROP. Backend counterpart:
+`tests/unit/api/chat_v2/test_id_equivalence.py` asserts every runtime overlay
+item id is byte-identical to the canonical projector id for the same event —
+an id mismatch is the #1 source of streaming-vs-reload duplicates.
+
+**L2 feedback loop (legacy golden replay):**
+
+```bash
+# Step 1: Capture golden event streams from live stack (starts everything automatically)
+uv run pytest tests/e2e/ -v
+
+# Step 2: Replay through the legacy ChatTimeline store (fast, no stack needed)
+cd ui && npm test src/lib/chat-timeline.golden.test.ts
+```
+
+Step 1 starts: mock-llm (deterministic OpenAI-compatible server) + Mnemory +
+Intaris (`ANALYSIS_ENABLED=false`, no LLM needed) + Cognis, seeds a
+capability-off e2e agent (`memory_backend=none, guardrails_backend=none`),
+runs each scenario, and writes `tests/e2e/golden/<scenario>.jsonl`.
+
+Step 2 replays the golden files through the legacy `ChatTimeline` store and
+asserts: INV-NO-HANG (no streaming/started after message_complete), INV-NO-DUP,
+INV-MONOTONIC-PRESENCE, INV-STABLE-ORDERKEY, INV-FIELD-PRESERVE, INV-FINAL-PRESENCE
+(streaming items must survive to final state — catches "message disappears" bug),
+INV-RECONNECT-NO-HANG (no streaming/started after a `has_active_turn:false` runtime
+snapshot — catches reconnect re-injection), and INV-REFRESH-NO-DROP (a refresh /
+`replaceAll` must not evict an unconfirmed-live item present just before it — catches
+"message disappears after refresh"). NOTE: this replay exercises the LEGACY
+store, not the production ChatV2 path — treat green legacy goldens as
+necessary but not sufficient; the ChatV2 invariant suite is authoritative for
+production behavior.
+
+Chat v2 ordering contracts the fixes rely on: canonical sort keys are
+`lineage:seq:phase:kind_rank:local`; active-turn runtime items live in the
+`9998` sentinel band with per-item phases; carried (settled-but-unconfirmed)
+prior-turn items are rekeyed into the `9997` band so the next turn's items
+and new optimistic user messages sort after them; assistant phases advance
+once per tool call (`_bump_assistant_phase_for_tool`) and are persisted on
+assistant/thinking/tool events; tool grouping joins on turn + cycle +
+classification only (never phases or live-mutable status). Scroll has a
+single driver (ResizeObserver) for streaming growth.
+
+**Scenario catalog** (`tests/e2e/scenarios/`):
+- `single-phase-stream` — baseline text streaming
+- `thinking-multiblock` — thinking segment with multiple blocks (id-stability bug)
+- `multiphase-thinking-tool-assistant` — thinking + multi-segment text
+- `tool-args-then-result` — multi-turn: text+tool_call → text (field-loss bug)
+- `rapid-tokens` — high-rate token stream (batching/dedup)
+- `coding-session-multiphase` — production-inspired: tool calls → text summary
+- `research-multiphase` — production-inspired: multiple searches → response
+- `tool-error-recovery` — production-inspired: multiple tool calls → recovery
+- `long-streaming-response` — sustained burst (rAF batching)
+- `thinking-then-tools-then-answer` — thinking + multi-turn + text
+- `prod-multiphase-workflow` — production-shaped: 3 LLM calls, phases 0→1→2, thinking
+- `reconnect-stale-thinking` — thinking + tools + text, then a post-turn reconnect snapshot
+  (INV-RECONNECT-NO-HANG)
+
+**L3 browser specs** (`ui/e2e/`, shared helpers in `ui/e2e/helpers.ts`):
+- `timeline.spec.ts` — spinner/phase/duplicate DOM assertions; `single-phase-stream` also
+  asserts the assistant message node is never unmounted mid-stream (flicker check).
+- `scroll-stability.spec.ts` — tail stays pinned during a streaming burst and a manual
+  scroll-up is preserved (Symptom 4). Uses `data-testid="timeline-viewport"` hooks.
+
+**Mock LLM multi-turn contract** (critical for multi-phase turns):
+- Each `turns` entry = one LLM call. `turn_index` = number of assistant messages in history.
+- Scenario resolved from the **first** user message (original trigger), not the last.
+- `finish_reason` is derived from the turn's last step:
+  - Last step is `tool_call` → `"tool_calls"` → agent executes tool, bumps phase, re-invokes LLM
+  - Last step is `text`/`thinking` → `"stop"` → turn complete
+- Without correct `finish_reason`, the agent loop never enters the multi-phase path.
+
+**Live WS frame recorder** (dev/debug):
+```javascript
+// Activate via URL: ?recordWs=1
+// Or from browser console:
+window.__cognisWsRecorder.start()
+window.__cognisWsRecorder.download()  // saves ws-recording-<timestamp>.jsonl
+```
+Place the downloaded JSONL in `tests/e2e/golden/` to replay as a golden test.
+
+**CRITICAL — test coverage gap:** The golden replay tests only exercise the
+**client store** against a pre-captured, clean, mock-LLM stream. They do NOT
+cover: the 60ms coalescer, rAF batching, WS delivery/backpressure, real-LLM
+timing/ordering, or apply_patch/tool-output progress (mock never emits
+`tool_progress`). When a prod bug persists despite green tests, the first
+diagnostic step is to capture a **live WS recording** of the broken session
+and replay it through the golden store test. This is the only artifact that
+exercises the real coalescer+WS+real-LLM delivery layer. If frames are MISSING
+from the recording, the bug is server-side (dropped frame, guard, coalescer).
+If frames are PRESENT but mis-rendered, the bug is client-side (store/order).
+
+**Adding a new scenario** (reproduce → promote loop):
+1. Start the interactive e2e stack: `make e2e-up && make e2e-seed`
+2. Inject a scenario via the mock-llm control plane:
+   `curl -X POST http://localhost:8090/__mock/active -d '{"id":"my-scenario"}'`
+3. Reproduce the bug in the browser at `http://localhost:8080`
+4. Save the scenario YAML to `tests/e2e/scenarios/my-scenario.yaml`
+5. Run `uv run pytest tests/e2e/ -v` to capture the golden file
+6. Run `cd ui && npm test src/lib/chat-timeline.golden.test.ts` — it will fail
+   if the bug is present in the client store
+7. Fix the code, re-run step 6 (fast, no stack needed)
+8. Re-run step 5 to update the golden file with the fixed behavior
+
+**Interactive debugging with Playwright MCP** (see `docs/specs/33-e2e-test-harness.md`):
+```bash
+make e2e-up && make e2e-seed   # Start deterministic stack
+# Attach @playwright/mcp to http://localhost:8080
+# Inject scenario: POST http://localhost:8090/__mock/active {"id":"..."}
+make e2e-down                  # Teardown
+```
+
+**Per-agent backend capabilities** (`AgentCapabilities`):
+- `memory_backend: "none"` — disables Mnemory recall/remember for this agent
+- `guardrails_backend: "none"` — disables Intaris evaluate/report_reasoning
+  (Intaris event store still used; all tools auto-approved including non-bypassable)
+- Defaults: `"mnemory"` and `"intaris"` (existing behavior unchanged)
+- System defaults: `COGNIS_DEFAULT_MEMORY_BACKEND` / `COGNIS_DEFAULT_GUARDRAILS_BACKEND`
+- Adding a new backend: create `cognis/providers/backends/{kind}/{id}.py`,
+  implement the Provider Protocol, decorate with `@register_backend(kind=..., id=...)`
+
+**Mock LLM server** (`cognis/testing/mock_llm/`):
+- Implements OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`
+- Replays scenario scripts keyed by first-user-message trigger (not last message)
+- Multi-turn: `turn_index` = assistant message count in history; each turn is one LLM call
+- Control plane: `POST /__mock/scenario` (inject), `POST /__mock/active` (set active),
+  `GET /__mock/scenarios`, `GET /__mock/history`
+- Run standalone: `python -m cognis.testing.mock_llm --port 8090`
+- Thinking blocks: emit `reasoning_content` in the delta (not a custom field)
 
 ### Linting
 
@@ -420,7 +579,8 @@ uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
 | `COGNIS_CONTROLLER_URL` | — | Executor: controller WebSocket URL (alternative to `--controller-url`) |
 | `COGNIS_EXECUTOR_TOKEN` | — | Executor: JWT auth token (alternative to `--token`) |
 | `COGNIS_EXECUTOR_WORKDIR` | `~` | Executor: default working directory for tool calls (alternative to `--workdir`) |
-| `COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED` | `true` | Attach explicit `prompt_cache_key` to ChatGPT/Codex Responses requests. Set to `false` to disable globally; per-provider `use_prompt_cache_key: false` disables for a single provider. |
+| `COGNIS_EXECUTOR_INFERENCE_CHUNK_TIMEOUT_SECONDS` | `300` | Controller: max inter-chunk wait for executor-routed inference streams (dead-man's switch; executors forward provider liveness chunks) |
+| `COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED` | `false` | Attach explicit `prompt_cache_key` to ChatGPT/Codex Responses requests only when explicitly opted in. Per-provider `use_prompt_cache_key: true` enables it for a single provider. |
 | `CHATGPT_DEFAULT_INSTRUCTIONS` | suppressed by Cognis | LiteLLM reads this to override the Codex CLI default instructions block. Cognis suppresses it at startup to prevent the ~5 KB Codex prompt from being prepended to every request. Set a non-empty value in the environment before startup to override. |
 
 ### Database

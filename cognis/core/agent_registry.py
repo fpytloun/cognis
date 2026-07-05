@@ -7,6 +7,7 @@ system workflows.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -327,7 +328,7 @@ details, removing stale details, and merging in new facts.
 Output exactly this Markdown structure and keep every section, even when empty:
 
 ## Goal
-- [single-sentence task summary, or "(none)"]
+- [all active user requests and intents; use multiple bullets when needed, or "(none)"]
 
 ## Constraints & Preferences
 - [user constraints, preferences, specs, or "(none)"]
@@ -345,6 +346,9 @@ Output exactly this Markdown structure and keep every section, even when empty:
 ## Key Decisions
 - [decision and why, or "(none)"]
 
+## Errors & Fixes
+- [error string/symptom and the fix or current diagnosis, or "(none)"]
+
 ## Next Steps
 - [ordered next actions or "(none)"]
 
@@ -360,6 +364,9 @@ Output exactly this Markdown structure and keep every section, even when empty:
 Rules:
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, commands, error strings, call_ids, and identifiers when known.
+- For in-progress work include function names, signatures, exact commands, and error strings —
+  enough to resume without re-reading files.
+- Aim for 800–1500 words for complex sessions; prune stale details rather than active state.
 - Do not mention the summary process or that context was compacted.
 - Do not invent information not present in the history."""
 
@@ -820,7 +827,12 @@ class AgentRegistry:
 
 def _row_to_definition(row: Any) -> AgentDefinition:
     """Convert a DB Agent row to an AgentDefinition domain model."""
-    from cognis.models.agent import AgentLLMConfig, AgentPermissions, AgentRuntimeProfile
+    from cognis.models.agent import (
+        AgentCapabilities,
+        AgentLLMConfig,
+        AgentPermissions,
+        AgentRuntimeProfile,
+    )
 
     permissions = None
     if row.permissions:
@@ -829,6 +841,12 @@ def _row_to_definition(row: Any) -> AgentDefinition:
     llm_config = None
     if row.llm_config:
         llm_config = AgentLLMConfig.model_validate(row.llm_config)
+
+    capabilities = AgentCapabilities()
+    raw_capabilities = getattr(row, "capabilities", None)
+    if isinstance(raw_capabilities, dict) and raw_capabilities:
+        with contextlib.suppress(Exception):
+            capabilities = AgentCapabilities.model_validate(raw_capabilities)
 
     agent_profiles: dict[str, AgentRuntimeProfile] = {}
     raw_profiles = getattr(row, "agent_profiles", None)
@@ -851,6 +869,7 @@ def _row_to_definition(row: Any) -> AgentDefinition:
         tools=row.tools,
         permissions=permissions,
         llm_config=llm_config,
+        capabilities=capabilities,
         agent_profiles=agent_profiles,
         default_agent_profile_id=getattr(row, "default_agent_profile_id", None),
         execution=row.execution,

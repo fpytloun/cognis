@@ -18,11 +18,15 @@
 //     still boots offline.
 //
 // Update UX:
-//   - New SW versions install in the background. `skipWaiting()` is only
-//     called on explicit `SKIP_WAITING` message from the page, so the user
-//     sees the "Reload" banner and controls when the update applies.
-//   - `clients.claim()` is called on activate so the newly-activated SW
-//     takes control of already-open tabs immediately after reload.
+//   - New SW versions activate themselves. The service worker is the only
+//     update actor that can rescue already-stale clients reliably; relying on
+//     stale page JS to run a perfect update protocol creates persistent update
+//     loops in installed PWAs.
+//   - `clients.claim()` is called on activate so the newly-activated SW takes
+//     control of already-open tabs immediately.
+//   - When this is an update over a previous Cognis app-shell cache, controlled
+//     windows are notified and navigated to their current URL so they cross to
+//     the new JS runtime without depending on an old page bundle.
 
 import { build, files, prerendered, version } from '$service-worker';
 
@@ -30,6 +34,7 @@ const sw = self as unknown as ServiceWorkerGlobalScope;
 
 const PRECACHE = `cognis-precache-${version}`;
 const RUNTIME = `cognis-runtime-${version}`;
+const COGNIS_CACHE_PREFIX = 'cognis-';
 
 const PRECACHE_URLS = [
   ...build,
@@ -42,8 +47,7 @@ sw.addEventListener('install', (event) => {
     (async () => {
       const cache = await caches.open(PRECACHE);
       await cache.addAll(PRECACHE_URLS);
-      // Do NOT skipWaiting here — wait for user to confirm via the update
-      // banner. The page will post SKIP_WAITING when ready.
+      await sw.skipWaiting();
     })()
   );
 });
@@ -52,17 +56,38 @@ sw.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       const names = await caches.keys();
-      await Promise.all(
-        names
-          .filter((n) => n.startsWith('cognis-') && n !== PRECACHE && n !== RUNTIME)
-          .map((n) => caches.delete(n))
-      );
-      // Take control of existing clients; required so the reload after
-      // SKIP_WAITING is served by the new SW.
+      const staleCognisCaches = names
+        .filter((n) => n.startsWith(COGNIS_CACHE_PREFIX) && n !== PRECACHE && n !== RUNTIME);
+      const isUpdate = staleCognisCaches.length > 0;
+
       await sw.clients.claim();
+
+      if (isUpdate) {
+        await reloadControlledWindowClients();
+      }
+
+      await Promise.all(staleCognisCaches.map((n) => caches.delete(n)));
     })()
   );
 });
+
+async function reloadControlledWindowClients(): Promise<void> {
+  const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  await Promise.all(
+    clients.map(async (client) => {
+      const windowClient = client as WindowClient;
+      try {
+        const url = new URL(windowClient.url);
+        if (url.origin !== sw.location.origin) return;
+        windowClient.postMessage({ type: 'COGNIS_SW_UPDATED', version });
+        await windowClient.navigate(windowClient.url);
+      } catch {
+        // The client may close or reject navigation during activation. Other
+        // clients should still update, and a future navigation will use this SW.
+      }
+    })
+  );
+}
 
 type WebPushPayload = {
   title?: string;
@@ -80,14 +105,31 @@ type ActiveConversationMessage = {
   active?: boolean;
 };
 
+type ServiceWorkerControlMessage = ActiveConversationMessage & {
+  type?: 'GET_VERSION' | 'SKIP_WAITING' | 'ACTIVE_CONVERSATION';
+};
+
 const activeConversationByClient = new Map<string, string>();
 
 sw.addEventListener('message', (event) => {
-  if (event.data?.type === 'SKIP_WAITING') {
-    void sw.skipWaiting();
+  const data = event.data as ServiceWorkerControlMessage | undefined;
+  const replyPort = event.ports?.[0];
+
+  if (data?.type === 'GET_VERSION') {
+    replyPort?.postMessage({ type: 'VERSION', version });
     return;
   }
-  const data = event.data as ActiveConversationMessage | undefined;
+
+  if (data?.type === 'SKIP_WAITING') {
+    event.waitUntil(
+      (async () => {
+        await sw.skipWaiting();
+        replyPort?.postMessage({ type: 'SKIP_WAITING_ACK', version });
+      })()
+    );
+    return;
+  }
+
   if (data?.type === 'ACTIVE_CONVERSATION') {
     const sourceId = (event.source as Client | null | undefined)?.id;
     if (!sourceId) return;

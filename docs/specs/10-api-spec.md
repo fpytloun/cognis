@@ -79,8 +79,6 @@ GET    /api/v1/conversations/:id                          → Get details
 PATCH  /api/v1/conversations/:id                          → Update (title, archive)
 DELETE /api/v1/conversations/:id                          → Delete
 DELETE /api/v1/conversations/:id/purge                    → Purge metadata (+ Intaris cascade)
-POST   /api/v1/conversations/:id/messages                 → Send a chat message (SSE or 202)
-GET    /api/v1/conversations/:id/messages                 → Get history (from Intaris events)
 GET    /api/v1/conversations/:id/queue                    → List pending queued user messages
 PATCH  /api/v1/conversations/:id/queue/:queue_id          → Edit pending queued message content
 DELETE /api/v1/conversations/:id/queue/:queue_id          → Cancel pending queued message
@@ -103,47 +101,36 @@ each agent. If an active conversation matching the (user, agent, context_type)
 triple exists, it is returned. Otherwise a new one is created with
 `context_ref=web:user:<email>:default`.
 
-For external runtimes, conversation history is a normalized projection over raw
-runtime trace plus Cognis overlay events. The REST API still exposes a single
-conversation history surface regardless of runtime.
+Conversation timeline reads and user-message sends use the Chat v2 API under
+`/api/v1/chat/v2/conversations/:id`. The legacy REST/SSE chat message routes were
+removed; clients should use Chat v2 snapshot/sync/timeline plus WebSocket
+`chat_v2_frame` updates.
 
 For web conversations, `active_session_id` may be `null` until the first user
 message is sent. Sending the first message lazily creates the root session.
 
-#### Get Messages (proxied from Intaris events)
+#### Chat v2 Timeline
 ```http
-GET /api/v1/conversations/conv_abc/messages?limit=50&after_seq=100
+GET /api/v1/chat/v2/conversations/conv_abc/snapshot
 
 → 200 OK
 {
-  "messages": [
-    {
-      "seq": 101,
-      "type": "user_message",
-      "content": "Can you research OAuth2?",
-      "lane": "main",
-      "timestamp": "2026-03-27T10:30:00Z"
-    },
-    {
-      "seq": 102,
-      "type": "assistant_message",
-      "content": "I'll research that for you...",
-      "lane": "main",
-      "token_usage": {...},
-      "timestamp": "2026-03-27T10:30:05Z"
-    }
-  ],
-  "last_seq": 150,
-  "has_more": true,
-  "active_streams": [],
-  "active_tool_outputs": []
+  "schema_version": 2,
+  "projection_version": "...",
+  "conversation": {"conversation_id": "conv_abc", "agent_id": "aria", ...},
+  "timeline": {"items": [{"kind": "message", "role": "user", ...}], ...},
+  "state": {...},
+  "queue": {"queued_count": 0, "messages": []},
+  "runtime": {"has_active_turn": false, "volatile_items": []},
+  "cursor": "opaque-cursor",
+  "server_time": "2026-03-27T10:30:05Z"
 }
 ```
 
-The controller reads from Intaris event store and formats for the client.
-`active_streams` and `active_tool_outputs` are optional refresh/reconnect
-snapshots for in-flight assistant text and tool output respectively; persisted
-history remains canonical once the turn is recorded.
+Use `GET /api/v1/chat/v2/conversations/:id/sync?cursor=...` for incremental
+updates and `GET /api/v1/chat/v2/conversations/:id/timeline?before=...` for
+older scrollback pages. The controller reads Intaris event streams and projects
+strict Chat v2 timeline items; clients must treat the cursor as opaque.
 
 Message records may include lane metadata:
 
@@ -187,87 +174,20 @@ Channel accounts should default to `pairing` so unknown remote senders cannot
 talk to an agent until the authenticated Cognis user redeems their short-lived
 pairing code in the web UI.
 
-#### Send Message (REST chat)
+#### Send Message (Chat v2)
 ```http
-POST /api/v1/conversations/conv_abc/messages
+PUT /api/v1/chat/v2/conversations/conv_abc/messages/web_01HV...
 Content-Type: application/json
-Accept: text/event-stream
 { "content": "What is the weather?", "client_message_id": "web_01HV..." }
 
-→ 200 OK (SSE stream)
-event: token
-data: {"conversation_id":"conv_abc","session_id":"ses_123","message_id":"msg_abc","delta":"The weather"}
-
-event: tool_call
-data: {"conversation_id":"conv_abc","session_id":"ses_123","call_id":"call_1","tool_name":"weather","status":"started"}
-
-event: tool_result
-data: {"conversation_id":"conv_abc","session_id":"ses_123","call_id":"call_1","tool_name":"weather","is_error":false,"duration_ms":150}
-
-event: complete
-data: {"conversation_id":"conv_abc","session_id":"ses_123","message_id":"msg_abc","last_seq":42,"delegated":false}
-```
-
-Supports two delivery modes via the `Accept` header:
-
-- **`Accept: text/event-stream`** — SSE streaming response with real-time
-  token deltas, tool calls, and turn completion events. Keepalive comments
-  (`: keepalive`) are emitted every 15 seconds to prevent proxy idle
-  disconnections.
-- **`Accept: application/json`** (default) — fire-and-forget 202 Accepted.
-  Poll `GET /conversations/:id/messages?after_seq=N` for the response.
-
-```http
-POST /api/v1/conversations/conv_abc/messages
-Content-Type: application/json
-{ "content": "Hello" }
-
 → 202 Accepted
-{ "status": "accepted" }
+{ "status": "accepted", "client_txn_id": "web_01HV...", ... }
 ```
 
-Slash commands (`/compact`, `/new`, `/model`, etc.) are dispatched through
-the `CommandDispatcher` and return their result directly as 200 OK:
-
-```http
-POST /api/v1/conversations/conv_abc/messages
-{ "content": "/info" }
-
-→ 200 OK
-{ "status": "command_executed", "result": {"type": "system_message", "text": "Session: ses_123\n..."} }
-```
-
-`/btw <question>` is a special side-question slash command. It is accepted even
-while the conversation has an active main turn. The command records side-lane
-user/assistant messages in the active session, but it does not enqueue a normal
-turn and does not mutate main-lane context.
-
-```http
-POST /api/v1/conversations/conv_abc/messages
-{ "content": "/btw why is the agent running tests?" }
-
-→ 200 OK
-{
-  "status": "command_executed",
-  "result": {
-    "type": "side_question_answer",
-    "conversation_id": "conv_abc",
-    "session_id": "ses_123",
-    "side_thread_id": "btw:turn_01HV...",
-    "anchor_turn_id": "turn_01HV...",
-    "question": "why is the agent running tests?",
-    "answer": "The active turn is validating...",
-    "lane": "side",
-    "tool_policy": "none",
-    "usage": {...}
-  }
-}
-```
-
-If the side-question LLM response attempts any tool call while
-`tool_policy="none"`, the controller rejects it, executes no tool, records the
-side answer as a no-tools failure/notice, and returns a structured
-`side_question_answer` result with `tool_call_rejected=true`.
+The path transaction id gives durable idempotency. Realtime progress is delivered
+over WebSocket as `chat_v2_frame`; clients recover missed frames with `/sync` or
+`/snapshot`. Slash commands are not accepted by Chat v2 send and should use the
+WebSocket command path.
 
 Error codes: `not_found` (404), `forbidden` (403), `session_ended` /
 `session_suspended` (409), `rate_limited` / `queue_full` (429).

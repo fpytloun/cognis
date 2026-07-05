@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, Query, Request, UploadFile
@@ -27,6 +27,8 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
+
+ArtifactURLMode = Literal["download", "view"]
 
 
 def _kind_for_content_type(content_type: str) -> ArtifactKind:
@@ -58,6 +60,48 @@ def _clamp_ttl_to_artifact_expiry(row: object, requested_ttl_seconds: int) -> in
         expires_at = expires_at.replace(tzinfo=UTC)
     remaining_seconds = int((expires_at - datetime.now(UTC)).total_seconds())
     return max(60, min(requested_ttl_seconds, remaining_seconds))
+
+
+def _is_html_content_type(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() == "text/html"
+
+
+def _assert_view_allowed(content_type: str) -> None:
+    if not _is_html_content_type(content_type):
+        raise api_exception(
+            415, "unsupported_media_type", "Artifact view is only supported for HTML"
+        )
+
+
+def _artifact_response_headers(
+    *,
+    filename: str,
+    content_type: str,
+    content_length: int,
+    mode: ArtifactURLMode,
+) -> dict[str, str]:
+    headers = {
+        "Cache-Control": "private, max-age=60",
+        "Content-Length": str(content_length),
+        "X-Content-Type-Options": "nosniff",
+    }
+    if mode == "view":
+        _assert_view_allowed(content_type)
+        headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quote(filename, safe='')}"
+        headers["Content-Security-Policy"] = (
+            "sandbox allow-scripts; "
+            "default-src 'none'; "
+            "connect-src 'none'; "
+            "img-src data: blob:; "
+            "style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline'; "
+            "font-src data:; "
+            "media-src data: blob:;"
+        )
+        return headers
+    if not content_type.startswith("image/"):
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename, safe='')}"
+    return headers
 
 
 @router.post("/upload")
@@ -126,6 +170,7 @@ async def get_signed_url(
     request: Request,
     artifact_id: str,
     ttl_seconds: int = Query(default=3600, ge=60, le=7 * 24 * 3600),
+    mode: ArtifactURLMode = Query(default="download"),
 ) -> dict[str, object]:
     user = require_current_user(request)
     artifact_store = request.app.state.artifact_store
@@ -134,10 +179,13 @@ async def get_signed_url(
             ref = await get_accessible_deliverable_ref(session, artifact_id, user.email)
         if ref is None:
             raise api_exception(404, "not_found", "Artifact not found")
+        if mode == "view":
+            _assert_view_allowed(ref.mime_type)
         url = build_deliverable_public_url(
             artifact_store,
             ref,
             ttl_seconds=ttl_seconds,
+            mode=mode,
         )
         return {
             "artifact_id": artifact_id,
@@ -145,6 +193,7 @@ async def get_signed_url(
             "source": "deliverable",
             "virtual": True,
             "url": url,
+            "mode": mode,
             "filename": ref.filename,
             "mime_type": ref.mime_type,
             "size_bytes": ref.size_bytes,
@@ -156,18 +205,40 @@ async def get_signed_url(
         raise api_exception(404, "not_found", "Artifact not found")
     if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
         raise api_exception(404, "not_found", "Artifact not found")
+    if mode == "view":
+        _assert_view_allowed(row.mime_type)
     ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
     url = await artifact_store.async_get_public_url(
         row.namespace,
         row.object_id,
         row.filename,
         ttl_seconds=ttl_seconds,
+        mode=mode,
     )
     return {
         "artifact_id": artifact_id,
         "url": url,
+        "mode": mode,
         "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
     }
+
+
+@router.get("/virtual/deliverables/view/{deliverable_id}/{filename:path}")
+async def serve_signed_deliverable_view(
+    request: Request,
+    deliverable_id: str,
+    filename: str,
+    exp: int,
+    sig: str,
+) -> Response:
+    return await _serve_signed_deliverable(
+        request,
+        deliverable_id=deliverable_id,
+        filename=filename,
+        exp=exp,
+        sig=sig,
+        mode="view",
+    )
 
 
 @router.get("/virtual/deliverables/{deliverable_id}/{filename:path}")
@@ -178,6 +249,25 @@ async def serve_signed_deliverable(
     exp: int,
     sig: str,
 ) -> Response:
+    return await _serve_signed_deliverable(
+        request,
+        deliverable_id=deliverable_id,
+        filename=filename,
+        exp=exp,
+        sig=sig,
+        mode="download",
+    )
+
+
+async def _serve_signed_deliverable(
+    request: Request,
+    *,
+    deliverable_id: str,
+    filename: str,
+    exp: int,
+    sig: str,
+    mode: ArtifactURLMode,
+) -> Response:
     artifact_store = request.app.state.artifact_store
     if not artifact_store.verify_signed_request(
         "deliverables",
@@ -185,18 +275,19 @@ async def serve_signed_deliverable(
         filename,
         exp=exp,
         sig=sig,
+        mode=mode,
     ):
         raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
     async with request.app.state.session_factory() as session:
         ref = await get_deliverable_ref_unscoped(session, deliverable_id)
     if ref is None or ref.filename != filename:
         raise api_exception(404, "not_found", "Artifact not found")
-    headers = {
-        "Cache-Control": "private, max-age=60",
-        "Content-Length": str(ref.size_bytes),
-        "X-Content-Type-Options": "nosniff",
-        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(ref.filename, safe='')}",
-    }
+    headers = _artifact_response_headers(
+        filename=ref.filename,
+        content_type=ref.mime_type,
+        content_length=ref.size_bytes,
+        mode=mode,
+    )
     return Response(
         content=ref.content_bytes,
         media_type=ref.mime_type,
@@ -213,8 +304,51 @@ async def serve_signed_artifact(
     exp: int,
     sig: str,
 ) -> Response:
+    return await _serve_signed_artifact(
+        request,
+        namespace=namespace,
+        object_id=object_id,
+        filename=filename,
+        exp=exp,
+        sig=sig,
+        mode="download",
+    )
+
+
+@router.get("/view/{namespace}/{object_id}/{filename:path}")
+async def serve_signed_artifact_view(
+    request: Request,
+    namespace: str,
+    object_id: str,
+    filename: str,
+    exp: int,
+    sig: str,
+) -> Response:
+    return await _serve_signed_artifact(
+        request,
+        namespace=namespace,
+        object_id=object_id,
+        filename=filename,
+        exp=exp,
+        sig=sig,
+        mode="view",
+    )
+
+
+async def _serve_signed_artifact(
+    request: Request,
+    *,
+    namespace: str,
+    object_id: str,
+    filename: str,
+    exp: int,
+    sig: str,
+    mode: ArtifactURLMode,
+) -> Response:
     artifact_store = request.app.state.artifact_store
-    if not artifact_store.verify_signed_request(namespace, object_id, filename, exp=exp, sig=sig):
+    if not artifact_store.verify_signed_request(
+        namespace, object_id, filename, exp=exp, sig=sig, mode=mode
+    ):
         raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
     async with request.app.state.session_factory() as session:
         row = await get_artifact_record(session, object_id)
@@ -242,13 +376,12 @@ async def serve_signed_artifact(
     if row.filename != filename:
         raise api_exception(404, "not_found", "Artifact not found")
     content, content_type = await artifact_store.async_load(namespace, object_id, filename)
-    headers = {
-        "Cache-Control": "private, max-age=60",
-        "Content-Length": str(len(content)),
-        "X-Content-Type-Options": "nosniff",
-    }
-    if not content_type.startswith("image/"):
-        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename, safe='')}"
+    headers = _artifact_response_headers(
+        filename=filename,
+        content_type=content_type,
+        content_length=len(content),
+        mode=mode,
+    )
     return Response(
         content=content,
         media_type=content_type,

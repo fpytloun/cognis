@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatStepQuestionResponse, normalizeStepQuestions } from '$lib/tool-call-question-set';
+import { formatStepQuestionResponse, normalizeStepQuestionAnswers, normalizeStepQuestions } from '$lib/tool-call-question-set';
 import type { ToolCallTimelineItem } from '$lib/chat';
 
 function questionToolItem(overrides: Partial<ToolCallTimelineItem> = {}): ToolCallTimelineItem {
@@ -72,7 +72,7 @@ describe('tool-call question sets', () => {
     });
 
     expect(formatted).toBe(
-      'Architecture: Shared interaction primitive\nValidation: Backend API contract, Web UI rendering',
+      'Which architecture should we use?: Shared interaction primitive\nWhich validation areas should be included?: Backend API contract, Web UI rendering',
     );
   });
 
@@ -87,6 +87,68 @@ describe('tool-call question sets', () => {
       },
     });
 
-    expect(formatted).toBe('Architecture: Workflow-only interaction');
+    expect(formatted).toBe('Which architecture should we use?: Workflow-only interaction');
+  });
+
+  it('normalizes submitted answers in input question order with question text', () => {
+    const answers = normalizeStepQuestionAnswers(questionToolItem(), {
+      mode: 'structured',
+      answers: [
+        { question_id: 'validation', selected_option_ids: ['api', 'ui'], custom_answer: null },
+        { question_id: 'architecture', selected_option_ids: ['shared'], custom_answer: 'plus notes' },
+      ],
+    });
+
+    expect(answers.map((answer) => answer.question.question)).toEqual([
+      'Which architecture should we use?',
+      'Which validation areas should be included?',
+    ]);
+    expect(answers[0]?.question.header).toBe('Architecture');
+    expect(answers[0]?.selected.map((option) => option.label)).toEqual(['Shared interaction primitive']);
+    expect(answers[0]?.custom).toBe('plus notes');
+    expect(answers[1]?.selected.map((option) => option.label)).toEqual([
+      'Backend API contract',
+      'Web UI rendering',
+    ]);
+  });
+
+  it('normalizes nested response answers and preserves unknown option ids', () => {
+    const answers = normalizeStepQuestionAnswers(questionToolItem(), {
+      response: {
+        mode: 'structured',
+        answers: [
+          { question_id: 'architecture', selected_option_ids: ['missing_option'], custom_answer: null },
+        ],
+      },
+    });
+
+    expect(answers).toHaveLength(1);
+    expect(answers[0]?.selected).toEqual([
+      { id: 'missing_option', label: 'missing_option', unknown: true },
+    ]);
+  });
+
+  it('normalizes custom-only legacy question answers', () => {
+    const answers = normalizeStepQuestionAnswers(
+      questionToolItem({
+        arguments: {
+          question: 'Approve this change?',
+          options: [{ label: 'Approve' }, { label: 'Reject' }],
+        },
+      }),
+      {
+        answers: [
+          { question_id: 'q1', selected_option_ids: [], custom_answer: 'Approve with mobile QA' },
+        ],
+      },
+    );
+
+    expect(answers).toHaveLength(1);
+    expect(answers[0]?.question.question).toBe('Approve this change?');
+    expect(answers[0]?.custom).toBe('Approve with mobile QA');
+  });
+
+  it('returns plain string response when no structured answers are present', () => {
+    expect(formatStepQuestionResponse(questionToolItem(), { response: 'continue' })).toBe('continue');
   });
 });

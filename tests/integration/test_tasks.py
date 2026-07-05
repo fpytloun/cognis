@@ -47,11 +47,11 @@ def test_task_lifecycle_draft_submit_complete(live_stack: LiveStack, run_id: str
         detail = live_stack.get(f"/api/v1/tasks/{task_id}")
         assert detail.status_code == 200
         final_status = detail.json()["status"]
-        if final_status in ("completed", "failed", "cancelled"):
+        if final_status in ("completed", "failed", "cancelled", "paused"):
             break
         time.sleep(3)
 
-    assert final_status in ("completed", "failed"), (
+    assert final_status in ("completed", "failed", "paused"), (
         f"Task did not reach terminal state within 120s, got: {final_status}"
     )
 

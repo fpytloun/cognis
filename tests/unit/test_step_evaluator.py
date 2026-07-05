@@ -183,6 +183,12 @@ async def test_from_session_factory_uses_seeded_timeout_default(
     assert evaluator.evaluator_timeout_seconds == DEFAULT_EVALUATOR_TIMEOUT_MS / 1000
 
 
+def test_constructor_uses_seeded_timeout_default() -> None:
+    evaluator = StepEvaluator(llm=_LLM())
+
+    assert evaluator.evaluator_timeout_seconds == DEFAULT_EVALUATOR_TIMEOUT_MS / 1000
+
+
 @pytest.mark.asyncio
 async def test_evaluator_error_forces_failure() -> None:
     evaluator = StepEvaluator(llm=_LLM(fail=True), evaluator_timeout_seconds=5.0)
@@ -196,6 +202,30 @@ async def test_evaluator_error_forces_failure() -> None:
     assert result.decision == "failed"
     assert is_evaluator_malfunction(result) is True
     assert "failed" in result.reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_evaluator_middle_truncates_large_deliverable_content() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+    output = StepOutput(
+        summary="Done",
+        content="start-" + ("x" * 40_000) + "-end",
+        claims=["Implemented feature"],
+    )
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def(),
+        step_output=output,
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert "start-" in prompt
+    assert "-end" in prompt
+    assert len(prompt) < 30_000
 
 
 @pytest.mark.asyncio

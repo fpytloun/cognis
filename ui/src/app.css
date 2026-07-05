@@ -23,6 +23,10 @@
   --app-floating-overlay-bottom: calc(max(var(--app-shell-bottom-offset, 0px), env(safe-area-inset-bottom, 0px)) + var(--app-overlay-gap));
   --app-floating-overlay-left: max(var(--app-overlay-gap), env(safe-area-inset-left, 0px));
   --app-floating-overlay-right: max(var(--app-overlay-gap), env(safe-area-inset-right, 0px));
+  --app-overlay-inner-top: calc(var(--app-overlay-gap) + max(0px, calc(env(safe-area-inset-top, 0px) - var(--app-shell-top-offset, 0px))));
+  --app-overlay-inner-bottom: calc(var(--app-overlay-gap) + max(0px, calc(env(safe-area-inset-bottom, 0px) - var(--app-shell-bottom-offset, 0px))));
+  --app-overlay-inner-left: max(var(--app-overlay-gap), env(safe-area-inset-left, 0px));
+  --app-overlay-inner-right: max(var(--app-overlay-gap), env(safe-area-inset-right, 0px));
   --theme-void: #020617;
   --theme-obsidian: #07111a;
   --theme-ink: #122a35;
@@ -383,6 +387,39 @@ textarea:focus-visible,
   bottom: var(--app-floating-overlay-bottom);
   left: var(--app-floating-overlay-left);
   right: var(--app-floating-overlay-right);
+}
+
+/*
+ * Fullscreen PWA overlays (media viewers, voice mode, drawers) must keep
+ * their controls inside the actually usable app viewport. The root
+ * app-viewport-overlay already removes app chrome; these inner insets then
+ * clear the remaining device safe areas without double-counting app offsets.
+ */
+.app-safe-fullscreen {
+  display: flex;
+  flex-direction: column;
+  gap: var(--app-overlay-gap);
+  padding-top: var(--app-overlay-inner-top);
+  padding-right: var(--app-overlay-inner-right);
+  padding-bottom: var(--app-overlay-inner-bottom);
+  padding-left: var(--app-overlay-inner-left);
+}
+
+.app-safe-fullscreen__toolbar {
+  position: relative;
+  z-index: 2;
+  flex-shrink: 0;
+}
+
+.app-safe-fullscreen__content {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.app-safe-side-panel {
+  padding-top: var(--app-overlay-inner-top);
+  padding-bottom: var(--app-overlay-inner-bottom);
 }
 
 /*

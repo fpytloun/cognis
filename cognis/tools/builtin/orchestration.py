@@ -12,6 +12,7 @@ Tool taxonomy:
 
 from __future__ import annotations
 
+import copy
 import json
 from enum import StrEnum
 from typing import Any
@@ -715,14 +716,19 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
         "fire-and-follow-up: after starting the managed turn, do "
         "not continue the same scoped work in parallel; finish the parent turn unless "
         "there is independent work that can safely proceed. The parent conversation "
-        "will be resumed or notified when the managed turn finishes. Use "
-        "agent_conversation_create(wait=false) for visible iterative work loops outside "
-        "the live channel, especially CI/build/deploy/debug/browser/external-system/"
-        "polling workflows where the user may need to inspect or interact. For "
-        "implementation/debugging style managed conversations, prefer creating the "
-        'first turn with chat_mode="plan"; after user or main-agent review, continue '
-        'with chat_mode="build". Clearly small read-only diagnostics may use default '
-        "mode. Build mode is acceptable when explicitly requested or obviously safe."
+        "will be resumed or notified when the managed turn finishes. Before creating, "
+        "prefer reusing an existing relevant managed conversation via "
+        "agent_conversation_send; create only when no suitable same-problem "
+        "conversation exists or intentional separation is needed. Use "
+        "agent_conversation_create(wait=false) for new visible iterative work loops "
+        "outside the live channel, especially CI/build/deploy/debug/browser/"
+        "external-system/polling workflows where the user may need to inspect or "
+        "interact. For new implementation/debugging style managed conversations, "
+        'prefer creating the first turn with chat_mode="plan"; after user or '
+        "main-agent review, continue the same managed conversation with "
+        'agent_conversation_send and chat_mode="build" instead of creating a '
+        "duplicate. Clearly small read-only diagnostics may use default mode. Build "
+        "mode is acceptable when explicitly requested or obviously safe."
     ),
     parameters={
         "type": "object",
@@ -762,11 +768,13 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
 AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
     name="agent_conversation_send",
     description=(
-        "Send a new turn into an existing managed agent conversation. With wait=false, "
-        "this is fire-and-follow-up: do not continue the same scoped work in parallel "
-        "after sending; finish the parent turn unless independent work can safely "
-        "proceed. The parent conversation will be resumed or notified when the "
-        "managed turn finishes."
+        "Send a new turn into an existing managed agent conversation. Prefer this for "
+        "same-problem continuation instead of creating a duplicate managed "
+        "conversation, including plan/debug to implementation handoffs with "
+        'chat_mode="build". With wait=false, this is fire-and-follow-up: do not '
+        "continue the same scoped work in parallel after sending; finish the parent "
+        "turn unless independent work can safely proceed. The parent conversation "
+        "will be resumed or notified when the managed turn finishes."
     ),
     parameters={
         "type": "object",
@@ -931,6 +939,69 @@ _ALL_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_LIST_TOOL,
     AGENT_CONVERSATION_GET_TOOL,
 ]
+
+
+_SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
+    "agent_conversation_create": (
+        "Create a managed agent conversation: a normal main Cognis/Intaris conversation "
+        "for another agent, controlled by this interactive chat. Use this when work "
+        "needs a visible, inspectable, iterative agent session rather than a terminal "
+        "delegate result or a structured workflow task. Target agent IDs must be "
+        "primary/user agents; use delegate() for system specialist agents (`system:*`) "
+        "available in this agent session. Not available in tasks. On this conversation "
+        "surface, the started managed turn is joined before returning."
+    ),
+    "agent_conversation_send": (
+        "Send a new turn into an existing managed agent conversation. On this "
+        "conversation surface, the submitted managed turn is joined before returning."
+    ),
+    "agent_conversation_retry": (
+        "Retry the last failed or interrupted Agent work turn in the same normal "
+        "conversation. Use agent_conversation_send, not retry, when providing new "
+        "instructions or clarification. On this conversation surface, the retried "
+        "managed turn is joined before returning."
+    ),
+    "agent_conversation_fork": (
+        "Fork a managed agent conversation and optionally start the fork with a "
+        "message. On this conversation surface, a started managed turn in the fork "
+        "is joined before returning."
+    ),
+}
+
+
+def _managed_conversation_sync_tool(tool: ToolDefinition) -> ToolDefinition:
+    """Return a managed-conversation tool schema without async wait controls."""
+
+    parameters = copy.deepcopy(tool.parameters)
+    properties = parameters.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("wait", None)
+    return tool.model_copy(
+        update={
+            "description": _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS.get(
+                tool.name,
+                (
+                    f"{tool.description} On this conversation surface, started turns "
+                    "are joined before returning."
+                ),
+            ),
+            "parameters": parameters,
+        }
+    )
+
+
+_SYNC_MANAGED_CONVERSATION_TOOLS = [
+    _managed_conversation_sync_tool(AGENT_CONVERSATION_CREATE_TOOL),
+    _managed_conversation_sync_tool(AGENT_CONVERSATION_SEND_TOOL),
+    AGENT_CONVERSATION_WAIT_TOOL,
+    AGENT_CONVERSATION_INTERRUPT_TOOL,
+    _managed_conversation_sync_tool(AGENT_CONVERSATION_RETRY_TOOL),
+    _managed_conversation_sync_tool(AGENT_CONVERSATION_FORK_TOOL),
+    AGENT_CONVERSATION_CLOSE_TOOL,
+    AGENT_CONVERSATION_LIST_TOOL,
+    AGENT_CONVERSATION_GET_TOOL,
+]
+
 
 LIST_WORKFLOWS_TOOL = ToolDefinition(
     name="list_workflows",
@@ -1218,6 +1289,7 @@ def orchestration_tools(
     *,
     expose_delegate_wait_option: bool = True,
     expose_managed_conversation_tools: bool = True,
+    expose_managed_conversation_wait_option: bool = True,
     expose_task_tools: bool = True,
     expose_workflow_tools: bool = True,
     expose_compose_workflow_tool: bool = True,
@@ -1241,7 +1313,11 @@ def orchestration_tools(
         subsession_tools[0] = _DELEGATE_SYNC_TOOL
     tools = subsession_tools
     if expose_managed_conversation_tools:
-        tools += _ALL_MANAGED_CONVERSATION_TOOLS
+        tools += (
+            _ALL_MANAGED_CONVERSATION_TOOLS
+            if expose_managed_conversation_wait_option
+            else _SYNC_MANAGED_CONVERSATION_TOOLS
+        )
     if expose_task_tools:
         tools += _ALL_TASK_TOOLS
     if expose_workflow_tools:

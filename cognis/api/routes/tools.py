@@ -18,6 +18,7 @@ from cognis.api.common import (
     check_agent_access,
     require_current_user,
 )
+from cognis.api.mcp_reconfigure import schedule_mcp_server_executor_reconfigure_for_app
 from cognis.api.models import (
     EffectiveToolItemResponse,
     EffectiveToolsExecutorResponse,
@@ -117,6 +118,12 @@ def _coerce_positive_int(value: object, default: int) -> int:
 
 def _sanitize_mcp_error(error: Exception) -> str:
     return f"{error.__class__.__name__}: {str(error)[:300]}"
+
+
+def _executor_observed_tools_are_current(row: Any) -> bool:
+    return int(getattr(row, "desired_config_version", 0) or 0) == int(
+        getattr(row, "applied_config_version", 0) or 0
+    )
 
 
 def _controller_catalog_tools() -> list[ToolDefinition]:
@@ -257,6 +264,8 @@ async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
 
     unique: dict[str, ToolDefinition] = {}
     for row in executors:
+        if not _executor_observed_tools_are_current(row):
+            continue
         observed = collect_unique_observed_local_mcp_tools(getattr(row, "observed_tools", None))
         for tool in observed:
             unique.setdefault(stable_tool_id(tool), tool)
@@ -1213,6 +1222,11 @@ async def update_mcp_server_route(
         if row is None:
             raise api_exception(404, "not_found", "MCP server not found")
         await session.commit()
+        await schedule_mcp_server_executor_reconfigure_for_app(
+            request.app,
+            server_id=row.server_id,
+            reason="mcp_server_update",
+        )
     return _mcp_row_to_response(row)
 
 

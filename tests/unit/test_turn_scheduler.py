@@ -14,6 +14,7 @@ from cognis.core.agent_loop import PauseWaiter, PendingPause
 from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
+    LLM_CYCLE_CEILING_CONTINUATION_REASON,
     ContinuationFollowUp,
     FollowUpMode,
     FollowUpOriginKind,
@@ -236,6 +237,10 @@ class _IdleAgentLoop:
         self.calls.append({"method": "locked", "session_id": session_id})
         return self.locked
 
+    async def wait_for_session_unlock(self, session_id: str) -> None:
+        self.calls.append({"method": "wait", "session_id": session_id})
+        self.locked = False
+
     async def run_idle_checkpoint_compaction(
         self,
         *,
@@ -271,6 +276,12 @@ class _DedupeGuardrails(_RecordingGuardrails):
     async def record_events(self, **kwargs: object) -> EventAppendResult:
         self.calls.append(kwargs)
         return EventAppendResult(ok=True, count=0, first_seq=0, last_seq=0)
+
+
+class _FailingGuardrails(_RecordingGuardrails):
+    async def record_events(self, **kwargs: object) -> EventAppendResult:
+        self.calls.append(kwargs)
+        raise RuntimeError("record failed")
 
 
 def _scheduler_for_redo_invalidation(session_factory: object) -> TurnScheduler:
@@ -452,7 +463,7 @@ async def test_idle_checkpoint_skips_normal_web_topic_conversation() -> None:
     error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
 
     assert error is None
-    assert agent_loop.calls == []
+    assert not any(call["method"] == "compact" for call in agent_loop.calls)
     assert scheduler._launch_turn.call_args.kwargs["session"].session_id == "session-1"
 
 
@@ -470,7 +481,7 @@ async def test_idle_checkpoint_skips_before_threshold() -> None:
     error = await scheduler.submit_turn("conv-1", "hello", user_email="user@example.com")
 
     assert error is None
-    assert agent_loop.calls == []
+    assert not any(call["method"] == "compact" for call in agent_loop.calls)
     assert scheduler._launch_turn.call_args.kwargs["session"].session_id == "session-1"
 
 
@@ -806,6 +817,7 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
         _on_tool_result,
         _on_tool_progress,
         _on_tool_output_chunk,
+        _on_context_usage,
     ) = scheduler._build_callbacks(
         "conv-1",
         "sess-1",
@@ -826,6 +838,8 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
             "turn_id": "turn-1",
             "content": "Hello world",
             "chunk_count": 2,
+            "assistant_phase_index": 0,
+            "turn_cycle_index": 0,
             "content_offset": 11,
             "updated_at": snapshots[0]["updated_at"],
         }
@@ -834,6 +848,49 @@ async def test_active_stream_snapshots_track_unpersisted_assistant_text() -> Non
 
     await on_tool_call("example_tool", "call-1", {})
     assert await scheduler.active_stream_snapshots("conv-1") == []
+
+
+@pytest.mark.asyncio
+async def test_active_stream_cycle_change_preserves_existing_content() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    await scheduler._append_active_stream_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        message_id="turn-1",
+        turn_id="turn-1",
+        delta="first cycle",
+        turn_cycle_index=0,
+    )
+    await scheduler._append_active_stream_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        message_id="turn-1",
+        turn_id="turn-1",
+        delta=" continued",
+        turn_cycle_index=1,
+    )
+
+    snapshots = await scheduler.active_stream_snapshots("conv-1")
+    assert len(snapshots) == 1
+    assert snapshots[0]["content"] == "first cycle continued"
+    assert snapshots[0]["chunk_count"] == 2
+    assert snapshots[0]["turn_cycle_index"] == 1
 
 
 @pytest.mark.asyncio
@@ -870,12 +927,14 @@ async def test_cancelled_turn_persists_partial_active_stream_and_completes_bubbl
     observer = _RecordingObserver()
     scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
     scheduler._clear_follow_up_pending = AsyncMock()  # type: ignore[method-assign]
+    scheduler._suppress_absorbed_channel_delivery_intents = AsyncMock()  # type: ignore[method-assign]
     await scheduler._append_active_stream_chunk(
         conversation_id="conv-1",
         session_id="sess-1",
         message_id="turn-1",
         turn_id="turn-1",
         delta="partial answer",
+        turn_cycle_index=2,
     )
 
     await scheduler._run_turn(
@@ -929,8 +988,14 @@ async def test_cancelled_turn_persists_partial_active_stream_and_completes_bubbl
         "partial": True,
         "cancelled": True,
         "finish_reason": "user_cancelled",
+        "assistant_phase_index": 0,
+        "turn_cycle_index": 2,
+        "chat_mode": "default",
+        "chat_mode_source": "system_default",
+        "runtime": {"agent_id": "agent-1", "agent_name": "Agent"},
     }
     session_cache.append_recorded_events.assert_awaited_once()
+    scheduler._suppress_absorbed_channel_delivery_intents.assert_awaited_once()
     assert observer.completed == ["turn-1"]
     assert len(observed_completed) == 1
     completion = observed_completed[0].data
@@ -938,6 +1003,56 @@ async def test_cancelled_turn_persists_partial_active_stream_and_completes_bubbl
     assert completion["last_seq"] == 42
     assert completion["partial"] is True
     assert completion["finish_reason"] == "user_cancelled"
+    assert completion["turn_cycle_index"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_active_stream_persistence_failure_returns_three_tuple() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(append_recorded_events=AsyncMock()),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(guardrails=_FailingGuardrails()),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    await scheduler._append_active_stream_chunk(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        message_id="turn-1",
+        turn_id="turn-1",
+        delta="partial answer",
+        turn_cycle_index=3,
+    )
+
+    result = await scheduler._persist_cancelled_active_stream(
+        conversation_id="conv-1",
+        session=SessionModel(
+            session_id="sess-1",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        message_id="turn-1",
+        turn_id="turn-1",
+        user_email="user@example.com",
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="owner@example.com",
+            name="Agent",
+            execution={},
+        ),
+    )
+
+    assert result == (None, 0, None)
 
 
 def test_render_follow_up_turn_notice_includes_task_failure_metadata() -> None:
@@ -1239,6 +1354,7 @@ async def test_thinking_callback_trims_metadata_for_legacy_observers() -> None:
         _on_tool_result,
         _on_tool_progress,
         _on_tool_output_chunk,
+        _on_context_usage,
     ) = scheduler._build_callbacks(
         "conv-1",
         "sess-1",
@@ -1320,6 +1436,61 @@ async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_active_tool_output_snapshots_include_progress_only_preparing_state() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler._active_turns["conv-1"] = asyncio.create_task(asyncio.sleep(60))
+    control = _TurnControl()
+    control.turn_id = "turn-1"
+    scheduler._turn_controls["conv-1"] = control
+
+    try:
+        await scheduler._update_active_tool_progress(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            call_id="call-patch",
+            tool_name="apply_patch",
+            turn_id="turn-1",
+            progress={
+                "phase": "preparing_input",
+                "input_chars": 1234,
+                "input_lines": 42,
+                "complete": False,
+            },
+        )
+
+        snapshots = await scheduler.active_tool_output_snapshots("conv-1")
+
+        assert len(snapshots) == 1
+        assert snapshots[0]["call_id"] == "call-patch"
+        assert snapshots[0]["tool_name"] == "apply_patch"
+        assert snapshots[0]["status"] == "running"
+        assert snapshots[0]["result"] == ""
+        assert snapshots[0]["progress_phase"] == "preparing_input"
+        assert snapshots[0]["progress_input_chars"] == 1234
+        assert snapshots[0]["progress_input_lines"] == 42
+        assert snapshots[0]["progress_complete"] is False
+    finally:
+        scheduler._active_turns["conv-1"].cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler._active_turns["conv-1"]
+
+
+@pytest.mark.asyncio
 async def test_active_tool_output_chunk_offsets_remain_monotonic_after_truncation() -> None:
     scheduler = TurnScheduler(
         session_factory=SimpleNamespace(),
@@ -1372,6 +1543,32 @@ async def test_active_tool_output_chunk_offsets_remain_monotonic_after_truncatio
         scheduler._active_turns["conv-1"].cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await scheduler._active_turns["conv-1"]
+
+
+def test_active_tool_output_snapshot_roundtrips_structured_arguments() -> None:
+    """The active-tool snapshot serializes/deserializes structured arguments so
+    the runtime overlay can carry the per-tool subtitle/body across L2 reloads."""
+    snapshot = ActiveToolOutputSnapshot(
+        conversation_id="conv-1",
+        session_id="sess-1",
+        call_id="call-read",
+        tool_name="read",
+        turn_id="turn-1",
+        result="file contents",
+        arguments={"file_path": "/tmp/x.py", "offset": 780, "limit": 55},
+    )
+    payload = snapshot.snapshot()
+    assert payload["arguments"] == {"file_path": "/tmp/x.py", "offset": 780, "limit": 55}
+
+    restored = ActiveToolOutputSnapshot.from_snapshot(payload)
+    assert restored is not None
+    assert restored.arguments == {"file_path": "/tmp/x.py", "offset": 780, "limit": 55}
+
+    # Non-dict arguments are coerced to None (no leaking of unexpected shapes).
+    payload["arguments"] = "not-a-dict"
+    restored_bad = ActiveToolOutputSnapshot.from_snapshot(payload)
+    assert restored_bad is not None
+    assert restored_bad.arguments is None
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1893,10 @@ async def test_build_attachment_notice_uses_pdf_text_fallback() -> None:
         decision_engine=SimpleNamespace(),
         task_queue=SimpleNamespace(),
         session_manager=SimpleNamespace(),
-        session_cache=SimpleNamespace(get_model_override=lambda _sid: None),
+        session_cache=SimpleNamespace(
+            get_model_override=lambda _sid: None,
+            get_model_override_provider_id=lambda _sid: None,
+        ),
         compaction_strategy=SimpleNamespace(),
         agent_loop=SimpleNamespace(),
         pause_waiter=PauseWaiter(),
@@ -2224,6 +2424,7 @@ async def test_queued_message_cancel_removes_item_before_follow_up_cleanup() -> 
     )
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
+    scheduler._suppress_channel_delivery_ids = AsyncMock(return_value=["cdel_1"])  # type: ignore[method-assign]
 
     async def _cleanup(_: str, __: str) -> None:
         cleanup_started.set()
@@ -2236,6 +2437,7 @@ async def test_queued_message_cancel_removes_item_before_follow_up_cleanup() -> 
             content="cancel me",
             user_email="user@example.com",
             follow_up=SimpleNamespace(follow_up_id="fup_1"),
+            delivery_id="cdel_1",
         )
     )
 
@@ -2244,6 +2446,11 @@ async def test_queued_message_cancel_removes_item_before_follow_up_cleanup() -> 
     assert scheduler.queued_messages("conv-1") == []
     release_cleanup.set()
     assert await cancel_task is True
+    scheduler._suppress_channel_delivery_ids.assert_awaited_once_with(
+        ["cdel_1"],
+        selected_delivery_id=None,
+        reason="cancelled queued follow-up turn",
+    )
 
 
 @pytest.mark.asyncio
@@ -2394,6 +2601,158 @@ async def test_submit_turn_reactivates_idle_session_before_launch() -> None:
     session_manager.mark_active.assert_awaited_once_with("sess-1")
     assert idle_session.status == SessionStatus.ACTIVE
     assert idle_session.idle_since is None
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_waits_for_locked_session_and_reloads_runtime() -> None:
+    class _LockedAgentLoop:
+        def __init__(self) -> None:
+            self.locked = True
+            self.waited_for: list[str] = []
+
+        def session_is_locked(self, session_id: str) -> bool:
+            del session_id
+            return self.locked
+
+        async def wait_for_session_unlock(self, session_id: str) -> None:
+            self.waited_for.append(session_id)
+            self.locked = False
+
+    session_manager = SimpleNamespace(mark_active=AsyncMock(return_value=True))
+    agent_loop = _LockedAgentLoop()
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=session_manager,
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=agent_loop,
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    old_session = SimpleNamespace(session_id="old-session", status=SessionStatus.ACTIVE)
+    new_session = SimpleNamespace(session_id="new-session", status=SessionStatus.ACTIVE)
+    runtime_calls = 0
+
+    async def _runtime(_: str, **__: object) -> tuple[object, object, object, bool]:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        return (
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            old_session if runtime_calls == 1 else new_session,
+            SimpleNamespace(agent_id="agent-1"),
+            False,
+        )
+
+    async def _attachments(**_: object) -> tuple[list[object], object]:
+        return [], None
+
+    async def _notice(**_: object) -> None:
+        return None
+
+    launched: dict[str, object] = {}
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = _attachments  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = _notice  # type: ignore[method-assign]
+    scheduler._clear_redo_on_accepted_user_turn = AsyncMock()  # type: ignore[method-assign]
+    scheduler._update_conversation_last_message_at = AsyncMock()  # type: ignore[method-assign]
+    scheduler._launch_turn = lambda **kwargs: launched.update(kwargs)  # type: ignore[assignment]
+
+    error = await scheduler.submit_turn(
+        "conv-1",
+        "hello",
+        user_email="user@example.com",
+    )
+
+    assert error is None
+    assert agent_loop.waited_for == ["old-session"]
+    assert runtime_calls == 2
+    session_manager.mark_active.assert_not_awaited()
+    assert launched["session"] is new_session
+
+
+@pytest.mark.asyncio
+async def test_submit_turn_reloads_runtime_when_compaction_lock_already_cleared() -> None:
+    class _UnlockedAgentLoop:
+        def __init__(self) -> None:
+            self.waited_for: list[str] = []
+
+        def session_is_locked(self, session_id: str) -> bool:
+            del session_id
+            return False
+
+        async def wait_for_session_unlock(self, session_id: str) -> None:
+            self.waited_for.append(session_id)
+
+    session_manager = SimpleNamespace(mark_active=AsyncMock(return_value=True))
+    agent_loop = _UnlockedAgentLoop()
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=session_manager,
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=agent_loop,
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+
+    old_session = SimpleNamespace(session_id="old-session", status=SessionStatus.ACTIVE)
+    new_session = SimpleNamespace(session_id="new-session", status=SessionStatus.ACTIVE)
+    runtime_calls = 0
+
+    async def _runtime(_: str, **__: object) -> tuple[object, object, object, bool]:
+        nonlocal runtime_calls
+        runtime_calls += 1
+        return (
+            SimpleNamespace(
+                conversation_id="conv-1", user_email="user@example.com", status="active"
+            ),
+            old_session if runtime_calls == 1 else new_session,
+            SimpleNamespace(agent_id="agent-1"),
+            False,
+        )
+
+    async def _attachments(**_: object) -> tuple[list[object], object]:
+        return [], None
+
+    async def _notice(**_: object) -> None:
+        return None
+
+    launched: dict[str, object] = {}
+    scheduler._load_conversation_runtime = _runtime  # type: ignore[method-assign]
+    scheduler._resolve_attachments_for_turn = _attachments  # type: ignore[method-assign]
+    scheduler._build_attachment_notice = _notice  # type: ignore[method-assign]
+    scheduler._clear_redo_on_accepted_user_turn = AsyncMock()  # type: ignore[method-assign]
+    scheduler._update_conversation_last_message_at = AsyncMock()  # type: ignore[method-assign]
+    scheduler._launch_turn = lambda **kwargs: launched.update(kwargs)  # type: ignore[assignment]
+
+    error = await scheduler.submit_turn(
+        "conv-1",
+        "hello",
+        user_email="user@example.com",
+    )
+
+    assert error is None
+    assert agent_loop.waited_for == []
+    assert runtime_calls == 2
+    session_manager.mark_active.assert_not_awaited()
+    assert launched["session"] is new_session
 
 
 @pytest.mark.asyncio
@@ -2565,6 +2924,166 @@ async def test_consume_queued_batch_for_active_turn_publishes_user_messages() ->
     assert control.absorbed_delivery_fallback_text == "fallback"
 
 
+@pytest.mark.asyncio
+async def test_consume_queued_batch_keeps_one_channel_delivery_intent() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    control = _TurnControl()
+    scheduler._turn_controls["conv-1"] = control
+    scheduler._suppress_absorbed_channel_delivery_intents = AsyncMock()  # type: ignore[method-assign]
+    scheduler._queued_messages["conv-1"].extend(
+        [
+            _QueuedMessage(
+                content="first follow-up",
+                user_email="user@example.com",
+                channel_deliverable=True,
+                delivery_id="cdel_first",
+                delivery_fallback_text="first fallback",
+            ),
+            _QueuedMessage(
+                content="second follow-up",
+                user_email="user@example.com",
+                channel_deliverable=True,
+                delivery_id="cdel_second",
+                delivery_fallback_text="second fallback",
+            ),
+        ]
+    )
+
+    await scheduler._consume_queued_batch_for_active_turn(
+        "conv-1",
+        reason="after_tool_cycle",
+    )
+
+    assert control.absorbed_channel_deliverable is True
+    assert control.absorbed_delivery_id == "cdel_first"
+    assert control.absorbed_delivery_fallback_text == "first fallback"
+    assert control.suppressed_channel_delivery_ids == ["cdel_second"]
+    scheduler._suppress_absorbed_channel_delivery_intents.assert_awaited_once_with(
+        control,
+        selected_delivery_id="cdel_first",
+    )
+
+
+@pytest.mark.asyncio
+async def test_consume_queued_batch_suppresses_queued_delivery_when_active_has_one() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    control = _TurnControl(active_delivery_id="cdel_active")
+    scheduler._turn_controls["conv-1"] = control
+    scheduler._suppress_absorbed_channel_delivery_intents = AsyncMock()  # type: ignore[method-assign]
+    scheduler._queued_messages["conv-1"].append(
+        _QueuedMessage(
+            content="queued follow-up",
+            user_email="user@example.com",
+            channel_deliverable=True,
+            delivery_id="cdel_queued",
+            delivery_fallback_text="queued fallback",
+        )
+    )
+
+    await scheduler._consume_queued_batch_for_active_turn(
+        "conv-1",
+        reason="after_tool_cycle",
+    )
+
+    assert control.absorbed_channel_deliverable is True
+    assert control.absorbed_delivery_id is None
+    assert control.absorbed_delivery_fallback_text is None
+    assert control.suppressed_channel_delivery_ids == ["cdel_queued"]
+    scheduler._suppress_absorbed_channel_delivery_intents.assert_awaited_once_with(
+        control,
+        selected_delivery_id="cdel_active",
+    )
+
+
+@pytest.mark.asyncio
+async def test_suppress_absorbed_channel_delivery_intents_persists_status() -> None:
+    suppressed_calls: list[dict[str, object]] = []
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def commit(self):
+            return None
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    control = _TurnControl(
+        suppressed_channel_delivery_ids=["cdel_first", "cdel_second", "cdel_first"]
+    )
+
+    async def _suppress_channel_delivery_outbox(_session, **kwargs):
+        suppressed_calls.append(kwargs)
+        return len(kwargs["delivery_ids"])
+
+    import cognis.store.queries as queries
+
+    original = queries.suppress_channel_delivery_outbox
+    queries.suppress_channel_delivery_outbox = _suppress_channel_delivery_outbox  # type: ignore[assignment]
+    try:
+        await scheduler._suppress_absorbed_channel_delivery_intents(
+            control,
+            selected_delivery_id="cdel_second",
+        )
+    finally:
+        queries.suppress_channel_delivery_outbox = original  # type: ignore[assignment]
+
+    assert suppressed_calls == [
+        {
+            "delivery_ids": ["cdel_first"],
+            "reason": "absorbed into active follow-up turn",
+        }
+    ]
+    assert control.suppressed_channel_delivery_ids == ["cdel_second"]
+
+
 def test_merge_active_turn_observers_skips_non_absorbable_observers() -> None:
     scheduler = TurnScheduler(
         session_factory=SimpleNamespace(),
@@ -2715,6 +3234,197 @@ async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
     assert scheduler.submit_turn.await_args.kwargs["channel_deliverable"] is True
     assert scheduler.submit_turn.await_args.kwargs["delivery_id"] == "cdel_1"
     assert scheduler.submit_turn.await_args.kwargs["delivery_fallback_text"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_event_creates_channel_delivery_intent_when_missing() -> None:
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    created_outbox: list[dict[str, object]] = []
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def add(self, _row):
+            return None
+
+        async def commit(self):
+            return None
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(
+            conversation_id=conversation_id,
+            user_email="user@example.com",
+            active_session_id="sess-1",
+        )
+
+    async def _get_conversation_channel_route(_session, conversation_id: str):
+        assert conversation_id == "conv-1"
+        return ("matrix", "ch_matrix", "!room:example.com", "$thread", "user@example.com")
+
+    async def _create_channel_delivery_outbox(_session, **kwargs):
+        created_outbox.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    import cognis.store.queries as queries
+
+    original_get_conversation = queries.get_conversation
+    original_route = queries.get_conversation_channel_route
+    original_create = queries.create_channel_delivery_outbox
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    queries.get_conversation_channel_route = _get_conversation_channel_route  # type: ignore[assignment]
+    queries.create_channel_delivery_outbox = _create_channel_delivery_outbox  # type: ignore[assignment]
+    try:
+        await scheduler._handle_follow_up_event(
+            SimpleNamespace(
+                data={
+                    "conversation_id": "conv-1",
+                    "follow_up": follow_up.model_dump(mode="json"),
+                }
+            )
+        )
+    finally:
+        queries.get_conversation = original_get_conversation  # type: ignore[assignment]
+        queries.get_conversation_channel_route = original_route  # type: ignore[assignment]
+        queries.create_channel_delivery_outbox = original_create  # type: ignore[assignment]
+
+    scheduler.submit_turn.assert_awaited_once()
+    assert created_outbox
+    outbox = created_outbox[0]
+    assert outbox["conversation_id"] == "conv-1"
+    assert outbox["session_id"] == "sess-1"
+    assert outbox["source_type"] == "follow_up"
+    assert outbox["source_id"] == "fup_1"
+    assert outbox["channel_type"] == "matrix"
+    assert outbox["account_id"] == "ch_matrix"
+    assert outbox["chat_id"] == "!room:example.com"
+    assert outbox["thread_id"] == "$thread"
+    assert isinstance(outbox["fallback_text"], str)
+    assert "Background task" in outbox["fallback_text"]
+    assert scheduler.submit_turn.await_args.kwargs["channel_deliverable"] is True
+    assert scheduler.submit_turn.await_args.kwargs["delivery_id"] == outbox["delivery_id"]
+    assert (
+        scheduler.submit_turn.await_args.kwargs["delivery_fallback_text"] == outbox["fallback_text"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_follow_up_event_respects_explicit_channel_delivery_suppression() -> None:
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_1",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def add(self, _row):
+            return None
+
+        async def commit(self):
+            return None
+
+    scheduler = TurnScheduler(
+        session_factory=lambda: _Session(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    async def _get_conversation(_session, conversation_id: str):
+        return SimpleNamespace(
+            conversation_id=conversation_id,
+            user_email="user@example.com",
+            active_session_id="sess-1",
+        )
+
+    async def _get_conversation_channel_route(_session, conversation_id: str):
+        raise AssertionError("explicitly suppressed follow-up must not resolve channel route")
+
+    import cognis.store.queries as queries
+
+    original_get_conversation = queries.get_conversation
+    original_route = queries.get_conversation_channel_route
+    queries.get_conversation = _get_conversation  # type: ignore[assignment]
+    queries.get_conversation_channel_route = _get_conversation_channel_route  # type: ignore[assignment]
+    try:
+        await scheduler._handle_follow_up_event(
+            SimpleNamespace(
+                data={
+                    "conversation_id": "conv-1",
+                    "follow_up": follow_up.model_dump(mode="json"),
+                    "channel_deliverable": False,
+                }
+            )
+        )
+    finally:
+        queries.get_conversation = original_get_conversation  # type: ignore[assignment]
+        queries.get_conversation_channel_route = original_route  # type: ignore[assignment]
+
+    scheduler.submit_turn.assert_awaited_once()
+    assert scheduler.submit_turn.await_args.kwargs["channel_deliverable"] is False
+    assert scheduler.submit_turn.await_args.kwargs["delivery_id"] is None
 
 
 @pytest.mark.asyncio
@@ -3021,6 +3731,7 @@ async def test_cancel_turn_clears_pending_queued_follow_up() -> None:
         workflow_registry=SimpleNamespace(),
         event_bus=EventBus(),
     )
+    scheduler._suppress_channel_delivery_ids = AsyncMock(return_value=["cdel_1"])  # type: ignore[method-assign]
     follow_up = TaskResultFollowUp(
         follow_up_id="fup_1",
         mode=FollowUpMode.NOTIFY,
@@ -3037,12 +3748,19 @@ async def test_cancel_turn_clears_pending_queued_follow_up() -> None:
         description="",
     )
     scheduler._pending_follow_ups.add(("conv-1", "fup_1"))
-    scheduler._queued_messages["conv-1"].append(SimpleNamespace(follow_up=follow_up))
+    scheduler._queued_messages["conv-1"].append(
+        SimpleNamespace(follow_up=follow_up, delivery_id="cdel_1")
+    )
 
     cleared = await scheduler.cancel_turn("conv-1")
 
     assert cleared is True
     assert ("conv-1", "fup_1") not in scheduler._pending_follow_ups
+    scheduler._suppress_channel_delivery_ids.assert_awaited_once_with(
+        ["cdel_1"],
+        selected_delivery_id=None,
+        reason="cleared queued follow-up turn",
+    )
 
 
 @pytest.mark.asyncio
@@ -3863,6 +4581,7 @@ async def test_run_turn_queues_automatic_continuation_after_tool_call_ceiling() 
             title="",
             user_email="user@example.com",
             status="active",
+            context=SimpleNamespace(platform_data={"chat_mode": "plan"}),
         ),
         session=SimpleNamespace(session_id="sess-1"),
         agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
@@ -3892,10 +4611,193 @@ async def test_run_turn_queues_automatic_continuation_after_tool_call_ceiling() 
     assert scheduler.submit_turn.await_args.args[:2] == ("conv-1", "")
     follow_up = scheduler.submit_turn.await_args.kwargs["follow_up"]
     assert scheduler.submit_turn.await_args.kwargs["system_initiated"] is True
+    assert scheduler.submit_turn.await_args.kwargs["one_shot_chat_mode"] is None
     assert isinstance(follow_up, ContinuationFollowUp)
     assert follow_up.reason == "tool_call_ceiling_reached"
     assert follow_up.attempt == 1
     assert follow_up.pending_todos == [{"content": "finish validation", "status": "in_progress"}]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_queues_automatic_continuation_after_step_timeout() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(
+                return_value=SimpleNamespace(
+                    summary="Step timed out",
+                    error="Step timed out after 3600s",
+                    content="",
+                    attachments=[],
+                    metadata={
+                        "continuation_reason": "step_timeout",
+                        "timeout_seconds": 3600,
+                        "pending_todos": [
+                            {"content": "finish implementation", "status": "in_progress"},
+                            {"content": "done", "status": "completed"},
+                        ],
+                    },
+                )
+            )
+        ),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_error = AsyncMock()  # type: ignore[method-assign]
+    scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            status="active",
+            context=SimpleNamespace(platform_data={"chat_mode": "plan"}),
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
+        content="work",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=_TurnControl(turn_observers=[observer]),
+        turn_observers=(observer,),
+        one_shot_chat_mode="build",
+    )
+
+    assert observer.system_messages == ["Step timed out after 3600s. Continuing automatically."]
+    scheduler._publish_turn_error.assert_not_awaited()
+    scheduler.submit_turn.assert_awaited_once()
+    assert scheduler._workflow_engine.run_direct_turn.await_args.kwargs["chat_mode"].mode == "build"
+    assert scheduler.submit_turn.await_args.kwargs["one_shot_chat_mode"] == "build"
+    completed_result = scheduler._publish_turn_completed.await_args.args[0]
+    assert completed_result.managed_continuation_pending is True
+    follow_up = scheduler.submit_turn.await_args.kwargs["follow_up"]
+    assert isinstance(follow_up, ContinuationFollowUp)
+    assert follow_up.reason == "step_timeout"
+    assert follow_up.attempt == 1
+    assert follow_up.pending_todos == [
+        {"content": "finish implementation", "status": "in_progress"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_queues_automatic_continuation_after_llm_cycle_ceiling() -> None:
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(
+                return_value=SimpleNamespace(
+                    summary="LLM cycle ceiling reached (150); turn requires continuation.",
+                    content="partial",
+                    attachments=[],
+                    metadata={
+                        "interrupted": True,
+                        "continuation_reason": LLM_CYCLE_CEILING_CONTINUATION_REASON,
+                        "cycle_count": 150,
+                        "max_llm_cycles": 150,
+                        "pending_todos": [
+                            {"content": "finish investigation", "status": "in_progress"},
+                            {"content": "done", "status": "completed"},
+                        ],
+                    },
+                )
+            )
+        ),
+        decision_engine=SimpleNamespace(
+            decide=AsyncMock(return_value=SimpleNamespace(decision="inline"))
+        ),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
+    scheduler.submit_turn = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            status="active",
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
+        content="work",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=False,
+        follow_up=None,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=_TurnControl(turn_observers=[observer]),
+        turn_observers=(observer,),
+    )
+
+    assert observer.system_messages == [
+        "LLM cycle limit reached (150/150 LLM cycles). Continuing automatically."
+    ]
+    scheduler.submit_turn.assert_awaited_once()
+    completed_result = scheduler._publish_turn_completed.await_args.args[0]
+    assert completed_result.managed_continuation_pending is True
+    follow_up = scheduler.submit_turn.await_args.kwargs["follow_up"]
+    assert isinstance(follow_up, ContinuationFollowUp)
+    assert follow_up.reason == LLM_CYCLE_CEILING_CONTINUATION_REASON
+    assert follow_up.attempt == 1
+    assert follow_up.cycle_count == 150
+    assert follow_up.max_llm_cycles == 150
+    assert follow_up.pending_todos == [{"content": "finish investigation", "status": "in_progress"}]
+    assert "LLM cycles: 150/150" in render_follow_up_turn_notice(follow_up)
 
 
 @pytest.mark.asyncio
@@ -3939,6 +4841,7 @@ async def test_tool_call_ceiling_continuation_preserves_existing_queue_order() -
     assert [item.content for item in queued] == ["user correction", ""]
     assert queued[0].follow_up is None
     assert isinstance(queued[1].follow_up, ContinuationFollowUp)
+    assert queued[1].one_shot_chat_mode is None
 
 
 @pytest.mark.asyncio
@@ -4023,6 +4926,94 @@ async def test_run_turn_stops_automatic_continuation_after_attempt_limit() -> No
         "Automatic continuation stopped after repeated tool-call ceilings. "
         "Send a new message to continue manually."
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_publishes_step_timeout_error_after_continuation_attempt_limit() -> None:
+    prior_follow_up = ContinuationFollowUp(
+        follow_up_id="fup_prior",
+        mode=FollowUpMode.INTEGRATE,
+        origin_kind=FollowUpOriginKind.CONTINUATION,
+        relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+        required_action=FollowUpRequiredAction.INTEGRATE_RESULT,
+        topic_ref="turn-prior",
+        status=FollowUpStatus.COMPLETED,
+        reason="step_timeout",
+        attempt=3,
+        max_attempts=3,
+    )
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(
+            run_direct_turn=AsyncMock(
+                return_value=SimpleNamespace(
+                    summary="Step timed out",
+                    error="Step timed out after 3600s",
+                    content="",
+                    attachments=[],
+                    metadata={
+                        "continuation_reason": "step_timeout",
+                        "timeout_seconds": 3600,
+                    },
+                )
+            )
+        ),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(
+            refresh=AsyncMock(return_value=SimpleNamespace(last_event_seq=0)),
+            get_context_usage=MagicMock(return_value=None),
+            get_entry=MagicMock(return_value=None),
+        ),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    scheduler._touch_conversation = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_completed = AsyncMock()  # type: ignore[method-assign]
+    scheduler._publish_turn_error = AsyncMock()  # type: ignore[method-assign]
+    scheduler._notify_queue_updated = AsyncMock()  # type: ignore[method-assign]
+
+    await scheduler._run_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            title="",
+            user_email="user@example.com",
+            status="active",
+        ),
+        session=SimpleNamespace(session_id="sess-1"),
+        agent=SimpleNamespace(agent_id="agent-1", owner_email="user@example.com", execution={}),
+        content="",
+        user_email="user@example.com",
+        attachments=[],
+        outbound_attachments=None,
+        attachment_notice=None,
+        attachment_context=None,
+        system_initiated=True,
+        follow_up=prior_follow_up,
+        channel_deliverable=False,
+        delivery_id=None,
+        delivery_fallback_text=None,
+        bootstrap_wait_for_intention=False,
+        cancel_event=AsyncMock(),
+        turn_control=_TurnControl(turn_observers=[observer]),
+        turn_observers=(observer,),
+    )
+
+    assert list(scheduler._queued_messages["conv-1"]) == []
+    assert observer.system_messages == [
+        "Automatic continuation stopped after repeated step timeouts. "
+        "Send a new message to continue manually."
+    ]
+    scheduler._publish_turn_completed.assert_not_awaited()
+    scheduler._publish_turn_error.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -4607,3 +5598,143 @@ async def test_load_runtime_bootstrap_ignores_persisted_conversation_title() -> 
 
     assert result is not None
     assert captured["intention"] == "Conversation with Agent"
+
+
+@pytest.mark.asyncio
+async def test_active_stream_snapshot_phase_advances_with_scheduler_counter() -> None:
+    """The streaming snapshot's assistant_phase_index must stay in sync with the
+    scheduler's phase counter across a multi-phase turn (assistant → tool → assistant).
+
+    Root cause of the orphaned-spinner duplicate: the snapshot was created once
+    with phase=0 and never updated when the phase bumped, so the phase-1 streaming
+    item had id 'message:{turn}:phase:0' while the live.assistant_complete patch
+    used id 'message:{turn}:phase:1' — they never merged, leaving a stuck spinner.
+    """
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    observer = _RecordingObserver()
+    (
+        on_token,
+        _on_thinking,
+        on_tool_call,
+        _on_tool_result,
+        _on_tool_progress,
+        _on_tool_output_chunk,
+        _on_context_usage,
+    ) = scheduler._build_callbacks(
+        "conv-1",
+        "sess-1",
+        "turn-1",
+        "turn-1",
+        turn_observers=(observer,),
+    )
+
+    # Phase 0: assistant streams first segment
+    await on_token("First segment.")
+    snapshots = await scheduler.active_stream_snapshots("conv-1")
+    assert len(snapshots) == 1
+    assert snapshots[0]["assistant_phase_index"] == 0
+    assert snapshots[0]["content"] == "First segment."
+
+    # Tool call fires → phase counter bumps to 1, active stream is cleared
+    await on_tool_call("bash", "call-1", {"cmd": "ls"})
+    assert await scheduler.active_stream_snapshots("conv-1") == []
+
+    # Phase 1: assistant streams second segment
+    await on_token("Second segment.")
+    snapshots = await scheduler.active_stream_snapshots("conv-1")
+    assert len(snapshots) == 1
+
+    # THE KEY ASSERTION: snapshot must carry phase 1, not the stale phase 0.
+    # Before the fix, assistant_phase_index was frozen at 0 for the whole turn,
+    # causing the streaming item id to be 'message:turn-1:phase:0' while the
+    # completion patch used 'message:turn-1:phase:1' — they never merged.
+    assert snapshots[0]["assistant_phase_index"] == 1, (
+        f"Expected phase 1 for second segment, got {snapshots[0]['assistant_phase_index']}. "
+        "The streaming snapshot must advance its phase when the scheduler counter bumps."
+    )
+    assert snapshots[0]["content"] == "Second segment."
+
+    # The snapshot id (as computed by the server projector) must match the
+    # completion patch id for the same phase.
+    from cognis.api.routes.conversations import _stable_assistant_timeline_id
+
+    snapshot_id = _stable_assistant_timeline_id(
+        snapshots[0]["message_id"],
+        snapshots[0]["assistant_phase_index"],
+        snapshots[0]["message_id"],
+    )
+    completion_id = _stable_assistant_timeline_id("turn-1", 1, "turn-1")
+    assert snapshot_id == completion_id, (
+        f"Snapshot id {snapshot_id!r} != completion id {completion_id!r}. "
+        "These must match so timelinePatchMergeIndex can merge them."
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_stream_snapshot_phase_advances_after_delegate_tool() -> None:
+    """Delegate/fork are still tool boundaries for Chat v2 timeline ordering.
+
+    If delegate is excluded from the scheduler phase bump, the next assistant
+    stream keeps phase 0. Since assistant messages sort before same-phase tool
+    calls, the post-delegate stream can render above the completed delegate card.
+    """
+    scheduler = TurnScheduler(
+        session_factory=SimpleNamespace(),
+        workflow_engine=SimpleNamespace(),
+        decision_engine=SimpleNamespace(),
+        task_queue=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=AsyncMock()),
+        session_cache=SimpleNamespace(),
+        compaction_strategy=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=SimpleNamespace(),
+        providers=SimpleNamespace(),
+        artifact_store=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        event_bus=EventBus(),
+    )
+    (
+        on_token,
+        _on_thinking,
+        on_tool_call,
+        _on_tool_result,
+        _on_tool_progress,
+        _on_tool_output_chunk,
+        _on_context_usage,
+    ) = scheduler._build_callbacks(
+        "conv-1",
+        "sess-1",
+        "turn-1",
+        "turn-1",
+    )
+
+    await on_token("Before delegate.")
+    snapshots = await scheduler.active_stream_snapshots("conv-1")
+    assert snapshots[0]["assistant_phase_index"] == 0
+    assert snapshots[0]["turn_cycle_index"] == 0
+
+    await on_tool_call("delegate", "call-delegate", {"task": "Inspect"})
+    assert await scheduler.active_stream_snapshots("conv-1") == []
+
+    await on_token("After delegate.")
+    snapshots = await scheduler.active_stream_snapshots("conv-1")
+    assert len(snapshots) == 1
+    assert snapshots[0]["assistant_phase_index"] == 1
+    assert snapshots[0]["turn_cycle_index"] == 1
+    assert snapshots[0]["content"] == "After delegate."

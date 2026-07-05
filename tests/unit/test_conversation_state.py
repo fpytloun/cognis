@@ -10,7 +10,12 @@ from cognis.core.conversation_state import (
 )
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, Conversation, NotificationRow, User
-from cognis.store.queries import create_step_run, create_task
+from cognis.store.queries import (
+    create_session,
+    create_step_run,
+    create_task,
+    replace_conversation_todos,
+)
 
 
 async def _factory(tmp_path: object):
@@ -50,6 +55,53 @@ async def test_normal_conversation_snapshot_has_no_task(tmp_path: object) -> Non
         assert snapshot.conversation_kind == "normal"
         assert snapshot.task is None
         assert snapshot.pending.notification_types == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_normal_conversation_snapshot_projects_conversation_todos(tmp_path: object) -> None:
+    engine, factory = await _factory(tmp_path)
+    try:
+        async with factory() as session:
+            session.add(
+                Conversation(
+                    conversation_id="conv_normal",
+                    user_email="user@test.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    active_session_id="sess_1",
+                )
+            )
+            await create_session(
+                session,
+                session_id="sess_1",
+                conversation_id="conv_normal",
+                user_email="user@test.com",
+                agent_id="agent-1",
+            )
+            await replace_conversation_todos(
+                session,
+                "conv_normal",
+                [
+                    {
+                        "content": "Keep TODO state visible",
+                        "status": "in_progress",
+                        "priority": "high",
+                    }
+                ],
+            )
+            await session.commit()
+            snapshot = await snapshot_for_conversation(
+                session,
+                user_email="user@test.com",
+                conversation_id="conv_normal",
+            )
+        assert snapshot is not None
+        assert snapshot.task is None
+        assert snapshot.active_session.todos[0].content == "Keep TODO state visible"
+        assert snapshot.active_session.todos[0].status == "in_progress"
+        assert snapshot.active_session.todos[0].priority == "high"
     finally:
         await engine.dispose()
 

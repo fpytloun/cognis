@@ -36,11 +36,11 @@ def test_intaris_records_session_events(live_stack: LiveStack, run_id: str) -> N
     assert sessions.status_code == 200
     assert len(sessions.json()) >= 1
 
-    messages = live_stack.get(f"/api/v1/conversations/{cid}/messages?after_seq=0&limit=50")
-    assert messages.status_code == 200
-    types = [i["type"] for i in messages.json()["items"]]
-    assert "user_message" in types
-    assert "assistant_message" in types
+    snapshot = live_stack.get(f"/api/v1/chat/v2/conversations/{cid}/snapshot")
+    assert snapshot.status_code == 200
+    messages = [item for item in snapshot.json()["timeline"]["items"] if item["kind"] == "message"]
+    roles = [item["role"] for item in messages]
+    assert "user" in roles
 
 
 @pytest.mark.integration

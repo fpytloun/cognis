@@ -82,6 +82,7 @@ class ModelInfo(BaseModel):
     supports_pdf_input: bool = False
     supports_file_input: bool = False
     supports_reasoning: bool = False
+    supported_image_mime_types: list[str] = Field(default_factory=list)
     reasoning_efforts: list[str] = Field(default_factory=list)
     reasoning_summary_format: str | None = None
     default_reasoning_summary: str | None = None

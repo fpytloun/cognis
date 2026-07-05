@@ -59,6 +59,7 @@ class ToolDefinition(BaseModel):
     timeout_seconds: int = 30
     non_bypassable: bool = False
     max_result_size: int = 50_000
+    content_trust: Literal["trusted", "untrusted"] = "trusted"
     risk_level: str | None = None
     aliases: list[dict[str, Any]] = Field(default_factory=list)
     canonical_name: str | None = None
@@ -227,6 +228,8 @@ class MCPOAuth2Config(BaseModel):
     client_secret_ref: str | None = None
     redirect_uri: str | None = None
     flow: Literal["auto", "authorization_code", "device_code"] = "auto"
+    callback_mode: Literal["auto", "controller_public", "executor_loopback"] = "auto"
+    oauth_executor_id: str | None = None
     dynamic_client_registration: bool = False
     client_metadata_document_url: str | None = None
     authorization_params: dict[str, str] = Field(default_factory=dict)
@@ -244,6 +247,8 @@ class MCPAuthConfig(BaseModel):
     client_secret_ref: str | None = None
     redirect_uri: str | None = None
     flow: Literal["auto", "authorization_code", "device_code"] = "auto"
+    callback_mode: Literal["auto", "controller_public", "executor_loopback"] = "auto"
+    oauth_executor_id: str | None = None
     dynamic_client_registration: bool = False
     client_metadata_document_url: str | None = None
     authorization_params: dict[str, str] = Field(default_factory=dict)

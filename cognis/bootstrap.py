@@ -38,9 +38,19 @@ logger = get_logger(__name__)
 DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
+    "session.compaction_max_input_tokens": ("session", 0),
+    "session.compaction_llm_max_attempts": ("session", 2),
+    "session.compaction_max_recursion": ("session", 2),
+    "session.compaction_fallback_enabled": ("session", True),
     "session.step_timeout_seconds": ("session", 3600),
+    "session.stale_after_seconds": ("session", 300),
     "session.llm_stream_idle_timeout_seconds": ("session", 300),
     "session.llm_stream_max_retries": ("session", 3),
+    "session.anthropic_cache_ttl": ("session", "5m"),
+    "session.memory_instructions_max_tokens": ("session", 2000),
+    "session.core_memories_max_tokens": ("session", 2000),
+    "session.immutable_prefix_repair_cooldown_seconds": ("session", 300),
+    "session.recall_ttl_seconds": ("session", 86400),
     "session.max_tool_calls_per_turn": ("session", 200),
     "session.idle_timeout_seconds": ("session", 1800),
     "session.long_lived_chat_idle_compaction_seconds": ("session", 21600),
@@ -50,6 +60,7 @@ DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
     "session.max_active_turns_per_user": ("session", 20),
     "session.max_queued_messages": ("session", 20),
     "session.escalation_timeout_seconds": ("session", 300),
+    "session.step_request_questions_timeout_seconds": ("session", 3600),
     "session.cache_max_entries": ("session", 200),
     "managed_conversations.cleanup_retention_days": ("managed_conversations", 7),
     "search.display_min_score": ("search", 0.2),
@@ -211,6 +222,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_session_lifecycle_columns)
         await conn.run_sync(_ensure_session_compaction_columns)
         await conn.run_sync(_ensure_api_key_columns)
+        await conn.run_sync(_ensure_agent_capabilities_column)
         await conn.run_sync(_ensure_agent_sync_metadata_column)
         await conn.run_sync(_ensure_provider_is_default_column)
         await conn.run_sync(_ensure_llm_provider_owner_schema)
@@ -241,6 +253,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_task_creator_agent_column)
         await conn.run_sync(_ensure_task_session_policy_column)
+        await conn.run_sync(_ensure_task_board_indexes)
         await conn.run_sync(_ensure_agent_profile_columns)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
@@ -262,6 +275,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_comments_table)
         await conn.run_sync(_ensure_tts_cache_table)
         await conn.run_sync(_ensure_knowledgebase_schema)
+        await conn.run_sync(_ensure_todos_tables)
 
 
 def _ensure_task_creator_agent_column(sync_conn: object) -> None:
@@ -329,6 +343,63 @@ def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
             )
         )
         execute(text("UPDATE sessions SET updated_at = COALESCE(updated_at, started_at)"))
+
+
+def _ensure_todos_tables(sync_conn: object) -> None:
+    """Create first-class TODO state tables."""
+
+    from cognis.store.models import ConversationTodo, SessionTodo
+
+    ConversationTodo.__table__.create(bind=sync_conn, checkfirst=True)
+    SessionTodo.__table__.create(bind=sync_conn, checkfirst=True)
+    sync_conn.execute(  # type: ignore[attr-defined]
+        text(
+            """
+            INSERT INTO conversation_todos (
+                conversation_id,
+                position,
+                content,
+                status,
+                priority,
+                created_at,
+                updated_at
+            )
+            SELECT
+                selected.conversation_id,
+                st.position,
+                st.content,
+                st.status,
+                st.priority,
+                st.created_at,
+                st.updated_at
+            FROM (
+                SELECT
+                    s.conversation_id AS conversation_id,
+                    s.session_id AS session_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.conversation_id
+                        ORDER BY
+                            CASE WHEN c.active_session_id = s.session_id THEN 0 ELSE 1 END,
+                            s.updated_at DESC,
+                            s.started_at DESC
+                    ) AS rn
+                FROM sessions s
+                JOIN conversations c ON c.conversation_id = s.conversation_id
+                WHERE (
+                    c.active_session_id = s.session_id
+                    OR (c.active_session_id IS NULL AND s.status IN ('active', 'idle'))
+                )
+            ) selected
+            JOIN session_todos st ON st.session_id = selected.session_id
+            WHERE selected.rn = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversation_todos existing
+                  WHERE existing.conversation_id = selected.conversation_id
+              )
+            """
+        )
+    )
 
 
 def _ensure_session_compaction_columns(sync_conn: object) -> None:
@@ -446,6 +517,42 @@ def _ensure_project_links_workflows_grants(sync_conn: object) -> None:
     )
 
 
+def _ensure_task_board_indexes(sync_conn: object) -> None:
+    """Create indexes used by paginated task list and kanban board queries."""
+
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_tasks_owner_updated "
+            "ON tasks (created_by, updated_at, task_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_tasks_owner_status_updated "
+            "ON tasks (created_by, status, updated_at, task_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_tasks_owner_agent_updated "
+            "ON tasks (created_by, agent_id, updated_at, task_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_tasks_owner_project_updated "
+            "ON tasks (created_by, project_id, updated_at, task_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_tasks_owner_workflow_updated "
+            "ON tasks (created_by, workflow_id, updated_at, task_id)"
+        )
+    )
+
+
 def _ensure_step_history_columns(sync_conn: object) -> None:
     """Add revision-history columns needed by later Stage 33 phases."""
 
@@ -503,6 +610,16 @@ def _ensure_agent_grant_overrides_column(sync_conn: object) -> None:
         return
     if "grantee_overrides" not in columns:
         sync_conn.execute(text("ALTER TABLE agent_grants ADD COLUMN grantee_overrides JSON"))  # type: ignore[attr-defined]
+
+
+def _ensure_agent_capabilities_column(sync_conn: object) -> None:
+    """Add capabilities JSON column to agents table (idempotent)."""
+    inspector = cast(Any, inspect(sync_conn))
+    agent_columns = {column["name"] for column in inspector.get_columns("agents")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+
+    if "capabilities" not in agent_columns:
+        execute(text("ALTER TABLE agents ADD COLUMN capabilities JSON"))
 
 
 def _ensure_agent_sync_metadata_column(sync_conn: object) -> None:

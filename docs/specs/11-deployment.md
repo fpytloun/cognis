@@ -120,6 +120,7 @@ COGNIS_LOG_LEVEL=info                  # Logging level
 COGNIS_LOG_FORMAT=json                 # json or text
 COGNIS_SERVE_UI=true                   # Serve bundled UI assets
 COGNIS_CORS_ORIGINS=http://localhost:5173  # CORS allowlist
+COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=false  # Enable ChatGPT prompt-cache key support
 ```
 
 ### Mnemory/Intaris JWT Configuration
@@ -487,17 +488,29 @@ The SvelteKit UI reads browser-visible environment variables:
 | Category | Key | Default | Description |
 |----------|-----|---------|-------------|
 | session | `session.max_context_tokens` | 128000 | Context window budget |
-| session | `session.compaction_threshold` | 0.85 | Trigger compaction at this % |
-| session | `session.compaction_preserve_turns` | 10 | Turns to keep uncompacted |
+| session | `session.compaction_threshold` | 0.85 | Trigger compaction at this ratio (valid 0.3-0.99) |
+| session | `session.compaction_preserve_turns` | 10 | Maximum user turns to keep uncompacted; actual tail is also token-budgeted |
+| session | `session.compaction_max_input_tokens` | 0 | Override compaction-model input budget; `0` uses provider metadata |
+| session | `session.compaction_llm_max_attempts` | 2 | Attempts for transient compaction LLM failures, including 429/5xx/timeouts |
+| session | `session.compaction_max_recursion` | 2 | Maximum compact-and-retry depth before classified failure/cooldown |
+| session | `session.compaction_fallback_enabled` | true | Enable last-resort mechanical compaction fallback |
 | session | `session.long_lived_chat_idle_compaction_seconds` | 21600 | Idle age before ambient web direct/channel chats checkpoint into a fresh session; `0` disables |
 | session | `session.long_lived_chat_idle_compaction_min_events` | 20 | Minimum uncompacted events before idle checkpoint compaction can run |
-| session | `session.max_tool_calls_per_turn` | 50 | Max tool calls per turn |
+| session | `session.max_tool_calls_per_turn` | 200 | Max tool calls per turn |
 | session | `session.idle_timeout_seconds` | 1800 | 30 min idle → mark idle |
 | session | `session.max_session_age_seconds` | 86400 | 24h max session age |
 | session | `session.max_delegation_depth` | 5 | Max delegation chain depth |
 | session | `session.max_active_turns_per_user` | 20 | Max active non-system turns per user |
 | session | `session.max_queued_messages` | 20 | Max queued messages per session |
+| session | `session.anthropic_cache_ttl` | "5m" | Anthropic prompt-cache TTL; set to "1h" only when the extended-cache TTL beta should be used for tools and cached prefix/project-context messages |
+| session | `session.memory_instructions_max_tokens` | 2000 | Token cap for memory-instruction content in the immutable prefix |
+| session | `session.core_memories_max_tokens` | 2000 | Token cap for core-memory content in the immutable prefix |
+| session | `session.immutable_prefix_repair_cooldown_seconds` | 300 | Cooldown before another immutable-prefix repair attempt for the same session; `0` disables cooldown |
+| session | `session.recall_ttl_seconds` | 86400 | TTL sent to managed Mnemory recall sessions |
+| session | `session.cache_max_entries` | 200 | Maximum number of Intaris session cache entries kept in memory |
 | session | `session.escalation_timeout_seconds` | 300 | 5 min escalation timeout |
+| session | `session.step_request_questions_timeout_seconds` | 3600 | Default wait for workflow `step_request_questions` answers before returning a timeout tool result with prescribed next action |
+| evaluator | `evaluator.timeout_ms` | 180000 | Step evaluator LLM timeout |
 | decision_engine | `decision_engine.inline_max_length` | 200 | Short messages → inline |
 | decision_engine | `decision_engine.classifier_timeout_ms` | 500 | Classifier timeout |
 | decision_engine | `decision_engine.classifier_fallback` | "inline" | Fallback on classifier failure |

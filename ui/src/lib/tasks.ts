@@ -10,6 +10,15 @@ export const TASK_BOARD_COLUMNS = [
 
 export type TaskBoardColumnId = (typeof TASK_BOARD_COLUMNS)[number]['id'];
 
+export function isTaskBoardColumnId(value: string | null | undefined): value is TaskBoardColumnId {
+  return TASK_BOARD_COLUMNS.some((column) => column.id === value);
+}
+
+export function taskBoardColumnFromSearchParams(searchParams: URLSearchParams): TaskBoardColumnId {
+  const column = searchParams.get('col');
+  return isTaskBoardColumnId(column) ? column : 'running';
+}
+
 export function boardColumnForStatus(status: string): TaskBoardColumnId {
   if (status === 'draft') {
     return 'draft';
@@ -77,15 +86,23 @@ export function taskFiltersToSearchParams(filters: TaskFilterState): URLSearchPa
   return searchParams;
 }
 
+export function taskBoardUrlForState(filters: TaskFilterState, column: TaskBoardColumnId = 'running'): string {
+  const searchParams = taskFiltersToSearchParams(filters);
+  if (column !== 'running') {
+    searchParams.set('col', column);
+  }
+  const query = searchParams.toString();
+  return query ? `/tasks?${query}` : '/tasks';
+}
+
 export function taskBoardProjectUrl(projectId: string): string {
-  const searchParams = taskFiltersToSearchParams({
+  return taskBoardUrlForState({
     search: '',
     agentId: '',
     workflowId: '',
     projectId,
     status: ''
   });
-  return `/tasks?${searchParams.toString()}`;
 }
 
 export function scheduleListProjectUrl(projectId: string): string {

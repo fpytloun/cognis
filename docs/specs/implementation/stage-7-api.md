@@ -37,9 +37,11 @@ resolve escalations, and configure settings.
   - `PATCH /api/v1/conversations/:id` — update title, archive
   - `DELETE /api/v1/conversations/:id` — soft delete
   - `DELETE /api/v1/conversations/:id/purge` — hard delete + Intaris cascade
-  - `GET /api/v1/conversations/:id/messages` — history (proxied from Intaris events)
   - `GET /api/v1/conversations/:id/sessions` — list sessions
   - `GET /api/v1/conversations/:id/delegations` — active delegations
+
+Message send/history moved to Chat v2 (`/api/v1/chat/v2/conversations/:id/*`);
+legacy conversation message routes are no longer part of the API.
 
 ### 2. Agent Routes
 

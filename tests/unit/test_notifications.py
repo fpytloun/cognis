@@ -130,15 +130,19 @@ class _FakeGuardrails:
         fail: bool = False,
         order: list[str] | None = None,
         escalations: dict[str, Any] | None = None,
+        on_submit: Any | None = None,
     ) -> None:
         self.fail = fail
         self.order = order if order is not None else []
         self.escalations = escalations or {}
+        self.on_submit = on_submit
 
     async def submit_decision(self, call_id: str, decision: str, note: str | None = None) -> None:
         self.order.append("submit")
         if self.fail:
             raise RuntimeError("submit failed")
+        if self.on_submit is not None:
+            self.on_submit(call_id, decision, note)
 
     async def get_escalation(self, call_id: str) -> Any:
         self.order.append("get_escalation")
@@ -222,6 +226,66 @@ async def test_escalation_resolution_keeps_pending_when_submit_fails() -> None:
     assert order == ["submit"]
     assert row.status == "pending"
     assert row.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_escalation_resolution_is_idempotent_for_same_terminal_decision() -> None:
+    row = _notification_row()
+    row.status = "resolved"
+    row.resolution = {"decision": "approve", "state": "resolved_remote"}
+    order: list[str] = []
+    event_bus = _FakeEventBus()
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=event_bus,
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(order=order)),
+    )
+
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "safe"},
+        user_email="user@example.com",
+    )
+
+    assert resolved is True
+    assert order == ["resolve"]
+    assert event_bus.events == []
+
+
+@pytest.mark.asyncio
+async def test_escalation_resolution_accepts_concurrent_remote_reconciliation() -> None:
+    row = _notification_row()
+    order: list[str] = []
+    event_bus = _FakeEventBus()
+
+    def _resolve_remotely(_: str, decision: str, __: str | None) -> None:
+        row.status = "resolved"
+        row.resolution = {"decision": decision, "state": "resolved_remote"}
+        row.resolved_at = datetime.now(UTC)
+
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(should_resolve=False, order=order),
+        event_bus=event_bus,
+        providers=SimpleNamespace(
+            guardrails=_FakeGuardrails(order=order, on_submit=_resolve_remotely)
+        ),
+    )
+
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "safe"},
+        user_email="user@example.com",
+    )
+
+    assert resolved is True
+    assert order == ["submit", "resolve"]
+    assert row.status == "resolved"
+    assert row.resolution["state"] == "resolved_remote"
+    assert event_bus.events == []
 
 
 @pytest.mark.asyncio
@@ -418,3 +482,393 @@ async def test_list_pending_keeps_remote_resolution_visible_when_waiter_is_missi
     assert row.status == "pending"
     assert row.resolution["state"] == "submitted_remote"
     assert event_bus.events == []
+
+
+# ---------------------------------------------------------------------------
+# Managed-conversation chain resolution
+# ---------------------------------------------------------------------------
+
+
+class _ManagedLinkSession:
+    """Fake DB session that resolves ManagedConversationLink lookups."""
+
+    def __init__(self, links: dict[str, Any]) -> None:
+        # links: {target_conversation_id: SimpleNamespace(controller_conversation_id=..., ...)}
+        self._links = links
+
+    async def __aenter__(self) -> _ManagedLinkSession:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+    async def execute(self, statement: Any) -> _FakeQueryResult:
+        # Extract the target_conversation_id from the WHERE clause
+        target_id: str | None = None
+        for criterion in getattr(statement, "_where_criteria", ()):
+            right = getattr(criterion, "right", None)
+            if hasattr(right, "value"):
+                target_id = right.value
+                break
+        if target_id is not None and target_id in self._links:
+            return _FakeQueryResult([self._links[target_id]])
+        return _FakeQueryResult([])
+
+    async def get(self, model: Any, key: str) -> Any:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+
+class _ManagedLinkSessionFactory:
+    def __init__(self, links: dict[str, Any]) -> None:
+        self._links = links
+
+    def __call__(self) -> _ManagedLinkSession:
+        return _ManagedLinkSession(self._links)
+
+
+def _managed_link(
+    target: str,
+    controller: str,
+    *,
+    title: str = "Sub-task",
+    target_agent_id: str = "agent-sub",
+) -> Any:
+    return SimpleNamespace(
+        target_conversation_id=target,
+        controller_conversation_id=controller,
+        title=title,
+        target_agent_id=target_agent_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_conversation_redirects_managed_child_to_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A notification on a managed child conversation is redirected to the parent."""
+    links = {"conv-child": _managed_link("conv-child", "conv-parent")}
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return links.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory(links),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    result = await service.resolve_target_conversation(None, "conv-child")
+
+    assert result == "conv-parent"
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_conversation_walks_multi_hop_managed_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three-level chain: delegate conv == managed conv → managed conv → parent conv."""
+    links = {
+        "conv-managed": _managed_link("conv-managed", "conv-parent"),
+    }
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return links.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory(links),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    # Delegate shares conversation_id with the managed conversation
+    result = await service.resolve_target_conversation(None, "conv-managed")
+
+    assert result == "conv-parent"
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_conversation_walks_nested_managed_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested managed conversations: child → mid → parent."""
+    links = {
+        "conv-child": _managed_link("conv-child", "conv-mid"),
+        "conv-mid": _managed_link("conv-mid", "conv-parent"),
+    }
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return links.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory(links),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    result = await service.resolve_target_conversation(None, "conv-child")
+
+    assert result == "conv-parent"
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_conversation_cycle_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cycle in managed links does not loop forever; returns last safe candidate."""
+    links = {
+        "conv-a": _managed_link("conv-a", "conv-b"),
+        "conv-b": _managed_link("conv-b", "conv-a"),
+    }
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return links.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory(links),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    # Should not raise; returns the last candidate before cycle was detected
+    result = await service.resolve_target_conversation(None, "conv-a")
+    assert result in {"conv-a", "conv-b"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_conversation_unchanged_for_direct_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct-chat conversation with no managed link is returned unchanged."""
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return None
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory({}),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    result = await service.resolve_target_conversation(None, "conv-direct")
+
+    assert result == "conv-direct"
+
+
+@pytest.mark.asyncio
+async def test_create_registers_pause_under_parent_conversation_for_managed_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Escalation created in a managed child registers PauseWaiter under the parent."""
+    links = {"conv-child": _managed_link("conv-child", "conv-parent")}
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return links.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    registered: list[Any] = []
+
+    class _CapturingPauseWaiter(_FakePauseWaiter):
+        def register(self, pending: Any) -> None:
+            registered.append(pending)
+
+    event_bus = _FakeEventBus()
+
+    class _AddSession:
+        def __init__(self) -> None:
+            self.added: list[Any] = []
+
+        async def __aenter__(self) -> _AddSession:
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        def add(self, row: Any) -> None:
+            self.added.append(row)
+
+        async def commit(self) -> None:
+            return None
+
+    add_session = _AddSession()
+
+    def _session_factory() -> _AddSession:
+        return add_session
+
+    service = NotificationService(
+        session_factory=_session_factory,
+        pause_waiter=_CapturingPauseWaiter(),
+        event_bus=event_bus,
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    await service.create(
+        notification_type="escalation",
+        user_email="user@example.com",
+        conversation_id="conv-child",
+        session_id="sess-child",
+        notification_id="call-esc-1",
+        payload={
+            "call_id": "call-esc-1",
+            "tool_name": "bash",
+            "risk": "medium",
+            "reasoning": "runs shell",
+            "timeout_seconds": 300,
+        },
+    )
+
+    assert len(registered) == 1
+    pause = registered[0]
+    # PauseWaiter must be registered under the parent conversation
+    assert pause.conversation_id == "conv-parent"
+    # Child session_id is preserved for resume
+    assert pause.session_id == "sess-child"
+
+    # DB row and event must also use the parent conversation
+    assert add_session.added[0].conversation_id == "conv-parent"
+    assert event_bus.events[0].data["conversation_id"] == "conv-parent"
+
+    # Managed-origin metadata must be in the enriched payload
+    assert add_session.added[0].payload.get("managed_conversation_title") == "Sub-task"
+    assert add_session.added[0].payload.get("managed_target_agent_id") == "agent-sub"
+
+
+@pytest.mark.asyncio
+async def test_resolve_target_conversation_hop_cap_stops_at_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An acyclic chain longer than the hop cap is truncated at the cap."""
+    # Build a chain of 15 hops (cap is 10)
+    chain: dict[str, Any] = {}
+    for i in range(15):
+        chain[f"conv-{i}"] = _managed_link(f"conv-{i}", f"conv-{i + 1}")
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return chain.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory(chain),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    result = await service.resolve_target_conversation(None, "conv-0")
+
+    # Must stop at hop 10 (conv-10), not reach conv-15
+    assert result == "conv-10"
+
+
+@pytest.mark.asyncio
+async def test_create_task_originated_notification_not_managed_enriched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task-originated notifications skip managed-link enrichment entirely."""
+    links = {"conv-child": _managed_link("conv-child", "conv-parent")}
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return links.get(target_id)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    async def _fake_get_task(session: Any, task_id: str) -> Any:
+        return SimpleNamespace(
+            task_id=task_id,
+            delivery_mode="same_conversation",
+            source_type="chat",
+            source_ref="conv-source",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            delivery_target=None,
+        )
+
+    monkeypatch.setattr("cognis.core.notifications.get_task", _fake_get_task)
+
+    registered: list[Any] = []
+
+    class _CapturingPauseWaiter(_FakePauseWaiter):
+        def register(self, pending: Any) -> None:
+            registered.append(pending)
+
+    event_bus = _FakeEventBus()
+
+    class _AddSession:
+        def __init__(self) -> None:
+            self.added: list[Any] = []
+
+        async def __aenter__(self) -> _AddSession:
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        def add(self, row: Any) -> None:
+            self.added.append(row)
+
+        async def commit(self) -> None:
+            return None
+
+    add_session = _AddSession()
+
+    def _session_factory() -> _AddSession:
+        return add_session
+
+    service = NotificationService(
+        session_factory=_session_factory,
+        pause_waiter=_CapturingPauseWaiter(),
+        event_bus=event_bus,
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    await service.create(
+        notification_type="gate",
+        user_email="user@example.com",
+        conversation_id="conv-child",
+        task_id="task-1",
+        notification_id="gate-1",
+        payload={"message": "approve step?"},
+    )
+
+    assert len(registered) == 1
+    pause = registered[0]
+    # Task delivery redirects to source conversation, not managed parent
+    assert pause.conversation_id == "conv-source"
+    # No managed-origin metadata injected for task-originated notifications
+    assert "managed_conversation_title" not in add_session.added[0].payload
+    assert "managed_target_agent_id" not in add_session.added[0].payload

@@ -13,6 +13,9 @@ _RESPONSES_PROMPT_SERIALIZATION_MARGIN_RATIO = 0.08
 _PROMPT_SERIALIZATION_MARGIN_FLOOR_TOKENS = 1_024
 _PROMPT_SERIALIZATION_MARGIN_CEILING_TOKENS = 32_768
 
+# Shared hard-pressure threshold for in-turn projection/compaction checks.
+LOOP_PRESSURE_THRESHOLD_RATIO = 0.95
+
 
 @dataclass(frozen=True, slots=True)
 class ContextBudget:

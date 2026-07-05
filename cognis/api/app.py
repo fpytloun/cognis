@@ -10,6 +10,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from cognis.api.chat_v2.routes import router as chat_v2_router
 from cognis.api.common import error_response
 from cognis.api.middleware import AuthenticationMiddleware
 from cognis.api.routes.agents import router as agents_router
@@ -61,7 +63,7 @@ from cognis.core.compaction import CompactionStrategy
 from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
 from cognis.core.events import EventBus
-from cognis.core.mcp_oauth import MCPOAuthService
+from cognis.core.mcp_oauth import MCPOAuthError, MCPOAuthService
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
 from cognis.core.session import SessionManager
@@ -345,6 +347,10 @@ def create_app() -> FastAPI:
         # Artifact store for images and other binary content
         from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 
+        artifact_signing_secret = (
+            config_runtime.artifact_signing_secret
+            or _ensure_artifact_signing_secret(config_runtime)
+        )
         artifact_store = ArtifactStore(
             ArtifactStoreConfig(
                 backend=config_runtime.artifact_backend,
@@ -356,10 +362,7 @@ def create_app() -> FastAPI:
                 s3_region=config_runtime.artifact_s3_region,
                 max_size_bytes=config_runtime.artifact_max_size_bytes,
                 base_url=_build_user_facing_url(config_runtime),
-                signing_secret=(
-                    config_runtime.artifact_signing_secret
-                    or _ensure_artifact_signing_secret(config_runtime)
-                ),
+                signing_secret=artifact_signing_secret,
                 signed_url_ttl_seconds=config_runtime.artifact_signed_url_ttl_seconds,
             )
         )
@@ -476,6 +479,11 @@ def create_app() -> FastAPI:
                 "session.llm_stream_max_retries",
                 3,
             )
+            anthropic_cache_ttl = await get_setting_value(
+                session,
+                "session.anthropic_cache_ttl",
+                "5m",
+            )
         agent_loop = AgentLoop(
             providers=providers,
             session_manager=session_manager,
@@ -500,6 +508,9 @@ def create_app() -> FastAPI:
             ),
             default_llm_stream_max_retries=(
                 int(llm_stream_max_retries) if isinstance(llm_stream_max_retries, int) else 3
+            ),
+            default_anthropic_cache_ttl=(
+                str(anthropic_cache_ttl) if anthropic_cache_ttl is not None else "5m"
             ),
             tool_output_store=tool_output_store,
             step_runtime_factory=step_runtime_factory,
@@ -549,9 +560,43 @@ def create_app() -> FastAPI:
             public_base_url=config_runtime.public_base_url,
             notification_service=notification_service,
             on_authorization_completed=_on_mcp_oauth_completed,
+            executor_provider=providers.executor.websocket
+            if hasattr(providers.executor, "websocket")
+            else None,
         )
         providers.mcp_oauth_service = mcp_oauth_service  # type: ignore[attr-defined]
         tool_router._mcp_oauth_service = mcp_oauth_service  # noqa: SLF001
+        if hasattr(providers.executor, "websocket"):
+
+            async def _on_mcp_oauth_loopback_callback(
+                executor_id: str,
+                payload: dict[str, Any],
+            ) -> None:
+                try:
+                    await mcp_oauth_service.complete_loopback_callback(
+                        executor_id=executor_id,
+                        listener_id=str(payload.get("listener_id") or ""),
+                        redirect_uri=str(payload.get("redirect_uri") or ""),
+                        state=str(payload.get("state") or ""),
+                        code=str(payload.get("code") or "") or None,
+                        error=str(payload.get("error") or "") or None,
+                        error_description=str(payload.get("error_description") or "") or None,
+                    )
+                except MCPOAuthError:
+                    logger.warning(
+                        "mcp oauth: executor loopback callback failed",
+                        extra={"extra_data": {"executor_id": executor_id}},
+                        exc_info=True,
+                    )
+                except Exception:
+                    logger.exception(
+                        "mcp oauth: unexpected executor loopback callback failure",
+                        extra={"extra_data": {"executor_id": executor_id}},
+                    )
+
+            providers.executor.websocket.register_oauth_loopback_callback(
+                _on_mcp_oauth_loopback_callback
+            )
         tool_router.notification_service = notification_service
         tool_router.pause_waiter = pause_waiter
         agent_loop.notification_service = notification_service
@@ -616,7 +661,17 @@ def create_app() -> FastAPI:
             turn_scheduler=turn_scheduler,
         )
 
-        recovered_sessions = await session_manager.recover_stale_sessions()
+        from cognis.store.queries import get_setting_value
+
+        async with session_factory() as session:
+            session_stale_after_seconds = _as_int(
+                await get_setting_value(session, "session.stale_after_seconds", 300),
+                300,
+            )
+
+        recovered_sessions = await session_manager.recover_stale_sessions(
+            stale_after_seconds=session_stale_after_seconds
+        )
         recovered_tasks = await task_queue.recover_stale_tasks()
         recovered_paused_tasks = await task_queue.recover_paused_tasks()
         recovered_orphaned_step_runs = await task_queue.recover_orphaned_running_step_runs()
@@ -684,6 +739,7 @@ def create_app() -> FastAPI:
         app.state.remember_queue = remember_queue
         app.state.tool_classification_queue = tool_classification_queue
         app.state.artifact_store = artifact_store
+        app.state.chat_v2_cursor_secret = f"chat-v2:{artifact_signing_secret}"
         app.state.artifact_maintenance = artifact_maintenance
         app.state.managed_conversation_maintenance = managed_conversation_maintenance
         app.state.knowledgebase_enabled = knowledgebase_backend_enabled
@@ -829,7 +885,7 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.10.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.11.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -849,6 +905,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(artifacts_router)
     app.include_router(channels_router)
+    app.include_router(chat_v2_router)
     app.include_router(conversations_router)
     app.include_router(credentials_router)
     app.include_router(agents_router)

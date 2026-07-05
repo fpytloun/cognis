@@ -27,7 +27,10 @@ PUBLIC_ROUTES = {
     ("GET", "/.well-known/jwks.json"),
     ("GET", "/api/health"),
     ("GET", "/api/health/providers"),
+    ("GET", "/api/livez"),
+    ("GET", "/api/readyz"),
     ("GET", "/api/metrics"),
+    ("GET", "/api/v1/pwa-reset"),
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/refresh"),
     ("GET", "/api/v1/mcp/oauth/callback"),
@@ -57,6 +60,10 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.method.upper() == "GET" and request.url.path.startswith(
             "/api/v1/artifacts/content/"
+        ):
+            return await call_next(request)
+        if request.method.upper() == "GET" and request.url.path.startswith(
+            "/api/v1/artifacts/view/"
         ):
             return await call_next(request)
         if request.method.upper() == "GET" and request.url.path.startswith(

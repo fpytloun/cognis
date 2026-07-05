@@ -295,7 +295,8 @@ STEP_TODO_WRITE_TOOL = ToolDefinition(
         "break complex tasks into concrete actionable items, keep only one "
         "item in progress at a time, and mark items completed or cancelled "
         "as soon as their status changes. Todos survive compaction and help "
-        "maintain context across long conversations."
+        "maintain context across long conversations. The todos array replaces "
+        "the entire current list."
     ),
     parameters={
         "type": "object",

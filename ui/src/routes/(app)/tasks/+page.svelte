@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
 
   import { api, asApiError } from '$lib/api/client';
@@ -18,8 +18,8 @@
   import { addToast } from '$lib/stores/toasts';
   import { workspaceHealth } from '$lib/system';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
-  import { TASK_BOARD_COLUMNS, boardColumnForStatus, matchesTaskFilters, sortTasks, taskFiltersFromSearchParams, taskFiltersToSearchParams, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
-  import type { Agent, Conversation, Project, Skill, Task, Workflow } from '$lib/types/api';
+  import { TASK_BOARD_COLUMNS, boardColumnForStatus, taskBoardColumnFromSearchParams, taskBoardUrlForState, taskFiltersFromSearchParams, type TaskFilterState, type TaskBoardColumnId } from '$lib/tasks';
+  import type { Agent, Conversation, Project, Skill, TaskBoardDoneGroup, TaskBoardItem, Workflow } from '$lib/types/api';
 
   // ---------------------------------------------------------------------------
   // Reactive state
@@ -29,7 +29,6 @@
   let loadingTimedOut = $state(false);
   let creating = $state(false);
   let error = $state('');
-  let tasks = $state<Task[]>([]);
   let agents = $state<Agent[]>([]);
   let workflows = $state<Workflow[]>([]);
   let filterWorkflows = $state<Workflow[]>([]);
@@ -37,7 +36,6 @@
   let skills = $state<Skill[]>([]);
   let conversations = $state<Conversation[]>([]);
   let showCreateModal = $state(false);
-  let expandedDoneGroups = $state<Set<string>>(new Set());
   let showEmptyDesktopColumns = $state(false);
   let expandedDesktopColumns = $state<Set<TaskBoardColumnId>>(new Set());
   let collapsedDesktopColumns = $state<Set<TaskBoardColumnId>>(new Set());
@@ -57,10 +55,50 @@
   let pollTimer: number | null = null;
   let visibilityHandler: (() => void) | null = null;
   let loadTimeoutTimer: number | null = null;
-  let boardLoadRequestId = 0;
+  let boardReplaceRequestId = 0;
+  let boardStateVersion = 0;
   let workflowFilterLoadKey = 0;
+  let filterReloadTimer: number | null = null;
 
   const TASK_BOARD_LOAD_TIMEOUT_MS = 10000;
+  const TASK_BOARD_PAGE_SIZE = 20;
+
+  type BoardColumnState = {
+    items: TaskBoardItem[];
+    groups: TaskBoardDoneGroup[];
+    cursor: string | null;
+    hasMore: boolean;
+    totalCount: number;
+    loading: boolean;
+  };
+
+  type DoneGroupHistoryState = {
+    items: TaskBoardItem[];
+    cursor: string | null;
+    hasMore: boolean;
+    totalCount: number;
+    loading: boolean;
+    loaded: boolean;
+    filterKey: string;
+  };
+
+  function emptyBoardColumnState(): BoardColumnState {
+    return { items: [], groups: [], cursor: null, hasMore: false, totalCount: 0, loading: false };
+  }
+
+  function emptyDoneGroupHistoryState(): DoneGroupHistoryState {
+    return { items: [], cursor: null, hasMore: false, totalCount: 0, loading: false, loaded: false, filterKey: '' };
+  }
+
+  function initialBoardColumns(): Record<TaskBoardColumnId, BoardColumnState> {
+    return Object.fromEntries(
+      TASK_BOARD_COLUMNS.map((column) => [column.id, emptyBoardColumnState()])
+    ) as Record<TaskBoardColumnId, BoardColumnState>;
+  }
+
+  let boardColumns = $state<Record<TaskBoardColumnId, BoardColumnState>>(initialBoardColumns());
+  let expandedDoneGroups = $state<Set<string>>(new Set());
+  let doneGroupHistories = $state<Record<string, DoneGroupHistoryState>>({});
 
   let filters = $state<TaskFilterState>({
     search: '',
@@ -82,9 +120,8 @@
   let urlHydrated = false;
   let urlSyncTimer: number | null = null;
 
-  function hydrateFiltersFromUrl(): void {
-    const sp = $page.url.searchParams;
-    const next = taskFiltersFromSearchParams(sp);
+  function hydrateFiltersFromUrl(searchParams: URLSearchParams): void {
+    const next = taskFiltersFromSearchParams(searchParams);
     if (
       next.search !== filters.search ||
       next.agentId !== filters.agentId ||
@@ -94,17 +131,14 @@
     ) {
       filters = next;
     }
-    const col = sp.get('col') as TaskBoardColumnId | null;
-    if (col && col !== mobileActiveColumn && TASK_BOARD_COLUMNS.some((c) => c.id === col)) {
-      mobileActiveColumn = col;
+    const column = taskBoardColumnFromSearchParams(searchParams);
+    if (column !== mobileActiveColumn) {
+      mobileActiveColumn = column;
     }
   }
 
   function buildFiltersUrl(): string {
-    const sp = taskFiltersToSearchParams(filters);
-    if (mobileActiveColumn !== 'running') sp.set('col', mobileActiveColumn);
-    const query = sp.toString();
-    return query ? `/tasks?${query}` : '/tasks';
+    return taskBoardUrlForState(filters, mobileActiveColumn);
   }
 
   function scheduleFiltersUrlSync(): void {
@@ -114,7 +148,7 @@
     urlSyncTimer = window.setTimeout(() => {
       urlSyncTimer = null;
       const next = buildFiltersUrl();
-      const current = $page.url.pathname + $page.url.search;
+      const current = untrack(() => $page.url.pathname + $page.url.search);
       if (next !== current) {
         void goto(next, { replaceState: true, noScroll: true, keepFocus: true });
       }
@@ -126,9 +160,11 @@
   // when the URL already matches local state, so this does not loop with
   // `scheduleFiltersUrlSync`.
   $effect(() => {
-    void $page.url.search;
-    hydrateFiltersFromUrl();
-    urlHydrated = true;
+    const search = $page.url.search;
+    untrack(() => {
+      hydrateFiltersFromUrl(new URLSearchParams(search));
+      urlHydrated = true;
+    });
   });
 
   // Sync: local state → URL (debounced). Reads all filter fields so
@@ -148,16 +184,10 @@
   // ---------------------------------------------------------------------------
 
   let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.projectId || filters.status));
-  let filteredTasks = $derived.by(() => {
-    const activeFilters = {
-      search: filters.search,
-      agentId: filters.agentId,
-      workflowId: filters.workflowId,
-      projectId: filters.projectId,
-      status: filters.status
-    };
-    return sortTasks(tasks.filter((task) => matchesTaskFilters(task, activeFilters)));
-  });
+  let tasks = $derived([
+    ...TASK_BOARD_COLUMNS.flatMap((column) => boardColumns[column.id].items),
+    ...Object.values(doneGroupHistories).flatMap((history) => history.items)
+  ]);
   let selectedCount = $derived(selectedIds.size);
 
   // Bulk action counts
@@ -201,67 +231,22 @@
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
 
-  interface TaskDoneGroup {
-    key: string;
-    title: string;
-    latest: Task;
-    tasks: Task[];
-  }
-
-  function taskGroupKey(task: Task): string {
-    const normalizedTitle = task.title.trim().toLowerCase();
-    return [
-      normalizedTitle || task.task_id,
-      task.workflow_id ?? 'auto',
-      task.agent_id,
-      task.source_type,
-      task.source_ref ?? 'none',
-    ].join('::');
-  }
-
-  function taskActivityLabel(task: Task): string | null {
+  function taskActivityLabel(task: TaskBoardItem): string | null {
     return task.updated_at ?? task.completed_at ?? task.started_at ?? task.created_at;
   }
 
-  function taskGroupTitle(task: Task): string {
-    return task.title.trim() || task.task_id;
-  }
+  let doneTaskGroups = $derived(boardColumns.done.groups);
 
-  let doneTaskGroups = $derived.by(() => {
-    const groups = new Map<string, TaskDoneGroup>();
-    for (const task of tasksForColumn('done')) {
-      const key = taskGroupKey(task);
-      const existing = groups.get(key);
-      if (existing) {
-        existing.tasks.push(task);
-        continue;
-      }
-      groups.set(key, {
-        key,
-        title: taskGroupTitle(task),
-        latest: task,
-        tasks: [task],
-      });
-    }
-    return [...groups.values()];
-  });
-
-  function toggleDoneGroup(groupKey: string): void {
-    const next = new Set(expandedDoneGroups);
-    if (next.has(groupKey)) {
-      next.delete(groupKey);
-    } else {
-      next.add(groupKey);
-    }
-    expandedDoneGroups = next;
-  }
-
-  function tasksForColumn(columnId: TaskBoardColumnId): Task[] {
-    return filteredTasks.filter((task) => boardColumnForStatus(task.status) === columnId);
+  function tasksForColumn(columnId: TaskBoardColumnId): TaskBoardItem[] {
+    return boardColumns[columnId].items;
   }
 
   function taskCountForColumn(columnId: TaskBoardColumnId): number {
-    return tasksForColumn(columnId).length;
+    return boardColumns[columnId].totalCount;
+  }
+
+  function loadedCountForColumn(columnId: TaskBoardColumnId): number {
+    return columnId === 'done' ? doneTaskGroups.length : tasksForColumn(columnId).length;
   }
 
   function isDesktopColumnCollapsed(columnId: TaskBoardColumnId): boolean {
@@ -300,8 +285,67 @@
   // Data loading
   // ---------------------------------------------------------------------------
 
+  function boardQueryParams(extra: Record<string, string | number | null | undefined> = {}): Record<string, string | number | null | undefined> {
+    return {
+      limit: TASK_BOARD_PAGE_SIZE,
+      q: filters.search || null,
+      agent_id: filters.agentId || null,
+      workflow_id: filters.workflowId || null,
+      project_id: filters.projectId || null,
+      status: filters.status || null,
+      ...extra
+    };
+  }
+
+  function boardFilterKey(): string {
+    return JSON.stringify({
+      search: filters.search,
+      agentId: filters.agentId,
+      workflowId: filters.workflowId,
+      projectId: filters.projectId,
+      status: filters.status
+    });
+  }
+
+  function applyBoardResponse(columns: Record<string, {
+    items: TaskBoardItem[];
+    groups?: TaskBoardDoneGroup[];
+    cursor: string | null;
+    has_more: boolean;
+    total_count: number;
+  }>): void {
+    const next = initialBoardColumns();
+    for (const column of TASK_BOARD_COLUMNS) {
+      const payload = columns[column.id];
+      next[column.id] = payload
+        ? {
+            items: payload.items,
+            groups: payload.groups ?? [],
+            cursor: payload.cursor,
+            hasMore: payload.has_more,
+            totalCount: payload.total_count,
+            loading: false
+          }
+        : emptyBoardColumnState();
+    }
+    boardColumns = next;
+    const visibleDoneGroups = new Set(next.done.groups.map((group) => group.key));
+    const currentFilterKey = boardFilterKey();
+    const nextDoneGroupHistories = Object.fromEntries(
+      Object.entries(doneGroupHistories).filter(
+        ([key, history]) => visibleDoneGroups.has(key) && history.filterKey === currentFilterKey
+      )
+    );
+    doneGroupHistories = nextDoneGroupHistories;
+    expandedDoneGroups = new Set(
+      [...expandedDoneGroups].filter((key) => visibleDoneGroups.has(key) && key in nextDoneGroupHistories)
+    );
+    boardStateVersion += 1;
+  }
+
   async function loadBoardData(): Promise<void> {
-    const requestId = ++boardLoadRequestId;
+    const requestId = ++boardReplaceRequestId;
+    const requestFilterKey = boardFilterKey();
     loading = true;
     loadingTimedOut = false;
     error = '';
@@ -309,32 +353,30 @@
       window.clearTimeout(loadTimeoutTimer);
     }
     loadTimeoutTimer = window.setTimeout(() => {
-      if (requestId === boardLoadRequestId && loading) {
+      if (requestId === boardReplaceRequestId && loading) {
         loadingTimedOut = true;
       }
     }, TASK_BOARD_LOAD_TIMEOUT_MS);
     try {
-      const [nextTasks, nextAgents, nextWorkflows, nextProjects, nextSkills, nextConversations] = await Promise.all([
-        api.tasks.listAll(),
+      const [nextBoard, nextAgents, nextWorkflows, nextProjects, nextSkills] = await Promise.all([
+        api.tasks.board(boardQueryParams()),
         api.agents.listAll(),
         api.workflows.listAll(),
         api.projects.list(),
-        api.skills.list(),
-        api.conversations.listAll()
+        api.skills.list()
       ]);
-      if (requestId !== boardLoadRequestId) return;
-      tasks = nextTasks;
+      if (requestId !== boardReplaceRequestId || requestFilterKey !== boardFilterKey()) return;
+      applyBoardResponse(nextBoard.columns);
       agents = nextAgents;
       workflows = nextWorkflows;
       filterWorkflows = nextWorkflows;
       projects = nextProjects;
       skills = nextSkills;
-      conversations = nextConversations;
     } catch (caughtError) {
-      if (requestId !== boardLoadRequestId) return;
+      if (requestId !== boardReplaceRequestId) return;
       error = asApiError(caughtError).message;
     } finally {
-      if (requestId === boardLoadRequestId) {
+      if (requestId === boardReplaceRequestId) {
         if (loadTimeoutTimer !== null) {
           window.clearTimeout(loadTimeoutTimer);
           loadTimeoutTimer = null;
@@ -362,12 +404,159 @@
     void loadWorkflowFilterOptions(filters.projectId);
   });
 
+  $effect(() => {
+    void filters.search;
+    void filters.agentId;
+    void filters.workflowId;
+    void filters.projectId;
+    void filters.status;
+    if (!urlHydrated || typeof window === 'undefined') return;
+    if (filterReloadTimer !== null) window.clearTimeout(filterReloadTimer);
+    filterReloadTimer = window.setTimeout(() => {
+      filterReloadTimer = null;
+      void loadBoardData();
+    }, 250);
+  });
+
   async function refreshTasksOnly(): Promise<void> {
     if (document.hidden) return;
+    const requestFilterKey = boardFilterKey();
+    const requestId = ++boardReplaceRequestId;
     try {
-      tasks = await api.tasks.listAll();
+      const nextBoard = await api.tasks.board(boardQueryParams());
+      if (requestId !== boardReplaceRequestId || requestFilterKey !== boardFilterKey()) return;
+      applyBoardResponse(nextBoard.columns);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+    }
+  }
+
+  async function loadMoreColumn(columnId: TaskBoardColumnId): Promise<void> {
+    const current = boardColumns[columnId];
+    if (current.loading || !current.hasMore || !current.cursor) return;
+    const requestFilterKey = boardFilterKey();
+    const requestCursor = current.cursor;
+    const requestStateVersion = boardStateVersion;
+    boardColumns = {
+      ...boardColumns,
+      [columnId]: { ...current, loading: true }
+    };
+    try {
+      const nextPage = await api.tasks.boardColumn(columnId, boardQueryParams({ cursor: current.cursor }));
+      if (
+        requestFilterKey !== boardFilterKey() ||
+        boardStateVersion !== requestStateVersion ||
+        boardColumns[columnId].cursor !== requestCursor
+      ) {
+        return;
+      }
+      const seenTasks = new Set(current.items.map((task) => task.task_id));
+      const appendedItems = nextPage.items.filter((task) => !seenTasks.has(task.task_id));
+      const seenGroups = new Set(current.groups.map((group) => group.key));
+      const appendedGroups = (nextPage.groups ?? []).filter((group) => !seenGroups.has(group.key));
+      boardColumns = {
+        ...boardColumns,
+        [columnId]: {
+          items: [...current.items, ...appendedItems],
+          groups: [...current.groups, ...appendedGroups],
+          cursor: nextPage.cursor,
+          hasMore: nextPage.has_more,
+          totalCount: nextPage.total_count,
+          loading: false
+        }
+      };
+      boardStateVersion += 1;
+    } catch (caughtError) {
+      boardColumns = {
+        ...boardColumns,
+        [columnId]: { ...boardColumns[columnId], loading: false }
+      };
+      error = asApiError(caughtError).message;
+    }
+  }
+
+  async function loadDoneGroupHistory(group: TaskBoardDoneGroup, append = false): Promise<void> {
+    const current = doneGroupHistories[group.key] ?? emptyDoneGroupHistoryState();
+    if (current.loading) return;
+    if (append && (!current.hasMore || !current.cursor)) return;
+    const requestFilterKey = boardFilterKey();
+    const requestCursor = append ? current.cursor : null;
+    doneGroupHistories = {
+      ...doneGroupHistories,
+      [group.key]: { ...current, filterKey: requestFilterKey, loading: true }
+    };
+    try {
+      const page = await api.tasks.doneGroupTasks(
+        group.key,
+        boardQueryParams({ cursor: requestCursor })
+      );
+      if (requestFilterKey !== boardFilterKey() || !boardColumns.done.groups.some((item) => item.key === group.key)) {
+        return;
+      }
+      const existingItems = append ? current.items : [];
+      const seen = new Set(existingItems.map((task) => task.task_id));
+      const newItems = page.items.filter((task) => !seen.has(task.task_id));
+      doneGroupHistories = {
+        ...doneGroupHistories,
+        [group.key]: {
+          items: [...existingItems, ...newItems],
+          cursor: page.cursor,
+          hasMore: page.has_more,
+          totalCount: group.task_count,
+          loading: false,
+          loaded: true,
+          filterKey: requestFilterKey
+        }
+      };
+    } catch (caughtError) {
+      doneGroupHistories = {
+        ...doneGroupHistories,
+        [group.key]: { ...(doneGroupHistories[group.key] ?? current), loading: false }
+      };
+      error = asApiError(caughtError).message;
+    }
+  }
+
+  function toggleDoneGroup(group: TaskBoardDoneGroup): void {
+    const next = new Set(expandedDoneGroups);
+    if (next.has(group.key)) {
+      next.delete(group.key);
+      expandedDoneGroups = next;
+      return;
+    }
+    next.add(group.key);
+    expandedDoneGroups = next;
+    const history = doneGroupHistories[group.key];
+    if (!history?.loaded || history.filterKey !== boardFilterKey()) {
+      void loadDoneGroupHistory(group);
+    }
+  }
+
+  function columnInfiniteScroll(node: HTMLElement, columnId: TaskBoardColumnId) {
+    if (typeof IntersectionObserver === 'undefined') {
+      return {};
+    }
+    const root = node.closest<HTMLElement>('[data-task-column-scroll]');
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        void loadMoreColumn(columnId);
+      }
+    }, { root, rootMargin: '200px 0px' });
+    observer.observe(node);
+    return {
+      destroy() {
+        observer.disconnect();
+      }
+    };
+  }
+
+  async function openCreateTaskModal(): Promise<void> {
+    showCreateModal = true;
+    if (conversations.length > 0) return;
+    try {
+      conversations = (await api.conversations.list(null, { status: 'active' })).items;
+    } catch {
+      conversations = [];
     }
   }
 
@@ -552,7 +741,7 @@
 
   async function reorderWithinColumn(targetTaskId: string, columnId: TaskBoardColumnId, sourceTaskId: string): Promise<void> {
     if (filtersActive || !sourceTaskId || sourceTaskId === targetTaskId) return;
-    const previousTasks = [...tasks];
+    const previousColumns = boardColumns;
     const columnTasks = tasksForColumn(columnId);
     const sourceIndex = columnTasks.findIndex((t) => t.task_id === sourceTaskId);
     const targetIndex = columnTasks.findIndex((t) => t.task_id === targetTaskId);
@@ -562,13 +751,19 @@
     const [moved] = reordered.splice(sourceIndex, 1);
     reordered.splice(targetIndex, 0, moved);
     const updated = reordered.map((task, i) => ({ ...task, priority: reordered.length - i }));
-    tasks = tasks.map((task) => updated.find((c) => c.task_id === task.task_id) ?? task);
+    boardColumns = {
+      ...boardColumns,
+      [columnId]: {
+        ...boardColumns[columnId],
+        items: updated
+      }
+    };
 
     try {
       await Promise.all(updated.map((t) => api.tasks.update(t.task_id, { priority: t.priority })));
       await refreshTasksOnly();
     } catch (caughtError) {
-      tasks = previousTasks;
+      boardColumns = previousColumns;
       error = asApiError(caughtError).message;
     }
   }
@@ -591,7 +786,6 @@
     // the URL-hydrate effect will clear the `filters` object reactively;
     // we only need to reset ephemeral state and the scroll container.
     const unsubTabReset = onTabReset('/tasks', () => {
-      expandedDoneGroups = new Set();
       selectedIds = new Set();
       mobileActiveColumn = 'running';
       clearPersistedScroll('/tasks');
@@ -607,6 +801,10 @@
       if (urlSyncTimer !== null) {
         window.clearTimeout(urlSyncTimer);
         urlSyncTimer = null;
+      }
+      if (filterReloadTimer !== null) {
+        window.clearTimeout(filterReloadTimer);
+        filterReloadTimer = null;
       }
       if (visibilityHandler) document.removeEventListener('visibilitychange', visibilityHandler);
       unsubTabReset();
@@ -661,7 +859,7 @@
         <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Workflow queue</p>
         <h1 class="mt-1 text-2xl font-semibold text-white">Task board</h1>
       </div>
-      <Button onclick={() => (showCreateModal = true)}>Create task</Button>
+      <Button onclick={() => void openCreateTaskModal()}>Create task</Button>
     </div>
 
     {#if error}
@@ -727,7 +925,7 @@
     <div class="lg:hidden">
       <div class="flex gap-2 overflow-x-auto pb-2" role="tablist" aria-label="Task columns">
         {#each TASK_BOARD_COLUMNS as column}
-          {@const count = tasksForColumn(column.id).length}
+          {@const count = taskCountForColumn(column.id)}
           <button
             type="button"
             role="tab"
@@ -747,25 +945,29 @@
             <div class="space-y-2">
               {#if column.id === 'done'}
                 {#each doneTaskGroups as group (group.key)}
+                  {@const history = doneGroupHistories[group.key] ?? emptyDoneGroupHistoryState()}
+                  {@const expanded = expandedDoneGroups.has(group.key)}
+                  {@const olderExecutions = history.items.filter((task) => task.task_id !== group.latest.task_id)}
                   <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
                     <div class="flex items-start gap-3">
-                      {#if group.tasks.length > 1}
-                        <button
-                          type="button"
-                          class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
-                          onclick={() => toggleDoneGroup(group.key)}
-                          aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
-                        >
-                          <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
-                        </button>
-                      {:else}
-                        <div class="h-8 w-8 shrink-0"></div>
-                      {/if}
+                      <div class="flex h-8 w-8 shrink-0 items-start justify-center">
+                        {#if group.task_count > 1}
+                          <button
+                            type="button"
+                            class="mt-1 rounded-full border border-slate-700 bg-slate-900 p-1 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-300"
+                            aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.title} executions`}
+                            aria-expanded={expanded}
+                            onclick={() => toggleDoneGroup(group)}
+                          >
+                            <ChevronDown class="h-3.5 w-3.5 transition {expanded ? 'rotate-180' : ''}" />
+                          </button>
+                        {/if}
+                      </div>
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
                           <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
-                          {#if group.tasks.length > 1}
-                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.tasks.length}</span>
+                          {#if group.task_count > 1}
+                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.task_count}</span>
                           {/if}
                         </div>
                         <TaskCard
@@ -779,20 +981,38 @@
                             Last activity {formatRelativeTime(taskActivityLabel(group.latest)!)}
                           </p>
                         {/if}
+                        {#if expanded}
+                          <div class="space-y-2 border-l border-slate-800 pl-3">
+                            {#if history.loading && !history.loaded}
+                              <p class="px-1 text-xs text-slate-500">Loading executions…</p>
+                            {:else if olderExecutions.length === 0}
+                              <p class="px-1 text-xs text-slate-500">No earlier executions loaded.</p>
+                            {:else}
+                              {#each olderExecutions as task (task.task_id)}
+                                <TaskCard
+                                  {task}
+                                  workflowName={workflowName(task.workflow_id)}
+                                  selected={selectedIds.has(task.task_id)}
+                                  onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                                />
+                              {/each}
+                            {/if}
+                            {#if history.hasMore}
+                              <div class="py-1 text-center">
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={history.loading}
+                                  onclick={() => void loadDoneGroupHistory(group, true)}
+                                >
+                                  {history.loading ? 'Loading…' : `Load more executions (${history.items.length}/${history.totalCount || group.task_count})`}
+                                </Button>
+                              </div>
+                            {/if}
+                          </div>
+                        {/if}
                       </div>
                     </div>
-                    {#if expandedDoneGroups.has(group.key) && group.tasks.length > 1}
-                      <div class="mt-3 space-y-2 border-t border-slate-800 pt-3">
-                        {#each group.tasks.slice(1) as task (task.task_id)}
-                          <TaskCard
-                            {task}
-                            workflowName={workflowName(task.workflow_id)}
-                            selected={selectedIds.has(task.task_id)}
-                            onclick={(event) => handleCardClick(event, task.task_id, column.id)}
-                          />
-                        {/each}
-                      </div>
-                    {/if}
                   </article>
                 {/each}
               {:else}
@@ -807,6 +1027,13 @@
               {/if}
               {#if (column.id === 'done' ? doneTaskGroups.length : tasksForColumn(column.id).length) === 0}
                 <p class="py-6 text-center text-sm text-slate-500">No tasks.</p>
+              {/if}
+              {#if boardColumns[column.id].hasMore}
+                <div use:columnInfiniteScroll={column.id} class="py-2 text-center">
+                  <Button size="sm" variant="secondary" disabled={boardColumns[column.id].loading} onclick={() => void loadMoreColumn(column.id)}>
+                    {boardColumns[column.id].loading ? 'Loading…' : `Load more (${loadedCountForColumn(column.id)}/${boardColumns[column.id].totalCount})`}
+                  </Button>
+                </div>
               {/if}
             </div>
           </section>
@@ -859,7 +1086,7 @@
             </section>
           {:else}
           <section
-            class="flex min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
+            class="flex h-[min(72vh,900px)] min-h-[600px] flex-col rounded-3xl border p-4 shadow-card transition-colors {dropTargetColumn === column.id && dragState && dragState.column !== column.id ? 'border-sky-500/50 bg-sky-950/20' : 'border-slate-800/80 bg-slate-900/70'}"
             ondragover={(event: DragEvent) => {
               if (dragState && isDragTransitionValid(dragState.column, column.id)) {
                 event.preventDefault();
@@ -893,28 +1120,32 @@
               </div>
             </div>
 
-            <div class="flex-1 space-y-2 overflow-y-auto">
+            <div class="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1" data-task-column-scroll>
               {#if column.id === 'done'}
                 {#each doneTaskGroups as group (group.key)}
+                  {@const history = doneGroupHistories[group.key] ?? emptyDoneGroupHistoryState()}
+                  {@const expanded = expandedDoneGroups.has(group.key)}
+                  {@const olderExecutions = history.items.filter((task) => task.task_id !== group.latest.task_id)}
                   <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-3">
                     <div class="flex items-start gap-3">
-                      {#if group.tasks.length > 1}
-                        <button
-                          type="button"
-                          class="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900/70 text-slate-400 transition hover:border-slate-600 hover:text-white"
-                          onclick={() => toggleDoneGroup(group.key)}
-                          aria-label={expandedDoneGroups.has(group.key) ? 'Collapse task group' : 'Expand task group'}
-                        >
-                          <ChevronDown class={`h-4 w-4 transition ${expandedDoneGroups.has(group.key) ? 'rotate-180' : ''}`} />
-                        </button>
-                      {:else}
-                        <div class="h-8 w-8 shrink-0"></div>
-                      {/if}
+                      <div class="flex h-8 w-8 shrink-0 items-start justify-center">
+                        {#if group.task_count > 1}
+                          <button
+                            type="button"
+                            class="mt-1 rounded-full border border-slate-700 bg-slate-900 p-1 text-slate-400 transition hover:border-sky-500/60 hover:text-sky-300"
+                            aria-label={`${expanded ? 'Collapse' : 'Expand'} ${group.title} executions`}
+                            aria-expanded={expanded}
+                            onclick={() => toggleDoneGroup(group)}
+                          >
+                            <ChevronDown class="h-3.5 w-3.5 transition {expanded ? 'rotate-180' : ''}" />
+                          </button>
+                        {/if}
+                      </div>
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
                           <span class="text-xs uppercase tracking-[0.2em] text-slate-500">{group.title}</span>
-                          {#if group.tasks.length > 1}
-                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.tasks.length}</span>
+                          {#if group.task_count > 1}
+                            <span class="rounded-full border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-slate-300">{group.task_count}</span>
                           {/if}
                         </div>
                         <TaskCard
@@ -928,20 +1159,38 @@
                             Last activity {formatRelativeTime(taskActivityLabel(group.latest)!)}
                           </p>
                         {/if}
+                        {#if expanded}
+                          <div class="space-y-2 border-l border-slate-800 pl-3">
+                            {#if history.loading && !history.loaded}
+                              <p class="px-1 text-xs text-slate-500">Loading executions…</p>
+                            {:else if olderExecutions.length === 0}
+                              <p class="px-1 text-xs text-slate-500">No earlier executions loaded.</p>
+                            {:else}
+                              {#each olderExecutions as task (task.task_id)}
+                                <TaskCard
+                                  {task}
+                                  workflowName={workflowName(task.workflow_id)}
+                                  selected={selectedIds.has(task.task_id)}
+                                  onclick={(event) => handleCardClick(event, task.task_id, column.id)}
+                                />
+                              {/each}
+                            {/if}
+                            {#if history.hasMore}
+                              <div class="py-1 text-center">
+                                <Button
+                                  size="sm"
+                                  variant="secondary"
+                                  disabled={history.loading}
+                                  onclick={() => void loadDoneGroupHistory(group, true)}
+                                >
+                                  {history.loading ? 'Loading…' : `Load more executions (${history.items.length}/${history.totalCount || group.task_count})`}
+                                </Button>
+                              </div>
+                            {/if}
+                          </div>
+                        {/if}
                       </div>
                     </div>
-                    {#if expandedDoneGroups.has(group.key) && group.tasks.length > 1}
-                      <div class="mt-3 space-y-2 border-t border-slate-800 pt-3">
-                        {#each group.tasks.slice(1) as task (task.task_id)}
-                          <TaskCard
-                            {task}
-                            workflowName={workflowName(task.workflow_id)}
-                            selected={selectedIds.has(task.task_id)}
-                            onclick={(event) => handleCardClick(event, task.task_id, column.id)}
-                          />
-                        {/each}
-                      </div>
-                    {/if}
                   </article>
                 {/each}
               {:else}
@@ -962,6 +1211,13 @@
                     />
                   </div>
                 {/each}
+              {/if}
+              {#if boardColumns[column.id].hasMore}
+                <div use:columnInfiniteScroll={column.id} class="py-2 text-center">
+                  <Button size="sm" variant="secondary" disabled={boardColumns[column.id].loading} onclick={() => void loadMoreColumn(column.id)}>
+                    {boardColumns[column.id].loading ? 'Loading…' : `Load more (${loadedCountForColumn(column.id)}/${boardColumns[column.id].totalCount})`}
+                  </Button>
+                </div>
               {/if}
             </div>
           </section>

@@ -1041,19 +1041,19 @@ class TestTavilyRequiredTools:
     async def test_map_without_tavily_uses_sitemap_path(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Without Tavily configured, web_map falls through to sitemap.xml
-        # discovery (W3). It must not raise a "Tavily required" error.
+        # Without Tavily configured, web_map falls through to the in-tree
+        # direct mapper (W3). It must not raise a "Tavily required" error.
         from cognis.tools.executor.web.handlers import handle_web_map
 
-        async def _fake_discover(
-            url: str, *, limit: int = 200, same_host_only: bool = True
+        async def _fake_map_site_urls(
+            url: str, *, options: dict[str, object] | None = None
         ) -> tuple[list[str], str]:
-            del limit, same_host_only
+            del options
             return ["https://example.com/a"], "sitemap"
 
         monkeypatch.setattr(
-            "cognis.tools.executor.web.sitemap.discover_sitemap_urls",
-            _fake_discover,
+            "cognis.tools.executor.web.sitemap.map_site_urls",
+            _fake_map_site_urls,
         )
         result = await handle_web_map({"url": "https://example.com"}, _DUMMY_CONTEXT)
         assert not result.is_error
@@ -1442,6 +1442,7 @@ class TestSettingsSchema:
         from cognis.settings_schema import validate_setting_value
 
         validate_setting_value("session.step_timeout_seconds", 3600)
+        validate_setting_value("session.step_request_questions_timeout_seconds", 3600)
         validate_setting_value("evaluator.timeout_ms", 180000)
 
     def test_positive_timeout_settings_reject_zero(self) -> None:
@@ -1449,5 +1450,7 @@ class TestSettingsSchema:
 
         with pytest.raises(ValueError, match="greater than zero"):
             validate_setting_value("session.step_timeout_seconds", 0)
+        with pytest.raises(ValueError, match="greater than zero"):
+            validate_setting_value("session.step_request_questions_timeout_seconds", 0)
         with pytest.raises(ValueError, match="greater than zero"):
             validate_setting_value("evaluator.timeout_ms", 0)

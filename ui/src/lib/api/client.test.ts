@@ -99,13 +99,12 @@ describe('conversation API client', () => {
     );
   });
 
-  it('requests projected conversation timeline pages', async () => {
+  it('serializes multi-select sidebar filters as repeated query parameters', async () => {
     const payload = {
-      items: [],
-      timeline_items: [],
-      last_seq: 0,
-      has_more: false,
-      has_active_turn: false
+      agents: [],
+      agent_direct_chats: [],
+      conversations: { items: [], cursor: null, has_more: false },
+      context_types: ['agent_work', 'web']
     };
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
       new Response(JSON.stringify(payload), {
@@ -115,11 +114,17 @@ describe('conversation API client', () => {
     );
     global.fetch = fetchMock;
 
-    await expect(api.conversations.timelinePage('conv_1', 100, 'cursor-old')).resolves.toEqual(payload);
+    await expect(
+      api.conversations.sidebar(null, {
+        contextTypes: ['web', 'agent_work'],
+        agentIds: ['laforge', 'riker'],
+        status: 'active'
+      })
+    ).resolves.toEqual(payload);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/v1/conversations/conv_1/timeline?after_seq=0&limit=100&anchor=latest&before=cursor-old'
+      '/api/v1/conversations/sidebar?limit=50&context_types=web&context_types=agent_work&agent_ids=laforge&agent_ids=riker&status=active'
     );
   });
 
@@ -163,7 +168,13 @@ describe('conversation API client', () => {
       api.conversations.open({
         agent_id: 'agent-1',
         context_type: 'web',
-        candidate_conversation_ids: ['conv-other', 'conv-selected']
+        candidate_conversation_ids: ['conv-other', 'conv-selected'],
+        candidate_conversations: [
+          {
+            conversation_id: 'conv-selected',
+            opened_at: '2026-06-22T10:00:00.000Z',
+          }
+        ]
       })
     ).resolves.toEqual(payload);
 
@@ -174,7 +185,13 @@ describe('conversation API client', () => {
       body: JSON.stringify({
         agent_id: 'agent-1',
         context_type: 'web',
-        candidate_conversation_ids: ['conv-other', 'conv-selected']
+        candidate_conversation_ids: ['conv-other', 'conv-selected'],
+        candidate_conversations: [
+          {
+            conversation_id: 'conv-selected',
+            opened_at: '2026-06-22T10:00:00.000Z',
+          }
+        ]
       })
     });
   });

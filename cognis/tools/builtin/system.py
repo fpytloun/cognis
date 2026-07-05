@@ -20,7 +20,7 @@ class StatusProvider(Protocol):
 
 LIST_AGENTS_TOOL = ToolDefinition(
     name="list_agents",
-    description="List available agents.",
+    description="List active agents with ids, display names, and status for delegation or routing decisions.",
     parameters={"type": "object", "properties": {}},
     source=ToolSource(type="builtin"),
     category="system",
@@ -29,7 +29,7 @@ LIST_AGENTS_TOOL = ToolDefinition(
 
 GET_STATUS_TOOL = ToolDefinition(
     name="get_status",
-    description="Get current runtime status.",
+    description="Return safe runtime status including active session, executor, and capability metadata.",
     parameters={"type": "object", "properties": {}},
     source=ToolSource(type="builtin"),
     category="system",

@@ -47,7 +47,8 @@ DEFAULT_PRESERVED_TOOL_TOKENS = 50_000  # replaces old byte constant
 DEFAULT_MAX_HISTORICAL_TOOL_RESULT_TOKENS = 5_000  # replaces old byte constant
 # Backward-compatible alias used by existing call sites.
 DEFAULT_COMPACTED_TOOL_GROUPS = DEFAULT_PRESERVED_TOOL_GROUPS
-_ARG_CLEAR_THRESHOLD = 1_000
+_ARG_CLEAR_THRESHOLD = 6_000
+_ARG_STRUCTURED_PREVIEW_CHARS = 500
 
 # Pressure escalation thresholds (fraction of available_prompt_tokens).
 # normal → pressure: usage crosses this fraction for one cycle.
@@ -228,14 +229,37 @@ def clear_large_tool_call_arguments(
             cleared_calls.append(tool_call)
             continue
         changed = True
+        preview: dict[str, Any] = {"_cleared": f"[Arguments cleared - {len(args_str)} chars]"}
+        parsed_args: Any | None = None
+        if isinstance(raw_args, dict):
+            parsed_args = raw_args
+        elif isinstance(raw_args, str):
+            try:
+                parsed_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                parsed_args = None
+        if isinstance(parsed_args, dict):
+            for key in ("file_path", "path", "source_path", "target_path"):
+                value = parsed_args.get(key)
+                if isinstance(value, str) and value:
+                    preview[key] = value
+            for key, value in parsed_args.items():
+                if not isinstance(value, str) or key in preview:
+                    continue
+                preview[f"{key}_preview"] = value[:_ARG_STRUCTURED_PREVIEW_CHARS]
+                if len(value) > _ARG_STRUCTURED_PREVIEW_CHARS:
+                    preview[f"{key}_preview_truncated"] = True
+                break
+        else:
+            preview["arguments_preview"] = args_str[:_ARG_STRUCTURED_PREVIEW_CHARS]
+            if len(args_str) > _ARG_STRUCTURED_PREVIEW_CHARS:
+                preview["arguments_preview_truncated"] = True
         cleared_calls.append(
             {
                 **tool_call,
                 "function": {
                     **function,
-                    "arguments": json.dumps(
-                        {"_cleared": f"[Arguments cleared - {len(args_str)} chars]"}
-                    ),
+                    "arguments": json.dumps(preview),
                 },
             }
         )
@@ -527,6 +551,7 @@ class ProjectionTurnState:
     # Projection cache
     last_result: ProjectionResult | None = None
     last_message_count: int = 0
+    last_projected_token_estimate: int = 0
     last_group_anchor: str | None = None  # hash of last tool group call_ids
     last_prefix_fingerprint: str | None = None
 
@@ -818,6 +843,44 @@ def _newest_completed_latest_turn_tool_index(
     return None
 
 
+def _compact_prunable_delegation_replays(
+    messages: list[dict[str, Any]],
+    *,
+    max_historical_tool_result_tokens: int,
+    token_counter: Callable[[str], int] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    if max_historical_tool_result_tokens <= 0:
+        return messages, False
+    projected: list[dict[str, Any]] = []
+    changed = False
+    for message in messages:
+        if not message.get("_delegation_result_replay"):
+            projected.append(message)
+            continue
+        if _get_message_token_estimate(message, token_counter) <= max_historical_tool_result_tokens:
+            projected.append(message)
+            continue
+        call_id = message.get("_recovery_call_id")
+        session_id = message.get("_source_session_id")
+        handle_parts: list[str] = []
+        if isinstance(call_id, str) and call_id:
+            handle_parts.append(f"read_tool_output(call_id={call_id!r})")
+        if isinstance(session_id, str) and session_id:
+            handle_parts.append(f"get_subsession(session_id={session_id!r})")
+        handle = " or ".join(handle_parts) or "the original delegation event"
+        compacted = dict(message)
+        compacted["content"] = (
+            "<delegation_result_compacted>\n"
+            "Prior delegation result replay was compacted under context pressure. "
+            f"Recover the full result with {handle}.\n"
+            "</delegation_result_compacted>"
+        )
+        compacted[PROJECTED_COMPACTED] = True
+        projected.append(compacted)
+        changed = True
+    return projected, changed
+
+
 def _latest_turn_has_unresolved_tool_call(
     messages: list[dict[str, Any]], latest_turn_start: int
 ) -> bool:
@@ -893,9 +956,14 @@ def project_messages(
     committed = prior_state.committed_preservations if prior_state is not None else set()
     is_critical = pressure_mode == "critical" or pressure_mode == PressureMode.critical
 
+    messages, delegation_replays_compacted = _compact_prunable_delegation_replays(
+        list(messages),
+        max_historical_tool_result_tokens=max_historical_tool_result_tokens,
+        token_counter=token_counter,
+    )
     groups = _collect_tool_groups(messages)
     if not groups:
-        return ProjectionResult(messages=list(messages), mutable_start_index=0)
+        return ProjectionResult(messages=messages, mutable_start_index=0)
 
     preserve_recent_completed_tool_groups = max(0, int(preserve_recent_completed_tool_groups))
     latest_turn_start = _latest_real_user_index(messages)

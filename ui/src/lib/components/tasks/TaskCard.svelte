@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Task } from '$lib/types/api';
+  import type { Task, TaskBoardItem } from '$lib/types/api';
 
   let {
     task,
@@ -7,7 +7,7 @@
     selected = false,
     onclick
   } = $props<{
-    task: Task;
+    task: Task | TaskBoardItem;
     workflowName: string;
     selected?: boolean;
     onclick?: ((event: MouseEvent) => void) | null;
@@ -23,6 +23,12 @@
     failed: 'border-rose-700 text-rose-300',
     cancelled: 'border-slate-600 text-slate-500'
   };
+
+  function handleKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Enter' && onclick) {
+      onclick(event as unknown as MouseEvent);
+    }
+  }
 </script>
 
 <div
@@ -30,7 +36,7 @@
   onclick={onclick}
   role="button"
   tabindex="0"
-  onkeydown={(e) => { if (e.key === 'Enter' && onclick) onclick(e as unknown as MouseEvent); }}
+  onkeydown={handleKeydown}
   title={task.title}
 >
   <div class="flex items-start justify-between gap-2">

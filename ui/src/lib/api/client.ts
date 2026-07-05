@@ -47,9 +47,7 @@ import type {
   MCPServerTestResponse,
   MCPServer,
   MCPServerUpdateRequest,
-  MessageHistoryResponse,
   ManagedConversationActionResponse,
-  QueuedMessage,
   QueuedMessagesResponse,
   Notification,
   PushSubscriptionPayload,
@@ -79,22 +77,26 @@ import type {
   SkillImportRequest,
   SkillUpdate,
   SkillVersion,
+  SlashCommandSuggestionsResponse,
   SystemDiagnostics,
   StepRun,
   StepProfileDefinition,
   SttTranscribeResponse,
   Task,
+  TaskBoard,
+  TaskBoardColumn,
+  TaskBoardItem,
   TaskChatResponse,
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
-  TimelineProjectionResponse,
   ToolOutputPageResponse,
   ToolDefinitionSummary,
   TtsSynthesizeRequest,
   TtsSynthesizeResponse,
   UserCreatePayload,
   UserDetail,
+  UserPreferences,
   UserSummary,
   UserUpdatePayload,
   VapidPublicKeyResponse,
@@ -116,24 +118,6 @@ export class ApiError extends Error {
     this.status = options.status;
     this.details = options.details ?? null;
   }
-}
-
-interface ConversationMessagesOptions {
-  anchor?: 'oldest' | 'latest';
-  before?: string | null;
-}
-
-function conversationMessagesQuery(
-  afterSeq = 0,
-  limit = 200,
-  params: ConversationMessagesOptions = {}
-): Record<string, string | number | boolean | null | undefined> {
-  return {
-    after_seq: afterSeq,
-    limit,
-    anchor: params.anchor,
-    before: params.before
-  };
 }
 
 type RequestOptions = RequestInit & {
@@ -227,10 +211,16 @@ async function collectCursorPages<T>(fetchPage: (cursor: string | null) => Promi
   }
 }
 
-function encodeQuery(params: Record<string, string | number | boolean | null | undefined>): string {
+function encodeQuery(params: Record<string, string | number | boolean | string[] | null | undefined>): string {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === null || value === '') {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item) query.append(key, item);
+      }
       continue;
     }
     query.set(key, String(value));
@@ -355,9 +345,11 @@ export const api = {
       q: string;
       filters?: {
         agent_id?: string | null;
+        agent_ids?: string[] | null;
         project_id?: string | null;
         status?: 'active' | 'starred' | 'archived' | 'all';
         context_type?: string | null;
+        context_types?: string[] | null;
         from_ts?: string | null;
         to_ts?: string | null;
       };
@@ -391,29 +383,18 @@ export const api = {
       return request<QueuedMessagesResponse>(`/api/v1/conversations/${conversationId}/queue`);
     },
 
-    updateQueuedMessage(conversationId: string, queueId: string, content: string): Promise<QueuedMessage> {
-      return request<QueuedMessage>(`/api/v1/conversations/${conversationId}/queue/${queueId}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ content })
-      });
-    },
-
-    deleteQueuedMessage(conversationId: string, queueId: string): Promise<void> {
-      return request<void>(`/api/v1/conversations/${conversationId}/queue/${queueId}`, {
-        method: 'DELETE'
-      });
-    },
-
     list(
       cursor: string | null = null,
-      filters: { contextType?: string | null; agentId?: string | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
     ): Promise<CursorPage<Conversation>> {
       return request<CursorPage<Conversation>>(
         `/api/v1/conversations${encodeQuery({
           cursor,
           limit: 50,
           context_type: filters.contextType,
+          context_types: filters.contextTypes ?? undefined,
           agent_id: filters.agentId,
+          agent_ids: filters.agentIds ?? undefined,
           status: filters.status,
           include_agent_direct: filters.includeAgentDirect
         })}`
@@ -421,21 +402,23 @@ export const api = {
     },
 
     async listAll(
-      filters: { contextType?: string | null; agentId?: string | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
     ): Promise<Conversation[]> {
       return collectCursorPages((cursor) => this.list(cursor, filters));
     },
 
     sidebar(
       cursor: string | null = null,
-      filters: { contextType?: string | null; agentId?: string | null; status?: string | null } = {}
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null } = {}
     ): Promise<SidebarProjection> {
       return request<SidebarProjection>(
         `/api/v1/conversations/sidebar${encodeQuery({
           cursor,
           limit: 50,
           context_type: filters.contextType,
+          context_types: filters.contextTypes ?? undefined,
           agent_id: filters.agentId,
+          agent_ids: filters.agentIds ?? undefined,
           status: filters.status
         })}`
       );
@@ -449,10 +432,11 @@ export const api = {
       );
     },
 
-    agentDirect(params: { agentId?: string | null; status?: string | null } = {}): Promise<AgentDirectChat[]> {
+    agentDirect(params: { agentId?: string | null; agentIds?: string[] | null; status?: string | null } = {}): Promise<AgentDirectChat[]> {
       return request<AgentDirectChat[]>(
         `/api/v1/conversations/agent-direct${encodeQuery({
           agent_id: params.agentId,
+          agent_ids: params.agentIds ?? undefined,
           status: params.status
         })}`
       );
@@ -484,6 +468,12 @@ export const api = {
       return request<ConversationTitleSuggestion>(`/api/v1/conversations/${conversationId}/title-suggestion`);
     },
 
+    slashCommandSuggestions(conversationId: string, input: string, limit = 12): Promise<SlashCommandSuggestionsResponse> {
+      return request<SlashCommandSuggestionsResponse>(
+        `/api/v1/conversations/${conversationId}/slash-command-suggestions${encodeQuery({ input, limit })}`
+      );
+    },
+
     update(conversationId: string, payload: Record<string, unknown>): Promise<Conversation> {
       return request<Conversation>(`/api/v1/conversations/${conversationId}`, {
         method: 'PATCH',
@@ -499,30 +489,6 @@ export const api = {
       return request<{ ok: boolean; intaris_cascade: boolean; warning?: string }>(
         `/api/v1/conversations/${conversationId}/purge`,
         { method: 'DELETE' }
-      );
-    },
-
-    messages(conversationId: string, afterSeq = 0, limit = 200): Promise<MessageHistoryResponse> {
-      return request<MessageHistoryResponse>(
-        `/api/v1/conversations/${conversationId}/messages${encodeQuery(conversationMessagesQuery(afterSeq, limit))}`
-      );
-    },
-
-    historyPage(conversationId: string, limit = 200, before: string | null = null): Promise<MessageHistoryResponse> {
-      return request<MessageHistoryResponse>(
-        `/api/v1/conversations/${conversationId}/messages${encodeQuery(conversationMessagesQuery(0, limit, {
-          anchor: 'latest',
-          before
-        }))}`
-      );
-    },
-
-    timelinePage(conversationId: string, limit = 200, before: string | null = null): Promise<TimelineProjectionResponse> {
-      return request<TimelineProjectionResponse>(
-        `/api/v1/conversations/${conversationId}/timeline${encodeQuery(conversationMessagesQuery(0, limit, {
-          anchor: 'latest',
-          before
-        }))}`
       );
     },
 
@@ -590,7 +556,7 @@ export const api = {
 
     managedAction(
       conversationId: string,
-      action: 'send' | 'wait' | 'interrupt' | 'retry' | 'fork' | 'close',
+      action: 'send' | 'wait' | 'interrupt' | 'stop' | 'retry' | 'fork' | 'close' | 'take-control',
       payload: { message?: string | null; reason?: string | null; instruction?: string | null; wait?: boolean } = {}
     ): Promise<ManagedConversationActionResponse> {
       return request<ManagedConversationActionResponse>(`/api/v1/conversations/${conversationId}/managed/${action}`, {
@@ -776,8 +742,8 @@ export const api = {
       });
     },
 
-    signedUrl(artifactId: string, ttlSeconds = 3600): Promise<{ artifact_id: string; url: string; expires_at: string | null }> {
-      return request<{ artifact_id: string; url: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds })}`);
+    signedUrl(artifactId: string, ttlSeconds = 3600, mode: 'download' | 'view' = 'download'): Promise<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }> {
+      return request<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds, mode: mode === 'download' ? undefined : mode })}`);
     }
   },
 
@@ -873,6 +839,16 @@ export const api = {
       issuer?: string | null;
       authorization_server?: string | null;
       scopes?: string[];
+      flow?: string;
+      verification_uri?: string | null;
+      verification_uri_complete?: string | null;
+      user_code?: string | null;
+      interval?: number | null;
+      callback_mode?: string;
+      oauth_executor_id?: string | null;
+      oauth_executor_name?: string | null;
+      redirect_uri?: string | null;
+      instructions?: string | null;
     }> {
       return request(`/api/v1/mcp-servers/${serverId}/oauth/start`, {
         method: 'POST'
@@ -1066,15 +1042,31 @@ export const api = {
 
   tasks: {
     list(params: Record<string, string | number | null | undefined> = {}): Promise<CursorPage<Task>> {
-      return request<CursorPage<Task>>(`/api/v1/tasks${encodeQuery({ ...params, limit: 100 })}`);
+      return request<CursorPage<Task>>(`/api/v1/tasks${encodeQuery({ limit: 100, ...params })}`);
     },
 
     async listAll(): Promise<Task[]> {
       return collectCursorPages((cursor) => this.list({ cursor }));
     },
 
+    board(params: Record<string, string | number | null | undefined> = {}): Promise<TaskBoard> {
+      return request<TaskBoard>(`/api/v1/tasks/board${encodeQuery({ limit: 20, ...params })}`);
+    },
+
+    boardColumn(columnId: string, params: Record<string, string | number | null | undefined> = {}): Promise<TaskBoardColumn> {
+      return request<TaskBoardColumn>(`/api/v1/tasks/board/${columnId}${encodeQuery({ limit: 20, ...params })}`);
+    },
+
+    doneGroupTasks(groupKey: string, params: Record<string, string | number | null | undefined> = {}): Promise<CursorPage<TaskBoardItem>> {
+      return request<CursorPage<TaskBoardItem>>(`/api/v1/tasks/board/done/groups/${encodeURIComponent(groupKey)}/tasks${encodeQuery({ limit: 20, ...params })}`);
+    },
+
     detail(taskId: string): Promise<TaskDetail> {
       return request<TaskDetail>(`/api/v1/tasks/${taskId}`);
+    },
+
+    summary(taskId: string): Promise<TaskDetail> {
+      return request<TaskDetail>(`/api/v1/tasks/${taskId}/summary`);
     },
 
     create(payload: Record<string, unknown>): Promise<Task> {
@@ -1154,8 +1146,31 @@ export const api = {
       return request<StepRun[]>(`/api/v1/tasks/${taskId}/steps`);
     },
 
+    stepSummaries(
+      taskId: string,
+      params: Record<string, string | number | boolean | null | undefined> = {}
+    ): Promise<CursorPage<StepRun>> {
+      return request<CursorPage<StepRun>>(
+        `/api/v1/tasks/${taskId}/steps/summary${encodeQuery({ limit: 100, latest_only: true, ...params })}`
+      );
+    },
+
     stepHistory(taskId: string, stepName: string): Promise<StepRun[]> {
       return request<StepRun[]>(`/api/v1/tasks/${taskId}/steps/${encodeURIComponent(stepName)}/history`);
+    },
+
+    stepHistorySummary(
+      taskId: string,
+      stepName: string,
+      params: Record<string, string | number | boolean | null | undefined> = {}
+    ): Promise<CursorPage<StepRun>> {
+      return request<CursorPage<StepRun>>(
+        `/api/v1/tasks/${taskId}/steps/${encodeURIComponent(stepName)}/summary${encodeQuery({ limit: 50, ...params })}`
+      );
+    },
+
+    stepRunDetail(stepRunId: string): Promise<StepRun> {
+      return request<StepRun>(`/api/v1/step-runs/${encodeURIComponent(stepRunId)}`);
     },
 
     comments(taskId: string): Promise<TaskComment[]> {
@@ -1392,6 +1407,19 @@ export const api = {
     }
   },
 
+  userPreferences: {
+    get(): Promise<UserPreferences> {
+      return request<UserPreferences>('/api/v1/user-preferences');
+    },
+
+    update(payload: UserPreferences): Promise<UserPreferences> {
+      return request<UserPreferences>('/api/v1/user-preferences', {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
+    }
+  },
+
   llmProviders: {
     list(): Promise<CursorPage<LLMProvider>> {
       return request<CursorPage<LLMProvider>>('/api/v1/llm-providers');
@@ -1479,12 +1507,35 @@ export const api = {
       return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt/status`);
     },
 
+    startAnthropicOAuth(providerId: string): Promise<LLMProviderOAuthStatus> {
+      return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/anthropic/start`, {
+        method: 'POST'
+      });
+    },
+
+    completeAnthropicOAuth(providerId: string, callbackInput: string): Promise<LLMProviderOAuthStatus> {
+      return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/anthropic/complete`, {
+        method: 'POST',
+        body: JSON.stringify({ callback_input: callbackInput })
+      });
+    },
+
+    anthropicOAuthStatus(providerId: string): Promise<LLMProviderOAuthStatus> {
+      return request<LLMProviderOAuthStatus>(`/api/v1/llm-providers/${providerId}/oauth/anthropic/status`);
+    },
+
     codexUsage(providerId: string): Promise<CodexUsage> {
       return request<CodexUsage>(`/api/v1/llm-providers/${providerId}/codex/usage`);
     },
 
     clearChatgptOAuth(providerId: string): Promise<{ ok: boolean }> {
       return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}/oauth/chatgpt`, {
+        method: 'DELETE'
+      });
+    },
+
+    clearAnthropicOAuth(providerId: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(`/api/v1/llm-providers/${providerId}/oauth/anthropic`, {
         method: 'DELETE'
       });
     },

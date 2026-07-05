@@ -17,7 +17,10 @@ from cognis.store.queries import (
     create_agent,
     create_channel_account,
     create_conversation,
+    create_deliverable,
     create_session,
+    create_step_run,
+    create_task,
     create_user,
     get_agent_direct_conversation,
     get_channel_delivery_outbox,
@@ -31,8 +34,13 @@ class _Guardrails:
         self.recorded: list[tuple[str, list[object]]] = []
 
     async def record_events(
-        self, session_id: str, events: list[object], source: str = "cognis"
+        self,
+        session_id: str,
+        events: list[object],
+        source: str = "cognis",
+        idempotency_key: str | None = None,
     ) -> object:
+        del idempotency_key
         self.recorded.append((session_id, events))
         return SimpleNamespace(last_seq=1)
 
@@ -128,7 +136,9 @@ async def test_deliver_task_result_uses_latest_active_conversation_and_publishes
 
 
 @pytest.mark.asyncio
-async def test_deliver_task_result_skips_silent_delivery(tmp_path: object) -> None:
+async def test_deliver_task_result_skips_outward_silent_delivery_but_publishes_terminal_event(
+    tmp_path: object,
+) -> None:
     engine, session_factory = await _runtime(tmp_path)
     guardrails = _Guardrails()
     event_bus = EventBus()
@@ -170,7 +180,7 @@ async def test_deliver_task_result_skips_silent_delivery(tmp_path: object) -> No
     )
 
     assert guardrails.recorded == []
-    assert seen == []
+    assert seen == [EventType.TASK_COMPLETED]
     await engine.dispose()
 
 
@@ -356,6 +366,104 @@ async def test_deliver_task_result_direct_sends_channel_message_without_follow_u
     assert channel_delivery.calls == [(conversation.conversation_id, "Final direct reply", [])]
     assert EventType.FOLLOW_UP_TURN_REQUESTED not in seen
     assert EventType.TASK_COMPLETED in seen
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_deliver_task_result_direct_publishes_terminal_event_when_deliverable_already_sent(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    channel_delivery = _ChannelDelivery()
+    event_bus = EventBus()
+    seen: list[EventType] = []
+
+    async def _capture(event: object) -> None:
+        seen.append(event.type)
+
+    event_bus.subscribe_all(_capture)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=event_bus,
+        pause_waiter=SimpleNamespace(),
+        channel_delivery=channel_delivery,
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="signal",
+            context_ref="signal:acct-1:chat-1",
+            context_data={
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+            },
+            title="Signal",
+        )
+        await create_task(
+            session,
+            task_id="task-direct-duplicate",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            title="Background task",
+            status="completed",
+        )
+        step_run = await create_step_run(
+            session,
+            task_id="task-direct-duplicate",
+            step_name="deliver",
+            step_type="run",
+            agent_id="agent-1",
+        )
+        deliverable = await create_deliverable(
+            session,
+            step_run_id=step_run.step_run_id,
+            deliverable_id="dlv_direct_duplicate",
+            content="Already delivered content",
+            format="markdown",
+        )
+        deliverable.status = "delivered"
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-direct-duplicate",
+            title="Background task",
+            description="",
+            status=TaskStatus.COMPLETED,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="chat",
+            source_ref=conversation.conversation_id,
+            delivery=TaskDelivery(mode="same_conversation"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family="direct"),
+            workflow_id=None,
+            result_summary="Done",
+            result_data={"final_deliverable_id": "dlv_direct_duplicate"},
+            applied_completion_mode="direct",
+        )
+    )
+
+    assert channel_delivery.calls == []
+    assert guardrails.recorded == []
+    assert EventType.TASK_COMPLETED in seen
+    assert EventType.FOLLOW_UP_TURN_REQUESTED not in seen
     await engine.dispose()
 
 

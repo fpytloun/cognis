@@ -2,6 +2,7 @@
   import Download from 'lucide-svelte/icons/download';
   import FileText from 'lucide-svelte/icons/file-text';
 
+  import { api } from '$lib/api/client';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import type { AttachmentRef } from '$lib/types/api';
 
@@ -23,28 +24,60 @@
   let { attachments } = $props<{ attachments: AttachmentRef[] }>();
 
   let lightboxIndex = $state<number | null>(null);
+  let resolvedUrls = $state<Record<string, string>>({});
+
+  function urlKey(attachment: AttachmentRef, mode: 'download' | 'view'): string {
+    return `${attachment.artifact_id}:${mode}`;
+  }
+
+  function resolvedUrl(attachment: AttachmentRef, mode: 'download' | 'view' = 'view'): string | null {
+    if (mode === 'download') return attachment.url ?? resolvedUrls[urlKey(attachment, mode)] ?? null;
+    return resolvedUrls[urlKey(attachment, mode)] ?? null;
+  }
 
   const imageAttachments = $derived(
     attachments.filter(
-      (a: AttachmentRef): a is AttachmentRef & { url: string } =>
-        Boolean(a.url) && typeof a.mime_type === 'string' && a.mime_type.startsWith('image/'),
+      (a: AttachmentRef) =>
+        Boolean(resolvedUrl(a, 'download')) && typeof a.mime_type === 'string' && a.mime_type.startsWith('image/'),
     ),
   );
 
   const otherAttachments = $derived(
     attachments.filter(
       (a: AttachmentRef) =>
-        !(typeof a.mime_type === 'string' && a.mime_type.startsWith('image/') && Boolean(a.url)),
+        !(typeof a.mime_type === 'string' && a.mime_type.startsWith('image/') && Boolean(resolvedUrl(a, 'download'))),
     ),
   );
 
   const lightboxImages = $derived(
-    imageAttachments.map((image: AttachmentRef & { url: string }) => ({
-      src: image.url,
+    imageAttachments.map((image: AttachmentRef) => ({
+      src: resolvedUrl(image, 'download') ?? '',
       alt: image.filename,
       filename: image.filename,
     })),
   );
+
+  async function resolveAttachmentUrl(attachment: AttachmentRef, mode: 'download' | 'view' = 'download'): Promise<string | null> {
+    const existing = resolvedUrl(attachment, mode);
+    if (existing) return existing;
+    try {
+      const result = await api.artifacts.signedUrl(attachment.artifact_id, 3600, mode);
+      resolvedUrls = { ...resolvedUrls, [urlKey(attachment, mode)]: result.url };
+      return result.url;
+    } catch (error) {
+      console.error('Failed to resolve artifact URL', error);
+      return null;
+    }
+  }
+
+  $effect(() => {
+    for (const attachment of attachments) {
+      if (attachment.url || resolvedUrls[urlKey(attachment, 'download')]) continue;
+      if (typeof attachment.mime_type === 'string' && attachment.mime_type.startsWith('image/')) {
+        void resolveAttachmentUrl(attachment, 'download');
+      }
+    }
+  });
 
   function openLightbox(index: number): void {
     lightboxIndex = index;
@@ -52,6 +85,40 @@
 
   function closeLightbox(): void {
     lightboxIndex = null;
+  }
+
+  function isHtmlAttachment(attachment: AttachmentRef): boolean {
+    return attachment.mime_type?.split(';', 1)[0]?.trim().toLowerCase() === 'text/html';
+  }
+
+  async function openViewAttachment(event: MouseEvent, attachment: AttachmentRef): Promise<void> {
+    event.preventDefault();
+    const popup = window.open('', '_blank');
+    if (popup) {
+      popup.opener = null;
+    }
+    try {
+      const url = await resolveAttachmentUrl(attachment, 'view');
+      if (!url) throw new Error('Unable to resolve artifact URL');
+      if (popup) {
+        popup.location.href = url;
+      } else {
+        window.open(url, '_blank', 'noopener,noreferrer');
+      }
+    } catch (error) {
+      console.error('Failed to open artifact view URL', error);
+      if (popup) {
+        popup.close();
+      }
+      if (attachment.url) {
+        window.open(attachment.url, '_blank', 'noopener,noreferrer');
+      }
+    }
+  }
+
+  async function openDownloadAttachment(attachment: AttachmentRef): Promise<void> {
+    const url = await resolveAttachmentUrl(attachment, 'download');
+    if (url) window.open(url, '_blank', 'noopener,noreferrer');
   }
 
   function formatBytes(value: number | null | undefined): string {
@@ -73,7 +140,7 @@
         aria-label={`View ${image.filename}`}
       >
         <img
-          src={image.url}
+          src={resolvedUrl(image, 'download') ?? ''}
           alt={image.filename}
           class="h-full w-full object-cover transition group-hover:scale-105"
           loading="lazy"
@@ -92,11 +159,12 @@
           <FileText class="h-4 w-4" />
         </span>
         <div class="min-w-0 flex-1">
-          {#if attachment.url}
+          {#if resolvedUrl(attachment, 'download') || isHtmlAttachment(attachment)}
             <a
-              href={attachment.url}
+              href={resolvedUrl(attachment, 'download') ?? '#'}
               target="_blank"
               rel="noopener noreferrer"
+              onclick={isHtmlAttachment(attachment) ? (event) => { void openViewAttachment(event, attachment); } : undefined}
               class="block truncate text-sm font-medium text-slate-100 hover:text-sky-300"
             >
               {attachment.filename}
@@ -108,9 +176,9 @@
             {attachment.mime_type ?? 'file'}{sizeText ? ` · ${sizeText}` : ''}
           </p>
         </div>
-        {#if attachment.url}
+        {#if resolvedUrl(attachment, 'download')}
           <a
-            href={attachment.url}
+            href={resolvedUrl(attachment, 'download') ?? ''}
             download={attachment.filename}
             target="_blank"
             rel="noopener noreferrer"
@@ -119,6 +187,15 @@
           >
             <Download class="h-4 w-4" />
           </a>
+        {:else}
+          <button
+            type="button"
+            onclick={() => { void openDownloadAttachment(attachment); }}
+            aria-label={`Download ${attachment.filename}`}
+            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-100"
+          >
+            <Download class="h-4 w-4" />
+          </button>
         {/if}
       </div>
     {/each}
@@ -128,7 +205,7 @@
 {#if lightboxIndex !== null && imageAttachments[lightboxIndex]}
   {@const current = imageAttachments[lightboxIndex]}
   <ImageLightbox
-    src={current.url}
+    src={resolvedUrl(current, 'download') ?? ''}
     alt={current.filename}
     filename={current.filename}
     images={lightboxImages}

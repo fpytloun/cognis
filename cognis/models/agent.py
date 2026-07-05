@@ -14,6 +14,65 @@ from cognis.models.tool import Permission
 
 logger = get_logger(__name__)
 
+# Known backend ids — validated at parse time.  New backends register themselves
+# in cognis/providers/backends/ and must be added here for validation.
+_KNOWN_MEMORY_BACKENDS = {"mnemory", "none"}
+_KNOWN_GUARDRAILS_BACKENDS = {"intaris", "none"}
+
+
+class AgentCapabilities(BaseModel):
+    """Per-agent backend selection.
+
+    Controls which memory and guardrails backends are used for this agent's
+    turns.  Defaults preserve existing behaviour (mnemory + intaris).
+
+    memory_backend:
+      "mnemory"  — Mnemory HTTP provider (default)
+      "none"     — No memory (NullMemoryProvider); no recall/remember calls
+
+    guardrails_backend:
+      "intaris"  — Intaris HTTP provider (default)
+      "none"     — No guardrails (NoGuardrailsProvider); all tools auto-approved,
+                   including non-bypassable ones.  Intaris is still used as the
+                   session/event store regardless of this setting.
+
+    Both fields are open strings (not Literal) so new backends can be added
+    without schema changes.  Unknown values raise a validation error.
+    """
+
+    memory_backend: str = "mnemory"
+    guardrails_backend: str = "intaris"
+
+    @field_validator("memory_backend")
+    @classmethod
+    def _validate_memory_backend(cls, value: str) -> str:
+        if value not in _KNOWN_MEMORY_BACKENDS:
+            raise ValueError(
+                f"Unknown memory_backend {value!r}. "
+                f"Known: {sorted(_KNOWN_MEMORY_BACKENDS)}. "
+                "Add a new backend in cognis/providers/backends/memory/."
+            )
+        return value
+
+    @field_validator("guardrails_backend")
+    @classmethod
+    def _validate_guardrails_backend(cls, value: str) -> str:
+        if value not in _KNOWN_GUARDRAILS_BACKENDS:
+            raise ValueError(
+                f"Unknown guardrails_backend {value!r}. "
+                f"Known: {sorted(_KNOWN_GUARDRAILS_BACKENDS)}. "
+                "Add a new backend in cognis/providers/backends/guardrails/."
+            )
+        return value
+
+    @property
+    def memory_enabled(self) -> bool:
+        return self.memory_backend != "none"
+
+    @property
+    def guardrails_enabled(self) -> bool:
+        return self.guardrails_backend != "none"
+
 
 class AgentDefinition(BaseModel):
     """Agent definition as stored in the database."""
@@ -29,6 +88,15 @@ class AgentDefinition(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: AgentPermissions | None = None
     llm_config: AgentLLMConfig | None = None
+    capabilities: AgentCapabilities = Field(default_factory=AgentCapabilities)
+
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def _coerce_capabilities(cls, value: object) -> object:
+        """Coerce None or empty dict to default AgentCapabilities."""
+        if value is None:
+            return AgentCapabilities()
+        return value
     agent_profiles: dict[str, AgentRuntimeProfile] = Field(default_factory=dict)
     default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None

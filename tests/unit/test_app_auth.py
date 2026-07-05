@@ -14,6 +14,10 @@ def _create_test_client(
 ) -> TestClient:
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
+    monkeypatch.setenv("COGNIS_INTARIS_URL", "http://localhost:8060")  # type: ignore[attr-defined]
+    monkeypatch.setenv("COGNIS_MNEMORY_URL", "http://localhost:8050")  # type: ignore[attr-defined]
+    monkeypatch.delenv("PUBLIC_INTARIS_UI_URL", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.delenv("PUBLIC_MNEMORY_UI_URL", raising=False)  # type: ignore[attr-defined]
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)  # type: ignore[attr-defined]
     app = create_app()

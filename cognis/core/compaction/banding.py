@@ -78,8 +78,15 @@ def build_compaction_input(
     tail_budget = int(budget_chars * _TAIL_RATIO)
 
     # Fast path: if everything fits, return as-is (no band drop needed).
+    # The char estimate is not sufficient for CJK and other high-token-density
+    # payloads, so confirm with the exact tokenizer when one is available.
     full_text = format_events_for_compaction(older_events)
-    if len(full_text) <= budget_chars:
+    if len(full_text) <= budget_chars and _within_exact_budget(
+        full_text,
+        max_input_tokens=max_input_tokens,
+        count_tokens_fn=count_tokens_fn,
+        model=model,
+    ):
         return CompactionInput(
             text=full_text,
             head_event_count=len(older_events),
@@ -103,8 +110,9 @@ def build_compaction_input(
     # Build tail band: take events from the end until tail_budget is reached.
     tail_events: list[Any] = []
     tail_chars = 0
+    head_event_ids = {id(event) for event in head_events}
     for event in reversed(older_events):
-        if event in head_events:
+        if id(event) in head_event_ids:
             break
         line = format_events_for_compaction([event])
         if tail_chars + len(line) > tail_budget and tail_events:
@@ -124,6 +132,7 @@ def build_compaction_input(
         dropped_seq_end = getattr(dropped_events[-1], "seq", None)
 
     # Assemble the final text.
+    include_dropped_user_messages = True
     parts: list[str] = []
     if head_events:
         parts.append(format_events_for_compaction(head_events))
@@ -135,9 +144,12 @@ def build_compaction_input(
             else f"{n} events"
         )
         parts.append(
-            f"[compaction band: omitted {n} events between {seq_range}; "
-            "tool outputs from this range remain recoverable by call_id "
-            "when recovery handles are present]"
+            _dropped_band_marker(
+                n,
+                seq_range,
+                dropped_events,
+                include_user_messages=include_dropped_user_messages,
+            )
         )
     if tail_events:
         parts.append(format_events_for_compaction(tail_events))
@@ -152,11 +164,21 @@ def build_compaction_input(
             while actual_tokens > max_input_tokens and (
                 len(head_events) > 1 or len(tail_events) > 1
             ):
-                # Trim one event from whichever band is larger.
-                if len(head_events) >= len(tail_events) and len(head_events) > 1:
-                    dropped_events.insert(0, head_events.pop())
+                # Trim a batch per iteration so pathological inputs do not
+                # degrade into O(n²) repeated rebuilds/tokenizations.
+                trim_from_head = len(head_events) >= len(tail_events) and len(head_events) > 1
+                if trim_from_head:
+                    trim_count = max(1, int(len(head_events) * 0.10))
+                    trim_count = min(trim_count, len(head_events) - 1)
+                    moved = head_events[-trim_count:]
+                    del head_events[-trim_count:]
+                    dropped_events = moved + dropped_events
                 elif len(tail_events) > 1:
-                    dropped_events.append(tail_events.pop(0))
+                    trim_count = max(1, int(len(tail_events) * 0.10))
+                    trim_count = min(trim_count, len(tail_events) - 1)
+                    moved = tail_events[:trim_count]
+                    del tail_events[:trim_count]
+                    dropped_events.extend(moved)
                 else:
                     break
                 # Rebuild.
@@ -174,9 +196,38 @@ def build_compaction_input(
                         else f"{n} events"
                     )
                     parts.append(
-                        f"[compaction band: omitted {n} events between {seq_range}; "
-                        "tool outputs from this range remain recoverable by call_id "
-                        "when recovery handles are present]"
+                        _dropped_band_marker(
+                            n,
+                            seq_range,
+                            dropped_events,
+                            include_user_messages=include_dropped_user_messages,
+                        )
+                    )
+                if tail_events:
+                    parts.append(format_events_for_compaction(tail_events))
+                text = "\n".join(parts)
+                actual_tokens = count_tokens_fn(text, model)
+            if actual_tokens > max_input_tokens and include_dropped_user_messages:
+                include_dropped_user_messages = False
+                parts = []
+                if head_events:
+                    parts.append(format_events_for_compaction(head_events))
+                if dropped_events:
+                    dropped_seq_start = getattr(dropped_events[0], "seq", None)
+                    dropped_seq_end = getattr(dropped_events[-1], "seq", None)
+                    n = len(dropped_events)
+                    seq_range = (
+                        f"seq {dropped_seq_start}–{dropped_seq_end}"
+                        if dropped_seq_start is not None
+                        else f"{n} events"
+                    )
+                    parts.append(
+                        _dropped_band_marker(
+                            n,
+                            seq_range,
+                            dropped_events,
+                            include_user_messages=include_dropped_user_messages,
+                        )
                     )
                 if tail_events:
                     parts.append(format_events_for_compaction(tail_events))
@@ -193,4 +244,47 @@ def build_compaction_input(
         dropped_seq_start=dropped_seq_start,
         dropped_seq_end=dropped_seq_end,
         estimated_chars=len(text),
+    )
+
+
+def _within_exact_budget(
+    text: str,
+    *,
+    max_input_tokens: int | None,
+    count_tokens_fn: Any,
+    model: str | None,
+) -> bool:
+    if count_tokens_fn is None or model is None or max_input_tokens is None:
+        return True
+    try:
+        return int(count_tokens_fn(text, model)) <= max_input_tokens
+    except Exception:
+        return True
+
+
+def _dropped_band_marker(
+    count: int,
+    seq_range: str,
+    dropped_events: list[Any],
+    *,
+    include_user_messages: bool = True,
+) -> str:
+    marker = (
+        f"[compaction band: omitted {count} events between {seq_range}; "
+        "tool outputs from this range remain recoverable by call_id "
+        "when recovery handles are present]"
+    )
+    if not include_user_messages:
+        return marker
+    dropped_user_events = [
+        event for event in dropped_events if getattr(event, "type", None) == "user_message"
+    ]
+    if not dropped_user_events:
+        return marker
+    return "\n".join(
+        [
+            marker,
+            "Dropped-band user messages (verbatim):",
+            format_events_for_compaction(dropped_user_events),
+        ]
     )

@@ -36,6 +36,12 @@ import Target from 'lucide-svelte/icons/target';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
+  import {
+    clearQuestionDraft,
+    readQuestionDraft,
+    writeQuestionDraft,
+    type QuestionDraftAnswers,
+  } from '$lib/interactive-drafts';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import {
@@ -49,21 +55,21 @@ import Target from 'lucide-svelte/icons/target';
   import { policyFromText, policyText } from '$lib/session-policy';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
-import type {
-  Agent,
-  Conversation,
-  Deliverable,
-  Escalation,
-  Notification,
-  Project,
-  QuestionSetAnswer,
-  QuestionSetQuestion,
-  Session,
-  StepRun,
-  Task,
-  TaskDetail,
-  Workflow
-} from '$lib/types/api';
+  import type {
+    Agent,
+    Conversation,
+    Deliverable,
+    Escalation,
+    Notification,
+    Project,
+    QuestionSetAnswer,
+    QuestionSetQuestion,
+    Session,
+    StepRun,
+    Task,
+    TaskDetail,
+    Workflow
+  } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -78,7 +84,8 @@ import type {
   let dependencyTaskId = $state('');
   let gateFeedback = $state('');
   let stepResponse = $state('');
-  let stepQuestionAnswers = $state<Record<string, { selected: string[]; custom: string }>>({});
+  let stepQuestionAnswers = $state<QuestionDraftAnswers>({});
+  let lastStepQuestionNotificationId = $state<string | null>(null);
   let expandedStepHistory = $state<Set<string>>(new Set());
   let selectedStepName = $state('');
   let selectedAttemptByStep = $state<Record<string, string>>({});
@@ -88,6 +95,10 @@ import type {
   let configModalOpen = $state(false);
   let taskActionsOpen = $state(false);
   let outputModalStepRun = $state<StepRun | null>(null);
+  let loadingStepRunId = $state<string | null>(null);
+  let stepRunDetailLoadKey = 0;
+  let stepHistoryLoading = $state<Set<string>>(new Set());
+  let stepHistoryLoaded = $state<Set<string>>(new Set());
   let taskEscalations = $state<Escalation[]>([]);
   let taskCredentialRequest = $state<Notification | null>(null);
   let taskEscalationBusyCallId = $state<string | null>(null);
@@ -225,9 +236,55 @@ import type {
 
   function toggleStepHistory(stepName: string): void {
     const next = new Set(expandedStepHistory);
-    if (next.has(stepName)) next.delete(stepName);
-    else next.add(stepName);
+    if (next.has(stepName)) {
+      next.delete(stepName);
+    } else {
+      next.add(stepName);
+      void loadStepHistory(stepName);
+    }
     expandedStepHistory = next;
+  }
+
+  function setStepHistoryLoading(stepName: string, loadingHistory: boolean): void {
+    const next = new Set(stepHistoryLoading);
+    if (loadingHistory) next.add(stepName);
+    else next.delete(stepName);
+    stepHistoryLoading = next;
+  }
+
+  function markStepHistoryLoaded(stepName: string): void {
+    const next = new Set(stepHistoryLoaded);
+    next.add(stepName);
+    stepHistoryLoaded = next;
+  }
+
+  async function loadStepHistory(stepName: string): Promise<void> {
+    if (!task || stepHistoryLoaded.has(stepName) || stepHistoryLoading.has(stepName)) return;
+    setStepHistoryLoading(stepName, true);
+    try {
+      let cursor: string | null = null;
+      const historyRuns: StepRun[] = [];
+      do {
+        const page = await api.tasks.stepHistorySummary(task.task_id, stepName, {
+          limit: 100,
+          cursor
+        });
+        historyRuns.push(...page.items);
+        cursor = page.has_more ? page.cursor : null;
+      } while (cursor);
+      if (!task) return;
+      const runsById = new Map(task.step_runs.map((run) => [run.step_run_id, run]));
+      for (const run of historyRuns) {
+        runsById.set(run.step_run_id, runsById.get(run.step_run_id) ?? run);
+      }
+      task = { ...task, step_runs: [...runsById.values()] };
+      markStepHistoryLoaded(stepName);
+    } catch (err) {
+      const apiError = asApiError(err);
+      addToast(apiError.message || 'Could not load step history.', 'error');
+    } finally {
+      setStepHistoryLoading(stepName, false);
+    }
   }
 
   function isMobileViewport(): boolean {
@@ -269,7 +326,50 @@ import type {
     taskActionsOpen = true;
   }
 
+  function isProjectedStepRun(stepRun: StepRun | null): boolean {
+    return stepRun?.is_projection === true;
+  }
+
+  function replaceStepRun(stepRun: StepRun): void {
+    if (!task) return;
+    const nextRuns = [...task.step_runs];
+    const existingIndex = nextRuns.findIndex((run) => run.step_run_id === stepRun.step_run_id);
+    if (existingIndex >= 0) {
+      nextRuns[existingIndex] = stepRun;
+    } else {
+      nextRuns.push(stepRun);
+    }
+    task = { ...task, step_runs: nextRuns };
+  }
+
+  async function loadStepRunDetail(stepRunId: string): Promise<StepRun | null> {
+    const key = ++stepRunDetailLoadKey;
+    loadingStepRunId = stepRunId;
+    try {
+      const detail = await api.tasks.stepRunDetail(stepRunId);
+      if (key !== stepRunDetailLoadKey) return null;
+      replaceStepRun(detail);
+      if (outputModalStepRun?.step_run_id === stepRunId) {
+        outputModalStepRun = detail;
+      }
+      return detail;
+    } catch (err) {
+      const apiError = asApiError(err);
+      addToast(apiError.message || 'Could not load step details.', 'error');
+      return null;
+    } finally {
+      if (key === stepRunDetailLoadKey) {
+        loadingStepRunId = null;
+      }
+    }
+  }
+
   function openOutputModal(stepRun: StepRun): void {
+    if (isProjectedStepRun(stepRun)) {
+      outputModalStepRun = stepRun;
+      void loadStepRunDetail(stepRun.step_run_id);
+      return;
+    }
     outputModalStepRun = stepRun;
   }
 
@@ -370,6 +470,7 @@ import type {
 
   function hasRecordedStepOutput(stepRun: StepRun | null): boolean {
     if (!stepRun) return false;
+    if (stepRun.deliverable_id) return true;
     if (stepRun.deliverables.length > 0) return true;
     if (!stepRun.output) return false;
     const output = stepRun.output;
@@ -892,6 +993,48 @@ import type {
     return attempt.step_run_id === group.latest.step_run_id;
   });
 
+  function preserveLoadedStepRuns(nextTask: TaskDetail, previousRuns: StepRun[]): TaskDetail {
+    const nextRunsById = new Map(nextTask.step_runs.map((run) => [run.step_run_id, run]));
+    for (const previous of previousRuns) {
+      const next = nextRunsById.get(previous.step_run_id);
+      if (stepHistoryLoaded.has(previous.step_name) && !next) {
+        nextRunsById.set(previous.step_run_id, previous);
+        continue;
+      }
+      if (next && !isProjectedStepRun(previous)) {
+        const heavyPayloadMayBeStale =
+          previous.status !== next.status || previous.deliverable_id !== next.deliverable_id;
+        if (heavyPayloadMayBeStale) {
+          nextRunsById.set(previous.step_run_id, next);
+          continue;
+        }
+        nextRunsById.set(previous.step_run_id, {
+          ...previous,
+          status: next.status,
+          attempt: next.attempt,
+          attempt_number: next.attempt_number,
+          superseded_by_step_run_id: next.superseded_by_step_run_id,
+          deliverable_id: next.deliverable_id,
+          require_deliverable: next.require_deliverable,
+          started_at: next.started_at,
+          completed_at: next.completed_at,
+          updated_at: next.updated_at,
+          duration_seconds: next.duration_seconds,
+          accumulated_duration_seconds: next.accumulated_duration_seconds,
+          latest_attempt_duration_seconds: next.latest_attempt_duration_seconds,
+          is_projection: false
+        });
+      }
+    }
+    return { ...nextTask, step_runs: [...nextRunsById.values()] };
+  }
+
+  $effect(() => {
+    const stepRun = selectedAttempt;
+    if (!stepRun || !isProjectedStepRun(stepRun)) return;
+    void loadStepRunDetail(stepRun.step_run_id);
+  });
+
   function selectAttempt(stepName: string, stepRunId: string): void {
     selectedAttemptByStep = { ...selectedAttemptByStep, [stepName]: stepRunId };
   }
@@ -1110,12 +1253,47 @@ import type {
     return stepQuestionAnswers[questionId] ?? { selected: [], custom: '' };
   }
 
+  function taskQuestionDraftNamespace(): string {
+    return `task:${taskIdFromRoute()}`;
+  }
+
+  function activeStepQuestionNotificationId(): string | null {
+    const notificationId = activePause?.pause_id;
+    return typeof notificationId === 'string' && notificationId ? notificationId : null;
+  }
+
+  function persistStepQuestionDraft(): void {
+    writeQuestionDraft(
+      taskQuestionDraftNamespace(),
+      activeStepQuestionNotificationId(),
+      stepQuestionAnswers,
+    );
+  }
+
+  function restoreStepQuestionDraft(): QuestionDraftAnswers {
+    return readQuestionDraft(taskQuestionDraftNamespace(), activeStepQuestionNotificationId());
+  }
+
+  function clearActiveStepQuestionDraft(): void {
+    clearQuestionDraft(taskQuestionDraftNamespace(), activeStepQuestionNotificationId());
+  }
+
+  $effect(() => {
+    const notificationId = activeStepQuestionNotificationId();
+    if (notificationId === lastStepQuestionNotificationId) {
+      return;
+    }
+    lastStepQuestionNotificationId = notificationId;
+    stepQuestionAnswers = notificationId ? restoreStepQuestionDraft() : {};
+  });
+
   function setStepQuestionCustom(questionId: string, value: string): void {
     const current = stepQuestionState(questionId);
     stepQuestionAnswers = {
       ...stepQuestionAnswers,
       [questionId]: { ...current, custom: value }
     };
+    persistStepQuestionDraft();
   }
 
   function toggleStepQuestionOption(question: QuestionSetQuestion, optionId: string): void {
@@ -1135,6 +1313,7 @@ import type {
       ...stepQuestionAnswers,
       [question.id]: { ...current, selected: Array.from(selected) }
     };
+    persistStepQuestionDraft();
   }
 
   function buildStepQuestionReply(questions: QuestionSetQuestion[]): QuestionSetAnswer[] {
@@ -1250,7 +1429,7 @@ import type {
     error = '';
     try {
       const data = await loadTaskPageData(api, taskIdFromRoute());
-      task = data.task;
+      task = preserveLoadedStepRuns(data.task, task?.step_runs ?? []);
       agents = data.agents;
       workflows = data.workflows;
       conversations = data.conversations;
@@ -1299,11 +1478,20 @@ import type {
   async function refreshTaskOnly(): Promise<void> {
     if (document.hidden) return;
     try {
+      const previousRuns = task?.step_runs ?? [];
       const data = await refreshTaskPageData(api, taskIdFromRoute(), allTasks);
-      task = data.task;
+      task = preserveLoadedStepRuns(data.task, previousRuns);
       allTasks = data.allTasks;
       error = data.auxiliaryError;
       selectedStepName = defaultStepSelection(task, selectedStepName);
+      const activeSelectedAttempt = selectedAttempt;
+      if (
+        activeSelectedAttempt &&
+        !isProjectedStepRun(activeSelectedAttempt) &&
+        ['running', 'evaluating'].includes(activeSelectedAttempt.status)
+      ) {
+        void loadStepRunDetail(activeSelectedAttempt.step_run_id);
+      }
       try {
         await refreshTaskEscalations();
       } catch {
@@ -1432,6 +1620,7 @@ import type {
         answers
       });
       stepResponse = '';
+      clearActiveStepQuestionDraft();
       stepQuestionAnswers = {};
       task = await api.tasks.detail(task.task_id);
     } catch (caughtError) {

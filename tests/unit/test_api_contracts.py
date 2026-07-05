@@ -16,7 +16,6 @@ import pytest
 from pydantic import ValidationError
 
 from cognis.api.models import (
-    ActiveStreamSnapshotResponse,
     ActiveThinkingBlockResponse,
     ActiveThinkingSnapshotResponse,
     AgentGrantResponse,
@@ -25,7 +24,6 @@ from cognis.api.models import (
     DeliverableResponse,
     EffectiveToolItemResponse,
     ExecutorTokenResponse,
-    MessageHistoryResponse,
     ModelRoutingEntry,
     ModelRoutingResponse,
     PendingPauseResponse,
@@ -176,29 +174,6 @@ def test_executor_token_response_allows_non_expiring_tokens() -> None:
     response = ExecutorTokenResponse(executor_id="exec-1", token="jwt", expires_in=None)
 
     assert response.expires_in is None
-
-
-def test_message_history_response_round_trips_active_streams() -> None:
-    response = MessageHistoryResponse(
-        items=[],
-        has_active_turn=True,
-        active_streams=[
-            ActiveStreamSnapshotResponse(
-                conversation_id="conv-1",
-                session_id="sess-1",
-                message_id="turn-1",
-                turn_id="turn-1",
-                content="partial assistant text",
-                chunk_count=3,
-                content_offset=22,
-                updated_at="2026-04-20T00:00:00Z",
-            )
-        ],
-    )
-
-    assert response.has_active_turn is True
-    assert response.active_streams[0].content == "partial assistant text"
-    assert response.active_streams[0].chunk_count == 3
 
 
 def test_session_events_response_round_trips_active_thinking() -> None:

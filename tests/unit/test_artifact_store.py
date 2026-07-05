@@ -71,6 +71,24 @@ def test_public_url_uses_cognis_base_url(tmp_path) -> None:
     assert "minio.minio.svc.cluster.local" not in url
 
 
+def test_public_view_url_uses_distinct_route_and_signature(tmp_path) -> None:
+    store = ArtifactStore(
+        ArtifactStoreConfig(
+            backend="filesystem",
+            path=str(tmp_path),
+            base_url="https://cognis.example.com",
+            signing_secret="test-secret",
+        )
+    )
+
+    download_url = store.get_public_url("reports", "html_123", "report.html")
+    view_url = store.get_public_url("reports", "html_123", "report.html", mode="view")
+
+    assert "/api/v1/artifacts/content/reports/html_123/report.html?" in download_url
+    assert "/api/v1/artifacts/view/reports/html_123/report.html?" in view_url
+    assert download_url.split("sig=", 1)[1] != view_url.split("sig=", 1)[1]
+
+
 def test_sanitize_artifact_filename_preserves_json_extension() -> None:
     assert sanitize_artifact_filename("export (1).json") == "export_1_.json"
 

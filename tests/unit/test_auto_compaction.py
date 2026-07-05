@@ -16,12 +16,13 @@ from cognis.core.agent_loop import (
     SessionLock,
     StepContext,
 )
-from cognis.core.compaction import CompactionResult
-from cognis.core.events import Event, EventBus
+from cognis.core.compaction import CompactionModelContext, CompactionResult
+from cognis.core.events import Event, EventBus, EventType
 from cognis.core.session_cache import CachedEvent, CachedSessionState
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
 from cognis.models.workflow import StepDefinition
+from cognis.store import queries
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -48,6 +49,7 @@ class _FakeCompactionStrategy:
         self._fail = fail
         self._slow = slow
         self.fallback_calls: list[tuple[str, str]] = []
+        self.model_contexts: list[object | None] = []
 
     async def compact(
         self,
@@ -57,7 +59,7 @@ class _FakeCompactionStrategy:
         model_context: object | None = None,
         long_lived_chat: bool = False,
     ) -> CompactionResult:
-        del model_context
+        self.model_contexts.append(model_context)
         self.calls.append((session.session_id, trigger, long_lived_chat))
         if self._slow:
             await asyncio.sleep(self._slow)
@@ -88,10 +90,36 @@ class _FakeGuardrails:
         return type("AppendResult", (), {"ok": True, "first_seq": 1, "last_seq": len(events)})()
 
 
+class _FakeLLM:
+    def __init__(self) -> None:
+        self.resolve_calls: list[dict[str, object]] = []
+
+    async def resolve_model_target(
+        self,
+        *,
+        explicit_model: str | None = None,
+        task_type: str = "default",
+        explicit_provider_id: str | None = None,
+        acting_user_email: str | None = None,
+    ) -> tuple[str, str | None]:
+        self.resolve_calls.append(
+            {
+                "explicit_model": explicit_model,
+                "task_type": task_type,
+                "explicit_provider_id": explicit_provider_id,
+                "acting_user_email": acting_user_email,
+            }
+        )
+        return explicit_model or "default-model", explicit_provider_id or "default-provider"
+
+
 class _FakeSessionManager:
     def __init__(self, *, fail: bool = False) -> None:
         self.rotations: list[dict[str, Any]] = []
         self._fail = fail
+
+    def session_factory(self) -> Any:
+        return _FakeDbSession()
 
     async def rotate_session(
         self,
@@ -123,6 +151,14 @@ class _FakeSessionManager:
         )
 
 
+class _FakeDbSession:
+    async def __aenter__(self) -> _FakeDbSession:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
 class _FakeSessionCache:
     def __init__(self, *, entry: CachedSessionState | None = None) -> None:
         self._entry = entry
@@ -132,6 +168,18 @@ class _FakeSessionCache:
     def get_entry(self, session_id: str) -> CachedSessionState | None:
         if self._entry and self._entry.session_id == session_id:
             return self._entry
+        return None
+
+    def get_model_override(self, session_id: str) -> str | None:
+        del session_id
+        return None
+
+    def get_model_override_provider_id(self, session_id: str) -> str | None:
+        del session_id
+        return None
+
+    def get_reasoning_effort_override(self, session_id: str) -> str | None:
+        del session_id
         return None
 
     async def refresh(self, session: SessionModel) -> CachedSessionState:
@@ -230,10 +278,11 @@ def _minimal_agent_loop(
     session_manager: _FakeSessionManager | None = None,
     session_cache: _FakeSessionCache | None = None,
     event_bus: EventBus | None = None,
+    llm: _FakeLLM | None = None,
 ) -> AgentLoop:
     """Create an AgentLoop with only the fields needed for _auto_compact."""
     loop = AgentLoop(
-        providers=type("P", (), {"llm": None, "guardrails": _FakeGuardrails()})(),
+        providers=type("P", (), {"llm": llm or _FakeLLM(), "guardrails": _FakeGuardrails()})(),
         session_manager=session_manager or _FakeSessionManager(),
         session_cache=session_cache or _FakeSessionCache(),
         context_assembler=None,
@@ -311,6 +360,75 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
     assert published[1].data["previous_session_id"] == "session-1"
     assert published[1].data["session_id"] == "new-session-1"
     assert published[1].data["status"] == "compacted"
+
+
+@pytest.mark.asyncio
+async def test_stale_rotated_session_stops_before_step_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[Event] = []
+    bus = EventBus()
+
+    async def capture(event: Event) -> None:
+        published.append(event)
+
+    bus.subscribe_all(capture)
+    loop = _minimal_agent_loop(event_bus=bus)
+    ctx = _step_context()
+    ctx.turn_id = "turn-1"
+
+    async def fake_get_conversation(db_session: object, conversation_id: str) -> Any:
+        del db_session, conversation_id
+        return type("ConversationRow", (), {"active_session_id": "new-session-1"})()
+
+    async def fake_get_session_row(db_session: object, session_id: str) -> Any:
+        del db_session, session_id
+        return type(
+            "SessionRow",
+            (),
+            {"status": "completed", "completion_reason": "compacted"},
+        )()
+
+    monkeypatch.setattr(queries, "get_conversation", fake_get_conversation)
+    monkeypatch.setattr(queries, "get_session_row", fake_get_session_row)
+
+    result = await loop._stale_session_step_output(ctx, phase="before_assistant_or_tool_dispatch")
+
+    assert result is not None
+    assert result.metadata["interrupted"] is True
+    assert result.metadata["continuation_reason"] == "session_rotated"
+    assert result.metadata["active_session_id"] == "new-session-1"
+    assert result.metadata["completion_reason"] == "compacted"
+    assert [event.type for event in published] == [EventType.SYSTEM_NOTICE]
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_resolves_model_context_before_cycle_model_call() -> None:
+    """Pre-turn auto-compaction has a concrete model for same-session routing."""
+
+    compaction = _FakeCompactionStrategy()
+    cache = _FakeSessionCache(entry=_cache_entry_with_events(5))
+    llm = _FakeLLM()
+    loop = _minimal_agent_loop(compaction=compaction, session_cache=cache, llm=llm)
+
+    ctx = _step_context()
+    result = await loop._auto_compact(ctx)
+
+    assert result is not None
+    assert llm.resolve_calls == [
+        {
+            "explicit_model": None,
+            "task_type": "default",
+            "explicit_provider_id": None,
+            "acting_user_email": "user@example.com",
+        }
+    ]
+    model_context = compaction.model_contexts[0]
+    assert isinstance(model_context, CompactionModelContext)
+    assert model_context.model == "default-model"
+    assert model_context.provider_id == "default-provider"
+    assert ctx.current_model == "default-model"
+    assert ctx.current_provider_id == "default-provider"
 
 
 @pytest.mark.asyncio

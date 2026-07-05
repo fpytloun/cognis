@@ -129,6 +129,43 @@ async def test_tool_execute_returns_tool_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_oauth_loopback_callback_notification_dispatches() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(),
+        breaker=CircuitBreaker(failure_threshold=10, recovery_timeout=1),
+    )
+    received: list[tuple[str, dict[str, Any]]] = []
+
+    async def callback(executor_id: str, payload: dict[str, Any]) -> None:
+        received.append((executor_id, payload))
+
+    conn.register_oauth_loopback_callback(callback)
+    conn.start_receiver()
+    ws.inject_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "oauth.loopback_callback",
+            "params": {"listener_id": "listener-1", "state": "state", "code": "code"},
+        }
+    )
+    for _ in range(20):
+        if received:
+            break
+        await asyncio.sleep(0.01)
+
+    assert received == [
+        (
+            "exec-1",
+            {"listener_id": "listener-1", "state": "state", "code": "code"},
+        )
+    ]
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_disconnected_connection_raises_error() -> None:
     """rpc_call raises ExecutorDisconnectedError when not connected."""
     ws = FakeWebSocket()

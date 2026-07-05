@@ -201,9 +201,12 @@ def build_deliverable_public_url(
     ref: DeliverableContentRef,
     *,
     ttl_seconds: int,
+    mode: str = "download",
 ) -> str:
     """Build a signed virtual deliverable download URL without storing a blob."""
 
+    if mode not in {"download", "view"}:
+        raise ValueError(f"Unsupported artifact URL mode: {mode}")
     config = getattr(artifact_store, "_config", None)
     base_url = getattr(config, "base_url", "")
     signing_secret = getattr(config, "signing_secret", "")
@@ -213,8 +216,9 @@ def build_deliverable_public_url(
     if not callable(signer):
         raise ValueError("Artifact store does not support signed virtual URLs")
     exp = int(time.time()) + ttl_seconds
-    sig = signer("deliverables", ref.artifact_id, ref.filename, exp)
-    path = f"/api/v1/artifacts/virtual/deliverables/{quote(ref.artifact_id)}/{quote(ref.filename)}"
+    sig = signer("deliverables", ref.artifact_id, ref.filename, exp, mode=mode)
+    route = "virtual/deliverables" if mode == "download" else "virtual/deliverables/view"
+    path = f"/api/v1/artifacts/{route}/{quote(ref.artifact_id)}/{quote(ref.filename)}"
     return f"{base_url}{path}?exp={exp}&sig={sig}"
 
 

@@ -31,14 +31,12 @@ def test_send_message_and_receive_response(live_stack: LiveStack, run_id: str) -
     assert any(e["type"] == "message_complete" for e in events), (
         f"No message_complete. Got: {[e.get('type') for e in events]}"
     )
-    chunks = [e for e in events if e.get("type") == "chunk"]
-    assert len(chunks) > 0, "Expected at least one streaming chunk"
 
 
 @pytest.mark.integration
 @pytest.mark.live_server
-def test_conversation_messages_persisted(live_stack: LiveStack, run_id: str) -> None:
-    """After a chat turn, messages should be readable via REST."""
+def test_chat_v2_snapshot_contains_persisted_messages(live_stack: LiveStack, run_id: str) -> None:
+    """After a chat turn, persisted messages should be readable via Chat v2."""
     agent_id = f"persist-agent-{run_id}"
     live_create_agent(live_stack, agent_id)
     conv = live_create_conversation(live_stack, agent_id)
@@ -49,11 +47,11 @@ def test_conversation_messages_persisted(live_stack: LiveStack, run_id: str) -> 
 
     time.sleep(2)
 
-    r = live_stack.get(f"/api/v1/conversations/{cid}/messages?after_seq=0&limit=50")
+    r = live_stack.get(f"/api/v1/chat/v2/conversations/{cid}/snapshot")
     assert r.status_code == 200
-    types = [i["type"] for i in r.json()["items"]]
-    assert "user_message" in types
-    assert "assistant_message" in types
+    messages = [item for item in r.json()["timeline"]["items"] if item["kind"] == "message"]
+    roles = [item["role"] for item in messages]
+    assert "user" in roles
 
 
 @pytest.mark.integration

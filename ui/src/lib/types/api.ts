@@ -32,6 +32,24 @@ export interface UserUpdatePayload {
   password?: string;
 }
 
+export type UserThemePreference = 'system' | 'dark' | 'light';
+
+export interface UserDisplayPreferences {
+  theme: UserThemePreference;
+  language: string;
+}
+
+export interface UserChatPreferences {
+  show_thinking_blocks: boolean;
+  group_tool_calls: boolean;
+  show_internal_tool_calls: boolean;
+}
+
+export interface UserPreferences {
+  display: UserDisplayPreferences;
+  chat: UserChatPreferences;
+}
+
 export interface TokenResponse {
   token: string;
   refresh_token: string | null;
@@ -179,6 +197,7 @@ export interface ConversationStateEnvelope {
     session_id?: string | null;
     status?: string | null;
     completion_reason?: string | null;
+    todos?: ConversationTodoItem[];
   };
   task?: ConversationTaskState | null;
   pending: ConversationPendingState;
@@ -198,9 +217,9 @@ export interface ConversationStateDelta {
 }
 
 export interface Conversation {
-    conversation_id: string;
-    user_email: string;
-    agent_id: string;
+  conversation_id: string;
+  user_email: string;
+  agent_id: string;
     agent_profile_id?: string | null;
     project_id: string | null;
     title: string | null;
@@ -234,10 +253,29 @@ export interface Conversation {
       turn_state?: string | null;
       last_result_summary?: string | null;
       last_error?: string | null;
+      control_metadata?: Record<string, unknown> | null;
+      follow_up_conversation_id?: string | null;
+      follow_up_session_id?: string | null;
+      closed_reason?: string | null;
     } | null;
     created_at: string | null;
     updated_at: string | null;
-    conversation_state?: ConversationStateEnvelope | null;
+  conversation_state?: ConversationStateEnvelope | null;
+}
+
+export interface SlashCommandSuggestion {
+  kind: 'command' | 'parameter';
+  command: string;
+  value: string;
+  label: string;
+  insert_text: string;
+  description?: string | null;
+  suffix: 'space' | 'none';
+  badges: string[];
+}
+
+export interface SlashCommandSuggestionsResponse {
+  items: SlashCommandSuggestion[];
 }
 
 export interface AgentDirectChat {
@@ -257,6 +295,15 @@ export interface ConversationOpenRequest {
   agent_profile_id?: string | null;
   context_type?: string;
   candidate_conversation_ids?: string[];
+  candidate_conversations?: LastOpenedConversationCandidate[];
+}
+
+export interface LastOpenedConversationCandidate {
+  conversation_id: string;
+  opened_at?: string | null;
+  agent_id?: string | null;
+  agent_profile_id?: string | null;
+  context_type?: string | null;
 }
 
 export interface ConversationTitleSuggestion {
@@ -463,29 +510,10 @@ export interface ActiveThinkingSnapshot {
   updated_at?: string | null;
 }
 
-export interface MessageHistoryResponse {
-  items: MessageEvent[];
-  last_seq: number;
-  has_more: boolean;
-  older_cursor?: string | null;
-  has_active_turn: boolean;
-  active_streams?: ActiveStreamSnapshot[];
-  active_tool_outputs?: ActiveToolOutputSnapshot[];
-  active_session_id?: string | null;
-  active_session_last_seq?: number;
-  history_truncated?: boolean;
-  truncation_reason?: string | null;
-  state_snapshot?: ConversationStateEnvelope | null;
-}
-
 export type TimelineProjectionItem = Record<string, unknown> & {
   id: string;
   kind: string;
 };
-
-export interface TimelineProjectionResponse extends MessageHistoryResponse {
-  timeline_items: TimelineProjectionItem[];
-}
 
 export type SearchKind = 'reasoning' | 'intention' | 'summary';
 export type SearchMode = 'auto' | 'lexical' | 'vector' | 'hybrid';
@@ -607,6 +635,7 @@ export interface Session {
 export interface SessionEventsResponse {
   session_id: string;
   items: MessageEvent[];
+  timeline_items?: TimelineProjectionItem[];
   last_seq: number;
   has_more: boolean;
   active_thinking?: ActiveThinkingSnapshot[];
@@ -636,6 +665,13 @@ export interface AgentRuntimeProfile {
   enabled?: boolean;
 }
 
+export interface AgentCapabilities {
+  /** Memory backend: "mnemory" (default) | "none" */
+  memory_backend: string;
+  /** Guardrails backend: "intaris" (default) | "none" */
+  guardrails_backend: string;
+}
+
 export interface Agent {
   agent_id: string;
   owner_email: string;
@@ -648,6 +684,7 @@ export interface Agent {
   tools: Record<string, unknown> | null;
   permissions: Record<string, unknown> | null;
   llm_config: Record<string, unknown> | null;
+  capabilities?: AgentCapabilities | null;
   agent_profiles?: Record<string, AgentRuntimeProfile>;
   default_agent_profile_id?: string | null;
   execution: Record<string, unknown> | null;
@@ -849,6 +886,9 @@ export interface MCPAuthConfig {
   client_id?: string | null;
   client_secret_ref?: string | null;
   redirect_uri?: string | null;
+  flow?: 'auto' | 'authorization_code' | 'device_code';
+  callback_mode?: 'auto' | 'controller_public' | 'executor_loopback';
+  oauth_executor_id?: string | null;
   dynamic_client_registration?: boolean;
   client_metadata_document_url?: string | null;
   authorization_params?: Record<string, string>;
@@ -1413,6 +1453,7 @@ export interface StepRun {
   duration_seconds?: number | null;
   accumulated_duration_seconds?: number | null;
   latest_attempt_duration_seconds?: number | null;
+  is_projection?: boolean;
 }
 
 export interface WorkflowRun {
@@ -1459,6 +1500,42 @@ export interface Task {
   result_data: Record<string, unknown> | null;
   applied_completion_mode: 'default' | 'direct' | 'silent' | null;
   applied_completion_reason: string | null;
+}
+
+export interface TaskBoardItem {
+  task_id: string;
+  title: string;
+  status: string;
+  priority: number;
+  agent_id: string;
+  workflow_id: string | null;
+  project_id: string | null;
+  source_type: string;
+  source_ref: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  updated_at: string | null;
+  result_summary: string | null;
+}
+
+export interface TaskBoardDoneGroup {
+  key: string;
+  title: string;
+  latest: TaskBoardItem;
+  task_count: number;
+}
+
+export interface TaskBoardColumn {
+  items: TaskBoardItem[];
+  groups: TaskBoardDoneGroup[];
+  cursor: string | null;
+  has_more: boolean;
+  total_count: number;
+}
+
+export interface TaskBoard {
+  columns: Record<string, TaskBoardColumn>;
 }
 
 export interface TaskDetail extends Task {
@@ -1716,6 +1793,8 @@ export interface LLMProviderOAuthStatus {
   provider_id: string;
   status: string;
   verification_url: string | null;
+  authorization_url: string | null;
+  redirect_uri: string | null;
   user_code: string | null;
   interval: number | null;
   expires_at: number | null;
@@ -2034,6 +2113,8 @@ export interface WebSocketMessageCompleteEvent {
   chat_mode_source?: ChatModeSource;
   partial?: boolean;
   finish_reason?: string | null;
+  assistant_phase_index?: number;
+  turn_cycle_index?: number | null;
   runtime?: MessageRuntimeMetadata | null;
 }
 
@@ -2265,6 +2346,11 @@ export interface WebSocketQueuedEvent {
   conversation_id?: string;
   queued_count: number;
   messages?: QueuedMessage[];
+  reason?: string | null;
+  code?: string | null;
+  command?: string | null;
+  task_id?: string | null;
+  command_result?: boolean;
 }
 
 export interface QueuedMessage {
@@ -2341,6 +2427,7 @@ export interface WebSocketTimelinePatchEvent {
   conversation_id: string;
   source?: string | null;
   last_seq?: number | null;
+  remove_ids?: string[] | null;
   items: TimelineProjectionItem[];
 }
 
@@ -2355,6 +2442,10 @@ export interface WebSocketConversationRuntimeSnapshotEvent {
   active_streams: ActiveStreamSnapshot[];
   active_tool_outputs: ActiveToolOutputSnapshot[];
   active_thinking: ActiveThinkingSnapshot[];
+  timeline_items?: TimelineProjectionItem[];
+  runtime_generation?: string;
+  server_time?: string;
+  build_id?: string;
 }
 
 export interface WebSocketToolResultEvent {
@@ -2466,9 +2557,16 @@ export interface WebSocketSystemMessageEvent {
   kind?: string | null;
   scope?: string | null;
   turn_id?: string | null;
+  follow_up_conversation_id?: string | null;
+  follow_up_session_id?: string | null;
   text: string;
   chat_mode?: ChatMode;
   chat_mode_source?: ChatModeSource;
+  command_result?: boolean;
+  command?: string | null;
+  code?: string | null;
+  resolved_agent_profile_id?: string | null;
+  executor_id?: string | null;
 }
 
 export interface WebSocketNoticeEvent {
@@ -2506,6 +2604,8 @@ export interface WebSocketSessionCompactedEvent {
   conversation_id: string;
   session_id: string;
   previous_session_id?: string | null;
+  message?: string | null;
+  command_result?: boolean;
   summary_preview: string;
   method: string;
   turns_compacted: number;
@@ -2606,6 +2706,22 @@ export interface WebSocketUserMessageEvent {
   chat_mode_source?: ChatModeSource;
 }
 
+export interface WebSocketMcpOAuthStatusChangedEvent {
+  type: 'mcp_oauth_status_changed';
+  server_id: string;
+  status: Record<string, unknown>;
+}
+
+/**
+ * Lightweight sidebar refresh hint sent to all owner connections when a new
+ * conversation is created (e.g. on another device or via /new). The client
+ * should reload the sidebar projection to pick up the new row.
+ */
+export interface WebSocketSidebarConversationUpsertEvent {
+  type: 'sidebar_conversation_upsert';
+  conversation_id: string;
+}
+
 export type CognisWebSocketEvent =
   | WebSocketAuthenticatedEvent
   | WebSocketChunkEvent
@@ -2655,11 +2771,13 @@ export type CognisWebSocketEvent =
   | WebSocketHistoryRebasedEvent
   | WebSocketConversationCreatedEvent
   | WebSocketUserMessageEvent
+  | WebSocketMcpOAuthStatusChangedEvent
   | WebSocketQueuedEvent
   | WebSocketQueuedMessagesUpdatedEvent
   | WebSocketReconnectedEvent
   | WebSocketSessionRecoveredEvent
   | WebSocketTtsSentenceReadyEvent
+  | WebSocketSidebarConversationUpsertEvent
   | WebSocketErrorEvent
   | WebSocketPongEvent;
 

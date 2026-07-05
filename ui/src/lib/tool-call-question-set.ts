@@ -11,6 +11,13 @@ export type StepQuestion = {
   required?: boolean;
 };
 
+export type StepQuestionAnswerChoice = StepQuestionOption & { unknown?: boolean };
+export type StepQuestionAnswer = {
+  question: StepQuestion;
+  selected: StepQuestionAnswerChoice[];
+  custom: string;
+};
+
 export function normalizeStepQuestions(item: Pick<ToolCallTimelineItem, 'arguments'>): StepQuestion[] {
   const rawQuestions = item.arguments?.questions;
   if (Array.isArray(rawQuestions)) {
@@ -87,41 +94,95 @@ export function stepQuestionOptionLabel(question: StepQuestion, optionId: string
   return question.options.find((option) => option.id === optionId)?.label ?? optionId;
 }
 
+function structuredAnswerRecords(parsed: Record<string, unknown> | null): unknown[] | null {
+  const response = parsed?.response;
+  const reply = parsed?.reply;
+  if (parsed && Array.isArray(parsed.answers)) return parsed.answers;
+  if (reply && typeof reply === 'object') {
+    const answers = (reply as Record<string, unknown>).answers;
+    if (Array.isArray(answers)) return answers;
+  }
+  if (response && typeof response === 'object') {
+    const answers = (response as Record<string, unknown>).answers;
+    if (Array.isArray(answers)) return answers;
+  }
+  return null;
+}
+
+function fallbackQuestion(questionId: string, index: number): StepQuestion {
+  return {
+    id: questionId || `q${index + 1}`,
+    question: questionId || 'Question',
+    options: [],
+    allow_custom: true,
+    required: true,
+  };
+}
+
+function normalizeAnswerRecord(
+  questions: StepQuestion[],
+  raw: unknown,
+  index: number,
+): StepQuestionAnswer | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const record = raw as Record<string, unknown>;
+  const questionId = typeof record.question_id === 'string' ? record.question_id : '';
+  const question = questions.find((item) => item.id === questionId) ?? fallbackQuestion(questionId, index);
+  const selected = Array.isArray(record.selected_option_ids)
+    ? record.selected_option_ids
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+        .map((value) => {
+          const option = question.options.find((item) => item.id === value);
+          return option ? { ...option } : { id: value, label: value, unknown: true };
+        })
+    : [];
+  const custom = typeof record.custom_answer === 'string' && record.custom_answer.trim()
+    ? record.custom_answer.trim()
+    : '';
+  if (selected.length === 0 && !custom) return null;
+  return { question, selected, custom };
+}
+
+export function normalizeStepQuestionAnswers(
+  item: Pick<ToolCallTimelineItem, 'arguments'>,
+  parsed: Record<string, unknown> | null,
+): StepQuestionAnswer[] {
+  const records = structuredAnswerRecords(parsed);
+  if (!records) return [];
+
+  const questions = normalizeStepQuestions(item);
+  const answers = records
+    .map((record, index) => normalizeAnswerRecord(questions, record, index))
+    .filter((answer): answer is StepQuestionAnswer => answer !== null);
+
+  if (questions.length === 0) return answers;
+
+  const questionOrder = new Map(questions.map((question, index) => [question.id, index]));
+  return [...answers].sort((left, right) => {
+    const leftIndex = questionOrder.get(left.question.id);
+    const rightIndex = questionOrder.get(right.question.id);
+    if (leftIndex == null && rightIndex == null) return 0;
+    if (leftIndex == null) return 1;
+    if (rightIndex == null) return -1;
+    return leftIndex - rightIndex;
+  });
+}
+
 export function formatStepQuestionResponse(
   item: Pick<ToolCallTimelineItem, 'arguments'>,
   parsed: Record<string, unknown> | null,
 ): string {
   const response = parsed?.response;
-  const reply = parsed?.reply;
-  const answers = Array.isArray(parsed?.answers)
-    ? parsed.answers
-    : reply && typeof reply === 'object' && Array.isArray((reply as Record<string, unknown>).answers)
-      ? (reply as Record<string, unknown>).answers
-      : response && typeof response === 'object' && Array.isArray((response as Record<string, unknown>).answers)
-        ? (response as Record<string, unknown>).answers
-        : null;
-  if (Array.isArray(answers)) {
-    const questions = normalizeStepQuestions(item);
+  const answers = normalizeStepQuestionAnswers(item, parsed);
+  if (answers.length > 0) {
     return answers
       .map((answer) => {
-        if (!answer || typeof answer !== 'object') return '';
-        const record = answer as Record<string, unknown>;
-        const questionId = typeof record.question_id === 'string' ? record.question_id : '';
-        const question = questions.find((item) => item.id === questionId);
-        const selected = Array.isArray(record.selected_option_ids)
-          ? record.selected_option_ids
-              .filter((value): value is string => typeof value === 'string')
-              .map((value) => question ? stepQuestionOptionLabel(question, value) : value)
-          : [];
-        const custom = typeof record.custom_answer === 'string' && record.custom_answer.trim()
-          ? record.custom_answer.trim()
-          : '';
-        const parts = [...selected, custom].filter((part) => part.length > 0);
-        if (parts.length === 0) return '';
-        const label = question?.header || question?.question || questionId || 'Question';
-        return `${label}: ${parts.join(', ')}`;
+        const parts = [
+          ...answer.selected.map((option) => option.label),
+          answer.custom,
+        ].filter((part) => part.length > 0);
+        return `${answer.question.question}: ${parts.join(', ')}`;
       })
-      .filter((line) => line.length > 0)
       .join('\n');
   }
   return typeof response === 'string' ? response : '';

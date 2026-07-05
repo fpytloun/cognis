@@ -106,6 +106,30 @@ class _NonAppendingGuardrails(_Guardrails):
         return EventAppendResult(ok=False, count=0, first_seq=0, last_seq=0)
 
 
+class _OptionalAppendFailingGuardrails(_Guardrails):
+    async def record_events(
+        self,
+        session_id: str,
+        events: list[SessionEvent],
+        source: str = "cognis",
+        idempotency_key: str | None = None,
+        **_: object,
+    ) -> object:
+        del source
+        self.recorded_events.append((session_id, events, idempotency_key))
+        self.record_event_contexts.append(
+            (current_user_email.get(), current_agent_id.get(), current_agent_owner_email.get())
+        )
+        if idempotency_key and idempotency_key.endswith(":rotation_seed"):
+            return EventAppendResult(
+                ok=True,
+                count=len(events),
+                first_seq=1,
+                last_seq=len(events),
+            )
+        return EventAppendResult(ok=False, count=0, first_seq=0, last_seq=0)
+
+
 class _SlowGuardrails(_Guardrails):
     def __init__(self) -> None:
         super().__init__(fail=False)
@@ -426,6 +450,14 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
     assert len(providers.guardrails.calls) == 2  # original + rotation
     assert providers.guardrails.calls[1][0] == new_session.session_id
     assert any(
+        key == f"{new_session.session_id}:rotation_seed"
+        and events
+        and getattr(events[0], "type", None) == "lifecycle"
+        and events[0].data["event"] == "session_rotated"
+        for session_id, events, key in providers.guardrails.recorded_events
+        if session_id == new_session.session_id
+    )
+    assert any(
         key == f"{new_session.session_id}:compaction_summary:rotation"
         and events
         and getattr(events[0], "type", None) == "compaction_summary"
@@ -447,7 +479,7 @@ async def test_rotate_session_keeps_new_root_when_compaction_summary_append_fail
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     providers = _Providers()
-    providers.guardrails = _NonAppendingGuardrails()
+    providers.guardrails = _OptionalAppendFailingGuardrails()
     cache = _Cache()
     manager = SessionManager(session_factory, providers, cache)
 
@@ -480,7 +512,46 @@ async def test_rotate_session_keeps_new_root_when_compaction_summary_append_fail
     assert new_row.status == "active"
     assert new_row.previous_session_id == root_session.session_id
     assert providers.guardrails.recorded_events
-    assert cache.appended_events == []
+    assert len(cache.appended_events) == 1
+    assert cache.appended_events[0][1][0].type == "lifecycle"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_session_does_not_activate_unseeded_intaris_stream(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _NonAppendingGuardrails()
+    cache = _Cache()
+    manager = SessionManager(session_factory, providers, cache)
+
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Rotation seed failure test",
+    )
+
+    with pytest.raises(RuntimeError, match="Could not seed rotated Intaris session stream"):
+        await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root_session,
+            intention="Continued after compaction",
+            completion_reason="compacted",
+            compaction_summary="Summary of older turns.",
+        )
+
+    async with session_factory() as db:
+        conv = await db.get(Conversation, conversation.conversation_id)
+        old_row = await db.get(Session, root_session.session_id)
+
+    assert conv is not None
+    assert conv.active_session_id == root_session.session_id
+    assert old_row is not None
+    assert old_row.status == "active"
+    assert old_row.completion_reason is None
+    assert root_session.session_id not in cache.evicted
 
     await engine.dispose()
 

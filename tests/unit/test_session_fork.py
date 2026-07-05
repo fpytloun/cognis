@@ -64,6 +64,11 @@ class _Guardrails:
     def __init__(self) -> None:
         self.recorded_events: list[SessionEvent] = []
         self.recorded_batches: list[list[SessionEvent]] = []
+        self.read_kwargs: list[dict[str, object]] = []
+
+    async def read_events(self, **kwargs: object) -> object:
+        self.read_kwargs.append(dict(kwargs))
+        return SimpleNamespace(events=[])
 
     async def record_events(self, **kwargs: object) -> object:
         events = cast(list[SessionEvent], kwargs.get("events", []))
@@ -219,3 +224,32 @@ async def test_fork_session_events_preserves_prefix_by_default() -> None:
     assert all(
         "turn_id" not in event.model_dump()["data"] for event in guardrails.recorded_events[1:]
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_session_events_tolerates_missing_source_stream() -> None:
+    cache = _SessionCache()
+    cache.events = []
+    cache.prefix_entries = []
+    guardrails = _Guardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="conversation_fork",
+    )
+
+    assert copied is False
+    assert guardrails.read_kwargs == [
+        {
+            "session_id": "source-intaris",
+            "after_seq": 0,
+            "allow_missing_stream": True,
+        }
+    ]
+    assert guardrails.recorded_events == []

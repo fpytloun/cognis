@@ -10,6 +10,8 @@ marked.setOptions({
 const forbiddenAttributes = ['onerror', 'onclick', 'onload', 'onmouseover'];
 const forbiddenTags = ['iframe', 'script', 'style'];
 const genericEnclosingFenceLanguages = new Set(['', 'md', 'markdown', 'plain', 'plaintext', 'text', 'txt']);
+const markdownCacheLimit = 500;
+const markdownCache = new Map<string, string>();
 
 interface FenceLine {
   indent: string;
@@ -195,17 +197,8 @@ function linkifyBareUrls(text: string): string {
   return html;
 }
 
-function applyOutgoingLinkTargets(html: string): string {
-  if (typeof document === 'undefined') return html;
-  const template = document.createElement('template');
-  template.innerHTML = html;
-  template.content.querySelectorAll('a[href]').forEach((link) => {
-    if (isOutgoingHref(link.getAttribute('href'))) {
-      link.setAttribute('target', '_blank');
-      link.setAttribute('rel', 'noopener noreferrer');
-    }
-  });
-  return template.innerHTML;
+function htmlMayContainBareUrl(html: string): boolean {
+  return html.includes('http://') || html.includes('https://');
 }
 
 function shouldSkipBareUrlLinkification(node: Node): boolean {
@@ -220,6 +213,7 @@ function linkifyBareUrlsInHtml(html: string): string {
   const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       if (shouldSkipBareUrlLinkification(node)) return NodeFilter.FILTER_REJECT;
+      bareUrlPattern.lastIndex = 0;
       return bareUrlPattern.test(node.textContent ?? '') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
     }
   });
@@ -253,6 +247,21 @@ function linkifyBareUrlsInHtml(html: string): string {
   return template.innerHTML;
 }
 
+function postProcessMarkdownHtml(html: string): string {
+  if (typeof document === 'undefined') return html;
+  if (!htmlMayContainBareUrl(html) && !html.includes('<a')) return html;
+
+  const template = document.createElement('template');
+  template.innerHTML = htmlMayContainBareUrl(html) ? linkifyBareUrlsInHtml(html) : html;
+  template.content.querySelectorAll('a[href]').forEach((link) => {
+    if (isOutgoingHref(link.getAttribute('href'))) {
+      link.setAttribute('target', '_blank');
+      link.setAttribute('rel', 'noopener noreferrer');
+    }
+  });
+  return template.innerHTML;
+}
+
 function createLinkRenderer(): Renderer {
   const renderer = new Renderer();
   const baseLink = renderer.link.bind(renderer);
@@ -280,6 +289,24 @@ function createLinkRenderer(): Renderer {
   return renderer;
 }
 
+const defaultLinkRenderer = createLinkRenderer();
+const docsRenderer = createDocsRenderer();
+
+function cacheGet(key: string): string | undefined {
+  const value = markdownCache.get(key);
+  if (value === undefined) return undefined;
+  markdownCache.delete(key);
+  markdownCache.set(key, value);
+  return value;
+}
+
+function cacheSet(key: string, value: string): void {
+  markdownCache.set(key, value);
+  if (markdownCache.size <= markdownCacheLimit) return;
+  const oldest = markdownCache.keys().next().value;
+  if (oldest !== undefined) markdownCache.delete(oldest);
+}
+
 export function sanitizeHtml(html: string): string {
   return DOMPurify.sanitize(html, {
     FORBID_ATTR: forbiddenAttributes,
@@ -289,8 +316,14 @@ export function sanitizeHtml(html: string): string {
 }
 
 export function renderMarkdown(markdown: string): string {
-  const parsed = marked.parse(normalizeEnclosingFence(markdown), { async: false, renderer: createLinkRenderer() });
-  return applyOutgoingLinkTargets(linkifyBareUrlsInHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : '')));
+  const normalized = normalizeEnclosingFence(markdown);
+  const cacheKey = `${typeof document === 'undefined' ? 'ssr' : 'dom'}\0${normalized}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+  const parsed = marked.parse(normalized, { async: false, renderer: defaultLinkRenderer });
+  const html = postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
+  cacheSet(cacheKey, html);
+  return html;
 }
 
 export function stripMarkdown(markdown: string): string {
@@ -321,9 +354,9 @@ function createDocsRenderer(): Renderer {
 export function renderDocsMarkdown(markdown: string): string {
   const parsed = marked.parse(normalizeEnclosingFence(markdown), {
     async: false,
-    renderer: createDocsRenderer()
+    renderer: docsRenderer
   });
-  return applyOutgoingLinkTargets(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
+  return postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
 }
 
 /**
@@ -407,8 +440,7 @@ export function createMarkdownStreamer(): MarkdownStreamer {
   }
 
   function parseSanitize(chunk: string): string {
-    const parsed = marked.parse(normalizeEnclosingFence(chunk), { async: false, renderer: createLinkRenderer() });
-    return applyOutgoingLinkTargets(linkifyBareUrlsInHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : '')));
+    return renderMarkdown(chunk);
   }
 
   function render(content: string): string {

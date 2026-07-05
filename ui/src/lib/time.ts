@@ -36,7 +36,7 @@ export function formatShortTime(value: string | null): string {
 export function formatRelativeTime(value: string | null, now = new Date()): string {
   const parsed = normalizeDate(value);
   if (!parsed) {
-    return 'just now';
+    return '';
   }
   const diffMs = parsed.getTime() - now.getTime();
   const diffSeconds = Math.round(diffMs / 1000);
@@ -103,7 +103,7 @@ export function formatDuration(
 export function formatCompactTime(value: string | null, now = new Date()): string {
   const short = formatShortTime(value);
   if (!short) {
-    return 'just now';
+    return '';
   }
   const relative = formatRelativeTime(value, now);
   return `${short} · ${relative}`;

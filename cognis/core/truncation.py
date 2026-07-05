@@ -94,10 +94,27 @@ def _middle_truncate_chars(
         # Not enough room for meaningful head+tail — fall back to head-only
         return text[:max_chars], True
 
-    head_size = int(available * head_ratio)
-    tail_size = available - head_size
+    head_size = _snap_head_to_newline(text, int(available * head_ratio))
+    tail_size = _snap_tail_to_newline(text, available - head_size)
 
     return text[:head_size] + marker + text[-tail_size:], True
+
+
+def _snap_head_to_newline(text: str, size: int) -> int:
+    if size <= 0 or size >= len(text):
+        return size
+    window_start = max(0, size - 2000)
+    newline = text.rfind("\n", window_start, size)
+    return newline + 1 if newline >= 0 else size
+
+
+def _snap_tail_to_newline(text: str, size: int) -> int:
+    if size <= 0 or size >= len(text):
+        return size
+    start = len(text) - size
+    window_end = min(len(text), start + 2000)
+    newline = text.find("\n", start, window_end)
+    return len(text) - newline - 1 if newline >= 0 else size
 
 
 def _middle_truncate_by_tokens(

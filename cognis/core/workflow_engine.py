@@ -253,11 +253,15 @@ class WorkflowEngine:
         on_tool_result: ToolResultCallback | None = None,
         on_tool_progress: Any | None = None,
         on_tool_output_chunk: ToolOutputChunkCallback | None = None,
+        on_context_usage: Any | None = None,
         cancel_event: asyncio.Event | None = None,
         bootstrap_wait_for_intention: bool = False,
         turn_id: str | None = None,
+        client_message_id: str | None = None,
         chat_mode: ResolvedChatMode | None = None,
         consume_boundary_batch: Callable[[str], Any] | None = None,
+        get_current_assistant_phase: Callable[[], int] | None = None,
+        get_assistant_phase_for_tool: Callable[[str], int | None] | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
 
@@ -310,6 +314,7 @@ class WorkflowEngine:
             executor_agent=agent,
             policy=CHAT_POLICY,
             user_message=user_message,
+            client_message_id=client_message_id,
             user_attachments=user_attachments or [],
             attachment_notice=attachment_notice,
             attachment_context=attachment_context,
@@ -331,6 +336,8 @@ class WorkflowEngine:
             chat_mode=chat_mode,
             controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
             consume_boundary_batch=consume_boundary_batch,
+            get_current_assistant_phase=get_current_assistant_phase,
+            get_assistant_phase_for_tool=get_assistant_phase_for_tool,
         )
         ctx.workspace_root, ctx.working_directory = _resolve_execution_paths(
             workspace_root=ctx.workspace_root,
@@ -358,6 +365,7 @@ class WorkflowEngine:
                     on_tool_result=on_tool_result,
                     on_tool_progress=on_tool_progress,
                     on_tool_output_chunk=on_tool_output_chunk,
+                    on_context_usage=on_context_usage,
                 )
         finally:
             await runtime.cleanup()
@@ -2305,6 +2313,11 @@ class WorkflowEngine:
                 session_id=prior_run.intaris_session_id,
                 events=with_session_events_turn_id([event], None),
                 source="cognis",
+                # A lost response after a successful append must not duplicate
+                # the feedback event when the internal retry re-sends it.
+                idempotency_key=(
+                    f"{prior_run.intaris_session_id}:evaluation_feedback:{step_def.name}:{attempt}"
+                ),
             )
             # Clear in-state fallback — the event is now in Intaris
             state.last_evaluation_feedback = None
@@ -2462,6 +2475,11 @@ class WorkflowEngine:
                 "task_delivery: explicit silent completion, skipping outward delivery",
                 extra={"extra_data": {"task_id": task.task_id}},
             )
+            await self._publish_task_terminal_event(
+                task,
+                silent_delivery=True,
+                delivery_skipped_reason="explicit_silent_completion",
+            )
             return
 
         delivery_mode = task.delivery.mode
@@ -2477,6 +2495,10 @@ class WorkflowEngine:
                         "source_ref": task.source_ref,
                     }
                 },
+            )
+            await self._publish_task_terminal_event(
+                task,
+                delivery_skipped_reason="no_target_conversation",
             )
             return
 
@@ -2506,6 +2528,12 @@ class WorkflowEngine:
                 "task_delivery: legacy silent delivery mode, skipping",
                 extra={"extra_data": {"task_id": task.task_id}},
             )
+            await self._publish_task_terminal_event(
+                task,
+                conversation_id=target_conversation_id,
+                silent_delivery=True,
+                delivery_skipped_reason="legacy_silent_delivery",
+            )
             return
 
         logger.info(
@@ -2521,6 +2549,32 @@ class WorkflowEngine:
         )
 
         await self._deliver_task_result_default(task, target_conversation_id)
+
+    async def _publish_task_terminal_event(self, task: TaskModel, **extra_data: object) -> None:
+        """Publish the internal terminal task lifecycle event.
+
+        Result delivery and task lifecycle propagation are separate concerns:
+        silent or unresolved outward delivery must not suppress internal
+        observers such as the scheduler.
+        """
+
+        event_type = EventType.TASK_FAILED
+        if task.status == TaskStatus.COMPLETED:
+            event_type = EventType.TASK_COMPLETED
+        elif task.status == TaskStatus.CANCELLED:
+            event_type = EventType.TASK_CANCELLED
+
+        result_data = task.result_data if isinstance(task.result_data, dict) else {}
+        data = {
+            "task_id": task.task_id,
+            "task_title": task.title,
+            "title": task.title,
+            "result_summary": task.result_summary,
+            "attachments": result_data.get("attachments", []),
+        }
+        data.update(extra_data)
+
+        await self._event_bus.publish(Event(type=event_type, data=data))
 
     async def _resolve_task_delivery_conversation(self, task: TaskModel) -> str | None:
         """Resolve the conversation that should receive a task result."""
@@ -2679,6 +2733,12 @@ class WorkflowEngine:
                     "extra_data": {"task_id": task.task_id, "deliverable_id": final_deliverable_id}
                 },
             )
+            await self._publish_task_terminal_event(
+                task,
+                conversation_id=target_conversation_id,
+                direct_delivery=True,
+                delivery_skipped_reason="deliverable_already_delivered",
+            )
             return
 
         sent = await self._channel_delivery.send_to_conversation(
@@ -2810,6 +2870,14 @@ class WorkflowEngine:
                             session_id=sess.intaris_session_id,
                             events=with_session_events_turn_id([event], None),
                             source="cognis",
+                            # Idempotency key: the provider retries internally
+                            # and this loop retries once more — a lost response
+                            # after a successful server-side append must not
+                            # duplicate the task-result message on reload.
+                            idempotency_key=(
+                                f"{sess.intaris_session_id}:task_delivery:"
+                                f"{task.task_id}:{task.status}"
+                            ),
                         )
                 break  # Success
             except Exception:

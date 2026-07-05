@@ -869,26 +869,26 @@
 
 {#if open}
   <div
-    class="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-md"
+    class="app-viewport-overlay app-safe-fullscreen z-50 bg-slate-950/95 backdrop-blur-md"
     role="dialog"
     aria-modal="true"
     aria-label="Voice conversation mode"
     tabindex="-1"
     onpointerdown={handleOverlayPointerDown}
-    style="padding-left: max(1rem, env(safe-area-inset-left, 0px)); padding-right: max(1rem, env(safe-area-inset-right, 0px)); padding-top: max(1rem, calc(env(safe-area-inset-top, 0px) + 0.5rem)); padding-bottom: max(1rem, calc(env(safe-area-inset-bottom, 0px) + 0.5rem));"
   >
-    <button
-      type="button"
-      class="absolute z-10 inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-900/80 text-slate-300 transition hover:bg-slate-800 hover:text-white"
-      style="right: max(1rem, env(safe-area-inset-right, 0px)); top: max(1rem, calc(env(safe-area-inset-top, 0px) + 0.5rem));"
-      aria-label="End conversation"
-      onclick={handleClose}
-    >
-      <X class="h-5 w-5" />
-    </button>
+    <div class="app-safe-fullscreen__toolbar flex justify-end">
+      <button
+        type="button"
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-900/90 text-slate-300 shadow-lg backdrop-blur transition hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+        aria-label="End conversation"
+        onclick={handleClose}
+      >
+        <X class="h-5 w-5" />
+      </button>
+    </div>
 
-    <div class="mx-auto flex h-full w-full max-w-2xl flex-col items-center justify-between gap-5">
-      <div class="flex w-full items-center gap-3 pr-14">
+    <div class="app-safe-fullscreen__content mx-auto flex w-full max-w-2xl flex-col items-center justify-between gap-5">
+      <div class="flex w-full items-center gap-3">
         <AgentAvatar name={agentLabel()} avatarUrl={agent?.avatar_url ?? null} class="h-11 w-11 rounded-2xl" />
         <div class="min-w-0">
           <p class="truncate text-base font-semibold text-white">{agentLabel()}</p>

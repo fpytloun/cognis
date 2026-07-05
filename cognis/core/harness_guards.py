@@ -57,7 +57,8 @@ class LoopGuardState:
     """
 
     last_key: tuple[str, str] | None = None
-    streak: int = 0
+    last_result_hash: str | None = None
+    identical_result_streak: int = 0
     exemptions: set[str] = field(default_factory=set)
 
 
@@ -73,6 +74,10 @@ class LoopGuardState:
 _LOOP_GUARD_EXEMPT_TOOLS: frozenset[str] = frozenset(
     {
         # Pagination-likely tools commonly called repeatedly.
+        "agent_conversation_get",
+        "agent_conversation_wait",
+        "bash_output",
+        "get_subsession",
         "memory_list",
         "memory_recent",
         "memory_search",
@@ -110,24 +115,18 @@ def check_loop_guard(
     tool_name: str,
     arguments: dict[str, Any] | None,
 ) -> str | None:
-    """Inspect a pending tool call and return a teach-back message or None.
+    """Inspect a pending tool call and return a teach-back message or None."""
 
-    Call ``record_tool_call`` after the tool has actually been dispatched
-    (or after the teach-back is delivered). This split lets callers short-
-    circuit execution on a repeat detection.
-    """
-
-    if tool_name in _LOOP_GUARD_EXEMPT_TOOLS:
+    if tool_name in _LOOP_GUARD_EXEMPT_TOOLS or tool_name in state.exemptions:
         return None
     key = (tool_name, _args_hash(tool_name, arguments))
-    if state.last_key == key and state.streak >= 1:
+    if state.last_key == key and state.identical_result_streak >= 2:
         return (
-            "Detected a repeated identical tool call with no intervening "
-            f"change — '{tool_name}' was called twice in a row with the same "
-            "arguments and produced no new information. Proceed with a "
-            "different concrete action, update the todo list, or call "
-            "step_complete if the objective is done. Do not retry the same "
-            "call."
+            "Detected repeated identical tool calls with identical results — "
+            f"'{tool_name}' was called with the same arguments and produced no "
+            "new information. Proceed with a different concrete action, update "
+            "the todo list, or call step_complete if the objective is done. Do "
+            "not retry the same call."
         )
     return None
 
@@ -137,20 +136,41 @@ def record_tool_call(
     tool_name: str,
     arguments: dict[str, Any] | None,
 ) -> None:
-    """Record that a tool call has been dispatched.
+    """Compatibility hook for older call sites.
 
-    Increments the streak when the (name, args) tuple matches the previous
-    recording; resets otherwise. Must be called for every executed call,
-    including calls that were intercepted by the controller (step_complete,
-    step_todo_write, etc.) so the guard reflects the ground-truth sequence.
+    The guard is result-aware: it updates actionable state only when the
+    model-visible result is known via ``record_tool_result``.
     """
 
+    _ = (state, tool_name, arguments)
+
+
+def _result_hash(result: Any) -> str:
+    try:
+        serialized = json.dumps(result, sort_keys=True, default=str)
+    except TypeError:
+        serialized = str(result)
+    return hashlib.sha1(serialized.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def record_tool_result(
+    state: LoopGuardState,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    result: Any,
+) -> None:
+    """Record the model-visible result for a completed tool call."""
+
+    if tool_name in _LOOP_GUARD_EXEMPT_TOOLS or tool_name in state.exemptions:
+        return
     key = (tool_name, _args_hash(tool_name, arguments))
-    if state.last_key == key:
-        state.streak += 1
-    else:
-        state.last_key = key
-        state.streak = 1
+    result_hash = _result_hash(result)
+    if state.last_key == key and state.last_result_hash == result_hash:
+        state.identical_result_streak += 1
+        return
+    state.last_key = key
+    state.last_result_hash = result_hash
+    state.identical_result_streak = 1
 
 
 def loop_guard_rejection_payload(

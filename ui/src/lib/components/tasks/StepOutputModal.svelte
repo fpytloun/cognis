@@ -176,7 +176,7 @@
   scrolling internally.
 -->
 <div
-  class="app-viewport-overlay z-[95] flex items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/85 px-3 py-3 backdrop-blur sm:items-center sm:px-4 sm:py-6"
+  class="app-viewport-overlay app-safe-fullscreen z-[95] items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/85 backdrop-blur sm:items-center"
   role="presentation"
 >
   <button class="absolute inset-0" onclick={onclose} type="button" aria-label="Close full output"></button>

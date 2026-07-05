@@ -112,6 +112,10 @@ class CognisConfig:
     initial_admin_email: str | None
     initial_admin_password: str | None
 
+    # Default backend selection (overridden per-agent via AgentCapabilities)
+    default_memory_backend: str
+    default_guardrails_backend: str
+
 
 def load_config() -> CognisConfig:
     """Load configuration from environment variables.
@@ -260,6 +264,8 @@ def load_config() -> CognisConfig:
         tool_output_max_size_mb=int(os.environ.get("COGNIS_TOOL_OUTPUT_MAX_SIZE_MB", "500")),
         initial_admin_email=os.environ.get("COGNIS_INITIAL_ADMIN_EMAIL"),
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
+        default_memory_backend=os.environ.get("COGNIS_DEFAULT_MEMORY_BACKEND", "mnemory"),
+        default_guardrails_backend=os.environ.get("COGNIS_DEFAULT_GUARDRAILS_BACKEND", "intaris"),
     )
 
 

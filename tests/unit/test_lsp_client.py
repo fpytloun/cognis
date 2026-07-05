@@ -8,7 +8,7 @@ import logging
 import pytest
 
 from cognis.tools.executor.lsp.client import LSPClient, file_uri, uri_to_path
-from cognis.tools.executor.lsp.types import DiagnosticSeverity
+from cognis.tools.executor.lsp.types import DiagnosticFreshness, DiagnosticSeverity
 
 
 class TestFileUri:
@@ -74,6 +74,38 @@ class TestPublishDiagnostics:
         assert diags == {}
         # But internal state has the key with an empty list
         assert client._diagnostics["file:///src/foo.py"] == []
+
+    def test_stale_versioned_diagnostics_do_not_replace_fresh_snapshot(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 2)
+
+        client._handle_publish_diagnostics({"uri": uri, "version": 1, "diagnostics": []})
+
+        assert client.get_diagnostic_snapshots(uri) == {}
+        assert client.get_diagnostics(uri) == {}
+
+    def test_matching_versioned_diagnostics_are_fresh(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 2)
+
+        client._handle_publish_diagnostics({"uri": uri, "version": 2, "diagnostics": []})
+
+        snapshot = client.get_diagnostic_snapshots(uri)[uri]
+        assert snapshot.freshness is DiagnosticFreshness.FRESH
+        assert snapshot.diagnostic_version == 2
+        assert snapshot.document_version == 2
+
+    def test_unversioned_diagnostics_after_update_are_marked_fresh_unversioned(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 3)
+
+        client._handle_publish_diagnostics({"uri": uri, "diagnostics": []})
+
+        snapshot = client.get_diagnostic_snapshots(uri)[uri]
+        assert snapshot.freshness is DiagnosticFreshness.FRESH_UNVERSIONED
 
     def test_handle_malformed_diagnostic(self) -> None:
         """Malformed diagnostics should be skipped, not crash."""
@@ -246,9 +278,110 @@ class TestDispatch:
         assert client.has_pending_diagnostics(uri)
 
         client._handle_publish_diagnostics({"uri": uri, "diagnostics": []})
-        await task
+        result = await task
 
         assert not client.has_pending_diagnostics(uri)
+        assert result.status is DiagnosticFreshness.FRESH_UNVERSIONED
+
+    @pytest.mark.asyncio()
+    async def test_wait_for_diagnostics_times_out_without_stale_cache(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 2)
+        client._handle_publish_diagnostics({"uri": uri, "version": 1, "diagnostics": []})
+
+        result = await client.wait_for_diagnostics(uri, target_version=2, timeout_ms=1)
+
+        assert result.status is DiagnosticFreshness.TIMEOUT
+        assert result.snapshot is None
+
+    @pytest.mark.asyncio()
+    async def test_wait_for_diagnostics_debounces_first_fresh_batch(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 1)
+
+        task = asyncio.create_task(
+            client.wait_for_diagnostics(uri, target_version=1, timeout_ms=1000, debounce_ms=50)
+        )
+        await asyncio.sleep(0)
+        client._handle_publish_diagnostics({"uri": uri, "version": 1, "diagnostics": []})
+        await asyncio.sleep(0.01)
+        client._handle_publish_diagnostics(
+            {
+                "uri": uri,
+                "version": 1,
+                "diagnostics": [
+                    {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 1},
+                        },
+                        "severity": 1,
+                        "message": "late error",
+                    }
+                ],
+            }
+        )
+
+        result = await task
+
+        assert result.status is DiagnosticFreshness.FRESH
+        assert result.error_count == 1
+
+    @pytest.mark.asyncio()
+    async def test_wait_for_diagnostics_debounces_preexisting_fresh_snapshot(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 1)
+        client._handle_publish_diagnostics({"uri": uri, "version": 1, "diagnostics": []})
+
+        task = asyncio.create_task(
+            client.wait_for_diagnostics(uri, target_version=1, timeout_ms=1000, debounce_ms=50)
+        )
+        await asyncio.sleep(0.01)
+        client._handle_publish_diagnostics(
+            {
+                "uri": uri,
+                "version": 1,
+                "diagnostics": [
+                    {
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 1},
+                        },
+                        "severity": 1,
+                        "message": "late preexisting error",
+                    }
+                ],
+            }
+        )
+
+        result = await task
+
+        assert result.status is DiagnosticFreshness.FRESH
+        assert result.error_count == 1
+
+    @pytest.mark.asyncio()
+    async def test_wait_for_diagnostics_continues_after_stale_batch(self) -> None:
+        client = LSPClient("test", "test-cmd", [], "file:///tmp")
+        uri = "file:///src/foo.py"
+        client._mark_document_updated(uri, 2)
+
+        task = asyncio.create_task(
+            client.wait_for_diagnostics(uri, target_version=2, timeout_ms=1000, debounce_ms=10)
+        )
+        await asyncio.sleep(0)
+        client._handle_publish_diagnostics({"uri": uri, "version": 1, "diagnostics": []})
+        await asyncio.sleep(0.03)
+        client._handle_publish_diagnostics({"uri": uri, "version": 2, "diagnostics": []})
+
+        result = await task
+
+        assert result.status is DiagnosticFreshness.FRESH
+        assert result.target_version == 2
+        assert result.snapshot is not None
+        assert result.snapshot.diagnostic_version == 2
 
     @pytest.mark.asyncio()
     async def test_dispatch_response(self) -> None:

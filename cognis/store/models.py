@@ -145,6 +145,7 @@ class Agent(Base):
     tools: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     permissions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     llm_config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    capabilities: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     agent_profiles: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     default_agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     execution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -388,6 +389,57 @@ class Conversation(Base):
     )
 
 
+class ChatClientTransactionRow(Base):
+    """Durable idempotency ledger for Chat v2 client mutations.
+
+    The row is a control-plane ledger only. Canonical conversation content remains
+    in the configured session event store; route handlers store only request
+    identity, request hash, and small mutation results here.
+    """
+
+    __tablename__ = "chat_client_transactions"
+
+    transaction_id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"chat_txn_{uuid.uuid4().hex}"
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    principal_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("users.email", ondelete="CASCADE"),
+        nullable=False,
+    )
+    client_txn_id: Mapped[str] = mapped_column(String, nullable=False)
+    operation: Mapped[str] = mapped_column(String, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "principal_id",
+            "client_txn_id",
+            "operation",
+            name="uq_chat_client_transactions_key",
+        ),
+        Index("ix_chat_client_transactions_conversation", "conversation_id"),
+        Index("ix_chat_client_transactions_principal", "principal_id"),
+        Index("ix_chat_client_transactions_updated", "updated_at"),
+    )
+
+
 class Session(Base):
     """Session metadata. Session content is in Intaris.
 
@@ -422,6 +474,62 @@ class Session(Base):
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class ConversationTodo(Base):
+    """Authoritative conversation-scoped TODO state.
+
+    Cognis may create or rotate backing Intaris sessions under one chat
+    conversation. This table is the OpenCode-style long-lived TODO state for
+    the user-visible conversation.
+    """
+
+    __tablename__ = "conversation_todos"
+    __table_args__ = (Index("ix_conversation_todos_conversation", "conversation_id"),)
+
+    conversation_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    priority: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class SessionTodo(Base):
+    """Backing-session TODO state.
+
+    Session content still lives in Intaris; TODOs are small controller-owned
+    runtime state. ConversationTodo is authoritative for user-visible chat
+    state; this table mirrors it for backing-session lineage and audit.
+    """
+
+    __tablename__ = "session_todos"
+    __table_args__ = (Index("ix_session_todos_session", "session_id"),)
+
+    session_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("sessions.session_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    priority: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
@@ -655,6 +763,25 @@ class Task(Base):
     """
 
     __tablename__ = "tasks"
+    __table_args__ = (
+        Index("ix_tasks_owner_updated", "created_by", "updated_at", "task_id"),
+        Index("ix_tasks_owner_status_updated", "created_by", "status", "updated_at", "task_id"),
+        Index("ix_tasks_owner_agent_updated", "created_by", "agent_id", "updated_at", "task_id"),
+        Index(
+            "ix_tasks_owner_project_updated",
+            "created_by",
+            "project_id",
+            "updated_at",
+            "task_id",
+        ),
+        Index(
+            "ix_tasks_owner_workflow_updated",
+            "created_by",
+            "workflow_id",
+            "updated_at",
+            "task_id",
+        ),
+    )
 
     task_id: Mapped[str] = mapped_column(String, primary_key=True)
     title: Mapped[str] = mapped_column(String, nullable=False)

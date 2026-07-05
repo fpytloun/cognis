@@ -433,8 +433,19 @@ class ArtifactStore:
         """Check if an artifact exists (sync)."""
         return self._backend.exists(namespace, object_id, filename)
 
-    def _filesystem_signature(self, namespace: str, object_id: str, filename: str, exp: int) -> str:
-        payload = f"{namespace}:{object_id}:{filename}:{exp}".encode()
+    def _filesystem_signature(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        exp: int,
+        *,
+        mode: str = "download",
+    ) -> str:
+        if mode == "download":
+            payload = f"{namespace}:{object_id}:{filename}:{exp}".encode()
+        else:
+            payload = f"{namespace}:{object_id}:{filename}:{exp}:{mode}".encode()
         secret = self._config.signing_secret.encode("utf-8")
         return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
@@ -474,6 +485,7 @@ class ArtifactStore:
         filename: str,
         *,
         ttl_seconds: int | None = None,
+        mode: str = "download",
     ) -> str:
         """Generate a Cognis-served signed URL for an artifact.
 
@@ -482,22 +494,32 @@ class ArtifactStore:
         user-facing or channel-facing artifact delivery where internal backend
         hostnames may not be reachable.
         """
+        if mode not in {"download", "view"}:
+            raise ValueError(f"Unsupported artifact URL mode: {mode}")
         if not self._config.base_url or not self._config.signing_secret:
             raise ValueError("Artifact public URLs require base_url and signing_secret")
         ttl = ttl_seconds or self._config.signed_url_ttl_seconds
         exp = int(time.time()) + ttl
-        sig = self._filesystem_signature(namespace, object_id, filename, exp)
-        path = f"/api/v1/artifacts/content/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
+        sig = self._filesystem_signature(namespace, object_id, filename, exp, mode=mode)
+        route = "content" if mode == "download" else "view"
+        path = f"/api/v1/artifacts/{route}/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
         return f"{self._config.base_url}{path}?exp={exp}&sig={sig}"
 
     def verify_signed_request(
-        self, namespace: str, object_id: str, filename: str, *, exp: int, sig: str
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        *,
+        exp: int,
+        sig: str,
+        mode: str = "download",
     ) -> bool:
         if exp < int(time.time()):
             return False
         if not self._config.signing_secret:
             return False
-        expected = self._filesystem_signature(namespace, object_id, filename, exp)
+        expected = self._filesystem_signature(namespace, object_id, filename, exp, mode=mode)
         return hmac.compare_digest(expected, sig)
 
     # ------------------------------------------------------------------
@@ -573,9 +595,15 @@ class ArtifactStore:
         filename: str,
         *,
         ttl_seconds: int | None = None,
+        mode: str = "download",
     ) -> str:
         import asyncio
 
         return await asyncio.to_thread(
-            self.get_public_url, namespace, object_id, filename, ttl_seconds=ttl_seconds
+            self.get_public_url,
+            namespace,
+            object_id,
+            filename,
+            ttl_seconds=ttl_seconds,
+            mode=mode,
         )

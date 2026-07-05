@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from time import monotonic
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 import httpx
 from prometheus_client import Counter, Histogram
@@ -40,6 +40,7 @@ from sqlalchemy.exc import IntegrityError
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.core.agent_direct import is_agent_direct_context
+from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.attachment_utils import (
     attachment_placeholder_text,
     normalize_attachment_refs,
@@ -56,6 +57,9 @@ from cognis.core.compaction import ROTATION_TOTAL
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
+    LLM_CYCLE_CEILING_CONTINUATION_REASON,
+    STEP_TIMEOUT_CONTINUATION_REASON,
+    TOOL_CALL_CEILING_CONTINUATION_REASON,
     ContinuationFollowUp,
     FollowUpMetadata,
     FollowUpMode,
@@ -63,8 +67,10 @@ from cognis.core.followups import (
     FollowUpRelevanceHint,
     FollowUpRequiredAction,
     FollowUpStatus,
+    build_automatic_continuation_follow_up,
     build_follow_up_id,
     parse_follow_up_metadata,
+    positive_optional_int,
     render_follow_up_turn_notice,
     truncate_follow_up_text,
 )
@@ -133,7 +139,6 @@ DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_SECONDS = 21600
 DEFAULT_LONG_LIVED_CHAT_IDLE_COMPACTION_MIN_EVENTS = 20
 _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
-MAX_AUTOMATIC_CONTINUATION_ATTEMPTS = 3
 
 
 def _utcnow() -> datetime:
@@ -273,6 +278,8 @@ class TurnResult:
     chat_mode_source: str = "system_default"
     partial: bool = False
     finish_reason: str | None = None
+    assistant_phase_index: int = 0
+    turn_cycle_index: int | None = None
     managed_continuation_pending: bool = False
     runtime: dict[str, Any] | None = None
 
@@ -287,19 +294,25 @@ class ActiveStreamState:
     turn_id: str | None
     content: str = ""
     chunk_count: int = 0
+    assistant_phase_index: int = 0
+    turn_cycle_index: int | None = None
     updated_at: datetime = field(default_factory=_utcnow)
 
     def snapshot(self) -> dict[str, Any]:
-        return {
+        snapshot = {
             "conversation_id": self.conversation_id,
             "session_id": self.session_id,
             "message_id": self.message_id,
             "turn_id": self.turn_id,
             "content": self.content,
             "chunk_count": self.chunk_count,
+            "assistant_phase_index": self.assistant_phase_index,
             "content_offset": _utf16_code_units(self.content),
             "updated_at": self.updated_at.isoformat(),
         }
+        if self.turn_cycle_index is not None:
+            snapshot["turn_cycle_index"] = self.turn_cycle_index
+        return snapshot
 
 
 @dataclass(slots=True)
@@ -311,6 +324,8 @@ class ActiveToolOutputSnapshot:
     call_id: str
     tool_name: str
     turn_id: str | None
+    assistant_phase_index: int | None = None
+    turn_cycle_index: int | None = None
     status: str = "running"
     result: str = ""
     stream: str | None = None
@@ -326,6 +341,15 @@ class ActiveToolOutputSnapshot:
     tool_output_artifact_id: str | None = None
     anchors_available: bool = False
     anchor_count: int = 0
+    progress_phase: str | None = None
+    progress_input_chars: int | None = None
+    progress_input_lines: int | None = None
+    progress_complete: bool | None = None
+    # Parent-log-safe structured tool arguments (dict). Carried on the runtime
+    # overlay so the live tool card renders its per-tool subtitle/body before
+    # the canonical tool_call event lands. Never contains delegated prompt
+    # content (delegate arguments are redacted upstream in on_tool_call).
+    arguments: dict[str, Any] | None = None
     updated_at: datetime = field(default_factory=_utcnow)
 
     def expired(self, now: datetime | None = None) -> bool:
@@ -334,12 +358,13 @@ class ActiveToolOutputSnapshot:
         )
 
     def snapshot(self) -> dict[str, Any]:
-        return {
+        snapshot = {
             "conversation_id": self.conversation_id,
             "session_id": self.session_id,
             "call_id": self.call_id,
             "tool_name": self.tool_name,
             "turn_id": self.turn_id,
+            "assistant_phase_index": self.assistant_phase_index,
             "status": self.status,
             "result": self.result,
             "stream": self.stream,
@@ -355,8 +380,16 @@ class ActiveToolOutputSnapshot:
             "tool_output_artifact_id": self.tool_output_artifact_id,
             "anchors_available": self.anchors_available,
             "anchor_count": self.anchor_count,
+            "progress_phase": self.progress_phase,
+            "progress_input_chars": self.progress_input_chars,
+            "progress_input_lines": self.progress_input_lines,
+            "progress_complete": self.progress_complete,
+            "arguments": self.arguments,
             "updated_at": self.updated_at.isoformat(),
         }
+        if self.turn_cycle_index is not None:
+            snapshot["turn_cycle_index"] = self.turn_cycle_index
+        return snapshot
 
     @classmethod
     def from_snapshot(cls, data: dict[str, Any]) -> ActiveToolOutputSnapshot | None:
@@ -371,6 +404,12 @@ class ActiveToolOutputSnapshot:
                 call_id=str(data["call_id"]),
                 tool_name=str(data.get("tool_name") or "tool"),
                 turn_id=data.get("turn_id") if isinstance(data.get("turn_id"), str) else None,
+                assistant_phase_index=data.get("assistant_phase_index")
+                if isinstance(data.get("assistant_phase_index"), int)
+                else None,
+                turn_cycle_index=data.get("turn_cycle_index")
+                if isinstance(data.get("turn_cycle_index"), int)
+                else None,
                 status=str(data.get("status") or "running"),
                 result=str(data.get("result") or ""),
                 stream=data.get("stream") if isinstance(data.get("stream"), str) else None,
@@ -390,6 +429,21 @@ class ActiveToolOutputSnapshot:
                 else None,
                 anchors_available=bool(data.get("anchors_available")),
                 anchor_count=int(data.get("anchor_count") or 0),
+                progress_phase=data.get("progress_phase")
+                if isinstance(data.get("progress_phase"), str)
+                else None,
+                progress_input_chars=int(data["progress_input_chars"])
+                if isinstance(data.get("progress_input_chars"), int)
+                else None,
+                progress_input_lines=int(data["progress_input_lines"])
+                if isinstance(data.get("progress_input_lines"), int)
+                else None,
+                progress_complete=bool(data.get("progress_complete"))
+                if isinstance(data.get("progress_complete"), bool)
+                else None,
+                arguments=data.get("arguments")
+                if isinstance(data.get("arguments"), dict)
+                else None,
                 updated_at=updated_at,
             )
         except Exception:
@@ -442,9 +496,11 @@ class _TurnControl:
     turn_observers: list[TurnObserver] = field(default_factory=list)
     absorbed_follow_up_ids: set[str] = field(default_factory=set)
     absorbed_outbound_attachments: list[dict[str, Any]] = field(default_factory=list)
+    active_delivery_id: str | None = None
     absorbed_channel_deliverable: bool = False
     absorbed_delivery_id: str | None = None
     absorbed_delivery_fallback_text: str | None = None
+    suppressed_channel_delivery_ids: list[str] = field(default_factory=list)
 
 
 def _user_message_event_id(
@@ -512,13 +568,30 @@ def _user_message_event_payload(
     }
 
 
-def _tool_call_ceiling_metadata(step_output: Any | None) -> dict[str, Any] | None:
+_AUTOMATIC_CONTINUATION_REASONS = {
+    LLM_CYCLE_CEILING_CONTINUATION_REASON,
+    TOOL_CALL_CEILING_CONTINUATION_REASON,
+    STEP_TIMEOUT_CONTINUATION_REASON,
+}
+
+
+def _automatic_continuation_metadata(step_output: Any | None) -> dict[str, Any] | None:
     metadata = getattr(step_output, "metadata", None)
     if not isinstance(metadata, dict):
         return None
-    if metadata.get("continuation_reason") != "tool_call_ceiling_reached":
+    if metadata.get("continuation_reason") not in _AUTOMATIC_CONTINUATION_REASONS:
         return None
     return metadata
+
+
+def _automatic_continuation_exhausted_subject(reason: str) -> str:
+    if reason == TOOL_CALL_CEILING_CONTINUATION_REASON:
+        return "tool-call ceilings"
+    if reason == LLM_CYCLE_CEILING_CONTINUATION_REASON:
+        return "LLM cycle ceilings"
+    if reason == STEP_TIMEOUT_CONTINUATION_REASON:
+        return "step timeouts"
+    return "turn boundaries"
 
 
 def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
@@ -533,34 +606,6 @@ def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
         recoverable=True,
         detail={"error_detail": error_text[:2000]},
     )
-
-
-def _pending_todos_from_metadata(metadata: dict[str, Any]) -> list[dict[str, str]]:
-    todos = metadata.get("pending_todos")
-    if not isinstance(todos, list):
-        return []
-    pending: list[dict[str, str]] = []
-    for todo in todos:
-        if not isinstance(todo, dict):
-            continue
-        content = str(todo.get("content") or "").strip()
-        if not content:
-            continue
-        status = str(todo.get("status") or "pending").strip() or "pending"
-        if status in {"completed", "cancelled"}:
-            continue
-        pending.append({"content": content, "status": status})
-    return pending
-
-
-def _positive_optional_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
 
 
 class SessionCreationFailedError(Exception):
@@ -593,6 +638,7 @@ class TurnObserver(Protocol):
         delta: str,
         chunk_index: int | None = None,
         content_offset: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None: ...
 
     async def on_tool_call(
@@ -603,6 +649,8 @@ class TurnObserver(Protocol):
         tool_name: str,
         arguments: dict[str, Any] | None,
         turn_id: str | None,
+        assistant_phase_index: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None: ...
 
     async def on_tool_progress(
@@ -613,6 +661,7 @@ class TurnObserver(Protocol):
         tool_name: str,
         progress: dict[str, Any],
         turn_id: str | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None: ...
 
     async def on_tool_result(
@@ -629,6 +678,8 @@ class TurnObserver(Protocol):
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
         presentation: dict[str, Any] | None = None,
+        assistant_phase_index: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None: ...
 
     async def on_tool_output_chunk(
@@ -642,6 +693,7 @@ class TurnObserver(Protocol):
         turn_id: str | None = None,
         chunk_index: int | None = None,
         content_offset: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None: ...
 
     async def on_thinking(
@@ -660,6 +712,15 @@ class TurnObserver(Protocol):
         duration_ms: int | None = None,
         source: str | None = None,
         provider_block_index: int | None = None,
+        turn_cycle_index: int | None = None,
+    ) -> None: ...
+
+    async def on_context_usage(
+        self,
+        conversation_id: str,
+        session_id: str,
+        usage: dict[str, Any],
+        turn_id: str | None = None,
     ) -> None: ...
 
     async def on_turn_complete(self, result: TurnResult) -> None: ...
@@ -741,6 +802,11 @@ class TurnScheduler:
         self._escalation_notice_pause_ids: dict[str, str] = {}
         self._pending_follow_ups: set[tuple[str, str]] = set()
         self._handled_follow_ups: dict[tuple[str, str], float] = {}
+        self._assistant_phase_by_turn: dict[tuple[str, str], int] = {}
+        self._assistant_phase_tool_keys: set[tuple[str, str, str]] = set()
+        self._assistant_phase_by_tool: dict[tuple[str, str, str], int] = {}
+        self._turn_cycle_by_turn: dict[tuple[str, str], int] = {}
+        self._turn_cycle_by_tool: dict[tuple[str, str, str], int] = {}
         self._active_streams: dict[str, ActiveStreamState] = {}
         self._active_streams_lock = asyncio.Lock()
         self._published_title_updates: dict[str, str] = {}
@@ -850,7 +916,12 @@ class TurnScheduler:
                     if snapshot.turn_id != active_turn_id:
                         stale_keys.append(key)
                         continue
-                    if snapshot.status == "running" and snapshot.result and not snapshot.expired():
+                    has_visible_progress = bool(snapshot.result or snapshot.progress_phase)
+                    if (
+                        snapshot.status == "running"
+                        and has_visible_progress
+                        and not snapshot.expired()
+                    ):
                         snapshots.append(snapshot.snapshot())
                 for key in stale_keys:
                     self._active_tool_outputs.pop(key, None)
@@ -902,7 +973,7 @@ class TurnScheduler:
                 if (
                     cid == conversation_id
                     and snapshot.status == "running"
-                    and snapshot.result
+                    and (snapshot.result or snapshot.progress_phase)
                     and not snapshot.expired()
                 )
             ]
@@ -943,8 +1014,16 @@ class TurnScheduler:
                     call_id=call_id,
                     tool_name=tool_name,
                     turn_id=turn_id,
+                    assistant_phase_index=self._assistant_phase_for_tool(
+                        conversation_id, turn_id, call_id
+                    ),
+                    turn_cycle_index=self._turn_cycle_for_tool(conversation_id, turn_id, call_id),
                 )
                 self._active_tool_outputs[key] = snapshot
+            snapshot.turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
+            snapshot.assistant_phase_index = self._assistant_phase_for_tool(
+                conversation_id, turn_id, call_id
+            )
             index = snapshot.chunk_count
             offset = snapshot.content_offset
             next_result = snapshot.result + delta
@@ -976,6 +1055,92 @@ class TurnScheduler:
         await self._persist_active_tool_output_l2(conversation_id)
         return index, offset
 
+    async def _record_active_tool_arguments(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        turn_id: str | None,
+        arguments: dict[str, Any] | None,
+    ) -> None:
+        """Record parent-safe tool arguments on the active-tool snapshot.
+
+        Called from ``on_tool_call`` so the runtime overlay tool item can render
+        its per-tool subtitle/body immediately, even before the canonical
+        ``tool_call`` event is persisted. Delegate arguments are already
+        redacted upstream. This does not, by itself, make the snapshot visible
+        in the overlay (visibility still requires result or progress); it seeds
+        the arguments so they are present once the tool emits progress/output.
+        """
+        if not isinstance(arguments, dict):
+            return
+        async with self._active_tool_outputs_lock:
+            key = (conversation_id, session_id, call_id)
+            snapshot = self._active_tool_outputs.get(key)
+            if snapshot is None:
+                snapshot = ActiveToolOutputSnapshot(
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    turn_id=turn_id,
+                    assistant_phase_index=self._assistant_phase_for_tool(
+                        conversation_id, turn_id, call_id
+                    ),
+                    turn_cycle_index=self._turn_cycle_for_tool(conversation_id, turn_id, call_id),
+                )
+                self._active_tool_outputs[key] = snapshot
+            snapshot.arguments = dict(arguments)
+            snapshot.turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
+            snapshot.updated_at = _utcnow()
+        await self._persist_active_tool_output_l2(conversation_id)
+
+    async def _update_active_tool_progress(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        call_id: str,
+        tool_name: str,
+        turn_id: str | None,
+        progress: dict[str, Any],
+    ) -> None:
+        async with self._active_tool_outputs_lock:
+            key = (conversation_id, session_id, call_id)
+            snapshot = self._active_tool_outputs.get(key)
+            if snapshot is None:
+                snapshot = ActiveToolOutputSnapshot(
+                    conversation_id=conversation_id,
+                    session_id=session_id,
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    turn_id=turn_id,
+                    assistant_phase_index=self._assistant_phase_for_tool(
+                        conversation_id, turn_id, call_id
+                    ),
+                    turn_cycle_index=self._turn_cycle_for_tool(conversation_id, turn_id, call_id),
+                )
+                self._active_tool_outputs[key] = snapshot
+            snapshot.tool_name = tool_name
+            snapshot.turn_id = turn_id
+            snapshot.assistant_phase_index = self._assistant_phase_for_tool(
+                conversation_id, turn_id, call_id
+            )
+            snapshot.turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
+            snapshot.status = "running"
+            phase = progress.get("phase")
+            snapshot.progress_phase = phase if isinstance(phase, str) else None
+            input_chars = progress.get("input_chars")
+            snapshot.progress_input_chars = input_chars if isinstance(input_chars, int) else None
+            input_lines = progress.get("input_lines")
+            snapshot.progress_input_lines = input_lines if isinstance(input_lines, int) else None
+            complete = progress.get("complete")
+            snapshot.progress_complete = complete if isinstance(complete, bool) else None
+            snapshot.updated_at = _utcnow()
+        await self._persist_active_tool_output_l2(conversation_id)
+
     async def _finalize_active_tool_output(
         self,
         *,
@@ -998,9 +1163,17 @@ class TurnScheduler:
                     call_id=call_id,
                     tool_name=tool_name,
                     turn_id=turn_id,
+                    assistant_phase_index=self._assistant_phase_for_tool(
+                        conversation_id, turn_id, call_id
+                    ),
+                    turn_cycle_index=self._turn_cycle_for_tool(conversation_id, turn_id, call_id),
                 )
                 self._active_tool_outputs[key] = snapshot
             meta = metadata or {}
+            snapshot.assistant_phase_index = self._assistant_phase_for_tool(
+                conversation_id, turn_id, call_id
+            )
+            snapshot.turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
             snapshot.status = "failed" if is_error else "completed"
             if not (meta.get("transport_truncated") and len(snapshot.result) > len(result)):
                 snapshot.result = result
@@ -1061,6 +1234,7 @@ class TurnScheduler:
         message_id: str,
         turn_id: str | None,
         delta: str,
+        turn_cycle_index: int | None = None,
     ) -> tuple[int, int]:
         """Append a live token to the volatile stream snapshot.
 
@@ -1071,19 +1245,41 @@ class TurnScheduler:
 
         async with self._active_streams_lock:
             stream = self._active_streams.get(conversation_id)
+            current_phase = (
+                self._assistant_phase_by_turn.get((conversation_id, turn_id), 0)
+                if turn_id is not None
+                else 0
+            )
+            effective_turn_cycle_index = (
+                turn_cycle_index if turn_cycle_index is not None else current_phase
+            )
             if (
                 stream is None
                 or stream.session_id != session_id
                 or stream.message_id != message_id
                 or stream.turn_id != turn_id
+                # The phase counter advances when a tool call fires mid-turn
+                # (_bump_assistant_phase_for_tool). The snapshot's phase is
+                # captured at creation and never updated, so a multi-phase turn
+                # (assistant → tool → assistant) produces a phase-0 snapshot for
+                # the second assistant segment — its id diverges from the
+                # live.assistant_complete patch which uses the final counter value,
+                # leaving an orphaned streaming spinner in the UI.
+                # Reset the snapshot whenever the scheduler phase has advanced
+                # past the snapshot's phase so the streaming item always carries
+                # the correct phase and its id matches the completion patch.
+                or current_phase > stream.assistant_phase_index
             ):
                 stream = ActiveStreamState(
                     conversation_id=conversation_id,
                     session_id=session_id,
                     message_id=message_id,
                     turn_id=turn_id,
+                    assistant_phase_index=current_phase,
+                    turn_cycle_index=effective_turn_cycle_index,
                 )
                 self._active_streams[conversation_id] = stream
+            stream.turn_cycle_index = effective_turn_cycle_index
             index = stream.chunk_count
             offset = _utf16_code_units(stream.content)
             stream.content += delta
@@ -1094,6 +1290,100 @@ class TurnScheduler:
     async def _reset_active_stream(self, conversation_id: str) -> None:
         async with self._active_streams_lock:
             self._active_streams.pop(conversation_id, None)
+
+    def _bump_assistant_phase(self, conversation_id: str, turn_id: str | None) -> None:
+        if turn_id is None:
+            return
+        key = (conversation_id, turn_id)
+        self._assistant_phase_by_turn[key] = self._assistant_phase_by_turn.get(key, 0) + 1
+
+    def _bump_assistant_phase_for_tool(
+        self,
+        conversation_id: str,
+        turn_id: str | None,
+        call_id: str | None,
+        tool_name: str | None = None,
+    ) -> int | None:
+        del tool_name
+        if turn_id is None or call_id is None:
+            return None
+        tool_key = (conversation_id, turn_id, call_id)
+        if tool_key in self._assistant_phase_tool_keys:
+            return self._assistant_phase_by_tool.get(tool_key)
+        phase = self._assistant_phase_by_turn.get((conversation_id, turn_id), 0)
+        self._assistant_phase_tool_keys.add(tool_key)
+        self._assistant_phase_by_tool[tool_key] = phase
+        self._bump_assistant_phase(conversation_id, turn_id)
+        return phase
+
+    def _assistant_phase_for_tool(
+        self,
+        conversation_id: str,
+        turn_id: str | None,
+        call_id: str | None,
+    ) -> int | None:
+        if turn_id is None or call_id is None:
+            return None
+        return self._assistant_phase_by_tool.get((conversation_id, turn_id, call_id))
+
+    def _record_turn_cycle_for_tool(
+        self,
+        conversation_id: str,
+        turn_id: str | None,
+        call_id: str | None,
+        turn_cycle_index: int | None,
+    ) -> None:
+        if turn_id is None or call_id is None or turn_cycle_index is None:
+            return
+        self._turn_cycle_by_tool[(conversation_id, turn_id, call_id)] = turn_cycle_index
+
+    def _record_turn_cycle_for_turn(
+        self,
+        conversation_id: str,
+        turn_id: str | None,
+        turn_cycle_index: int | None,
+    ) -> None:
+        if turn_id is None or turn_cycle_index is None:
+            return
+        self._turn_cycle_by_turn[(conversation_id, turn_id)] = turn_cycle_index
+
+    def _turn_cycle_for_turn(
+        self,
+        conversation_id: str,
+        turn_id: str | None,
+    ) -> int | None:
+        if turn_id is None:
+            return None
+        return self._turn_cycle_by_turn.get((conversation_id, turn_id))
+
+    def _turn_cycle_for_tool(
+        self,
+        conversation_id: str,
+        turn_id: str | None,
+        call_id: str | None,
+    ) -> int | None:
+        if turn_id is None or call_id is None:
+            return None
+        return self._turn_cycle_by_tool.get((conversation_id, turn_id, call_id))
+
+    def _clear_assistant_phase(self, conversation_id: str, turn_id: str | None) -> None:
+        if turn_id is None:
+            return
+        self._assistant_phase_by_turn.pop((conversation_id, turn_id), None)
+        self._assistant_phase_tool_keys = {
+            key for key in self._assistant_phase_tool_keys if key[:2] != (conversation_id, turn_id)
+        }
+        self._assistant_phase_by_tool = {
+            key: phase
+            for key, phase in self._assistant_phase_by_tool.items()
+            if key[:2] != (conversation_id, turn_id)
+        }
+        self._turn_cycle_by_turn.pop((conversation_id, turn_id), None)
+        self._turn_cycle_by_tool = {
+            key: cycle
+            for key, cycle in self._turn_cycle_by_tool.items()
+            if key[:2] != (conversation_id, turn_id)
+        }
 
     async def _pop_active_stream(
         self,
@@ -1124,7 +1414,9 @@ class TurnScheduler:
         turn_id: str | None,
         user_email: str,
         agent: AgentDefinition,
-    ) -> tuple[str | None, int]:
+        chat_mode: str = "default",
+        chat_mode_source: str = "system_default",
+    ) -> tuple[str | None, int, int | None]:
         """Persist already streamed assistant text when a turn is cancelled."""
 
         stream = await self._pop_active_stream(
@@ -1134,22 +1426,27 @@ class TurnScheduler:
             turn_id=turn_id,
         )
         if stream is None or not stream.content:
-            return None, 0
+            return None, 0, None
 
-        event = SessionEvent(
-            type="assistant_message",
-            data={
-                "content": stream.content,
-                "turn_id": turn_id,
-                "runtime": assistant_message_runtime_metadata(
-                    agent,
-                    self._session_cache.get_tool_runtime_info(session.session_id) or {},
-                ),
-                "partial": True,
-                "cancelled": True,
-                "finish_reason": "user_cancelled",
-            },
-        )
+        event_data = {
+            "content": stream.content,
+            "turn_id": turn_id,
+            "runtime": assistant_message_runtime_metadata(
+                agent,
+                self._tool_runtime_info(session.session_id),
+            ),
+            "partial": True,
+            "cancelled": True,
+            "finish_reason": "user_cancelled",
+            "assistant_phase_index": stream.assistant_phase_index,
+            # Persist chat_mode so the history projector can stamp the
+            # plan-mode marker on cancelled assistant messages after refresh.
+            "chat_mode": chat_mode,
+            "chat_mode_source": chat_mode_source,
+        }
+        if stream.turn_cycle_index is not None:
+            event_data["turn_cycle_index"] = stream.turn_cycle_index
+        event = SessionEvent(type="assistant_message", data=event_data)
         intaris_session_id = session.intaris_session_id or session.session_id
         digest = hashlib.sha256(stream.content.encode("utf-8")).hexdigest()[:16]
         idempotency_key = (
@@ -1169,7 +1466,7 @@ class TurnScheduler:
             if not append_result.ok:
                 raise RuntimeError("Intaris did not persist cancelled assistant stream")
             await self._session_cache.append_recorded_events(session, [event], append_result)
-            return stream.content, append_result.last_seq
+            return stream.content, append_result.last_seq, stream.turn_cycle_index
         except Exception:
             logger.warning(
                 "turn_scheduler: failed to persist cancelled assistant stream",
@@ -1182,7 +1479,14 @@ class TurnScheduler:
                 },
                 exc_info=True,
             )
-            return None, 0
+            return None, 0, None
+
+    def _tool_runtime_info(self, session_id: str) -> dict[str, Any]:
+        reader = getattr(self._session_cache, "get_tool_runtime_info", None)
+        if not callable(reader):
+            return {}
+        info = reader(session_id)
+        return info if isinstance(info, dict) else {}
 
     async def _persist_follow_up_turn_notice(
         self,
@@ -1576,6 +1880,50 @@ class TurnScheduler:
                     await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
                     return None
 
+            loaded_session_id = session.session_id
+            try:
+                session_locked = self._agent_loop.session_is_locked(session.session_id)
+            except AttributeError:
+                session_locked = False
+            if session_locked:
+                await self._agent_loop.wait_for_session_unlock(session.session_id)
+            refreshed_runtime = await self._load_conversation_runtime(
+                conversation_id,
+                user_message=bootstrap_content,
+            )
+            if refreshed_runtime is None:
+                return TurnError(
+                    code="not_found",
+                    message="Conversation not found",
+                    recoverable=False,
+                )
+            conversation, session, agent, bootstrap_wait_for_intention = refreshed_runtime
+            if conversation.status in {"archived", "deleted"}:
+                return TurnError(
+                    code="conflict",
+                    message="Conversation is not active",
+                    recoverable=False,
+                )
+            if session.status in BLOCKED_STATES:
+                return TurnError(
+                    code="session_ended",
+                    message="This session has ended. Use /new to start a fresh conversation.",
+                    recoverable=False,
+                )
+            if (
+                session.session_id != loaded_session_id
+                and prepared_attachment_notice is None
+                and prepared_attachment_context is None
+            ):
+                (
+                    attachment_notice,
+                    attachment_context,
+                ) = await self._build_attachment_support_messages(
+                    session=session,
+                    agent=agent,
+                    attachments=normalized_attachments,
+                )
+
             checkpoint_conversation = _model_copy_or_self(conversation)
             checkpoint_session = _model_copy_or_self(session)
 
@@ -1653,11 +2001,20 @@ class TurnScheduler:
         cleared_queue = False
         if clear_queue and queue is not None:
             cleared_queue = bool(queue)
+            queued_delivery_ids: list[str] = []
             for queued in queue:
                 if queued.follow_up is not None:
                     await self._clear_follow_up_pending(
                         conversation_id, queued.follow_up.follow_up_id
                     )
+                delivery_id = getattr(queued, "delivery_id", None)
+                if delivery_id:
+                    queued_delivery_ids.append(delivery_id)
+            await self._suppress_channel_delivery_ids(
+                queued_delivery_ids,
+                selected_delivery_id=None,
+                reason="cleared queued follow-up turn",
+            )
             queue.clear()
         if cleared_queue:
             await self._notify_queue_updated(conversation_id)
@@ -1890,6 +2247,7 @@ class TurnScheduler:
                 return session
             if new_session is None:
                 return session
+            new_session = cast(SessionModel, new_session)
             conversation.active_session_id = new_session.session_id
             if len(self._idle_checkpoint_locks) > _MAX_DEFERRED_LOCKS:
                 stale_ids = [
@@ -1985,6 +2343,12 @@ class TurnScheduler:
             await self._notify_queue_updated(conversation_id)
             if queued.follow_up is not None:
                 await self._clear_follow_up_pending(conversation_id, queued.follow_up.follow_up_id)
+            if queued.delivery_id:
+                await self._suppress_channel_delivery_ids(
+                    [queued.delivery_id],
+                    selected_delivery_id=None,
+                    reason="cancelled queued follow-up turn",
+                )
             return True
         return False
 
@@ -2072,8 +2436,13 @@ class TurnScheduler:
             if queued.channel_deliverable:
                 control.absorbed_channel_deliverable = True
             if queued.delivery_id:
-                control.absorbed_delivery_id = queued.delivery_id
-            if queued.delivery_fallback_text:
+                if control.active_delivery_id or control.absorbed_delivery_id:
+                    control.suppressed_channel_delivery_ids.append(queued.delivery_id)
+                else:
+                    control.absorbed_delivery_id = queued.delivery_id
+                    if queued.delivery_fallback_text:
+                        control.absorbed_delivery_fallback_text = queued.delivery_fallback_text
+            elif queued.delivery_fallback_text and not control.absorbed_delivery_fallback_text:
                 control.absorbed_delivery_fallback_text = queued.delivery_fallback_text
             payloads.append(
                 {
@@ -2107,6 +2476,11 @@ class TurnScheduler:
                         ),
                     )
                 )
+
+        await self._suppress_absorbed_channel_delivery_intents(
+            control,
+            selected_delivery_id=control.active_delivery_id or control.absorbed_delivery_id,
+        )
 
         logger.info(
             "turn_scheduler: absorbed queued batch into active turn",
@@ -2273,7 +2647,7 @@ class TurnScheduler:
         except Exception:
             logger.debug("turn_scheduler: durable follow-up clear unavailable", exc_info=True)
 
-    def _build_tool_call_ceiling_follow_up(
+    def _build_automatic_continuation_follow_up(
         self,
         *,
         conversation_id: str,
@@ -2281,45 +2655,18 @@ class TurnScheduler:
         metadata: dict[str, Any],
         prior_follow_up: FollowUpMetadata | None,
     ) -> ContinuationFollowUp | None:
-        if (
-            isinstance(prior_follow_up, ContinuationFollowUp)
-            and prior_follow_up.reason == "tool_call_ceiling_reached"
-        ):
-            attempt = prior_follow_up.attempt + 1
-        else:
-            attempt = 1
-        if attempt > MAX_AUTOMATIC_CONTINUATION_ATTEMPTS:
-            return None
-
-        pending_todos = _pending_todos_from_metadata(metadata)
-        tool_call_count = _positive_optional_int(metadata.get("tool_call_count"))
-        max_tool_calls = _positive_optional_int(metadata.get("max_tool_calls"))
-        follow_up = ContinuationFollowUp(
-            follow_up_id=build_follow_up_id(
-                kind=FollowUpOriginKind.CONTINUATION.value,
+        reason = str(metadata.get("continuation_reason") or "").strip()
+        if reason in _AUTOMATIC_CONTINUATION_REASONS:
+            return build_automatic_continuation_follow_up(
                 conversation_id=conversation_id,
-                parts={
-                    "reason": "tool_call_ceiling_reached",
-                    "turn_id": turn_id,
-                    "attempt": attempt,
-                },
-            ),
-            mode=FollowUpMode.INTEGRATE,
-            origin_kind=FollowUpOriginKind.CONTINUATION,
-            relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
-            required_action=FollowUpRequiredAction.INTEGRATE_RESULT,
-            topic_ref=turn_id,
-            status=FollowUpStatus.COMPLETED,
-            reason="tool_call_ceiling_reached",
-            attempt=attempt,
-            max_attempts=MAX_AUTOMATIC_CONTINUATION_ATTEMPTS,
-            tool_call_count=tool_call_count,
-            max_tool_calls=max_tool_calls,
-            pending_todos=pending_todos,
-        )
-        return follow_up
+                turn_id=turn_id,
+                reason=reason,
+                metadata=metadata,
+                prior_follow_up=prior_follow_up,
+            )
+        return None
 
-    async def _schedule_tool_call_ceiling_continuation(
+    async def _schedule_automatic_continuation(
         self,
         *,
         conversation_id: str,
@@ -2329,20 +2676,22 @@ class TurnScheduler:
         metadata: dict[str, Any],
         prior_follow_up: FollowUpMetadata | None,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...],
-    ) -> None:
-        follow_up = self._build_tool_call_ceiling_follow_up(
+        one_shot_chat_mode: ChatMode | None = None,
+    ) -> bool:
+        reason = str(metadata.get("continuation_reason") or "").strip()
+        follow_up = self._build_automatic_continuation_follow_up(
             conversation_id=conversation_id,
             turn_id=turn_id,
             metadata=metadata,
             prior_follow_up=prior_follow_up,
         )
-        tool_call_count = _positive_optional_int(metadata.get("tool_call_count"))
-        max_tool_calls = _positive_optional_int(metadata.get("max_tool_calls"))
+        tool_call_count = positive_optional_int(metadata.get("tool_call_count"))
+        max_tool_calls = positive_optional_int(metadata.get("max_tool_calls"))
+        cycle_count = positive_optional_int(metadata.get("cycle_count"))
+        max_llm_cycles = positive_optional_int(metadata.get("max_llm_cycles"))
         if follow_up is None:
-            message = (
-                "Automatic continuation stopped after repeated tool-call ceilings. "
-                "Send a new message to continue manually."
-            )
+            subject = _automatic_continuation_exhausted_subject(reason)
+            message = f"Automatic continuation stopped after repeated {subject}. Send a new message to continue manually."
             await self._notify_observers_system_message(
                 conversation_id,
                 message,
@@ -2355,21 +2704,39 @@ class TurnScheduler:
                         "conversation_id": conversation_id,
                         "session_id": session_id,
                         "turn_id": turn_id,
+                        "reason": reason,
                         "tool_call_count": tool_call_count,
                         "max_tool_calls": max_tool_calls,
+                        "cycle_count": cycle_count,
+                        "max_llm_cycles": max_llm_cycles,
                     }
                 },
             )
-            return
+            return False
 
-        count_text = (
-            f" ({tool_call_count}/{max_tool_calls} tool calls)"
-            if tool_call_count is not None and max_tool_calls is not None
-            else ""
-        )
+        if reason == TOOL_CALL_CEILING_CONTINUATION_REASON:
+            count_text = (
+                f" ({tool_call_count}/{max_tool_calls} tool calls)"
+                if tool_call_count is not None and max_tool_calls is not None
+                else ""
+            )
+            message = f"Tool-call limit reached{count_text}. Continuing automatically."
+        elif reason == LLM_CYCLE_CEILING_CONTINUATION_REASON:
+            count_text = (
+                f" ({cycle_count}/{max_llm_cycles} LLM cycles)"
+                if cycle_count is not None and max_llm_cycles is not None
+                else ""
+            )
+            message = f"LLM cycle limit reached{count_text}. Continuing automatically."
+        elif reason == STEP_TIMEOUT_CONTINUATION_REASON:
+            timeout_seconds = positive_optional_int(metadata.get("timeout_seconds"))
+            timeout_text = f" after {timeout_seconds}s" if timeout_seconds is not None else ""
+            message = f"Step timed out{timeout_text}. Continuing automatically."
+        else:
+            message = "Turn boundary reached. Continuing automatically."
         await self._notify_observers_system_message(
             conversation_id,
-            f"Tool-call limit reached{count_text}. Continuing automatically.",
+            message,
             turn_observers=turn_observers,
         )
         self._queued_messages[conversation_id].append(
@@ -2379,23 +2746,51 @@ class TurnScheduler:
                 system_initiated=True,
                 follow_up=follow_up,
                 turn_observers=tuple(turn_observers),
+                one_shot_chat_mode=one_shot_chat_mode,
             )
         )
         logger.info(
-            "turn_scheduler: queued automatic continuation after tool-call ceiling",
+            "turn_scheduler: queued automatic continuation",
             extra={
                 "extra_data": {
                     "conversation_id": conversation_id,
                     "session_id": session_id,
                     "turn_id": turn_id,
+                    "reason": reason,
                     "attempt": follow_up.attempt,
                     "tool_call_count": tool_call_count,
                     "max_tool_calls": max_tool_calls,
+                    "cycle_count": cycle_count,
+                    "max_llm_cycles": max_llm_cycles,
                     "pending_todo_count": len(follow_up.pending_todos),
                 }
             },
         )
         await self._notify_queue_updated(conversation_id, turn_observers=turn_observers)
+        return True
+
+    async def _schedule_tool_call_ceiling_continuation(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        turn_id: str,
+        user_email: str,
+        metadata: dict[str, Any],
+        prior_follow_up: FollowUpMetadata | None,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...],
+        one_shot_chat_mode: ChatMode | None = None,
+    ) -> bool:
+        return await self._schedule_automatic_continuation(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            user_email=user_email,
+            metadata=metadata,
+            prior_follow_up=prior_follow_up,
+            turn_observers=turn_observers,
+            one_shot_chat_mode=one_shot_chat_mode,
+        )
 
     # ------------------------------------------------------------------
     # Follow-up turn handling (EventBus subscriber)
@@ -2446,6 +2841,28 @@ class TurnScheduler:
             )
             return
 
+        delivery_id = event.data.get("delivery_id")
+        if not isinstance(delivery_id, str):
+            delivery_id = None
+        channel_deliverable = bool(event.data.get("channel_deliverable"))
+        delivery_fallback_text = event.data.get("delivery_fallback_text")
+        if not isinstance(delivery_fallback_text, str):
+            delivery_fallback_text = None
+
+        if delivery_id is not None:
+            channel_deliverable = True
+        elif channel_deliverable or "channel_deliverable" not in event.data:
+            (
+                delivery_id,
+                channel_deliverable,
+                delivery_fallback_text,
+            ) = await self._ensure_follow_up_channel_delivery_intent(
+                conversation_id=conversation_id,
+                conversation=row,
+                follow_up=follow_up,
+                fallback_text=delivery_fallback_text,
+            )
+
         error = await self.submit_turn(
             conversation_id,
             "",
@@ -2458,13 +2875,9 @@ class TurnScheduler:
             else None,
             system_initiated=True,
             follow_up=follow_up,
-            channel_deliverable=bool(event.data.get("channel_deliverable")),
-            delivery_id=event.data.get("delivery_id")
-            if isinstance(event.data.get("delivery_id"), str)
-            else None,
-            delivery_fallback_text=event.data.get("delivery_fallback_text")
-            if isinstance(event.data.get("delivery_fallback_text"), str)
-            else None,
+            channel_deliverable=channel_deliverable,
+            delivery_id=delivery_id,
+            delivery_fallback_text=delivery_fallback_text,
         )
         if error is not None:
             await self._publish_turn_error(
@@ -2472,15 +2885,175 @@ class TurnScheduler:
                 row.active_session_id or "",
                 error,
                 system_initiated=True,
-                channel_deliverable=bool(event.data.get("channel_deliverable")),
-                delivery_id=event.data.get("delivery_id")
-                if isinstance(event.data.get("delivery_id"), str)
-                else None,
-                delivery_fallback_text=event.data.get("delivery_fallback_text")
-                if isinstance(event.data.get("delivery_fallback_text"), str)
-                else None,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
             )
             await self._clear_follow_up_pending(conversation_id, follow_up.follow_up_id)
+
+    async def _ensure_follow_up_channel_delivery_intent(
+        self,
+        *,
+        conversation_id: str,
+        conversation: Any,
+        follow_up: FollowUpMetadata,
+        fallback_text: str | None,
+    ) -> tuple[str | None, bool, str | None]:
+        """Persist a generic channel outbox row for channel-bound follow-up turns."""
+
+        try:
+            async with self._session_factory() as db_session:
+                route = await queries.get_conversation_channel_route(db_session, conversation_id)
+                if route is None:
+                    return None, False, fallback_text
+
+                channel_type, account_id, chat_id, thread_id, user_email = route
+                delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
+                resolved_fallback = fallback_text or self._build_follow_up_delivery_fallback(
+                    follow_up
+                )
+                await queries.create_channel_delivery_outbox(
+                    db_session,
+                    delivery_id=delivery_id,
+                    user_email=user_email,
+                    conversation_id=conversation_id,
+                    session_id=getattr(conversation, "active_session_id", None),
+                    source_type="follow_up",
+                    source_id=follow_up.follow_up_id,
+                    channel_type=channel_type,
+                    account_id=account_id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    fallback_text=resolved_fallback,
+                    next_attempt_at=datetime.now(UTC) + timedelta(minutes=2),
+                )
+                await db_session.commit()
+                return delivery_id, True, resolved_fallback
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to persist channel follow-up delivery intent",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "follow_up_id": follow_up.follow_up_id,
+                        "origin_kind": follow_up.origin_kind.value,
+                    }
+                },
+                exc_info=True,
+            )
+        return None, False, fallback_text
+
+    def _build_follow_up_delivery_fallback(self, follow_up: FollowUpMetadata) -> str:
+        """Build a channel fallback used only when the follow-up turn cannot render content."""
+
+        status = follow_up.status.value
+        if follow_up.origin_kind in {FollowUpOriginKind.TASK_RESULT, FollowUpOriginKind.SCHEDULE}:
+            task_id = getattr(follow_up, "task_id", None)
+            task_title = getattr(follow_up, "task_title", None) or "Background task"
+            summary = getattr(follow_up, "result_summary", None)
+            suffix = f" Summary: {summary}" if summary else ""
+            return (
+                f'Task "{task_title}" ({task_id}) is {status}.{suffix} '
+                "I could not deliver the detailed follow-up reply, so please open the conversation for details."
+            )
+
+        if follow_up.origin_kind is FollowUpOriginKind.DELEGATION_RESULT:
+            summary = getattr(follow_up, "result_summary", None)
+            suffix = f" Summary: {summary}" if summary else ""
+            return (
+                f"Background work is {status}.{suffix} "
+                "I could not deliver the detailed follow-up reply, so please open the conversation for details."
+            )
+
+        if follow_up.origin_kind is FollowUpOriginKind.BACKGROUND_TOOL_RESULT:
+            description = getattr(follow_up, "description", None)
+            tool_name = getattr(follow_up, "tool_name", None) or "tool"
+            subject = f"{tool_name} background command"
+            if description:
+                subject = description
+            return (
+                f"{subject} is {status}. "
+                "I could not deliver the detailed follow-up reply, so please open the conversation for details."
+            )
+
+        if follow_up.origin_kind is FollowUpOriginKind.GATE:
+            task_id = getattr(follow_up, "task_id", None)
+            task_title = getattr(follow_up, "task_title", None) or "Background task"
+            return (
+                f'Task "{task_title}" ({task_id}) is waiting for input. '
+                "I could not deliver the detailed follow-up reply, so please open the conversation for details."
+            )
+
+        if follow_up.origin_kind is FollowUpOriginKind.CONTINUATION:
+            reason = getattr(follow_up, "reason", None) or "continuation"
+            return (
+                f"Automatic follow-up turn for {reason} is {status}. "
+                "I could not deliver the detailed follow-up reply, so please open the conversation for details."
+            )
+
+        title = getattr(follow_up, "title", None) or "Follow-up turn"
+        summary = getattr(follow_up, "summary", None)
+        suffix = f" Summary: {summary}" if summary else ""
+        return (
+            f"{title} is {status}.{suffix} "
+            "I could not deliver the detailed follow-up reply, so please open the conversation for details."
+        )
+
+    async def _suppress_absorbed_channel_delivery_intents(
+        self,
+        turn_control: _TurnControl,
+        *,
+        selected_delivery_id: str | None,
+    ) -> None:
+        delivery_ids = await self._suppress_channel_delivery_ids(
+            turn_control.suppressed_channel_delivery_ids,
+            selected_delivery_id=selected_delivery_id,
+            reason="absorbed into active follow-up turn",
+        )
+        if not delivery_ids:
+            return
+        turn_control.suppressed_channel_delivery_ids = [
+            delivery_id
+            for delivery_id in turn_control.suppressed_channel_delivery_ids
+            if delivery_id not in delivery_ids
+        ]
+
+    async def _suppress_channel_delivery_ids(
+        self,
+        delivery_ids: list[str],
+        *,
+        selected_delivery_id: str | None,
+        reason: str,
+    ) -> list[str]:
+        delivery_ids = [
+            delivery_id
+            for delivery_id in dict.fromkeys(delivery_ids)
+            if delivery_id != selected_delivery_id
+        ]
+        if not delivery_ids:
+            return []
+        try:
+            async with self._session_factory() as db_session:
+                await queries.suppress_channel_delivery_outbox(
+                    db_session,
+                    delivery_ids=delivery_ids,
+                    reason=reason,
+                )
+                await db_session.commit()
+            return delivery_ids
+        except Exception:
+            logger.warning(
+                "turn_scheduler: failed to suppress channel delivery intents",
+                extra={
+                    "extra_data": {
+                        "delivery_ids": delivery_ids,
+                        "selected_delivery_id": selected_delivery_id,
+                        "reason": reason,
+                    }
+                },
+                exc_info=True,
+            )
+        return []
 
     # ------------------------------------------------------------------
     # Turn execution
@@ -2545,10 +3118,16 @@ class TurnScheduler:
     ) -> tuple[str | None, str | None]:
         if not attachments:
             return None, None
-        explicit_model = self._session_cache.get_model_override(session.session_id) or (
-            agent.llm_config.model if agent.llm_config else None
+        model_override = self._session_cache.get_model_override(session.session_id)
+        model_override_provider_id = self._session_cache.get_model_override_provider_id(
+            session.session_id
         )
-        explicit_provider_id = agent.llm_config.provider_id if agent.llm_config else None
+        if model_override:
+            explicit_model = model_override
+            explicit_provider_id = model_override_provider_id
+        else:
+            explicit_model = agent.llm_config.model if agent.llm_config else None
+            explicit_provider_id = agent.llm_config.provider_id if agent.llm_config else None
         provider_id: str | None = None
         if hasattr(self._providers.llm, "resolve_model_target"):
             try:
@@ -2587,7 +3166,11 @@ class TurnScheduler:
         unsupported: list[str] = []
         pdf_fallbacks: list[str] = []
         for attachment in attachments:
-            if attachment.kind == ArtifactKind.IMAGE and model_info.supports_vision:
+            if attachment.kind == ArtifactKind.IMAGE and supports_native_image_input(
+                model_info,
+                attachment.mime_type,
+                filename=attachment.filename,
+            ):
                 continue
             if attachment.kind == ArtifactKind.PDF and (
                 model_info.supports_pdf_input or model_info.supports_file_input
@@ -2717,6 +3300,7 @@ class TurnScheduler:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
         control = _TurnControl(turn_observers=list(turn_observers))
+        control.active_delivery_id = delivery_id
         turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         control.turn_id = turn_id
         self._turn_controls[conversation_id] = control
@@ -2793,6 +3377,7 @@ class TurnScheduler:
         turn_succeeded = False
         if turn_control is None:
             turn_control = _TurnControl(turn_observers=list(turn_observers))
+        turn_control.active_delivery_id = delivery_id
         turn_control.turn_id = turn_id
         turn_observers = turn_control.turn_observers
 
@@ -2957,6 +3542,7 @@ class TurnScheduler:
                 on_tool_result,
                 on_tool_progress,
                 on_tool_output_chunk,
+                on_context_usage,
             ) = self._build_callbacks(
                 conversation_id,
                 session.session_id,
@@ -2982,17 +3568,50 @@ class TurnScheduler:
                 on_tool_result=on_tool_result,
                 on_tool_progress=on_tool_progress,
                 on_tool_output_chunk=on_tool_output_chunk,
+                on_context_usage=on_context_usage,
                 cancel_event=cancel_event,
                 bootstrap_wait_for_intention=bootstrap_wait_for_intention,
                 turn_id=turn_id,
+                client_message_id=client_message_id,
                 chat_mode=resolved_chat_mode,
                 consume_boundary_batch=lambda reason: self._consume_queued_batch_for_active_turn(
                     conversation_id,
                     reason=reason,
                 ),
+                get_current_assistant_phase=lambda: self._assistant_phase_by_turn.get(
+                    (conversation_id, turn_id), 0
+                ),
+                # Idempotent per-call phase resolution: the first ask (agent
+                # loop persisting tool events, or the on_tool_call observer)
+                # assigns the phase and bumps the counter; later asks return
+                # the recorded value. Live overlay and persisted events
+                # therefore always agree on the tool's phase.
+                get_assistant_phase_for_tool=lambda call_id: self._bump_assistant_phase_for_tool(
+                    conversation_id, turn_id, call_id
+                ),
             )
+            continuation_metadata = _automatic_continuation_metadata(step_output)
+            continuation_scheduled = False
+            if (
+                continuation_metadata is not None
+                and not channel_deliverable
+                and getattr(conversation, "status", "active") == "active"
+            ):
+                continuation_scheduled = await self._schedule_automatic_continuation(
+                    conversation_id=conversation_id,
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    user_email=user_email,
+                    metadata=continuation_metadata,
+                    prior_follow_up=follow_up,
+                    turn_observers=turn_observers,
+                    one_shot_chat_mode=resolved_chat_mode.mode
+                    if resolved_chat_mode.source == "one_shot"
+                    else None,
+                )
+
             step_error = _turn_error_from_step_output(step_output)
-            if step_error is not None:
+            if step_error is not None and not continuation_scheduled:
                 logger.warning(
                     "turn_scheduler: turn step returned error",
                     extra={
@@ -3004,6 +3623,11 @@ class TurnScheduler:
                     },
                 )
                 turn_control.settled = True
+                selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
+                await self._suppress_absorbed_channel_delivery_intents(
+                    turn_control,
+                    selected_delivery_id=selected_delivery_id,
+                )
                 await self._publish_turn_error(
                     conversation_id,
                     session.session_id,
@@ -3013,7 +3637,7 @@ class TurnScheduler:
                     channel_deliverable=(
                         channel_deliverable or turn_control.absorbed_channel_deliverable
                     ),
-                    delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                    delivery_id=selected_delivery_id,
                     delivery_fallback_text=(
                         turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                     ),
@@ -3023,21 +3647,6 @@ class TurnScheduler:
                 )
                 TURNS_TOTAL.labels(outcome="error").inc()
                 return
-            ceiling_metadata = _tool_call_ceiling_metadata(step_output)
-            if (
-                ceiling_metadata is not None
-                and not channel_deliverable
-                and getattr(conversation, "status", "active") == "active"
-            ):
-                await self._schedule_tool_call_ceiling_continuation(
-                    conversation_id=conversation_id,
-                    session_id=session.session_id,
-                    turn_id=turn_id,
-                    user_email=user_email,
-                    metadata=ceiling_metadata,
-                    prior_follow_up=follow_up,
-                    turn_observers=turn_observers,
-                )
 
             queued_continuation_pending = self.queued_count(conversation_id) > 0
             # Post-turn housekeeping
@@ -3065,7 +3674,7 @@ class TurnScheduler:
             context_usage = self._session_cache.get_context_usage(session.session_id)
             runtime = assistant_message_runtime_metadata(
                 agent,
-                self._session_cache.get_tool_runtime_info(session.session_id) or {},
+                self._tool_runtime_info(session.session_id),
             )
 
             await self._adopt_late_intaris_title(conversation, session)
@@ -3083,6 +3692,12 @@ class TurnScheduler:
                 latest_title
                 and latest_title != _pre_turn_title
                 and latest_title != already_published_title
+            )
+
+            selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
+            await self._suppress_absorbed_channel_delivery_intents(
+                turn_control,
+                selected_delivery_id=selected_delivery_id,
             )
 
             result = TurnResult(
@@ -3103,7 +3718,7 @@ class TurnScheduler:
                 channel_deliverable=(
                     channel_deliverable or turn_control.absorbed_channel_deliverable
                 ),
-                delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                delivery_id=selected_delivery_id,
                 delivery_fallback_text=(
                     turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                 ),
@@ -3120,6 +3735,10 @@ class TurnScheduler:
                 completed_at=completed_at,
                 chat_mode=resolved_chat_mode.mode,
                 chat_mode_source=resolved_chat_mode.source,
+                assistant_phase_index=self._assistant_phase_by_turn.get(
+                    (conversation_id, turn_id), 0
+                ),
+                turn_cycle_index=self._turn_cycle_for_turn(conversation_id, turn_id),
                 managed_continuation_pending=queued_continuation_pending,
                 runtime=runtime,
             )
@@ -3142,13 +3761,24 @@ class TurnScheduler:
         except asyncio.CancelledError:
             turn_control.settled = True
             completed_at = datetime.now(UTC)
-            partial_content, last_seq = await self._persist_cancelled_active_stream(
+            selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
+            await self._suppress_absorbed_channel_delivery_intents(
+                turn_control,
+                selected_delivery_id=selected_delivery_id,
+            )
+            (
+                partial_content,
+                last_seq,
+                turn_cycle_index,
+            ) = await self._persist_cancelled_active_stream(
                 conversation_id=conversation_id,
                 session=session,
                 message_id=message_id,
                 turn_id=turn_id,
                 user_email=user_email,
                 agent=agent,
+                chat_mode=resolved_chat_mode.mode,
+                chat_mode_source=resolved_chat_mode.source,
             )
             if partial_content is not None:
                 await self._touch_conversation(conversation_id, when=completed_at)
@@ -3163,7 +3793,7 @@ class TurnScheduler:
                     channel_deliverable=(
                         channel_deliverable or turn_control.absorbed_channel_deliverable
                     ),
-                    delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                    delivery_id=selected_delivery_id,
                     delivery_fallback_text=(
                         turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                     ),
@@ -3181,9 +3811,13 @@ class TurnScheduler:
                     chat_mode_source=resolved_chat_mode.source,
                     partial=True,
                     finish_reason="user_cancelled",
+                    assistant_phase_index=self._assistant_phase_by_turn.get(
+                        (conversation_id, turn_id), 0
+                    ),
+                    turn_cycle_index=turn_cycle_index,
                     runtime=assistant_message_runtime_metadata(
                         agent,
-                        self._session_cache.get_tool_runtime_info(session.session_id) or {},
+                        self._tool_runtime_info(session.session_id),
                     ),
                 )
                 await self._publish_turn_completed(result, turn_observers=turn_observers)
@@ -3202,7 +3836,7 @@ class TurnScheduler:
                     channel_deliverable=(
                         channel_deliverable or turn_control.absorbed_channel_deliverable
                     ),
-                    delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                    delivery_id=selected_delivery_id,
                     delivery_fallback_text=(
                         turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                     ),
@@ -3229,6 +3863,11 @@ class TurnScheduler:
             )
             turn_control.settled = True
             error = await self._classify_turn_error(exc)
+            selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
+            await self._suppress_absorbed_channel_delivery_intents(
+                turn_control,
+                selected_delivery_id=selected_delivery_id,
+            )
             await self._publish_turn_error(
                 conversation_id,
                 session.session_id,
@@ -3238,7 +3877,7 @@ class TurnScheduler:
                 channel_deliverable=(
                     channel_deliverable or turn_control.absorbed_channel_deliverable
                 ),
-                delivery_id=turn_control.absorbed_delivery_id or delivery_id,
+                delivery_id=selected_delivery_id,
                 delivery_fallback_text=(
                     turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
                 ),
@@ -3354,17 +3993,24 @@ class TurnScheduler:
         turn_id: str | None,
         *,
         turn_observers: tuple[TurnObserver, ...] = (),
-    ) -> tuple[Any, Any, Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
         """Build streaming callbacks that fan out to registered observers."""
 
-        async def on_token(delta: str) -> None:
+        async def on_token(delta: str, turn_cycle_index: int | None = None) -> None:
             chunk_index, content_offset = await self._append_active_stream_chunk(
                 conversation_id=conversation_id,
                 session_id=session_id,
                 message_id=message_id,
                 turn_id=turn_id,
                 delta=delta,
+                turn_cycle_index=turn_cycle_index,
             )
+            effective_turn_cycle_index = (
+                turn_cycle_index
+                if turn_cycle_index is not None
+                else self._assistant_phase_by_turn.get((conversation_id, turn_id), 0)
+            )
+            self._record_turn_cycle_for_turn(conversation_id, turn_id, effective_turn_cycle_index)
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -3378,6 +4024,7 @@ class TurnScheduler:
                         delta,
                         chunk_index,
                         content_offset,
+                        effective_turn_cycle_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -3396,7 +4043,14 @@ class TurnScheduler:
             duration_ms: int | None = None,
             source: str | None = None,
             provider_block_index: int | None = None,
+            turn_cycle_index: int | None = None,
         ) -> None:
+            effective_turn_cycle_index = (
+                turn_cycle_index
+                if turn_cycle_index is not None
+                else self._assistant_phase_by_turn.get((conversation_id, turn_id), 0)
+            )
+            self._record_turn_cycle_for_turn(conversation_id, turn_id, effective_turn_cycle_index)
             if hasattr(self._session_cache, "update_active_thinking"):
                 self._session_cache.update_active_thinking(
                     session_id,
@@ -3412,6 +4066,10 @@ class TurnScheduler:
                     duration_ms=duration_ms,
                     source=source,
                     provider_block_index=provider_block_index,
+                    assistant_phase_index=self._assistant_phase_by_turn.get(
+                        (conversation_id, turn_id), 0
+                    ),
+                    turn_cycle_index=effective_turn_cycle_index,
                 )
             await asyncio.gather(
                 *(
@@ -3433,6 +4091,7 @@ class TurnScheduler:
                         duration_ms,
                         source,
                         provider_block_index,
+                        effective_turn_cycle_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -3444,6 +4103,7 @@ class TurnScheduler:
             tool_name: str,
             call_id: str,
             arguments: dict[str, Any] | None = None,
+            turn_cycle_index: int | None = None,
         ) -> None:
             if tool_name == "delegate" and isinstance(arguments, dict):
                 arguments = {
@@ -3455,6 +4115,23 @@ class TurnScheduler:
                     "input_redacted": True,
                 }
             await self._reset_active_stream(conversation_id)
+            assistant_phase_index = self._bump_assistant_phase_for_tool(
+                conversation_id, turn_id, call_id, tool_name
+            )
+            effective_turn_cycle_index = (
+                turn_cycle_index if turn_cycle_index is not None else assistant_phase_index
+            )
+            self._record_turn_cycle_for_tool(
+                conversation_id, turn_id, call_id, effective_turn_cycle_index
+            )
+            await self._record_active_tool_arguments(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                turn_id=turn_id,
+                arguments=arguments,
+            )
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -3467,6 +4144,8 @@ class TurnScheduler:
                         tool_name,
                         arguments,
                         turn_id,
+                        assistant_phase_index,
+                        effective_turn_cycle_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -3480,6 +4159,16 @@ class TurnScheduler:
             progress: dict[str, Any],
         ) -> None:
             await self._reset_active_stream(conversation_id)
+            self._bump_assistant_phase_for_tool(conversation_id, turn_id, call_id, tool_name)
+            await self._update_active_tool_progress(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                turn_id=turn_id,
+                progress=progress,
+            )
+            turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -3492,6 +4181,7 @@ class TurnScheduler:
                         tool_name,
                         progress,
                         turn_id,
+                        turn_cycle_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -3510,6 +4200,7 @@ class TurnScheduler:
             attachments: list[dict[str, Any]] | None = None,
             file_diffs: list[dict[str, Any]] | None = None,
             presentation: dict[str, Any] | None = None,
+            turn_cycle_index: int | None = None,
         ) -> None:
             metadata = (
                 presentation.get("tool_output_presentation")
@@ -3528,6 +4219,11 @@ class TurnScheduler:
                 is_error=is_error,
                 metadata=metadata,
             )
+            assistant_phase_index = self._assistant_phase_for_tool(
+                conversation_id, turn_id, call_id
+            )
+            if turn_cycle_index is None:
+                turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -3546,6 +4242,8 @@ class TurnScheduler:
                         file_diffs,
                         turn_id,
                         presentation,
+                        assistant_phase_index,
+                        turn_cycle_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -3558,6 +4256,7 @@ class TurnScheduler:
             tool_name: str,
             delta: str,
             stream: str | None = None,
+            turn_cycle_index: int | None = None,
         ) -> None:
             chunk_index, content_offset = await self._append_active_tool_output_chunk(
                 conversation_id=conversation_id,
@@ -3568,6 +4267,8 @@ class TurnScheduler:
                 delta=delta,
                 stream=stream,
             )
+            if turn_cycle_index is None:
+                turn_cycle_index = self._turn_cycle_for_tool(conversation_id, turn_id, call_id)
             await asyncio.gather(
                 *(
                     self._call_observer(
@@ -3583,10 +4284,30 @@ class TurnScheduler:
                         turn_id,
                         chunk_index,
                         content_offset,
+                        turn_cycle_index,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
                     )
+                )
+            )
+
+        async def on_context_usage(usage: dict[str, Any]) -> None:
+            await asyncio.gather(
+                *(
+                    self._call_observer(
+                        conversation_id,
+                        observer,
+                        observer.on_context_usage,
+                        conversation_id,
+                        session_id,
+                        usage,
+                        turn_id,
+                    )
+                    for observer in self._iter_observers(
+                        conversation_id, turn_observers=turn_observers
+                    )
+                    if hasattr(observer, "on_context_usage")
                 )
             )
 
@@ -3597,6 +4318,7 @@ class TurnScheduler:
             on_tool_result,
             on_tool_progress,
             on_tool_output_chunk,
+            on_context_usage,
         )
 
     def _iter_observers(
@@ -3665,6 +4387,13 @@ class TurnScheduler:
     ) -> None:
         """Notify observers and publish lifecycle event."""
         await self._reset_active_stream(result.conversation_id)
+        # Clear any lingering active-thinking state for this session so that a
+        # subsequent conversation_runtime_snapshot on reconnect never re-emits
+        # streaming:true thinking items for a finished turn.  The normal drain
+        # path (agent_loop finalize_thinking → on_thinking(complete=True)) clears
+        # blocks individually, but the CancelledError path bypasses that drain.
+        if hasattr(self._session_cache, "clear_active_thinking"):
+            self._session_cache.clear_active_thinking(result.session_id)
         self._settle_turn_waiters(result.conversation_id, result)
         await asyncio.gather(
             *(
@@ -3711,10 +4440,13 @@ class TurnScheduler:
                     "attachments": strip_attachment_payload_bytes(result.attachments or []),
                     "partial": result.partial,
                     "finish_reason": result.finish_reason,
+                    "turn_cycle_index": result.turn_cycle_index,
+                    "managed_continuation_pending": result.managed_continuation_pending,
                 },
             )
         )
         await self._notify_managed_turn_result(result)
+        self._clear_assistant_phase(result.conversation_id, result.turn_id)
 
     async def _notify_managed_turn_result(self, result: TurnResult) -> None:
         """Update managed-conversation state for a completed scheduler turn."""
@@ -3767,6 +4499,10 @@ class TurnScheduler:
     ) -> None:
         """Notify observers and publish lifecycle event."""
         await self._reset_active_stream(conversation_id)
+        # Mirror the cleanup done in _publish_turn_completed: clear active-thinking
+        # state so reconnect snapshots never re-emit stale streaming items.
+        if hasattr(self._session_cache, "clear_active_thinking"):
+            self._session_cache.clear_active_thinking(session_id)
         self._settle_turn_waiters(conversation_id, error)
         await asyncio.gather(
             *(
@@ -3876,6 +4612,9 @@ class TurnScheduler:
                     # clear notification state for a newer controller-submitted turn.
                     return
                 notify = bool(link.notify_on_completion and notify_on_completion)
+                control_metadata = (
+                    link.control_metadata if isinstance(link.control_metadata, dict) else {}
+                )
                 await queries.update_managed_conversation_link(
                     db_session,
                     link.link_id,
@@ -3896,12 +4635,21 @@ class TurnScheduler:
                 if not notify:
                     return
                 needs_attention = status in {FollowUpStatus.FAILED, FollowUpStatus.CANCELLED}
+                manually_cancelled = bool(control_metadata.get("cancelled_by_user"))
                 if error_message and summary and error_message not in summary:
                     raw_summary = f"{error_message}\n\nPartial output:\n{summary}"
                 else:
                     raw_summary = error_message or summary
                 follow_up_summary = truncate_follow_up_text(raw_summary, max_chars=600)
-                if needs_attention:
+                if manually_cancelled:
+                    description = (
+                        "The user manually stopped this managed agent work turn from the "
+                        "managed conversation UI. Treat it as a user cancellation, not as an "
+                        "agent failure. Review the managed conversation before deciding "
+                        "whether to continue."
+                    )
+                    title = f"Agent work cancelled by user: {link.title or target_conversation_id}"
+                elif needs_attention:
                     description = (
                         "A managed agent work turn needs attention. "
                         f"Status: {turn_state}. "
@@ -3949,6 +4697,8 @@ class TurnScheduler:
                         "target_session_id": target_session_id,
                         "turn_state": turn_state,
                         "recoverable": recoverable,
+                        "control_metadata": control_metadata,
+                        "cancelled_by_user": manually_cancelled,
                     },
                 }
             await self._event_bus.publish(

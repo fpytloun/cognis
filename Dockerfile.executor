@@ -72,7 +72,7 @@ RUN apt-get update \
         zstd \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md build.py ./
+COPY pyproject.toml uv.lock README.md build.py ./
 COPY cognis/ ./cognis/
 COPY docs/ ./docs/
 
@@ -86,9 +86,11 @@ ARG COGNIS_EXECUTOR_BROWSERS="chromium chrome"
 ARG TARGETARCH
 ARG OFFICECLI_VERSION="v1.0.102"
 
-RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir ".[postgres,s3,redis]" \
-    && python -m pip install --no-cache-dir "ruff>=0.5.0" uv \
+ENV UV_PROJECT_ENVIRONMENT=/usr/local
+
+RUN python -m pip install --no-cache-dir --upgrade pip uv \
+    && uv sync --locked --no-dev --extra postgres --extra s3 --extra redis \
+    && python -m pip install --no-cache-dir "ruff>=0.5.0" \
     && python -m playwright install --with-deps $(echo "$COGNIS_EXECUTOR_BROWSERS" | tr ',' ' ') \
     && npm install -g --ignore-scripts \
         @vue/language-server@2.2.8 \

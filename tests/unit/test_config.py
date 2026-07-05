@@ -8,6 +8,9 @@ from cognis.config import load_config
 def test_load_config_defaults(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.delenv("DATABASE_URL", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.delenv("COGNIS_HOST", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.delenv("COGNIS_PORT", raising=False)  # type: ignore[attr-defined]
+    monkeypatch.delenv("COGNIS_PUBLIC_BASE_URL", raising=False)  # type: ignore[attr-defined]
 
     config = load_config()
 

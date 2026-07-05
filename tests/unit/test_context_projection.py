@@ -51,7 +51,7 @@ def _tool_result(
 
 
 def test_project_messages_compacts_older_completed_tool_groups() -> None:
-    big_args = {"content": "x" * 2_000}
+    big_args = {"file_path": "a.py", "content": "x" * 7_000}
     messages = [
         _assistant_tool_call("call-1", "bash", big_args),
         _tool_result("call-1", "A" * 8_000, tool_name="bash", recovery_call_id="call-1"),
@@ -72,6 +72,8 @@ def test_project_messages_compacts_older_completed_tool_groups() -> None:
     assistant_args = result.messages[0]["tool_calls"][0]["function"]["arguments"]
     assert isinstance(assistant_args, str)
     assert "Arguments cleared -" in assistant_args
+    assert '"file_path": "a.py"' in assistant_args
+    assert '"content_preview":' in assistant_args
     assert result.messages[3]["content"] == "recent 1"
     assert result.messages[5]["content"] == "recent 2"
 
@@ -1136,3 +1138,25 @@ def test_projection_turn_state_update_pressure_tracks_history() -> None:
     snap_crit = _make_snapshot(int(100_000 * CRITICAL_ESCALATE_FRACTION))
     state.update_pressure(snap_crit)
     assert state.pressure_mode == PressureMode.critical
+
+
+def test_project_messages_compacts_prunable_delegation_replay() -> None:
+    messages = [
+        {
+            "role": "system",
+            "content": "delegation head\n" + ("x" * 20_000),
+            "_delegation_result_replay": True,
+            "_prunable": True,
+        }
+    ]
+
+    result = project_messages(
+        messages,
+        max_historical_tool_result_bytes=400,
+        token_counter=lambda value: len(str(value)) // 4,
+    )
+
+    content = result.messages[0]["content"]
+    assert content.startswith("<delegation_result_compacted>")
+    assert "Recover the full result" in content
+    assert result.messages[0]["_delegation_result_replay"] is True

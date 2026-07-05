@@ -7,6 +7,7 @@ Intaris run as uvx subprocesses pointed at the Cognis-generated JWT key.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import signal
@@ -133,6 +134,9 @@ class LiveStack:
     mnemory_process: subprocess.Popen[bytes]
     intaris_process: subprocess.Popen[bytes]
     http: httpx.Client
+    cognis_command: list[str]
+    cognis_env: dict[str, str]
+    clean_env: dict[str, str]
 
     def admin_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.admin_token}"}
@@ -186,6 +190,7 @@ def _start_service(
         env=base,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
     process._log_handle = log_handle  # type: ignore[attr-defined]
     return process
@@ -198,11 +203,17 @@ def _stop_service(process: subprocess.Popen[bytes], label: str) -> None:
         if log_handle:
             log_handle.close()
         return
-    process.send_signal(signal.SIGTERM)
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        if log_handle:
+            log_handle.close()
+        return
     try:
         process.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        process.kill()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=5)
     if log_handle:
         log_handle.close()
@@ -355,6 +366,7 @@ def integration_stack(
             "location": "controller",
             "backend": "litellm",
             "config": {
+                "scope": "system",
                 "default_model": llm_model,
                 "models": [
                     {
@@ -480,6 +492,8 @@ def live_stack(
             "MCP_HOST": "127.0.0.1",
             "MCP_PORT": str(mnemory_port),
             "MNEMORY_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "test-api-key",
+            "OPENAI_API_KEY": "test-api-key",
             "LOG_LEVEL": "warning",
         },
         label="mnemory",
@@ -494,6 +508,8 @@ def live_stack(
             "INTARIS_HOST": "127.0.0.1",
             "INTARIS_PORT": str(intaris_port),
             "INTARIS_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "test-api-key",
+            "OPENAI_API_KEY": "test-api-key",
             "LOG_LEVEL": "warning",
         },
         label="intaris",
@@ -515,21 +531,23 @@ def live_stack(
         raise
 
     # Start Cognis as subprocess
+    cognis_command = [uv_path, "run", "cognis-controller", "serve"]
+    cognis_env = {
+        "COGNIS_DATA_DIR": str(cognis_dir),
+        "COGNIS_HOST": "127.0.0.1",
+        "COGNIS_PORT": str(cognis_port),
+        "COGNIS_MNEMORY_URL": mnemory_url,
+        "COGNIS_INTARIS_URL": intaris_url,
+        "COGNIS_INITIAL_ADMIN_EMAIL": admin_email,
+        "COGNIS_INITIAL_ADMIN_PASSWORD": admin_password,
+        "COGNIS_LOG_FORMAT": "text",
+        "COGNIS_LOG_LEVEL": "warning",
+        "COGNIS_CORS_ORIGINS": "*",
+        "DATA_DIR": str(cognis_dir),  # for log file path in _start_service
+    }
     cognis_proc = _start_service(
-        [uv_path, "run", "cognis", "serve"],
-        {
-            "COGNIS_DATA_DIR": str(cognis_dir),
-            "COGNIS_HOST": "127.0.0.1",
-            "COGNIS_PORT": str(cognis_port),
-            "COGNIS_MNEMORY_URL": mnemory_url,
-            "COGNIS_INTARIS_URL": intaris_url,
-            "COGNIS_INITIAL_ADMIN_EMAIL": admin_email,
-            "COGNIS_INITIAL_ADMIN_PASSWORD": admin_password,
-            "COGNIS_LOG_FORMAT": "text",
-            "COGNIS_LOG_LEVEL": "warning",
-            "COGNIS_CORS_ORIGINS": "*",
-            "DATA_DIR": str(cognis_dir),  # for log file path in _start_service
-        },
+        cognis_command,
+        cognis_env,
         label="cognis",
         clean_env=clean_env,
     )
@@ -569,7 +587,7 @@ def live_stack(
             "display_name": "OpenAI (test)",
             "location": "controller",
             "backend": "litellm",
-            "config": {"default_model": llm_model},
+            "config": {"scope": "system", "default_model": llm_model},
         },
     )
     assert provider_response.status_code == 200, (
@@ -598,6 +616,9 @@ def live_stack(
         mnemory_process=mnemory_proc,
         intaris_process=intaris_proc,
         http=http_client,
+        cognis_command=cognis_command,
+        cognis_env=cognis_env,
+        clean_env=clean_env,
     )
 
     yield live
@@ -639,6 +660,7 @@ def create_test_agent(
             "display_name": "Test Agent",
             "description": "Integration test agent",
             "system_prompt": system_prompt,
+            "execution": {"executor_id": "default_inprocess"},
             "personality": {
                 "tone": "concise",
                 "temperament": "cooperative",
@@ -701,6 +723,7 @@ def live_create_agent(
             "display_name": "Test Agent",
             "description": "Integration test agent",
             "system_prompt": system_prompt,
+            "execution": {"executor_id": "default_inprocess"},
             "personality": {
                 "tone": "concise",
                 "temperament": "cooperative",
@@ -732,6 +755,52 @@ def live_create_conversation(live: LiveStack, agent_id: str) -> dict[str, Any]:
     )
     assert response.status_code == 200, f"Conversation creation failed: {response.text}"
     return response.json()
+
+
+def live_assistant_text(live: LiveStack, conversation_id: str) -> str:
+    """Return persisted assistant message text from the Chat v2 snapshot."""
+    deadline = time.monotonic() + 10
+    last_response: httpx.Response | None = None
+    while time.monotonic() < deadline:
+        response = live.get(f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot")
+        last_response = response
+        assert response.status_code == 200, f"Snapshot failed: {response.text}"
+        items = response.json()["timeline"]["items"]
+        content = "\n".join(
+            str(item.get("content") or "")
+            for item in items
+            if item.get("kind") == "message" and item.get("role") == "assistant"
+        )
+        if content:
+            return content
+        time.sleep(0.5)
+    assert last_response is not None
+    return ""
+
+
+def assistant_text_from_events(events: list[dict[str, Any]]) -> str:
+    """Extract assistant text from legacy chunks or Chat v2 frame payloads."""
+    parts: list[str] = [
+        str(event.get("content") or "") for event in events if event.get("type") == "chunk"
+    ]
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if (
+                value.get("kind") == "message"
+                and value.get("role") == "assistant"
+                and isinstance(value.get("content"), str)
+            ):
+                parts.append(value["content"])
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for event in events:
+        visit(event)
+    return "\n".join(part for part in parts if part)
 
 
 def live_chat_ws(

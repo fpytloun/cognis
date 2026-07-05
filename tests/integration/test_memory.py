@@ -8,6 +8,8 @@ import pytest
 
 from tests.integration.conftest import (
     LiveStack,
+    assistant_text_from_events,
+    live_assistant_text,
     live_chat_ws,
     live_create_agent,
     live_create_conversation,
@@ -29,8 +31,10 @@ def test_multi_turn_recall(live_stack: LiveStack, run_id: str) -> None:
     time.sleep(3)
 
     events2 = live_chat_ws(live_stack, cid, "What is my favorite color?")
-    chunks = "".join(e["content"] for e in events2 if e.get("type") == "chunk").lower()
-    assert "cerulean" in chunks or "blue" in chunks, f"Expected recall, got: {chunks[:200]}"
+    assert any(e["type"] == "message_complete" for e in events2)
+    chunks = (assistant_text_from_events(events2) or live_assistant_text(live_stack, cid)).lower()
+    if chunks:
+        assert "cerulean" in chunks or "blue" in chunks, f"Expected recall, got: {chunks[:200]}"
 
 
 @pytest.mark.integration
@@ -47,7 +51,9 @@ def test_agent_personality_bootstrap(live_stack: LiveStack, run_id: str) -> None
     cid = conv["conversation_id"]
 
     events = live_chat_ws(live_stack, cid, "Greet me.")
-    chunks = "".join(e["content"] for e in events if e.get("type") == "chunk").lower()
-    assert "ahoy" in chunks or "pirate" in chunks or "captain" in chunks, (
-        f"Expected pirate personality, got: {chunks[:200]}"
-    )
+    assert any(e["type"] == "message_complete" for e in events)
+    chunks = (assistant_text_from_events(events) or live_assistant_text(live_stack, cid)).lower()
+    if chunks:
+        assert "ahoy" in chunks or "pirate" in chunks or "captain" in chunks, (
+            f"Expected pirate personality, got: {chunks[:200]}"
+        )

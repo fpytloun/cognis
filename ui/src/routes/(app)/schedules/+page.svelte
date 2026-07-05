@@ -20,7 +20,7 @@
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText } from '$lib/session-policy';
-  import { matchesScheduleVisibility, type ScheduleVisibilityFilter } from '$lib/schedules';
+  import { matchesScheduleFilters, type ScheduleVisibilityFilter } from '$lib/schedules';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Project, Schedule, Skill, Workflow } from '$lib/types/api';
@@ -128,19 +128,21 @@ import Zap from 'lucide-svelte/icons/zap';
   };
 
   let filtered = $derived(
-    schedules.filter((s) => {
-      if (search && !s.name.toLowerCase().includes(search.toLowerCase())) return false;
-      if (!matchesScheduleVisibility(s, filterVisibility)) return false;
-      if (filterType && s.schedule_type !== filterType) return false;
-      if (filterEnabled === 'enabled' && !s.enabled) return false;
-      if (filterEnabled === 'disabled' && s.enabled) return false;
-      return true;
-    })
+    schedules.filter((schedule) =>
+      matchesScheduleFilters(schedule, {
+        search,
+        projectId: filterProjectId,
+        scheduleType: filterType,
+        enabled: filterEnabled,
+        visibility: filterVisibility
+      })
+    )
   );
 
   let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
   let workflowSourceOptions = $derived(buildWorkflowSourceOptions(projectWorkflows, skills, selectedAgent));
   let workflowLoadKey = 0;
+  let scheduleLoadKey = 0;
   let urlHydrated = false;
   let urlSyncTimer: number | null = null;
   let lastLoadedProjectId: string | null = null;
@@ -188,11 +190,21 @@ import Zap from 'lucide-svelte/icons/zap';
   });
 
   async function loadData(): Promise<void> {
+    const key = ++scheduleLoadKey;
+    const requestedProjectId = filterProjectId;
     loading = true;
     error = '';
     try {
-      [schedules, agents, workflows, projectWorkflows, projects, skills, conversations] = await Promise.all([
-        api.schedules.list({ project_id: filterProjectId || null }),
+      const [
+        nextSchedules,
+        nextAgents,
+        nextWorkflows,
+        nextProjectWorkflows,
+        nextProjects,
+        nextSkills,
+        nextConversations
+      ] = await Promise.all([
+        api.schedules.list({ project_id: requestedProjectId || null }),
         api.agents.listAll({ agent_type: 'primary' }),
         api.workflows.listAll(),
         api.workflows.listAll({ project_id: null }),
@@ -200,16 +212,27 @@ import Zap from 'lucide-svelte/icons/zap';
         api.skills.list(),
         api.conversations.listAll()
       ]);
-      lastLoadedProjectId = filterProjectId;
+      if (key !== scheduleLoadKey) return;
+      schedules = nextSchedules;
+      agents = nextAgents;
+      workflows = nextWorkflows;
+      projectWorkflows = nextProjectWorkflows;
+      projects = nextProjects;
+      skills = nextSkills;
+      conversations = nextConversations;
+      lastLoadedProjectId = requestedProjectId;
       if (!form.agent_id && agents.length > 0) {
         const active = agents.find((a) => a.status === 'active');
         form.agent_id = active?.agent_id ?? agents[0]?.agent_id ?? '';
       }
       form.agent_profile_id = normalizeSelectedAgentProfileId(selectedAgent, form.agent_profile_id);
     } catch (e) {
+      if (key !== scheduleLoadKey) return;
       error = asApiError(e).message;
     } finally {
-      loading = false;
+      if (key === scheduleLoadKey) {
+        loading = false;
+      }
     }
   }
 

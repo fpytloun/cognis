@@ -52,6 +52,118 @@ def test_auth_challenge_requires_code_when_declared(monkeypatch: object, tmp_pat
         assert response.status_code == 400
 
 
+def test_auth_challenge_cancel_does_not_require_declared_response_fields(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="auth_challenge",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={"kind": "browser_login", "required_fields": ["confirmed"]},
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={"decision": "cancel"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["decision"] == "cancel"
+
+
+def test_oauth_auth_challenge_cancel_is_allowed(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="auth_challenge",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={"kind": "oauth_authorization", "label": "OAuth"},
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={"decision": "cancel"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["decision"] == "cancel"
+
+
+def test_direct_step_question_cancel_can_clear_stale_pending_notification(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+            notification = await client.app.state.notification_service.create(
+                notification_type="step_question",
+                user_email="user@example.com",
+                conversation_id="conv-1",
+                payload={
+                    "questions": [
+                        {
+                            "id": "q1",
+                            "question": "Continue?",
+                            "required": True,
+                            "allow_custom": True,
+                        }
+                    ]
+                },
+            )
+            return notification.notification_id
+
+        notification_id = asyncio.run(_seed())
+
+        response = client.post(
+            f"/api/v1/notifications/{notification_id}/resolve",
+            headers=_auth_headers(client.app, email="user@example.com"),
+            json={"decision": "cancel"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["decision"] == "cancel"
+
+
 def test_credential_request_deny_does_not_store_credential(
     monkeypatch: object, tmp_path: Path
 ) -> None:

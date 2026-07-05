@@ -696,6 +696,53 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           </label>
         </div>
 
+        <div class="mb-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
+          <div class="mb-3">
+            <p class="text-sm font-medium text-slate-200">Backend capabilities</p>
+            <p class="mt-1 text-xs text-slate-400">
+              Select the per-agent memory and guardrails providers. Defaults keep the standard Mnemory + Intaris runtime.
+            </p>
+          </div>
+          <div class="grid gap-4 md:grid-cols-2">
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Memory backend</span>
+              <select
+                bind:value={form.memoryBackend}
+                class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                disabled={readonly || isSystemAsset}
+              >
+                <option value="mnemory">Mnemory</option>
+                <option value="none">None</option>
+              </select>
+              <span class="block text-xs text-slate-400">
+                None disables memory recall and remember calls for this agent.
+              </span>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Guardrails backend</span>
+              <select
+                bind:value={form.guardrailsBackend}
+                class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                disabled={readonly || isSystemAsset}
+              >
+                <option value="intaris">Intaris</option>
+                <option value="none">None</option>
+              </select>
+              <span class="block text-xs text-slate-400">
+                None disables Intaris tool-call evaluation while keeping the Intaris event store.
+              </span>
+            </label>
+          </div>
+          {#if mode === 'edit' && form.guardrailsBackend === 'none'}
+            <div class="mt-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+              <p class="font-medium">Guardrails are disabled for this agent.</p>
+              <p class="mt-1 text-xs text-amber-100/80">
+                Tool calls will be auto-approved, including non-bypassable tools. Use this only for trusted agents and controlled environments.
+              </p>
+            </div>
+          {/if}
+        </div>
+
         <!-- Stage 36: Additional executors (multi-executor agents) -->
         <div class="mb-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
           <div class="mb-2 flex items-center justify-between">

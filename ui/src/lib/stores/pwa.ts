@@ -7,8 +7,10 @@ import { readable, writable } from 'svelte/store';
  *   and we've stashed the event. Components can call `promptInstall()` to trigger.
  * - `displayMode`: 'standalone' | 'browser' — detects whether the app is launched
  *   from the home screen / installed app vs a regular tab.
- * - `updateAvailable`: true when the service worker posted a `sw:update` message
- *   indicating a new version has been activated.
+ * - `updateAvailable`: fallback for legacy/stuck registrations where a newer
+ *   service worker is waiting while the current page is already controlled by
+ *   an older worker. Normal updates are activated by the SW and reload clients
+ *   automatically.
  * - `isIosSafari`: true on iOS Safari where Add-to-Home-Screen is manual.
  */
 
@@ -26,15 +28,205 @@ const INSTALL_DISMISS_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export const installPromptAvailable = writable(false);
 
-/**
- * Kept for API compatibility with modules that still read this store, but
- * the update-available banner is disabled: we could not reliably
- * distinguish between a genuine new waiting SW and a freshly-registered
- * SW after a hard reset, so the banner kept re-appearing on boot.
- * Service workers still update silently in the background; users see the
- * new UI on their next navigation.
- */
 export const updateAvailable = writable(false);
+
+const UPDATE_RELOAD_TIMEOUT_MS = 5000;
+const SERVICE_WORKER_MESSAGE_TIMEOUT_MS = 1000;
+
+let waitingUpdateWorker: ServiceWorker | null = null;
+let controllerChangeObserverInstalled = false;
+let serviceWorkerMessageObserverInstalled = false;
+let serviceWorkerUpdateReloadScheduled = false;
+
+type ServiceWorkerVersionReply = {
+  type?: string;
+  version?: unknown;
+};
+
+type ServiceWorkerClientMessage = {
+  type?: string;
+  version?: unknown;
+};
+
+function hasActiveServiceWorkerController(): boolean {
+  return typeof navigator !== 'undefined'
+    && 'serviceWorker' in navigator
+    && Boolean(navigator.serviceWorker.controller);
+}
+
+function setWaitingUpdateWorker(worker: ServiceWorker | null): void {
+  waitingUpdateWorker = worker;
+  updateAvailable.set(Boolean(worker) && hasActiveServiceWorkerController());
+}
+
+function observeServiceWorkerControllerChange(): void {
+  if (controllerChangeObserverInstalled) return;
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+  if (typeof navigator.serviceWorker.addEventListener !== 'function') return;
+  controllerChangeObserverInstalled = true;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    setWaitingUpdateWorker(null);
+  });
+}
+
+export function handleServiceWorkerClientMessage(
+  data: ServiceWorkerClientMessage | undefined,
+  reloadPage: () => void = () => window.location.reload(),
+): boolean {
+  if (data?.type !== 'COGNIS_SW_UPDATED') return false;
+  if (serviceWorkerUpdateReloadScheduled) return true;
+  serviceWorkerUpdateReloadScheduled = true;
+  setWaitingUpdateWorker(null);
+  reloadPage();
+  return true;
+}
+
+function observeServiceWorkerMessages(): void {
+  if (serviceWorkerMessageObserverInstalled) return;
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+  if (typeof navigator.serviceWorker.addEventListener !== 'function') return;
+  serviceWorkerMessageObserverInstalled = true;
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    handleServiceWorkerClientMessage(event.data as ServiceWorkerClientMessage | undefined);
+  });
+}
+
+async function resolveCurrentWaitingUpdateWorker(): Promise<ServiceWorker | null> {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
+  try {
+    const registration = await navigator.serviceWorker.getRegistration?.();
+    if (registration) {
+      setWaitingUpdateWorker(registration.waiting ?? null);
+      return registration.waiting ?? null;
+    }
+  } catch {
+    // Fall back to the worker observed during registration; update activation is best-effort.
+  }
+  return waitingUpdateWorker;
+}
+
+function reconcileWaitingUpdateWorker(registration: ServiceWorkerRegistration): void {
+  setWaitingUpdateWorker(
+    hasActiveServiceWorkerController()
+      ? registration.waiting ?? null
+      : null,
+  );
+}
+
+function observeInstallingWorker(
+  registration: ServiceWorkerRegistration,
+  worker: ServiceWorker,
+): void {
+  reconcileWaitingUpdateWorker(registration);
+  worker.addEventListener('statechange', () => {
+    reconcileWaitingUpdateWorker(registration);
+  });
+}
+
+function observeServiceWorkerRegistration(registration: ServiceWorkerRegistration): void {
+  reconcileWaitingUpdateWorker(registration);
+
+  if (registration.installing) {
+    observeInstallingWorker(registration, registration.installing);
+  }
+
+  registration.addEventListener('updatefound', () => {
+    if (registration.installing) {
+      observeInstallingWorker(registration, registration.installing);
+    }
+  });
+}
+
+function postServiceWorkerMessageWithReply(
+  worker: ServiceWorker,
+  message: Record<string, unknown>,
+  timeoutMs = SERVICE_WORKER_MESSAGE_TIMEOUT_MS,
+): Promise<ServiceWorkerVersionReply | null> {
+  if (typeof window === 'undefined' || typeof MessageChannel === 'undefined') {
+    return Promise.resolve(null);
+  }
+
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    let settled = false;
+    const finish = (reply: ServiceWorkerVersionReply | null) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      channel.port1.onmessage = null;
+      channel.port1.close();
+      channel.port2.close();
+      resolve(reply);
+    };
+    const timeout = window.setTimeout(() => finish(null), timeoutMs);
+    channel.port1.onmessage = (event) => finish(event.data as ServiceWorkerVersionReply | null);
+    channel.port1.start?.();
+
+    try {
+      worker.postMessage(message, [channel.port2]);
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+async function serviceWorkerVersion(worker: ServiceWorker | null | undefined): Promise<string | null> {
+  if (!worker) return null;
+  const reply = await postServiceWorkerMessageWithReply(worker, { type: 'GET_VERSION' });
+  return reply?.type === 'VERSION' && typeof reply.version === 'string' ? reply.version : null;
+}
+
+async function waitForControllerChange(targetVersion: string | null): Promise<boolean> {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return false;
+  if (typeof navigator.serviceWorker.addEventListener !== 'function') return false;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      navigator.serviceWorker.removeEventListener?.('controllerchange', handleControllerChange);
+    };
+    const finish = (activated: boolean) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(activated);
+    };
+    const timeout = window.setTimeout(() => finish(false), UPDATE_RELOAD_TIMEOUT_MS);
+    const handleControllerChange = () => {
+      void (async () => {
+        if (!targetVersion) {
+          finish(true);
+          return;
+        }
+        const controllerVersion = await serviceWorkerVersion(navigator.serviceWorker.controller);
+        finish(controllerVersion === targetVersion);
+      })();
+    };
+
+    navigator.serviceWorker.addEventListener('controllerchange', handleControllerChange, { once: true });
+  });
+}
+
+async function clearCognisServiceWorkerCaches(): Promise<void> {
+  if (typeof window === 'undefined' || !('caches' in window)) return;
+  const names = await window.caches.keys();
+  await Promise.all(
+    names
+      .filter((name) => name.startsWith('cognis-'))
+      .map((name) => window.caches.delete(name)),
+  );
+}
+
+async function resetCognisServiceWorker(registration: ServiceWorkerRegistration | null): Promise<void> {
+  try {
+    await registration?.unregister();
+  } catch {
+    // Cache reset and reload are still useful if unregister fails.
+  }
+  await clearCognisServiceWorkerCaches();
+  setWaitingUpdateWorker(null);
+}
 
 function installPromptEligiblePath(pathname: string): boolean {
   return pathname === '/getting-started' || pathname === '/login' || pathname === '/setup';
@@ -65,9 +257,12 @@ export function dismissInstallPromptForNow(): void {
 // --- update banner ----------------------------
 
 /**
- * No-op kept to preserve the exported API for existing imports.
+ * Hides the update banner for the current page lifetime. The waiting worker
+ * is intentionally kept so the user can still apply it if another UI path
+ * calls `applyUpdate()`.
  */
 export function dismissUpdateBanner(): void {
+  serviceWorkerUpdateReloadScheduled = false;
   updateAvailable.set(false);
 }
 
@@ -154,20 +349,24 @@ export function canAttemptPwaAuxiliaryWindow(): boolean {
 /**
  * Service worker registration.
  *
- * A waiting worker is left to activate on a future navigation / when all
- * old tabs close (the browser default). We intentionally avoid any boot-time
- * cache reset or forced reload here because installed PWAs, especially on
- * iOS, can get trapped in reload loops if startup eagerly tears down and
- * re-registers the worker.
+ * New workers normally auto-activate and reload clients from the service
+ * worker. A waiting worker is surfaced only as a legacy/stuck-registration
+ * fallback when this page is already controlled by an older worker.
  */
 export async function registerServiceWorker(): Promise<void> {
   if (typeof window === 'undefined') return;
   if (!('serviceWorker' in navigator)) return;
 
   try {
-    await navigator.serviceWorker.register('/service-worker.js', {
+    observeServiceWorkerControllerChange();
+    observeServiceWorkerMessages();
+    const registration = await navigator.serviceWorker.register('/service-worker.js', {
       type: 'module',
       scope: '/'
+    });
+    observeServiceWorkerRegistration(registration);
+    void registration.update().catch(() => {
+      // Browser update checks are best-effort; registration itself succeeded.
     });
   } catch (error) {
     // Service worker registration failures are non-fatal.
@@ -175,38 +374,43 @@ export async function registerServiceWorker(): Promise<void> {
   }
 }
 
-export async function applyUpdate(): Promise<void> {
+export async function applyUpdate(reloadPage?: () => void): Promise<void> {
   if (typeof window === 'undefined') return;
 
   updateAvailable.set(false);
 
-  // Hard reset: unregister every service worker and delete every Cognis
-  // cache, then force a reload. Previous approaches used SKIP_WAITING +
-  // controllerchange, which could deadlock on some browsers and cause
-  // the banner to reappear indefinitely. The hard reset guarantees the
-  // next load has no waiting worker and no stale cached shell, so the
-  // new version installs cleanly without a banner loop.
+  let registration: ServiceWorkerRegistration | null = null;
   if ('serviceWorker' in navigator) {
     try {
-      const registrations = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(registrations.map((r) => r.unregister().catch(() => false)));
+      registration = await navigator.serviceWorker.getRegistration?.() ?? null;
     } catch {
-      // ignore
+      registration = null;
     }
   }
 
-  if (typeof caches !== 'undefined') {
+  const worker = registration?.waiting ?? await resolveCurrentWaitingUpdateWorker();
+
+  if ('serviceWorker' in navigator && worker && navigator.serviceWorker.controller) {
+    const targetVersion = await serviceWorkerVersion(worker);
+    const activation = waitForControllerChange(targetVersion);
     try {
-      const names = await caches.keys();
-      await Promise.all(
-        names
-          .filter((n) => n.startsWith('cognis-'))
-          .map((n) => caches.delete(n).catch(() => false))
-      );
+      worker.postMessage({ type: 'SKIP_WAITING' });
     } catch {
-      // ignore
+      // Fall through to activation timeout handling below.
+    }
+
+    const activated = await activation;
+    if (!activated) {
+      try {
+        registration = await navigator.serviceWorker.getRegistration?.() ?? registration;
+      } catch {
+        // Keep the previous registration reference for best-effort reset.
+      }
+      if (registration?.waiting) {
+        await resetCognisServiceWorker(registration);
+      }
     }
   }
 
-  window.location.reload();
+  (reloadPage ?? (() => window.location.reload()))();
 }

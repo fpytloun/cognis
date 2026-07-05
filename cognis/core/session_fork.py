@@ -98,6 +98,7 @@ async def fork_session_events(
             event_read = await providers.guardrails.read_events(
                 session_id=source_intaris_session_id,
                 after_seq=0,
+                allow_missing_stream=True,
             )
             for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0))):
                 event_type = str(raw_event.get("type") or "")

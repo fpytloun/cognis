@@ -3,6 +3,7 @@ from __future__ import annotations
 from cognis.core.prompts import (
     PromptContext,
     build_critical_rules,
+    build_follow_up_guidance,
     build_system_instructions,
     build_visible_edit_tool_guidance,
 )
@@ -38,6 +39,16 @@ def test_chat_prompt_sets_pragmatic_coding_expectations() -> None:
     assert "For software engineering work" in instructions
     assert "smallest correct change" in instructions
     assert "update docs only when directly affected" in instructions
+
+
+def test_prompt_describes_artifact_value_refs() -> None:
+    instructions = build_system_instructions(PromptContext.CHAT)
+    assert instructions is not None
+    assert "$artifact:<artifact_id>.content_b64" in instructions
+    assert "$artifact:<artifact_id>.public_url" in instructions
+    assert "resolved by the" in instructions
+    assert "controller at execution time" in instructions
+    assert "must be the entire string value" in instructions
 
 
 def test_chat_prompt_describes_delegate_wait_behavior() -> None:
@@ -88,11 +99,18 @@ def test_async_work_tool_descriptions_discourage_duplicate_parent_work() -> None
     assert "fire-and-follow-up" in create_description
     assert "finish the parent turn unless there is independent work" in create_description
     assert "resumed or notified" in create_description
-    assert "visible iterative work loops outside the live channel" in create_description
+    assert "prefer reusing an existing relevant managed conversation" in create_description
+    assert "agent_conversation_send" in create_description
+    assert "new visible iterative work loops outside the live channel" in create_description
     assert "CI/build/deploy/debug/browser/external-system/polling workflows" in create_description
+    assert "continue the same managed conversation" in create_description
+    assert "instead of creating a duplicate" in create_description
     assert 'chat_mode="plan"' in create_description
     assert 'chat_mode="build"' in create_description
 
+    assert "same-problem continuation" in send_description
+    assert "instead of creating a duplicate managed conversation" in send_description
+    assert "plan/debug to implementation handoffs" in send_description
     assert "fire-and-follow-up" in send_description
     assert "finish the parent turn unless independent work" in send_description
     assert "resumed or notified" in send_description
@@ -141,8 +159,8 @@ def test_chat_prompt_preserves_diacritics_in_user_facing_prose() -> None:
     rules = build_critical_rules()
     assert instructions is not None
     assert rules is not None
-    assert "Preserve correct orthography and diacritics" in instructions
-    assert "natural-language documents" in instructions
+    assert "Preserve correct orthography and diacritics" not in instructions
+    assert "natural-language documents" not in instructions
     assert "Preserve correct orthography and diacritics" in rules
 
 
@@ -263,18 +281,24 @@ def test_delegation_prompt_mentions_todos_and_questions() -> None:
 
 def test_follow_up_integrate_prompt_marks_history_as_inactive() -> None:
     instructions = build_system_instructions(PromptContext.FOLLOW_UP_INTEGRATE)
+    guidance = build_follow_up_guidance(PromptContext.FOLLOW_UP_INTEGRATE)
     assert instructions is not None
-    assert "historical context" in instructions
-    assert "active instruction is the follow-up event block" in instructions
-    assert "Do not re-answer an older user message literally" in instructions
+    assert guidance is not None
+    assert "historical context" not in instructions
+    assert "historical context" in guidance
+    assert "active instruction is the follow-up event block" in guidance
+    assert "Do not re-answer an older user message literally" in guidance
 
 
 def test_follow_up_notify_prompt_keeps_updates_separate() -> None:
     instructions = build_system_instructions(PromptContext.FOLLOW_UP_NOTIFY)
+    guidance = build_follow_up_guidance(PromptContext.FOLLOW_UP_NOTIFY)
     assert instructions is not None
-    assert "historical context" in instructions
-    assert "separate update" in instructions
-    assert "Do not resume or continue an older conversation thread" in instructions
+    assert guidance is not None
+    assert "historical context" not in instructions
+    assert "historical context" in guidance
+    assert "separate update" in guidance
+    assert "Do not resume or continue an older conversation thread" in guidance
 
 
 def test_coding_skill_preserves_user_facing_diacritics_and_workspace_hygiene() -> None:

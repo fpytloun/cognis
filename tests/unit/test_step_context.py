@@ -421,6 +421,72 @@ def test_events_to_messages_merges_tool_calls_with_assistant_text() -> None:
     assert messages[1]["role"] == "tool"
 
 
+def test_events_to_messages_rehydrates_responses_items_from_assistant_event() -> None:
+    responses_items = [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "opaque"},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "c1",
+            "name": "search",
+            "arguments": "{}",
+        },
+    ]
+    events = [
+        {
+            "type": "assistant_message",
+            "data": {
+                "content": "Let me check that.",
+                "responses_output_items": responses_items,
+            },
+        },
+        {"type": "tool_call", "data": {"name": "search", "call_id": "c1"}},
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "found it"}},
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[0]["_responses_output_items"] == responses_items
+    projected_ids = {tc["id"] for tc in messages[0]["tool_calls"]}
+    raw_ids = {
+        item["call_id"]
+        for item in messages[0]["_responses_output_items"]
+        if item.get("type") == "function_call"
+    }
+    assert raw_ids == projected_ids
+
+
+def test_events_to_messages_rehydrates_responses_items_from_tool_only_cycle() -> None:
+    responses_items = [
+        {"type": "reasoning", "id": "rs_2", "encrypted_content": "opaque"},
+        {
+            "type": "function_call",
+            "id": "fc_2",
+            "call_id": "c2",
+            "name": "read",
+            "arguments": "{}",
+        },
+    ]
+    events = [
+        {
+            "type": "tool_call",
+            "data": {
+                "name": "read",
+                "call_id": "c2",
+                "responses_output_items": responses_items,
+            },
+        },
+        {"type": "tool_result", "data": {"call_id": "c2", "result": "content"}},
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] is None
+    assert messages[0]["_responses_output_items"] == responses_items
+    assert messages[0]["tool_calls"][0]["id"] == "c2"
+
+
 def test_events_to_messages_keeps_assistant_attachments_out_of_visible_text() -> None:
     events = [
         {

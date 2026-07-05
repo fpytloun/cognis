@@ -420,10 +420,10 @@ def test_revoked_share_blocks_future_messages(monkeypatch: object, tmp_path: Pat
             f"/api/v1/agents/shared-agent/shares/{client.app.state._test_grant_id}",
             headers=_auth_headers(client.app, email="owner@example.com"),
         )
-        message_response = client.post(
-            "/api/v1/conversations/conv-shared/messages",
+        message_response = client.put(
+            "/api/v1/chat/v2/conversations/conv-shared/messages/txn-revoked-share",
             headers=_auth_headers(client.app, email="guest@example.com"),
-            json={"content": "hello"},
+            json={"client_message_id": "cmsg-revoked-share", "content": "hello"},
         )
 
         assert revoke_response.status_code == 200

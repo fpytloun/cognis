@@ -209,3 +209,37 @@ def test_thinking_blocks_include_stable_request_scoped_id_and_timing() -> None:
     assert close_events[0].complete is True
     assert close_events[0].content == "Inspecting logs"
     assert close_events[0].duration_ms == completed[0].duration_ms
+
+
+def test_structured_anthropic_thinking_blocks_are_collected_in_order() -> None:
+    acc = StreamAccumulator(block_id_prefix="llmr_test")
+
+    acc.feed(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "provider_thinking_blocks": [
+                            {
+                                "type": "thinking",
+                                "thinking": "Inspect first.",
+                                "signature": "sig-1",
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    acc.feed(
+        {
+            "choices": [
+                {"delta": {"thinking_blocks": [{"type": "redacted_thinking", "data": "opaque"}]}}
+            ]
+        }
+    )
+
+    assert acc.get_anthropic_thinking_blocks() == [
+        {"type": "thinking", "thinking": "Inspect first.", "signature": "sig-1"},
+        {"type": "redacted_thinking", "data": "opaque"},
+    ]

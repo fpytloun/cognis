@@ -1143,9 +1143,16 @@ class SessionManager:
 
     def _copy_runtime_overrides(self, source_session_id: str, target_session_id: str) -> None:
         model_override = self.session_cache.get_model_override(source_session_id)
+        model_provider_override = self.session_cache.get_model_override_provider_id(
+            source_session_id
+        )
         reasoning_override = self.session_cache.get_reasoning_effort_override(source_session_id)
         if model_override is not None:
-            self.session_cache.set_model_override(target_session_id, model_override)
+            self.session_cache.set_model_override(
+                target_session_id,
+                model_override,
+                provider_id=model_provider_override,
+            )
         if reasoning_override is not None:
             self.session_cache.set_reasoning_effort_override(target_session_id, reasoning_override)
 
@@ -1488,19 +1495,7 @@ class SessionManager:
 
         async with self.session_factory() as db_session:
             try:
-                # 1. Mark current session completed
-                # NOTE: result_summary is metadata only — no LLM-generated content
-                # in the Cognis DB. The actual compaction summary lives in Intaris.
-                await queries.set_session_status(
-                    db_session,
-                    current_session.session_id,
-                    SessionStatus.COMPLETED,
-                    completed_at=datetime.now(UTC),
-                    result_summary=f"Rotated ({completion_reason})",
-                    completion_reason=completion_reason,
-                )
-
-                # 2. Create new root session (fresh Mnemory session — the
+                # 1. Create new root session (fresh Mnemory session — the
                 #    first recall will create a new Mnemory session and
                 #    reconstruct the full immutable prefix from scratch)
                 new_session_row = await queries.create_session(
@@ -1512,7 +1507,7 @@ class SessionManager:
                     mnemory_session_id=None,
                 )
 
-                # 3. Create Intaris session for the new root
+                # 2. Create Intaris session for the new root
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
@@ -1537,7 +1532,61 @@ class SessionManager:
                     db_session, new_session_row.session_id, new_session_row.session_id
                 )
 
-                # 4. Update conversation root
+                # 3. Seed the Intaris stream before Cognis points the
+                #    conversation at the new session.  A created Intaris session
+                #    may not have a readable event stream until at least one
+                #    event is appended; activating the Cognis session before
+                #    this succeeds makes /fork and history reads fail with
+                #    "event stream not found".
+                seed_events = with_session_events_turn_id(
+                    [
+                        SessionEvent(
+                            type="lifecycle",
+                            data={
+                                "event": "session_rotated",
+                                "marker_role": "context_seed",
+                                "timeline_visible": False,
+                                "previous_session_id": current_session.session_id,
+                                "completion_reason": completion_reason,
+                            },
+                        )
+                    ],
+                    None,
+                )
+                with scoped_runtime_context(
+                    user_email=current_session.user_email,
+                    agent_id=current_session.agent_id,
+                    agent_owner_email=agent_owner_email,
+                ):
+                    seed_result = await self.providers.guardrails.record_events(
+                        session_id=new_session_row.session_id,
+                        events=seed_events,
+                        source="cognis",
+                        idempotency_key=f"{new_session_row.session_id}:rotation_seed",
+                        retry_missing_session=True,
+                        user_email=current_session.user_email,
+                        agent_id=current_session.agent_id,
+                        agent_owner_email=agent_owner_email,
+                    )
+                if not seed_result.ok:
+                    raise RuntimeError("Could not seed rotated Intaris session stream")
+
+                # 4. Mark current session completed.  Do this only after the
+                #    replacement session has a durable Intaris stream so the
+                #    conversation cannot be left pointing at an unreadable
+                #    active session.
+                # NOTE: result_summary is metadata only — no LLM-generated content
+                # in the Cognis DB. The actual compaction summary lives in Intaris.
+                await queries.set_session_status(
+                    db_session,
+                    current_session.session_id,
+                    SessionStatus.COMPLETED,
+                    completed_at=datetime.now(UTC),
+                    result_summary=f"Rotated ({completion_reason})",
+                    completion_reason=completion_reason,
+                )
+
+                # 5. Update conversation root
                 await queries.update_conversation_active_session(
                     db_session, conversation_id, new_session_row.session_id
                 )
@@ -1560,6 +1609,16 @@ class SessionManager:
 
         new_session_row.intaris_session_id = new_session_row.session_id
         new_session = _to_session_model(new_session_row)
+        try:
+            append_recorded_events = getattr(self.session_cache, "append_recorded_events", None)
+            if callable(append_recorded_events):
+                await append_recorded_events(new_session, seed_events, seed_result)
+        except Exception:
+            logger.warning(
+                "session: failed to cache rotated session seed event",
+                extra={"extra_data": {"session_id": new_session.session_id}},
+                exc_info=True,
+            )
         rotated_prefix: list[ImmutablePrefixEntry] = [
             entry for entry in prefix_entries if entry.source != "compaction_summary"
         ]

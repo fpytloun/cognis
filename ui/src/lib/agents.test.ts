@@ -89,6 +89,28 @@ describe('agent payload mapping', () => {
     });
   });
 
+  it('drops legacy hidden MCP category disables on load and save', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      tools: {
+        disabled_categories: ['mcp', 'filesystem'],
+        disabled_mcp_servers: ['local_mcp:srv-github']
+      }
+    } as never);
+
+    expect(form.disabledCategories).toEqual(['filesystem']);
+
+    form.disabledCategories = ['mcp', ...form.disabledCategories];
+    const payload = formStateToPayload(form);
+
+    expect(payload.tools).toMatchObject({
+      disabled_categories: ['filesystem'],
+      disabled_mcp_servers: ['local_mcp:srv-github']
+    });
+  });
+
   it('round-trips disabled MCP server groups', () => {
     const form = agentToFormState({
       agent_id: 'agent-1',
@@ -170,6 +192,27 @@ describe('agent payload mapping', () => {
         { skill_id: 'research', enabled: true },
         { skill_id: 'disabled', enabled: false, auto_load_instructions: true }
       ]
+    });
+  });
+
+  it('round-trips per-agent backend capabilities', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      capabilities: {
+        memory_backend: 'none',
+        guardrails_backend: 'none'
+      }
+    } as never);
+
+    expect(form.memoryBackend).toBe('none');
+    expect(form.guardrailsBackend).toBe('none');
+
+    const payload = formStateToPayload(form);
+    expect(payload.capabilities).toEqual({
+      memory_backend: 'none',
+      guardrails_backend: 'none'
     });
   });
 

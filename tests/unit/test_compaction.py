@@ -9,6 +9,9 @@ from cognis.core.compaction import (
     _format_events_for_compaction,
     _mechanical_summary,
 )
+from cognis.core.compaction.banding import build_compaction_input
+from cognis.core.compaction.fallback import build_sliding_window_summary
+from cognis.core.compaction.strategy import _split_events
 from cognis.core.session_cache import CachedEvent, CachedSessionState
 from cognis.models.session import EventAppendResult, SessionModel
 
@@ -133,6 +136,7 @@ async def test_compaction_records_summary_and_updates_cache() -> None:
     assert llm.kwargs[0]["task_type"] == "compaction"
     assert result.tail_start_seq == 3
     assert [event.seq for event in result.preserved_tail_events] == [3, 4, 5]
+    assert result.tokens_after > len("summary text")
 
 
 @pytest.mark.asyncio
@@ -321,6 +325,105 @@ def test_compaction_formats_tool_results_with_recovery_metadata() -> None:
     assert "truncated for compaction: omitted 500 chars" in formatted
 
 
+def test_compaction_formats_tool_call_identifying_args_before_truncation() -> None:
+    full_path = "/tmp/worktree/src/example.py"
+    events = [
+        CachedEvent(
+            seq=1,
+            type="tool_call",
+            data={
+                "name": "write",
+                "arguments": {
+                    "content": "x" * 50_000,
+                    "file_path": full_path,
+                },
+            },
+        )
+    ]
+
+    formatted = _format_events_for_compaction(events)
+
+    assert f"write file_path='{full_path}' args=" in formatted
+    assert full_path in formatted
+    assert "truncated for compaction" in formatted
+
+
+def test_banding_fast_path_uses_exact_token_count() -> None:
+    events = [
+        CachedEvent(seq=index, type="user_message", data={"content": "漢字" * 10})
+        for index in range(1, 20)
+    ]
+    calls: list[str] = []
+
+    def count_tokens(text: str, model: str) -> int:
+        del model
+        calls.append(text)
+        return len(text)
+
+    compaction_input = build_compaction_input(
+        events,
+        max_input_tokens=80,
+        count_tokens_fn=count_tokens,
+        model="token-dense-model",
+    )
+
+    assert calls
+    assert compaction_input.dropped_event_count > 0
+    assert "compaction band: omitted" in compaction_input.text
+
+
+def test_banding_drops_verbatim_middle_user_messages_when_exact_budget_requires_it() -> None:
+    events = [
+        CachedEvent(seq=index, type="user_message", data={"content": f"request {index} " * 12})
+        for index in range(1, 45)
+    ]
+
+    def count_tokens(text: str, model: str) -> int:
+        del model
+        return len(text)
+
+    compaction_input = build_compaction_input(
+        events,
+        max_input_tokens=700,
+        count_tokens_fn=count_tokens,
+        model="char-token-model",
+    )
+
+    assert count_tokens(compaction_input.text, "char-token-model") <= 700
+    assert compaction_input.dropped_event_count > 0
+    assert "compaction band: omitted" in compaction_input.text
+    assert "Dropped-band user messages (verbatim)" not in compaction_input.text
+
+
+def test_split_events_preserves_tail_with_token_budget_and_cycle_boundary() -> None:
+    events = [
+        CachedEvent(seq=1, type="user_message", data={"content": "first"}),
+        CachedEvent(seq=2, type="assistant_message", data={"content": "first reply"}),
+        CachedEvent(seq=3, type="tool_call", data={"name": "read", "arguments": {"path": "a"}}),
+        CachedEvent(
+            seq=4, type="tool_result", data={"name": "read", "call_id": "c1", "result": "a"}
+        ),
+        CachedEvent(seq=5, type="user_message", data={"content": "second"}),
+        CachedEvent(seq=6, type="assistant_message", data={"content": "second reply"}),
+        CachedEvent(
+            seq=7, type="tool_result", data={"name": "read", "call_id": "orphan", "result": "b"}
+        ),
+        CachedEvent(seq=8, type="user_message", data={"content": "third"}),
+    ]
+
+    older, preserved = _split_events(
+        events,
+        preserve_turns=10,
+        tail_token_budget=20,
+        count_tokens_fn=lambda text, _model: len(text),
+        model="test-model",
+    )
+
+    assert older
+    assert preserved[0].type in {"user_message", "assistant_message", "assistant_thinking"}
+    assert preserved[0].type != "tool_result"
+
+
 def test_mechanical_summary_keeps_recoverable_tool_handles() -> None:
     events = []
     for index in range(12):
@@ -428,6 +531,33 @@ async def test_same_session_compaction_forwards_model_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_same_session_compaction_requires_resolved_model_context() -> None:
+    class _SameSessionLLM(_LLM):
+        async def resolve_model(
+            self, explicit_model: str | None = None, task_type: str = "default", **kwargs: object
+        ) -> str:
+            del explicit_model, task_type, kwargs
+            return "__same_session_model__"
+
+    cache = _Cache()
+    llm = _SameSessionLLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=cache,
+        compaction_threshold=0.85,
+        preserve_turns=2,
+        fallback_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="__same_session_model__"):
+        await strategy.compact(_session(), model_context=CompactionModelContext())
+
+    assert llm.kwargs == []
+    assert cache.applied == []
+
+
+@pytest.mark.asyncio
 async def test_compaction_route_resolution_failure_preserves_route_behavior() -> None:
     class _FailingResolveLLM(_LLM):
         async def resolve_model(
@@ -459,3 +589,82 @@ async def test_compaction_route_resolution_failure_preserves_route_behavior() ->
     assert llm.kwargs[0]["task_type"] == "compaction"
     assert llm.kwargs[0]["provider_id"] is None
     assert llm.kwargs[0]["reasoning_effort"] is None
+
+
+def test_mechanical_fallback_keeps_previous_summary_original_request_and_deliverable_args() -> None:
+    events = [
+        CachedEvent(seq=1, type="user_message", data={"content": "Build the report"}),
+        CachedEvent(seq=2, type="user_message", data={"content": "Use the compact format"}),
+        CachedEvent(
+            seq=3,
+            type="tool_call",
+            data={
+                "name": "write_deliverable",
+                "arguments": {"content": "# Final deliverable\nThis is the real artifact."},
+            },
+        ),
+        CachedEvent(
+            seq=4,
+            type="tool_result",
+            data={"name": "write_deliverable", "result": "receipt-only"},
+        ),
+    ]
+
+    summary = build_sliding_window_summary(
+        events,
+        previous_summary="## Anchors\n- Keep this previous summary.",
+    )
+
+    assert "## Previous anchored summary (verbatim):" in summary
+    assert "Keep this previous summary." in summary
+    assert "## Original request (verbatim):" in summary
+    assert "Build the report" in summary
+    assert "# Final deliverable" in summary
+    assert "receipt-only" not in summary
+
+
+@pytest.mark.asyncio
+async def test_compaction_max_input_uses_compaction_route_provider_only_for_same_session() -> None:
+    class _ModelInfo:
+        max_input_tokens = 2_000
+
+    class _RoutedLLM(_LLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model_info_provider_ids: list[str | None] = []
+
+        async def resolve_model(
+            self, explicit_model: str | None = None, task_type: str = "default", **kwargs: object
+        ) -> str:
+            del explicit_model, task_type, kwargs
+            return "compaction-model"
+
+        async def get_model_info(
+            self,
+            model: str,
+            provider_id: str | None = None,
+            **kwargs: object,
+        ) -> _ModelInfo:
+            del model, kwargs
+            self.model_info_provider_ids.append(provider_id)
+            return _ModelInfo()
+
+    llm = _RoutedLLM()
+    strategy = CompactionStrategy(
+        guardrails=_Guardrails(),
+        llm=llm,
+        session_cache=_Cache(),
+        compaction_threshold=0.85,
+        preserve_turns=2,
+    )
+
+    result = await strategy.compact(
+        _session(),
+        model_context=CompactionModelContext(
+            model="agent-model",
+            provider_id="agent-provider",
+        ),
+    )
+
+    assert result.compacted is True
+    assert llm.model_info_provider_ids == [None]

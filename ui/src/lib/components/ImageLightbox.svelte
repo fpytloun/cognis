@@ -245,15 +245,51 @@
   aria-modal="true"
   aria-label={active.filename ?? active.alt ?? 'Image'}
   tabindex="-1"
-  class="app-viewport-overlay z-[95] overflow-hidden overscroll-contain touch-none bg-slate-950/95"
+  class="app-viewport-overlay app-safe-fullscreen z-[95] overflow-hidden overscroll-contain touch-none bg-slate-950/95"
 >
+  <!--
+    Safe top toolbar. It is part of the fullscreen shell layout instead of
+    being absolutely pinned to top: 0, so iOS standalone chrome, notches,
+    and the Cognis mobile shell cannot push the close control out of view.
+  -->
+  <div
+    class="app-safe-fullscreen__toolbar flex items-center justify-between gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/90 px-3 py-2.5 shadow-lg backdrop-blur sm:px-4 sm:py-3"
+    onclick={(event) => event.stopPropagation()}
+  >
+    <p class="min-w-0 flex-1 truncate text-sm text-slate-200">
+      {active.filename ?? active.alt ?? 'Image'}{#if canNavigate}<span class="ml-2 text-slate-500">{currentIndex + 1}/{items.length}</span>{/if}
+    </p>
+    <div class="flex shrink-0 items-center gap-2">
+      <a
+        aria-label="Download"
+        title="Download"
+        href={active.src}
+        download={active.filename ?? ''}
+        target="_blank"
+        rel="noopener noreferrer"
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-800/90 text-slate-100 transition hover:bg-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+      >
+        <Download class="h-5 w-5" />
+      </a>
+      <button
+        aria-label="Close image viewer"
+        title="Close"
+        type="button"
+        onclick={onClose}
+        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-slate-100 text-slate-950 shadow-lg transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+      >
+        <X class="h-5 w-5" />
+      </button>
+    </div>
+  </div>
+
   <!-- Image area. Centered, fills the viewport. Tapping the image
        does not close the lightbox; tapping the surrounding backdrop
        does. -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
-    class="absolute inset-0 flex items-center justify-center px-3 pb-4 pt-20 sm:px-4 sm:pt-24"
+    class="app-safe-fullscreen__content flex items-center justify-center overflow-hidden rounded-[1.75rem] bg-slate-950/30"
     onclick={handleStageClick}
     onpointerdown={handlePointerDown}
     onpointermove={handlePointerMove}
@@ -275,7 +311,8 @@
     <button
       type="button"
       aria-label="Previous image"
-      class="absolute left-2 top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950/70 text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800/90 sm:inline-flex"
+      class="absolute top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950/80 text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:inline-flex"
+      style="left: var(--app-overlay-inner-left);"
       onclick={(event) => { event.stopPropagation(); navigate(-1); }}
     >
       <ChevronLeft class="h-6 w-6" />
@@ -283,49 +320,21 @@
     <button
       type="button"
       aria-label="Next image"
-      class="absolute right-2 top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950/70 text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800/90 sm:inline-flex"
+      class="absolute top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950/80 text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300 sm:inline-flex"
+      style="right: var(--app-overlay-inner-right);"
       onclick={(event) => { event.stopPropagation(); navigate(1); }}
     >
       <ChevronRight class="h-6 w-6" />
     </button>
   {/if}
 
-  <!--
-    Toolbar. Absolutely positioned inside the fixed lightbox so the
-    surrounding image flex layout can never push it out of view, and
-    it carries its own solid background so it's always readable
-    against any image colour. The parent overlay already respects the
-    shared app-shell offsets, so the close button stays below the
-    mobile header and above the bottom tab bar.
-  -->
-  <div
-    class="absolute inset-x-0 top-0 flex items-center justify-between gap-2 bg-slate-950/85 px-3 py-3 shadow-lg backdrop-blur sm:px-4 sm:py-4"
-    onclick={(event) => event.stopPropagation()}
-  >
-    <p class="min-w-0 flex-1 truncate text-sm text-slate-200">
-      {active.filename ?? active.alt ?? 'Image'}{#if canNavigate}<span class="ml-2 text-slate-500">{currentIndex + 1}/{items.length}</span>{/if}
-    </p>
-    <div class="flex shrink-0 items-center gap-2">
-      <a
-        aria-label="Download"
-        title="Download"
-        href={active.src}
-        download={active.filename ?? ''}
-        target="_blank"
-        rel="noopener noreferrer"
-        class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-800/80 text-slate-100 transition hover:bg-slate-700"
-      >
-        <Download class="h-5 w-5" />
-      </a>
-      <button
-        aria-label="Close"
-        title="Close"
-        type="button"
-        onclick={onClose}
-        class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-slate-800/80 text-slate-100 transition hover:bg-slate-700"
-      >
-        <X class="h-5 w-5" />
-      </button>
-    </div>
+  <div class="app-safe-fullscreen__toolbar flex justify-center sm:hidden" onclick={(event) => event.stopPropagation()}>
+    <button
+      type="button"
+      class="inline-flex min-h-11 items-center justify-center rounded-full border border-slate-700 bg-slate-900/95 px-6 text-sm font-medium text-slate-100 shadow-lg backdrop-blur transition hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300"
+      onclick={onClose}
+    >
+      Close image
+    </button>
   </div>
 </div>

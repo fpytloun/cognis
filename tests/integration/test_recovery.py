@@ -19,7 +19,7 @@ def test_stale_sessions_detected_on_startup(stack: IntegrationStack) -> None:
     app = stack.client.app
     recovered = getattr(app.state, "recovered_session_ids", None)
     assert recovered is not None
-    assert isinstance(recovered, list)
+    assert isinstance(recovered, (list, frozenset, set, tuple))
 
 
 @pytest.mark.integration

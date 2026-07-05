@@ -414,12 +414,18 @@ system context in the new session.
 
 Two compaction paths:
 
-- **Manual** (``/compact`` slash command): Compaction runs immediately.
-  Session creation is *deferred* until the next user message. The
-  ``_load_conversation_runtime()`` function detects the completed/compacted
-  root session and calls ``rotate_session()`` on the next turn, re-fetching
-  the preserved tail events from the old session's Intaris stream via
-  ``tail_start_seq`` stored in the ``compaction_summary`` event data.
+- **Manual** (``/compact`` slash command): Compaction and session rotation run
+  immediately under the agent-loop per-session lock. A concurrent turn waits
+  and then re-resolves the active session before recording its user message.
+  The deferred rotation path is crash-recovery/legacy safety only: if Cognis
+  observes a completed/compacted root session without an already-rotated active
+  child, ``_load_conversation_runtime()`` calls ``rotate_session()`` on the next
+  turn and re-fetches preserved tail events from the old session's Intaris
+  stream via ``tail_start_seq`` stored in the ``compaction_summary`` event data.
+  preserved tail is seeded from Intaris events, not from any model-facing
+  projected transcript; controller-only provider metadata such as Anthropic
+  signed thinking blocks is within-turn only and is not replayed across the
+  manual rotation boundary.
 
 - **Automatic**: When context assembly or provider-overflow recovery indicates
   durable context pressure, ``_auto_compact()`` compacts, rotates the session,
@@ -439,21 +445,30 @@ lost if compaction rotated away from the session before events were saved.
   and task framing.
 - **Middle band** (dropped): events between head and tail, replaced with an
   explicit omission marker that includes the seq range and a note that tool
-  outputs remain recoverable by ``call_id``.
+  outputs remain recoverable by ``call_id``. User messages from the dropped
+  band are copied verbatim into the compaction input so intermediate user
+  intents are not lost.
 - **Tail band** (60% of token budget): newest events — highest signal for
   resumption.
 - **Headroom** (20%): reserved for the previous-summary wrapper and the
   recoverable-handles trailer.
 
 Token budget is derived from the compaction model's ``max_input_tokens`` with
-15% headroom, or from the ``session.compaction_max_input_tokens`` setting.
+15% headroom, or from the ``session.compaction_max_input_tokens`` setting. The
+previous summary wrapper is reserved from the input budget before banding, and
+the preserved uncompacted tail is capped by walking user-turn boundaries
+backwards until it reaches roughly 30% of the active prompt budget, with
+``session.compaction_preserve_turns`` as the maximum turn cap.
 
-**LLM retry**: ``compact()`` retries once on transient errors (5xx, timeout,
-connection) before falling back to the mechanical sliding-window summary.
-Non-retryable errors (4xx, empty summary) skip the retry.
+**LLM retry**: ``compact()`` retries transient errors (429, 5xx, timeout,
+connection) up to ``session.compaction_llm_max_attempts`` before falling back
+to the mechanical sliding-window summary. Non-retryable errors (other 4xx,
+empty summary) skip the retry.
 
-**Mechanical fallback** (``build_sliding_window_summary``): keeps the last 8
-user messages, 4 assistant finals, and 4 deliverables verbatim, followed by
+**Mechanical fallback** (``build_sliding_window_summary``): prepends the
+previous anchored summary when present, keeps the first 1-2 original user
+requests, the last 8 user messages, 4 assistant finals, and 4
+``write_deliverable`` contents captured from tool-call arguments, followed by
 event counts and the recoverable-handles block. A prominent warning header
 signals irreversible information loss. This path is a last resort — the
 ``cognis_compaction_fallback_used_total`` counter is alert-worthy.
@@ -466,7 +481,8 @@ instead of a degraded mechanical summary.
 **Recursion bound**: ``_execute_step`` tracks ``ctx.compaction_recursion_depth``
 and caps it at ``session.compaction_max_recursion`` (default 2). Exceeding the
 cap surfaces a ``compaction_recursion_exhausted`` classified failure with a
-user-visible notice to try ``/new``.
+user-visible notice to try ``/new`` and sets a short session-cache cooldown so
+threshold-based auto-compaction is suppressed for the next few turns.
 
 **Recoverable-handles block**: capped at 50 entries (ranked by ``output_size``
 desc). A trailer line lists how many additional handles were omitted.
@@ -475,7 +491,7 @@ desc). A trailer line lists how many additional handles were omitted.
 class CompactionStrategy:
     async def compact(self, session: Session, *, trigger: str = "manual") -> CompactionResult:
         """
-        1. Preserve last N turns uncompacted (default 10)
+        1. Preserve a token-budgeted tail, capped by last N user turns (default 10)
         2. Assemble three-band input (head/middle-drop/tail, token-budgeted)
         3. Call LLM (system:compaction agent); retry once on transient errors
         4. Append recoverable-handle block (capped at 50 entries)
@@ -781,8 +797,11 @@ class SessionTimeoutPolicy:
 
 Session rotation happens for three reasons:
 
-1. **Compaction** (automatic or manual ``/compact``): context exceeds 85%
-   of model capacity. Uses ``rotate_session()`` with
+1. **Compaction** (automatic hard-pressure recovery or manual ``/compact``):
+   automatic rotation runs when durable prompt pressure reaches the configured
+   hard-pressure band (currently about 92% of the selected model budget), while
+   manual ``/compact`` rotates immediately under the agent-loop session lock.
+   Uses ``rotate_session()`` with
    ``completion_reason="compacted"``.
 2. **User reset** (``/new`` or ``/reset`` in channel-bound context): user
    explicitly starts fresh. Uses ``rotate_session()`` with
@@ -797,9 +816,9 @@ In all cases ``rotate_session()`` is called:
 5. Update ``conversation.root_session_id``
 6. Emit ``SESSION_COMPACTED`` event (for compaction) or push notification to client
 
-A per-conversation ``asyncio.Lock`` in the WebSocket handler prevents
-duplicate deferred session creation when multiple tabs send messages
-simultaneously after ``/compact``.
+The agent-loop session lock covers the full compact→rotate critical section,
+preventing active model cycles, idle checkpoints, or multiple tabs from
+interleaving duplicate deferred session creation after ``/compact``.
 
 ### Conversation Archival
 

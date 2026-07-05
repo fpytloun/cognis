@@ -33,6 +33,7 @@ from cognis.store.models import NotificationRow
 from cognis.store.queries import (
     get_agent_direct_conversation,
     get_latest_active_conversation_for_agent,
+    get_managed_conversation_link_for_target,
     get_preferred_channel_account_for_agent,
     get_task,
 )
@@ -126,6 +127,8 @@ class NotificationService:
     # Target resolution
     # ------------------------------------------------------------------
 
+    _MANAGED_LINK_HOP_CAP = 10
+
     async def resolve_target_conversation(
         self,
         task_id: str | None,
@@ -138,10 +141,19 @@ class NotificationService:
         delivery.  This ensures escalations, gates, and step questions
         from scheduled tasks reach the user via the configured channel.
 
+        For managed-conversation notifications (no task_id), the target
+        is walked up the ``ManagedConversationLink`` chain until a
+        conversation with no open link is found (i.e. the channel-bound
+        parent).  This covers the delegate → managed conv → parent conv
+        chain: delegate child sessions share the managed conversation's
+        conversation_id, so a single link hop already covers two levels.
+        Up to ``_MANAGED_LINK_HOP_CAP`` hops are followed to handle
+        nested managed conversations; a visited-set prevents cycles.
+
         For direct-chat notifications, the conversation_id is used as-is.
         """
         if not task_id:
-            return conversation_id
+            return await self._resolve_managed_conversation_chain(conversation_id)
 
         async with self._session_factory() as db:
             task_row = await get_task(db, task_id)
@@ -194,6 +206,57 @@ class NotificationService:
 
         return conversation_id
 
+    async def _resolve_managed_conversation_chain(
+        self,
+        conversation_id: str | None,
+    ) -> str | None:
+        """Walk ManagedConversationLink hops to the channel-bound parent.
+
+        Returns the topmost controller conversation_id, or the original
+        conversation_id when no link exists.  Collects managed-origin
+        metadata (title, target_agent_id) from the first hop for use in
+        notification payloads.
+        """
+        if not conversation_id:
+            return conversation_id
+        candidate = conversation_id
+        visited: set[str] = {candidate}
+        for _ in range(self._MANAGED_LINK_HOP_CAP):
+            async with self._session_factory() as db:
+                link = await get_managed_conversation_link_for_target(db, candidate)
+            if link is None:
+                break
+            next_id = link.controller_conversation_id
+            if next_id in visited:
+                logger.warning(
+                    "notification: managed conversation link cycle detected",
+                    extra={"extra_data": {"conversation_id": conversation_id}},
+                )
+                break
+            visited.add(next_id)
+            candidate = next_id
+        return candidate
+
+    async def resolve_managed_origin_metadata(
+        self,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        """Return managed-origin metadata for a notification payload.
+
+        If ``conversation_id`` is a managed target, returns a dict with
+        ``managed_conversation_title`` and ``managed_target_agent_id``
+        from the first link hop.  Returns an empty dict when the
+        conversation is not a managed target.
+        """
+        async with self._session_factory() as db:
+            link = await get_managed_conversation_link_for_target(db, conversation_id)
+        if link is None:
+            return {}
+        return {
+            "managed_conversation_title": link.title or "",
+            "managed_target_agent_id": link.target_agent_id or "",
+        }
+
     # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
@@ -222,10 +285,20 @@ class NotificationService:
         nid = notification_id or f"notif_{uuid.uuid4().hex[:12]}"
         now = datetime.now(UTC)
 
-        # Resolve target conversation (task source for task-originated)
+        # Resolve target conversation (task source for task-originated;
+        # managed-conversation chain for non-task notifications).
         resolved_conversation_id = (
             await self.resolve_target_conversation(task_id, conversation_id)
         ) or conversation_id
+
+        # When the notification originated inside a managed sub-conversation
+        # and was redirected to the parent, enrich the payload with managed-
+        # origin metadata so channel renderers can surface the context.
+        enriched_payload = dict(payload or {})
+        if resolved_conversation_id != conversation_id and not task_id:
+            origin_meta = await self.resolve_managed_origin_metadata(conversation_id)
+            if origin_meta:
+                enriched_payload = {**enriched_payload, **origin_meta}
 
         notification = Notification(
             notification_id=nid,
@@ -236,7 +309,7 @@ class NotificationService:
             step_name=step_name,
             step_run_id=step_run_id,
             session_id=session_id,
-            payload=payload or {},
+            payload=enriched_payload,
             status="pending",
             created_at=now,
         )
@@ -253,7 +326,7 @@ class NotificationService:
                     step_name=step_name,
                     step_run_id=step_run_id,
                     session_id=session_id,
-                    payload=payload or {},
+                    payload=enriched_payload,
                     status="pending",
                     created_at=now,
                 )
@@ -262,17 +335,17 @@ class NotificationService:
 
         # Register PauseWaiter so the blocking coroutine can be resolved
         pause_context = (
-            (payload or {}).get("context")
-            if isinstance((payload or {}).get("context"), dict)
+            enriched_payload.get("context")
+            if isinstance(enriched_payload.get("context"), dict)
             else None
         )
         if pause_context is None and notification_type == NotificationType.ESCALATION:
             pause_context = {
-                "call_id": (payload or {}).get("call_id"),
-                "tool_name": (payload or {}).get("tool_name"),
-                "risk": (payload or {}).get("risk"),
-                "reasoning": (payload or {}).get("reasoning"),
-                "timeout_seconds": (payload or {}).get("timeout_seconds"),
+                "call_id": enriched_payload.get("call_id"),
+                "tool_name": enriched_payload.get("tool_name"),
+                "risk": enriched_payload.get("risk"),
+                "reasoning": enriched_payload.get("reasoning"),
+                "timeout_seconds": enriched_payload.get("timeout_seconds"),
             }
         self._pause_waiter.register(
             PendingPause(
@@ -283,12 +356,12 @@ class NotificationService:
                 step_run_id=step_run_id,
                 session_id=session_id,
                 conversation_id=resolved_conversation_id,
-                question=(payload or {}).get("message") or (payload or {}).get("question"),
-                options=(payload or {}).get("options")
-                if isinstance((payload or {}).get("options"), list)
+                question=enriched_payload.get("message") or enriched_payload.get("question"),
+                options=enriched_payload.get("options")
+                if isinstance(enriched_payload.get("options"), list)
                 else None,
-                questions=normalize_questions((payload or {}).get("questions"))
-                if (payload or {}).get("questions") is not None
+                questions=normalize_questions(enriched_payload.get("questions"))
+                if enriched_payload.get("questions") is not None
                 else None,
                 context=pause_context if isinstance(pause_context, dict) else None,
             )
@@ -308,7 +381,7 @@ class NotificationService:
                         "task_id": task_id,
                         "step_name": step_name,
                         "session_id": session_id,
-                        "payload": payload or {},
+                        "payload": enriched_payload,
                     },
                 )
             )
@@ -322,6 +395,10 @@ class NotificationService:
                     "type": notification_type,
                     "conversation_id": resolved_conversation_id,
                     "task_id": task_id,
+                    "managed_origin": bool(
+                        enriched_payload.get("managed_conversation_title")
+                        or enriched_payload.get("managed_target_agent_id")
+                    ),
                 }
             },
         )
@@ -341,8 +418,12 @@ class NotificationService:
     ) -> bool:
         """Resolve a notification, update DB, resolve PauseWaiter.
 
-        Returns True if the notification was resolved, False if it was
-        already resolved or not found.
+        Returns True if the notification was resolved. Duplicate resolves for
+        an already-resolved notification are treated as successful when they
+        repeat the same decision and resolution payload; this keeps UI
+        retries/idempotent WebSocket frames from surfacing a false "not found"
+        error after an approval raced with remote Intaris reconciliation,
+        without accepting conflicting duplicate input.
         """
         resolution_data = data or {}
         now = datetime.now(UTC)
@@ -356,6 +437,26 @@ class NotificationService:
                 )
                 return False
             if row.status != "pending":
+                if _is_same_resolution(row, decision, resolution_data):
+                    waiter_ok = self._pause_waiter.resolve(
+                        notification_id,
+                        PauseResolution(
+                            decision=decision,
+                            data=_resolution_waiter_data(row.resolution, resolution_data),
+                        ),
+                    )
+                    logger.info(
+                        "notification: resolve — already resolved with same decision",
+                        extra={
+                            "extra_data": {
+                                "notification_id": notification_id,
+                                "status": row.status,
+                                "decision": decision,
+                                "pause_waiter_ok": waiter_ok,
+                            }
+                        },
+                    )
+                    return True
                 logger.info(
                     "notification: resolve — already resolved",
                     extra={
@@ -398,11 +499,23 @@ class NotificationService:
         )
 
         async with self._session_factory() as db:
-            if (
-                notification_type == NotificationType.ESCALATION
-                and not ok
-                and decision == "approve"
-            ):
+            if notification_type == NotificationType.ESCALATION and not ok:
+                current = await db.get(NotificationRow, notification_id)
+                if current is not None and _is_same_resolution(current, decision, resolution_data):
+                    logger.info(
+                        "notification: escalation resolved by concurrent remote reconciliation",
+                        extra={
+                            "extra_data": {
+                                "notification_id": notification_id,
+                                "decision": decision,
+                            }
+                        },
+                    )
+                    return True
+
+                if decision != "approve":
+                    return False
+
                 await db.execute(
                     update(NotificationRow)
                     .where(NotificationRow.notification_id == notification_id)
@@ -867,6 +980,42 @@ def _row_to_notification(row: NotificationRow) -> Notification:
         created_at=row.created_at,
         resolved_at=row.resolved_at,
     )
+
+
+def _is_same_resolution(
+    row: NotificationRow, decision: str, resolution_data: dict[str, Any]
+) -> bool:
+    """Return true when a terminal notification already has this resolution."""
+    if row.status != "resolved" or not isinstance(row.resolution, dict):
+        return False
+    if str(row.resolution.get("decision") or "").lower() != decision.lower():
+        return False
+    if row.resolution.get("state") == "resolved_remote":
+        return True
+    persisted_data = {
+        key: value for key, value in row.resolution.items() if key not in {"decision", "state"}
+    }
+    return _normalize_resolution_data(persisted_data) == _normalize_resolution_data(resolution_data)
+
+
+def _normalize_resolution_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize semantically equivalent persisted/input resolution payloads."""
+    normalized = dict(data)
+    if normalized.get("note") == "":
+        normalized.pop("note")
+    return normalized
+
+
+def _resolution_waiter_data(
+    resolution: dict[str, Any] | None,
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    """Return PauseResolution data from persisted resolution plus current input."""
+    data = {
+        key: value for key, value in (resolution or {}).items() if key not in {"decision", "state"}
+    }
+    data.update(fallback)
+    return data
 
 
 def _is_expired_escalation(row: NotificationRow, *, now: datetime) -> bool:

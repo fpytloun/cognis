@@ -11,7 +11,7 @@ from cognis.channels.manager import ChannelManager
 from cognis.core.events import Event, EventBus, EventType
 from cognis.models.channel import AgentProfile, ChannelAccountConfig, OutboundMessage
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.queries import create_agent, create_user
+from cognis.store.queries import create_agent, create_user, update_agent
 
 
 class _FakeAdapter:
@@ -59,6 +59,32 @@ class _FakeWebSocketProvider:
     def get_connection(self, executor_id: str) -> None:
         del executor_id
         return None
+
+
+class _FakeArtifactStore:
+    def __init__(self) -> None:
+        self.signed_url_calls: list[tuple[str, str, str]] = []
+        self.load_calls: list[tuple[str, str, str]] = []
+
+    async def async_get_signed_url(
+        self,
+        bucket: str,
+        artifact_id: str,
+        name: str,
+        *,
+        ttl_seconds: int,
+    ) -> str:
+        del ttl_seconds
+        self.signed_url_calls.append((bucket, artifact_id, name))
+        if name != "image":
+            raise FileNotFoundError(name)
+        return "https://example.com/avatar.png"
+
+    async def async_load(self, bucket: str, artifact_id: str, name: str) -> tuple[bytes, str]:
+        self.load_calls.append((bucket, artifact_id, name))
+        if name != "image":
+            raise FileNotFoundError(name)
+        return b"avatar-bytes", "image/png"
 
 
 class _FakeHTTPResponse:
@@ -194,6 +220,45 @@ async def test_start_account_syncs_profile(tmp_path: Any, monkeypatch: pytest.Mo
         assert len(adapter.synced_profiles) == 1
         assert adapter.synced_profiles[0].name == "TestBot"
         assert adapter.synced_profiles[0].effective_name == "Bot Display"
+    finally:
+        await manager.stop_all()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_start_account_loads_agent_avatar_image_artifact(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory, event_bus = await _setup(tmp_path)
+    try:
+        async with session_factory() as session:
+            await update_agent(
+                session,
+                "agent-1",
+                updates={"avatar_image_id": "avatar-image-1"},
+            )
+            await session.commit()
+
+        adapter = _FakeAdapter()
+        artifact_store = _FakeArtifactStore()
+        monkeypatch.setattr("cognis.channels.manager._create_adapter", lambda _: adapter)
+        manager = ChannelManager(
+            session_factory=session_factory,
+            inbound_pipeline=None,  # type: ignore[arg-type]
+            secrets_provider=_FakeSecrets(),
+            artifact_store=artifact_store,
+            event_bus=event_bus,
+        )
+
+        await manager.start_account(_config())
+
+        assert len(adapter.synced_profiles) == 1
+        profile = adapter.synced_profiles[0]
+        assert profile.avatar_url == "https://example.com/avatar.png"
+        assert profile.avatar_bytes == b"avatar-bytes"
+        assert profile.avatar_content_type == "image/png"
+        assert artifact_store.signed_url_calls == [("avatars", "avatar-image-1", "image")]
+        assert artifact_store.load_calls == [("avatars", "avatar-image-1", "image")]
     finally:
         await manager.stop_all()
         await engine.dispose()

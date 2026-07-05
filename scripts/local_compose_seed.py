@@ -65,6 +65,10 @@ class LocalSeedConfig:
     llm_api_key_env: str
     chat_model: str
     executor_token_dir: Path
+    executor_token_uid: int
+    executor_token_gid: int
+    host_token_uid: int | None
+    host_token_gid: int | None
     controller_ws_url: str
     host_controller_ws_url: str
     seed_sample_conversation: bool
@@ -89,7 +93,7 @@ def _local_config() -> LocalSeedConfig:
     if not _env(llm_api_key_env):
         raise RuntimeError(f"{llm_api_key_env} is required for local provider seeding")
     return LocalSeedConfig(
-        admin_email=_env("COGNIS_LOCAL_ADMIN_EMAIL", "admin@localhost"),
+        admin_email=_env("COGNIS_LOCAL_ADMIN_EMAIL", "admin@cognis-e2e.localdev.me"),
         admin_password=_env("COGNIS_LOCAL_ADMIN_PASSWORD", "cognis-local-admin"),
         admin_name=_env("COGNIS_LOCAL_ADMIN_NAME", "Local Admin"),
         provider_name=_env("COGNIS_LOCAL_PROVIDER_NAME", "Local OpenAI-Compatible"),
@@ -97,6 +101,14 @@ def _local_config() -> LocalSeedConfig:
         llm_api_key_env=llm_api_key_env,
         chat_model=_env("COGNIS_LOCAL_CHAT_MODEL", "gpt-oss-120b"),
         executor_token_dir=Path(_env("COGNIS_LOCAL_EXECUTOR_TOKEN_DIR", "/run/cognis-local")),
+        executor_token_uid=int(_env("COGNIS_LOCAL_EXECUTOR_TOKEN_UID", "1000")),
+        executor_token_gid=int(_env("COGNIS_LOCAL_EXECUTOR_TOKEN_GID", "1000")),
+        host_token_uid=int(host_uid)
+        if (host_uid := _env("COGNIS_LOCAL_HOST_TOKEN_UID", ""))
+        else None,
+        host_token_gid=int(host_gid)
+        if (host_gid := _env("COGNIS_LOCAL_HOST_TOKEN_GID", ""))
+        else None,
         controller_ws_url=_env(
             "COGNIS_LOCAL_EXECUTOR_CONTROLLER_URL",
             "ws://cognis:8080/api/executor/ws",
@@ -439,6 +451,9 @@ async def _seed_sample_conversation(
 
 def _write_executor_env(config: LocalSeedConfig, token: str) -> None:
     config.executor_token_dir.mkdir(parents=True, exist_ok=True)
+    config.executor_token_dir.chmod(
+        stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH
+    )
     token_file = config.executor_token_dir / "executor.env"
     content = "\n".join(
         [
@@ -451,6 +466,7 @@ def _write_executor_env(config: LocalSeedConfig, token: str) -> None:
     )
     tmp_path = token_file.with_suffix(".tmp")
     tmp_path.write_text(content, encoding="utf-8")
+    os.chown(tmp_path, config.executor_token_uid, config.executor_token_gid)
     tmp_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
     tmp_path.replace(token_file)
     print(f"Wrote Docker executor env file: {token_file}")
@@ -466,7 +482,11 @@ def _write_executor_env(config: LocalSeedConfig, token: str) -> None:
     )
     host_tmp = host_env_path.with_suffix(".tmp")
     host_tmp.write_text(host_content, encoding="utf-8")
-    host_tmp.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+    if config.host_token_uid is not None and config.host_token_gid is not None:
+        os.chown(host_tmp, config.host_token_uid, config.host_token_gid)
+        host_tmp.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+    else:
+        host_tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
     host_tmp.replace(host_env_path)
     print(f"Wrote host executor env file: {host_env_path}")
 

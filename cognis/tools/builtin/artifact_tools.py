@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
+from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.content_refs import (
     build_deliverable_public_url,
     continuation_scope_task_id,
@@ -78,6 +79,20 @@ def _is_expired_artifact_row(row: object, *, now: datetime | None = None) -> boo
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
     return expires_at <= (now or datetime.now(UTC))
+
+
+def _clamp_ttl_to_artifact_expiry(row: object, requested_ttl_seconds: int) -> int:
+    expires_at = getattr(row, "expires_at", None)
+    if expires_at is None:
+        return requested_ttl_seconds
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    remaining_seconds = int((expires_at - datetime.now(UTC)).total_seconds())
+    return max(60, min(requested_ttl_seconds, remaining_seconds))
+
+
+def _is_html_content_type(content_type: str) -> bool:
+    return content_type.split(";", 1)[0].strip().lower() == "text/html"
 
 
 ARTIFACT_READ_TOOL = ToolDefinition(
@@ -241,7 +256,10 @@ ARTIFACT_GET_URL_TOOL = ToolDefinition(
         "Generate a short-lived download URL for an artifact-compatible content ref by "
         "artifact_id, including saved Cognis artifact IDs and task deliverable IDs (dlv_*). "
         "Use this when the user asks for download links, wants to view artifacts, or wants "
-        "images/files returned as direct UI attachments."
+        "images/files returned as direct UI attachments. When another tool needs an artifact "
+        "URL directly in its arguments, use an exact artifact value ref such as "
+        "$artifact:<artifact_id>.signed_url or $artifact:<artifact_id>.public_url instead of "
+        "calling this tool just to copy the URL."
     ),
     parameters={
         "type": "object",
@@ -255,6 +273,11 @@ ARTIFACT_GET_URL_TOOL = ToolDefinition(
                 "description": "Signed URL lifetime in seconds (default 3600, max 604800).",
                 "minimum": 60,
                 "maximum": 604800,
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["download", "view"],
+                "description": "URL serving mode. Default download serves files as attachments; view serves supported HTML artifacts inline.",
             },
         },
         "required": ["artifact_id"],
@@ -299,7 +322,11 @@ def attachment_supports_model(attachment: AttachmentRef, model_info: Any) -> boo
     """Return whether a model can inspect an attachment natively."""
 
     if attachment.kind == ArtifactKind.IMAGE:
-        return bool(getattr(model_info, "supports_vision", False))
+        return supports_native_image_input(
+            model_info,
+            attachment.mime_type,
+            filename=attachment.filename,
+        )
     if attachment.kind == ArtifactKind.PDF:
         return bool(
             getattr(model_info, "supports_pdf_input", False)
@@ -491,6 +518,9 @@ async def _handle_artifact_read(
         )
         if attachment_supports_model(attachment, model_info):
             safe_attachment = _attachment_ref_tool_payload(attachment)
+            # Mark as inspection-only so the agent loop injects it into the next
+            # LLM cycle but does NOT echo it back to the channel as outbound media.
+            safe_attachment = {**safe_attachment, "native_inspection_only": True}
             prompt_note = f"\nRequested analysis prompt: {prompt}" if prompt else ""
             return ToolResult(
                 output=(
@@ -703,6 +733,9 @@ async def _handle_artifact_get_url(
         return ToolResult(output="artifact_id is required.", is_error=True)
     ttl_seconds = _coerce_limit(arguments.get("ttl_seconds"), default=3600, maximum=604800)
     ttl_seconds = max(60, ttl_seconds)
+    mode = str(arguments.get("mode") or "download").strip().lower()
+    if mode not in {"download", "view"}:
+        return ToolResult(output="mode must be 'download' or 'view'.", is_error=True)
 
     if is_deliverable_ref(artifact_id):
         async with session_factory() as session:
@@ -711,11 +744,17 @@ async def _handle_artifact_get_url(
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        if mode == "view" and not _is_html_content_type(ref.mime_type):
+            return ToolResult(
+                output=f"Artifact view is only supported for HTML artifacts: {artifact_id}",
+                is_error=True,
+            )
         try:
             url = build_deliverable_public_url(
                 artifact_store,
                 ref,
                 ttl_seconds=ttl_seconds,
+                mode=mode,
             )
         except Exception as exc:
             return ToolResult(
@@ -729,6 +768,7 @@ async def _handle_artifact_get_url(
             "source": "deliverable",
             "virtual": True,
             "url": url,
+            "mode": mode,
             "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
             "filename": ref.filename,
             "kind": "file",
@@ -746,13 +786,20 @@ async def _handle_artifact_get_url(
         return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
     if row.owner_email and user_email and row.owner_email != user_email:
         return ToolResult(output=f"Artifact access denied: {artifact_id}", is_error=True)
+    if mode == "view" and not _is_html_content_type(str(row.mime_type)):
+        return ToolResult(
+            output=f"Artifact view is only supported for HTML artifacts: {artifact_id}",
+            is_error=True,
+        )
 
     try:
+        ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
         url = await artifact_store.async_get_public_url(
             row.namespace,
             row.object_id,
             row.filename,
             ttl_seconds=ttl_seconds,
+            mode=mode,
         )
     except Exception as exc:
         return ToolResult(
@@ -760,7 +807,7 @@ async def _handle_artifact_get_url(
             is_error=True,
         )
 
-    item = _artifact_url_item(row, url=url, ttl_seconds=ttl_seconds)
+    item = _artifact_url_item(row, url=url, ttl_seconds=ttl_seconds, mode=mode)
     # artifact_get_url returns a signed URL for the artifact.  The LLM and the
     # tool-call block UI already have the URL from the JSON output; returning the
     # artifact as an attachment would echo a file the user already uploaded into the
@@ -1855,10 +1902,13 @@ def _artifact_metadata_item(row: Any) -> dict[str, Any]:
     }
 
 
-def _artifact_url_item(row: Any, *, url: str, ttl_seconds: int) -> dict[str, Any]:
+def _artifact_url_item(
+    row: Any, *, url: str, ttl_seconds: int, mode: str = "download"
+) -> dict[str, Any]:
     return {
         "artifact_id": str(row.artifact_id),
         "url": url,
+        "mode": mode,
         "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
         "filename": str(row.filename),
         "kind": str(row.kind),

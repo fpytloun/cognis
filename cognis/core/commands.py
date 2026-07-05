@@ -13,8 +13,10 @@ into its native format (WS JSON, REST response, CLI output, etc.).
 from __future__ import annotations
 
 import contextlib
+import hashlib
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.agent_loop import PauseResolution
@@ -25,7 +27,8 @@ from cognis.core.long_lived_chat import is_channel_context_type
 from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.config import NORMALIZED_REASONING_LEVELS
+from cognis.models.session import ConversationContext, ConversationModel, SessionEvent, SessionModel
 from cognis.models.task import TaskDelivery
 from cognis.providers.llm.reasoning import (
     normalize_reasoning_effort,
@@ -61,6 +64,7 @@ _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
         "/model",
         "/thinking",
         "/profile",
+        "/skill",
         "/executor",
         "/task",
         "/research",
@@ -151,6 +155,142 @@ class CommandResult:
     data: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class SlashCommandSuggestion:
+    """A slash command or slash command parameter suggestion."""
+
+    kind: str
+    command: str
+    value: str
+    label: str
+    insert_text: str
+    description: str | None = None
+    suffix: str = "none"
+    badges: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class _SlashCommandMetadata:
+    command: str
+    description: str
+    accepts_argument: bool = False
+    parameter_suggestions: bool = False
+
+
+_SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
+    _SlashCommandMetadata("/help", "Show available commands"),
+    _SlashCommandMetadata("/model", "List or switch LLM model", True, True),
+    _SlashCommandMetadata("/thinking", "Set reasoning effort", True, True),
+    _SlashCommandMetadata("/profile", "List or switch agent runtime profile", True, True),
+    _SlashCommandMetadata("/skill", "List or load a skill into this session", True, True),
+    _SlashCommandMetadata("/executor", "Show or switch active executor", True, True),
+    _SlashCommandMetadata("/context", "Show context usage"),
+    _SlashCommandMetadata("/info", "Show session details"),
+    _SlashCommandMetadata("/lsp", "Show LSP diagnostics status"),
+    _SlashCommandMetadata("/plan", "Plan/read-only mode; add text for one-shot planning", True),
+    _SlashCommandMetadata("/build", "Build/implementation mode; add text for one-shot build", True),
+    _SlashCommandMetadata(
+        "/default",
+        "Return to agent default mode; add text for one-shot default",
+        True,
+    ),
+    _SlashCommandMetadata("/compact", "Compact conversation"),
+    _SlashCommandMetadata("/summarize", "Alias for /compact"),
+    _SlashCommandMetadata("/fork", "Fork conversation; add text to start the fork", True),
+    _SlashCommandMetadata("/task", "Create a background task", True),
+    _SlashCommandMetadata("/research", "Start a research task", True),
+    _SlashCommandMetadata("/implement", "Start an implementation task", True),
+    _SlashCommandMetadata("/delegate", "Delegate a bounded sub-task", True),
+    _SlashCommandMetadata("/undo", "Undo the last user turn in this chat"),
+    _SlashCommandMetadata("/redo", "Redo the last undone turn in this chat"),
+    _SlashCommandMetadata("/new", "Start new conversation"),
+    _SlashCommandMetadata("/reset", "Alias for /new"),
+    _SlashCommandMetadata("/clear", "Alias for /new"),
+    _SlashCommandMetadata("/stop", "Stop current work"),
+    _SlashCommandMetadata("/cancel", "Alias for /stop"),
+    _SlashCommandMetadata("/approve", "Approve tool escalation", True),
+    _SlashCommandMetadata("/deny", "Deny tool escalation", True),
+    _SlashCommandMetadata("/retry", "Retry paused workflow gate", True),
+    _SlashCommandMetadata("/continue", "Continue paused workflow gate", True),
+)
+_SLASH_COMMAND_METADATA_BY_COMMAND = {item.command: item for item in _SLASH_COMMAND_METADATA}
+_PARAMETER_SUGGESTION_COMMANDS = frozenset(
+    item.command for item in _SLASH_COMMAND_METADATA if item.parameter_suggestions
+)
+
+
+def _parse_slash_suggestion_input(value: str) -> tuple[str, str, str] | None:
+    """Parse raw composer text into command or parameter suggestion mode."""
+
+    stripped = value.strip()
+    if not stripped.startswith("/"):
+        return None
+    normalized = normalize_slash_command_message(value)
+    if not normalized.startswith("/"):
+        return None
+    has_trailing_space = bool(value) and value[-1].isspace()
+    if has_trailing_space and normalized in _SLASH_COMMAND_METADATA_BY_COMMAND:
+        return ("parameter", normalized, "")
+    if " " not in normalized:
+        return ("command", "", normalized.lower())
+    command, partial = normalized.split(" ", 1)
+    return ("parameter", command.lower(), partial.strip())
+
+
+def _suggest_commands(partial: str, *, limit: int) -> list[SlashCommandSuggestion]:
+    suggestions: list[SlashCommandSuggestion] = []
+    for metadata in _SLASH_COMMAND_METADATA:
+        if partial and not metadata.command.startswith(partial):
+            continue
+        suffix = "space" if metadata.accepts_argument else "none"
+        insert_text = f"{metadata.command} " if metadata.accepts_argument else metadata.command
+        suggestions.append(
+            SlashCommandSuggestion(
+                kind="command",
+                command=metadata.command,
+                value=metadata.command,
+                label=metadata.command,
+                description=metadata.description,
+                insert_text=insert_text,
+                suffix=suffix,
+            )
+        )
+        if len(suggestions) >= limit:
+            break
+    return suggestions
+
+
+def _matches_suggestion(partial: str, *values: str | None) -> bool:
+    if not partial:
+        return True
+    normalized = partial.casefold()
+    return any(normalized in value.casefold() for value in values if value)
+
+
+def _ranked(values: list[Any], partial: str, value_getter: Any, label_getter: Any) -> list[Any]:
+    if not partial:
+        return values
+    normalized = partial.casefold()
+
+    def rank(indexed: tuple[int, Any]) -> tuple[int, int]:
+        index, item = indexed
+        value = str(value_getter(item) or "")
+        label = str(label_getter(item) or "")
+        value_key = value.casefold()
+        label_key = label.casefold()
+        if value_key == normalized:
+            score = 0
+        elif value_key.startswith(normalized):
+            score = 1
+        elif label_key.startswith(normalized):
+            score = 2
+        else:
+            score = 3
+        return (score, index)
+
+    return [item for _, item in sorted(enumerate(values), key=rank)]
+
+
 # ---------------------------------------------------------------------------
 # CommandDispatcher
 # ---------------------------------------------------------------------------
@@ -188,6 +328,372 @@ class CommandDispatcher:
     @property
     def _task_queue(self) -> Any | None:
         return getattr(self._turn_scheduler, "_task_queue", None)
+
+    def _agent_loop(self) -> Any | None:
+        return getattr(self._turn_scheduler, "_agent_loop", None)
+
+    @contextlib.asynccontextmanager
+    async def _hold_session_lock(self, session_id: str) -> AsyncIterator[None]:
+        agent_loop = self._agent_loop()
+        hold_session_lock = getattr(agent_loop, "hold_session_lock", None)
+        if not callable(hold_session_lock):
+            yield
+            return
+        async with hold_session_lock(session_id):
+            yield
+
+    async def _reload_runtime_if_available(
+        self,
+        conversation_id: str,
+    ) -> tuple[ConversationModel, SessionModel, AgentDefinition, bool] | None:
+        loader = getattr(self._turn_scheduler, "_load_conversation_runtime", None)
+        if not callable(loader):
+            return None
+        return cast(
+            tuple[ConversationModel, SessionModel, AgentDefinition, bool] | None,
+            await loader(conversation_id),
+        )
+
+    async def suggest(
+        self,
+        command_input: str,
+        *,
+        conversation: ConversationModel,
+        session: SessionModel | None,
+        agent: AgentDefinition,
+        user_email: str,
+        limit: int = 12,
+    ) -> list[SlashCommandSuggestion]:
+        """Return read-only slash command suggestions for the current runtime."""
+
+        parsed = _parse_slash_suggestion_input(command_input)
+        if parsed is None:
+            return []
+        mode, command, partial = parsed
+        bounded_limit = max(1, min(limit, 50))
+        if mode == "command":
+            return _suggest_commands(partial, limit=bounded_limit)
+        if command not in _PARAMETER_SUGGESTION_COMMANDS:
+            return []
+        if partial and any(char.isspace() for char in partial.strip()):
+            return []
+        if command == "/model":
+            return await self._suggest_models(
+                session,
+                partial,
+                user_email=user_email,
+                limit=bounded_limit,
+            )
+        if command == "/thinking":
+            return await self._suggest_thinking_levels(session, partial, limit=bounded_limit)
+        if command == "/profile":
+            return self._suggest_profiles(
+                conversation, session, agent, partial, limit=bounded_limit
+            )
+        if command == "/skill":
+            return await self._suggest_skills(
+                session,
+                agent,
+                user_email,
+                partial,
+                limit=bounded_limit,
+            )
+        if command == "/executor":
+            return await self._suggest_executors(
+                conversation,
+                agent,
+                user_email,
+                partial,
+                limit=bounded_limit,
+            )
+        return []
+
+    async def _suggest_models(
+        self,
+        session: SessionModel | None,
+        partial: str,
+        *,
+        user_email: str,
+        limit: int,
+    ) -> list[SlashCommandSuggestion]:
+        try:
+            if hasattr(self._providers.llm, "list_model_references"):
+                model_refs = await self._providers.llm.list_model_references(
+                    acting_user_email=user_email
+                )
+            else:
+                model_refs = [
+                    {"value": model_id, "model_id": model_id, "provider_id": None}
+                    for model_id in await self._providers.llm.list_model_ids()
+                ]
+        except Exception:
+            model_refs = []
+        current_model = self._current_model_id(session)
+        current_provider = (
+            self._session_cache.get_model_override_provider_id(session.session_id)
+            if session is not None
+            else None
+        )
+        matches = [
+            ref
+            for ref in model_refs
+            if _matches_suggestion(partial, str(ref.get("value") or ""))
+            or _matches_suggestion(partial, str(ref.get("model_id") or ""))
+        ]
+        matches = _ranked(
+            matches,
+            partial,
+            lambda item: str(item.get("value") or ""),
+            lambda item: str(item.get("model_id") or ""),
+        )
+        suggestions: list[SlashCommandSuggestion] = []
+        for ref in matches[:limit]:
+            model_id = str(ref.get("model_id") or ref.get("value") or "")
+            provider_id = ref.get("provider_id")
+            value = str(ref.get("value") or model_id)
+            badges: list[str] = []
+            if provider_id and bool(ref.get("is_default_provider")):
+                badges.append("default provider")
+            if model_id == current_model and (
+                current_provider is None or current_provider == provider_id
+            ):
+                badges.insert(0, "current")
+            suggestions.append(
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/model",
+                    value=value,
+                    label=value,
+                    description=str(ref.get("provider_display_name") or provider_id or "") or None,
+                    insert_text=f"/model {value}",
+                    badges=badges,
+                )
+            )
+        return suggestions
+
+    async def _suggest_thinking_levels(
+        self,
+        session: SessionModel | None,
+        partial: str,
+        *,
+        limit: int,
+    ) -> list[SlashCommandSuggestion]:
+        current_model = self._current_model_id(session) or ""
+        try:
+            if current_model:
+                model_info = await self._providers.llm.get_model_info(current_model)
+                available = list(model_info.reasoning_efforts or [])
+            else:
+                available = []
+        except Exception:
+            available = []
+        if not available and current_model:
+            available = _infer_reasoning_efforts(current_model)
+        levels = list(dict.fromkeys(["default", "off", *available, *NORMALIZED_REASONING_LEVELS]))
+        current_effort = (
+            self._session_cache.get_reasoning_effort_override(session.session_id)
+            if session is not None
+            else None
+        )
+        matches = [level for level in levels if _matches_suggestion(partial, level)]
+        matches = _ranked(matches, partial, lambda item: item, lambda item: item)
+        suggestions: list[SlashCommandSuggestion] = []
+        for level in matches[:limit]:
+            is_current = (
+                not current_effort and level in {"default", "off"}
+            ) or level == current_effort
+            description = (
+                "Reset to default" if level in {"default", "off"} else "Set reasoning effort"
+            )
+            suggestions.append(
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/thinking",
+                    value=level,
+                    label=level,
+                    description=description,
+                    insert_text=f"/thinking {level}",
+                    badges=["current"] if is_current else [],
+                )
+            )
+        return suggestions
+
+    def _suggest_profiles(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel | None,
+        agent: AgentDefinition,
+        partial: str,
+        *,
+        limit: int,
+    ) -> list[SlashCommandSuggestion]:
+        current_id = requested_agent_profile_id(session, conversation)
+        current = resolve_agent_profile(agent, current_id, source="conversation")
+        profiles: list[tuple[str, str, bool]] = []
+        if agent.agent_profiles:
+            for profile_id, profile in sorted(agent.agent_profiles.items()):
+                if not profile.enabled:
+                    continue
+                resolved_id = profile.profile_id or profile_id
+                profiles.append((resolved_id, profile.description or "", False))
+        else:
+            profiles.append(
+                ("default", "Synthetic profile derived from agent LLM configuration", True)
+            )
+        if agent.default_agent_profile_id and not any(
+            item[0] == agent.default_agent_profile_id for item in profiles
+        ):
+            profiles.append((agent.default_agent_profile_id, "Default agent profile", True))
+        matches = [item for item in profiles if _matches_suggestion(partial, item[0], item[1])]
+        matches = _ranked(matches, partial, lambda item: item[0], lambda item: item[0])
+        suggestions: list[SlashCommandSuggestion] = []
+        for profile_id, description, is_default in matches[:limit]:
+            badges: list[str] = []
+            if profile_id == current.profile_id:
+                badges.append("current")
+            if is_default or profile_id == agent.default_agent_profile_id:
+                badges.append("default")
+            suggestions.append(
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/profile",
+                    value=profile_id,
+                    label=profile_id,
+                    description=description or None,
+                    insert_text=f"/profile {profile_id}",
+                    badges=badges,
+                )
+            )
+        return suggestions
+
+    async def _suggest_skills(
+        self,
+        session: SessionModel | None,
+        agent: AgentDefinition,
+        user_email: str,
+        partial: str,
+        *,
+        limit: int,
+    ) -> list[SlashCommandSuggestion]:
+        if self._session_factory is None:
+            return []
+        session_id = session.session_id if session is not None else None
+        try:
+            from cognis.tools.skills import resolve_skills_for_agent
+
+            async with self._session_factory() as db_session:
+                resolved = await resolve_skills_for_agent(
+                    db_session,
+                    agent,
+                    owner_email=user_email,
+                )
+        except Exception:
+            logger.debug("/skill suggestions: failed to resolve skills", exc_info=True)
+            return []
+        skills = [
+            skill
+            for skill in resolved.skills
+            if _matches_suggestion(
+                partial,
+                getattr(skill, "skill_id", ""),
+                getattr(skill, "name", ""),
+                getattr(skill, "description", ""),
+            )
+        ]
+        skills = _ranked(
+            skills,
+            partial,
+            lambda item: getattr(item, "skill_id", ""),
+            lambda item: getattr(item, "name", ""),
+        )
+        loaded_skill_ids = self._get_loaded_skill_ids(session_id) if session_id else set()
+        activated_skill_ids = self._get_activated_skill_ids(session_id) if session_id else set()
+        suggestions: list[SlashCommandSuggestion] = []
+        for skill in skills[:limit]:
+            skill_id = str(getattr(skill, "skill_id", ""))
+            name = str(getattr(skill, "name", skill_id))
+            badges: list[str] = []
+            if skill_id in loaded_skill_ids:
+                badges.append("loaded")
+            if skill_id in activated_skill_ids:
+                badges.append("active tools")
+            suggestions.append(
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/skill",
+                    value=skill_id,
+                    label=name,
+                    description=str(getattr(skill, "description", "") or "") or None,
+                    insert_text=f"/skill {skill_id}",
+                    badges=badges,
+                )
+            )
+        return suggestions
+
+    async def _suggest_executors(
+        self,
+        conversation: ConversationModel,
+        agent: AgentDefinition,
+        user_email: str,
+        partial: str,
+        *,
+        limit: int,
+    ) -> list[SlashCommandSuggestion]:
+        pool = await self._resolve_executor_pool_for_command(agent, user_email)
+        if pool is None:
+            return []
+        active_id = getattr(conversation, "active_executor_id", None)
+        targets = [
+            target
+            for target in pool.all
+            if _matches_suggestion(
+                partial,
+                getattr(target, "executor_id", ""),
+                getattr(target, "description", ""),
+                getattr(target, "executor_type", ""),
+            )
+        ]
+        targets = _ranked(
+            targets,
+            partial,
+            lambda item: getattr(item, "executor_id", ""),
+            lambda item: getattr(item, "description", ""),
+        )
+        suggestions: list[SlashCommandSuggestion] = []
+        for target in targets[:limit]:
+            executor_id = str(getattr(target, "executor_id", ""))
+            badges: list[str] = ["primary" if target.is_primary else "additional"]
+            if executor_id == active_id:
+                badges.insert(0, "active")
+            state = getattr(target, "state", None)
+            state_value = getattr(state, "value", str(state)) if state is not None else None
+            if state_value:
+                badges.append(str(state_value))
+            executor_type = str(getattr(target, "executor_type", "") or "")
+            description = str(getattr(target, "description", "") or "") or executor_type or None
+            suggestions.append(
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/executor",
+                    value=executor_id,
+                    label=executor_id,
+                    description=description,
+                    insert_text=f"/executor {executor_id}",
+                    badges=badges,
+                )
+            )
+        return suggestions
+
+    def _current_model_id(self, session: SessionModel | None) -> str | None:
+        if session is None:
+            return None
+        current = self._session_cache.get_model_override(session.session_id)
+        if current:
+            return str(current)
+        usage = self._session_cache.get_context_usage(session.session_id)
+        if usage and usage.get("model"):
+            return str(usage["model"])
+        return None
 
     async def dispatch(
         self,
@@ -295,7 +801,7 @@ class CommandDispatcher:
         # /model [name]
         if stripped == "/model" or stripped.startswith("/model "):
             arg = stripped[6:].strip() if len(stripped) > 6 else ""
-            return await self._handle_model(session, arg)
+            return await self._handle_model(session, arg, user_email=user_email)
 
         # /thinking [level]
         if stripped == "/thinking" or stripped.startswith("/thinking "):
@@ -306,6 +812,11 @@ class CommandDispatcher:
         if stripped == "/profile" or stripped.startswith("/profile "):
             arg = stripped[len("/profile") :].strip() if len(stripped) > len("/profile") else ""
             return await self._handle_profile(conversation, session, agent, arg)
+
+        # /skill [skill name or id]
+        if stripped == "/skill" or stripped.startswith("/skill "):
+            arg = stripped[len("/skill") :].strip() if len(stripped) > len("/skill") else ""
+            return await self._handle_skill(session, agent, user_email, arg)
 
         # /lsp
         if stripped == "/lsp":
@@ -339,7 +850,7 @@ class CommandDispatcher:
             )
 
         # /approve [note] or /deny [note]
-        if stripped.startswith("/approve") or stripped.startswith("/deny"):
+        if stripped in ("/approve", "/deny") or stripped.startswith(("/approve ", "/deny ")):
             is_approve = stripped.startswith("/approve")
             cmd_word = "/approve" if is_approve else "/deny"
             note = stripped[len(cmd_word) :].strip() or None
@@ -386,15 +897,20 @@ class CommandDispatcher:
             source="conversation",
         )
         model_override = self._session_cache.get_model_override(session.session_id)
+        model_override_provider_id = self._session_cache.get_model_override_provider_id(
+            session.session_id
+        )
         reasoning_override = self._session_cache.get_reasoning_effort_override(session.session_id)
-        explicit_model = (
-            model_override
-            or resolved_profile.model
-            or (agent.llm_config.model if agent.llm_config else None)
-        )
-        provider_id = resolved_profile.provider_id or (
-            agent.llm_config.provider_id if agent.llm_config else None
-        )
+        if model_override:
+            explicit_model = model_override
+            provider_id = model_override_provider_id
+        else:
+            explicit_model = resolved_profile.model or (
+                agent.llm_config.model if agent.llm_config else None
+            )
+            provider_id = resolved_profile.provider_id or (
+                agent.llm_config.provider_id if agent.llm_config else None
+            )
         reasoning_effort = reasoning_override or (
             resolved_profile.reasoning_effort
             or (agent.llm_config.reasoning_effort if agent.llm_config else None)
@@ -444,72 +960,93 @@ class CommandDispatcher:
         """Handle /compact or /summarize."""
         conversation_id = conversation.conversation_id
 
-        try:
-            compaction_result = await self._compaction_strategy.compact(
-                session,
-                trigger="manual",
-                model_context=await self._compaction_model_context(session, agent, user_email),
-            )
-        except Exception:
-            logger.exception(
-                "Command /compact failed",
-                extra={"extra_data": {"session_id": session.session_id}},
-            )
-            return CommandResult(
-                type="error",
-                text="Compaction failed. Try again or continue chatting.",
-                data={"code": "compaction_failed"},
-            )
+        lock_session_id = session.session_id
+        for _attempt in range(3):
+            async with self._hold_session_lock(lock_session_id):
+                runtime = await self._reload_runtime_if_available(conversation_id)
+                if runtime is not None:
+                    conversation, session, agent, _bootstrap_wait = runtime
+                if session.session_id != lock_session_id:
+                    lock_session_id = session.session_id
+                    continue
 
-        if not compaction_result.compacted:
-            if compaction_result.method == "llm_failed":
+                try:
+                    compaction_result = await self._compaction_strategy.compact(
+                        session,
+                        trigger="manual",
+                        model_context=await self._compaction_model_context(
+                            session, agent, user_email
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Command /compact failed",
+                        extra={"extra_data": {"session_id": session.session_id}},
+                    )
+                    return CommandResult(
+                        type="error",
+                        text="Compaction failed. Try again or continue chatting.",
+                        data={"code": "compaction_failed"},
+                    )
+
+                if not compaction_result.compacted:
+                    if compaction_result.method == "llm_failed":
+                        return CommandResult(
+                            type="error",
+                            text=(
+                                "Compaction requires the LLM and the request failed. "
+                                "Please try again, or use /new to start a fresh conversation."
+                            ),
+                            data={"code": "compaction_llm_failed"},
+                        )
+                    return CommandResult(
+                        type="system_message",
+                        text="Not enough conversation history to compact.",
+                    )
+
+                try:
+                    new_session = await self._session_manager.rotate_session(
+                        conversation_id=conversation_id,
+                        current_session=session,
+                        intention="Continued conversation",
+                        completion_reason="compacted",
+                        compaction_summary=compaction_result.summary,
+                        tail_events=getattr(compaction_result, "preserved_tail_events", None),
+                    )
+                    if compaction_result.summary:
+                        await self._session_cache.refresh(new_session)
+                except Exception:
+                    logger.exception(
+                        "Command /compact rotation failed",
+                        extra={"extra_data": {"session_id": session.session_id}},
+                    )
+                    return CommandResult(
+                        type="error",
+                        text=(
+                            "Compaction succeeded, but session rotation failed. "
+                            "Try again or continue chatting."
+                        ),
+                        data={"code": "compaction_rotation_failed"},
+                    )
+
+                summary_preview = (compaction_result.summary or "")[:500]
                 return CommandResult(
-                    type="error",
-                    text=(
-                        "Compaction requires the LLM and the request failed. "
-                        "Please try again, or use /new to start a fresh conversation."
-                    ),
-                    data={"code": "compaction_llm_failed"},
+                    type="session_compacted",
+                    text="Conversation history compacted.",
+                    data={
+                        "conversation_id": conversation_id,
+                        "session_id": new_session.session_id,
+                        "previous_session_id": session.session_id,
+                        "summary_preview": summary_preview,
+                        "method": compaction_result.method,
+                        "turns_compacted": compaction_result.turns_compacted,
+                    },
                 )
-            return CommandResult(
-                type="system_message",
-                text="Not enough conversation history to compact.",
-            )
 
-        try:
-            new_session = await self._session_manager.rotate_session(
-                conversation_id=conversation_id,
-                current_session=session,
-                intention="Continued conversation",
-                completion_reason="compacted",
-                compaction_summary=compaction_result.summary,
-                tail_events=getattr(compaction_result, "preserved_tail_events", None),
-            )
-            if compaction_result.summary:
-                await self._session_cache.refresh(new_session)
-        except Exception:
-            logger.exception(
-                "Command /compact rotation failed",
-                extra={"extra_data": {"session_id": session.session_id}},
-            )
-            return CommandResult(
-                type="error",
-                text="Compaction succeeded, but session rotation failed. Try again or continue chatting.",
-                data={"code": "compaction_rotation_failed"},
-            )
-
-        summary_preview = (compaction_result.summary or "")[:500]
         return CommandResult(
-            type="session_compacted",
-            text="Conversation history compacted.",
-            data={
-                "conversation_id": conversation_id,
-                "session_id": new_session.session_id,
-                "previous_session_id": session.session_id,
-                "summary_preview": summary_preview,
-                "method": compaction_result.method,
-                "turns_compacted": compaction_result.turns_compacted,
-            },
+            type="error",
+            text="Compaction could not acquire a stable active session. Try again.",
+            data={"code": "compaction_session_changed"},
         )
 
     async def _handle_new(
@@ -1311,52 +1848,95 @@ class CommandDispatcher:
         if session.completion_reason:
             lines.append(f"{indent}Completion reason: {session.completion_reason}")
 
-    async def _handle_model(self, session: SessionModel, arg: str) -> CommandResult:
+    async def _handle_model(
+        self,
+        session: SessionModel,
+        arg: str,
+        *,
+        user_email: str,
+    ) -> CommandResult:
         """Handle /model [name] — list or switch LLM model."""
         session_id = session.session_id
 
         if not arg:
             # List available models
             try:
-                model_ids = await self._providers.llm.list_model_ids()
+                if hasattr(self._providers.llm, "list_model_references"):
+                    model_refs = await self._providers.llm.list_model_references(
+                        acting_user_email=session.user_email or user_email
+                    )
+                else:
+                    model_refs = [
+                        {"value": model_id, "model_id": model_id, "provider_id": None}
+                        for model_id in await self._providers.llm.list_model_ids()
+                    ]
             except Exception:
-                model_ids = []
+                model_refs = []
 
             current = self._session_cache.get_model_override(session_id)
+            current_provider = self._session_cache.get_model_override_provider_id(session_id)
             if not current:
                 usage = self._session_cache.get_context_usage(session_id)
                 current = usage["model"] if usage else None
+                current_provider = usage.get("provider_id") if usage else None
 
-            if not model_ids:
+            if not model_refs:
                 return CommandResult(
                     type="system_message",
                     text="No models configured. Add LLM providers in Settings → Providers.",
                 )
 
             lines = ["Available models:"]
-            for mid in model_ids:
-                marker = " *" if mid == current else ""
-                lines.append(f"  {mid}{marker}")
-            lines.append(f"\nCurrent: {current or 'system default'}")
-            lines.append("Usage: /model <model_name>")
+            for ref in model_refs:
+                model_id = str(ref.get("model_id") or ref.get("value") or "")
+                provider_id = ref.get("provider_id")
+                value = str(ref.get("value") or model_id)
+                marker = (
+                    " *"
+                    if model_id == current
+                    and (current_provider is None or current_provider == provider_id)
+                    else ""
+                )
+                default_marker = " [default provider]" if ref.get("is_default_provider") else ""
+                lines.append(f"  {value}{marker}{default_marker}")
+            current_ref = (
+                f"{current_provider}/{current}" if current and current_provider else current
+            )
+            lines.append(f"\nCurrent: {current_ref or 'system default'}")
+            lines.append("Usage: /model <provider_id/model_name>")
+            lines.append(
+                "Bare /model <model_name> is accepted only when exactly one visible provider "
+                "exposes it, or one matching provider is marked default."
+            )
             return CommandResult(type="system_message", text="\n".join(lines))
 
         # Switch model
-        try:
-            model_ids = await self._providers.llm.list_model_ids()
-        except Exception:
-            model_ids = []
+        if hasattr(self._providers.llm, "resolve_model_reference"):
+            try:
+                model_id, provider_id = await self._providers.llm.resolve_model_reference(
+                    arg,
+                    acting_user_email=session.user_email or user_email,
+                )
+            except ValueError as exc:
+                return CommandResult(type="system_message", text=str(exc))
+        else:
+            try:
+                model_ids = await self._providers.llm.list_model_ids()
+            except Exception:
+                model_ids = []
+            if model_ids and arg not in model_ids:
+                return CommandResult(
+                    type="system_message",
+                    text=f"Unknown model: {arg}\nAvailable: {', '.join(model_ids)}",
+                )
+            model_id = arg
+            provider_id = None
 
-        if model_ids and arg not in model_ids:
-            return CommandResult(
-                type="system_message",
-                text=f"Unknown model: {arg}\nAvailable: {', '.join(model_ids)}",
-            )
-
-        self._session_cache.set_model_override(session_id, arg)
+        self._session_cache.set_model_override(session_id, model_id, provider_id=provider_id)
+        selected = f"{provider_id}/{model_id}" if provider_id else model_id
         return CommandResult(
             type="system_message",
-            text=f"Model switched to: {arg}\nTakes effect on next message.",
+            text=f"Model switched to: {selected}\nTakes effect on next message.",
         )
 
     async def _handle_thinking(self, session: SessionModel, arg: str) -> CommandResult:
@@ -1520,6 +2100,292 @@ class CommandDispatcher:
             data=resolved.audit_metadata(),
         )
 
+    async def _handle_skill(
+        self,
+        session: SessionModel,
+        agent: AgentDefinition,
+        user_email: str,
+        arg: str,
+    ) -> CommandResult:
+        """Handle /skill [name|id] — list or load skills for the current session."""
+
+        if self._session_factory is None:
+            return CommandResult(
+                type="error",
+                text="Skill lookup is unavailable because the database session factory is not configured.",
+                data={"code": "skill_unavailable"},
+            )
+
+        try:
+            from cognis.tools.skills import resolve_skills_for_agent
+
+            async with self._session_factory() as db_session:
+                resolved = await resolve_skills_for_agent(
+                    db_session,
+                    agent,
+                    owner_email=user_email,
+                )
+        except Exception:
+            logger.exception(
+                "Command /skill failed to resolve skills",
+                extra={
+                    "extra_data": {"session_id": session.session_id, "agent_id": agent.agent_id}
+                },
+            )
+            return CommandResult(
+                type="error",
+                text="Could not list available skills for this agent session.",
+                data={"code": "skill_resolution_failed"},
+            )
+
+        loaded_skill_ids = self._get_loaded_skill_ids(session.session_id)
+        activated_skill_ids = self._get_activated_skill_ids(session.session_id)
+        if not arg:
+            return CommandResult(
+                type="system_message",
+                text=self._render_skill_list(
+                    resolved.skills,
+                    loaded_skill_ids=loaded_skill_ids,
+                    activated_skill_ids=activated_skill_ids,
+                ),
+                data={"skill_count": len(resolved.skills)},
+            )
+
+        match, candidates = self._resolve_skill_command_match(resolved.skills, arg)
+        if match is None:
+            if candidates:
+                options = "\n".join(
+                    f"  {skill.name} ({skill.skill_id})" for skill in candidates[:10]
+                )
+                return CommandResult(
+                    type="error",
+                    text=(
+                        f"Ambiguous skill: {arg}\n"
+                        f"Matching skills:\n{options}\n"
+                        "Use /skill <skill_id> to load a specific skill."
+                    ),
+                    data={
+                        "code": "ambiguous_skill",
+                        "matches": [
+                            {"skill_id": skill.skill_id, "name": skill.name} for skill in candidates
+                        ],
+                    },
+                )
+            return CommandResult(
+                type="error",
+                text=f"Skill not found: {arg}\nUse /skill to list available skills.",
+                data={"code": "skill_not_found"},
+            )
+
+        return await self._load_skill_for_session(
+            session=session,
+            agent=agent,
+            user_email=user_email,
+            skill=match,
+        )
+
+    async def _load_skill_for_session(
+        self,
+        *,
+        session: SessionModel,
+        agent: AgentDefinition,
+        user_email: str,
+        skill: Any,
+    ) -> CommandResult:
+        from cognis.tools.builtin.skill_management import materialize_loaded_skill_context
+
+        tool_payloads = [tool.model_dump(mode="json") for tool in skill.tools]
+        _, metadata = materialize_loaded_skill_context(
+            skill_id=skill.skill_id,
+            name=skill.name,
+            description=skill.description,
+            instructions=skill.instructions,
+            tools=tool_payloads,
+            templates=skill.prompt_templates,
+            asset_refs=skill.asset_manifest,
+            steps=skill.steps,
+            tags=skill.tags,
+            linked_tool_ids=skill.linked_tool_ids,
+            attach_to_all_agents=skill.auto_load,
+        )
+        protected_context = str(metadata.get("protected_context") or "")
+        content_hash = (
+            skill.content_hash or hashlib.sha256(protected_context.encode("utf-8")).hexdigest()
+        )
+        declared_tool_ids = [
+            item
+            for item in metadata.get("discovered_tool_ids", [])
+            if isinstance(item, str) and item.strip()
+        ]
+        loaded_hash = self._get_loaded_skill_context_hash(session.session_id, skill.skill_id)
+        already_loaded = loaded_hash == content_hash
+
+        if not already_loaded:
+            guardrails = getattr(self._providers, "guardrails", None)
+            record_events = getattr(guardrails, "record_events", None)
+            if not callable(record_events):
+                return CommandResult(
+                    type="error",
+                    text="Skill loading is unavailable because session event storage is not configured.",
+                    data={"code": "skill_event_storage_unavailable"},
+                )
+
+            event = SessionEvent(
+                type="developer_message",
+                data={
+                    "role": "system",
+                    "content": protected_context,
+                    "content_type": "text",
+                    "source": "loaded_skill",
+                    "context_injection": True,
+                    "replayable": True,
+                    "replay_scope": "same_session",
+                    "visibility": "agent_context",
+                    "model_role": "system",
+                    "trust": "trusted",
+                    "kind": "loaded_skill",
+                    "skill_id": skill.skill_id,
+                    "skill_name": skill.name,
+                    "content_hash": content_hash,
+                    "activated_tool_ids": declared_tool_ids,
+                },
+            )
+            try:
+                append_result = await record_events(
+                    session.intaris_session_id or session.session_id,
+                    [event],
+                    source="cognis_command",
+                    idempotency_key=(
+                        f"slash-skill:{session.session_id}:{skill.skill_id}:{content_hash}"
+                    ),
+                    retry_missing_session=True,
+                    user_email=user_email,
+                    agent_id=agent.agent_id,
+                    agent_owner_email=agent.owner_email,
+                )
+                if not append_result.ok:
+                    return CommandResult(
+                        type="error",
+                        text="Skill context could not be persisted. Try again before relying on it.",
+                        data={"code": "skill_event_record_failed"},
+                    )
+                append_recorded_events = getattr(
+                    self._session_cache, "append_recorded_events", None
+                )
+                if callable(append_recorded_events):
+                    await append_recorded_events(session, [event], append_result)
+            except Exception:
+                logger.exception(
+                    "Command /skill failed to persist loaded skill context",
+                    extra={
+                        "extra_data": {
+                            "session_id": session.session_id,
+                            "agent_id": agent.agent_id,
+                            "skill_id": skill.skill_id,
+                        }
+                    },
+                )
+                return CommandResult(
+                    type="error",
+                    text="Skill loading failed while persisting session context.",
+                    data={"code": "skill_load_failed"},
+                )
+
+        activate_skill_tools = getattr(self._session_cache, "activate_skill_tools", None)
+        if activate_skill_tools is not None:
+            activate_skill_tools(session.session_id, skill.skill_id, set(declared_tool_ids))
+
+        lines = [f"Loaded skill: {skill.name} ({skill.skill_id})"]
+        if already_loaded:
+            lines.append("Status: already loaded for this session.")
+        if declared_tool_ids:
+            lines.append(f"Activated tools: {', '.join(sorted(declared_tool_ids))}")
+        else:
+            lines.append("Activated tools: none declared by this skill.")
+        lines.append("Takes effect on the next message.")
+        return CommandResult(
+            type="system_message",
+            text="\n".join(lines),
+            data={
+                "code": "skill_loaded",
+                "skill_id": skill.skill_id,
+                "skill_name": skill.name,
+                "already_loaded": already_loaded,
+                "activated_tool_ids": declared_tool_ids,
+            },
+        )
+
+    def _get_loaded_skill_ids(self, session_id: str) -> set[str]:
+        getter = getattr(self._session_cache, "get_loaded_skill_ids", None)
+        if getter is None:
+            return set()
+        return set(getter(session_id))
+
+    def _get_activated_skill_ids(self, session_id: str) -> set[str]:
+        getter = getattr(self._session_cache, "get_activated_skill_ids", None)
+        if getter is None:
+            return set()
+        return set(getter(session_id))
+
+    def _get_loaded_skill_context_hash(self, session_id: str, skill_id: str) -> str | None:
+        getter = getattr(self._session_cache, "get_loaded_skill_context_hash", None)
+        if getter is None:
+            return None
+        value = getter(session_id, skill_id)
+        return value if isinstance(value, str) else None
+
+    @staticmethod
+    def _render_skill_list(
+        skills: list[Any],
+        *,
+        loaded_skill_ids: set[str],
+        activated_skill_ids: set[str],
+    ) -> str:
+        if not skills:
+            return "No skills are available for this agent session."
+        lines = ["Available skills:"]
+        for skill in skills:
+            markers: list[str] = []
+            if skill.attached:
+                markers.append("attached")
+            if skill.auto_load_instructions or skill.skill_id in loaded_skill_ids:
+                markers.append("loaded")
+            if skill.skill_id in activated_skill_ids:
+                markers.append("activated")
+            suffix = f" [{', '.join(markers)}]" if markers else ""
+            lines.append(f"  {skill.name} ({skill.skill_id}){suffix}")
+            description = (skill.description or skill.instructions or "").replace("\n", " ").strip()
+            if description:
+                if len(description) > 140:
+                    description = description[:137].rstrip() + "..."
+                lines.append(f"    {description}")
+        lines.append("")
+        lines.append("Usage: /skill <skill name or id>")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _resolve_skill_command_match(skills: list[Any], query: str) -> tuple[Any | None, list[Any]]:
+        stripped = query.strip()
+        if not stripped:
+            return None, []
+        exact_id = [skill for skill in skills if skill.skill_id == stripped]
+        if len(exact_id) == 1:
+            return exact_id[0], []
+        if len(exact_id) > 1:
+            return None, exact_id
+        normalized = _normalize_skill_command_name(stripped)
+        exact_name = [
+            skill
+            for skill in skills
+            if skill.name.casefold() == stripped.casefold()
+            or _normalize_skill_command_name(skill.name) == normalized
+        ]
+        if len(exact_name) == 1:
+            return exact_name[0], []
+        if len(exact_name) > 1:
+            return None, exact_name
+        return None, []
+
     async def _handle_lsp(self, *, user_email: str | None = None) -> CommandResult:
         """Handle /lsp — display LSP diagnostics subsystem status."""
         lines: list[str] = []
@@ -1565,6 +2431,23 @@ class CommandDispatcher:
                     lines.append(
                         f"      Files: {srv.file_count}, diagnostics: {srv.error_count} errors, {srv.warning_count} warnings"
                     )
+                    diag_status = srv.diagnostics
+                    if diag_status:
+                        pending = int(diag_status.get("pending_uri_count", 0))
+                        tracked = int(diag_status.get("tracked_uri_count", 0))
+                        sequence = int(diag_status.get("latest_sequence", 0))
+                        lines.append(
+                            f"      Freshness: {tracked} tracked URI(s), {pending} pending wait(s), latest seq {sequence}"
+                        )
+                        last_waits = diag_status.get("last_waits")
+                        if isinstance(last_waits, list) and last_waits:
+                            latest = last_waits[-1]
+                            if isinstance(latest, dict):
+                                lines.append(
+                                    "      Last wait: "
+                                    f"{latest.get('status', 'unknown')} in "
+                                    f"{latest.get('duration_ms', '?')}ms"
+                                )
                     idle = srv.idle_seconds
                     if idle >= 60:
                         lines.append(f"      Idle: {idle // 60}m {idle % 60}s")
@@ -1973,14 +2856,14 @@ class CommandDispatcher:
                 cancelled += 1
         return cancelled
 
-    async def _handle_stop(
+    async def stop_conversation(
         self,
-        conversation: ConversationModel,
+        conversation_id: str,
         *,
         user_email: str,
-    ) -> CommandResult:
-        """Handle /stop or /cancel by aborting active work immediately."""
-        conversation_id = conversation.conversation_id
+    ) -> bool:
+        """Abort active work and live direct pauses for a conversation."""
+
         stopped_anything = False
 
         if self._turn_scheduler is not None:
@@ -2016,6 +2899,20 @@ class CommandDispatcher:
                 ):
                     stopped_anything = True
 
+        return stopped_anything
+
+    async def _handle_stop(
+        self,
+        conversation: ConversationModel,
+        *,
+        user_email: str,
+    ) -> CommandResult:
+        """Handle /stop or /cancel by aborting active work immediately."""
+        stopped_anything = await self.stop_conversation(
+            conversation.conversation_id,
+            user_email=user_email,
+        )
+
         if not stopped_anything:
             return CommandResult(
                 type="system_message",
@@ -2040,6 +2937,7 @@ Available commands:
   /model [name]      List available models or switch model
   /thinking [level]  Show or set reasoning effort
   /profile [id]      List or switch this agent's runtime profile
+  /skill [name|id]   List available skills or load one for this session
   /context           Show context window usage
   /info              Show session details and statistics
   /compact           Compact conversation history
@@ -2064,3 +2962,7 @@ Available commands:
 def _infer_reasoning_efforts(model: str) -> list[str]:
     """Best-effort reasoning effort levels for a model."""
     return reasoning_efforts_for_model(model, supports_reasoning=True)
+
+
+def _normalize_skill_command_name(value: str) -> str:
+    return " ".join(value.casefold().split())

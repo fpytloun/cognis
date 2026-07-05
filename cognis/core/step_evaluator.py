@@ -19,6 +19,7 @@ from cognis.core.json_utils import (
     extract_text_from_response,
     infer_evaluation_from_text,
 )
+from cognis.core.truncation import middle_truncate
 from cognis.logging import get_logger
 from cognis.models.workflow import StepDefinition, StepEvaluation, StepOutput
 from cognis.store.queries import get_setting_value
@@ -27,6 +28,7 @@ logger = get_logger(__name__)
 
 EVALUATOR_MALFUNCTION_REASON_PREFIX = "Evaluator malfunction:"
 DEFAULT_EVALUATOR_TIMEOUT_MS = 180000
+_EVALUATOR_CONTENT_MAX_CHARS = 24_000
 
 EVALUATIONS_TOTAL = Counter(
     "cognis_evaluations_total",
@@ -124,7 +126,7 @@ class StepEvaluator:
         self,
         *,
         llm: Any,
-        evaluator_timeout_seconds: float = 30.0,
+        evaluator_timeout_seconds: float = DEFAULT_EVALUATOR_TIMEOUT_MS / 1000,
     ) -> None:
         self.llm = llm
         self.evaluator_timeout_seconds = evaluator_timeout_seconds
@@ -257,9 +259,13 @@ class StepEvaluator:
         )
         formatted_execution_evidence = json.dumps(execution_evidence, default=str)[:4000] or "{}"
 
-        # Include the full response content so the evaluator can verify claims
-        # against evidence anywhere in the deliverable.
-        formatted_content = step_output.content or "(no content produced)"
+        # Include a middle-truncated deliverable so the evaluator sees both
+        # the opening contract evidence and closing conclusions without
+        # exceeding the evaluator prompt budget.
+        formatted_content = middle_truncate(
+            step_output.content or "(no content produced)",
+            _EVALUATOR_CONTENT_MAX_CHARS,
+        )
 
         return template.format(
             objective=step_definition.prompt or step_definition.description,

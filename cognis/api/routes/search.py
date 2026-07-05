@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -40,6 +41,7 @@ _EXTRA_MATCHES_PER_SESSION = 4
 _EXTRA_MATCHES_TOTAL_LIMIT = 50
 _SESSION_SEARCH_OVERFETCH_FACTOR = 3
 _SESSION_SEARCH_MAX_LIMIT = 100
+_MAX_MULTI_AGENT_SEARCH_FILTERS = 25
 _health_cache: dict[str, tuple[float, SearchHealth]] = {}
 
 
@@ -47,9 +49,26 @@ def _cache_key(user_email: str) -> str:
     return user_email
 
 
-def _intaris_filters(filters: Any) -> SearchRequestFilters:
+def _agent_filter_values(filters: Any) -> list[str]:
+    return sorted(
+        {
+            value
+            for value in [
+                getattr(filters, "agent_id", None),
+                *(getattr(filters, "agent_ids", None) or []),
+            ]
+            if value
+        }
+    )
+
+
+def _intaris_filters(filters: Any, *, agent_id_override: str | None = None) -> SearchRequestFilters:
+    agent_ids = _agent_filter_values(filters)
+    agent_id = agent_id_override
+    if agent_id is None and len(agent_ids) == 1:
+        agent_id = agent_ids[0]
     return SearchRequestFilters(
-        agent_id=filters.agent_id,
+        agent_id=agent_id,
         session_id=filters.session_id,
         session_ids=filters.session_ids,
         from_ts=filters.from_ts,
@@ -84,32 +103,68 @@ async def search_conversations(
     user = require_current_user(request)
     if not payload.q.strip():
         raise api_exception(400, "validation_error", "Search query cannot be empty")
+    agent_filter = _agent_filter_values(payload.filters)
+    if len(agent_filter) > _MAX_MULTI_AGENT_SEARCH_FILTERS:
+        raise api_exception(
+            400,
+            "too_many_agent_filters",
+            f"Conversation search supports at most {_MAX_MULTI_AGENT_SEARCH_FILTERS} agent filters",
+        )
     display_min_score = await _display_min_score(request)
 
     intaris_limit = min(
         _SESSION_SEARCH_MAX_LIMIT,
         payload.limit * _SESSION_SEARCH_OVERFETCH_FACTOR,
     )
-    intaris_request = SearchSessionsRequest(
-        q=payload.q,
-        filters=_intaris_filters(payload.filters),
-        kinds=payload.kinds,
-        mode=payload.mode,
-        limit=intaris_limit,
-        cursor=payload.cursor,
-    )
-    result = await request.app.state.providers.guardrails.search_sessions(
-        intaris_request,
-        user_email=user.email,
-    )
+    if len(agent_filter) > 1:
+        results = await asyncio.gather(
+            *(
+                request.app.state.providers.guardrails.search_sessions(
+                    SearchSessionsRequest(
+                        q=payload.q,
+                        filters=_intaris_filters(payload.filters, agent_id_override=agent_id),
+                        kinds=payload.kinds,
+                        mode=payload.mode,
+                        limit=intaris_limit,
+                        cursor=None,
+                    ),
+                    user_email=user.email,
+                )
+                for agent_id in agent_filter
+            )
+        )
+        result = results[0]
+        session_matches = [match for search_result in results for match in search_result.sessions]
+        total_estimates = [search_result.total_estimated for search_result in results]
+        total_estimated = (
+            sum(total_estimates) if all(total is not None for total in total_estimates) else None
+        )
+        next_cursor = None
+    else:
+        result = await request.app.state.providers.guardrails.search_sessions(
+            SearchSessionsRequest(
+                q=payload.q,
+                filters=_intaris_filters(payload.filters),
+                kinds=payload.kinds,
+                mode=payload.mode,
+                limit=intaris_limit,
+                cursor=payload.cursor,
+            ),
+            user_email=user.email,
+        )
+        session_matches = result.sessions
+        total_estimated = result.total_estimated
+        next_cursor = result.next_cursor
     async with request.app.state.session_factory() as session:
         matches = await join_session_matches(
             session,
             user_email=user.email,
-            matches=result.sessions,
+            matches=session_matches,
+            agent_ids=agent_filter,
             project_id=payload.filters.project_id,
             status=payload.filters.status,
             context_type=payload.filters.context_type,
+            context_types=payload.filters.context_types,
             min_score=display_min_score,
             query=payload.q,
         )
@@ -150,8 +205,8 @@ async def search_conversations(
 
     return ConversationSearchResponse(
         matches=matches,
-        next_cursor=None if truncated_after_join else result.next_cursor,
-        total_estimated=result.total_estimated,
+        next_cursor=None if truncated_after_join else next_cursor,
+        total_estimated=total_estimated,
         backend=result.backend,
     )
 

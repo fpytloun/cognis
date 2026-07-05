@@ -73,9 +73,11 @@ async def join_session_matches(
     *,
     user_email: str,
     matches: list[SearchSessionMatch],
+    agent_ids: list[str] | None = None,
     project_id: str | None = None,
     status: str = "active",
     context_type: str | None = None,
+    context_types: list[str] | None = None,
     min_score: float = MIN_DISPLAY_SCORE,
     query: str | None = None,
 ) -> list[ConversationSearchMatch]:
@@ -90,6 +92,8 @@ async def join_session_matches(
     session_rows = await list_sessions_by_intaris_session_ids(db, [m.session_id for m in matches])
     session_by_id = _index_sessions(session_rows)
     conversation_by_id: dict[str, Conversation] = {}
+    agent_filter = sorted({value for value in agent_ids or [] if value})
+    context_filter = sorted({value for value in [context_type, *(context_types or [])] if value})
     output: list[ConversationSearchMatch] = []
 
     for match in matches:
@@ -110,6 +114,8 @@ async def join_session_matches(
             continue
         if project_id is not None and conversation.project_id != project_id:
             continue
+        if agent_filter and conversation.agent_id not in agent_filter:
+            continue
         if status == "active" and conversation.status != "active":
             continue
         if status == "archived" and conversation.status != "archived":
@@ -119,7 +125,7 @@ async def join_session_matches(
             continue
         if status not in {"active", "starred", "archived", "all"}:
             continue
-        if context_type is not None and getattr(conversation, "context_type", None) != context_type:
+        if context_filter and getattr(conversation, "context_type", None) not in context_filter:
             continue
         output.append(
             ConversationSearchMatch(

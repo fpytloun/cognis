@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { matchesTaskFilters, scheduleListProjectUrl, sortTasks, taskBoardProjectUrl, taskFiltersFromSearchParams, taskFiltersToSearchParams } from '$lib/tasks';
+import {
+  matchesTaskFilters,
+  scheduleListProjectUrl,
+  sortTasks,
+  taskBoardColumnFromSearchParams,
+  taskBoardProjectUrl,
+  taskBoardUrlForState,
+  taskFiltersFromSearchParams,
+  taskFiltersToSearchParams
+} from '$lib/tasks';
 import type { Task } from '$lib/types/api';
 
 function makeTask(overrides: Partial<Task>): Task {
@@ -109,5 +118,19 @@ describe('task filters', () => {
     expect(params.toString()).toBe('q=docs&agent_id=agent-1&workflow_id=workflow-1&project_id=project-1&status=running');
     expect(taskBoardProjectUrl('project-1')).toBe('/tasks?project_id=project-1');
     expect(scheduleListProjectUrl('project-1')).toBe('/schedules?project_id=project-1');
+  });
+
+  it('normalizes the mobile task board column query param', () => {
+    expect(taskBoardColumnFromSearchParams(new URLSearchParams('col=paused'))).toBe('paused');
+    expect(taskBoardColumnFromSearchParams(new URLSearchParams('col=missing'))).toBe('running');
+    expect(taskBoardColumnFromSearchParams(new URLSearchParams())).toBe('running');
+  });
+
+  it('serializes the mobile task board column only when it changes from the default', () => {
+    const emptyFilters = { search: '', agentId: '', workflowId: '', projectId: '', status: '' };
+
+    expect(taskBoardUrlForState(emptyFilters, 'running')).toBe('/tasks');
+    expect(taskBoardUrlForState(emptyFilters, 'paused')).toBe('/tasks?col=paused');
+    expect(taskBoardUrlForState({ ...emptyFilters, status: 'paused' }, 'paused')).toBe('/tasks?status=paused&col=paused');
   });
 });

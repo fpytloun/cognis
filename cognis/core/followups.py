@@ -41,6 +41,10 @@ _MAX_TEXT_FIELD_CHARS = 600
 _MAX_DESCRIPTION_CHARS = 1200
 _MAX_SNIPPETS = 5
 _MAX_SNIPPET_CHARS = 220
+TOOL_CALL_CEILING_CONTINUATION_REASON = "tool_call_ceiling_reached"
+LLM_CYCLE_CEILING_CONTINUATION_REASON = "llm_cycle_ceiling_reached"
+STEP_TIMEOUT_CONTINUATION_REASON = "step_timeout"
+DEFAULT_MAX_AUTOMATIC_CONTINUATION_ATTEMPTS = 3
 
 
 class FollowUpMode(StrEnum):
@@ -140,6 +144,8 @@ class ContinuationFollowUp(FollowUpBase):
     max_attempts: int = Field(ge=1)
     tool_call_count: int | None = Field(default=None, ge=0)
     max_tool_calls: int | None = Field(default=None, ge=1)
+    cycle_count: int | None = Field(default=None, ge=0)
+    max_llm_cycles: int | None = Field(default=None, ge=1)
     pending_todos: list[dict[str, Any]] = Field(default_factory=list)
 
 
@@ -204,6 +210,95 @@ def build_follow_up_id(*, kind: str, conversation_id: str, parts: dict[str, Any]
         json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     return f"fup_{digest[:16]}"
+
+
+def positive_optional_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def pending_todos_from_metadata(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    todos = metadata.get("pending_todos")
+    if not isinstance(todos, list):
+        return []
+    pending: list[dict[str, str]] = []
+    for todo in todos:
+        if not isinstance(todo, dict):
+            continue
+        content = str(todo.get("content") or "").strip()
+        if not content:
+            continue
+        status = str(todo.get("status") or "pending").strip() or "pending"
+        if status in {"completed", "cancelled"}:
+            continue
+        pending.append({"content": content, "status": status})
+    return pending
+
+
+def build_automatic_continuation_follow_up(
+    *,
+    conversation_id: str,
+    turn_id: str,
+    reason: str,
+    metadata: dict[str, Any],
+    prior_follow_up: FollowUpMetadata | None,
+    max_attempts: int = DEFAULT_MAX_AUTOMATIC_CONTINUATION_ATTEMPTS,
+) -> ContinuationFollowUp | None:
+    if isinstance(prior_follow_up, ContinuationFollowUp) and prior_follow_up.reason == reason:
+        attempt = prior_follow_up.attempt + 1
+    else:
+        attempt = 1
+    if attempt > max_attempts:
+        return None
+
+    return ContinuationFollowUp(
+        follow_up_id=build_follow_up_id(
+            kind=FollowUpOriginKind.CONTINUATION.value,
+            conversation_id=conversation_id,
+            parts={
+                "reason": reason,
+                "turn_id": turn_id,
+                "attempt": attempt,
+            },
+        ),
+        mode=FollowUpMode.INTEGRATE,
+        origin_kind=FollowUpOriginKind.CONTINUATION,
+        relevance_hint=FollowUpRelevanceHint.SAME_THREAD,
+        required_action=FollowUpRequiredAction.INTEGRATE_RESULT,
+        topic_ref=turn_id,
+        status=FollowUpStatus.COMPLETED,
+        reason=reason,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        tool_call_count=positive_optional_int(metadata.get("tool_call_count")),
+        max_tool_calls=positive_optional_int(metadata.get("max_tool_calls")),
+        cycle_count=positive_optional_int(metadata.get("cycle_count")),
+        max_llm_cycles=positive_optional_int(metadata.get("max_llm_cycles")),
+        pending_todos=pending_todos_from_metadata(metadata),
+    )
+
+
+def build_tool_call_ceiling_continuation_follow_up(
+    *,
+    conversation_id: str,
+    turn_id: str,
+    metadata: dict[str, Any],
+    prior_follow_up: FollowUpMetadata | None,
+    max_attempts: int = DEFAULT_MAX_AUTOMATIC_CONTINUATION_ATTEMPTS,
+) -> ContinuationFollowUp | None:
+    return build_automatic_continuation_follow_up(
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        reason=TOOL_CALL_CEILING_CONTINUATION_REASON,
+        metadata=metadata,
+        prior_follow_up=prior_follow_up,
+        max_attempts=max_attempts,
+    )
 
 
 def build_history_boundary_message() -> str:
@@ -271,6 +366,13 @@ def render_follow_up_turn_notice(follow_up: FollowUpMetadata) -> str:
                 else str(follow_up.tool_call_count)
             )
             summary = f"Tool calls: {ceiling}; attempt {follow_up.attempt}/{follow_up.max_attempts}"
+        elif follow_up.cycle_count is not None:
+            ceiling = (
+                f"{follow_up.cycle_count}/{follow_up.max_llm_cycles}"
+                if follow_up.max_llm_cycles is not None
+                else str(follow_up.cycle_count)
+            )
+            summary = f"LLM cycles: {ceiling}; attempt {follow_up.attempt}/{follow_up.max_attempts}"
         else:
             summary = f"Attempt {follow_up.attempt}/{follow_up.max_attempts}"
     elif isinstance(follow_up, OtherFollowUp):
@@ -397,6 +499,13 @@ def render_follow_up_block(follow_up: FollowUpMetadata) -> str:
                 else str(follow_up.tool_call_count)
             )
             lines.append(f"tool_calls: {ceiling}")
+        if follow_up.cycle_count is not None:
+            ceiling = (
+                f"{follow_up.cycle_count}/{follow_up.max_llm_cycles}"
+                if follow_up.max_llm_cycles is not None
+                else str(follow_up.cycle_count)
+            )
+            lines.append(f"llm_cycles: {ceiling}")
         if follow_up.pending_todos:
             lines.append("pending_todos:")
             for todo in follow_up.pending_todos:

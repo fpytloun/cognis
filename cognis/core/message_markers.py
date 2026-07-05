@@ -34,6 +34,21 @@ FOLLOW_UP_CONTEXT = "_follow_up_context"
 # Set on project-context system messages.
 PROJECT_CONTEXT = "_project_context"
 
+# Set on the latest mutable Mnemory recall block. Older replayed recall blocks
+# intentionally do not carry this marker so context pruning can drop them under
+# pressure.
+LATEST_MEMORY_RECALL_CONTEXT = "_latest_memory_recall_context"
+
+# Set on tail reminders that describe the current executor pool.
+EXECUTOR_POOL_REMINDER = "_executor_pool_reminder"
+
+# Set on agent-loop tail reminders.
+EXECUTOR_REMINDER = "_executor_reminder"
+BACKGROUND_SHELL_STATUS_REMINDER = "_background_shell_status_reminder"
+BACKGROUND_WORK_STATUS_REMINDER = "_background_work_status_reminder"
+WORKFLOW_STEP_REMINDER = "_workflow_step_reminder"
+FORCE_SUMMARY = "_force_summary"
+
 # ── Audit markers ─────────────────────────────────────────────────────────────
 
 # Source label for audit collection (e.g. "memory_search", "tool_result").
@@ -111,6 +126,13 @@ ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
         PRIOR_CONTEXT,
         FOLLOW_UP_CONTEXT,
         PROJECT_CONTEXT,
+        LATEST_MEMORY_RECALL_CONTEXT,
+        EXECUTOR_POOL_REMINDER,
+        EXECUTOR_REMINDER,
+        BACKGROUND_SHELL_STATUS_REMINDER,
+        BACKGROUND_WORK_STATUS_REMINDER,
+        WORKFLOW_STEP_REMINDER,
+        FORCE_SUMMARY,
         AUDIT_SOURCE,
         AUDIT_ROLE,
         AUDIT_METADATA,

@@ -121,9 +121,9 @@ async def test_artifact_get_url_returns_virtual_deliverable_url(task_continuatio
         _config = type("Config", (), {"base_url": "https://cognis.test", "signing_secret": "s"})()
 
         def _filesystem_signature(
-            self, namespace: str, object_id: str, filename: str, exp: int
+            self, namespace: str, object_id: str, filename: str, exp: int, *, mode: str = "download"
         ) -> str:
-            return f"sig-{namespace}-{object_id}-{filename}-{exp}"
+            return f"sig-{namespace}-{object_id}-{filename}-{exp}-{mode}"
 
     result = await handle_artifact_tool(
         "artifact_get_url",
@@ -142,3 +142,21 @@ async def test_artifact_get_url_returns_virtual_deliverable_url(task_continuatio
         "/api/v1/artifacts/virtual/deliverables/dlv_owner/Full-report.md" in result.metadata["url"]
     )
     assert "sig=sig-deliverables-dlv_owner-Full-report.md-" in result.metadata["url"]
+    assert result.metadata["mode"] == "download"
+
+
+@pytest.mark.asyncio
+async def test_artifact_get_url_rejects_virtual_deliverable_view_for_non_html(
+    task_continuation_db,
+) -> None:
+    result = await handle_artifact_tool(
+        "artifact_get_url",
+        {"artifact_id": "dlv_owner", "ttl_seconds": 60, "mode": "view"},
+        llm=None,
+        artifact_store=object(),
+        session_factory=task_continuation_db,
+        user_email="owner@example.com",
+    )
+
+    assert result.is_error is True
+    assert result.output == "Artifact view is only supported for HTML artifacts: dlv_owner"

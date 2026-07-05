@@ -71,12 +71,16 @@ def test_compaction_triggers_after_threshold_crossed(live_stack: LiveStack, run_
         # Small delay between turns
         time.sleep(1)
 
-    # Step 4: Check events for compaction_summary
-    # Read events via REST to see if compaction occurred
-    messages_response = live.get(f"/api/v1/conversations/{cid}/messages?limit=500")
-    assert messages_response.status_code == 200
-    events_data = messages_response.json()
-    items = events_data.get("items", [])
+    # Step 4: Check raw session events for compaction_summary.
+    sessions_response = live.get(f"/api/v1/conversations/{cid}/sessions")
+    assert sessions_response.status_code == 200
+    items = []
+    for session_row in sessions_response.json():
+        events_response = live.get(
+            f"/api/v1/conversations/{cid}/sessions/{session_row['session_id']}/events?limit=500"
+        )
+        assert events_response.status_code == 200
+        items.extend(events_response.json().get("items", []))
 
     # Look for compaction_summary events
     compaction_events = [e for e in items if e.get("type") == "compaction_summary"]

@@ -13,6 +13,7 @@ from cognis.core.harness_guards import (
     check_loop_guard,
     loop_guard_rejection_payload,
     record_tool_call,
+    record_tool_result,
 )
 
 
@@ -21,13 +22,25 @@ class TestLoopGuard:
         state = LoopGuardState()
         assert check_loop_guard(state, "foo", {"a": 1}) is None
 
-    def test_second_identical_call_is_rejected(self) -> None:
+    def test_third_identical_call_with_identical_results_is_rejected(self) -> None:
         state = LoopGuardState()
         record_tool_call(state, "foo", {"a": 1})
+        record_tool_result(state, "foo", {"a": 1}, "same")
+        assert check_loop_guard(state, "foo", {"a": 1}) is None
+        record_tool_call(state, "foo", {"a": 1})
+        record_tool_result(state, "foo", {"a": 1}, "same")
         message = check_loop_guard(state, "foo", {"a": 1})
         assert message is not None
         assert "foo" in message
-        assert "Do not retry the same call." in message
+
+    def test_identical_call_with_changing_result_is_allowed(self) -> None:
+        state = LoopGuardState()
+        record_tool_call(state, "foo", {"a": 1})
+        record_tool_result(state, "foo", {"a": 1}, "first")
+        assert check_loop_guard(state, "foo", {"a": 1}) is None
+        record_tool_call(state, "foo", {"a": 1})
+        record_tool_result(state, "foo", {"a": 1}, "second")
+        assert check_loop_guard(state, "foo", {"a": 1}) is None
 
     def test_different_arguments_reset_streak(self) -> None:
         state = LoopGuardState()
@@ -44,13 +57,30 @@ class TestLoopGuard:
     def test_argument_key_order_does_not_matter(self) -> None:
         state = LoopGuardState()
         record_tool_call(state, "foo", {"a": 1, "b": 2})
-        assert check_loop_guard(state, "foo", {"b": 2, "a": 1}) is not None
+        record_tool_result(state, "foo", {"a": 1, "b": 2}, "same")
+        assert check_loop_guard(state, "foo", {"b": 2, "a": 1}) is None
+        record_tool_call(state, "foo", {"b": 2, "a": 1})
+        record_tool_result(state, "foo", {"b": 2, "a": 1}, "same")
+        assert check_loop_guard(state, "foo", {"a": 1, "b": 2}) is not None
 
     def test_exempt_tool_is_not_loop_checked(self) -> None:
         state = LoopGuardState()
         record_tool_call(state, "memory_search", {"query": "x"})
+        record_tool_result(state, "memory_search", {"query": "x"}, "same")
         # Even repeated identical calls to exempt tools pass.
         assert check_loop_guard(state, "memory_search", {"query": "x"}) is None
+
+    def test_poll_tools_are_exempt(self) -> None:
+        state = LoopGuardState()
+        for tool_name in (
+            "bash_output",
+            "get_subsession",
+            "agent_conversation_get",
+            "agent_conversation_wait",
+        ):
+            record_tool_call(state, tool_name, {"id": "x"})
+            record_tool_result(state, tool_name, {"id": "x"}, "same")
+            assert check_loop_guard(state, tool_name, {"id": "x"}) is None
 
     def test_non_json_arguments_do_not_crash(self) -> None:
         state = LoopGuardState()
@@ -62,13 +92,17 @@ class TestLoopGuard:
         # No exception — the guard falls back to a deterministic repr.
         assert check_loop_guard(state, "foo", {"obj": "not the same"}) is None
 
-    def test_third_identical_call_after_rejection_still_trips(self) -> None:
+    def test_fourth_identical_call_after_rejection_still_trips(self) -> None:
         state = LoopGuardState()
         record_tool_call(state, "foo", {"a": 1})
-        # Second call rejected.
+        record_tool_result(state, "foo", {"a": 1}, "same")
+        assert check_loop_guard(state, "foo", {"a": 1}) is None
+        record_tool_call(state, "foo", {"a": 1})
+        record_tool_result(state, "foo", {"a": 1}, "same")
         assert check_loop_guard(state, "foo", {"a": 1}) is not None
         record_tool_call(state, "foo", {"a": 1})
-        # Third call still flagged.
+        record_tool_result(state, "foo", {"a": 1}, "same")
+        # Subsequent identical calls remain flagged after another identical result.
         assert check_loop_guard(state, "foo", {"a": 1}) is not None
 
     def test_rejection_payload_shape(self) -> None:

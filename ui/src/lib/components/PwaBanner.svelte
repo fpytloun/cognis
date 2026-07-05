@@ -2,17 +2,21 @@
   import { page } from '$app/state';
   import { onMount } from 'svelte';
   import Download from 'lucide-svelte/icons/download';
-import Share from 'lucide-svelte/icons/share';
-import X from 'lucide-svelte/icons/x';
+  import RefreshCw from 'lucide-svelte/icons/refresh-cw';
+  import Share from 'lucide-svelte/icons/share';
+  import X from 'lucide-svelte/icons/x';
 
   import Button from '$lib/components/ui/Button.svelte';
   import {
+    applyUpdate,
     displayMode,
     dismissInstallPromptForNow,
+    dismissUpdateBanner,
     installPromptAvailable,
     isInstallPromptDismissed,
     isIosSafari,
     promptInstall,
+    updateAvailable,
   } from '$lib/stores/pwa';
 
   /**
@@ -25,12 +29,9 @@ import X from 'lucide-svelte/icons/x';
    *     Add to Home Screen — since iOS has no install prompt event.
    *   - All banners are dismissible and remember dismissal in localStorage.
    *
-   * The former \"Update available\" banner was removed: we could not reliably
-   * distinguish between \"a genuinely newer SW is waiting\" and \"the browser
-   * just registered a fresh SW after a hard reset\", which meant the banner
-   * kept re-appearing on boot. Until we have a robust signal, the SW updates
-   * silently on the next navigation and users simply see the new UI on their
-   * next reload.
+   * Update prompts are shown only for controlled pages with a genuinely
+   * waiting newer worker. First install and hard-reset registration do not
+   * trigger this banner.
    */
 
   const DISMISS_KEY_IOS = 'cognis-pwa-ios-dismissed';
@@ -38,6 +39,7 @@ import X from 'lucide-svelte/icons/x';
   let installDismissed = $state(false);
   let iosDismissed = $state(false);
   let showIosHint = $state(false);
+  let updateApplying = $state(false);
   let shouldShowInstallUi = $derived(
     page.url.pathname === '/getting-started' || page.url.pathname === '/login' || page.url.pathname === '/setup'
   );
@@ -79,9 +81,32 @@ import X from 'lucide-svelte/icons/x';
     showIosHint = false;
     window.localStorage.setItem(DISMISS_KEY_IOS, '1');
   }
+
+  async function handleApplyUpdate(): Promise<void> {
+    updateApplying = true;
+    await applyUpdate();
+  }
 </script>
 
-{#if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
+{#if $updateAvailable}
+  <div
+    class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-amber-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
+    role="region"
+    aria-label="Cognis update available"
+  >
+    <RefreshCw class={`mt-0.5 h-4 w-4 shrink-0 text-amber-300 ${updateApplying ? 'animate-spin' : ''}`} />
+    <div class="min-w-0 flex-1">
+      <p class="font-medium">Update available</p>
+      <p class="text-xs text-slate-400">Reload Cognis to use the latest app version and avoid stale PWA state.</p>
+    </div>
+    <div class="flex shrink-0 gap-2">
+      <Button size="sm" variant="secondary" disabled={updateApplying} onclick={dismissUpdateBanner}>Later</Button>
+      <Button size="sm" disabled={updateApplying} onclick={() => void handleApplyUpdate()}>
+        {updateApplying ? 'Reloading…' : 'Reload'}
+      </Button>
+    </div>
+  </div>
+{:else if shouldShowInstallUi && $installPromptAvailable && !installDismissed && $displayMode === 'browser'}
   <div
     class="app-floating-bottom-overlay z-[70] mx-auto flex max-w-xl items-start gap-3 rounded-2xl border border-sky-400/40 bg-slate-900/95 px-4 py-3 text-sm text-slate-100 shadow-card backdrop-blur"
     role="region"

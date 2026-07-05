@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -233,11 +234,12 @@ async def test_discover_sitemap_urls_prefers_sitemap_xml() -> None:
         return httpx.Response(status, request=request, text=text)
 
     responses = {
+        "https://example.com/robots.txt": _make_response(404),
         "https://example.com/sitemap.xml": _make_response(200, sitemap_xml),
         "https://example.com/sitemap_index.xml": _make_response(404),
     }
 
-    async def _get(url: str) -> httpx.Response:
+    async def _get(url: str, **_kwargs: Any) -> httpx.Response:
         return responses[url]
 
     with patch("cognis.tools.executor.web.sitemap.httpx.AsyncClient") as mock_client_cls:
@@ -255,26 +257,42 @@ async def test_discover_sitemap_urls_prefers_sitemap_xml() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discover_sitemap_falls_back_to_html_links_when_no_sitemap() -> None:
-    from cognis.tools.executor.web.sitemap import discover_sitemap_urls
+async def test_map_site_urls_expands_gzip_sitemap_index_children() -> None:
+    from cognis.tools.executor.web.sitemap import map_site_urls
 
-    page_html = (
-        "<html><body>"
-        "<a href='/about'>About</a>"
-        "<a href='https://example.com/blog/post'>Post</a>"
-        "<a href='mailto:hi@example.com'>Email</a>"
-        "<a href='https://other.example/x'>External</a>"
-        "</body></html>"
-    )
-    request = httpx.Request("GET", "https://example.com/")
+    sitemap_index_xml = """<?xml version="1.0"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://example.com/sitemaps/products.xml.gz</loc></sitemap>
+</sitemapindex>"""
+    child_sitemap_xml = """<?xml version="1.0"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/perennials/</loc></url>
+  <url><loc>https://example.com/shrubs/</loc></url>
+  <url><loc>https://other.example/grasses/</loc></url>
+</urlset>"""
+
+    request = httpx.Request("GET", "https://example.com/sitemap.xml")
+
+    def _make_response(
+        status: int,
+        text: str = "",
+        content: bytes | None = None,
+    ) -> httpx.Response:
+        if content is not None:
+            return httpx.Response(status, request=request, content=content)
+        return httpx.Response(status, request=request, text=text)
+
     responses = {
-        "https://example.com/sitemap.xml": httpx.Response(404, request=request),
-        "https://example.com/sitemap_index.xml": httpx.Response(404, request=request),
-        "https://example.com/": httpx.Response(200, request=request, text=page_html),
+        "https://example.com/robots.txt": _make_response(404),
+        "https://example.com/sitemap.xml": _make_response(200, sitemap_index_xml),
+        "https://example.com/sitemaps/products.xml.gz": _make_response(
+            200,
+            content=gzip.compress(child_sitemap_xml.encode()),
+        ),
     }
 
-    async def _get(url: str) -> httpx.Response:
-        return responses[url]
+    async def _get(url: str, **_kwargs: Any) -> httpx.Response:
+        return responses.get(url, _make_response(404))
 
     with patch("cognis.tools.executor.web.sitemap.httpx.AsyncClient") as mock_client_cls:
         mock_client = MagicMock()
@@ -283,13 +301,130 @@ async def test_discover_sitemap_falls_back_to_html_links_when_no_sitemap() -> No
         mock_client.get = AsyncMock(side_effect=_get)
         mock_client_cls.return_value = mock_client
 
-        urls, source = await discover_sitemap_urls("https://example.com/", limit=10)
+        urls, source = await map_site_urls("https://example.com/", options={"limit": 10})
 
-    assert source == "html_links"
+    assert source == "sitemap_index"
+    assert urls == ["https://example.com/perennials/", "https://example.com/shrubs/"]
+
+
+@pytest.mark.asyncio
+async def test_map_site_urls_does_not_fetch_external_child_sitemaps_by_default() -> None:
+    from cognis.tools.executor.web.sitemap import map_site_urls
+
+    sitemap_index_xml = """<?xml version="1.0"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sitemap><loc>https://other.example/sitemap.xml</loc></sitemap>
+</sitemapindex>"""
+    request = httpx.Request("GET", "https://example.com/sitemap.xml")
+
+    responses = {
+        "https://example.com/robots.txt": httpx.Response(404, request=request),
+        "https://example.com/sitemap.xml": httpx.Response(
+            200,
+            request=request,
+            text=sitemap_index_xml,
+        ),
+        "https://example.com/sitemap_index.xml": httpx.Response(404, request=request),
+        "https://example.com/": httpx.Response(200, request=request, text=""),
+    }
+
+    async def _get(url: str, **_kwargs: Any) -> httpx.Response:
+        assert url != "https://other.example/sitemap.xml"
+        return responses.get(url, httpx.Response(404, request=request))
+
+    with patch("cognis.tools.executor.web.sitemap.httpx.AsyncClient") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(side_effect=_get)
+        mock_client_cls.return_value = mock_client
+
+        urls, source = await map_site_urls("https://example.com/", options={"limit": 10})
+
+    assert source == "html_crawl"
+    assert urls == ["https://example.com/"]
+
+
+@pytest.mark.asyncio
+async def test_map_site_urls_falls_back_to_bounded_html_crawl_when_no_sitemap() -> None:
+    from cognis.tools.executor.web.sitemap import map_site_urls
+
+    root_html = (
+        "<html><body>"
+        "<a href='/about'>About</a>"
+        "<a href='https://example.com/blog/post'>Post</a>"
+        "<a href='mailto:hi@example.com'>Email</a>"
+        "<a href='https://other.example/x'>External</a>"
+        "</body></html>"
+    )
+    about_html = "<html><body><a href='/about/team'>Team</a></body></html>"
+    request = httpx.Request("GET", "https://example.com/")
+    responses = {
+        "https://example.com/robots.txt": httpx.Response(404, request=request),
+        "https://example.com/sitemap.xml": httpx.Response(404, request=request),
+        "https://example.com/sitemap_index.xml": httpx.Response(404, request=request),
+        "https://example.com/": httpx.Response(200, request=request, text=root_html),
+        "https://example.com/about": httpx.Response(200, request=request, text=about_html),
+        "https://example.com/blog/post": httpx.Response(200, request=request, text=""),
+    }
+
+    async def _get(url: str, **_kwargs: Any) -> httpx.Response:
+        return responses.get(url, httpx.Response(404, request=request))
+
+    with patch("cognis.tools.executor.web.sitemap.httpx.AsyncClient") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(side_effect=_get)
+        mock_client_cls.return_value = mock_client
+
+        urls, source = await map_site_urls(
+            "https://example.com/",
+            options={"limit": 10, "max_depth": 2, "max_breadth": 10},
+        )
+
+    assert source == "html_crawl"
+    assert "https://example.com/" in urls
     assert "https://example.com/about" in urls
     assert "https://example.com/blog/post" in urls
+    assert "https://example.com/about/team" in urls
     assert "mailto:hi@example.com" not in urls
     assert "https://other.example/x" not in urls
+
+
+@pytest.mark.asyncio
+async def test_map_site_urls_html_crawl_respects_max_breadth_per_level() -> None:
+    from cognis.tools.executor.web.sitemap import map_site_urls
+
+    root_html = "<html><body><a href='/a'>A</a><a href='/b'>B</a></body></html>"
+    request = httpx.Request("GET", "https://example.com/")
+    responses = {
+        "https://example.com/robots.txt": httpx.Response(404, request=request),
+        "https://example.com/sitemap.xml": httpx.Response(404, request=request),
+        "https://example.com/sitemap_index.xml": httpx.Response(404, request=request),
+        "https://example.com/": httpx.Response(200, request=request, text=root_html),
+        "https://example.com/a": httpx.Response(200, request=request, text=""),
+        "https://example.com/b": httpx.Response(200, request=request, text=""),
+    }
+
+    async def _get(url: str, **_kwargs: Any) -> httpx.Response:
+        return responses.get(url, httpx.Response(404, request=request))
+
+    with patch("cognis.tools.executor.web.sitemap.httpx.AsyncClient") as mock_client_cls:
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        mock_client.get = AsyncMock(side_effect=_get)
+        mock_client_cls.return_value = mock_client
+
+        urls, source = await map_site_urls(
+            "https://example.com/",
+            options={"limit": 10, "max_depth": 1, "max_breadth": 1},
+        )
+
+    assert source == "html_crawl"
+    assert urls == ["https://example.com/", "https://example.com/a"]
+    assert "https://example.com/b" not in urls
 
 
 # ---------------------------------------------------------------------------
@@ -353,19 +488,22 @@ async def test_handle_web_map_uses_sitemap_when_fetch_backend_not_tavily(
 ) -> None:
     from cognis.tools.executor.web import handlers
 
-    async def _fake_discover(
-        url: str, *, limit: int = 200, same_host_only: bool = True
+    async def _fake_map_site_urls(
+        url: str, *, options: dict[str, Any] | None = None
     ) -> tuple[list[str], str]:
-        del limit, same_host_only
+        assert options == {"max_depth": 2, "limit": 10}
         return ["https://example.com/a", "https://example.com/b"], "sitemap"
 
     monkeypatch.setattr(
-        "cognis.tools.executor.web.sitemap.discover_sitemap_urls",
-        _fake_discover,
+        "cognis.tools.executor.web.sitemap.map_site_urls",
+        _fake_map_site_urls,
     )
 
     ctx = _FakeContext({"web_fetch_backend": "direct"})
-    result = await handlers.handle_web_map({"url": "https://example.com"}, ctx)
+    result = await handlers.handle_web_map(
+        {"url": "https://example.com", "max_depth": 2, "limit": 10},
+        ctx,
+    )
     assert not result.is_error
     assert "https://example.com/a" in result.output
     assert (result.metadata or {}).get("sitemap_source") == "sitemap"
