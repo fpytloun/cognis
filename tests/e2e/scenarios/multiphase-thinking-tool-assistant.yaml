@@ -1,0 +1,34 @@
+id: multiphase-thinking-tool-assistant
+description: |
+  Multi-phase turn: thinking then multi-chunk text response.
+  Tests that thinking blocks finalize and assistant message completes cleanly.
+  The "multi-phase" aspect is tested via the thinking block + text combination.
+  
+  Note: actual tool-call multi-phase turns require executor tool execution which
+  is tested separately in the tool-args-then-result scenario.
+trigger: "scenario:multiphase-thinking-tool-assistant"
+turns:
+  - role: assistant
+    steps:
+      # Thinking block (phase 0)
+      - type: thinking
+        block_id: blk_phase0
+        title: "Thinking"
+        content: "Let me analyze this step by step."
+        complete: true
+        delay_ms: 40
+      # First text segment
+      - type: text
+        chunks: ["First, ", "let ", "me ", "address ", "the ", "main ", "point. "]
+        delay_ms: 30
+      # Second thinking block (simulates multi-phase reasoning)
+      - type: thinking
+        block_id: blk_phase1
+        title: "Thinking"
+        content: "Now considering the follow-up..."
+        complete: true
+        delay_ms: 40
+      # Final text segment
+      - type: text
+        chunks: ["In ", "conclusion, ", "here ", "is ", "my ", "complete ", "answer."]
+        delay_ms: 30

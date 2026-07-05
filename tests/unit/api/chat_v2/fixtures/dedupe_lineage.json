@@ -1,0 +1,68 @@
+{
+  "lineage_ordinal": 0,
+  "raw_events": [
+    {
+      "store_id": "intaris",
+      "session_id": "root_session",
+      "seq": 1,
+      "type": "user_message",
+      "data": {
+        "content": "First copy",
+        "message_id": "msg_user_original",
+        "client_message_id": "same_client_message",
+        "client_txn_id": "txn_same",
+        "_lineage_index": 0
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "root_session",
+      "seq": 2,
+      "type": "user_message",
+      "data": {
+        "content": "Second canonical copy",
+        "message_id": "msg_user_retry",
+        "client_message_id": "same_client_message",
+        "client_txn_id": "txn_same",
+        "_lineage_index": 0
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "rebased_session",
+      "seq": 1,
+      "type": "assistant_message",
+      "data": {
+        "content": "Rebased answer",
+        "message_id": "msg_assistant_rebased",
+        "_lineage_index": 1
+      }
+    }
+  ],
+  "expected": {
+    "skipped_count": 0,
+    "warning_codes": [],
+    "items": [
+      {
+        "id": "user:same_client_message",
+        "kind": "message",
+        "sort_key": "0000:000000000000002:000000:00:000000001",
+        "source_ref_count": 2,
+        "role": "user",
+        "content": "Second canonical copy",
+        "message_id": "msg_user_retry",
+        "client_message_id": "same_client_message",
+        "client_txn_id": "txn_same"
+      },
+      {
+        "id": "message:msg_assistant_rebased",
+        "kind": "message",
+        "sort_key": "0001:000000000000001:000000:02:000000002",
+        "source_ref_count": 1,
+        "role": "assistant",
+        "content": "Rebased answer",
+        "message_id": "msg_assistant_rebased"
+      }
+    ]
+  }
+}

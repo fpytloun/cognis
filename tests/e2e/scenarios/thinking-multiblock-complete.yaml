@@ -1,0 +1,50 @@
+id: thinking-multiblock-complete
+description: |
+  Reproduces the duplicate thinking block / stuck progress bug.
+
+  The bug: thinking item id = thinking:{message_id}:phase:{phase}:{first_block_id}.
+  session_cache.update_active_thinking pops completed blocks. When block 1
+  completes and is popped, block 2 becomes blocks[0]. Without the first_block_id
+  anchor, the runtime projector uses block 2 as first_block_id → id changes →
+  old item orphaned (stuck streaming:true spinner) + new item created (duplicate).
+
+  This scenario has TWO thinking blocks in the same segment:
+    - blk_1 streams, then completes (popped from session_cache)
+    - blk_2 streams while blk_1 is gone
+    - final assistant text
+
+  With the fix (first_block_id anchor in session_cache), the thinking item id
+  stays stable throughout → no orphan, no duplicate.
+
+  INV-NO-DUP asserts no two items share an id.
+  INV-FINAL-PRESENCE asserts the thinking item survives to the final state.
+  INV-NO-HANG asserts no streaming items remain after message_complete.
+
+trigger: "scenario:thinking-multiblock-complete"
+turns:
+  # Single-phase turn: two thinking blocks, then assistant text
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_think_1
+        title: "First reasoning step"
+        content: "Let me think through the first part of this problem carefully."
+        complete: true
+        delay_ms: 25
+      - type: thinking
+        block_id: blk_think_2
+        title: "Second reasoning step"
+        content: "Now for the second part, building on the first conclusion."
+        complete: true
+        delay_ms: 25
+      - type: text
+        chunks:
+          - "Based "
+          - "on "
+          - "my "
+          - "analysis, "
+          - "the "
+          - "answer "
+          - "is "
+          - "clear."
+        delay_ms: 20

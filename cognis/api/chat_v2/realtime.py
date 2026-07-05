@@ -1,0 +1,588 @@
+"""Chat v2 native realtime frame and runtime item helpers."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from typing import Any, cast
+
+from cognis.api.chat_v2.cycles import cycle_states_from_items
+from cognis.api.chat_v2.item_keys import (
+    KIND_RANK,
+    assistant_message_item_id,
+    late_runtime_timeline_sort_key,
+    runtime_timeline_sort_key,
+    thinking_item_id,
+)
+from cognis.api.chat_v2.schemas import (
+    ChatRealtimeFrame,
+    MessageTimelineItem,
+    RuntimeActiveTurn,
+    RuntimeOverlaySnapshot,
+    SourceRef,
+    ThinkingBlock,
+    ThinkingTimelineItem,
+    TimelineItem,
+    TimelineItemStatus,
+    ToolCallTimelineItem,
+)
+from cognis.api.chat_v2.sync import PROJECTION_VERSION, runtime_epoch_for
+from cognis.models.artifact import AttachmentRef
+
+
+def runtime_overlay_from_items(
+    *,
+    conversation_id: str,
+    runtime_revision: int,
+    has_active_turn: bool,
+    active_turn: Mapping[str, Any] | None,
+    volatile_items: Sequence[TimelineItem],
+    context_usage: Mapping[str, Any] | None = None,
+    generated_at: str | None = None,
+) -> RuntimeOverlaySnapshot:
+    """Build a strict Chat v2 runtime overlay from native TimelineItem models."""
+
+    active_turn_model: RuntimeActiveTurn | None = None
+    if has_active_turn and active_turn is not None:
+        active_turn_model = RuntimeActiveTurn.model_validate(active_turn)
+    sorted_volatile_items = sorted(list(volatile_items), key=lambda item: item.sort_key)
+    return RuntimeOverlaySnapshot(
+        runtime_epoch=runtime_epoch_for(conversation_id),
+        runtime_revision=runtime_revision,
+        generated_at=generated_at or datetime.now(UTC).isoformat(),
+        has_active_turn=active_turn_model is not None,
+        active_turn=active_turn_model,
+        volatile_items=sorted_volatile_items,
+        cycle_states=cycle_states_from_items(sorted_volatile_items),
+        context_usage=dict(context_usage) if context_usage is not None else None,
+    )
+
+
+def runtime_frame(
+    *,
+    conversation_id: str,
+    cursor: str,
+    runtime: RuntimeOverlaySnapshot,
+    server_time: str | None = None,
+) -> ChatRealtimeFrame:
+    """Build a runtime-only Chat v2 frame without advancing the canonical cursor."""
+
+    return ChatRealtimeFrame(
+        projection_version=PROJECTION_VERSION,
+        conversation_id=conversation_id,
+        cursor_before=cursor,
+        cursor_after=cursor,
+        ops=[],
+        cycle_states=runtime.cycle_states,
+        runtime=runtime,
+        server_time=server_time or datetime.now(UTC).isoformat(),
+    )
+
+
+def runtime_items_from_snapshots(
+    *,
+    active_streams: Sequence[Mapping[str, Any]] | None = None,
+    active_tool_outputs: Sequence[Mapping[str, Any]] | None = None,
+    active_thinking: Sequence[Mapping[str, Any]] | None = None,
+    phase_hint_items: Sequence[TimelineItem] | None = None,
+    chat_mode: str | None = None,
+    chat_mode_source: str | None = None,
+) -> list[TimelineItem]:
+    """Project volatile runtime snapshots directly into strict Chat v2 items."""
+
+    items: list[TimelineItem] = []
+
+    for index, snapshot in enumerate(active_streams or []):
+        item = assistant_stream_runtime_item(
+            snapshot,
+            local=index,
+            phase_hint_items=phase_hint_items,
+            chat_mode=chat_mode,
+            chat_mode_source=chat_mode_source,
+        )
+        if item is not None:
+            items.append(item)
+
+    for index, snapshot in enumerate(active_tool_outputs or []):
+        item = tool_output_runtime_item(snapshot, local=index)
+        if item is not None:
+            items.append(item)
+
+    think_local = 0
+    for snapshot in active_thinking or []:
+        for item in thinking_runtime_items(
+            snapshot,
+            local_start=think_local,
+            phase_hint_items=phase_hint_items,
+        ):
+            items.append(item)
+            think_local += 1
+
+    return sorted(items, key=lambda item: item.sort_key)
+
+
+def assistant_stream_runtime_item(
+    snapshot: Mapping[str, Any],
+    *,
+    local: int,
+    phase_hint_items: Sequence[TimelineItem] | None = None,
+    chat_mode: str | None = None,
+    chat_mode_source: str | None = None,
+) -> MessageTimelineItem | None:
+    content = snapshot.get("content")
+    message_id = snapshot.get("message_id")
+    if not isinstance(content, str) or not content:
+        return None
+    if not isinstance(message_id, str) or not message_id:
+        return None
+    turn_id = _str(snapshot.get("turn_id")) or message_id
+    phase = _phase(snapshot.get("assistant_phase_index"))
+    if phase is None:
+        phase = _next_runtime_assistant_phase(phase_hint_items, turn_id)
+    turn_cycle_index = _phase(snapshot.get("turn_cycle_index"))
+    if turn_cycle_index is None:
+        turn_cycle_index = _next_runtime_turn_cycle(phase_hint_items, turn_id, phase)
+    timestamp = _str(snapshot.get("updated_at"))
+    return MessageTimelineItem(
+        id=assistant_message_item_id(message_id=message_id, phase=phase),
+        kind="message",
+        sort_key=runtime_timeline_sort_key(
+            phase=phase,
+            kind_rank=KIND_RANK["assistant_message"],
+            local=local,
+        ),
+        source_refs=[_runtime_source_ref(snapshot, event_type="assistant_stream")],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status="running",
+        stable=False,
+        role="assistant",
+        content=content,
+        message_id=message_id,
+        turn_id=turn_id,
+        assistant_phase_index=phase,
+        turn_cycle_index=turn_cycle_index,
+        partial=True,
+        chat_mode=cast(Any, chat_mode) if chat_mode in {"default", "plan", "build"} else None,
+        chat_mode_source=chat_mode_source if isinstance(chat_mode_source, str) else None,
+    )
+
+
+def assistant_completion_runtime_item(
+    *,
+    message_id: str,
+    turn_id: str | None,
+    session_id: str | None,
+    phase: int,
+    content: str,
+    timestamp: str,
+    partial: bool,
+    chat_mode: str | None = None,
+    chat_mode_source: str | None = None,
+    turn_cycle_index: int | None = None,
+) -> MessageTimelineItem:
+    return MessageTimelineItem(
+        id=assistant_message_item_id(message_id=message_id, phase=phase),
+        kind="message",
+        sort_key=runtime_timeline_sort_key(
+            phase=phase,
+            kind_rank=KIND_RANK["assistant_message"],
+            local=0,
+        ),
+        source_refs=[
+            SourceRef(
+                store="runtime",
+                session_id=session_id or "runtime",
+                seq=0,
+                event_type="assistant_complete",
+            )
+        ],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status="complete",
+        stable=False,
+        role="assistant",
+        content=content,
+        message_id=message_id,
+        turn_id=turn_id or message_id,
+        assistant_phase_index=phase,
+        turn_cycle_index=turn_cycle_index if isinstance(turn_cycle_index, int) else None,
+        partial=partial,
+        chat_mode=cast(Any, chat_mode) if chat_mode in {"default", "plan", "build"} else None,
+        chat_mode_source=chat_mode_source if isinstance(chat_mode_source, str) else None,
+    )
+
+
+def tool_call_runtime_item(
+    *,
+    session_id: str,
+    call_id: str,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+    turn_id: str | None,
+    assistant_phase_index: int | None,
+    turn_cycle_index: int | None,
+    timestamp: str,
+) -> ToolCallTimelineItem:
+    return ToolCallTimelineItem(
+        id=f"tool:{call_id}",
+        kind="tool_call",
+        sort_key=runtime_timeline_sort_key(
+            phase=assistant_phase_index,
+            kind_rank=KIND_RANK["tool_call"],
+            local=0,
+        ),
+        source_refs=[
+            SourceRef(store="runtime", session_id=session_id, seq=0, event_type="tool_call")
+        ],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status="running",
+        stable=False,
+        call_id=call_id,
+        tool_name=tool_name,
+        turn_id=turn_id,
+        assistant_phase_index=assistant_phase_index,
+        turn_cycle_index=turn_cycle_index,
+        arguments=arguments,
+        arguments_preview=_preview(arguments),
+    )
+
+
+def tool_result_runtime_item(
+    *,
+    session_id: str,
+    call_id: str,
+    tool_name: str,
+    result: str,
+    is_error: bool,
+    duration_ms: int | None,
+    evaluation: dict[str, Any] | None,
+    attachments: list[dict[str, Any]] | None,
+    file_diffs: list[dict[str, Any]] | None,
+    turn_id: str | None,
+    assistant_phase_index: int | None,
+    turn_cycle_index: int | None,
+    timestamp: str,
+    presentation: dict[str, Any] | None = None,
+) -> ToolCallTimelineItem:
+    presentation = presentation or {}
+    return ToolCallTimelineItem(
+        id=f"tool:{call_id}",
+        kind="tool_call",
+        sort_key=runtime_timeline_sort_key(
+            phase=assistant_phase_index,
+            kind_rank=KIND_RANK["tool_call"],
+            local=0,
+        ),
+        source_refs=[
+            SourceRef(store="runtime", session_id=session_id, seq=0, event_type="tool_result")
+        ],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status="failed" if is_error else "complete",
+        stable=False,
+        call_id=call_id,
+        tool_name=tool_name,
+        turn_id=turn_id,
+        assistant_phase_index=assistant_phase_index,
+        turn_cycle_index=turn_cycle_index,
+        result_preview=result,
+        streamed_output=result,
+        is_error=is_error,
+        duration_ms=duration_ms if isinstance(duration_ms, int) else None,
+        attachments=_attachments(attachments),
+        file_diffs=file_diffs or [],
+        output_size=_int(presentation.get("output_size")) or len(result),
+        truncated=bool(presentation.get("truncated")),
+        has_full_output=bool(presentation.get("has_full_output")),
+        recovery_call_id=_str(presentation.get("recovery_call_id")),
+        tool_output_artifact_id=_str(presentation.get("tool_output_artifact_id")),
+        evaluation=evaluation,
+    )
+
+
+def tool_output_runtime_item(
+    snapshot: Mapping[str, Any],
+    *,
+    local: int,
+) -> ToolCallTimelineItem | None:
+    call_id = _str(snapshot.get("call_id"))
+    if not call_id:
+        return None
+    tool_name = _str(snapshot.get("tool_name")) or "unknown"
+    result = snapshot.get("result")
+    result_text = result if isinstance(result, str) else ""
+    phase = _phase(snapshot.get("assistant_phase_index"))
+    timestamp = _str(snapshot.get("updated_at"))
+    output_size = _int(snapshot.get("output_size")) or len(result_text)
+    return ToolCallTimelineItem(
+        id=f"tool:{call_id}",
+        kind="tool_call",
+        sort_key=runtime_timeline_sort_key(
+            phase=phase,
+            kind_rank=KIND_RANK["tool_call"],
+            local=local,
+        ),
+        source_refs=[_runtime_source_ref(snapshot, event_type="tool_output")],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status=_status(snapshot.get("status")) or "running",
+        stable=False,
+        call_id=call_id,
+        tool_name=tool_name,
+        turn_id=_str(snapshot.get("turn_id")),
+        assistant_phase_index=phase,
+        turn_cycle_index=_phase(snapshot.get("turn_cycle_index")),
+        arguments=snapshot.get("arguments")
+        if isinstance(snapshot.get("arguments"), dict)
+        else None,
+        result_preview=result_text or None,
+        streamed_output=result_text or None,
+        is_error=snapshot.get("is_error") is True,
+        output_size=output_size,
+        truncated=snapshot.get("truncated") is True,
+        has_full_output=snapshot.get("has_full_output") is True,
+        recovery_call_id=_str(snapshot.get("recovery_call_id")),
+        tool_output_artifact_id=_str(snapshot.get("tool_output_artifact_id")),
+        progress_phase=_str(snapshot.get("progress_phase")),
+        progress_input_chars=_int(snapshot.get("progress_input_chars")),
+        progress_input_lines=_int(snapshot.get("progress_input_lines")),
+        progress_complete=snapshot.get("progress_complete")
+        if isinstance(snapshot.get("progress_complete"), bool)
+        else None,
+    )
+
+
+def thinking_runtime_items(
+    snapshot: Mapping[str, Any],
+    *,
+    local_start: int,
+    phase_hint_items: Sequence[TimelineItem] | None = None,
+) -> list[ThinkingTimelineItem]:
+    message_id = _str(snapshot.get("message_id"))
+    if not message_id:
+        return []
+    turn_id = _str(snapshot.get("turn_id")) or message_id
+    phase = _phase(snapshot.get("assistant_phase_index"))
+    if phase is None:
+        phase = _next_runtime_assistant_phase(phase_hint_items, turn_id)
+    turn_cycle_index = _phase(snapshot.get("turn_cycle_index"))
+    if turn_cycle_index is None:
+        turn_cycle_index = _next_runtime_turn_cycle(phase_hint_items, turn_id, phase)
+    raw_blocks = snapshot.get("blocks")
+    if not isinstance(raw_blocks, list):
+        return []
+    timestamp = _str(snapshot.get("updated_at"))
+    items: list[ThinkingTimelineItem] = []
+    for offset, raw_block in enumerate(raw_blocks):
+        if not isinstance(raw_block, Mapping):
+            continue
+        block_id = _str(raw_block.get("block_id"))
+        content = raw_block.get("content")
+        if not block_id or not isinstance(content, str) or not content:
+            continue
+        complete = raw_block.get("complete") is True
+        title = _str(raw_block.get("title")) or "Thinking"
+        block = ThinkingBlock(
+            id=block_id,
+            title=title,
+            content=content,
+            status="complete" if complete else "running",
+            started_at=_str(raw_block.get("started_at")),
+            completed_at=_str(raw_block.get("completed_at")),
+            duration_ms=_int(raw_block.get("duration_ms")),
+        )
+        items.append(
+            ThinkingTimelineItem(
+                id=thinking_item_id(message_id=message_id, phase=phase, block_id=block_id),
+                kind="thinking",
+                sort_key=runtime_timeline_sort_key(
+                    phase=phase,
+                    kind_rank=KIND_RANK["thinking"],
+                    local=local_start + offset,
+                ),
+                source_refs=[_runtime_source_ref(snapshot, event_type="thinking")],
+                created_at=timestamp,
+                updated_at=timestamp,
+                status="complete" if complete else "running",
+                stable=False,
+                message_id=message_id,
+                turn_id=turn_id,
+                assistant_phase_index=phase,
+                turn_cycle_index=turn_cycle_index,
+                blocks=[block],
+                active_title=None if complete else title,
+            )
+        )
+    return items
+
+
+def delegation_runtime_item(
+    event_data: Mapping[str, Any], *, timestamp: str
+) -> ToolCallTimelineItem | None:
+    call_id = _str(event_data.get("call_id"))
+    if not call_id:
+        return None
+    mode = event_data.get("mode")
+    tool_name = mode if mode in {"delegate", "fork"} else "delegate"
+    status = _delegation_status(event_data)
+    session_id = (
+        _str(event_data.get("parent_session_id")) or _str(event_data.get("session_id")) or "runtime"
+    )
+    phase = _phase(event_data.get("assistant_phase_index"))
+    sort_key = (
+        runtime_timeline_sort_key(
+            phase=phase,
+            kind_rank=KIND_RANK["tool_call"],
+            local=0,
+        )
+        if phase is not None
+        else late_runtime_timeline_sort_key(
+            kind_rank=KIND_RANK["tool_call"],
+            local=0,
+        )
+    )
+    delegation = {
+        "child_session_id": event_data.get("child_session_id") or event_data.get("session_id"),
+        "status": status,
+        "turn_id": _str(event_data.get("turn_id")),
+        "assistant_phase_index": phase,
+        "turn_cycle_index": _phase(event_data.get("turn_cycle_index")),
+        "agent_id": event_data.get("agent_id") or event_data.get("used_agent_id"),
+        "used_agent_id": event_data.get("used_agent_id"),
+        "title": event_data.get("title") or event_data.get("task_title") or event_data.get("label"),
+        "summary": event_data.get("summary") or event_data.get("task"),
+        "started_at": event_data.get("started_at"),
+        "duration_ms": event_data.get("duration_ms"),
+        "result_summary": event_data.get("result_summary") or event_data.get("result"),
+        "result_content": event_data.get("result_content"),
+        "result_source": event_data.get("result_source"),
+        "result_truncated": event_data.get("result_truncated"),
+        "result_anchors": event_data.get("result_anchors"),
+        "todos": event_data.get("todos") if isinstance(event_data.get("todos"), list) else [],
+        "tool_call_count": event_data.get("tool_call_count"),
+        "max_tool_calls": event_data.get("max_tool_calls"),
+        "last_tool": event_data.get("last_tool"),
+        "error": event_data.get("error") or event_data.get("reason"),
+    }
+    return ToolCallTimelineItem(
+        id=f"tool:{call_id}",
+        kind="tool_call",
+        sort_key=sort_key,
+        source_refs=[
+            SourceRef(store="runtime", session_id=session_id, seq=0, event_type="delegation")
+        ],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status=_status(status) or "running",
+        stable=False,
+        call_id=call_id,
+        tool_name=str(tool_name),
+        turn_id=_str(event_data.get("turn_id")),
+        assistant_phase_index=phase,
+        turn_cycle_index=_phase(event_data.get("turn_cycle_index")),
+        delegation=delegation,
+    )
+
+
+def _runtime_source_ref(snapshot: Mapping[str, Any], *, event_type: str) -> SourceRef:
+    return SourceRef(
+        store="runtime",
+        session_id=_str(snapshot.get("session_id")) or "runtime",
+        seq=0,
+        event_type=event_type,
+    )
+
+
+def _next_runtime_assistant_phase(
+    items: Sequence[TimelineItem] | None,
+    turn_id: str | None,
+) -> int | None:
+    if not turn_id:
+        return None
+    if not items:
+        return None
+    phases = [
+        item.assistant_phase_index
+        for item in items or []
+        if getattr(item, "turn_id", None) == turn_id and isinstance(item.assistant_phase_index, int)
+    ]
+    if phases:
+        return max(phases) + 1
+    return sum(
+        1
+        for item in items or []
+        if isinstance(item, MessageTimelineItem)
+        and item.role == "assistant"
+        and item.turn_id == turn_id
+    )
+
+
+def _next_runtime_turn_cycle(
+    items: Sequence[TimelineItem] | None,
+    turn_id: str | None,
+    phase: int | None,
+) -> int | None:
+    if not turn_id:
+        return phase
+    cycles = [
+        item.turn_cycle_index
+        for item in items or []
+        if getattr(item, "turn_id", None) == turn_id and isinstance(item.turn_cycle_index, int)
+    ]
+    if cycles:
+        return max(cycles) + 1
+    return phase
+
+
+def _delegation_status(data: Mapping[str, Any]) -> str:
+    status = data.get("status")
+    if isinstance(status, str) and status:
+        return status
+    event_status = data.get("event")
+    return str(event_status) if isinstance(event_status, str) and event_status else "running"
+
+
+def _attachments(value: Any) -> list[AttachmentRef]:
+    if not isinstance(value, list):
+        return []
+    attachments: list[AttachmentRef] = []
+    for attachment in value:
+        if isinstance(attachment, AttachmentRef):
+            attachments.append(attachment)
+        elif isinstance(attachment, dict):
+            attachments.append(AttachmentRef.model_validate(attachment))
+    return attachments
+
+
+def _status(value: Any) -> TimelineItemStatus | None:
+    if value in {"pending", "running", "waiting", "complete", "failed", "cancelled"}:
+        return cast(TimelineItemStatus, value)
+    if value in {"started", "in_progress"}:
+        return "running"
+    if value in {"completed", "success", "succeeded"}:
+        return "complete"
+    if value == "error":
+        return "failed"
+    return None
+
+
+def _preview(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return repr(value)
+
+
+def _str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _phase(value: Any) -> int | None:
+    return value if isinstance(value, int) and value >= 0 else None

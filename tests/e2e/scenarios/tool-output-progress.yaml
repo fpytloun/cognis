@@ -1,0 +1,42 @@
+id: tool-output-progress
+description: |
+  Exercises the tool-output progress ordering fix.
+
+  Previously on_tool_progress and on_tool_output_chunk sent without canonical_items,
+  giving tool-output progress items a bare sentinel orderKey with no phase anchor.
+  This caused progress items to sort wrong relative to finalized items.
+
+  This scenario uses thinking + tool_call + final text. The golden captures the
+  live patches and INV-PHASE-ORDER asserts all items sort correctly by (phase, kind).
+  The tool-output progress path (on_tool_output_chunk) is exercised when the
+  executor streams tool output, which happens in the live stack but not the mock.
+  This scenario validates the ordering invariant for the tool_call item itself.
+
+trigger: "scenario:tool-output-progress"
+turns:
+  # Turn 0: thinking + tool_call (finish_reason="tool_calls")
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_progress_1
+        title: "Planning the edit"
+        content: "I will apply the patch now."
+        complete: true
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_apply_patch
+        name: memory_search
+        arguments:
+          query: "test context"
+        delay_ms: 15
+
+  # Turn 1: final assistant text (finish_reason="stop")
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "The "
+          - "operation "
+          - "completed "
+          - "successfully."
+        delay_ms: 20

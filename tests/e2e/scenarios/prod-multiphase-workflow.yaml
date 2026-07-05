@@ -1,0 +1,149 @@
+id: prod-multiphase-workflow
+description: |
+  Production-shaped multi-phase workflow turn.
+
+  Mirrors the structure of real session sess_XXXX (obfuscated), last turn
+  seq 1324-1372: thinking + 3 assistant phases (0, 6, 13) interleaved with
+  multiple tool calls and results.
+
+  Turn 0 (LLM call 1): thinking block + assistant text (phase 0) + tool_calls
+    → finish_reason="tool_calls" → agent executes tools → phase bumps to 1
+  Turn 1 (LLM call 2): assistant text (phase 1) + more tool_calls
+    → finish_reason="tool_calls" → agent executes tools → phase bumps to 2
+  Turn 2 (LLM call 3): final assistant text (phase 2)
+    → finish_reason="stop" → turn complete
+
+  Uses memory_search (controller-side builtin, returns [] with memory_backend=none)
+  as the safe tool for e2e testing — no executor needed, completes fast.
+
+  Tests:
+  - Thinking block finalizes (not stuck streaming) after message_complete
+  - Phase-0 assistant message finalizes (not stuck streaming) after message_complete
+  - Phase-1 assistant message finalizes after message_complete
+  - Phase-2 (final) assistant message is present in final store state
+  - No assistant message disappears after streaming completes
+  - Tool cards keep their arguments across result patches
+  - No duplicate items at any snapshot
+
+  All content is synthetic.
+trigger: "scenario:prod-multiphase-workflow"
+turns:
+  # Turn 0 (LLM call 1): thinking + assistant text (phase 0) + tool_calls
+  # finish_reason="tool_calls" because last step is tool_call
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_think_1
+        title: "Analyzing the request"
+        content: "Let me think through this carefully. I need to gather some context first before providing a comprehensive answer."
+        complete: true
+        delay_ms: 30
+      - type: text
+        chunks:
+          - "I'll "
+          - "start "
+          - "by "
+          - "gathering "
+          - "the "
+          - "relevant "
+          - "context "
+          - "for "
+          - "this "
+          - "task."
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_p0_t1
+        name: memory_search
+        arguments:
+          query: "task context overview"
+        delay_ms: 15
+      - type: tool_call
+        call_id: call_p0_t2
+        name: memory_search
+        arguments:
+          query: "related patterns"
+        delay_ms: 15
+
+  # Turn 1 (LLM call 2): assistant text (phase 1) + more tool_calls
+  # finish_reason="tool_calls" because last step is tool_call
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "Based "
+          - "on "
+          - "the "
+          - "initial "
+          - "context, "
+          - "I "
+          - "need "
+          - "to "
+          - "investigate "
+          - "further."
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_p1_t1
+        name: memory_search
+        arguments:
+          query: "implementation details"
+        delay_ms: 15
+      - type: tool_call
+        call_id: call_p1_t2
+        name: memory_search
+        arguments:
+          query: "constraints and requirements"
+        delay_ms: 15
+      - type: tool_call
+        call_id: call_p1_t3
+        name: memory_search
+        arguments:
+          query: "previous decisions"
+        delay_ms: 15
+
+  # Turn 2 (LLM call 3): final assistant text (phase 2)
+  # finish_reason="stop" because last step is text
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "After "
+          - "thorough "
+          - "analysis "
+          - "across "
+          - "multiple "
+          - "queries, "
+          - "here "
+          - "is "
+          - "the "
+          - "complete "
+          - "answer:\n\n"
+          - "The "
+          - "recommended "
+          - "approach "
+          - "involves "
+          - "three "
+          - "key "
+          - "steps. "
+          - "First, "
+          - "establish "
+          - "the "
+          - "baseline "
+          - "metrics. "
+          - "Second, "
+          - "apply "
+          - "the "
+          - "changes "
+          - "incrementally "
+          - "with "
+          - "validation "
+          - "at "
+          - "each "
+          - "step. "
+          - "Third, "
+          - "verify "
+          - "the "
+          - "final "
+          - "state "
+          - "matches "
+          - "expectations."
+        delay_ms: 20

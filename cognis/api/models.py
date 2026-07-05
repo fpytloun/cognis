@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 
@@ -9,7 +10,6 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 from pydantic_core import PydanticCustomError
 
 from cognis.core.question_sets import normalize_questions, normalize_reply
-from cognis.models.artifact import AttachmentRef
 from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import SessionPolicy, WorkflowState
@@ -133,6 +133,47 @@ class ProfileUpdateRequest(BaseModel):
     name: str | None = None
 
 
+class UserDisplayPreferences(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    theme: Literal["system", "dark", "light"] = "system"
+    language: str = "auto"
+
+    @field_validator("language")
+    @classmethod
+    def _validate_language(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return "auto"
+        if normalized == "auto":
+            return normalized
+        if not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", normalized):
+            raise PydanticCustomError(
+                "invalid_language",
+                "language must be 'auto' or a BCP-47-like language tag",
+            )
+        return normalized
+
+
+class UserChatPreferences(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    show_thinking_blocks: bool = False
+    group_tool_calls: bool = True
+    show_internal_tool_calls: bool = False
+
+
+class UserPreferencesResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    display: UserDisplayPreferences = Field(default_factory=UserDisplayPreferences)
+    chat: UserChatPreferences = Field(default_factory=UserChatPreferences)
+
+
+class UserPreferencesUpdateRequest(UserPreferencesResponse):
+    pass
+
+
 class ProviderTestResultResponse(BaseModel):
     ok: bool
     model_resolved: str | None = None
@@ -206,6 +247,16 @@ class ConversationResolveRequest(BaseModel):
     scope: Literal["latest", "agent_direct"] = "latest"
 
 
+class ConversationOpenCandidate(BaseModel):
+    """Timestamped browser-local last-opened candidate."""
+
+    conversation_id: str
+    opened_at: datetime | str | None = None
+    agent_id: str | None = None
+    agent_profile_id: str | None = None
+    context_type: str | None = None
+
+
 class ConversationOpenRequest(BaseModel):
     """Resolve the best conversation to open for the chat landing page."""
 
@@ -213,6 +264,7 @@ class ConversationOpenRequest(BaseModel):
     agent_profile_id: str | None = None
     context_type: str = "web"
     candidate_conversation_ids: list[str] = Field(default_factory=list)
+    candidate_conversations: list[ConversationOpenCandidate] = Field(default_factory=list)
 
 
 class ConversationCreateRequest(BaseModel):
@@ -281,6 +333,21 @@ class ConversationTitleSuggestionResponse(BaseModel):
     generated_at: str | None = None
     available: bool = False
     reason: str | None = None
+
+
+class SlashCommandSuggestionResponse(BaseModel):
+    kind: Literal["command", "parameter"]
+    command: str
+    value: str
+    label: str
+    insert_text: str
+    description: str | None = None
+    suffix: Literal["space", "none"] = "none"
+    badges: list[str] = Field(default_factory=list)
+
+
+class SlashCommandSuggestionsResponse(BaseModel):
+    items: list[SlashCommandSuggestionResponse] = Field(default_factory=list)
 
 
 class MessageEventResponse(BaseModel):
@@ -371,49 +438,6 @@ class ActiveThinkingSnapshotResponse(BaseModel):
     turn_id: str | None = None
     blocks: list[ActiveThinkingBlockResponse] = Field(default_factory=list)
     updated_at: str | None = None
-
-
-class MessageHistoryResponse(BaseModel):
-    items: list[MessageEventResponse]
-    last_seq: int = 0
-    has_more: bool = False
-    older_cursor: str | None = Field(
-        default=None,
-        description="Opaque cursor for loading older conversation history before this page.",
-    )
-    has_active_turn: bool = Field(
-        default=False,
-        description="Whether the controller currently has user-visible work running for this conversation.",
-    )
-    active_streams: list[ActiveStreamSnapshotResponse] = Field(default_factory=list)
-    active_tool_outputs: list[ActiveToolOutputSnapshotResponse] = Field(default_factory=list)
-    active_session_id: str | None = Field(
-        default=None,
-        description="Active session identifier for switching the client from lineage bootstrap to active-session replay.",
-    )
-    active_session_last_seq: int = Field(
-        default=0,
-        description="Last persisted sequence number in the active session's seq space.",
-    )
-    history_truncated: bool = Field(
-        default=False,
-        description="Whether the returned history is incomplete and the client should surface a truncation notice.",
-    )
-    truncation_reason: str | None = Field(
-        default=None,
-        description="Machine-readable reason explaining why the history response was truncated.",
-    )
-    state_snapshot: ConversationStateEnvelope | None = Field(
-        default=None,
-        description="Authoritative backend-projected conversation state at history load time.",
-    )
-
-
-class TimelineProjectionResponse(MessageHistoryResponse):
-    timeline_items: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Backend-projected canonical timeline items for initial/refresh rendering.",
-    )
 
 
 class ProjectSourceCreateRequest(BaseModel):
@@ -547,6 +571,7 @@ class SessionResponse(BaseModel):
 class SessionEventsResponse(BaseModel):
     session_id: str
     items: list[MessageEventResponse]
+    timeline_items: list[dict[str, Any]] = Field(default_factory=list)
     last_seq: int = 0
     has_more: bool = False
     active_thinking: list[ActiveThinkingSnapshotResponse] = Field(default_factory=list)
@@ -568,6 +593,7 @@ class AgentRequestBase(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
+    capabilities: dict[str, Any] | None = None
     agent_profiles: dict[str, Any] | None = None
     default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
@@ -604,6 +630,7 @@ class AgentUpdateRequest(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
+    capabilities: dict[str, Any] | None = None
     agent_profiles: dict[str, Any] | None = None
     default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
@@ -636,6 +663,7 @@ class AgentResponse(BaseModel):
     tools: dict[str, Any] | None = None
     permissions: dict[str, Any] | None = None
     llm_config: dict[str, Any] | None = None
+    capabilities: dict[str, Any] | None = None
     agent_profiles: dict[str, Any] | None = None
     default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
@@ -768,9 +796,15 @@ class LLMProviderOAuthStatusResponse(BaseModel):
     provider_id: str
     status: str
     verification_url: str | None = None
+    authorization_url: str | None = None
+    redirect_uri: str | None = None
     user_code: str | None = None
     interval: int | None = None
     expires_at: float | None = None
+
+
+class LLMProviderOAuthCompleteRequest(BaseModel):
+    callback_input: str
 
 
 class CodexUsageWindowResponse(BaseModel):
@@ -1104,6 +1138,42 @@ class TaskResponse(BaseModel):
     applied_completion_reason: str | None = None
 
 
+class TaskBoardItemResponse(BaseModel):
+    task_id: str
+    title: str
+    status: str
+    priority: int = 0
+    agent_id: str
+    workflow_id: str | None = None
+    project_id: str | None = None
+    source_type: str
+    source_ref: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime | None = None
+    result_summary: str | None = None
+
+
+class TaskBoardDoneGroupResponse(BaseModel):
+    key: str
+    title: str
+    latest: TaskBoardItemResponse
+    task_count: int = 1
+
+
+class TaskBoardColumnResponse(BaseModel):
+    items: list[TaskBoardItemResponse] = Field(default_factory=list)
+    groups: list[TaskBoardDoneGroupResponse] = Field(default_factory=list)
+    cursor: str | None = None
+    has_more: bool = False
+    total_count: int = 0
+
+
+class TaskBoardResponse(BaseModel):
+    columns: dict[str, TaskBoardColumnResponse]
+
+
 class WorkflowRunResponse(BaseModel):
     task_id: str
     workflow_id: str | None = None
@@ -1178,6 +1248,7 @@ class StepRunResponse(BaseModel):
     duration_seconds: float | None = None
     accumulated_duration_seconds: float | None = None
     latest_attempt_duration_seconds: float | None = None
+    is_projection: bool = False
 
 
 class TaskDetailResponse(TaskResponse):
@@ -1842,26 +1913,6 @@ class MCPServerUpdateRequest(BaseModel):
     description: str | None = None
     status: str | None = None
     shared: bool | None = None
-
-
-class SendMessageRequest(BaseModel):
-    """Request body for POST /conversations/{id}/messages."""
-
-    content: str = Field(default="", max_length=100_000)
-    attachments: list[AttachmentRef] = Field(default_factory=list, max_length=20)
-    client_message_id: str | None = Field(default=None, max_length=128)
-
-    @model_validator(mode="after")
-    def _validate_not_empty(self) -> SendMessageRequest:
-        if not self.content.strip() and not self.attachments:
-            raise ValueError("content or attachments are required")
-        return self
-
-
-class SendMessageResponse(BaseModel):
-    """Response for fire-and-forget message submission (202 Accepted)."""
-
-    status: Literal["accepted", "queued"] = "accepted"
 
 
 class QueuedMessageResponse(BaseModel):

@@ -1,0 +1,122 @@
+id: long-streaming-response
+description: |
+  Long streaming text response with many chunks — tests that the rAF
+  batching and coalescing work correctly under sustained token load.
+
+  Inspired by production sessions where the agent produces a detailed
+  analysis or code review spanning hundreds of tokens. The key risk is
+  that rapid token delivery causes the client to miss the final
+  streaming:false state or produce duplicate items.
+
+  Tests:
+  - Single assistant item throughout (no duplicates)
+  - streaming:false after message_complete
+  - No position jumps (orderKey stable)
+  - rAF batching handles burst correctly
+
+  All content is synthetic.
+trigger: "scenario:long-streaming-response"
+turns:
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "# Analysis\n\n"
+          - "## Overview\n\n"
+          - "The "
+          - "implementation "
+          - "consists "
+          - "of "
+          - "several "
+          - "key "
+          - "components "
+          - "that "
+          - "work "
+          - "together "
+          - "to "
+          - "provide "
+          - "the "
+          - "desired "
+          - "functionality.\n\n"
+          - "## Component A\n\n"
+          - "This "
+          - "component "
+          - "handles "
+          - "the "
+          - "primary "
+          - "data "
+          - "flow. "
+          - "It "
+          - "receives "
+          - "input, "
+          - "processes "
+          - "it "
+          - "through "
+          - "a "
+          - "pipeline, "
+          - "and "
+          - "emits "
+          - "the "
+          - "result.\n\n"
+          - "## Component B\n\n"
+          - "This "
+          - "component "
+          - "manages "
+          - "state "
+          - "transitions. "
+          - "Each "
+          - "transition "
+          - "is "
+          - "validated "
+          - "before "
+          - "being "
+          - "applied.\n\n"
+          - "## Component C\n\n"
+          - "This "
+          - "component "
+          - "provides "
+          - "the "
+          - "external "
+          - "interface. "
+          - "It "
+          - "exposes "
+          - "a "
+          - "clean "
+          - "API "
+          - "that "
+          - "hides "
+          - "internal "
+          - "complexity.\n\n"
+          - "## Recommendations\n\n"
+          - "1. "
+          - "Refactor "
+          - "Component A "
+          - "to "
+          - "reduce "
+          - "coupling.\n"
+          - "2. "
+          - "Add "
+          - "error "
+          - "handling "
+          - "to "
+          - "Component B.\n"
+          - "3. "
+          - "Document "
+          - "the "
+          - "Component C "
+          - "API.\n\n"
+          - "## Conclusion\n\n"
+          - "The "
+          - "overall "
+          - "architecture "
+          - "is "
+          - "sound. "
+          - "The "
+          - "recommended "
+          - "changes "
+          - "will "
+          - "improve "
+          - "maintainability "
+          - "and "
+          - "reliability."
+        delay_ms: 15

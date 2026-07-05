@@ -1,0 +1,105 @@
+# E2E test overlay for docker compose.
+#
+# Usage:
+#   docker compose -f compose.local.yml -f compose.e2e.yml up -d --build
+#   docker compose -f compose.local.yml -f compose.e2e.yml run --rm seed-e2e
+#
+# This overlay:
+#   - Adds the mock-llm service (deterministic OpenAI-compatible server)
+#   - Points cognis, mnemory, intaris at mock-llm for LLM calls
+#   - Disables Intaris analysis (ANALYSIS_ENABLED=false) — event store still works
+#   - Sets default backend to "none" for memory and guardrails
+  #   - Adds seed-e2e job (local executor/provider seed + E2E agent/scenarios)
+
+services:
+  mock-llm:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock-llm
+    ports:
+      - "${MOCK_LLM_PORT:-8090}:8090"
+    volumes:
+      - ./tests/e2e/scenarios:/scenarios:ro
+    environment:
+      MOCK_LLM_PORT: 8090
+      MOCK_LLM_HOST: 0.0.0.0
+      MOCK_LLM_SCENARIOS_DIR: /scenarios
+      MOCK_LLM_LOG_LEVEL: ${MOCK_LLM_LOG_LEVEL:-info}
+      MOCK_LLM_EMBEDDING_DIMS: 1536
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  cognis:
+    depends_on:
+      mock-llm:
+        condition: service_healthy
+    environment:
+      # Point LLM at mock server
+      COGNIS_LOCAL_LLM_BASE_URL: http://mock-llm:8090/v1
+      COGNIS_LOCAL_LLM_API_KEY: mock-key
+      # Default backends: no memory, no guardrails (for e2e agents)
+      COGNIS_DEFAULT_MEMORY_BACKEND: none
+      COGNIS_DEFAULT_GUARDRAILS_BACKEND: none
+
+  cognis-executor:
+    environment:
+      COGNIS_LOCAL_LLM_API_KEY: mock-key
+
+  intaris:
+    environment:
+      # Disable LLM-backed analysis — event store still works
+      ANALYSIS_ENABLED: "false"
+      # Point at mock-llm as a safety net (won't be called with analysis off)
+      LLM_API_KEY: mock-key
+      LLM_BASE_URL: http://mock-llm:8090/v1
+      ANALYSIS_LLM_API_KEY: mock-key
+      ANALYSIS_LLM_BASE_URL: http://mock-llm:8090/v1
+
+  mnemory:
+    environment:
+      # Point at mock-llm (won't be called when memory_backend=none)
+      LLM_API_KEY: mock-key
+      LLM_BASE_URL: http://mock-llm:8090/v1
+      EMBED_API_KEY: mock-key
+      EMBED_BASE_URL: http://mock-llm:8090/v1
+
+  seed-e2e:
+    image: ${COGNIS_IMAGE:-cognis-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      cognis:
+        condition: service_started
+      mock-llm:
+        condition: service_healthy
+    profiles:
+      - e2e
+    environment:
+      COGNIS_DATA_DIR: /data
+      COGNIS_LOG_FORMAT: ${COGNIS_LOG_FORMAT:-text}
+      COGNIS_MNEMORY_URL: http://mnemory:8050
+      COGNIS_INTARIS_URL: http://intaris:8060
+      COGNIS_LOCAL_ADMIN_EMAIL: ${COGNIS_LOCAL_ADMIN_EMAIL:-admin@cognis-e2e.localdev.me}
+      COGNIS_LOCAL_ADMIN_PASSWORD: ${COGNIS_LOCAL_ADMIN_PASSWORD:-cognis-local-admin}
+      COGNIS_LOCAL_ADMIN_NAME: ${COGNIS_LOCAL_ADMIN_NAME:-Local Admin}
+      COGNIS_LOCAL_LLM_BASE_URL: http://mock-llm:8090/v1
+      COGNIS_LOCAL_LLM_API_KEY: mock-key
+      COGNIS_LOCAL_CHAT_MODEL: mock-model
+      COGNIS_LOCAL_EXECUTOR_TOKEN_DIR: /run/cognis-local
+      COGNIS_LOCAL_HOST_TOKEN_UID: ${COGNIS_LOCAL_HOST_TOKEN_UID:-}
+      COGNIS_LOCAL_HOST_TOKEN_GID: ${COGNIS_LOCAL_HOST_TOKEN_GID:-}
+      COGNIS_LOCAL_SEED_SAMPLE_CONVERSATION: "false"
+    volumes:
+      - cognis-local-data:/data
+      - ./.local/cognis-compose/executor-token:/run/cognis-local
+    command:
+      [
+        "sh",
+        "-lc",
+        "python /app/scripts/local_compose_seed.py && python /app/scripts/seed_e2e.py"
+      ]

@@ -24,7 +24,13 @@ from cognis.models.conversation_state import (
     ConversationTodoItem,
 )
 from cognis.store.models import Conversation, NotificationRow, Session, StepRun, Task
-from cognis.store.queries import get_conversation, get_session_row, get_step_run, get_task
+from cognis.store.queries import (
+    get_conversation,
+    get_session_row,
+    get_step_run,
+    get_task,
+    list_conversation_todos,
+)
 
 
 @dataclass(frozen=True)
@@ -279,6 +285,9 @@ async def snapshot_for_conversation(
             session_id=getattr(active_session, "session_id", None),
             status=getattr(active_session, "status", None),
             completion_reason=getattr(active_session, "completion_reason", None),
+            todos=_normalize_todos(
+                await list_conversation_todos(session, conversation.conversation_id)
+            ),
         ),
         task=task_state,
         pending=await _pending_state(

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -27,14 +28,30 @@ from fastapi import WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge
 from sqlalchemy import select
 
+from cognis.api.chat_v2.event_store import RawSessionEvent
+from cognis.api.chat_v2.normalizer import normalize_session_events
+from cognis.api.chat_v2.projector import project_timeline
+from cognis.api.chat_v2.realtime import (
+    assistant_completion_runtime_item,
+    delegation_runtime_item,
+    runtime_frame,
+    runtime_items_from_snapshots,
+    runtime_overlay_from_items,
+    tool_call_runtime_item,
+    tool_result_runtime_item,
+)
+from cognis.api.chat_v2.schemas import TimelineItem
 from cognis.api.models import (
-    MessageEventResponse,
     WebSocketAuthenticated,
     WebSocketChunkGap,
     WebSocketError,
     WebSocketPong,
 )
-from cognis.api.routes.conversations import project_timeline_events
+from cognis.api.timeline_visibility import (
+    is_transient_compaction_start_notice,
+    is_visible_persisted_system_message,
+)
+from cognis.api.view_state import cognis_build_id, runtime_generation, server_time_iso
 from cognis.core.attachment_utils import hydrate_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.conversation_state import (
     build_state_delta,
@@ -53,6 +70,7 @@ from cognis.core.turn_scheduler import (
 )
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.providers.circuit_breaker import CircuitBreakerError
 from cognis.runtime_context import current_user_email
 from cognis.store.models import Task
 from cognis.store.queries import (
@@ -67,19 +85,6 @@ from cognis.store.queries import (
 logger = get_logger(__name__)
 
 
-def _is_visible_persisted_system_message(data: dict[str, Any]) -> bool:
-    """Return true for persisted system messages intended for chat timeline UI."""
-
-    notice_id = data.get("notice_id")
-    if isinstance(notice_id, str) and notice_id:
-        return True
-
-    if data.get("kind") == "turn_initiated":
-        return True
-
-    return data.get("event") == "turn_initiated"
-
-
 def _assistant_runtime_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     """Return persisted assistant runtime metadata when it has the expected shape."""
 
@@ -89,6 +94,7 @@ def _assistant_runtime_payload(data: dict[str, Any]) -> dict[str, Any] | None:
 
 _NEW_SESSION_STREAM_GRACE = timedelta(seconds=30)
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
+
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics (transport-specific)
@@ -106,118 +112,106 @@ WS_CHUNK_GAP_FRAMES_TOTAL = Counter(
     "Chunk gap frames emitted due to dropped streaming chunks",
 )
 
-DEFAULT_INBOUND_RATE_LIMIT = 10
+
+def _positive_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+DEFAULT_INBOUND_RATE_LIMIT = _positive_int_env("COGNIS_WS_INBOUND_RATE_LIMIT", 60)
 DEFAULT_OUTBOUND_BUFFER = 100
 DEFAULT_REPLAY_LIMIT = 200
 COOKIE_NAME = "cognis_session"
-_TIMELINE_PATCH_WITH_LEGACY_SIDE_EFFECT_EVENTS = {
-    EventType.TASK_COMPLETED,
-    EventType.TASK_FAILED,
-    EventType.TASK_CANCELLED,
-    EventType.DELEGATION_COMPLETED,
-    EventType.DELEGATION_FAILED,
-}
 
 
-def _timeline_patch_payload(
-    conversation_id: str,
-    events: list[MessageEventResponse],
-    *,
-    source: str,
-) -> dict[str, Any] | None:
-    """Project backend events into canonical timeline patch items."""
-
-    items = project_timeline_events(events)
-    if not items:
-        return None
-    return {
-        "type": "timeline_patch",
-        "conversation_id": conversation_id,
-        "source": source,
-        "items": items,
-        "last_seq": max((event.seq or 0 for event in events), default=0),
-    }
+# Memoized phase-hint projections keyed by session. The hint computation runs
+# normalize+project over the ENTIRE cached event list and used to execute per
+# token/thinking delta on the event loop — O(session events) CPU per token on
+# long sessions, delaying frame delivery. Cached events only change at flush
+# boundaries, so tokens between flushes hit the memo.
+_PHASE_HINT_MEMO_MAX_SESSIONS = 256
+_phase_hint_memo: dict[str, tuple[tuple[int, int], list[TimelineItem]]] = {}
 
 
-def _timeline_patch_for_raw_event(
-    conversation_id: str,
-    *,
-    event_type: str,
-    data: dict[str, Any],
-    timestamp: str | None,
-    source: str,
-) -> dict[str, Any] | None:
-    """Project one raw persisted-event-shaped payload into a timeline patch."""
+def _chat_v2_phase_hint_items_from_session_cache(
+    session_cache: Any,
+    session_id: str | None,
+) -> list[TimelineItem]:
+    """Return canonical Chat v2 items from cached active-session events for phase fallback."""
 
-    return _timeline_patch_payload(
-        conversation_id,
-        [MessageEventResponse(seq=None, type=event_type, data=data, timestamp=timestamp)],
-        source=source,
-    )
+    if session_cache is None or not session_id:
+        return []
+    if not hasattr(session_cache, "get_events_since_compaction"):
+        return []
+    try:
+        cached = session_cache.get_events_since_compaction(session_id)
+        if not cached:
+            return []
+        memo_key = (cached[-1].seq, len(cached))
+        memoized = _phase_hint_memo.get(session_id)
+        if memoized is not None and memoized[0] == memo_key:
+            return memoized[1]
+        raw_events = [
+            RawSessionEvent(
+                store_id="runtime-cache",
+                session_id=session_id,
+                seq=ev.seq,
+                type=ev.type,
+                data=ev.data,
+                timestamp=ev.ts if isinstance(ev.ts, datetime) else None,
+            )
+            for ev in cached
+        ]
+        normalized = normalize_session_events(raw_events)
+        items = list(project_timeline(normalized.events).timeline.items)
+        if len(_phase_hint_memo) >= _PHASE_HINT_MEMO_MAX_SESSIONS:
+            _phase_hint_memo.pop(next(iter(_phase_hint_memo)), None)
+        _phase_hint_memo[session_id] = (memo_key, items)
+        return items
+    except Exception:  # noqa: BLE001
+        return []
 
 
-def _timeline_patch_for_bus_event(event: Event, conversation_id: str) -> dict[str, Any] | None:
-    """Return a canonical timeline patch for visible non-stream EventBus events."""
+def _chat_v2_delegation_runtime_item(event: Event) -> TimelineItem | None:
+    """Fold live delegation bus events onto the parent delegate tool card.
 
-    timestamp = event.timestamp.isoformat() if event.timestamp else None
-    data = dict(event.data)
-    event_type: str | None = None
+    The legacy timeline patch for a single delegation event cannot fold onto the
+    original tool call because that projector invocation sees only the delegation
+    event. Chat v2 therefore gets a small runtime tool_call overlay keyed by the
+    original delegate call_id; the frontend merge keeps the canonical arguments
+    and overlays child-session progress/result details.
+    """
 
-    if event.type == EventType.SYSTEM_NOTICE:
-        event_type = "system_message"
-        data = {
-            **data,
-            "content": data.get("message") or data.get("content"),
-        }
-    elif event.type == EventType.WORKFLOW_COMPOSED:
-        event_type = "workflow_composed"
-    elif event.type == EventType.WORKFLOW_PROGRESS and data.get("event") in {
-        "tool_call_started",
-        "tool_call_completed",
+    if event.type not in {
+        EventType.DELEGATION_STARTED,
+        EventType.DELEGATION_PROGRESS,
+        EventType.DELEGATION_COMPLETED,
+        EventType.DELEGATION_FAILED,
     }:
-        event_type = "tool_result" if data.get("event") == "tool_call_completed" else "tool_call"
-        if event_type == "tool_call":
-            data = {**data, "status": "started"}
-    elif event.type == EventType.TASK_COMPLETED:
-        event_type = "task_result"
-    elif event.type == EventType.TASK_FAILED:
-        event_type = "task_failed"
-    elif event.type == EventType.TASK_CANCELLED:
-        event_type = "task_cancelled"
-    elif event.type == EventType.DELEGATION_STARTED:
-        event_type = "delegation"
-        data = {**data, "status": "started"}
-    elif event.type == EventType.DELEGATION_PROGRESS:
-        event_type = "delegation"
-        data = {**data, "status": data.get("status") or "running"}
-    elif event.type == EventType.DELEGATION_COMPLETED:
-        event_type = "delegation"
-        data = {
-            **data,
-            "status": "completed",
-            "result_summary": data.get("result_summary") or data.get("result"),
-        }
-    elif event.type == EventType.DELEGATION_FAILED:
-        event_type = "delegation"
-        data = {**data, "status": "failed", "error": data.get("reason")}
-    elif event.type == EventType.SESSION_RECOVERED:
-        event_type = "session_recovered"
-
-    if event_type is None:
         return None
-    payload = _timeline_patch_for_raw_event(
-        conversation_id,
-        event_type=event_type,
-        data=data,
-        timestamp=timestamp,
-        source=f"live.{event.type.value}",
-    )
-    if payload is not None and event_type == "workflow_composed" and payload.get("items"):
-        workflow_id = str(data.get("workflow_id") or "")
-        task_or_schedule_id = str(data.get("task_id") or data.get("schedule_id") or "")
-        stable_id = workflow_id or task_or_schedule_id or event.type.value
-        payload["items"][0]["id"] = f"workflow-composed:{stable_id}"
-    return payload
+    data = dict(event.data)
+    call_id = data.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    status = data.get("status")
+    if event.type == EventType.DELEGATION_STARTED:
+        status = status or "started"
+    elif event.type == EventType.DELEGATION_PROGRESS:
+        status = status or "running"
+    elif event.type == EventType.DELEGATION_COMPLETED:
+        status = "completed"
+    elif event.type == EventType.DELEGATION_FAILED:
+        status = "failed"
+        data = {**data, "error": data.get("error") or data.get("reason")}
+    data["status"] = status
+    timestamp = event.timestamp.isoformat() if event.timestamp else datetime.now(UTC).isoformat()
+    return delegation_runtime_item(data, timestamp=timestamp)
 
 
 def _workflow_composed_payload(conversation_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -253,6 +247,7 @@ class AuthenticatedWebSocket:
     pending_sends: int = 0
     dropped_chunks: dict[str, int] = field(default_factory=dict)
     recovery_notified: set[str] = field(default_factory=set)
+    chat_v2_cursors: dict[str, str] = field(default_factory=dict)
     # Voice mode (conversation overlay). Populated by `enable_tts`/
     # `disable_tts` inbound frames; consumed by `WebSocketTurnObserver`
     # to gate `tts_sentence_ready` emission.
@@ -318,7 +313,26 @@ class WebSocketTurnObserver:
 
     One instance per WebSocketConnectionManager. Fans out streaming
     events to all connections subscribed to the relevant conversation.
+
+    Chat v2 runtime coalescing
+    --------------------------
+    Streaming assistant tokens arrive at LLM token rate (potentially
+    hundreds per second). Sending a full runtime overlay snapshot on every
+    token floods the client with redundant frames.
+
+    Instead we coalesce: each ``on_token`` call stores the latest
+    snapshot for the conversation and schedules a flush after
+    ``_COALESCE_INTERVAL_S`` seconds. If another token arrives before
+    the flush fires, the stored snapshot is replaced (latest wins —
+    content is always cumulative). The flush sends exactly one Chat v2 frame
+    per coalesce window regardless of token rate.
+
+    The coalesce window is intentionally short (~60 ms) so streaming
+    still feels live. The client-side rAF batching provides an
+    additional layer of smoothing.
     """
+
+    _COALESCE_INTERVAL_S: float = 0.06  # 60 ms
 
     def __init__(self, manager: WebSocketConnectionManager) -> None:
         self._manager = manager
@@ -328,6 +342,10 @@ class WebSocketTurnObserver:
 
         self._SentenceBuffer = SentenceBuffer
         self._sentence_buffers: dict[tuple[str, str], SentenceBuffer] = {}
+
+        # Chat v2 runtime snapshot coalescing state.
+        self._chat_v2_coalesce_pending: dict[str, tuple[list[TimelineItem], str | None]] = {}
+        self._chat_v2_coalesce_tasks: dict[str, asyncio.Task[None]] = {}
 
     def _get_sentence_buffer(self, conversation_id: str, message_id: str) -> Any:
         key = (conversation_id, message_id)
@@ -339,6 +357,61 @@ class WebSocketTurnObserver:
 
     def _release_sentence_buffer(self, conversation_id: str, message_id: str) -> Any:
         return self._sentence_buffers.pop((conversation_id, message_id), None)
+
+    async def _chat_v2_coalesce_flush(self, conversation_id: str) -> None:
+        """Wait for the coalesce interval then send the pending Chat v2 runtime frame."""
+
+        await asyncio.sleep(self._COALESCE_INTERVAL_S)
+        pending = self._chat_v2_coalesce_pending.pop(conversation_id, None)
+        self._chat_v2_coalesce_tasks.pop(conversation_id, None)
+        if pending is not None:
+            items, active_session_id = pending
+            # Shield the send: _flush_coalesced may cancel this task after
+            # the pending frame was already popped. Without the shield the
+            # frame is silently lost mid-send for some subscribers.
+            await asyncio.shield(
+                self._manager.send_chat_v2_runtime_to_conversation(
+                    conversation_id,
+                    volatile_items=items,
+                    active_session_id=active_session_id,
+                )
+            )
+
+    async def _chat_v2_coalesce_or_send(
+        self,
+        conversation_id: str,
+        *,
+        chat_v2_items: list[TimelineItem],
+        active_session_id: str | None,
+    ) -> None:
+        """Buffer a Chat v2 runtime overlay for coalesced delivery."""
+
+        self._chat_v2_coalesce_pending[conversation_id] = (chat_v2_items, active_session_id)
+        task = self._chat_v2_coalesce_tasks.get(conversation_id)
+        if task is None or task.done():
+            self._chat_v2_coalesce_tasks[conversation_id] = asyncio.create_task(
+                self._chat_v2_coalesce_flush(conversation_id)
+            )
+
+    async def _flush_coalesced(self, conversation_id: str) -> None:
+        """Immediately flush any pending coalesced snapshot for a conversation.
+
+        Called before non-streaming events (tool_call, message_complete, etc.)
+        so the client receives the final streaming state before the boundary.
+        """
+        chat_v2_task = self._chat_v2_coalesce_tasks.pop(conversation_id, None)
+        if chat_v2_task is not None and not chat_v2_task.done():
+            chat_v2_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await chat_v2_task
+        chat_v2_pending = self._chat_v2_coalesce_pending.pop(conversation_id, None)
+        if chat_v2_pending is not None:
+            items, active_session_id = chat_v2_pending
+            await self._manager.send_chat_v2_runtime_to_conversation(
+                conversation_id,
+                volatile_items=items,
+                active_session_id=active_session_id,
+            )
 
     async def _send_conversation_activity(
         self,
@@ -366,6 +439,11 @@ class WebSocketTurnObserver:
             payload["last_message_at"] = last_message_at.isoformat()
             payload["updated_at"] = last_message_at.isoformat()
         await self._manager.send_to_conversation(conversation_id, payload)
+        # Fan out the same activity correction to owner tabs that are not
+        # subscribed to this conversation (e.g. a tab viewing a different chat
+        # or a second device). This keeps sidebar turn indicators and
+        # last_message_at timestamps accurate across all open clients.
+        await self._manager.send_sidebar_update_to_owner(conversation_id, payload)
 
     async def on_token(
         self,
@@ -376,6 +454,7 @@ class WebSocketTurnObserver:
         delta: str,
         chunk_index: int | None = None,
         content_offset: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None:
         # Conversation-mode TTS streaming: feed the sentence buffer and
         # emit `tts_sentence_ready` to TTS-enabled subscribers only when
@@ -394,18 +473,40 @@ class WebSocketTurnObserver:
                     },
                 )
 
-        await self._manager.send_to_conversation(
+        state = getattr(getattr(self._manager, "app", None), "state", None)
+        turn_scheduler = getattr(state, "turn_scheduler", None)
+        snapshots = (
+            await turn_scheduler.active_stream_snapshots(conversation_id) if turn_scheduler else []
+        )
+        # Coalesce streaming snapshots: buffer for ~60 ms and send the latest
+        # cumulative snapshot per coalesce window instead of one per token.
+        session_cache = getattr(state, "session_cache", None)
+        phase_hint_items = _chat_v2_phase_hint_items_from_session_cache(session_cache, session_id)
+        # Read the turn's chat_mode so the plan-mode marker is visible on the
+        # live streaming assistant item without waiting for a history refresh.
+        running_state = (
+            turn_scheduler.running_turn_state(conversation_id)
+            if turn_scheduler is not None and hasattr(turn_scheduler, "running_turn_state")
+            else None
+        )
+        stream_chat_mode = running_state.get("chat_mode") if running_state else None
+        stream_chat_mode_source = running_state.get("chat_mode_source") if running_state else None
+        chat_v2_items = runtime_items_from_snapshots(
+            active_streams=snapshots,
+            phase_hint_items=phase_hint_items,
+            chat_mode=stream_chat_mode,
+            chat_mode_source=stream_chat_mode_source,
+        )
+        # A late token callback after the turn settled resolves no active
+        # stream snapshots. Sending an empty overlay here would carry
+        # has_active_turn=True (the runtime frame default) and re-arm the
+        # client's active-turn indicator after teardown — skip it entirely.
+        if not chat_v2_items:
+            return
+        await self._chat_v2_coalesce_or_send(
             conversation_id,
-            {
-                "type": "chunk",
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "message_id": message_id,
-                "turn_id": turn_id,
-                "content": delta,
-                "index": chunk_index if chunk_index is not None else 0,
-                "content_offset": content_offset if content_offset is not None else 0,
-            },
+            chat_v2_items=chat_v2_items,
+            active_session_id=session_id,
         )
 
     async def on_tool_call(
@@ -416,26 +517,42 @@ class WebSocketTurnObserver:
         tool_name: str,
         arguments: dict[str, Any] | None,
         turn_id: str | None,
+        assistant_phase_index: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).isoformat()
-        data: dict[str, Any] = {
-            "session_id": session_id,
-            "call_id": call_id,
-            "tool_name": tool_name,
-            "status": "started",
-            "turn_id": turn_id,
-        }
-        if arguments is not None:
-            data["arguments"] = arguments
-        payload = _timeline_patch_for_raw_event(
-            conversation_id,
-            event_type="tool_call",
-            data=data,
+        chat_v2_tool_item = tool_call_runtime_item(
+            session_id=session_id,
+            call_id=call_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            turn_id=turn_id,
+            assistant_phase_index=assistant_phase_index,
+            turn_cycle_index=turn_cycle_index,
             timestamp=timestamp,
-            source="live.tool_call",
         )
-        if payload is not None:
-            await self._manager.send_to_conversation(conversation_id, payload)
+        # Flush any coalesced streaming snapshot before the tool boundary so the
+        # client sees the final assistant content before the tool call.
+        await self._flush_coalesced(conversation_id)
+        session_cache = getattr(self._manager.app.state, "session_cache", None)
+        active_thinking = (
+            session_cache.active_thinking_snapshots(session_id)
+            if session_cache is not None and hasattr(session_cache, "active_thinking_snapshots")
+            else []
+        )
+        phase_hint_items = _chat_v2_phase_hint_items_from_session_cache(session_cache, session_id)
+        chat_v2_items = [
+            *runtime_items_from_snapshots(
+                active_thinking=active_thinking,
+                phase_hint_items=phase_hint_items,
+            ),
+            chat_v2_tool_item,
+        ]
+        await self._manager.send_chat_v2_runtime_to_conversation(
+            conversation_id,
+            volatile_items=chat_v2_items,
+            active_session_id=session_id,
+        )
 
     async def on_tool_progress(
         self,
@@ -445,19 +562,21 @@ class WebSocketTurnObserver:
         tool_name: str,
         progress: dict[str, Any],
         turn_id: str | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None:
-        await self._manager.send_to_conversation(
+        del call_id, tool_name, progress, turn_id, turn_cycle_index
+        state = getattr(getattr(self._manager, "app", None), "state", None)
+        turn_scheduler = getattr(state, "turn_scheduler", None)
+        snapshots = (
+            await turn_scheduler.active_tool_output_snapshots(conversation_id)
+            if turn_scheduler
+            else []
+        )
+        chat_v2_items = runtime_items_from_snapshots(active_tool_outputs=snapshots)
+        await self._manager.send_chat_v2_runtime_to_conversation(
             conversation_id,
-            {
-                "type": "tool_progress",
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "call_id": call_id,
-                "tool_name": tool_name,
-                "progress": progress,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "turn_id": turn_id,
-            },
+            volatile_items=chat_v2_items,
+            active_session_id=session_id,
         )
 
     async def on_tool_result(
@@ -474,35 +593,31 @@ class WebSocketTurnObserver:
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
         presentation: dict[str, Any] | None = None,
+        assistant_phase_index: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).isoformat()
-        data: dict[str, Any] = {
-            "session_id": session_id,
-            "call_id": call_id,
-            "tool_name": tool_name,
-            "result": result,
-            "is_error": is_error,
-            "duration_ms": duration_ms,
-            "turn_id": turn_id,
-        }
-        if evaluation:
-            data["evaluation"] = evaluation
-        if attachments:
-            data["attachments"] = strip_attachment_payload_bytes(attachments)
-        if file_diffs:
-            data["file_diffs"] = file_diffs
-        if presentation:
-            data.update(presentation)
-            data["tool_output_presentation"] = presentation
-        payload = _timeline_patch_for_raw_event(
-            conversation_id,
-            event_type="tool_result",
-            data=data,
+        chat_v2_item = tool_result_runtime_item(
+            session_id=session_id,
+            call_id=call_id,
+            tool_name=tool_name,
+            result=result,
+            is_error=is_error,
+            duration_ms=duration_ms,
+            evaluation=evaluation,
+            attachments=strip_attachment_payload_bytes(attachments or []),
+            file_diffs=file_diffs,
+            turn_id=turn_id,
+            assistant_phase_index=assistant_phase_index,
+            turn_cycle_index=turn_cycle_index,
             timestamp=timestamp,
-            source="live.tool_result",
+            presentation=presentation,
         )
-        if payload is not None:
-            await self._manager.send_to_conversation(conversation_id, payload)
+        await self._manager.send_chat_v2_runtime_to_conversation(
+            conversation_id,
+            volatile_items=[chat_v2_item],
+            active_session_id=session_id,
+        )
 
     async def on_tool_output_chunk(
         self,
@@ -515,26 +630,55 @@ class WebSocketTurnObserver:
         turn_id: str | None = None,
         chunk_index: int | None = None,
         content_offset: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None:
-        await self._manager.send_to_conversation(
+        del (
+            call_id,
+            tool_name,
+            delta,
+            stream,
+            turn_id,
+            chunk_index,
+            content_offset,
+            turn_cycle_index,
+        )
+        state = getattr(getattr(self._manager, "app", None), "state", None)
+        turn_scheduler = getattr(state, "turn_scheduler", None)
+        snapshots = (
+            await turn_scheduler.active_tool_output_snapshots(conversation_id)
+            if turn_scheduler
+            else []
+        )
+        chat_v2_items = runtime_items_from_snapshots(active_tool_outputs=snapshots)
+        await self._manager.send_chat_v2_runtime_to_conversation(
             conversation_id,
-            {
-                "type": "tool_result_chunk",
-                "conversation_id": conversation_id,
-                "session_id": session_id,
-                "call_id": call_id,
-                "tool_name": tool_name,
-                "delta": delta,
-                "stream": stream,
-                "is_error": stream == "stderr",
-                "timestamp": datetime.now(UTC).isoformat(),
-                "turn_id": turn_id,
-                "chunk_index": chunk_index,
-                "content_offset": content_offset,
-            },
+            volatile_items=chat_v2_items,
+            active_session_id=session_id,
+        )
+
+    async def on_context_usage(
+        self,
+        conversation_id: str,
+        session_id: str,
+        usage: dict[str, Any],
+        turn_id: str | None = None,
+    ) -> None:
+        del turn_id
+        await self._manager.send_chat_v2_runtime_to_conversation(
+            conversation_id,
+            volatile_items=[],
+            active_session_id=session_id,
+            context_usage=usage,
         )
 
     async def on_turn_complete(self, result: TurnResult) -> None:
+        # Flush any pending coalesced streaming frame BEFORE the completion
+        # frame. Without this a buffered partial-content frame (60 ms coalesce
+        # window) fires AFTER the completion item with a HIGHER runtime
+        # revision and has_active_turn defaulting to True — downgrading the
+        # completed message back to streaming and re-arming the active-turn
+        # indicator on the client.
+        await self._flush_coalesced(result.conversation_id)
         queued_messages = self._manager.app.state.turn_scheduler.queued_messages(
             result.conversation_id
         )
@@ -555,6 +699,34 @@ class WebSocketTurnObserver:
                             "text": sentence,
                         },
                     )
+
+        if result.final_content:
+            completed_at_iso = (
+                result.completed_at.isoformat()
+                if result.completed_at is not None
+                else datetime.now(UTC).isoformat()
+            )
+            chat_v2_completion_item = assistant_completion_runtime_item(
+                message_id=result.message_id,
+                turn_id=result.turn_id,
+                session_id=result.session_id,
+                phase=result.assistant_phase_index,
+                content=result.final_content,
+                timestamp=completed_at_iso,
+                partial=result.partial,
+                chat_mode=result.chat_mode if result.chat_mode != "default" else None,
+                chat_mode_source=result.chat_mode_source
+                if result.chat_mode_source != "system_default"
+                else None,
+                turn_cycle_index=result.turn_cycle_index,
+            )
+            await self._manager.send_chat_v2_runtime_to_conversation(
+                result.conversation_id,
+                volatile_items=[chat_v2_completion_item],
+                active_session_id=result.session_id,
+                has_active_turn=result.managed_continuation_pending,
+                context_usage=result.context_usage,
+            )
 
         payload: dict[str, Any] = {
             "type": "message_complete",
@@ -578,20 +750,33 @@ class WebSocketTurnObserver:
             "chat_mode_source": result.chat_mode_source,
             "partial": result.partial,
             "finish_reason": result.finish_reason,
+            "assistant_phase_index": result.assistant_phase_index,
+            "turn_cycle_index": result.turn_cycle_index,
+            "managed_continuation_pending": result.managed_continuation_pending,
             "runtime": result.runtime,
         }
         if result.delegated:
             payload["delegated"] = True
             payload["task_id"] = result.task_id
         await self._manager.send_to_conversation(result.conversation_id, payload)
+        if not result.final_content and not result.managed_continuation_pending:
+            await self._manager.send_chat_v2_runtime_to_conversation(
+                result.conversation_id,
+                volatile_items=[],
+                active_session_id=result.session_id,
+                has_active_turn=False,
+                context_usage=result.context_usage,
+            )
 
         completed_at = result.completed_at if result.completed_at is not None else datetime.now(UTC)
         await self._send_conversation_activity(
             result.conversation_id,
-            has_active_turn=False,
+            has_active_turn=result.managed_continuation_pending,
             last_message_at=completed_at,
-            active_turn_chat_mode=result.chat_mode,
-            active_turn_chat_mode_source=result.chat_mode_source,
+            active_turn_chat_mode=result.chat_mode if result.managed_continuation_pending else None,
+            active_turn_chat_mode_source=result.chat_mode_source
+            if result.managed_continuation_pending
+            else None,
         )
 
         # Notify clients if the conversation title changed
@@ -602,13 +787,22 @@ class WebSocketTurnObserver:
                     "type": "conversation_updated",
                     "conversation_id": result.conversation_id,
                     "title": result.new_title,
-                    "has_active_turn": False,
+                    "has_active_turn": result.managed_continuation_pending,
                     "last_message_at": completed_at.isoformat(),
                     "updated_at": completed_at.isoformat(),
                 },
             )
 
     async def on_turn_error(self, conversation_id: str, error: TurnError) -> None:
+        # Flush any coalesced live.thinking / live.assistant_stream patch BEFORE
+        # sending the error frame. Without this, a buffered streaming:true patch
+        # (coalesce=True, ~60ms window) arrives AFTER the turn_cancelled error
+        # and AFTER the has_active_turn=false activity frame, causing:
+        #   (1) the thinking block to visibly stream in after cancel, and
+        #   (2) the client to re-arm turnInProgress=true (timelinePatchHasActiveWork).
+        # Flushing first ensures the client sees the streaming content (if any)
+        # before the teardown signal, not after it.
+        await self._flush_coalesced(conversation_id)
         await self._manager.send_to_conversation(
             conversation_id,
             WebSocketError(
@@ -620,6 +814,11 @@ class WebSocketTurnObserver:
             ).model_dump(),
         )
         await self._send_conversation_activity(conversation_id, has_active_turn=False)
+        await self._manager.send_chat_v2_runtime_to_conversation(
+            conversation_id,
+            volatile_items=[],
+            has_active_turn=False,
+        )
 
     async def on_thinking(
         self,
@@ -637,6 +836,7 @@ class WebSocketTurnObserver:
         duration_ms: int | None = None,
         source: str | None = None,
         provider_block_index: int | None = None,
+        turn_cycle_index: int | None = None,
     ) -> None:
         """Emit assistant thinking chunk or block boundary frame.
 
@@ -644,49 +844,85 @@ class WebSocketTurnObserver:
         backpressure, same as regular ``chunk`` frames).
         Block-boundary signals (``complete=True`` with empty delta) →
         ``assistant_thinking_block`` to let the UI finalize the block.
+
+        NOTE: a running_turn_state guard was previously placed here to drop
+        thinking frames for settled turns. It was removed because it dropped
+        the FINAL thinking block at the settled/drain race: reasoning models
+        emit the last block boundary right at the completion transition, and
+        running_turn_state() returns None as soon as control.settled=True —
+        which is set at the START of the completion path, before the agent
+        loop finishes draining. This caused thinking to never render or stick
+        in a streaming state while text streamed normally (on_token has no
+        such guard). The cancel-stale case is already covered by:
+          1. on_turn_error flushes the coalescer before sending the error frame.
+          2. session_cache._cleared_thinking_turns blocks re-creation after clear.
+          3. clear_active_thinking() is called at turn teardown.
         """
-        if delta:
-            # Streaming chunk — droppable under backpressure
-            await self._manager.send_to_conversation(
-                conversation_id,
+        session_cache = getattr(self._manager.app.state, "session_cache", None)
+        active_thinking = (
+            session_cache.active_thinking_snapshots(session_id)
+            if session_cache is not None and hasattr(session_cache, "active_thinking_snapshots")
+            else []
+        )
+        if not active_thinking:
+            block_content = content if content is not None else delta
+            if not block_content:
+                return
+            # PATH B: the session_cache snapshot is empty because the last block
+            # was just popped (complete=True). Reconstruct a snapshot for the
+            # runtime projector so it emits the correct thinking item id.
+            #
+            # Previously this path omitted assistant_phase_index and first_block_id,
+            # causing the projector to infer phase=0 and use the current block_id
+            # as the anchor, producing a divergent id (thinking:...:phase:0:blk_N)
+            # instead of the streaming id (thinking:...:phase:K:blk_1). That
+            # orphaned the streaming item (stuck spinner) and created a duplicate.
+            #
+            # Fix: read the stable metadata from the session_cache state (which
+            # is now retained even when blocks are empty) and inject it here.
+            thinking_meta: dict[str, Any] = {}
+            if session_cache is not None and hasattr(session_cache, "get_active_thinking_metadata"):
+                meta = session_cache.get_active_thinking_metadata(session_id)
+                if meta is not None:
+                    thinking_meta = meta
+            active_thinking = [
                 {
-                    "type": "assistant_thinking_chunk",
-                    "conversation_id": conversation_id,
                     "session_id": session_id,
                     "message_id": message_id,
                     "turn_id": turn_id,
-                    "block_id": block_id,
-                    "delta": delta,
-                    "title": title,
-                    "complete": complete,
-                    "started_at": started_at,
-                    "completed_at": completed_at,
-                    "duration_ms": duration_ms,
-                    "source": source,
-                    "provider_block_index": provider_block_index,
-                },
-            )
-        if complete:
-            # Block boundary — always deliver
-            await self._manager.send_to_conversation(
-                conversation_id,
-                {
-                    "type": "assistant_thinking_block",
-                    "conversation_id": conversation_id,
-                    "session_id": session_id,
-                    "message_id": message_id,
-                    "turn_id": turn_id,
-                    "block_id": block_id,
-                    "title": title,
-                    "complete": True,
-                    "content": content,
-                    "started_at": started_at,
-                    "completed_at": completed_at,
-                    "duration_ms": duration_ms,
-                    "source": source,
-                    "provider_block_index": provider_block_index,
-                },
-            )
+                    "updated_at": datetime.now(UTC).isoformat(),
+                    # Inject stable phase and anchor from the state so the
+                    # projector produces the same id as the streaming patches.
+                    "assistant_phase_index": thinking_meta.get("assistant_phase_index"),
+                    "turn_cycle_index": turn_cycle_index
+                    if turn_cycle_index is not None
+                    else thinking_meta.get("turn_cycle_index"),
+                    "first_block_id": thinking_meta.get("first_block_id"),
+                    "blocks": [
+                        {
+                            "block_id": block_id,
+                            "title": title or "Thinking",
+                            "content": block_content,
+                            "complete": complete,
+                            "started_at": started_at,
+                            "completed_at": completed_at,
+                            "duration_ms": duration_ms,
+                            "source": source,
+                            "provider_block_index": provider_block_index,
+                        }
+                    ],
+                }
+            ]
+        phase_hint_items = _chat_v2_phase_hint_items_from_session_cache(session_cache, session_id)
+        chat_v2_items = runtime_items_from_snapshots(
+            active_thinking=active_thinking,
+            phase_hint_items=phase_hint_items,
+        )
+        await self._chat_v2_coalesce_or_send(
+            conversation_id,
+            chat_v2_items=chat_v2_items,
+            active_session_id=session_id,
+        )
 
     async def on_system_message(
         self,
@@ -751,7 +987,9 @@ class WebSocketConnectionManager:
         self.app = app
         self._connections: dict[str, AuthenticatedWebSocket] = {}
         self._by_conversation: dict[str, set[str]] = defaultdict(set)
+        self._by_chat_v2_conversation: dict[str, set[str]] = defaultdict(set)
         self._by_user: dict[str, set[str]] = defaultdict(set)
+        self._chat_v2_runtime_revisions: dict[str, int] = defaultdict(int)
 
         # Create the TurnObserver bridge
         self._observer = WebSocketTurnObserver(self)
@@ -793,20 +1031,90 @@ class WebSocketConnectionManager:
                 del self._by_user[connection.user_email]
         for cid in list(connection.subscriptions):
             self._unsubscribe(connection, cid)
+        for cid in list(connection.chat_v2_cursors):
+            self.unsubscribe_chat_v2(connection, cid)
         WS_CONNECTIONS_ACTIVE.dec()
+
+    def _has_conversation_observers(self, conversation_id: str) -> bool:
+        """Return True when any connection needs turn observer events."""
+
+        return bool(
+            self._by_conversation.get(conversation_id)
+            or self._by_chat_v2_conversation.get(conversation_id)
+        )
+
+    def _ensure_turn_observer(self, conversation_id: str) -> None:
+        """Register the turn observer for the first subscriber of any stream."""
+
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        if turn_scheduler is not None:
+            turn_scheduler.add_observer(conversation_id, self._observer)
+
+    def _remove_turn_observer_if_unused(self, conversation_id: str) -> None:
+        """Remove the turn observer when no legacy or Chat v2 subscriber remains."""
+
+        if self._has_conversation_observers(conversation_id):
+            return
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        if turn_scheduler is not None:
+            turn_scheduler.remove_observer(conversation_id, self._observer)
 
     def subscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Subscribe a connection to a conversation's events."""
+        already_observed = self._has_conversation_observers(conversation_id)
         connection.subscriptions.add(conversation_id)
-        already_subscribed = bool(self._by_conversation.get(conversation_id))
         self._by_conversation[conversation_id].add(connection.connection_id)
 
         # Register observer on TurnScheduler only on first subscription
         # (idempotent — prevents duplicate event delivery)
-        if not already_subscribed:
-            turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
-            if turn_scheduler is not None:
-                turn_scheduler.add_observer(conversation_id, self._observer)
+        if not already_observed:
+            self._ensure_turn_observer(conversation_id)
+
+    def subscribe_chat_v2(
+        self,
+        connection: AuthenticatedWebSocket,
+        conversation_id: str,
+        *,
+        cursor: str,
+    ) -> None:
+        """Opt a connection into Chat v2 realtime frames for a conversation."""
+
+        already_observed = self._has_conversation_observers(conversation_id)
+        self._by_chat_v2_conversation[conversation_id].add(connection.connection_id)
+        connection.chat_v2_cursors[conversation_id] = cursor
+        if not already_observed:
+            self._ensure_turn_observer(conversation_id)
+
+    def update_chat_v2_cursor(
+        self,
+        connection: AuthenticatedWebSocket,
+        conversation_id: str,
+        *,
+        cursor: str,
+    ) -> None:
+        """Update the latest Chat v2 cursor known for a subscribed connection."""
+
+        if conversation_id in connection.chat_v2_cursors:
+            connection.chat_v2_cursors[conversation_id] = cursor
+
+    def unsubscribe_chat_v2(
+        self,
+        connection: AuthenticatedWebSocket,
+        conversation_id: str,
+    ) -> None:
+        """Disable Chat v2 frames without changing the legacy subscription."""
+
+        connection.chat_v2_cursors.pop(conversation_id, None)
+        conns = self._by_chat_v2_conversation.get(conversation_id)
+        if conns:
+            conns.discard(connection.connection_id)
+            if not conns:
+                del self._by_chat_v2_conversation[conversation_id]
+        self._remove_turn_observer_if_unused(conversation_id)
+
+    def _next_chat_v2_runtime_revision(self, conversation_id: str) -> int:
+        self._chat_v2_runtime_revisions[conversation_id] += 1
+        return self._chat_v2_runtime_revisions[conversation_id]
 
     async def send_queue_snapshot(
         self, connection: AuthenticatedWebSocket, conversation_id: str
@@ -838,6 +1146,7 @@ class WebSocketConnectionManager:
         active_streams: list[dict[str, Any]] = []
         active_tool_outputs: list[dict[str, Any]] = []
         active_turn_state: dict[str, Any] | None = None
+        runtime_server_time = server_time_iso()
         if turn_scheduler is not None:
             queued_messages = turn_scheduler.queued_messages(conversation_id)
             active_streams = await turn_scheduler.active_stream_snapshots(conversation_id)
@@ -857,10 +1166,25 @@ class WebSocketConnectionManager:
         ):
             active_thinking = session_cache.active_thinking_snapshots(active_session_id)
 
-        return {
+        has_active_turn = active_turn_state is not None
+
+        # Defense-in-depth: when no turn is running, suppress any stale
+        # active_streams / active_tool_outputs / active_thinking from the
+        # snapshot so the client never receives runtime items for a finished
+        # turn.
+        # The primary fix is clearing _active_thinking at turn teardown
+        # (session_cache.clear_active_thinking), but this guard ensures that
+        # any residual state (e.g. from a controller restart that lost the
+        # teardown signal) never re-injects hanging spinners on reconnect.
+        if not has_active_turn:
+            active_streams = []
+            active_tool_outputs = []
+            active_thinking = []
+
+        payload = {
             "queued_messages": queued_messages,
             "queued_count": len(queued_messages),
-            "has_active_turn": active_turn_state is not None,
+            "has_active_turn": has_active_turn,
             "active_turn_chat_mode": (
                 active_turn_state.get("chat_mode") if active_turn_state else None
             ),
@@ -871,6 +1195,10 @@ class WebSocketConnectionManager:
             "active_tool_outputs": active_tool_outputs,
             "active_thinking": active_thinking,
         }
+        payload["runtime_generation"] = runtime_generation(payload)
+        payload["server_time"] = runtime_server_time
+        payload["build_id"] = cognis_build_id()
+        return payload
 
     async def _send_conversation_runtime_snapshot(
         self,
@@ -890,19 +1218,70 @@ class WebSocketConnectionManager:
                 **runtime,
             }
         )
+        chat_v2_cursors = getattr(connection, "chat_v2_cursors", {})
+        cursor = chat_v2_cursors.get(conversation_id) if isinstance(chat_v2_cursors, dict) else None
+        if cursor:
+            runtime_revision = self._next_chat_v2_runtime_revision(conversation_id)
+            session_cache = getattr(self.app.state, "session_cache", None)
+            phase_hint_items = _chat_v2_phase_hint_items_from_session_cache(
+                session_cache, active_session_id
+            )
+            volatile_items = runtime_items_from_snapshots(
+                active_streams=runtime.get("active_streams")
+                if isinstance(runtime.get("active_streams"), list)
+                else [],
+                active_tool_outputs=runtime.get("active_tool_outputs")
+                if isinstance(runtime.get("active_tool_outputs"), list)
+                else [],
+                active_thinking=runtime.get("active_thinking")
+                if isinstance(runtime.get("active_thinking"), list)
+                else [],
+                phase_hint_items=phase_hint_items,
+                chat_mode=runtime.get("active_turn_chat_mode")
+                if isinstance(runtime.get("active_turn_chat_mode"), str)
+                else None,
+                chat_mode_source=runtime.get("active_turn_chat_mode_source")
+                if isinstance(runtime.get("active_turn_chat_mode_source"), str)
+                else None,
+            )
+            overlay = runtime_overlay_from_items(
+                conversation_id=conversation_id,
+                runtime_revision=runtime_revision,
+                has_active_turn=bool(runtime.get("has_active_turn")),
+                active_turn=self._chat_v2_active_turn_payload(
+                    conversation_id,
+                    active_session_id=active_session_id,
+                    runtime=runtime,
+                ),
+                volatile_items=volatile_items,
+                context_usage=(
+                    session_cache.get_context_usage(active_session_id)
+                    if session_cache is not None
+                    and hasattr(session_cache, "get_context_usage")
+                    and active_session_id
+                    else None
+                ),
+                generated_at=runtime.get("server_time"),
+            )
+            await connection.send_json(
+                runtime_frame(
+                    conversation_id=conversation_id,
+                    cursor=cursor,
+                    runtime=overlay,
+                    server_time=runtime.get("server_time"),
+                ).model_dump(mode="json")
+            )
 
     def _unsubscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Unsubscribe a connection from a conversation."""
         connection.subscriptions.discard(conversation_id)
+        self.unsubscribe_chat_v2(connection, conversation_id)
         conns = self._by_conversation.get(conversation_id)
         if conns:
             conns.discard(connection.connection_id)
             if not conns:
                 del self._by_conversation[conversation_id]
-                # Remove observer when no connections are subscribed
-                turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
-                if turn_scheduler is not None:
-                    turn_scheduler.remove_observer(conversation_id, self._observer)
+        self._remove_turn_observer_if_unused(conversation_id)
 
     async def send_to_conversation(self, conversation_id: str, payload: dict[str, Any]) -> None:
         """Fan out a payload to all connections subscribed to a conversation."""
@@ -916,6 +1295,93 @@ class WebSocketConnectionManager:
                 coroutines.append(conn.send_json(payload))
         if coroutines:
             await asyncio.gather(*coroutines, return_exceptions=True)
+
+    async def send_chat_v2_runtime_to_conversation(
+        self,
+        conversation_id: str,
+        *,
+        volatile_items: list[TimelineItem],
+        has_active_turn: bool = True,
+        active_session_id: str | None = None,
+        context_usage: dict[str, Any] | None = None,
+    ) -> None:
+        """Fan out a runtime-only Chat v2 frame to opted-in connections."""
+
+        connection_ids = self._by_chat_v2_conversation.get(conversation_id, set())
+        if not connection_ids:
+            return
+        runtime_revision = self._next_chat_v2_runtime_revision(conversation_id)
+        server_time = server_time_iso()
+        overlay = runtime_overlay_from_items(
+            conversation_id=conversation_id,
+            runtime_revision=runtime_revision,
+            has_active_turn=has_active_turn,
+            active_turn=(
+                self._chat_v2_active_turn_payload(
+                    conversation_id,
+                    active_session_id=active_session_id,
+                )
+                if has_active_turn
+                else None
+            ),
+            volatile_items=volatile_items,
+            context_usage=context_usage,
+            generated_at=server_time,
+        )
+        coroutines = []
+        for cid in list(connection_ids):
+            conn = self._connections.get(cid)
+            if conn is None:
+                continue
+            cursor = conn.chat_v2_cursors.get(conversation_id)
+            if not cursor:
+                continue
+            frame = runtime_frame(
+                conversation_id=conversation_id,
+                cursor=cursor,
+                runtime=overlay,
+                server_time=server_time,
+            )
+            coroutines.append(conn.send_json(frame.model_dump(mode="json")))
+        if coroutines:
+            await asyncio.gather(*coroutines, return_exceptions=True)
+
+    def _chat_v2_active_turn_payload(
+        self,
+        conversation_id: str,
+        *,
+        active_session_id: str | None,
+        runtime: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the Chat v2 active-turn payload for runtime overlay frames."""
+
+        has_active_turn = bool(runtime.get("has_active_turn")) if runtime is not None else True
+        if not has_active_turn:
+            return None
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        checkpoint = (
+            turn_scheduler.active_turn_checkpoint(conversation_id)
+            if turn_scheduler is not None and hasattr(turn_scheduler, "active_turn_checkpoint")
+            else None
+        )
+        running_state = (
+            turn_scheduler.running_turn_state(conversation_id)
+            if turn_scheduler is not None and hasattr(turn_scheduler, "running_turn_state")
+            else None
+        )
+        return {
+            "turn_id": (checkpoint or {}).get("turn_id") or f"active:{conversation_id}",
+            "session_id": (checkpoint or {}).get("session_id") or active_session_id or "",
+            "status": "running",
+            "chat_mode": (
+                (running_state or {}).get("chat_mode")
+                or (runtime or {}).get("active_turn_chat_mode")
+            ),
+            "chat_mode_source": (
+                (running_state or {}).get("chat_mode_source")
+                or (runtime or {}).get("active_turn_chat_mode_source")
+            ),
+        }
 
     async def send_to_user(self, user_email: str, payload: dict[str, Any]) -> None:
         """Fan out a payload to all connections authenticated as one user."""
@@ -1022,22 +1488,41 @@ class WebSocketConnectionManager:
         conversation_id = await self._resolve_conversation_id(event)
         if conversation_id is None:
             return
-        timeline_patch = _timeline_patch_for_bus_event(event, conversation_id)
-        if timeline_patch is not None:
-            await self.send_to_conversation(conversation_id, timeline_patch)
-            if event.type in _TIMELINE_PATCH_WITH_LEGACY_SIDE_EFFECT_EVENTS:
-                payload = _event_to_payload(event, conversation_id)
-                if payload is not None:
-                    await self.send_to_conversation(conversation_id, payload)
-        else:
-            payload = _event_to_payload(event, conversation_id)
-            if payload is None:
-                return
+
+        delegation_runtime_item = _chat_v2_delegation_runtime_item(event)
+        if delegation_runtime_item is not None:
+            await self.send_chat_v2_runtime_to_conversation(
+                conversation_id,
+                volatile_items=[delegation_runtime_item],
+                active_session_id=event.data.get("parent_session_id")
+                if isinstance(event.data.get("parent_session_id"), str)
+                else None,
+            )
+
+        suppress_legacy_payload = False
+        if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
+            "tool_call_started",
+            "tool_call_completed",
+        }:
+            session_id = event.data.get("session_id")
+            suppress_legacy_payload = isinstance(session_id, str) and await self._is_subsession(
+                session_id
+            )
+
+        payload = None if suppress_legacy_payload else _event_to_payload(event, conversation_id)
+        if payload is not None:
             await self.send_to_conversation(conversation_id, payload)
         activity_payload = self._conversation_activity_payload(event, conversation_id)
         if activity_payload is not None:
             await self.send_to_conversation(conversation_id, activity_payload)
             await self.send_sidebar_update_to_owner(conversation_id, activity_payload)
+        # Fan out CONVERSATION_UPDATED events to non-subscribed owner tabs so
+        # sidebar rows (title, unread state, last_message_at) stay current on
+        # all open clients without requiring a subscription to every conversation.
+        if event.type == EventType.CONVERSATION_UPDATED:
+            conv_updated_payload = _event_to_payload(event, conversation_id)
+            if conv_updated_payload is not None:
+                await self.send_sidebar_update_to_owner(conversation_id, conv_updated_payload)
         attention_payload = await self._notification_attention_payload(event, conversation_id)
         if attention_payload is not None:
             await self.send_to_user(attention_payload["user_email"], attention_payload["payload"])
@@ -1091,6 +1576,38 @@ class WebSocketConnectionManager:
         )
 
     async def _fanout_conversation_state_delta(self, event: Event) -> None:
+        source_kind = event.data.get("source_kind")
+        if not isinstance(source_kind, str) or not source_kind:
+            source_kind = "task.state.changed"
+        if source_kind == "session.todos.changed":
+            conversation_id = event.data.get("conversation_id")
+            user_email = event.data.get("user_email")
+            if not isinstance(conversation_id, str) or not isinstance(user_email, str):
+                return
+            async with self.app.state.session_factory() as session:
+                snapshot = await snapshot_for_conversation(
+                    session,
+                    user_email=user_email,
+                    conversation_id=conversation_id,
+                    turn_scheduler=getattr(self.app.state, "turn_scheduler", None),
+                )
+            if snapshot is None:
+                return
+            delta = build_state_delta(
+                conversation_id=conversation_id,
+                source_kind=source_kind,
+                changed_paths=["state", "active_session.todos"],
+                replace={"state": snapshot.model_dump(mode="json")},
+            )
+            payload = {
+                "type": "conversation_state_delta",
+                "conversation_id": conversation_id,
+                **delta.model_dump(mode="json"),
+            }
+            await self.send_to_conversation(conversation_id, payload)
+            await self.send_sidebar_update_to_owner(conversation_id, payload)
+            return
+
         task_id = event.data.get("task_id")
         user_email = event.data.get("user_email")
         if not isinstance(task_id, str):
@@ -1104,9 +1621,6 @@ class WebSocketConnectionManager:
         step_run_id = event.data.get("step_run_id")
         if not isinstance(step_run_id, str):
             step_run_id = None
-        source_kind = event.data.get("source_kind")
-        if not isinstance(source_kind, str) or not source_kind:
-            source_kind = "task.state.changed"
         async with self.app.state.session_factory() as session:
             conversation_ids = await linked_conversation_ids_for_task(
                 session,
@@ -1178,12 +1692,17 @@ class WebSocketConnectionManager:
             completed_at = event.data.get("completed_at") or (
                 event.timestamp.isoformat() if event.timestamp else None
             )
+            continuation_pending = bool(event.data.get("managed_continuation_pending"))
             payload: dict[str, Any] = {
                 "type": "conversation_updated",
                 "conversation_id": conversation_id,
-                "has_active_turn": False,
-                "active_turn_chat_mode": None,
-                "active_turn_chat_mode_source": None,
+                "has_active_turn": continuation_pending,
+                "active_turn_chat_mode": event.data.get("chat_mode")
+                if continuation_pending
+                else None,
+                "active_turn_chat_mode_source": event.data.get("chat_mode_source")
+                if continuation_pending
+                else None,
             }
             if completed_at is not None:
                 payload["last_message_at"] = completed_at
@@ -1242,6 +1761,23 @@ class WebSocketConnectionManager:
             },
         }
 
+    async def _is_subsession(self, session_id: str) -> bool:
+        """Return True if the session is a sub-session (has parent_session_id set).
+
+        Sub-session tool_call/tool_result events must not be projected into the
+        parent conversation's main timeline — they belong in the sub-session
+        detail panel. The delegation cards (DELEGATION_*) are the correct
+        parent-visible artifact for child session activity.
+        """
+        from cognis.store.queries import get_session_row
+
+        try:
+            async with self.app.state.session_factory() as session:
+                session_row = await get_session_row(session, session_id)
+            return session_row is not None and session_row.parent_session_id is not None
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _resolve_conversation_id(self, event: Event) -> str | None:
         """Resolve the conversation_id from an event."""
         if isinstance(event.data.get("conversation_id"), str):
@@ -1274,6 +1810,7 @@ class WebSocketConnectionManager:
         conversation_id: str,
         last_seq: int,
         client_session_id: str | None = None,
+        chat_v2_cursor: str | None = None,
     ) -> None:
         """Replay missed events for a reconnecting client."""
         from cognis.core.session import _to_session_model
@@ -1311,6 +1848,8 @@ class WebSocketConnectionManager:
                 await db_session.commit()
 
         self.subscribe(connection, conversation_id)
+        if chat_v2_cursor:
+            self.subscribe_chat_v2(connection, conversation_id, cursor=chat_v2_cursor)
         await self.send_queue_snapshot(connection, conversation_id)
 
         if session_row is None:
@@ -1321,12 +1860,26 @@ class WebSocketConnectionManager:
         if client_session_id and client_session_id != session.session_id:
             last_seq = 0
 
-        result = await self.app.state.providers.guardrails.read_events(
-            session_id=session.intaris_session_id or session.session_id,
-            after_seq=last_seq,
-            limit=DEFAULT_REPLAY_LIMIT,
-            allow_missing_stream=True,
-        )
+        try:
+            result = await self.app.state.providers.guardrails.read_events(
+                session_id=session.intaris_session_id or session.session_id,
+                after_seq=last_seq,
+                limit=DEFAULT_REPLAY_LIMIT,
+                allow_missing_stream=True,
+            )
+        except CircuitBreakerError:
+            await self.send_error(
+                connection,
+                code="event_store_unavailable",
+                message="Session event store is temporarily unavailable; realtime connection remains active.",
+                recoverable=True,
+            )
+            await self._send_conversation_runtime_snapshot(
+                connection,
+                conversation_id,
+                active_session_id=session.session_id,
+            )
+            return
         replayed = 0
         async with self.app.state.session_factory() as artifact_session:
             artifact_store = self.app.state.artifact_store
@@ -1334,151 +1887,65 @@ class WebSocketConnectionManager:
                 event_type = item.get("type")
                 data = item.get("data", {})
                 if event_type == "user_message":
+                    replay_data = dict(data)
                     attachments = await hydrate_attachment_refs(
                         artifact_session,
                         artifact_store,
-                        data.get("attachments")
-                        if isinstance(data.get("attachments"), list)
+                        replay_data.get("attachments")
+                        if isinstance(replay_data.get("attachments"), list)
                         else [],
                         owner_email=connection.user_email,
                         conversation_id=conversation_id,
                         session_id=session.session_id,
                     )
-                    await connection.send_json(
-                        {
-                            "type": "user_message",
-                            "conversation_id": conversation_id,
-                            "session_id": data.get("session_id") or session.session_id,
-                            "message_id": data.get("message_id") or data.get("event_id"),
-                            "event_id": data.get("event_id") or data.get("message_id"),
-                            "timestamp": item.get("timestamp"),
-                            "seq": item.get("seq", 0),
-                            "turn_id": data.get("turn_id"),
-                            "content": data.get("content", ""),
-                            "attachments": attachments,
-                            "queue_id": data.get("queue_id"),
-                            "client_message_id": data.get("client_message_id"),
-                            "chat_mode": data.get("chat_mode"),
-                            "chat_mode_source": data.get("chat_mode_source"),
-                        }
-                    )
+                    replay_data["attachments"] = attachments
+                    replay_data.setdefault("session_id", session.session_id)
                     replayed += 1
                 elif event_type == "assistant_message":
+                    replay_data = dict(data)
                     turn_id = data.get("turn_id") if isinstance(data.get("turn_id"), str) else None
-                    message_id = turn_id or f"replay_{item.get('seq', uuid.uuid4().hex)}"
-                    content = str(data.get("content", ""))
                     attachments = await hydrate_attachment_refs(
                         artifact_session,
                         artifact_store,
-                        data.get("attachments")
-                        if isinstance(data.get("attachments"), list)
+                        replay_data.get("attachments")
+                        if isinstance(replay_data.get("attachments"), list)
                         else [],
                         owner_email=connection.user_email,
                         conversation_id=conversation_id,
                         session_id=session.session_id,
                     )
-                    if content:
-                        await connection.send_json(
-                            {
-                                "type": "chunk",
-                                "conversation_id": conversation_id,
-                                "session_id": session.session_id,
-                                "message_id": message_id,
-                                "turn_id": turn_id,
-                                "content": content,
-                                "index": 0,
-                            }
-                        )
-                    await connection.send_json(
-                        {
-                            "type": "message_complete",
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                            "message_id": message_id,
-                            "turn_id": turn_id,
-                            "content": content,
-                            "seq": item.get("seq", 0),
-                            "token_usage": None,
-                            "queued_count": 0,
-                            "attachments": attachments,
-                            "partial": bool(data.get("partial")),
-                            "finish_reason": data.get("finish_reason")
-                            if isinstance(data.get("finish_reason"), str)
-                            else None,
-                            "runtime": _assistant_runtime_payload(data),
-                        }
-                    )
+                    replay_data["attachments"] = attachments
+                    replay_data.setdefault("session_id", session.session_id)
+                    if turn_id is not None:
+                        replay_data.setdefault("message_id", turn_id)
                     replayed += 1
                 elif event_type == "tool_call":
+                    replay_data = dict(data)
                     arguments = data.get("arguments")
                     if isinstance(arguments, str):
                         with contextlib.suppress(Exception):
                             arguments = json.loads(arguments)
-                    await connection.send_json(
-                        {
-                            "type": "tool_call",
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                            "seq": item.get("seq"),
-                            "call_id": data.get("call_id"),
-                            "tool_name": data.get("name") or data.get("tool_name"),
-                            "status": data.get("status", "started"),
-                            "arguments": arguments,
-                            "turn_id": data.get("turn_id"),
-                        }
-                    )
+                    replay_data["arguments"] = arguments
+                    replay_data.setdefault("session_id", session.session_id)
                     replayed += 1
                 elif event_type == "tool_result":
+                    replay_data = dict(data)
                     attachments = await hydrate_attachment_refs(
                         artifact_session,
                         artifact_store,
-                        data.get("attachments")
-                        if isinstance(data.get("attachments"), list)
+                        replay_data.get("attachments")
+                        if isinstance(replay_data.get("attachments"), list)
                         else [],
                         owner_email=connection.user_email,
                         conversation_id=conversation_id,
                         session_id=session.session_id,
                     )
-                    await connection.send_json(
-                        {
-                            "type": "tool_result",
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                            "seq": item.get("seq"),
-                            "call_id": data.get("call_id"),
-                            "tool_name": data.get("name") or data.get("tool_name"),
-                            "result": data.get("result", ""),
-                            "is_error": bool(data.get("is_error", False)),
-                            "duration_ms": data.get("duration_ms"),
-                            "evaluation": data.get("evaluation"),
-                            "file_diffs": data.get("file_diffs") or [],
-                            "attachments": attachments,
-                            "turn_id": data.get("turn_id"),
-                        }
-                    )
+                    replay_data["attachments"] = attachments
+                    replay_data.setdefault("session_id", session.session_id)
                     replayed += 1
                 elif event_type == "assistant_thinking":
-                    # Replay as a single completed block frame (no streaming chunks on replay)
-                    block_id = data.get("block_id") or f"thk_replay_{item.get('seq', 0)}"
-                    await connection.send_json(
-                        {
-                            "type": "assistant_thinking_block",
-                            "conversation_id": conversation_id,
-                            "session_id": session.session_id,
-                            "message_id": data.get("message_id") or data.get("turn_id"),
-                            "turn_id": data.get("turn_id"),
-                            "block_id": block_id,
-                            "title": data.get("title"),
-                            "content": data.get("content", ""),
-                            "complete": True,
-                            "started_at": data.get("started_at"),
-                            "completed_at": data.get("completed_at"),
-                            "duration_ms": data.get("duration_ms"),
-                            "source": data.get("reasoning_source") or data.get("source"),
-                            "provider_block_index": data.get("provider_block_index"),
-                            "seq": item.get("seq"),
-                        }
-                    )
+                    replay_data = dict(data)
+                    replay_data.setdefault("session_id", session.session_id)
                     replayed += 1
                 elif event_type == "task_result":
                     await connection.send_json(
@@ -1575,7 +2042,7 @@ class WebSocketConnectionManager:
                         )
                     replayed += 1
                 elif event_type == "system_message":
-                    if not _is_visible_persisted_system_message(data):
+                    if not is_visible_persisted_system_message(data):
                         continue
                     await connection.send_json(
                         {
@@ -1593,6 +2060,8 @@ class WebSocketConnectionManager:
                     )
                     replayed += 1
                 elif event_type == "lifecycle" and data.get("event") == "system_notice":
+                    if is_transient_compaction_start_notice(data):
+                        continue
                     await connection.send_json(
                         {
                             "type": "system_message",
@@ -1651,14 +2120,6 @@ class WebSocketConnectionManager:
 
         turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
         has_active_turn = bool(turn_scheduler and turn_scheduler.has_running_turn(conversation_id))
-        if turn_scheduler is not None:
-            for snapshot in await turn_scheduler.active_stream_snapshots(conversation_id):
-                await connection.send_json(
-                    {
-                        "type": "assistant_stream_snapshot",
-                        **snapshot,
-                    }
-                )
         await self._send_conversation_state_snapshot(
             connection,
             conversation_id,
@@ -1811,6 +2272,14 @@ async def handle_websocket(websocket: WebSocket) -> None:
                 await _handle_message(websocket.app, manager, connection, message)
                 continue
 
+            if message_type == "chat_v2_subscribe":
+                await _handle_chat_v2_subscribe(websocket.app, manager, connection, message)
+                continue
+
+            if message_type == "chat_v2_unsubscribe":
+                await _handle_chat_v2_unsubscribe(websocket.app, manager, connection, message)
+                continue
+
             if message_type == "cancel_queued_message":
                 await _handle_cancel_queued_message(websocket.app, manager, connection, message)
                 continue
@@ -1850,6 +2319,7 @@ async def handle_websocket(websocket: WebSocket) -> None:
                 conversation_id = message.get("conversation_id")
                 last_seq = message.get("last_seq", 0)
                 session_id = message.get("session_id")
+                chat_v2_cursor = message.get("chat_v2_cursor")
                 if not isinstance(conversation_id, str) or not isinstance(last_seq, int):
                     await manager.send_error(
                         connection,
@@ -1863,6 +2333,9 @@ async def handle_websocket(websocket: WebSocket) -> None:
                     conversation_id=conversation_id,
                     last_seq=last_seq,
                     client_session_id=session_id if isinstance(session_id, str) else None,
+                    chat_v2_cursor=chat_v2_cursor
+                    if isinstance(chat_v2_cursor, str) and chat_v2_cursor
+                    else None,
                 )
                 continue
 
@@ -1882,6 +2355,74 @@ async def handle_websocket(websocket: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 # Message dispatch handlers
 # ---------------------------------------------------------------------------
+
+
+async def _handle_chat_v2_subscribe(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    message: dict[str, Any],
+) -> None:
+    """Opt a websocket connection into Chat v2 realtime frames."""
+
+    conversation_id = message.get("conversation_id")
+    cursor = message.get("cursor")
+    if not isinstance(conversation_id, str) or not isinstance(cursor, str) or not cursor:
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="conversation_id and cursor are required",
+            recoverable=True,
+        )
+        return
+    if not await _authorize_conversation_frame(
+        app,
+        manager,
+        connection,
+        conversation_id,
+        require_mutation=False,
+    ):
+        return
+    manager.subscribe_chat_v2(connection, conversation_id, cursor=cursor)
+    active_session_id: str | None = None
+    async with app.state.session_factory() as db_session:
+        conversation_row = await get_conversation(db_session, conversation_id)
+        active_session_id = (
+            conversation_row.active_session_id if conversation_row is not None else None
+        )
+    await manager._send_conversation_runtime_snapshot(
+        connection,
+        conversation_id,
+        active_session_id=active_session_id,
+    )
+
+
+async def _handle_chat_v2_unsubscribe(
+    app: Any,
+    manager: WebSocketConnectionManager,
+    connection: AuthenticatedWebSocket,
+    message: dict[str, Any],
+) -> None:
+    """Opt a websocket connection out of Chat v2 realtime frames."""
+
+    conversation_id = message.get("conversation_id")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        await manager.send_error(
+            connection,
+            code="validation_error",
+            message="conversation_id is required",
+            recoverable=True,
+        )
+        return
+    if not await _authorize_conversation_frame(
+        app,
+        manager,
+        connection,
+        conversation_id,
+        require_mutation=False,
+    ):
+        return
+    manager.unsubscribe_chat_v2(connection, conversation_id)
 
 
 async def _handle_message(
@@ -2262,7 +2803,14 @@ async def _handle_resolve_escalation(
     if not resolved:
         notification = await svc.get(call_id)
         resolution = notification.resolution if notification is not None else None
-        if isinstance(resolution, dict) and resolution.get("reason") == "timeout":
+        if (
+            notification is not None
+            and notification.status == "resolved"
+            and isinstance(resolution, dict)
+            and str(resolution.get("decision") or "").lower() == decision.lower()
+        ):
+            resolved = True
+        elif isinstance(resolution, dict) and resolution.get("reason") == "timeout":
             await manager.send_error(
                 connection,
                 code="expired",
@@ -2270,13 +2818,14 @@ async def _handle_resolve_escalation(
                 recoverable=True,
             )
             return
-        await manager.send_error(
-            connection,
-            code="not_found",
-            message="Escalation not found or already resolved",
-            recoverable=True,
-        )
-        return
+        else:
+            await manager.send_error(
+                connection,
+                code="not_found",
+                message="Escalation not found or already resolved",
+                recoverable=True,
+            )
+            return
 
     # System message to conversation
     verb = "approved" if decision == "approve" else "denied"
@@ -2621,6 +3170,7 @@ async def _render_command_result(
                 "type": "system_message",
                 "conversation_id": conversation_id,
                 "text": result.text,
+                "command_result": True,
                 **result.data,
             },
         )
@@ -2639,6 +3189,8 @@ async def _render_command_result(
             {
                 "type": "session_compacted",
                 "conversation_id": conversation_id,
+                "message": result.text,
+                "command_result": True,
                 **result.data,
             },
         )
@@ -2650,6 +3202,21 @@ async def _render_command_result(
                 **result.data,
             },
         )
+        # Notify all other owner tabs about the new conversation so their
+        # sidebar lists stay current without a manual refresh. The creating
+        # tab already handles this via the conversation_created event above;
+        # send_sidebar_update_to_owner excludes subscribed connections so we
+        # use send_to_user here to reach every tab including the creator's
+        # other windows.
+        new_conversation_id = result.data.get("conversation_id")
+        if isinstance(new_conversation_id, str) and new_conversation_id:
+            await manager.send_sidebar_update_to_owner(
+                new_conversation_id,
+                {
+                    "type": "sidebar_conversation_upsert",
+                    "conversation_id": new_conversation_id,
+                },
+            )
     elif result.type == "session_reset":
         await manager.send_to_conversation(
             conversation_id,
@@ -2674,7 +3241,9 @@ async def _render_command_result(
             {
                 "type": "queued",
                 "conversation_id": conversation_id,
+                "queued_count": result.data.get("queued_count", 0),
                 "reason": result.text,
+                "command_result": True,
                 **result.data,
             },
         )
@@ -2725,6 +3294,8 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
     if event.type == EventType.WORKFLOW_COMPOSED:
         return _workflow_composed_payload(conversation_id, event.data)
     if event.type == EventType.SYSTEM_NOTICE:
+        if is_transient_compaction_start_notice(event.data):
+            return None
         return {
             "type": "system_message",
             "conversation_id": conversation_id,

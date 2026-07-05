@@ -1,0 +1,74 @@
+id: coding-session-multiphase
+description: |
+  Real-world coding session pattern: agent reads context, writes changes,
+  then emits multiple assistant phases separated by tool calls.
+
+  Inspired by production sessions (sess_9da525a9):
+    Turn 0 (LLM call 1): tool calls to gather context and write changes
+    Turn 1 (LLM call 2): assistant summary of work done (phase 0)
+    Turn 2 (LLM call 3): final assistant message with next steps (phase 1)
+
+  Wait — actually in Cognis the agent loop calls the LLM once per turn.
+  The multi-phase pattern happens within a single LLM response:
+  the LLM emits text, then tool_calls, then the agent executes tools,
+  then calls the LLM again for the continuation.
+
+  This scenario uses two turns:
+  - Turn 0: tool calls (gather context)
+  - Turn 1: text response (summary + next steps)
+
+  Tests: tool cards stable, text response arrives cleanly after tool execution.
+  All content is synthetic.
+trigger: "scenario:coding-session-multiphase"
+turns:
+  # Turn 0: LLM emits tool calls to gather context
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_read_1
+        name: memory_search
+        arguments:
+          query: "component structure"
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_read_2
+        name: memory_search
+        arguments:
+          query: "existing patterns"
+        delay_ms: 20
+
+  # Turn 1: LLM responds after tool results with summary
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "I've "
+          - "reviewed "
+          - "the "
+          - "component "
+          - "structure "
+          - "and "
+          - "applied "
+          - "the "
+          - "requested "
+          - "changes. "
+          - "The "
+          - "implementation "
+          - "follows "
+          - "the "
+          - "existing "
+          - "patterns "
+          - "and "
+          - "is "
+          - "ready "
+          - "for "
+          - "review. "
+          - "Next "
+          - "steps: "
+          - "run "
+          - "the "
+          - "tests "
+          - "to "
+          - "verify "
+          - "correctness."
+        delay_ms: 25

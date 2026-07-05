@@ -1,0 +1,62 @@
+id: reconnect-stale-thinking
+description: |
+  Reproduces the hanging-spinner bug: thinking + assistant blocks stuck
+  in-progress after a reconnect.
+
+  The bug: server _active_thinking is not cleared at turn teardown.
+  On reconnect, conversation_runtime_snapshot re-emits the stale
+  streaming:true thinking item. No message_complete follows, so
+  _finalizeStreamingForTurn never runs → permanent spinner.
+
+  This scenario uses thinking + tool_call + text (3 LLM calls).
+  The capture_ws_events reconnect path captures the post-turn
+  conversation_runtime_snapshot, which the golden replay then
+  routes through applyRuntimeSnapshot(hasActiveTurn=false).
+
+  INV-RECONNECT-NO-HANG asserts: after replaying the reconnect snapshot,
+  no streaming:true or status:started items remain in the store.
+
+  All content is synthetic.
+trigger: "scenario:reconnect-stale-thinking"
+turns:
+  # Turn 0: thinking block + tool_call (finish_reason="tool_calls")
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_reconnect_1
+        title: "Analyzing the request"
+        content: "Let me think through this carefully before gathering context."
+        complete: true
+        delay_ms: 30
+      - type: tool_call
+        call_id: call_reconnect_t1
+        name: memory_search
+        arguments:
+          query: "reconnect test context"
+        delay_ms: 15
+
+  # Turn 1: more tool_calls (finish_reason="tool_calls")
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_reconnect_t2
+        name: memory_search
+        arguments:
+          query: "additional context"
+        delay_ms: 15
+
+  # Turn 2: final text response (finish_reason="stop")
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "Based "
+          - "on "
+          - "the "
+          - "analysis, "
+          - "here "
+          - "is "
+          - "the "
+          - "complete "
+          - "answer."
+        delay_ms: 20

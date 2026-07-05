@@ -1,0 +1,80 @@
+id: research-multiphase
+description: |
+  Real-world research session pattern: multiple searches, then a
+  comprehensive response.
+
+  Inspired by production sessions (sess_7c00454e):
+  - Turn 0: multiple web searches (some fail, some succeed)
+  - Turn 1: comprehensive response with findings
+
+  Tests:
+  - Multiple tool cards (some with errors) render correctly
+  - Tool cards with is_error=true show error state
+  - Final text response arrives after all tool results
+  - No duplicate tool cards
+
+  All content is synthetic.
+trigger: "scenario:research-multiphase"
+turns:
+  # Turn 0: LLM emits multiple search tool calls
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_s1
+        name: memory_search
+        arguments:
+          query: "topic overview"
+        delay_ms: 15
+      - type: tool_call
+        call_id: call_s2
+        name: memory_search
+        arguments:
+          query: "related concepts"
+        delay_ms: 15
+      - type: tool_call
+        call_id: call_s3
+        name: memory_search
+        arguments:
+          query: "implementation details"
+        delay_ms: 15
+
+  # Turn 1: LLM responds with findings after all searches complete
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "Based "
+          - "on "
+          - "the "
+          - "research "
+          - "across "
+          - "three "
+          - "queries, "
+          - "here "
+          - "are "
+          - "the "
+          - "key "
+          - "findings:\n\n"
+          - "The "
+          - "recommended "
+          - "approach "
+          - "involves "
+          - "three "
+          - "main "
+          - "steps. "
+          - "First, "
+          - "establish "
+          - "the "
+          - "baseline. "
+          - "Second, "
+          - "apply "
+          - "the "
+          - "changes "
+          - "incrementally. "
+          - "Third, "
+          - "verify "
+          - "each "
+          - "step "
+          - "before "
+          - "proceeding."
+        delay_ms: 20

@@ -1,0 +1,35 @@
+id: rapid-tokens
+description: |
+  High-rate token stream — many small chunks with minimal delay.
+  Assert: single render path, no flicker, monotonic id-set, no duplicate items.
+  Tests the rAF batching and coalescing under load.
+trigger: "scenario:rapid-tokens"
+turns:
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "This "
+          - "is "
+          - "a "
+          - "rapid "
+          - "token "
+          - "stream "
+          - "test. "
+          - "The "
+          - "client "
+          - "should "
+          - "batch "
+          - "these "
+          - "into "
+          - "one "
+          - "render "
+          - "per "
+          - "animation "
+          - "frame "
+          - "without "
+          - "flickering "
+          - "or "
+          - "duplicating "
+          - "items."
+        delay_ms: 5

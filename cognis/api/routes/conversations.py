@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import base64
 import json
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import Response
 
 from cognis.api.common import (
     api_exception,
@@ -34,15 +34,13 @@ from cognis.api.models import (
     ManagedConversationActionRequest,
     ManagedConversationActionResponse,
     MessageEventResponse,
-    MessageHistoryResponse,
     QueuedMessageResponse,
     QueuedMessagesResponse,
-    SendMessageRequest,
-    SendMessageResponse,
     SessionEventsResponse,
     SessionResponse,
     SidebarProjectionResponse,
-    TimelineProjectionResponse,
+    SlashCommandSuggestionResponse,
+    SlashCommandSuggestionsResponse,
     ToolOutputChunkResponse,
     ToolOutputPageResponse,
     UpdateQueuedMessageRequest,
@@ -53,10 +51,18 @@ from cognis.api.serializers import (
     serialize_event_rows,
     session_to_response,
 )
+from cognis.api.timeline_visibility import (
+    is_transient_compaction_start_notice,
+    is_visible_persisted_system_message,
+)
 from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.attachment_utils import hydrate_attachment_refs
+from cognis.core.chat_modes import ChatMode
 from cognis.core.conversation_state import snapshot_for_conversation
-from cognis.core.managed_conversations import last_managed_conversation_user_message_for_retry
+from cognis.core.managed_conversations import (
+    ManagedConversationRetryMessage,
+    last_managed_conversation_user_message_for_retry,
+)
 from cognis.core.title_policy import latest_intaris_title_from_platform_data
 from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
@@ -68,11 +74,9 @@ from cognis.store.queries import (
     get_agent_direct_conversation,
     get_conversation,
     get_latest_active_conversation_for_agent,
-    get_latest_root_session_for_conversation,
     get_managed_conversation_link_for_target,
     get_project,
     get_root_session_chain,
-    get_root_session_chain_page,
     get_session_row,
     get_user_ui_state_value,
     list_conversation_context_types,
@@ -81,7 +85,6 @@ from cognis.store.queries import (
     list_pending_notification_types_by_conversation,
     list_sessions_by_ids,
     list_visible_agents,
-    mark_artifacts_attached,
     mark_conversation_read,
     update_conversation_context_data,
     update_managed_conversation_link,
@@ -90,57 +93,28 @@ from cognis.store.queries import (
 
 logger = get_logger(__name__)
 
-_CONVERSATION_MESSAGES_CURSOR_VERSION = 1
 _MANAGED_CONVERSATION_CONTEXT_TYPES = {"agent_work", "managed_agent_conversation"}
 _CHAT_LAST_OPENED_UI_STATE_PREFIX = "chat.last_opened"
+# Agent-agnostic global key: tracks the most recently opened conversation
+# across all agents so PWA cold-starts can restore the right conversation
+# even when the selected agent doesn't match the last-active one.
+_CHAT_LAST_OPENED_GLOBAL_STATE_KEY = "chat.last_opened:global"
+
+
+def _filter_values(single: str | None, multiple: list[str] | None) -> list[str] | None:
+    values = sorted(
+        {value.strip() for value in [single, *(multiple or [])] if value and value.strip()}
+    )
+    return values or None
 
 
 def _agent_definition_from_row(row: object) -> AgentDefinition:
     return AgentDefinition.model_validate(agent_to_response(row).model_dump())
 
 
-def _encode_messages_cursor(session_id: str, seq: int) -> str:
-    payload = {
-        "v": _CONVERSATION_MESSAGES_CURSOR_VERSION,
-        "sid": session_id,
-        "seq": max(0, seq),
-    }
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def _decode_messages_cursor(cursor: str) -> tuple[str, int]:
-    try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
-    except Exception as exc:
-        raise api_exception(400, "invalid_cursor", "Invalid history cursor") from exc
-    if not isinstance(payload, dict) or payload.get("v") != _CONVERSATION_MESSAGES_CURSOR_VERSION:
-        raise api_exception(400, "invalid_cursor", "Invalid history cursor")
-    session_id = payload.get("sid")
-    seq = payload.get("seq")
-    if not isinstance(session_id, str) or not session_id:
-        raise api_exception(400, "invalid_cursor", "Invalid history cursor")
-    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
-        raise api_exception(400, "invalid_cursor", "Invalid history cursor")
-    return session_id, seq
-
-
 def _event_seq(event: dict[str, Any]) -> int:
     seq = event.get("seq")
     return seq if isinstance(seq, int) else 0
-
-
-def _messages_cursor_anchor_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return the oldest real event usable as a history cursor anchor."""
-    for event in events:
-        if _event_seq(event) <= 0:
-            continue
-        data = event.get("data")
-        if not isinstance(data, dict) or not isinstance(data.get("session_id"), str):
-            continue
-        return event
-    return None
 
 
 def _timeline_event_identity(event: MessageEventResponse) -> tuple[str | None, int | None, str]:
@@ -162,11 +136,24 @@ def _project_event_turn_id(data: dict[str, Any]) -> str | None:
 
 
 def _project_visible_system_message(data: dict[str, Any]) -> bool:
-    if isinstance(data.get("notice_id"), str) and data["notice_id"]:
+    return is_visible_persisted_system_message(data)
+
+
+def _visible_history_event(event: MessageEventResponse | dict[str, Any]) -> bool:
+    if not isinstance(event, MessageEventResponse) and not isinstance(event, dict):
         return True
-    if data.get("kind") == "turn_initiated":
+    event_type = event.type if isinstance(event, MessageEventResponse) else event.get("type")
+    data = event.data if isinstance(event, MessageEventResponse) else event.get("data")
+    if (
+        event_type == "lifecycle"
+        and isinstance(data, dict)
+        and data.get("event") == "system_notice"
+        and is_transient_compaction_start_notice(data)
+    ):
+        return False
+    if event_type != "system_message":
         return True
-    return data.get("event") == "turn_initiated"
+    return isinstance(data, dict) and _project_visible_system_message(data)
 
 
 def _project_number(value: Any) -> int | float | None:
@@ -196,6 +183,211 @@ def _strip_none_values(item: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in item.items() if value is not None}
 
 
+def _normalize_thinking_content(content: str, title: str | None = None) -> str:
+    value = content.strip()
+    if len(value) < 64:
+        return content
+    normalized_title = title.strip().lower() if title else None
+    normalized_title_prefix = normalized_title.rstrip(".…").strip() if normalized_title else None
+    for repetitions in range(5, 1, -1):
+        if len(content) % repetitions != 0:
+            continue
+        unit = content[: len(content) // repetitions]
+        if (
+            len(unit.strip()) >= 32
+            and unit * repetitions == content
+            and (
+                not normalized_title
+                or unit.lstrip().lower().startswith(normalized_title)
+                or (
+                    bool(normalized_title_prefix)
+                    and unit.lstrip().lower().startswith(normalized_title_prefix)
+                )
+            )
+        ):
+            return unit.strip()
+    return content
+
+
+def _normalize_repeated_assistant_content(content: str) -> str:
+    value = content.strip()
+    if len(value) < 512:
+        return content
+    for repetitions in range(5, 1, -1):
+        if len(value) % repetitions != 0:
+            continue
+        unit = value[: len(value) // repetitions]
+        if len(unit.strip()) >= 256 and unit * repetitions == value:
+            return unit.strip()
+    return content
+
+
+def _merge_assistant_content(existing: str, incoming: str) -> str:
+    """Reconcile repeated assistant frames without duplicating one message body."""
+
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    if incoming == existing:
+        return existing
+    if incoming.startswith(existing):
+        return incoming
+    if existing.startswith(incoming):
+        return existing
+    if existing.endswith(incoming):
+        return existing
+
+    max_overlap = min(len(existing), len(incoming))
+    min_overlap = min(16, max_overlap)
+    for overlap in range(max_overlap, min_overlap - 1, -1):
+        if existing.endswith(incoming[:overlap]):
+            return existing + incoming[overlap:]
+
+    return f"{existing}\n\n{incoming}"
+
+
+def _event_order(event: MessageEventResponse, fallback_index: int) -> dict[str, Any]:
+    data = event.data if isinstance(event.data, dict) else {}
+    # For live bus patches (seq=None) that embed a monotonic patch counter, use
+    # it as the local tiebreaker so concurrent patches of the same kind (e.g.
+    # two delegation boxes) get distinct ``local`` values in the sort key and
+    # therefore a deterministic, stable relative order.
+    live_patch_counter = data.get("_live_patch_counter")
+    local = int(live_patch_counter) if isinstance(live_patch_counter, int) else fallback_index
+    # Lineage index: position of the backing session in the root-session chain
+    # (0 = oldest, increasing toward newest).  Stamped by _tag_session_events.
+    # Live bus patches and incremental active-session events do not carry
+    # _lineage_index; they use _ORDER_KEY_ACTIVE_LINEAGE so they sort after all
+    # historical sessions but before runtime-only sentinel items.
+    raw_lineage = data.get("_lineage_index")
+    lineage = int(raw_lineage) if isinstance(raw_lineage, int) else _ORDER_KEY_ACTIVE_LINEAGE
+    return {
+        # Do not invent canonical sequence numbers from projection-local row
+        # indexes. Missing sequence stays explicitly unknown and falls back to
+        # timestamp/local ordering only after all sequenced events.
+        "seq": event.seq if isinstance(event.seq, int) else None,
+        "timestamp": event.timestamp or "",
+        "local": local,
+        "lineage": lineage,
+    }
+
+
+def _timeline_sort_key(item: dict[str, Any]) -> tuple[int, int, str, int]:
+    order = item.get("order")
+    if isinstance(order, dict):
+        lineage = order.get("lineage")
+        seq = order.get("seq")
+        timestamp = order.get("timestamp")
+        local = order.get("local")
+        return (
+            lineage if isinstance(lineage, int) else 0,
+            seq if isinstance(seq, int) else 10**12,
+            timestamp if isinstance(timestamp, str) else "",
+            local if isinstance(local, int) else 0,
+        )
+    return (0, 10**12, "", 0)
+
+
+# Kind rank for stable intra-turn ordering: lower = earlier in the turn.
+_KIND_RANK: dict[str, int] = {
+    "message:user": 0,
+    "thinking": 1,
+    "message:assistant": 2,
+    "tool_call": 3,
+    "delegation": 4,
+    "compaction": 5,
+    "system_message": 6,
+    "notice": 7,
+    "workflow_composed": 8,
+}
+
+# Sentinel values that sort after all real persisted data.
+# Using 9999 for lineage (4-digit field) and 10**15-1 for seq (15-digit field)
+# so both fit exactly in their format fields without widening.
+_ORDER_KEY_NO_LINEAGE = 9999  # runtime-only items (no persisted seq)
+_ORDER_KEY_NO_SEQ = 10**15 - 1  # fits in 15 digits: 999999999999999
+
+# Active-session lineage sentinel: used for incremental reads and live patches
+# that do not carry a _lineage_index tag.  Sorts after all historical sessions
+# (lineage 0..N) but before runtime-only items (lineage 9999).
+# Value 9998 leaves room for up to 9998 historical sessions before collision.
+_ORDER_KEY_ACTIVE_LINEAGE = 9998
+
+# Invariant: active < no-lineage, and both must fit in the 4-digit field.
+assert 0 <= _ORDER_KEY_ACTIVE_LINEAGE < _ORDER_KEY_NO_LINEAGE <= 9999, (
+    "Lineage sentinel ordering invariant violated: "
+    f"active={_ORDER_KEY_ACTIVE_LINEAGE}, no_lineage={_ORDER_KEY_NO_LINEAGE}"
+)
+
+
+def _item_kind_rank(item: dict[str, Any]) -> int:
+    kind = item.get("kind", "")
+    role = item.get("role", "")
+    if kind == "message":
+        return _KIND_RANK.get(f"message:{role}", 9)
+    return _KIND_RANK.get(kind, 9)
+
+
+def _encode_order_key(
+    lineage: int | None,
+    seq: int | None,
+    phase: int | None,
+    kind_rank: int,
+    local: int,
+) -> str:
+    """Encode a stable, lexicographically-sortable order key for a timeline item.
+
+    Format: ``{lineage:04d}:{seq:015d}:{phase:06d}:{kind_rank:02d}:{local:09d}``
+
+    The lineage component is the position of the backing session in the
+    root-session chain (0 = oldest).  This ensures that post-compaction
+    sessions (whose seq restarts at 1) sort AFTER all events from older
+    sessions, regardless of the raw seq value.
+
+    Items without a persisted seq use sentinel values so they sort after all
+    persisted items in their lineage.
+    """
+    li = lineage if isinstance(lineage, int) else _ORDER_KEY_NO_LINEAGE
+    s = seq if isinstance(seq, int) else _ORDER_KEY_NO_SEQ
+    p = phase if isinstance(phase, int) else 0
+    return f"{li:04d}:{s:015d}:{p:06d}:{kind_rank:02d}:{local:09d}"
+
+
+def _stable_user_timeline_id(data: dict[str, Any], fallback_id: str) -> str:
+    client_message_id = data.get("client_message_id")
+    if isinstance(client_message_id, str) and client_message_id:
+        return f"user:{client_message_id}"
+    queue_id = data.get("queue_id")
+    if isinstance(queue_id, str) and queue_id:
+        return f"user:{queue_id}"
+    message_id = data.get("message_id")
+    if isinstance(message_id, str) and message_id:
+        return f"user:{message_id}"
+    return f"event:{fallback_id}:user"
+
+
+def _stable_assistant_timeline_id(message_id: str, phase: int | None, fallback_id: str) -> str:
+    if message_id:
+        return (
+            f"message:{message_id}:phase:{phase}"
+            if isinstance(phase, int)
+            else f"message:{message_id}"
+        )
+    return f"event:{fallback_id}:assistant"
+
+
+def _stable_thinking_timeline_id(
+    message_id: str,
+    phase: int | None,
+    block_id: str,
+) -> str:
+    """Stable per-block id for a persisted thinking block."""
+    if phase is None:
+        return f"thinking:{message_id}:{block_id}"
+    return f"thinking:{message_id}:phase:{phase}:{block_id}"
+
+
 def _project_timeline_events(
     events: list[MessageEventResponse],
 ) -> list[dict[str, Any]]:
@@ -203,6 +395,101 @@ def _project_timeline_events(
     tool_index_by_call_id: dict[str, int] = {}
     system_notice_index_by_id: dict[str, int] = {}
     open_assistant_index_by_turn: dict[str, int] = {}
+    delegation_order_by_anchor: dict[str, dict[str, Any]] = {}
+    delegation_order_queue_by_task: dict[str, list[dict[str, Any]]] = {}
+    assistant_order_by_phase: dict[tuple[str | None, int], dict[str, Any]] = {}
+    assistant_phase_by_turn: dict[str, int] = {}
+
+    def _projected_assistant_phase_index(data: dict[str, Any], turn_id: str | None) -> int | None:
+        explicit_phase = data.get("assistant_phase_index")
+        if isinstance(explicit_phase, int):
+            return explicit_phase
+        if turn_id is None:
+            return None
+        return assistant_phase_by_turn.get(turn_id)
+
+    def _inferred_assistant_phase_index(data: dict[str, Any], turn_id: str | None) -> int:
+        phase = _projected_assistant_phase_index(data, turn_id)
+        if phase is not None:
+            return phase
+        # Fallback: infer from already-projected persisted assistant messages
+        # for this turn. Thinking blocks share the phase of their assistant
+        # segment and do not advance the counter.
+        phases = [
+            item.get("assistantPhaseIndex")
+            for item in items
+            if item.get("kind") == "message"
+            and item.get("role") == "assistant"
+            and item.get("turnId") == turn_id
+            and isinstance(item.get("assistantPhaseIndex"), int)
+        ]
+        if phases:
+            return max(cast(list[int], phases)) + 1
+        return sum(
+            1
+            for item in items
+            if item.get("kind") == "message"
+            and item.get("role") == "assistant"
+            and item.get("turnId") == turn_id
+        )
+
+    def _bump_projected_assistant_phase(turn_id: str | None) -> None:
+        if turn_id is None:
+            return
+        assistant_phase_by_turn[turn_id] = assistant_phase_by_turn.get(turn_id, 0) + 1
+
+    def _tool_arguments(data: dict[str, Any]) -> dict[str, Any]:
+        raw = data.get("arguments")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    def _delegation_anchor_keys(
+        *, session_id: str | None = None, call_id: str | None = None, task: str | None = None
+    ) -> list[str]:
+        keys: list[str] = []
+        if session_id:
+            keys.append(f"session:{session_id}")
+        if call_id:
+            keys.append(f"call:{call_id}")
+        if task:
+            keys.append(f"task:{task}")
+        return keys
+
+    def _delegation_order_for(
+        item: dict[str, Any], *, consume_task_anchor: bool = False
+    ) -> dict[str, Any] | None:
+        task_value = item.get("task") or item.get("taskLabel")
+        task = task_value if isinstance(task_value, str) else None
+        session_value = item.get("delegation_session_id") or item.get("session_id")
+        session_id = session_value if isinstance(session_value, str) else None
+        call_value = item.get("call_id") or item.get("callId")
+        call_id = call_value if isinstance(call_value, str) else None
+        for key in _delegation_anchor_keys(session_id=session_id, call_id=call_id):
+            if key in delegation_order_by_anchor:
+                return delegation_order_by_anchor[key]
+        if task:
+            queued = delegation_order_queue_by_task.get(task)
+            if queued:
+                return queued.pop(0) if consume_task_anchor else queued[0]
+            key = f"task:{task}"
+            if key in delegation_order_by_anchor:
+                return delegation_order_by_anchor[key]
+        return None
+
+    def _turn_has_projected_assistant_message(turn_id: str | None) -> bool:
+        return any(
+            item.get("kind") == "message"
+            and item.get("role") == "assistant"
+            and item.get("turnId") == turn_id
+            for item in items
+        )
 
     def close_assistant_phase(turn_id: str | None) -> None:
         if turn_id:
@@ -227,6 +514,7 @@ def _project_timeline_events(
                 "description": description,
                 "tone": tone,
                 "timestamp": timestamp,
+                "order": _event_order(event, event_index),
             }
         )
 
@@ -256,10 +544,24 @@ def _project_timeline_events(
             None,
         )
         if existing_index is None:
+            anchored_order = _delegation_order_for(item, consume_task_anchor=True)
+            item.setdefault("order", anchored_order or _event_order(event, event_index))
+            session_value = item.get("delegation_session_id") or item.get("session_id")
+            session_id = session_value if isinstance(session_value, str) else None
+            if session_id and anchored_order is not None:
+                delegation_order_by_anchor.setdefault(f"session:{session_id}", anchored_order)
             items.append(_strip_none_values(item))
             return
         existing = dict(items[existing_index])
         incoming = _strip_none_values(item)
+        incoming.pop("order", None)
+        anchored_order = _delegation_order_for({**existing, **incoming})
+        if anchored_order is not None:
+            existing["order"] = anchored_order
+            session_value = incoming.get("delegation_session_id") or incoming.get("session_id")
+            session_id = session_value if isinstance(session_value, str) else None
+            if session_id:
+                delegation_order_by_anchor.setdefault(f"session:{session_id}", anchored_order)
         existing_status = existing.get("status")
         incoming_status = incoming.get("status")
         existing_is_terminal = status_rank(existing_status) >= 4
@@ -294,11 +596,26 @@ def _project_timeline_events(
                 if index >= insert_index:
                     index_by_id[key] = index + 1
 
-    def find_open_thinking_index(message_id: str) -> int | None:
+    def find_open_thinking_index(
+        message_id: str,
+        assistant_phase_index: int | None,
+        block_id: str | None,
+    ) -> int | None:
         for index in range(len(items) - 1, -1, -1):
             item = items[index]
-            if item.get("kind") == "thinking" and item.get("messageId") == message_id:
-                return index
+            if (
+                item.get("kind") == "thinking"
+                and item.get("messageId") == message_id
+                and item.get("assistantPhaseIndex") == assistant_phase_index
+            ):
+                blocks = item.get("blocks")
+                if block_id is None:
+                    return index
+                if isinstance(blocks, list) and any(
+                    isinstance(block, dict) and block.get("block_id") == block_id
+                    for block in blocks
+                ):
+                    return index
             if item.get("kind") == "message" and item.get("role") == "assistant":
                 if item.get("messageId") != message_id:
                     return None
@@ -309,21 +626,68 @@ def _project_timeline_events(
 
     def append_thinking_item(item: dict[str, Any], *, turn_id: str | None) -> None:
         message_id = item.get("messageId")
-        existing_index = find_open_thinking_index(str(message_id)) if message_id else None
+        previous_item = items[-1] if items else None
+        previous_assistant_phase = (
+            previous_item.get("assistantPhaseIndex")
+            if previous_item
+            and previous_item.get("kind") == "message"
+            and previous_item.get("role") == "assistant"
+            and previous_item.get("turnId") == turn_id
+            else None
+        )
+        previous_thinking_phase = (
+            previous_item.get("assistantPhaseIndex")
+            if previous_item
+            and previous_item.get("kind") == "thinking"
+            and previous_item.get("turnId") == turn_id
+            else None
+        )
+        assistant_phase_index = item.get("assistantPhaseIndex")
+        if not isinstance(assistant_phase_index, int) and isinstance(previous_thinking_phase, int):
+            assistant_phase_index = previous_thinking_phase
+        if not isinstance(assistant_phase_index, int) and isinstance(previous_assistant_phase, int):
+            assistant_phase_index = previous_assistant_phase + 1
+        if not isinstance(assistant_phase_index, int):
+            assistant_phase_index = _next_assistant_phase_index(items, turn_id)
+        item["assistantPhaseIndex"] = assistant_phase_index
+
+        item_blocks = item.get("blocks")
+        item_block_id = None
+        if isinstance(item_blocks, list) and item_blocks and isinstance(item_blocks[0], dict):
+            raw_block_id = item_blocks[0].get("block_id")
+            item_block_id = str(raw_block_id) if raw_block_id else None
+        existing_index = (
+            find_open_thinking_index(str(message_id), assistant_phase_index, item_block_id)
+            if message_id
+            else None
+        )
         if existing_index is not None:
             existing_blocks = items[existing_index].setdefault("blocks", [])
             new_blocks = item.get("blocks")
             if isinstance(existing_blocks, list) and isinstance(new_blocks, list):
-                existing_blocks.extend(new_blocks)
+                existing_by_id = {
+                    str(block.get("block_id")): block
+                    for block in existing_blocks
+                    if isinstance(block, dict) and block.get("block_id")
+                }
+                for new_block in new_blocks:
+                    if not isinstance(new_block, dict):
+                        continue
+                    new_block_id = new_block.get("block_id")
+                    if new_block_id and str(new_block_id) in existing_by_id:
+                        existing_by_id[str(new_block_id)].update(_strip_none_values(new_block))
+                    else:
+                        existing_blocks.append(new_block)
             return
-        assistant_index = open_assistant_index_by_turn.get(turn_id or "") if turn_id else None
-        if assistant_index is not None and 0 <= assistant_index < len(items):
-            items.insert(assistant_index, _strip_none_values(item))
-            shift_projected_indices(assistant_index)
-            return
+        if (
+            previous_item
+            and previous_item.get("kind") == "message"
+            and previous_item.get("role") == "assistant"
+        ):
+            close_assistant_phase(turn_id)
         items.append(_strip_none_values(item))
 
-    for event in events:
+    for event_index, event in enumerate(events):
         data = event.data or {}
         sid, seq, eid = _timeline_event_identity(event)
         timestamp = event.timestamp
@@ -334,7 +698,7 @@ def _project_timeline_events(
         if event.type == "user_message":
             close_assistant_phase(turn_id)
             item: dict[str, Any] = {
-                "id": f"event:{eid}:user",
+                "id": _stable_user_timeline_id(data, eid),
                 "kind": "message",
                 "sessionId": sid,
                 "role": "user",
@@ -343,6 +707,10 @@ def _project_timeline_events(
                 "timestamp": timestamp,
                 "turnId": turn_id,
                 "attachments": attachments,
+                "clientMessageId": data.get("client_message_id")
+                if isinstance(data.get("client_message_id"), str)
+                else None,
+                "order": _event_order(event, event_index),
             }
             if isinstance(data.get("chat_mode"), str):
                 item["chatMode"] = data["chat_mode"]
@@ -353,6 +721,7 @@ def _project_timeline_events(
 
         if event.type == "assistant_message":
             if content.strip() or attachments:
+                content = _normalize_repeated_assistant_content(content)
                 message_id = (
                     data.get("message_id") if isinstance(data.get("message_id"), str) else turn_id
                 )
@@ -368,11 +737,7 @@ def _project_timeline_events(
                 if existing is not None and existing.get("messageId") == message_id:
                     existing_content = existing.get("content")
                     if isinstance(existing_content, str) and existing_content:
-                        existing["content"] = (
-                            content
-                            if content.startswith(existing_content)
-                            else f"{existing_content}\n\n{content}"
-                        )
+                        existing["content"] = _merge_assistant_content(existing_content, content)
                     else:
                         existing["content"] = content
                     existing["seq"] = seq
@@ -382,12 +747,14 @@ def _project_timeline_events(
                         existing["runtime"] = data["runtime"]
                     if isinstance(data.get("finish_reason"), str):
                         existing["finishReason"] = data["finish_reason"]
+                    if isinstance(data.get("turn_cycle_index"), int):
+                        existing["turnCycleIndex"] = data["turn_cycle_index"]
                     existing["partial"] = data.get("partial") is True
                     continue
 
-                phase = _next_assistant_phase_index(items, turn_id)
+                phase = _inferred_assistant_phase_index(data, turn_id)
                 item = {
-                    "id": f"event:{eid}:assistant",
+                    "id": _stable_assistant_timeline_id(message_id, phase, eid),
                     "kind": "message",
                     "sessionId": sid,
                     "role": "assistant",
@@ -402,6 +769,12 @@ def _project_timeline_events(
                     if isinstance(data.get("finish_reason"), str)
                     else None,
                     "assistantPhaseIndex": phase,
+                    "turnCycleIndex": data.get("turn_cycle_index")
+                    if isinstance(data.get("turn_cycle_index"), int)
+                    else None,
+                    "order": assistant_order_by_phase.get(
+                        (turn_id, phase), _event_order(event, event_index)
+                    ),
                 }
                 if isinstance(data.get("chat_mode"), str):
                     item["chatMode"] = data["chat_mode"]
@@ -435,7 +808,14 @@ def _project_timeline_events(
                         "noticeScope": data.get("scope")
                         if isinstance(data.get("scope"), str)
                         else None,
+                        "followUpConversationId": data.get("follow_up_conversation_id")
+                        if isinstance(data.get("follow_up_conversation_id"), str)
+                        else None,
+                        "followUpSessionId": data.get("follow_up_session_id")
+                        if isinstance(data.get("follow_up_session_id"), str)
+                        else None,
                         "timestamp": timestamp,
+                        "order": _event_order(event, event_index),
                     }
                 )
                 if notice_id and notice_id in system_notice_index_by_id:
@@ -447,10 +827,34 @@ def _project_timeline_events(
             continue
 
         if event.type == "tool_call":
-            close_assistant_phase(turn_id)
             tool_name = str(data.get("name") or data.get("tool_name") or "unknown")
             if tool_name in {"delegate", "fork"}:
+                tool_order = _event_order(event, event_index)
+                if not _turn_has_projected_assistant_message(turn_id):
+                    phase = _projected_assistant_phase_index(data, turn_id) or 0
+                    assistant_order_by_phase.setdefault(
+                        (turn_id, phase),
+                        {
+                            **tool_order,
+                            "local": int(tool_order.get("local", 0)) - 1,
+                        },
+                    )
+                arguments = _tool_arguments(data)
+                task = (
+                    arguments.get("task")
+                    or arguments.get("message")
+                    or arguments.get("initial_message")
+                )
+                task_label = task if isinstance(task, str) and task else None
+                call_id_value = data.get("call_id")
+                call_id = call_id_value if isinstance(call_id_value, str) else None
+                for key in _delegation_anchor_keys(call_id=call_id):
+                    delegation_order_by_anchor.setdefault(key, tool_order)
+                if task_label:
+                    delegation_order_queue_by_task.setdefault(task_label, []).append(tool_order)
+                close_assistant_phase(turn_id)
                 continue
+            close_assistant_phase(turn_id)
             call_id = str(data.get("call_id") or f"tc-{eid}")
             arguments = data.get("arguments")
             visible_name = data.get("visible_name")
@@ -464,6 +868,13 @@ def _project_timeline_events(
                 "toolName": tool_name,
                 "status": data.get("status") if isinstance(data.get("status"), str) else "started",
                 "timestamp": timestamp,
+                "assistantPhaseIndex": data.get("assistant_phase_index")
+                if isinstance(data.get("assistant_phase_index"), int)
+                else None,
+                "turnCycleIndex": data.get("turn_cycle_index")
+                if isinstance(data.get("turn_cycle_index"), int)
+                else None,
+                "order": _event_order(event, event_index),
             }
             if isinstance(visible_name, str) and visible_name:
                 item["displayToolName"] = visible_name
@@ -481,6 +892,7 @@ def _project_timeline_events(
                 )
             tool_index_by_call_id[call_id] = len(items)
             items.append(_strip_none_values(item))
+            _bump_projected_assistant_phase(turn_id)
             continue
 
         if event.type == "tool_result":
@@ -498,6 +910,13 @@ def _project_timeline_events(
                     "sessionId": sid,
                     "toolName": str(data.get("name") or data.get("tool_name") or "unknown"),
                     "timestamp": timestamp,
+                    "assistantPhaseIndex": data.get("assistant_phase_index")
+                    if isinstance(data.get("assistant_phase_index"), int)
+                    else None,
+                    "turnCycleIndex": data.get("turn_cycle_index")
+                    if isinstance(data.get("turn_cycle_index"), int)
+                    else None,
+                    "order": _event_order(event, event_index),
                     "reconstructed": True,
                 }
                 tool_index_by_call_id[call_id] = len(items)
@@ -513,6 +932,12 @@ def _project_timeline_events(
                     if isinstance(data.get("is_error"), bool)
                     else None,
                     "durationMs": _project_number(data.get("duration_ms")),
+                    "assistantPhaseIndex": data.get("assistant_phase_index")
+                    if isinstance(data.get("assistant_phase_index"), int)
+                    else base.get("assistantPhaseIndex"),
+                    "turnCycleIndex": data.get("turn_cycle_index")
+                    if isinstance(data.get("turn_cycle_index"), int)
+                    else base.get("turnCycleIndex"),
                     "attachments": _project_event_attachments(data) or base.get("attachments"),
                     "fileDiffs": data.get("file_diffs")
                     if isinstance(data.get("file_diffs"), list)
@@ -575,21 +1000,21 @@ def _project_timeline_events(
                     ),
                     "tone": "warning",
                     "timestamp": timestamp,
+                    "order": _event_order(event, event_index),
                 }
             )
             continue
 
         if event.type == "compaction_summary":
             close_assistant_phase(turn_id)
-            marker_role = (
-                data.get("marker_role") if isinstance(data.get("marker_role"), str) else None
-            )
             method = data.get("method") if isinstance(data.get("method"), str) else "unknown"
-            if (
-                data.get("timeline_visible") is False
-                or marker_role == "context_seed"
-                or method == "rotation"
-            ):
+            # Skip only markers explicitly flagged as non-visible. Previously
+            # we also skipped method=="rotation" and marker_role=="context_seed",
+            # but those are the deferred-rotation path markers — the most common
+            # compaction path. Skipping them meant the backend history never
+            # contained a compaction card, so any history refresh after
+            # compaction silently dropped the live-streamed compaction box.
+            if data.get("timeline_visible") is False:
                 continue
             summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
             session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else sid
@@ -629,6 +1054,7 @@ def _project_timeline_events(
                         "hardPressureExceeded": data.get("hard_pressure_exceeded") is True,
                         "usedTimeoutFallback": data.get("used_timeout_fallback") is True,
                         "timestamp": timestamp,
+                        "order": _event_order(event, event_index),
                     }
                 )
             )
@@ -657,6 +1083,7 @@ def _project_timeline_events(
                         if isinstance(data.get("steps"), list)
                         else [],
                         "timestamp": timestamp,
+                        "order": _event_order(event, event_index),
                     }
                 )
             )
@@ -674,6 +1101,7 @@ def _project_timeline_events(
                 if isinstance(data.get("title"), str) and data.get("title")
                 else "Thinking"
             )
+            thinking_content = _normalize_thinking_content(thinking_content, thinking_title)
             if (
                 thinking_source == "reasoning"
                 and thinking_title == "Reasoning"
@@ -688,14 +1116,16 @@ def _project_timeline_events(
             block_id = (
                 data.get("block_id") if isinstance(data.get("block_id"), str) else f"thk_{eid}"
             )
+            phase = _inferred_assistant_phase_index(data, turn_id)
             append_thinking_item(
                 _strip_none_values(
                     {
-                        "id": f"thinking:{message_id}:{block_id}",
+                        "id": f"thinking:{message_id}:phase:{phase}:{block_id}",
                         "kind": "thinking",
                         "sessionId": sid,
                         "messageId": message_id,
                         "turnId": turn_id,
+                        "assistantPhaseIndex": phase,
                         "blocks": [
                             _strip_none_values(
                                 {
@@ -720,6 +1150,7 @@ def _project_timeline_events(
                         "streaming": False,
                         "activeTitle": None,
                         "timestamp": timestamp,
+                        "order": _event_order(event, event_index),
                     }
                 ),
                 turn_id=turn_id,
@@ -879,6 +1310,8 @@ def _project_timeline_events(
                 )
             elif lifecycle_event == "system_notice":
                 message = data.get("message") if isinstance(data.get("message"), str) else ""
+                if is_transient_compaction_start_notice(data):
+                    continue
                 if message:
                     close_assistant_phase(turn_id)
                     notice_id = (
@@ -897,6 +1330,7 @@ def _project_timeline_events(
                             if isinstance(data.get("scope"), str)
                             else None,
                             "timestamp": timestamp,
+                            "order": _event_order(event, event_index),
                         }
                     )
                     if notice_id and notice_id in system_notice_index_by_id:
@@ -930,6 +1364,7 @@ def _project_timeline_events(
                             if isinstance(data.get("steps"), list)
                             else [],
                             "timestamp": timestamp,
+                            "order": _event_order(event, event_index),
                         }
                     )
                 )
@@ -983,6 +1418,7 @@ def _project_timeline_events(
                     "kind": "system_message",
                     "text": "The controller recovered this conversation after a restart.",
                     "timestamp": timestamp,
+                    "order": _event_order(event, event_index),
                 }
             )
             continue
@@ -994,13 +1430,169 @@ def _project_timeline_events(
             timestamp=timestamp,
         )
 
-    return items
+    for index, item in enumerate(items):
+        if "order" not in item:
+            seq = item.get("seq")
+            timestamp_value = item.get("timestamp")
+            item["order"] = {
+                "seq": seq if isinstance(seq, int) else None,
+                "timestamp": timestamp_value if isinstance(timestamp_value, str) else "",
+                "local": index,
+                "lineage": 0,
+            }
+    ordered_items = sorted(items, key=_timeline_sort_key)
+    for position, item in enumerate(ordered_items):
+        order = item.pop("order", None)
+        seq = order.get("seq") if isinstance(order, dict) else None
+        lineage = order.get("lineage") if isinstance(order, dict) else None
+        phase = item.get("assistantPhaseIndex")
+        # For live bus patches that embed a monotonic counter, use it directly
+        # as the local component so two separate single-event patches get
+        # distinct orderKeys even though each is projected independently with
+        # position=0.  The counter is bounded to fit the 9-digit local field.
+        raw_local = order.get("local") if isinstance(order, dict) else None
+        local: int
+        if isinstance(raw_local, int) and raw_local > 0 and seq is None:
+            # Non-zero local on a seq=None item comes from _live_patch_counter.
+            local = raw_local % (10**9)
+        else:
+            local = position
+        item["orderKey"] = _encode_order_key(
+            lineage=lineage,
+            seq=seq,
+            phase=phase,
+            kind_rank=_item_kind_rank(item),
+            local=local,
+        )
+    return ordered_items
 
 
 def project_timeline_events(events: list[MessageEventResponse]) -> list[dict[str, Any]]:
     """Project message events into canonical timeline items."""
 
     return _project_timeline_events(events)
+
+
+def _projected_item_merge_index(items: list[dict[str, Any]], patch: dict[str, Any]) -> int | None:
+    patch_id = patch.get("id")
+    patch_kind = patch.get("kind")
+    if isinstance(patch_id, str) and patch_kind:
+        for index, item in enumerate(items):
+            if item.get("id") == patch_id and item.get("kind") == patch_kind:
+                return index
+    if patch_kind == "tool_call":
+        call_id = patch.get("callId")
+        if isinstance(call_id, str):
+            for index, item in enumerate(items):
+                if item.get("kind") == "tool_call" and item.get("callId") == call_id:
+                    return index
+    if patch_kind == "message":
+        role = patch.get("role")
+        message_id = patch.get("messageId")
+        turn_id = patch.get("turnId")
+        phase = patch.get("assistantPhaseIndex")
+        client_message_id = patch.get("clientMessageId")
+        queue_id = patch.get("queueId")
+        for index, item in enumerate(items):
+            if item.get("kind") != "message" or item.get("role") != role:
+                continue
+            if (
+                isinstance(client_message_id, str)
+                and item.get("clientMessageId") == client_message_id
+            ):
+                return index
+            if isinstance(queue_id, str) and item.get("queueId") == queue_id:
+                return index
+            if (
+                role == "assistant"
+                and isinstance(message_id, str)
+                and item.get("messageId") == message_id
+                and item.get("turnId") == turn_id
+                and item.get("assistantPhaseIndex") == phase
+            ):
+                return index
+    if patch_kind == "thinking":
+        message_id = patch.get("messageId")
+        turn_id = patch.get("turnId")
+        phase = patch.get("assistantPhaseIndex")
+        patch_blocks = patch.get("blocks")
+        patch_block_ids = (
+            {
+                str(block.get("block_id"))
+                for block in patch_blocks
+                if isinstance(block, dict) and block.get("block_id")
+            }
+            if isinstance(patch_blocks, list)
+            else set()
+        )
+        for index, item in enumerate(items):
+            if item.get("kind") != "thinking":
+                continue
+            if item.get("messageId") != message_id or item.get("turnId") != turn_id:
+                continue
+            if isinstance(phase, int) and item.get("assistantPhaseIndex") != phase:
+                continue
+            blocks = item.get("blocks")
+            item_block_ids = (
+                {
+                    str(block.get("block_id"))
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("block_id")
+                }
+                if isinstance(blocks, list)
+                else set()
+            )
+            if patch_block_ids & item_block_ids:
+                return index
+    if patch_kind == "delegation":
+        task_id = patch.get("taskId")
+        if isinstance(task_id, str):
+            for index, item in enumerate(items):
+                if item.get("kind") == "delegation" and item.get("taskId") == task_id:
+                    return index
+    return None
+
+
+def _merge_projected_item(existing: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    # Prefer the existing orderKey when it has a real seq (lower sentinel value)
+    # so that a runtime patch does not overwrite a persisted item's stable key.
+    existing_key = existing.get("orderKey", "")
+    patch_key = patch.get("orderKey", "")
+    preferred_key = existing_key if existing_key <= patch_key else patch_key
+
+    if existing.get("kind") == "tool_call" and patch.get("kind") == "tool_call":
+        result = {**existing, **_strip_none_values(patch)}
+        if not patch.get("arguments") and existing.get("arguments"):
+            result["arguments"] = existing["arguments"]
+        if not patch.get("timestamp") and existing.get("timestamp"):
+            result["timestamp"] = existing["timestamp"]
+        if preferred_key:
+            result["orderKey"] = preferred_key
+        return result
+    if existing.get("kind") == "thinking" and patch.get("kind") == "thinking":
+        existing_blocks = list(existing.get("blocks") or [])
+        patch_blocks = patch.get("blocks") if isinstance(patch.get("blocks"), list) else []
+        blocks_by_id = {
+            str(block.get("block_id")): dict(block)
+            for block in existing_blocks
+            if isinstance(block, dict) and block.get("block_id")
+        }
+        for block in patch_blocks:
+            if not isinstance(block, dict):
+                continue
+            block_id = block.get("block_id")
+            if block_id and str(block_id) in blocks_by_id:
+                blocks_by_id[str(block_id)].update(_strip_none_values(block))
+            elif block_id:
+                blocks_by_id[str(block_id)] = dict(_strip_none_values(block))
+        result = _strip_none_values({**existing, **patch, "blocks": list(blocks_by_id.values())})
+        if preferred_key:
+            result["orderKey"] = preferred_key
+        return result
+    result = _strip_none_values({**existing, **patch})
+    if preferred_key:
+        result["orderKey"] = preferred_key
+    return result
 
 
 def _event_timestamp(event: dict[str, Any]) -> datetime:
@@ -1044,13 +1636,27 @@ def _has_compaction_summary(events: list[dict[str, Any]]) -> bool:
     return any(event.get("type") == "compaction_summary" for event in events)
 
 
-def _tag_session_events(session_row: Any, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _tag_session_events(
+    session_row: Any,
+    events: list[dict[str, Any]],
+    lineage_index: int = 0,
+) -> list[dict[str, Any]]:
+    """Tag events with session_id and lineage_index for lineage-aware ordering.
+
+    ``lineage_index`` is the position of this session in the root-session chain
+    (0 = oldest backing session, increasing toward the active session).  It is
+    embedded in ``data["_lineage_index"]`` so ``_event_order`` can include it
+    in the sort key, ensuring that post-compaction sessions (whose seq restarts
+    at 1) always sort AFTER all events from older sessions.
+    """
     for event in events:
         if not isinstance(event, dict):
             continue
         data = event.get("data")
-        if isinstance(data, dict) and "session_id" not in data:
-            data["session_id"] = session_row.session_id
+        if isinstance(data, dict):
+            if "session_id" not in data:
+                data["session_id"] = session_row.session_id
+            data["_lineage_index"] = lineage_index
     return events
 
 
@@ -1207,7 +1813,9 @@ async def _conversation_page_projection(
     cursor: str | None = None,
     limit: int,
     context_type: str | None = None,
+    context_types: list[str] | None = None,
     agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
     project_id: str | None = None,
     status: str = "active",
     include_agent_direct: bool = False,
@@ -1220,7 +1828,9 @@ async def _conversation_page_projection(
             session,
             user_email,
             context_type=context_type,
+            context_types=context_types,
             agent_id=agent_id,
+            agent_ids=agent_ids,
             project_id=project_id,
             status=status,
             include_agent_direct=include_agent_direct,
@@ -1320,11 +1930,85 @@ def _chat_last_opened_state_key(
     )
 
 
+@dataclass(frozen=True)
+class _ChatLastOpenedCandidate:
+    conversation_id: str
+    opened_at: datetime | None
+    order: int
+
+
+def _parse_chat_last_opened_at(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def _chat_last_opened_conversation_id(state: dict[str, Any] | None) -> str | None:
     if not state:
         return None
     conversation_id = state.get("conversation_id")
     return conversation_id if isinstance(conversation_id, str) and conversation_id else None
+
+
+def _chat_last_opened_candidate_sort_key(
+    candidate: _ChatLastOpenedCandidate,
+) -> tuple[bool, datetime, int]:
+    return (
+        candidate.opened_at is not None,
+        candidate.opened_at or datetime.min.replace(tzinfo=UTC),
+        -candidate.order,
+    )
+
+
+def _chat_last_opened_candidates(
+    *,
+    persisted_state: dict[str, Any] | None,
+    payload: ConversationOpenRequest,
+) -> list[_ChatLastOpenedCandidate]:
+    by_conversation_id: dict[str, _ChatLastOpenedCandidate] = {}
+    order = 0
+
+    def add_candidate(conversation_id: str, opened_at: datetime | None) -> None:
+        nonlocal order
+        normalized_id = conversation_id.strip()
+        if not normalized_id:
+            return
+        candidate = _ChatLastOpenedCandidate(
+            conversation_id=normalized_id,
+            opened_at=opened_at,
+            order=order,
+        )
+        order += 1
+        existing = by_conversation_id.get(normalized_id)
+        if existing is None or _chat_last_opened_candidate_sort_key(
+            candidate
+        ) > _chat_last_opened_candidate_sort_key(existing):
+            by_conversation_id[normalized_id] = candidate
+
+    persisted_conversation_id = _chat_last_opened_conversation_id(persisted_state)
+    if persisted_conversation_id:
+        add_candidate(
+            persisted_conversation_id,
+            _parse_chat_last_opened_at((persisted_state or {}).get("opened_at")),
+        )
+
+    for candidate in payload.candidate_conversations:
+        add_candidate(candidate.conversation_id, _parse_chat_last_opened_at(candidate.opened_at))
+
+    for conversation_id in payload.candidate_conversation_ids:
+        add_candidate(conversation_id, None)
+
+    return sorted(
+        by_conversation_id.values(),
+        key=_chat_last_opened_candidate_sort_key,
+        reverse=True,
+    )
 
 
 async def _remember_chat_last_opened(
@@ -1335,7 +2019,16 @@ async def _remember_chat_last_opened(
     context_type: str,
     agent_profile_id: str | None,
     conversation_id: str,
+    opened_at: datetime | None = None,
 ) -> None:
+    opened_at = opened_at or datetime.now(UTC)
+    state_value = {
+        "conversation_id": conversation_id,
+        "agent_id": agent_id,
+        "agent_profile_id": agent_profile_id,
+        "context_type": context_type,
+        "opened_at": opened_at.isoformat(),
+    }
     scope_keys = [
         _chat_last_opened_state_key(
             agent_id=agent_id,
@@ -1352,17 +2045,12 @@ async def _remember_chat_last_opened(
             )
         )
     for scope_key in scope_keys:
-        await upsert_user_ui_state(
-            session,
-            user_email,
-            scope_key,
-            {
-                "conversation_id": conversation_id,
-                "agent_id": agent_id,
-                "agent_profile_id": agent_profile_id,
-                "context_type": context_type,
-            },
-        )
+        await upsert_user_ui_state(session, user_email, scope_key, state_value)
+    # Also write the agent-agnostic global key so PWA cold-starts can restore
+    # the last-opened conversation regardless of which agent is selected at
+    # launch. The global record carries agent_id so open_conversation can
+    # derive the correct agent from the conversation.
+    await upsert_user_ui_state(session, user_email, _CHAT_LAST_OPENED_GLOBAL_STATE_KEY, state_value)
 
 
 async def _agent_direct_chat_projection(
@@ -1370,16 +2058,18 @@ async def _agent_direct_chat_projection(
     *,
     user_email: str,
     agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
     status: str = "active",
 ) -> list[AgentDirectChatResponse]:
     turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
     rows: list[tuple[Any, Any]] = []
+    agent_filter = set(_filter_values(agent_id, agent_ids) or [])
     async with request.app.state.session_factory() as session:
         visible_agents = await list_visible_agents(session, user_email)
         for agent, _grant in visible_agents:
             if agent.agent_type != "primary" or agent.status != "active":
                 continue
-            if agent_id is not None and agent.agent_id != agent_id:
+            if agent_filter and agent.agent_id not in agent_filter:
                 continue
             existing = await get_agent_direct_conversation(session, user_email, agent.agent_id)
             rows.append((agent, existing))
@@ -1484,19 +2174,23 @@ async def conversation_list(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
     context_type: str | None = Query(default=None),
+    context_types: list[str] | None = Query(default=None),
     agent_id: str | None = Query(default=None),
+    agent_ids: list[str] | None = Query(default=None),
     project_id: str | None = Query(default=None),
     status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
     include_agent_direct: bool = Query(default=False),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
+    context_filter = _filter_values(context_type, context_types)
+    agent_filter = _filter_values(agent_id, agent_ids)
     return await _conversation_page_projection(
         request,
         user_email=user.email,
         cursor=cursor,
         limit=limit,
-        context_type=context_type,
-        agent_id=agent_id,
+        context_types=context_filter,
+        agent_ids=agent_filter,
         project_id=project_id,
         status=status,
         include_agent_direct=include_agent_direct,
@@ -1524,6 +2218,7 @@ async def conversation_context_types(
 async def agent_direct_chats(
     request: Request,
     agent_id: str | None = Query(default=None),
+    agent_ids: list[str] | None = Query(default=None),
     status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
 ) -> list[AgentDirectChatResponse]:
     """Return sticky web direct chats for visible primary agents."""
@@ -1532,7 +2227,7 @@ async def agent_direct_chats(
     return await _agent_direct_chat_projection(
         request,
         user_email=user.email,
-        agent_id=agent_id,
+        agent_ids=_filter_values(agent_id, agent_ids),
         status=status,
     )
 
@@ -1543,13 +2238,17 @@ async def sidebar_projection(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
     context_type: str | None = Query(default=None),
+    context_types: list[str] | None = Query(default=None),
     agent_id: str | None = Query(default=None),
+    agent_ids: list[str] | None = Query(default=None),
     project_id: str | None = Query(default=None),
     status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
 ) -> SidebarProjectionResponse:
     """Return the UI-shaped sidebar projection in one request."""
 
     user = require_current_user(request)
+    context_filter = _filter_values(context_type, context_types)
+    agent_filter = _filter_values(agent_id, agent_ids)
     agents = [
         agent_to_response(agent)
         for agent in await request.app.state.agent_registry.list_all(
@@ -1564,8 +2263,8 @@ async def sidebar_projection(
         user_email=user.email,
         cursor=cursor,
         limit=limit,
-        context_type=context_type,
-        agent_id=agent_id,
+        context_types=context_filter,
+        agent_ids=agent_filter,
         project_id=project_id,
         status=status,
         include_agent_direct=False,
@@ -1574,10 +2273,10 @@ async def sidebar_projection(
         await _agent_direct_chat_projection(
             request,
             user_email=user.email,
-            agent_id=agent_id,
+            agent_ids=agent_filter,
             status="active",
         )
-        if context_type in {None, "web"}
+        if context_filter is None or "web" in context_filter
         else []
     )
     async with request.app.state.session_factory() as session:
@@ -1628,11 +2327,11 @@ async def open_conversation(
                     context_type=context_type,
                     agent_profile_id=payload.agent_profile_id,
                     conversation_id=conversation.conversation_id,
+                    opened_at=datetime.now(UTC),
                 )
                 await session.commit()
             return await _conversation_response(request, conversation)
 
-        seen_candidates: set[str] = set()
         persisted_state_key = _chat_last_opened_state_key(
             agent_id=payload.agent_id,
             context_type=context_type,
@@ -1643,18 +2342,13 @@ async def open_conversation(
             user.email,
             persisted_state_key,
         )
-        candidate_conversation_ids: list[str] = []
-        persisted_conversation_id = _chat_last_opened_conversation_id(persisted_state)
-        if persisted_conversation_id:
-            candidate_conversation_ids.append(persisted_conversation_id)
-        candidate_conversation_ids.extend(payload.candidate_conversation_ids)
+        candidate_conversations = _chat_last_opened_candidates(
+            persisted_state=persisted_state,
+            payload=payload,
+        )
 
-        for conversation_id in candidate_conversation_ids[:10]:
-            conversation_id = conversation_id.strip()
-            if not conversation_id or conversation_id in seen_candidates:
-                continue
-            seen_candidates.add(conversation_id)
-            candidate = await get_conversation(session, conversation_id)
+        for candidate_hint in candidate_conversations[:10]:
+            candidate = await get_conversation(session, candidate_hint.conversation_id)
             if candidate is None:
                 continue
             if _is_openable_chat_conversation(
@@ -1665,6 +2359,47 @@ async def open_conversation(
                 agent_profile_id=payload.agent_profile_id,
             ):
                 return await return_opened(candidate)
+
+        # Global last-opened fallback: if no agent-scoped candidate validated,
+        # check the agent-agnostic global key. This handles the common PWA
+        # cold-start case where the selected agent at launch differs from the
+        # agent of the genuinely last-opened conversation (e.g. the user has
+        # multiple agents and the PWA always falls back to the first primary).
+        # We validate ownership, active status, and context_type but allow any
+        # agent so the conversation-first restore works correctly.
+        #
+        # Skip when the request targets a specific agent profile — the global
+        # key does not track profiles, so restoring a conversation from a
+        # different profile would be incorrect and would overwrite the
+        # profile-specific last-opened state.
+        if payload.agent_profile_id is None:
+            global_state = await get_user_ui_state_value(
+                session, user.email, _CHAT_LAST_OPENED_GLOBAL_STATE_KEY
+            )
+            global_conversation_id = _chat_last_opened_conversation_id(global_state)
+            if global_conversation_id:
+                global_candidate = await get_conversation(session, global_conversation_id)
+                if global_candidate is not None and _is_openable_chat_conversation(
+                    global_candidate,
+                    user_email=user.email,
+                    agent_id=global_candidate.agent_id,
+                    context_type=context_type,
+                    agent_profile_id=None,
+                ):
+                    # Record under the conversation's actual agent so subsequent
+                    # agent-scoped lookups find it correctly.
+                    if user.role != "viewer":
+                        await _remember_chat_last_opened(
+                            session,
+                            user_email=user.email,
+                            agent_id=global_candidate.agent_id,
+                            context_type=context_type,
+                            agent_profile_id=None,
+                            conversation_id=global_candidate.conversation_id,
+                            opened_at=datetime.now(UTC),
+                        )
+                        await session.commit()
+                    return await _conversation_response(request, global_candidate)
 
         fallback_rows = await list_conversations(
             session,
@@ -1706,6 +2441,7 @@ async def open_conversation(
             context_type=context_type,
             agent_profile_id=payload.agent_profile_id,
             conversation_id=conversation.conversation_id,
+            opened_at=datetime.now(UTC),
         )
         await session.commit()
     return await _conversation_response(request, conversation)
@@ -1843,6 +2579,7 @@ async def remember_opened_conversation(
                 context_type=row.context_type,
                 agent_profile_id=row.agent_profile_id,
                 conversation_id=row.conversation_id,
+                opened_at=datetime.now(UTC),
             )
             await session.commit()
     return await _conversation_response(request, row)
@@ -2042,374 +2779,6 @@ async def purge_conversation(request: Request, conversation_id: str) -> dict[str
         "intaris_cascade": cascade_ok,
         "warning": None if cascade_ok else "Intaris session purge failed for one or more sessions.",
     }
-
-
-@router.get("/{conversation_id}/messages", response_model=MessageHistoryResponse)
-async def conversation_messages(
-    request: Request,
-    conversation_id: str,
-    after_seq: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=500),
-    anchor: Literal["oldest", "latest"] = Query(default="oldest"),
-    before: str | None = Query(default=None),
-) -> MessageHistoryResponse:
-    async with request.app.state.session_factory() as session:
-        row = await get_conversation(session, conversation_id)
-        row = _require_visible_conversation(request, row)
-
-        history_anchor_id = row.active_session_id
-        if history_anchor_id is None and after_seq == 0:
-            latest_root = await get_latest_root_session_for_conversation(session, conversation_id)
-            history_anchor_id = latest_root.session_id if latest_root is not None else None
-        if history_anchor_id is None:
-            return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
-
-        before_session_id: str | None = None
-        before_seq: int | None = None
-        if before:
-            if after_seq > 0:
-                raise api_exception(
-                    400,
-                    "invalid_request",
-                    "History cursor cannot be combined with active-session incremental replay.",
-                )
-            before_session_id, before_seq = _decode_messages_cursor(before)
-            cursor_row = await get_session_row(session, before_session_id)
-            if cursor_row is None or cursor_row.conversation_id != conversation_id:
-                raise api_exception(400, "invalid_cursor", "Invalid history cursor")
-            if cursor_row.parent_session_id is not None:
-                raise api_exception(400, "invalid_cursor", "Invalid history cursor")
-
-        # Incremental fetch (after_seq > 0): read only the active session.
-        # Latest-page fetch: walk the root-session lineage but read only as
-        # many tail events as the client requested.
-        # Legacy full load (after_seq == 0, anchor=oldest): keep historical
-        # behavior for existing clients.
-        lineage_truncated = False
-        if after_seq > 0:
-            session_row = await get_session_row(session, history_anchor_id)
-            session_rows = [session_row] if session_row is not None else []
-        elif anchor == "latest" or before:
-            session_rows, lineage_truncated = await get_root_session_chain_page(
-                session,
-                conversation_id,
-                history_anchor_id,
-                before_session_id=before_session_id,
-            )
-        else:
-            session_rows, lineage_truncated = await get_root_session_chain(
-                session, conversation_id, history_anchor_id
-            )
-
-    if not session_rows:
-        return MessageHistoryResponse(items=[], last_seq=0, has_more=False)
-
-    guardrails = request.app.state.providers.guardrails
-
-    # Read events from each session in the chain (parallel for full load)
-    all_events: list[Any] = []
-    last_seq_value = 0
-    has_more = False
-    active_session_id = history_anchor_id
-    active_session_last_seq = 0
-    history_truncated = False
-    truncation_reason: str | None = None
-    older_cursor: str | None = None
-
-    if after_seq > 0:
-        # Incremental: single session read
-        sr = session_rows[0]
-        event_result = await guardrails.read_events(
-            session_id=sr.intaris_session_id or sr.session_id,
-            after_seq=after_seq,
-            limit=limit,
-            allow_missing_stream=True,
-        )
-        if event_result.missing_stream_fallback_used:
-            logger.warning(
-                "Conversation history missing in Intaris; returning empty history",
-                extra={
-                    "extra_data": {
-                        "conversation_id": conversation_id,
-                        "session_id": sr.session_id,
-                        "intaris_session_id": sr.intaris_session_id or sr.session_id,
-                    }
-                },
-            )
-        all_events = _tag_session_events(sr, list(event_result.events))
-        last_seq_value = event_result.last_seq
-        has_more = event_result.has_more
-        active_session_last_seq = event_result.last_seq
-    elif anchor == "latest" or before:
-        # Latest-first bootstrap / older-page fetch across root-session
-        # lineage. Read only enough events to fill the requested page, moving
-        # backwards across compacted root sessions when necessary.
-        remaining = limit
-        page_events: list[tuple[Any, list[dict[str, Any]]]] = []
-        has_older = False
-        for index in range(len(session_rows) - 1, -1, -1):
-            if remaining <= 0:
-                has_older = True
-                break
-            sr = session_rows[index]
-            result_last_seq = 0
-            result_missing_stream = False
-            if before_session_id == sr.session_id and before_seq is not None and before_seq > 0:
-                read_limit = remaining + 1
-                read_after_seq = max(0, before_seq - read_limit)
-                result = await guardrails.read_events(
-                    session_id=sr.intaris_session_id or sr.session_id,
-                    after_seq=read_after_seq,
-                    limit=read_limit,
-                    allow_missing_stream=True,
-                )
-                row_events = [
-                    event for event in list(result.events) if _event_seq(event) < before_seq
-                ]
-                if row_events and _event_seq(row_events[0]) > 1:
-                    has_older = True
-                if len(row_events) > remaining:
-                    row_events = row_events[-remaining:]
-                    has_older = True
-                result_last_seq = result.last_seq
-                result_missing_stream = result.missing_stream_fallback_used
-            else:
-                result = await guardrails.read_events(
-                    session_id=sr.intaris_session_id or sr.session_id,
-                    last_n=remaining,
-                    allow_missing_stream=True,
-                )
-                row_events = list(result.events)
-                if result.has_more:
-                    has_older = True
-                result_last_seq = result.last_seq
-                result_missing_stream = result.missing_stream_fallback_used
-            if result_missing_stream:
-                logger.warning(
-                    "Session stream missing in Intaris during paginated lineage read",
-                    extra={
-                        "extra_data": {
-                            "conversation_id": conversation_id,
-                            "session_id": sr.session_id,
-                        }
-                    },
-                )
-                row_events = [
-                    {
-                        "type": "history_gap",
-                        "data": {"reason": "stream_missing", "session_id": sr.session_id},
-                        "seq": 0,
-                        "ts": None,
-                    }
-                ]
-            row_events = _filter_orphan_tool_results(
-                _sort_session_events(_tag_session_events(sr, row_events))
-            )
-            if (
-                sr.previous_session_id
-                and not _has_compaction_summary(row_events)
-                and before_session_id is None
-                and getattr(row, "context_type", None) == "web"
-            ):
-                marker = await _read_compaction_summary_marker(guardrails, sr)
-                if marker is not None:
-                    row_events = _sort_session_events(
-                        _tag_session_events(sr, [marker, *row_events])
-                    )
-            if sr.session_id == active_session_id:
-                active_session_last_seq = result_last_seq
-            page_events.insert(0, (sr, row_events))
-            remaining -= len(row_events)
-            if result_missing_stream:
-                break
-        all_events = [event for _, events in page_events for event in events]
-        if active_session_last_seq == 0 and active_session_id:
-            active_row = next(
-                (item for item in session_rows if item.session_id == active_session_id),
-                None,
-            )
-            if active_row is None:
-                async with request.app.state.session_factory() as session:
-                    active_row = await get_session_row(session, active_session_id)
-            if active_row is not None:
-                active_session_last_seq = await guardrails.get_last_seq(
-                    active_row.intaris_session_id or active_row.session_id
-                )
-        last_seq_value = active_session_last_seq
-        has_more = has_older or lineage_truncated
-        if has_more and all_events:
-            first_event = _messages_cursor_anchor_event(all_events)
-            first_session_id = None
-            if first_event is not None:
-                data = first_event.get("data")
-                if isinstance(data, dict) and isinstance(data.get("session_id"), str):
-                    first_session_id = data["session_id"]
-                first_seq = _event_seq(first_event)
-                if first_session_id:
-                    older_cursor = _encode_messages_cursor(first_session_id, first_seq)
-        if lineage_truncated:
-            history_truncated = True
-            truncation_reason = "lineage_truncated"
-    else:
-        # Full load: read all sessions in parallel
-        import asyncio as _asyncio
-
-        async def _read_session(sr: Any) -> tuple[Any, list[dict[str, Any]], int]:
-            try:
-                result = await guardrails.read_events(
-                    session_id=sr.intaris_session_id or sr.session_id,
-                    after_seq=0,
-                    limit=0,
-                    allow_missing_stream=True,
-                )
-                if result.missing_stream_fallback_used:
-                    logger.warning(
-                        "Session stream missing in Intaris during lineage read",
-                        extra={
-                            "extra_data": {
-                                "conversation_id": conversation_id,
-                                "session_id": sr.session_id,
-                            }
-                        },
-                    )
-                    return (
-                        sr,
-                        [
-                            {
-                                "type": "history_gap",
-                                "data": {
-                                    "reason": "stream_missing",
-                                    "session_id": sr.session_id,
-                                },
-                                "seq": 0,
-                                "ts": None,
-                            }
-                        ],
-                        result.last_seq,
-                    )
-                return sr, _sort_session_events(list(result.events)), result.last_seq
-            except Exception:
-                logger.warning(
-                    "Failed to read session events during lineage walk",
-                    extra={
-                        "extra_data": {
-                            "conversation_id": conversation_id,
-                            "session_id": sr.session_id,
-                        }
-                    },
-                    exc_info=True,
-                )
-                return (
-                    sr,
-                    [
-                        {
-                            "type": "history_gap",
-                            "data": {
-                                "reason": "read_failed",
-                                "session_id": sr.session_id,
-                            },
-                            "seq": 0,
-                            "ts": None,
-                        }
-                    ],
-                    0,
-                )
-
-        results = await _asyncio.gather(*[_read_session(sr) for sr in session_rows])
-
-        if lineage_truncated:
-            history_truncated = True
-            truncation_reason = "lineage_truncated"
-            all_events.append(
-                {
-                    "type": "history_gap",
-                    "data": {"reason": "lineage_truncated"},
-                    "seq": 0,
-                    "ts": None,
-                }
-            )
-
-        for sr, events, session_last_seq in results:
-            # Tag each event with session_id so the UI can build
-            # lineage-safe timeline item IDs (seq is session-local).
-            sid = sr.session_id
-            if sid == active_session_id:
-                active_session_last_seq = session_last_seq
-            _tag_session_events(sr, events)
-            all_events.extend(events)
-
-        # For full loads, return the full lineage history and let the
-        # client switch to incremental mode afterward using the active
-        # session's seq space. Avoid single-session cursor semantics here.
-        has_more = False
-
-    await _hydrate_event_attachments(request, all_events, conversation_id=conversation_id)
-    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    has_active_turn = bool(turn_scheduler and turn_scheduler.has_running_turn(conversation_id))
-    active_streams = (
-        await turn_scheduler.active_stream_snapshots(conversation_id)
-        if turn_scheduler is not None
-        else []
-    )
-    active_tool_outputs = (
-        await turn_scheduler.active_tool_output_snapshots(conversation_id)
-        if turn_scheduler is not None
-        else []
-    )
-    async with request.app.state.session_factory() as state_session:
-        state_snapshot = await snapshot_for_conversation(
-            state_session,
-            user_email=row.user_email,
-            conversation_id=conversation_id,
-            turn_scheduler=turn_scheduler,
-            active_session_last_seq=active_session_last_seq,
-        )
-
-    return MessageHistoryResponse(
-        items=serialize_event_rows(
-            list(all_events),
-            log_label="conversation_messages",
-            log_context={
-                "conversation_id": conversation_id,
-                "session_id": session_rows[-1].session_id if session_rows else "",
-            },
-        ),
-        last_seq=last_seq_value,
-        has_more=has_more,
-        older_cursor=older_cursor,
-        has_active_turn=has_active_turn,
-        active_streams=active_streams,
-        active_tool_outputs=active_tool_outputs,
-        active_session_id=active_session_id,
-        active_session_last_seq=active_session_last_seq,
-        history_truncated=history_truncated,
-        truncation_reason=truncation_reason,
-        state_snapshot=state_snapshot,
-    )
-
-
-@router.get("/{conversation_id}/timeline", response_model=TimelineProjectionResponse)
-async def conversation_timeline(
-    request: Request,
-    conversation_id: str,
-    after_seq: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=500),
-    anchor: Literal["oldest", "latest"] = Query(default="oldest"),
-    before: str | None = Query(default=None),
-) -> TimelineProjectionResponse:
-    history = await conversation_messages(
-        request,
-        conversation_id,
-        after_seq=after_seq,
-        limit=limit,
-        anchor=anchor,
-        before=before,
-    )
-    timeline_items = _project_timeline_events(history.items)
-    return TimelineProjectionResponse(
-        **history.model_dump(),
-        timeline_items=timeline_items,
-    )
 
 
 def _event_data(event: Any) -> dict[str, Any] | None:
@@ -2612,136 +2981,64 @@ async def delete_queued_message(request: Request, conversation_id: str, queue_id
     return Response(status_code=204)
 
 
-@router.post("/{conversation_id}/messages")
-async def send_message(
+@router.get(
+    "/{conversation_id}/slash-command-suggestions",
+    response_model=SlashCommandSuggestionsResponse,
+)
+async def slash_command_suggestions(
     request: Request,
     conversation_id: str,
-    payload: SendMessageRequest,
-) -> Response:
-    """Send a chat message to a conversation.
+    input: str = Query(default="", max_length=500),
+    limit: int = Query(default=12, ge=1, le=50),
+) -> SlashCommandSuggestionsResponse:
+    """Return read-only slash command and parameter suggestions for a conversation."""
 
-    Supports two delivery modes via the ``Accept`` header:
+    require_current_user(request)
+    command_dispatcher = getattr(request.app.state, "command_dispatcher", None)
+    if command_dispatcher is None:
+        return SlashCommandSuggestionsResponse()
 
-    - ``Accept: text/event-stream`` — SSE streaming response with real-time
-      token deltas, tool calls, and turn completion events.
-    - ``Accept: application/json`` (default) — fire-and-forget 202 Accepted.
-      Poll ``GET /conversations/{id}/messages`` for the response.
-
-    Slash commands (``/compact``, ``/new``, ``/model``, etc.) are dispatched
-    through the ``CommandDispatcher`` and return their result directly.
-    """
-    user = require_current_user(request)
-    forbid_mutation_for_viewer(request)
+    from cognis.core.session import _to_conversation_model, _to_session_model
 
     async with request.app.state.session_factory() as session:
-        row = await get_conversation(session, conversation_id)
-    if row is None:
-        raise api_exception(404, "not_found", "Conversation not found")
-    require_resource_owner(request, row.user_email)
-    async with request.app.state.session_factory() as session:
-        agent = await get_agent(session, row.agent_id)
-    if agent is None:
-        raise api_exception(404, "not_found", "Agent not found")
-    await check_agent_access(request, agent, required="use")
-    if row.status == "deleted":
-        raise api_exception(404, "not_found", "Conversation not found")
-    if row.status == "archived":
-        raise api_exception(409, "conflict", "Conversation is not active")
-    if row.context_type in _MANAGED_CONVERSATION_CONTEXT_TYPES:
-        raise api_exception(
-            409,
-            "managed_conversation_read_only",
-            "Managed conversations are read-only from the target chat; use managed actions from the controller conversation.",
+        conversation_row = await get_conversation(session, conversation_id)
+        conversation_row = _require_visible_conversation(request, conversation_row)
+        agent_row = await get_agent(session, conversation_row.agent_id)
+        if agent_row is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        await check_agent_access(request, agent_row, required="use")
+        session_row = (
+            await get_session_row(session, conversation_row.active_session_id)
+            if conversation_row.active_session_id
+            else None
         )
+        agent_model = _agent_definition_from_row(agent_row)
+        conversation_model = _to_conversation_model(conversation_row)
+        session_model = _to_session_model(session_row) if session_row is not None else None
 
-    # --- Slash command dispatch ---
-    command_result = await _try_command_dispatch(request, conversation_id, payload.content, user)
-    if command_result is not None:
-        return JSONResponse(
-            status_code=200,
-            content={"status": "command_executed", "result": command_result},
-        )
-
-    # --- Turn submission ---
-    accept = request.headers.get("accept", "application/json")
-    wants_sse = "text/event-stream" in accept
-    turn_scheduler = request.app.state.turn_scheduler
-
-    if wants_sse:
-        from cognis.api.sse import SSETurnObserver
-
-        observer = SSETurnObserver(conversation_id)
-        error = await turn_scheduler.submit_turn(
-            conversation_id,
-            payload.content,
-            user_email=user.email,
-            attachments=[item.model_dump(mode="json") for item in payload.attachments],
-            turn_observers=[observer],
-            client_message_id=payload.client_message_id,
-        )
-        if error is not None:
-            raise _turn_error_to_http(error)
-        try:
-            async with request.app.state.session_factory() as session:
-                latest_row = await get_conversation(session, conversation_id)
-                await mark_artifacts_attached(
-                    session,
-                    [item.artifact_id for item in payload.attachments],
-                    owner_email=user.email,
-                    conversation_id=conversation_id,
-                    session_id=latest_row.active_session_id if latest_row else None,
-                )
-                await session.commit()
-        except Exception:
-            logger.warning(
-                "Failed to persist post-submit attachment association",
-                extra={"extra_data": {"conversation_id": conversation_id}},
-                exc_info=True,
+    suggestions = await command_dispatcher.suggest(
+        input,
+        conversation=conversation_model,
+        session=session_model,
+        agent=agent_model,
+        user_email=conversation_row.user_email,
+        limit=limit,
+    )
+    return SlashCommandSuggestionsResponse(
+        items=[
+            SlashCommandSuggestionResponse(
+                kind=item.kind,
+                command=item.command,
+                value=item.value,
+                label=item.label,
+                description=item.description,
+                insert_text=item.insert_text,
+                suffix=item.suffix,
+                badges=item.badges,
             )
-
-        async def _cleanup_generator():  # type: ignore[return]
-            try:
-                async for event in observer.event_generator():
-                    yield event
-            finally:
-                turn_scheduler.remove_observer(conversation_id, observer)
-
-        return StreamingResponse(
-            _cleanup_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-    else:
-        error = await turn_scheduler.submit_turn(
-            conversation_id,
-            payload.content,
-            user_email=user.email,
-            attachments=[item.model_dump(mode="json") for item in payload.attachments],
-            client_message_id=payload.client_message_id,
-        )
-        if error is not None:
-            raise _turn_error_to_http(error)
-        try:
-            async with request.app.state.session_factory() as session:
-                latest_row = await get_conversation(session, conversation_id)
-                await mark_artifacts_attached(
-                    session,
-                    [item.artifact_id for item in payload.attachments],
-                    owner_email=user.email,
-                    conversation_id=conversation_id,
-                    session_id=latest_row.active_session_id if latest_row else None,
-                )
-                await session.commit()
-        except Exception:
-            logger.warning(
-                "Failed to persist post-submit attachment association",
-                extra={"extra_data": {"conversation_id": conversation_id}},
-                exc_info=True,
-            )
-        return JSONResponse(
-            status_code=202,
-            content=SendMessageResponse(status="accepted").model_dump(),
-        )
+            for item in suggestions
+        ]
+    )
 
 
 async def _require_managed_conversation(
@@ -2783,7 +3080,53 @@ async def _managed_action_response(
     )
 
 
-async def _last_agent_work_user_message(request: Request, link: Any) -> str | None:
+def _managed_control_metadata(link: Any, **updates: Any) -> dict[str, Any]:
+    """Return link control metadata with updates merged in."""
+
+    metadata = getattr(link, "control_metadata", None)
+    base = dict(metadata) if isinstance(metadata, dict) else {}
+    for key, value in updates.items():
+        if value is not None:
+            base[key] = value
+    return base
+
+
+def _managed_control_metadata_for_new_turn(link: Any) -> dict[str, Any]:
+    """Return control metadata with transient manual-cancel flags removed."""
+
+    metadata = _managed_control_metadata(link)
+    for key in ("cancelled_by_user", "cancel_source", "cancelled_at"):
+        metadata.pop(key, None)
+    return metadata
+
+
+def _managed_conversation_has_active_work(
+    request: Request, link: Any, conversation_id: str
+) -> bool:
+    """Return whether a managed target has queued or running work."""
+
+    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
+    if turn_scheduler is not None and turn_scheduler.has_active_turn(conversation_id):
+        return True
+    if getattr(link, "active_turn_id", None):
+        return True
+    return getattr(link, "turn_state", None) in {"queued", "running"}
+
+
+def _require_inactive_managed_conversation(
+    request: Request, link: Any, conversation_id: str
+) -> None:
+    if _managed_conversation_has_active_work(request, link, conversation_id):
+        raise api_exception(
+            409,
+            "active_turn_running",
+            "Stop the active managed turn before using this action.",
+        )
+
+
+async def _last_agent_work_user_message(
+    request: Request, link: Any
+) -> ManagedConversationRetryMessage | None:
     return await last_managed_conversation_user_message_for_retry(
         session_cache=request.app.state.session_cache,
         guardrails=request.app.state.providers.guardrails,
@@ -2835,32 +3178,68 @@ async def _record_agent_work_context(
     )
 
 
-@router.post("/{conversation_id}/managed/send", response_model=ManagedConversationActionResponse)
-async def managed_conversation_send(
+async def _record_managed_takeover_notice(
     request: Request,
+    *,
+    session_model: SessionModel,
+    link: Any,
+    follow_up_conversation_id: str,
+    follow_up_session_id: str,
+) -> None:
+    """Record a durable UI-visible notice on the closed managed conversation."""
+
+    event = SessionEvent(
+        type="system_message",
+        data={
+            "role": "system",
+            "content": "User took control in a follow-up conversation.",
+            "content_type": "text",
+            "kind": "managed_takeover",
+            "notice_id": f"managed_takeover:{link.link_id}",
+            "follow_up_conversation_id": follow_up_conversation_id,
+            "follow_up_session_id": follow_up_session_id,
+        },
+    )
+    append_result = await request.app.state.providers.guardrails.record_events(
+        session_model.session_id,
+        [event],
+        source="cognis_agent_work",
+        user_email=session_model.user_email,
+        agent_id=session_model.agent_id,
+    )
+    await request.app.state.session_cache.append_recorded_events(
+        session_model,
+        [event],
+        append_result,
+    )
+
+
+async def _send_managed_conversation_message(
+    request: Request,
+    *,
     conversation_id: str,
-    payload: ManagedConversationActionRequest,
+    link: Any,
+    user_email: str,
+    message: str,
+    wait: bool,
+    one_shot_chat_mode: ChatMode | None = None,
 ) -> ManagedConversationActionResponse:
-    user, link = await _require_managed_conversation(request, conversation_id)
-    if link.conversation_state == "closed":
-        raise api_exception(409, "closed", "Agent work is closed")
-    message = (payload.message or "").strip()
-    if not message:
-        raise api_exception(400, "invalid_request", "Message is required")
     async with request.app.state.session_factory() as session:
         await update_managed_conversation_link(
             session,
             link.link_id,
             conversation_state="open",
             turn_state="running",
-            notify_on_completion=not payload.wait,
+            notify_on_completion=not wait,
             last_error=None,
+            control_metadata=_managed_control_metadata_for_new_turn(link),
         )
         await session.commit()
     error = await request.app.state.turn_scheduler.submit_turn(
         conversation_id,
         message,
-        user_email=user.email,
+        user_email=user_email,
+        one_shot_chat_mode=one_shot_chat_mode,
     )
     active_turn_id = request.app.state.turn_scheduler.active_turn_id(conversation_id)
     if error is not None or active_turn_id is not None:
@@ -2877,7 +3256,7 @@ async def managed_conversation_send(
     if error is not None:
         raise _turn_error_to_http(error)
     result = None
-    if payload.wait:
+    if wait:
         waited = await request.app.state.turn_scheduler.wait_for_turn(conversation_id)
         result = {
             "kind": waited.__class__.__name__ if waited is not None else "idle",
@@ -2885,6 +3264,29 @@ async def managed_conversation_send(
             "result_summary": getattr(waited, "result_summary", None),
         }
     return await _managed_action_response(request, conversation_id, "sent", result)
+
+
+@router.post("/{conversation_id}/managed/send", response_model=ManagedConversationActionResponse)
+async def managed_conversation_send(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    user, link = await _require_managed_conversation(request, conversation_id)
+    if link.conversation_state == "closed":
+        raise api_exception(409, "closed", "Agent work is closed")
+    _require_inactive_managed_conversation(request, link, conversation_id)
+    message = (payload.message or "").strip()
+    if not message:
+        raise api_exception(400, "invalid_request", "Message is required")
+    return await _send_managed_conversation_message(
+        request,
+        conversation_id=conversation_id,
+        link=link,
+        user_email=user.email,
+        message=message,
+        wait=payload.wait,
+    )
 
 
 @router.post("/{conversation_id}/managed/wait", response_model=ManagedConversationActionResponse)
@@ -2932,6 +3334,60 @@ async def managed_conversation_interrupt(
     )
 
 
+@router.post("/{conversation_id}/managed/stop", response_model=ManagedConversationActionResponse)
+async def managed_conversation_stop(
+    request: Request,
+    conversation_id: str,
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    user, link = await _require_managed_conversation(request, conversation_id)
+    if link.conversation_state == "closed":
+        raise api_exception(409, "closed", "Agent work is closed")
+
+    now = datetime.now(UTC).isoformat()
+    async with request.app.state.session_factory() as session:
+        await update_managed_conversation_link(
+            session,
+            link.link_id,
+            notify_on_completion=True,
+            last_error=payload.reason or "Stopped by user from managed conversation UI",
+            control_metadata=_managed_control_metadata(
+                link,
+                cancelled_by_user=True,
+                cancel_source="managed_ui",
+                cancelled_at=now,
+            ),
+        )
+        await session.commit()
+
+    stopped = False
+    command_dispatcher = getattr(request.app.state, "command_dispatcher", None)
+    if command_dispatcher is not None and hasattr(command_dispatcher, "stop_conversation"):
+        stopped = await command_dispatcher.stop_conversation(
+            conversation_id,
+            user_email=user.email,
+        )
+    else:
+        stopped = await request.app.state.turn_scheduler.cancel_turn(conversation_id)
+
+    if not stopped:
+        async with request.app.state.session_factory() as session:
+            await update_managed_conversation_link(
+                session,
+                link.link_id,
+                turn_state="idle",
+                clear_active_turn_id=True,
+                notify_on_completion=False,
+            )
+            await session.commit()
+
+    return await _managed_action_response(
+        request,
+        conversation_id,
+        "stopped" if stopped else "idle",
+    )
+
+
 @router.post("/{conversation_id}/managed/retry", response_model=ManagedConversationActionResponse)
 async def managed_conversation_retry(
     request: Request,
@@ -2945,13 +3401,20 @@ async def managed_conversation_retry(
             "not_retryable",
             "Agent work retry is only available after a failed or interrupted turn.",
         )
-    message = await _last_agent_work_user_message(request, link)
-    if not message:
+    if link.conversation_state == "closed":
+        raise api_exception(409, "closed", "Agent work is closed")
+    _require_inactive_managed_conversation(request, link, conversation_id)
+    retry_message = await _last_agent_work_user_message(request, link)
+    if retry_message is None:
         raise api_exception(409, "not_retryable", "No previous user message is available to retry")
-    return await managed_conversation_send(
+    return await _send_managed_conversation_message(
         request,
-        conversation_id,
-        ManagedConversationActionRequest(message=message, wait=payload.wait),
+        conversation_id=conversation_id,
+        link=link,
+        user_email=link.user_email,
+        message=retry_message.content,
+        wait=payload.wait,
+        one_shot_chat_mode=retry_message.one_shot_chat_mode,
     )
 
 
@@ -3086,75 +3549,111 @@ async def managed_conversation_fork(
     return await _managed_action_response(request, new_conversation.conversation_id, "forked")
 
 
-async def _try_command_dispatch(
+@router.post(
+    "/{conversation_id}/managed/take-control",
+    response_model=ManagedConversationActionResponse,
+)
+async def managed_conversation_take_control(
     request: Request,
     conversation_id: str,
-    content: str,
-    user: Any,
-) -> dict[str, Any] | None:
-    """Try to dispatch a slash command. Returns result dict or None."""
-    command_dispatcher = getattr(request.app.state, "command_dispatcher", None)
-    if command_dispatcher is None:
-        return None
-    if not content.strip().startswith("/"):
-        return None
+    payload: ManagedConversationActionRequest,
+) -> ManagedConversationActionResponse:
+    user, link = await _require_managed_conversation(request, conversation_id)
+    if link.conversation_state == "closed":
+        raise api_exception(409, "closed", "Agent work is closed")
+    _require_inactive_managed_conversation(request, link, conversation_id)
 
-    from cognis.api.serializers import agent_to_response
     from cognis.core.session import _to_conversation_model, _to_session_model
-    from cognis.models.agent import AgentDefinition
 
-    session_manager = getattr(request.app.state, "session_manager", None)
     async with request.app.state.session_factory() as session:
         conversation_row = await get_conversation(session, conversation_id)
-        if conversation_row is None:
-            return None
-        agent_row = await get_agent(session, conversation_row.agent_id)
-        if agent_row is None:
-            return None
-        agent_model = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
-        conversation_model = _to_conversation_model(conversation_row)
+        target_session_id = link.target_session_id or getattr(
+            conversation_row, "active_session_id", None
+        )
         session_row = (
-            await get_session_row(session, conversation_row.active_session_id)
-            if conversation_row.active_session_id
+            await get_session_row(session, target_session_id)
+            if isinstance(target_session_id, str)
             else None
         )
+        agent_row = await get_agent(session, link.target_agent_id)
+    if conversation_row is None or session_row is None or agent_row is None:
+        raise api_exception(404, "not_found", "Agent work runtime not found")
 
-    if session_row is None:
-        if session_manager is None:
-            return None
-        session_model = await session_manager.ensure_root_session(
-            conversation_id=conversation_id,
-            user_email=user.email,
-            agent_id=conversation_model.agent_id,
-            intention=content,
-        )
-        conversation_model = conversation_model.model_copy(
-            update={"active_session_id": session_model.session_id}
-        )
-    else:
-        session_model = _to_session_model(session_row)
-
-    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
-    has_active = turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
-    has_busy = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
-
-    cmd_result = await command_dispatcher.dispatch(
-        content,
-        conversation=conversation_model,
-        session=session_model,
-        agent=agent_model,
-        user_email=user.email,
-        has_active_turn=has_active,
-        has_busy_turn=has_busy,
+    target_agent = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+    fork_title = f"Follow-up: {link.title or conversation_row.title or 'Agent work'}"
+    fork_intention = (
+        payload.message or f"User took control of managed work with {target_agent.name}"
     )
-    if cmd_result is None:
-        return None
+    (
+        new_conversation,
+        new_session,
+        copied,
+    ) = await request.app.state.session_manager.fork_into_new_conversation(
+        source_session=_to_session_model(session_row),
+        source_conversation=_to_conversation_model(conversation_row),
+        agent=target_agent,
+        user_email=user.email,
+        title=fork_title,
+        intention=fork_intention,
+        snapshot_extras={"trigger": "managed_conversation_take_control"},
+    )
+    if not copied:
+        raise api_exception(
+            500, "fork_failed", "Managed conversation takeover fork did not copy context"
+        )
 
-    return {
-        "type": cmd_result.type,
-        "text": cmd_result.text,
-        "data": cmd_result.data,
-    }
+    now = datetime.now(UTC).isoformat()
+    async with request.app.state.session_factory() as session:
+        await update_managed_conversation_link(
+            session,
+            link.link_id,
+            conversation_state="closed",
+            turn_state="idle",
+            clear_active_turn_id=True,
+            notify_on_completion=False,
+            last_result_summary="User took control in a follow-up conversation.",
+            last_error="Taken over by user",
+            control_metadata=_managed_control_metadata(
+                link,
+                follow_up_conversation_id=new_conversation.conversation_id,
+                follow_up_session_id=new_session.session_id,
+                taken_over_by_user_at=now,
+                takeover_source="managed_ui",
+                closed_reason="taken_over_by_user",
+            ),
+            closed=True,
+        )
+        await session.commit()
+
+    try:
+        await _record_managed_takeover_notice(
+            request,
+            session_model=_to_session_model(session_row),
+            link=link,
+            follow_up_conversation_id=new_conversation.conversation_id,
+            follow_up_session_id=new_session.session_id,
+        )
+    except Exception:
+        logger.warning(
+            "managed conversation takeover notice recording failed",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "follow_up_conversation_id": new_conversation.conversation_id,
+                }
+            },
+            exc_info=True,
+        )
+
+    return await _managed_action_response(
+        request,
+        conversation_id,
+        "taken_over",
+        {
+            "conversation_id": new_conversation.conversation_id,
+            "session_id": new_session.session_id,
+        },
+    )
 
 
 def _turn_error_to_http(error: TurnError) -> Exception:
@@ -3253,12 +3752,29 @@ async def session_events(
         session_row = await get_session_row(session, session_id)
     if session_row is None or session_row.conversation_id != conversation_id:
         raise api_exception(404, "not_found", "Session not found in this conversation")
-    event_result = await request.app.state.providers.guardrails.read_events(
-        session_id=session_row.intaris_session_id or session_row.session_id,
-        after_seq=after_seq,
-        limit=limit,
-        allow_missing_stream=True,
-    )
+    visible_events: list[Any] = []
+    read_after_seq = after_seq
+    event_result = None
+    while len(visible_events) < limit:
+        previous_after_seq = read_after_seq
+        event_result = await request.app.state.providers.guardrails.read_events(
+            session_id=session_row.intaris_session_id or session_row.session_id,
+            after_seq=read_after_seq,
+            limit=limit - len(visible_events),
+            allow_missing_stream=True,
+        )
+        visible_events.extend(
+            event for event in event_result.events if _visible_history_event(event)
+        )
+        read_after_seq = event_result.last_seq
+        if (
+            not event_result.has_more
+            or not event_result.events
+            or read_after_seq <= previous_after_seq
+        ):
+            break
+    if event_result is None:
+        raise api_exception(500, "history_read_failed", "Unable to read session history")
     if event_result.missing_stream_fallback_used:
         logger.warning(
             "Conversation session history missing in Intaris; returning empty history",
@@ -3272,25 +3788,28 @@ async def session_events(
         )
     await _hydrate_event_attachments(
         request,
-        event_result.events,
+        visible_events,
         conversation_id=conversation_id,
         session_id=session_id,
     )
+    active_thinking = (
+        request.app.state.session_cache.active_thinking_snapshots(session_row.session_id)
+        if getattr(request.app.state, "session_cache", None) is not None
+        else []
+    )
+    items = serialize_event_rows(
+        visible_events,
+        log_label="conversation_session_events",
+        log_context={
+            "conversation_id": conversation_id,
+            "session_id": session_row.session_id,
+        },
+    )
     return SessionEventsResponse(
         session_id=session_id,
-        items=serialize_event_rows(
-            event_result.events,
-            log_label="conversation_session_events",
-            log_context={
-                "conversation_id": conversation_id,
-                "session_id": session_row.session_id,
-            },
-        ),
+        items=items,
+        timeline_items=project_timeline_events(items),
         last_seq=event_result.last_seq,
         has_more=event_result.has_more,
-        active_thinking=(
-            request.app.state.session_cache.active_thinking_snapshots(session_row.session_id)
-            if getattr(request.app.state, "session_cache", None) is not None
-            else []
-        ),
+        active_thinking=active_thinking,
     )

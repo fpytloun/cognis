@@ -1,0 +1,9 @@
+id: single-phase-stream
+description: "Baseline: stream text in chunks, complete. Assert spinner clears."
+trigger: "scenario:single-phase-stream"
+turns:
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["Hello ", "world! ", "This ", "is ", "a ", "streaming ", "response."]
+        delay_ms: 30

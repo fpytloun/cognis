@@ -1,0 +1,35 @@
+id: tool-args-then-result
+description: |
+  Tool call with arguments, then tool result without arguments.
+  This was the field-loss bug: on_tool_call sends arguments, but on_tool_result
+  (isolated projection) omits them. The store must merge, not replace.
+  Assert: tool card keeps its title/args through started->running->completed.
+  Uses memory_search (controller-side builtin, works with memory_backend=none).
+
+  Turn 0: text + tool_call (finish_reason="tool_calls" → agent executes tool)
+  Turn 1: text response after tool result (finish_reason="stop")
+
+  This is the correct multi-turn format: tool_call must be the LAST step in
+  turn 0 so the agent loop executes it and calls the LLM again for turn 1.
+trigger: "scenario:tool-args-then-result"
+turns:
+  # Turn 0: text + tool_call (last step is tool_call → finish_reason="tool_calls")
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["I ", "will ", "search ", "for ", "information."]
+        delay_ms: 30
+      - type: tool_call
+        call_id: call_mem_search
+        name: memory_search
+        arguments:
+          query: "important facts about the topic"
+          limit: 5
+        delay_ms: 20
+
+  # Turn 1: text response after tool result (last step is text → finish_reason="stop")
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["The ", "search ", "is ", "complete."]
+        delay_ms: 30

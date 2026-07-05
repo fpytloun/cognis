@@ -1,0 +1,143 @@
+{
+  "lineage_ordinal": 0,
+  "raw_events": [
+    {
+      "store_id": "intaris",
+      "session_id": "sess_a",
+      "seq": 1,
+      "type": "user_message",
+      "data": {
+        "content": "Hello",
+        "message_id": "msg_user_1",
+        "client_message_id": "cm_1",
+        "client_txn_id": "txn_1",
+        "turn_id": "turn_1"
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_a",
+      "seq": 2,
+      "type": "assistant_thinking",
+      "data": {
+        "message_id": "msg_assistant_1",
+        "turn_id": "turn_1",
+        "block_id": "think_1",
+        "title": "Thinking",
+        "content": "Checking context",
+        "assistant_phase_index": 0
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_a",
+      "seq": 3,
+      "type": "assistant_message",
+      "data": {
+        "content": "Hi.",
+        "message_id": "msg_assistant_1",
+        "turn_id": "turn_1",
+        "assistant_phase_index": 0
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_a",
+      "seq": 4,
+      "type": "tool_call",
+      "data": {
+        "call_id": "call_1",
+        "name": "web_fetch",
+        "arguments": {
+          "url": "https://example.com"
+        },
+        "turn_id": "turn_1",
+        "assistant_phase_index": 1
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_a",
+      "seq": 5,
+      "type": "tool_result",
+      "data": {
+        "call_id": "call_1",
+        "result": "Fetched page",
+        "duration_ms": 42,
+        "has_full_output": true,
+        "tool_output_artifact_id": "art_tool_1"
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_a",
+      "seq": 6,
+      "type": "delegation",
+      "data": {
+        "child_session_id": "child_1",
+        "agent_id": "system:explore",
+        "title": "Explore event shapes",
+        "status": "complete",
+        "result_summary": "Mapped projection events"
+      }
+    }
+  ],
+  "expected": {
+    "skipped_count": 0,
+    "warning_codes": [],
+    "items": [
+      {
+        "id": "user:cm_1",
+        "kind": "message",
+        "sort_key": "0000:000000000000001:000000:00:000000000",
+        "source_ref_count": 1,
+        "role": "user",
+        "content": "Hello",
+        "message_id": "msg_user_1",
+        "client_message_id": "cm_1",
+        "client_txn_id": "txn_1"
+      },
+      {
+        "id": "thinking:msg_assistant_1:phase:0:think_1",
+        "kind": "thinking",
+        "sort_key": "0000:000000000000002:000000:01:000000001",
+        "source_ref_count": 1,
+        "status": "complete",
+        "message_id": "msg_assistant_1",
+        "block_ids": ["think_1"]
+      },
+      {
+        "id": "message:msg_assistant_1:phase:0",
+        "kind": "message",
+        "sort_key": "0000:000000000000003:000000:02:000000002",
+        "source_ref_count": 1,
+        "role": "assistant",
+        "content": "Hi.",
+        "message_id": "msg_assistant_1"
+      },
+      {
+        "id": "tool:call_1",
+        "kind": "tool_call",
+        "sort_key": "0000:000000000000004:000001:03:000000003",
+        "source_ref_count": 2,
+        "status": "complete",
+        "call_id": "call_1",
+        "tool_name": "web_fetch",
+        "result_preview": "Fetched page",
+        "duration_ms": 42,
+        "has_full_output": true,
+        "tool_output_artifact_id": "art_tool_1"
+      },
+      {
+        "id": "delegation:child_1",
+        "kind": "delegation",
+        "sort_key": "0000:000000000000006:000000:04:000000005",
+        "source_ref_count": 1,
+        "status": "complete",
+        "child_session_id": "child_1",
+        "agent_id": "system:explore",
+        "result_summary": "Mapped projection events"
+      }
+    ]
+  }
+}

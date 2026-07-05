@@ -166,6 +166,26 @@ def conversation_to_response(
                 "turn_state": getattr(managed_link, "turn_state", None),
                 "last_result_summary": getattr(managed_link, "last_result_summary", None),
                 "last_error": getattr(managed_link, "last_error", None),
+                "control_metadata": getattr(managed_link, "control_metadata", None),
+                "follow_up_conversation_id": (
+                    (getattr(managed_link, "control_metadata", None) or {}).get(
+                        "follow_up_conversation_id"
+                    )
+                    if isinstance(getattr(managed_link, "control_metadata", None), dict)
+                    else None
+                ),
+                "follow_up_session_id": (
+                    (getattr(managed_link, "control_metadata", None) or {}).get(
+                        "follow_up_session_id"
+                    )
+                    if isinstance(getattr(managed_link, "control_metadata", None), dict)
+                    else None
+                ),
+                "closed_reason": (
+                    (getattr(managed_link, "control_metadata", None) or {}).get("closed_reason")
+                    if isinstance(getattr(managed_link, "control_metadata", None), dict)
+                    else None
+                ),
             }
             if platform_data.get("kind") in {"agent_work", "managed_agent_conversation"}
             else None
@@ -228,6 +248,9 @@ def agent_to_response(row: Any) -> AgentResponse:
     permissions = getattr(row, "permissions", None)
     if hasattr(permissions, "model_dump"):
         permissions = permissions.model_dump(mode="json", exclude_none=True)
+    capabilities = getattr(row, "capabilities", None)
+    if hasattr(capabilities, "model_dump"):
+        capabilities = capabilities.model_dump(mode="json", exclude_none=True)
     return AgentResponse(
         agent_id=row.agent_id,
         owner_email=row.owner_email,
@@ -240,6 +263,7 @@ def agent_to_response(row: Any) -> AgentResponse:
         tools=row.tools,
         permissions=permissions,
         llm_config=llm_config,
+        capabilities=capabilities,
         agent_profiles=agent_profiles,
         default_agent_profile_id=getattr(row, "default_agent_profile_id", None),
         execution=getattr(row, "execution", None),

@@ -1,0 +1,84 @@
+id: thinking-then-tools-then-answer
+description: |
+  Real-world pattern combining thinking blocks with tool calls and a
+  multi-turn response — the most complex scenario from production.
+
+  Pattern (from real coding sessions with extended thinking models):
+  - Turn 0: thinking block + tool calls (reason then gather info)
+  - Turn 1: comprehensive text answer after tool results
+
+  This is the hardest scenario for the timeline renderer:
+  - Thinking item must finalize (not hang) after message_complete
+  - Tool cards must keep their arguments across result patches
+  - Text response arrives cleanly in turn 1
+
+  All content is synthetic.
+trigger: "scenario:thinking-then-tools-then-answer"
+turns:
+  # Turn 0: thinking then tool calls
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_reason_1
+        title: "Thinking"
+        content: "Let me think about the best approach. I should first gather relevant context before providing a comprehensive answer."
+        complete: true
+        delay_ms: 40
+      - type: tool_call
+        call_id: call_ctx_1
+        name: memory_search
+        arguments:
+          query: "component architecture"
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_ctx_2
+        name: memory_search
+        arguments:
+          query: "design patterns used"
+        delay_ms: 20
+
+  # Turn 1: comprehensive answer after tool results
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "Based "
+          - "on "
+          - "my "
+          - "analysis "
+          - "and "
+          - "the "
+          - "gathered "
+          - "context:\n\n"
+          - "The "
+          - "component "
+          - "follows "
+          - "a "
+          - "layered "
+          - "architecture "
+          - "with "
+          - "clear "
+          - "separation "
+          - "of "
+          - "concerns. "
+          - "Each "
+          - "layer "
+          - "has "
+          - "a "
+          - "single "
+          - "responsibility "
+          - "and "
+          - "communicates "
+          - "through "
+          - "well-defined "
+          - "interfaces. "
+          - "This "
+          - "makes "
+          - "the "
+          - "system "
+          - "easy "
+          - "to "
+          - "test "
+          - "and "
+          - "maintain."
+        delay_ms: 20

@@ -1,0 +1,22 @@
+id: refresh-mid-and-post-turn
+description: |
+  Tests history-projection <-> runtime-id parity (disappear/reappear on refresh).
+  Uses a pre-seeded session so the history projector has events to project.
+  The runtime snapshot and history projection must produce the same item ids
+  so the client store can merge them without orphaning or duplicating.
+  
+  This scenario is used with the pre-seeded e2e conversation (seed-e2e.py).
+  The trigger sends a new message to an existing conversation with history.
+trigger: "scenario:refresh-mid-and-post-turn"
+turns:
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_refresh_1
+        title: "Thinking"
+        content: "Reviewing the conversation history..."
+        complete: true
+        delay_ms: 40
+      - type: text
+        chunks: ["Based ", "on ", "our ", "previous ", "conversation, ", "here ", "is ", "my ", "response."]
+        delay_ms: 30

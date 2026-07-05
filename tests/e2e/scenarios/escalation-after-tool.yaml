@@ -1,0 +1,23 @@
+id: escalation-after-tool
+description: |
+  Tool call followed by text response.
+  Tests that tool_call items are stable and don't duplicate.
+  Note: escalation events come from Intaris (not the mock LLM), so this
+  scenario tests the tool_call + result path without actual escalation.
+  Uses memory_search (controller-side builtin, works with memory_backend=none).
+trigger: "scenario:escalation-after-tool"
+turns:
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["I ", "will ", "look ", "up ", "some ", "information."]
+        delay_ms: 30
+      - type: tool_call
+        call_id: call_lookup
+        name: memory_search
+        arguments:
+          query: "security policy"
+        delay_ms: 20
+      - type: text
+        chunks: ["Done."]
+        delay_ms: 20

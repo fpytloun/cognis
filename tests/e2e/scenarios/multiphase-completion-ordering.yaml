@@ -1,0 +1,54 @@
+id: multiphase-completion-ordering
+description: |
+  Reproduces the live ordering bugs:
+    Bug 1: completion item's real Intaris seq jumps it above sentinel-seq
+           earlier-phase siblings → "assistant, thinking, tool" live, heals on refresh.
+    Bug 2: phase-1 thinking appears after a finalized phase-0 assistant because
+           on_thinking is called without canonical_items, so _next_tool_boundary_order_key
+           returns None and the thinking gets a sentinel-seq orderKey that sorts
+           after the real-seq completion item.
+
+  Turn shape:
+    Phase 0: thinking block + tool_call (finish_reason="tool_calls")
+    Phase 1: final assistant text (finish_reason="stop")
+
+  After phase 0 completes, the phase-0 assistant completion item (build_assistant_completion_item)
+  must NOT sort above the phase-0 thinking/tool siblings. The phase-1 assistant
+  must sort after the phase-0 tool.
+
+  INV-PHASE-ORDER asserts: within a turn, items are ordered by (phase, kind_rank).
+  This scenario goes RED on the bug and GREEN after the fix.
+
+trigger: "scenario:multiphase-completion-ordering"
+turns:
+  # Turn 0: thinking + tool_call → finish_reason="tool_calls"
+  - role: assistant
+    steps:
+      - type: thinking
+        block_id: blk_phase0
+        title: "Planning the approach"
+        content: "I need to search for context before answering."
+        complete: true
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_phase0
+        name: memory_search
+        arguments:
+          query: "ordering test context"
+        delay_ms: 15
+
+  # Turn 1: final assistant text → finish_reason="stop"
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "Based "
+          - "on "
+          - "the "
+          - "search "
+          - "results, "
+          - "here "
+          - "is "
+          - "the "
+          - "answer."
+        delay_ms: 20

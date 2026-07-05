@@ -1,0 +1,67 @@
+id: tool-error-recovery
+description: |
+  Real-world pattern: tool calls in turn 0, text response in turn 1.
+  The tool calls use memory_search which returns empty results (not errors)
+  since we can't simulate actual tool errors in the mock LLM.
+
+  Tests:
+  - Multiple tool cards render correctly
+  - Tool cards keep their arguments across result patches
+  - Final text response arrives after all tool results
+  - No duplicate tool cards
+
+  Note: actual tool error recovery (is_error=true) is tested at the
+  backend-contract level via the invariants — the client store handles
+  error tool cards the same as successful ones.
+
+  All content is synthetic.
+trigger: "scenario:tool-error-recovery"
+turns:
+  # Turn 0: multiple tool calls (simulating a retry sequence)
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_attempt_1
+        name: memory_search
+        arguments:
+          query: "first attempt"
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_attempt_2
+        name: memory_search
+        arguments:
+          query: "second attempt with different query"
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_attempt_3
+        name: memory_search
+        arguments:
+          query: "fallback query"
+        delay_ms: 20
+
+  # Turn 1: response after all tool results
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - "After "
+          - "trying "
+          - "multiple "
+          - "queries, "
+          - "the "
+          - "fallback "
+          - "approach "
+          - "provided "
+          - "the "
+          - "needed "
+          - "context. "
+          - "Here "
+          - "is "
+          - "the "
+          - "result "
+          - "based "
+          - "on "
+          - "the "
+          - "available "
+          - "information."
+        delay_ms: 25

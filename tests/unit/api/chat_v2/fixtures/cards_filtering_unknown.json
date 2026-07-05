@@ -1,0 +1,232 @@
+{
+  "lineage_ordinal": 0,
+  "raw_events": [
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 1,
+      "type": "developer_message",
+      "data": {
+        "content": "internal"
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 2,
+      "type": "user_message",
+      "lane": "side",
+      "data": {
+        "content": "side lane"
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 3,
+      "type": "user_message",
+      "prompt_visibility": "internal",
+      "data": {
+        "content": "hidden"
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 4,
+      "type": "question_set",
+      "data": {
+        "request_id": "question_1",
+        "title": "Need input",
+        "questions": [
+          {
+            "id": "scope",
+            "question": "Scope?",
+            "required": true
+          }
+        ]
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 5,
+      "type": "auth_challenge",
+      "data": {
+        "challenge_id": "auth_1",
+        "kind": "otp_code",
+        "label": "MFA",
+        "message": "Enter code",
+        "required_fields": ["code"]
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 6,
+      "type": "credential_request",
+      "data": {
+        "credential_request_id": "cred_req_1",
+        "credential_id": "github-token",
+        "kind": "token",
+        "label": "GitHub token",
+        "required_fields": ["token"]
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 7,
+      "type": "todo_state",
+      "data": {
+        "todos": [
+          {
+            "content": "Project fixtures",
+            "status": "completed"
+          }
+        ]
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 8,
+      "type": "artifact",
+      "data": {
+        "artifact_id": "art_1",
+        "filename": "report.md",
+        "mime_type": "text/markdown",
+        "size_bytes": 120
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 9,
+      "type": "file_diff",
+      "data": {
+        "title": "Patch",
+        "file_diffs": [
+          {
+            "path": "src/main.py",
+            "diff": "+ok"
+          }
+        ]
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 10,
+      "type": "mystery_event",
+      "data": {
+        "value": 1
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 11,
+      "type": "history_gap",
+      "data": {
+        "notice_id": "gap_1",
+        "title": "History incomplete",
+        "message": "A range is unavailable"
+      }
+    },
+    {
+      "store_id": "intaris",
+      "session_id": "sess_cards",
+      "seq": 12,
+      "type": "task_result",
+      "data": {
+        "task_id": "task_1",
+        "title": "Background task",
+        "result_summary": "Completed"
+      }
+    }
+  ],
+  "expected": {
+    "skipped_count": 3,
+    "skipped_event_types": {
+      "developer_message": 1,
+      "user_message": 2
+    },
+    "warning_codes": ["unsupported_event"],
+    "items": [
+      {
+        "id": "question-set:question_1",
+        "kind": "question_set",
+        "sort_key": "0000:000000000000004:000000:06:000000003",
+        "source_ref_count": 1,
+        "status": "waiting",
+        "question_count": 1
+      },
+      {
+        "id": "auth-challenge:auth_1",
+        "kind": "auth_challenge",
+        "sort_key": "0000:000000000000005:000000:06:000000004",
+        "source_ref_count": 1,
+        "status": "waiting",
+        "challenge_kind": "otp_code",
+        "required_fields": ["code"]
+      },
+      {
+        "id": "credential-request:cred_req_1",
+        "kind": "credential_request",
+        "sort_key": "0000:000000000000006:000000:06:000000005",
+        "source_ref_count": 1,
+        "status": "waiting",
+        "credential_id": "github-token",
+        "credential_kind": "token"
+      },
+      {
+        "id": "todo-state:sess_cards:7",
+        "kind": "todo_state",
+        "sort_key": "0000:000000000000007:000000:07:000000006",
+        "source_ref_count": 1,
+        "todo_count": 1
+      },
+      {
+        "id": "artifact:art_1",
+        "kind": "artifact",
+        "sort_key": "0000:000000000000008:000000:08:000000007",
+        "source_ref_count": 1,
+        "artifact_id": "art_1",
+        "filename": "report.md"
+      },
+      {
+        "id": "file-diff:sess_cards:9",
+        "kind": "file_diff",
+        "sort_key": "0000:000000000000009:000000:08:000000008",
+        "source_ref_count": 1,
+        "file_diff_count": 1
+      },
+      {
+        "id": "unknown:intaris:sess_cards:10",
+        "kind": "notice",
+        "sort_key": "0000:000000000000010:000000:12:000000009",
+        "source_ref_count": 1,
+        "level": "warning",
+        "title": "Unsupported chat event"
+      },
+      {
+        "id": "notice:gap_1",
+        "kind": "notice",
+        "sort_key": "0000:000000000000011:000000:10:000000010",
+        "source_ref_count": 1,
+        "level": "warning",
+        "title": "History incomplete"
+      },
+      {
+        "id": "task:task_1",
+        "kind": "task",
+        "sort_key": "0000:000000000000012:000000:05:000000011",
+        "source_ref_count": 1,
+        "status": "complete",
+        "task_id": "task_1",
+        "result_summary": "Completed"
+      }
+    ]
+  }
+}

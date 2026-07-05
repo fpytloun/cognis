@@ -1,0 +1,41 @@
+id: thinking-multiblock
+description: |
+  Thinking segment grows a second block mid-stream.
+  This was the id-mutation hanging-spinner bug: the runtime thinking item id
+  changed as blocks accumulated (thinking:msg:blk1 -> thinking:msg:blk1:blk2),
+  orphaning the previous id in the client store.
+trigger: "scenario:thinking-multiblock"
+turns:
+  - role: assistant
+    steps:
+      # First thinking block arrives (incomplete)
+      - type: thinking
+        block_id: blk_1
+        title: "Thinking"
+        content: "Step 1: analyzing the problem..."
+        complete: false
+        delay_ms: 50
+      # First block completes, second block starts
+      - type: thinking
+        block_id: blk_1
+        title: "Thinking"
+        content: "Step 1: analyzing the problem... done."
+        complete: true
+        delay_ms: 30
+      - type: thinking
+        block_id: blk_2
+        title: "Thinking"
+        content: "Step 2: formulating response..."
+        complete: false
+        delay_ms: 50
+      # Second block completes
+      - type: thinking
+        block_id: blk_2
+        title: "Thinking"
+        content: "Step 2: formulating response... done."
+        complete: true
+        delay_ms: 30
+      # Text response
+      - type: text
+        chunks: ["Based ", "on ", "my ", "analysis, ", "here ", "is ", "the ", "answer."]
+        delay_ms: 30

@@ -94,6 +94,10 @@ responds:
 
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.
 
+Use `/compact` to compact the current conversation manually. Manual compaction
+runs immediately and rotates to the new active session before the next user
+message is recorded.
+
 Long-lived ambient chats, such as web direct chats with an agent and external
 channel conversations, can also checkpoint after an idle gap. By default, if the
 active session has been idle for 6 hours and has at least 20 uncompacted events,

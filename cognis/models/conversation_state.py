@@ -27,6 +27,7 @@ class ConversationActiveSessionState(BaseModel):
     session_id: str | None = None
     status: str | None = None
     completion_reason: str | None = None
+    todos: list[ConversationTodoItem] = Field(default_factory=list)
 
 
 class ConversationTodoItem(BaseModel):
