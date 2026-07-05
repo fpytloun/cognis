@@ -14,6 +14,7 @@ class MidStreamErrorCategory(StrEnum):
     QUOTA_EXHAUSTED = "quota_exhausted"
     CONTEXT_OVERFLOW = "context_overflow"
     ARTIFACT_FETCH = "artifact_fetch"
+    ATTACHMENT_INPUT = "attachment_input"
     PROVIDER_5XX = "provider_5xx"
     CONNECTION = "connection"
     IDLE_TIMEOUT_RAW = "idle_timeout_raw"
@@ -140,7 +141,9 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
     else:
         param = None
 
-    if "reasoning.summary" in lowered or param == "reasoning.summary":
+    if param == "reasoning.summary" or (
+        code in {"unsupported_parameter", "unknown_parameter"} and "reasoning.summary" in lowered
+    ):
         category = MidStreamErrorCategory.REASONING_SUMMARY_REJECTED
     elif "context" in lowered and any(token in lowered for token in ("window", "length", "token")):
         category = MidStreamErrorCategory.CONTEXT_OVERFLOW
@@ -150,6 +153,8 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.RATE_LIMIT
     elif _looks_like_artifact_fetch_error(lowered, param):
         category = MidStreamErrorCategory.ARTIFACT_FETCH
+    elif _looks_like_attachment_input_error(lowered, param):
+        category = MidStreamErrorCategory.ATTACHMENT_INPUT
     elif status in {500, 502, 503, 504} or any(
         marker in lowered for marker in ("server error", "bad gateway", "service unavailable")
     ):
@@ -187,6 +192,8 @@ def classify_response_failure(details: dict[str, Any]) -> MidStreamErrorPayload:
         category = MidStreamErrorCategory.REASONING_SUMMARY_REJECTED
     elif _looks_like_artifact_fetch_error(lowered, str(param) if param is not None else None):
         category = MidStreamErrorCategory.ARTIFACT_FETCH
+    elif _looks_like_attachment_input_error(lowered, str(param) if param is not None else None):
+        category = MidStreamErrorCategory.ATTACHMENT_INPUT
     elif _looks_like_quota_exhaustion(lowered, str(code) if code is not None else None):
         category = MidStreamErrorCategory.QUOTA_EXHAUSTED
     elif "rate" in lowered and "limit" in lowered:
@@ -240,6 +247,34 @@ def _looks_like_artifact_fetch_error(message: str, param: str | None) -> bool:
         param in {"url", "image_url", "file_url"}
         and any(marker in message for marker in ("download", "fetch", "timeout", "timed out"))
     ) or bool("timeout while downloading" in message and "url" in message)
+
+
+def _looks_like_attachment_input_error(message: str, param: str | None) -> bool:
+    """Return whether a provider rejected native attachment input itself."""
+
+    param_text = (param or "").lower()
+    if param_text and not any(
+        marker in param_text
+        for marker in ("input", "message", "content", "image_url", "file_url", "url")
+    ):
+        return False
+    return (
+        any(marker in message for marker in ("input_image", "image_url", "file_url"))
+        and any(
+            marker in message
+            for marker in (
+                "invalid",
+                "not supported",
+                "unsupported",
+                "expected",
+                "valid image",
+                "supported image format",
+            )
+        )
+    ) or (
+        "image data" in message
+        and any(marker in message for marker in ("invalid", "valid image", "supported image"))
+    )
 
 
 def _looks_like_quota_exhaustion(message: str, code: str | None) -> bool:

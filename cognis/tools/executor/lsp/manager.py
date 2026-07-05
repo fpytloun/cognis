@@ -29,7 +29,13 @@ from cognis.logging import get_logger
 from cognis.tools.executor.lsp.client import LSPClient, file_uri, uri_to_path
 from cognis.tools.executor.lsp.install import get_cache_dir, resolve_command
 from cognis.tools.executor.lsp.servers import LSPServerDefinition, get_servers_for_extension
-from cognis.tools.executor.lsp.types import Diagnostic
+from cognis.tools.executor.lsp.types import (
+    Diagnostic,
+    DiagnosticCollection,
+    DiagnosticFreshness,
+    DiagnosticSnapshot,
+    DiagnosticWaitResult,
+)
 
 logger = get_logger(__name__)
 
@@ -110,8 +116,8 @@ class LSPManager:
         # Dedup concurrent spawns
         self._spawning: dict[str, asyncio.Task[LSPClient | None]] = {}
 
-        # File version tracking for didChange
-        self._file_versions: dict[str, int] = {}
+        # File version tracking for didChange, per client and URI.
+        self._file_versions: dict[tuple[str, str], int] = {}
 
         # Files that have been opened on each client
         self._opened_files: dict[str, set[str]] = {}  # client_key → set of URIs
@@ -127,7 +133,14 @@ class LSPManager:
     # Public API
     # ------------------------------------------------------------------
 
-    async def touch_file(self, file_path: str, *, wait: bool = True) -> None:
+    async def touch_file(
+        self,
+        file_path: str,
+        *,
+        wait: bool = True,
+        save: bool = False,
+        purpose: str = "diagnostics",
+    ) -> DiagnosticCollection:
         """Notify LSP servers of a file change.
 
         Finds matching server definitions by file extension, lazily spawns
@@ -136,22 +149,26 @@ class LSPManager:
         Args:
             file_path: Absolute path to the file.
             wait: If True, wait for diagnostics (with timeout).
+            save: If True, send didSave after didOpen/didChange.
+            purpose: ``diagnostics`` for edit-time diagnostics, ``semantic`` for explicit LSP queries.
         """
         if not self.enabled:
-            return
+            return DiagnosticCollection()
 
         abs_path = os.path.abspath(file_path)
         ext = os.path.splitext(abs_path)[1].lower()
         if not ext:
-            return
+            return DiagnosticCollection()
 
-        servers = get_servers_for_extension(ext)
+        servers = get_servers_for_extension(
+            ext, purpose="diagnostics" if purpose == "diagnostics" else "semantic"
+        )
         if not servers:
             logger.debug(
                 "lsp: no server for extension",
                 extra={"extra_data": {"extension": ext}},
             )
-            return
+            return DiagnosticCollection()
 
         # Start idle check task if not running
         if self._idle_check_task is None or self._idle_check_task.done():
@@ -159,7 +176,7 @@ class LSPManager:
                 self._idle_check_loop(), name="lsp-idle-check"
             )
 
-        clients_to_wait: list[tuple[LSPClient, str]] = []
+        clients_to_wait: list[tuple[LSPClient, str, int | None]] = []
 
         for server_def in servers:
             root_path = _find_project_root(abs_path, server_def.root_markers)
@@ -252,13 +269,16 @@ class LSPManager:
                     text = await asyncio.to_thread(Path(abs_path).read_text, "utf-8")
                     await client.did_open(uri, language_id, text)
                     opened_set.add(uri)
-                    self._file_versions[abs_path] = 0
+                    version = 0
+                    self._file_versions[(client_key, uri)] = version
                 else:
                     # Subsequent change — didChange
-                    version = self._file_versions.get(abs_path, 0) + 1
-                    self._file_versions[abs_path] = version
+                    version = self._file_versions.get((client_key, uri), 0) + 1
+                    self._file_versions[(client_key, uri)] = version
                     text = await asyncio.to_thread(Path(abs_path).read_text, "utf-8")
                     await client.did_change(uri, version, text)
+                if save:
+                    await client.did_save(uri)
             except Exception:
                 logger.debug(
                     "lsp: file notification failed",
@@ -268,26 +288,56 @@ class LSPManager:
                 continue
 
             if wait:
-                clients_to_wait.append((client, uri))
+                clients_to_wait.append((client, uri, version))
 
         # Wait for diagnostics from all notified clients concurrently
+        wait_results: list[DiagnosticWaitResult] = []
         if clients_to_wait:
-            await asyncio.gather(
-                *(self._wait_client_diagnostics(c, u) for c, u in clients_to_wait),
+            results = await asyncio.gather(
+                *(self._wait_client_diagnostics(c, u, v) for c, u, v in clients_to_wait),
                 return_exceptions=True,
             )
+            wait_results = [
+                result for result in results if isinstance(result, DiagnosticWaitResult)
+            ]
+        snapshots_by_path: dict[str, list[DiagnosticSnapshot]] = {}
+        for wait_result in wait_results:
+            if wait_result.snapshot is None:
+                continue
+            path = uri_to_path(wait_result.snapshot.uri)
+            snapshots_by_path.setdefault(path, []).append(wait_result.snapshot)
+        return DiagnosticCollection(
+            waits=wait_results,
+            snapshots_by_path=snapshots_by_path,
+        )
 
-    async def _wait_client_diagnostics(self, client: LSPClient, uri: str) -> None:
+    async def _wait_client_diagnostics(
+        self, client: LSPClient, uri: str, target_version: int | None
+    ) -> DiagnosticWaitResult:
         """Wait for diagnostics from a single client with metrics."""
         start = perf_counter()
         try:
-            diags = await client.wait_for_diagnostics(uri, timeout_ms=self.diagnostics_timeout_ms)
+            result = await client.wait_for_diagnostics(
+                uri,
+                target_version=target_version,
+                timeout_ms=self.diagnostics_timeout_ms,
+            )
             # Record metrics
-            for d in diags:
-                if d.severity is not None:
-                    LSP_DIAGNOSTICS_TOTAL.labels(severity=d.severity.name.lower()).inc()
+            if result.snapshot is not None:
+                for d in result.snapshot.diagnostics:
+                    if d.severity is not None:
+                        LSP_DIAGNOSTICS_TOTAL.labels(severity=d.severity.name.lower()).inc()
+            return result
         except Exception:
             LSP_ERRORS_TOTAL.labels(error_type="diagnostics_wait").inc()
+            return DiagnosticWaitResult(
+                server_id=client.server_id,
+                uri=uri,
+                target_version=target_version,
+                status=DiagnosticFreshness.FAILED,
+                duration_ms=int((perf_counter() - start) * 1000),
+                message="diagnostics wait failed",
+            )
         finally:
             LSP_DIAGNOSTICS_WAIT.labels(server_id=client.server_id).observe(perf_counter() - start)
 
@@ -341,6 +391,33 @@ class LSPManager:
                     path = uri_to_path(uri)
                     if path != os.path.abspath(file_path) and path not in result:
                         result[path] = diags
+
+        return result
+
+    def get_diagnostic_snapshots(
+        self, file_path: str | None = None
+    ) -> dict[str, list[DiagnosticSnapshot]]:
+        """Return aggregated diagnostic snapshots from all active clients."""
+        result: dict[str, list[DiagnosticSnapshot]] = {}
+
+        for client in self._clients.values():
+            if file_path is not None:
+                uri = file_uri(file_path)
+                client_snapshots = client.get_diagnostic_snapshots(uri)
+            else:
+                client_snapshots = client.get_diagnostic_snapshots()
+
+            for uri, snapshot in client_snapshots.items():
+                path = uri_to_path(uri)
+                result.setdefault(path, []).append(snapshot)
+
+        if file_path is not None:
+            abs_file = os.path.abspath(file_path)
+            for client in self._clients.values():
+                for uri, snapshot in client.get_diagnostic_snapshots().items():
+                    path = uri_to_path(uri)
+                    if path != abs_file and path not in result:
+                        result[path] = [snapshot]
 
         return result
 
@@ -409,6 +486,7 @@ class LSPManager:
                     "error_count": error_count,
                     "warning_count": warning_count,
                     "idle_seconds": idle_seconds,
+                    "diagnostics": client.diagnostic_status(),
                 }
             )
 
@@ -487,19 +565,19 @@ class LSPManager:
     async def definition(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
         """Return LSP definitions for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True)
+        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
         return await self._fanout_query(clients, "definition", file_path, line, character)
 
     async def references(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
         """Return LSP references for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True)
+        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
         return await self._fanout_query(clients, "references", file_path, line, character)
 
     async def hover(self, file_path: str, line: int, character: int) -> list[dict[str, Any]]:
         """Return hover information for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True)
+        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
         results = await asyncio.gather(
             *(client.hover(file_path, line, character) for client in clients),
             return_exceptions=True,
@@ -509,7 +587,7 @@ class LSPManager:
     async def document_symbol(self, file_path: str) -> list[dict[str, Any]]:
         """Return document symbols for a file."""
 
-        clients = await self._clients_for_file(file_path, wait=True)
+        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
         results = await asyncio.gather(
             *(client.document_symbol(file_path) for client in clients),
             return_exceptions=True,
@@ -519,7 +597,7 @@ class LSPManager:
     async def workspace_symbol(self, file_path: str, query: str) -> list[dict[str, Any]]:
         """Return workspace symbols from relevant clients."""
 
-        clients = await self._clients_for_file(file_path, wait=True)
+        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
         results = await asyncio.gather(
             *(client.workspace_symbol(query) for client in clients),
             return_exceptions=True,
@@ -531,7 +609,7 @@ class LSPManager:
     ) -> list[dict[str, Any]]:
         """Return implementations for a file position."""
 
-        clients = await self._clients_for_file(file_path, wait=True)
+        clients = await self._clients_for_file(file_path, wait=True, purpose="semantic")
         return await self._fanout_query(clients, "implementation", file_path, line, character)
 
     async def cleanup(self) -> None:
@@ -577,12 +655,16 @@ class LSPManager:
             },
         )
 
-    async def _clients_for_file(self, file_path: str, *, wait: bool) -> list[LSPClient]:
+    async def _clients_for_file(
+        self, file_path: str, *, wait: bool, purpose: str = "semantic"
+    ) -> list[LSPClient]:
         abs_path = os.path.abspath(file_path)
         ext = os.path.splitext(abs_path)[1].lower()
         if not ext:
             return []
-        servers = get_servers_for_extension(ext)
+        servers = get_servers_for_extension(
+            ext, purpose="diagnostics" if purpose == "diagnostics" else "semantic"
+        )
         if not servers:
             return []
         clients: list[LSPClient] = []

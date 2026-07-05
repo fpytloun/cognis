@@ -22,6 +22,7 @@ from cognis.providers.llm import retry as llm_retry
 from cognis.providers.llm.errors import (
     MidStreamErrorCategory,
     classify_llm_exception,
+    classify_response_failure,
 )
 from cognis.providers.llm.litellm import (
     LiteLLMProvider,
@@ -38,6 +39,7 @@ from cognis.providers.llm.reasoning import (
     remap_reasoning_effort_to_available,
 )
 from cognis.providers.llm.responses_bridge import responses_request_kwargs
+from cognis.providers.llm.retry import is_retryable_error
 from cognis.providers.llm.service import LLMService
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider, ModelRouting
@@ -104,6 +106,22 @@ def test_classify_llm_exception_artifact_fetch_payload() -> None:
 
     assert payload["category"] == MidStreamErrorCategory.ARTIFACT_FETCH.value
     assert payload["artifact_urls"] == ["https://cognis.fpy.cz/api/v1/artifacts/content/a/b.png"]
+
+
+def test_classify_response_failure_invalid_image_as_attachment_input() -> None:
+    payload = classify_response_failure(
+        {
+            "message": (
+                "The image data you provided does not represent a valid image. "
+                "Please use one of the supported image formats."
+            ),
+            "code": "invalid_value",
+            "param": "input[0].content[1].image_url.url",
+        }
+    )
+
+    assert payload["category"] == MidStreamErrorCategory.ATTACHMENT_INPUT.value
+    assert payload["param"] == "input[0].content[1].image_url.url"
 
 
 def test_classify_llm_exception_reasoning_summary_rejection() -> None:
@@ -491,6 +509,64 @@ async def test_chatgpt_generate_uses_direct_codex_transport_by_default(
     assert captured["input"] == [{"role": "user", "content": "hi"}]
     assert captured["store"] is False
     assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_anthropic_subscription_discover_models_uses_remote_models(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic-subscription",
+                display_name="Claude Subscription",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "auth_config": {"mode": "oauth", "provider": "anthropic_subscription"},
+                    "default_model": "claude-fable-5",
+                    "models": [{"model_id": "claude-sonnet-4-5"}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_auth(
+        self: LiteLLMProvider, row: LLMProvider
+    ) -> litellm_provider_module.AnthropicSubscriptionAuth:
+        captured["auth_provider_id"] = row.provider_id
+        return litellm_provider_module.AnthropicSubscriptionAuth("access-token")
+
+    async def _fake_fetch(
+        auth: litellm_provider_module.AnthropicSubscriptionAuth,
+    ) -> list[dict[str, Any]]:
+        captured["access_token"] = auth.access_token
+        return [
+            {"model_id": "claude-fable-5", "name": "Claude Fable 5 Remote"},
+            {"model_id": "claude-model-only-from-api", "name": "Remote-only model"},
+        ]
+
+    monkeypatch.setattr(LLMService, "_anthropic_subscription_auth", _fake_auth)
+    monkeypatch.setattr(litellm_provider_module, "fetch_subscription_models", _fake_fetch)
+
+    provider = LLMService(session_factory)
+    models = await provider.discover_models("anthropic-subscription")
+
+    by_id = {entry["model_id"]: entry for entry in models}
+    assert captured == {
+        "auth_provider_id": "anthropic-subscription",
+        "access_token": "access-token",
+    }
+    assert "claude-model-only-from-api" in by_id
+    assert by_id["claude-fable-5"]["name"] == "Claude Fable 5 Remote"
+    assert by_id["claude-fable-5"]["supports_prompt_caching"] is True
+    assert "claude-sonnet-4-5" in by_id
     await engine.dispose()
 
 
@@ -1551,6 +1627,39 @@ async def test_user_owned_provider_secret_auth_uses_provider_owner_scope(
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_drops_invalid_provider_request_kwargs(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="bad-openai",
+            display_name="Bad OpenAI Compatible",
+            location="controller",
+            backend="litellm",
+            config={
+                "preset": "openai_compatible",
+                "api_base": ["http://127.0.0.1:8090"],
+                "base_url": ["http://127.0.0.1:8090"],
+                "timeout": [30],
+                "api_version": "2024-10-21",
+            },
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    async with session_factory() as session:
+        row = await session.get(LLMProvider, "bad-openai")
+    kwargs = await provider._resolve_provider_kwargs(row)
+
+    assert kwargs == {"api_version": "2024-10-21"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_chatgpt_oauth_rejects_executor_location(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
@@ -2370,12 +2479,45 @@ def test_reasoning_translation_enforces_anthropic_budget_floor() -> None:
         model_id="claude-sonnet-4-20250514",
         provider_preset="anthropic",
         model_info=DEFAULT_MODEL_INFO.model_copy(
-            update={"supports_reasoning": True, "supports_extended_thinking": True}
+            update={
+                "supports_reasoning": True,
+                "supports_extended_thinking": True,
+                "max_output_tokens": 20000,
+            }
         ),
     )
 
     assert prepared.request_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8192}
-    assert prepared.request_kwargs["max_tokens"] == 9216
+    assert prepared.request_kwargs["max_tokens"] == 12288
+
+
+def test_reasoning_translation_preserves_anthropic_sampling_when_thinking_off() -> None:
+    prepared = apply_reasoning_config(
+        {"temperature": 0.3, "top_p": 0.9, "max_tokens": 4000},
+        model_id="claude-sonnet-4-20250514",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={"supports_reasoning": True, "supports_extended_thinking": True}
+        ),
+    )
+
+    assert prepared.request_kwargs["temperature"] == 0.3
+    assert prepared.request_kwargs["top_p"] == 0.9
+    assert prepared.request_kwargs["max_tokens"] == 4000
+    assert prepared.effective_effort is None
+
+
+def test_reasoning_translation_supports_haiku_when_model_info_is_explicit() -> None:
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "low"},
+        model_id="claude-3-5-haiku-20241022",
+        provider_preset="anthropic",
+        model_info=DEFAULT_MODEL_INFO.model_copy(
+            update={"supports_reasoning": True, "supports_extended_thinking": True}
+        ),
+    )
+
+    assert prepared.request_kwargs["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
 
 def test_reasoning_translation_uses_output_config_for_claude_47() -> None:
@@ -3068,12 +3210,65 @@ async def test_litellm_provider_generate_applies_anthropic_cache_hint_to_first_m
         {
             "type": "text",
             "text": "immutable prefix",
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
         }
     ]
     assert messages[1] == {"role": "system", "content": "mutable environment"}
     assert messages[2] == {"role": "user", "content": "hi"}
     await engine.dispose()
+
+
+def test_apply_message_cache_hints_accepts_ordered_breakpoint_ttls() -> None:
+    model_info = ModelInfo(
+        model_id="anthropic/claude-sonnet-4-5",
+        display_name="Claude Sonnet 4.5",
+        supports_prompt_caching=True,
+    )
+    messages = [
+        {"role": "system", "content": "prefix"},
+        {"role": "user", "content": "prior turn"},
+        {"role": "assistant", "content": "current"},
+    ]
+
+    result = litellm_provider_module._apply_message_cache_hints(
+        messages,
+        "anthropic/claude-sonnet-4-5",
+        model_info,
+        [
+            {"index": 0, "ttl": "1h"},
+            {"index": 1, "ttl": "5m"},
+            {"index": 2, "ttl": "1h"},
+        ],
+    )
+
+    assert result[0]["content"][-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "1h",
+    }
+    assert result[1]["content"][-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+    assert result[2]["content"][-1]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+    assert messages[0]["content"] == "prefix"
+
+
+def test_prompt_cache_rejection_requires_400_class_status() -> None:
+    class ProviderError(Exception):
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+            super().__init__("unknown parameter: prompt_cache_key")
+
+    assert litellm_provider_module._is_prompt_cache_key_rejected(ProviderError(400))
+    assert not litellm_provider_module._is_prompt_cache_key_rejected(ProviderError(503))
+
+
+def test_retryable_error_status_substring_requires_status_context() -> None:
+    assert is_retryable_error(Exception("HTTP status 500 from provider"))
+    assert not is_retryable_error(Exception("model-5000 exceeded an internal counter"))
 
 
 @pytest.mark.asyncio
@@ -3136,7 +3331,7 @@ async def test_litellm_provider_projects_anthropic_developer_notices_to_hidden_u
         {
             "type": "text",
             "text": "immutable prefix",
-            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
         }
     ]
     assert all(message["role"] != "developer" for message in messages)
@@ -3256,7 +3451,13 @@ async def test_litellm_provider_generate_skips_cache_hint_when_capability_disabl
 
     messages = captured["messages"]
     assert isinstance(messages, list)
-    assert messages[0] == {"role": "system", "content": "immutable prefix"}
+    assert messages[0]["content"] == [
+        {
+            "type": "text",
+            "text": "immutable prefix",
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+        }
+    ]
     await engine.dispose()
 
 
@@ -3965,7 +4166,7 @@ async def test_litellm_provider_prompt_cache_rejection_updates_diagnostics(
     async def _fake_aresponses(**kwargs: object) -> object:
         calls.append(kwargs)
         if "prompt_cache_key" in kwargs:
-            raise Exception("Unknown parameter: 'prompt_cache_key'")
+            raise _ProviderError("Unknown parameter: 'prompt_cache_key'", status_code=400)
         return _fake_stream()
 
     caplog.set_level(logging.INFO, logger="cognis.providers.llm.litellm")
@@ -5697,7 +5898,7 @@ async def test_resolve_model_default_id_fallback_honors_owner_visibility(
 
 
 @pytest.mark.asyncio
-async def test_find_provider_for_model_prefers_default_then_provider_id(tmp_path: object) -> None:
+async def test_find_provider_for_model_prefers_single_default_provider(tmp_path: object) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
         session.add_all(
@@ -5726,6 +5927,89 @@ async def test_find_provider_for_model_prefers_default_then_provider_id(tmp_path
     provider = LiteLLMProvider(session_factory)
 
     assert await provider.find_provider_for_model("gpt-5.4") == "aaa"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_find_provider_for_model_rejects_ambiguous_duplicates(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add_all(
+            [
+                LLMProvider(
+                    provider_id="aaa",
+                    display_name="Aye",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "openai", "models": [{"model_id": "shared-model"}]},
+                    status="active",
+                ),
+                LLMProvider(
+                    provider_id="zzz",
+                    display_name="Zed",
+                    location="controller",
+                    backend="litellm",
+                    config={"preset": "openai", "models": [{"model_id": "shared-model"}]},
+                    status="active",
+                ),
+            ]
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    assert await provider.find_provider_for_model("shared-model") is None
+    with pytest.raises(ValueError, match="ambiguous"):
+        await provider.resolve_model_reference("shared-model")
+    assert await provider.resolve_model_reference("aaa/shared-model") == (
+        "shared-model",
+        "aaa",
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_model_references_uses_provider_qualified_values(tmp_path: object) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic-sub",
+                display_name="Claude Subscription",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "claude-sonnet-5",
+                    "models": [{"model_id": "claude-fable-5"}],
+                },
+                is_default=True,
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+
+    refs = await provider.list_model_references()
+    assert refs == [
+        {
+            "provider_id": "anthropic-sub",
+            "provider_display_name": "Claude Subscription",
+            "model_id": "claude-sonnet-5",
+            "value": "anthropic-sub/claude-sonnet-5",
+            "is_default_provider": True,
+            "is_default_model": True,
+        },
+        {
+            "provider_id": "anthropic-sub",
+            "provider_display_name": "Claude Subscription",
+            "model_id": "claude-fable-5",
+            "value": "anthropic-sub/claude-fable-5",
+            "is_default_provider": True,
+            "is_default_model": False,
+        },
+    ]
     await engine.dispose()
 
 
@@ -6936,7 +7220,7 @@ async def test_prompt_cache_key_capability_fallback(
         captured_kwargs.append(dict(kwargs))
         if call_count == 1:
             # Simulate backend rejecting the cache key param.
-            raise Exception("Unknown parameter: 'prompt_cache_key'")
+            raise _ProviderError("Unknown parameter: 'prompt_cache_key'", status_code=400)
         return _Response()
 
     monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
@@ -6988,7 +7272,7 @@ async def test_prompt_cache_key_fallback_preserves_context_overflow_classificati
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            raise Exception("Unknown parameter: 'prompt_cache_key'")
+            raise _ProviderError("Unknown parameter: 'prompt_cache_key'", status_code=400)
         raise Exception("maximum context length exceeded")
 
     monkeypatch.setenv("COGNIS_OPENAI_RESPONSES_MODE", "on")
@@ -7175,8 +7459,17 @@ def test_chatgpt_patches_suppress_instructions_sets_space_when_absent(
 def test_is_prompt_cache_key_rejected_matches_known_messages() -> None:
     from cognis.providers.llm.litellm import _is_prompt_cache_key_rejected
 
-    assert _is_prompt_cache_key_rejected(Exception("Unknown parameter: 'prompt_cache_key'"))
-    assert _is_prompt_cache_key_rejected(Exception("Unsupported parameter: prompt_cache_retention"))
-    assert not _is_prompt_cache_key_rejected(Exception("Unknown parameter: 'max_tokens'"))
+    assert _is_prompt_cache_key_rejected(
+        _ProviderError("Unknown parameter: 'prompt_cache_key'", status_code=400)
+    )
+    assert _is_prompt_cache_key_rejected(
+        _ProviderError("Unsupported parameter: prompt_cache_retention", status_code=400)
+    )
+    assert not _is_prompt_cache_key_rejected(
+        _ProviderError("Unknown parameter: 'max_tokens'", status_code=400)
+    )
+    assert not _is_prompt_cache_key_rejected(
+        _ProviderError("Unknown parameter: 'prompt_cache_key'", status_code=503)
+    )
     assert not _is_prompt_cache_key_rejected(Exception("Some other error"))
     assert not _is_prompt_cache_key_rejected(ValueError("prompt_cache_key is fine here"))

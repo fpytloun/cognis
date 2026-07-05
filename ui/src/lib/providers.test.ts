@@ -209,6 +209,37 @@ describe('provider presets', () => {
     expect(config.codex_transport).toBe('direct');
   });
 
+  it('serializes Anthropic subscription auth as controller-managed oauth', () => {
+    const anthropicProvider: LLMProvider = {
+      provider_id: 'claude-subscription',
+      display_name: 'Claude Subscription',
+      location: 'controller',
+      backend: 'litellm',
+      config: {
+        preset: 'anthropic',
+        default_model: 'claude-sonnet-4-5',
+        models: [{ model_id: 'claude-sonnet-4-5' }],
+        auth_config: { mode: 'oauth', provider: 'anthropic_subscription' }
+      },
+      is_default: false,
+      status: 'active',
+      created_at: null,
+      updated_at: null,
+      models: [defaultModelEntry('claude-sonnet-4-5')],
+      last_test: null
+    };
+
+    const form = createProviderForm(anthropicProvider);
+    expect(form.preset).toBe('anthropic');
+    expect(form.auth_mode).toBe('oauth');
+    expect(form.location).toBe('controller');
+
+    const payload = providerFormToPayload(form);
+    const config = payload.config as Record<string, unknown>;
+    expect(config.auth_config).toEqual({ mode: 'oauth', provider: 'anthropic_subscription' });
+    expect(payload.location).toBe('controller');
+  });
+
   it('omits Codex transport from non-ChatGPT provider payloads', () => {
     const form = createProviderForm(provider);
     form.codex_transport = 'direct';

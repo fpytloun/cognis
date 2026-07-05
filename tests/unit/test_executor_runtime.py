@@ -229,3 +229,209 @@ def test_merge_runtime_metadata_preserves_controller_and_executor_mcp_diagnostic
         "MCP server oauth requires OAuth authorization.",
         "MCP server other failed during initialize.",
     ]
+
+
+def test_authorization_failed_mcp_server_ids_filters_runtime_statuses() -> None:
+    assert executor_runtime._authorization_failed_mcp_server_ids(
+        {
+            "mcp_servers": [
+                {
+                    "server_id": "rohlik",
+                    "status": "failed",
+                    "authorization_required": True,
+                },
+                {
+                    "server_id": "rohlik",
+                    "status": "failed",
+                    "authorization_required": True,
+                },
+                {
+                    "server_id": "transient",
+                    "status": "failed",
+                    "authorization_required": False,
+                },
+                {
+                    "server_id": "pending",
+                    "status": "authorization_required",
+                    "authorization_required": True,
+                },
+            ]
+        }
+    ) == ["rohlik"]
+
+
+def test_authorization_failed_mcp_server_ids_ignores_controller_skipped_oauth() -> None:
+    assert (
+        executor_runtime._authorization_failed_mcp_server_ids(
+            {
+                "mcp_servers": [
+                    {
+                        "server_id": "rohlik",
+                        "status": "authorization_required",
+                        "phase": "authorization",
+                        "authorization_required": True,
+                        "reason": "authorization_required",
+                    }
+                ]
+            }
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_auth_failure_invalidates_token_and_requests_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _executor_row(desired_config_version=3, applied_config_version=3)
+    app = _app_with_ws_connection(connection=object())
+    invalidated: list[tuple[str, str, str]] = []
+    bumps: list[str] = []
+
+    class _OAuthService:
+        async def mark_token_invalid_for_server(
+            self,
+            *,
+            user_email: str,
+            server_id: str,
+            reason: str,
+        ) -> bool:
+            invalidated.append((user_email, server_id, reason))
+            return True
+
+    async def _bump_executor_reconfigure_generation(
+        _session: object,
+        _executor_id: str,
+        *,
+        runtime_state: str,
+    ) -> bool:
+        bumps.append(runtime_state)
+        row.desired_config_version += 1
+        row.runtime_state = runtime_state
+        return True
+
+    app.state.providers.mcp_oauth_service = _OAuthService()
+    monkeypatch.setattr(
+        executor_runtime,
+        "bump_executor_reconfigure_generation",
+        _bump_executor_reconfigure_generation,
+    )
+
+    await executor_runtime._invalidate_mcp_oauth_tokens_for_runtime_failures(
+        app,
+        row,
+        runtime_metadata={
+            "mcp_servers": [
+                {
+                    "server_id": "rohlik",
+                    "status": "failed",
+                    "authorization_required": True,
+                }
+            ]
+        },
+    )
+
+    assert invalidated == [("alice@example.com", "rohlik", "mcp_resource_authorization_failed")]
+    assert row.desired_config_version == 4
+    assert row.runtime_state == "reconfiguring"
+    assert bumps == ["reconfiguring"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_skipped_oauth_status_does_not_request_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _executor_row(desired_config_version=3, applied_config_version=3)
+    app = _app_with_ws_connection(connection=object())
+    calls: list[str] = []
+
+    class _OAuthService:
+        async def mark_token_invalid_for_server(
+            self,
+            *,
+            user_email: str,
+            server_id: str,
+            reason: str,
+        ) -> bool:
+            calls.append(server_id)
+            return True
+
+    async def _bump_executor_reconfigure_generation(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("skipped OAuth metadata must not schedule a retry")
+
+    app.state.providers.mcp_oauth_service = _OAuthService()
+    monkeypatch.setattr(
+        executor_runtime,
+        "bump_executor_reconfigure_generation",
+        _bump_executor_reconfigure_generation,
+    )
+
+    await executor_runtime._invalidate_mcp_oauth_tokens_for_runtime_failures(
+        app,
+        row,
+        runtime_metadata={
+            "mcp_servers": [
+                {
+                    "server_id": "rohlik",
+                    "status": "authorization_required",
+                    "phase": "authorization",
+                    "authorization_required": True,
+                }
+            ]
+        },
+    )
+
+    assert calls == []
+    assert row.desired_config_version == 3
+
+
+@pytest.mark.asyncio
+async def test_runtime_auth_failure_bumps_current_generation_without_clobbering_newer_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _executor_row(desired_config_version=3, applied_config_version=3)
+    app = _app_with_ws_connection(connection=object())
+
+    class _OAuthService:
+        async def mark_token_invalid_for_server(
+            self,
+            *,
+            user_email: str,
+            server_id: str,
+            reason: str,
+        ) -> bool:
+            return True
+
+    async def _bump_executor_reconfigure_generation(
+        _session: object,
+        _executor_id: str,
+        *,
+        runtime_state: str,
+    ) -> bool:
+        row.desired_config_version = 11
+        row.runtime_state = runtime_state
+        return True
+
+    app.state.providers.mcp_oauth_service = _OAuthService()
+    monkeypatch.setattr(
+        executor_runtime,
+        "bump_executor_reconfigure_generation",
+        _bump_executor_reconfigure_generation,
+    )
+
+    await executor_runtime._invalidate_mcp_oauth_tokens_for_runtime_failures(
+        app,
+        row,
+        runtime_metadata={
+            "mcp_servers": [
+                {
+                    "server_id": "rohlik",
+                    "status": "failed",
+                    "authorization_required": True,
+                }
+            ]
+        },
+    )
+
+    assert row.desired_config_version == 11
+    assert row.runtime_state == "reconfiguring"

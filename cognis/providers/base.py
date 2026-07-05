@@ -61,6 +61,7 @@ class MemoryProvider(Protocol):
         include_instructions: bool = False,
         managed: bool = False,
         instruction_mode: str | None = None,
+        ttl: int | None = None,
     ) -> dict[str, Any]: ...
 
     async def remember(
@@ -175,6 +176,7 @@ class GuardrailsProvider(Protocol):
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        before_seq: int | None = None,
         seqs: list[int] | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult: ...

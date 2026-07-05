@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from websockets.exceptions import ConnectionClosed
 
@@ -77,6 +78,9 @@ _RECONNECT_BASE = 1.0
 _RECONNECT_MAX = 60.0
 _MCP_PREPARE_TOTAL_TIMEOUT_SECONDS = 90.0
 _RUNTIME_METADATA_SCHEMA_VERSION = 1
+_OAUTH_LOOPBACK_DEFAULT_TTL_SECONDS = 600
+_OAUTH_LOOPBACK_MAX_TTL_SECONDS = 900
+_OAUTH_LOOPBACK_CALLBACK_PATH = "/oauth/callback"
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
@@ -91,6 +95,20 @@ def _env_float(name: str, default: float, *, minimum: float | None = None) -> fl
     if minimum is not None:
         return max(minimum, value)
     return value
+
+
+def _coerce_bounded_int(
+    value: Any,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
 
 
 _WS_PING_INTERVAL_SECONDS = _env_float(
@@ -195,6 +213,7 @@ class ExecutorRunner:
         self._background_shell_completion_callback: BackgroundShellCompletionCallback | None = None
         self._started_at = perf_counter()
         self._ws_send_lock = asyncio.Lock()
+        self._oauth_loopback_listeners: dict[str, dict[str, Any]] = {}
 
     async def run(self) -> None:
         reconnect_delay = _RECONNECT_BASE
@@ -228,6 +247,8 @@ class ExecutorRunner:
                 await cleanup_shell_manager(self._runtime_metadata)
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._close_mcp_clients()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._close_oauth_loopback_listeners()
             if self._channel_handler is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._channel_handler.stop_all()
@@ -328,6 +349,8 @@ class ExecutorRunner:
             finally:
                 self._background_shell_completion_callback = None
                 set_background_shell_completion_callback(self._runtime_metadata, None)
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._close_oauth_loopback_listeners()
                 heartbeat_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await heartbeat_task
@@ -438,6 +461,18 @@ class ExecutorRunner:
                 self._create_background_handler_task(
                     self._handle_background_shell_status(ws, msg_id, params),
                     "shell.background_status",
+                    msg_id=msg_id,
+                )
+            elif method == "oauth.loopback_start":
+                self._create_background_handler_task(
+                    self._handle_oauth_loopback_start(ws, msg_id, params),
+                    "oauth.loopback_start",
+                    msg_id=msg_id,
+                )
+            elif method == "oauth.loopback_stop":
+                self._create_background_handler_task(
+                    self._handle_oauth_loopback_stop(ws, msg_id, params),
+                    "oauth.loopback_stop",
                     msg_id=msg_id,
                 )
             elif method == "executor.cancel":
@@ -1158,21 +1193,37 @@ class ExecutorRunner:
                     ),
                 )
             else:
+                chunk_params: dict[str, Any] = {
+                    "request_id": request_id,
+                    "content": safe_chunk.get("content"),
+                    "tool_calls": safe_chunk.get("tool_calls"),
+                    "reasoning_content": safe_chunk.get("reasoning_content"),
+                    "reasoning": safe_chunk.get("reasoning"),
+                    "refusal": safe_chunk.get("refusal"),
+                    "index": safe_chunk.get("index", 0),
+                }
+                # Structured stream fields (thinking block boundaries, raw
+                # Responses output items, apply_patch progress, liveness
+                # markers) — required for executor-routed inference to match
+                # controller-direct behavior.
+                for extra_key in (
+                    "reasoning_part_boundary",
+                    "tool_progress",
+                    "responses_output_item",
+                    "provider_event_type",
+                    "response_item_id",
+                    "content_source",
+                    "response_message_phase",
+                ):
+                    if safe_chunk.get(extra_key) is not None:
+                        chunk_params[extra_key] = safe_chunk[extra_key]
                 await self._send_ws(
                     ws,
                     json.dumps(
                         {
                             "jsonrpc": "2.0",
                             "method": "llm.chunk",
-                            "params": {
-                                "request_id": request_id,
-                                "content": safe_chunk.get("content"),
-                                "tool_calls": safe_chunk.get("tool_calls"),
-                                "reasoning_content": safe_chunk.get("reasoning_content"),
-                                "reasoning": safe_chunk.get("reasoning"),
-                                "refusal": safe_chunk.get("refusal"),
-                                "index": safe_chunk.get("index", 0),
-                            },
+                            "params": chunk_params,
                         }
                     ),
                 )
@@ -1576,6 +1627,201 @@ class ExecutorRunner:
         metadata.pop("background_shell_completion_callback", None)
         metadata.pop(_FILE_FRESHNESS_KEY, None)
         return metadata
+
+    async def _handle_oauth_loopback_start(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        ttl_seconds = _coerce_bounded_int(
+            params.get("ttl_seconds"),
+            default=_OAUTH_LOOPBACK_DEFAULT_TTL_SECONDS,
+            minimum=1,
+            maximum=_OAUTH_LOOPBACK_MAX_TTL_SECONDS,
+        )
+        callback_path = str(params.get("callback_path") or _OAUTH_LOOPBACK_CALLBACK_PATH)
+        if not callback_path.startswith("/") or "?" in callback_path or "#" in callback_path:
+            await self._send_rpc_error(ws, msg_id, -32602, "Invalid OAuth callback path")
+            return
+        expected_state = str(params.get("state") or "")
+        if not expected_state:
+            await self._send_rpc_error(ws, msg_id, -32602, "OAuth state is required")
+            return
+
+        listener_id = f"oauthlb_{uuid.uuid4().hex[:16]}"
+
+        async def _handle_client(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            await self._handle_oauth_loopback_http_request(
+                ws=ws,
+                listener_id=listener_id,
+                expected_state=expected_state,
+                callback_path=callback_path,
+                reader=reader,
+                writer=writer,
+            )
+
+        try:
+            server = await asyncio.start_server(_handle_client, "127.0.0.1", 0)
+        except OSError as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32060,
+                f"Failed to start OAuth loopback listener: {_safe_message(str(exc))}",
+            )
+            return
+
+        sockets = server.sockets or []
+        if not sockets:
+            server.close()
+            await server.wait_closed()
+            await self._send_rpc_error(ws, msg_id, -32060, "OAuth loopback listener has no socket")
+            return
+        port = int(sockets[0].getsockname()[1])
+        redirect_uri = f"http://127.0.0.1:{port}{callback_path}"
+        expires_at = datetime.now(UTC).timestamp() + ttl_seconds
+        cleanup_task = asyncio.create_task(
+            self._expire_oauth_loopback_listener(listener_id, ttl_seconds),
+            name=f"oauth-loopback-expire-{listener_id}",
+        )
+        self._oauth_loopback_listeners[listener_id] = {
+            "server": server,
+            "cleanup_task": cleanup_task,
+            "redirect_uri": redirect_uri,
+        }
+        await self._send_rpc_result(
+            ws,
+            msg_id,
+            {
+                "listener_id": listener_id,
+                "redirect_uri": redirect_uri,
+                "expires_at": datetime.fromtimestamp(expires_at, UTC).isoformat(),
+            },
+        )
+
+    async def _handle_oauth_loopback_stop(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        listener_id = str(params.get("listener_id") or "")
+        stopped = await self._close_oauth_loopback_listener(listener_id)
+        await self._send_rpc_result(ws, msg_id, {"stopped": stopped})
+
+    async def _handle_oauth_loopback_http_request(
+        self,
+        *,
+        ws: Any,
+        listener_id: str,
+        expected_state: str,
+        callback_path: str,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        status = "400 Bad Request"
+        body = "MCP OAuth callback failed."
+        notify_payload: dict[str, Any] | None = None
+        try:
+            request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            line = request_line.decode("latin-1", errors="replace").strip()
+            parts = line.split(" ", 2)
+            method = parts[0] if len(parts) >= 1 else ""
+            target = parts[1] if len(parts) >= 2 else ""
+            while True:
+                header_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                if header_line in {b"\r\n", b"\n", b""}:
+                    break
+            parsed = urlsplit(target)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            state = query.get("state", [""])[0]
+            code = query.get("code", [""])[0]
+            error = query.get("error", [""])[0]
+            error_description = query.get("error_description", [""])[0]
+            listener = self._oauth_loopback_listeners.get(listener_id)
+            redirect_uri = str(listener.get("redirect_uri") if listener else "")
+            if method != "GET" or parsed.path != callback_path:
+                body = "Invalid MCP OAuth callback path."
+            elif state != expected_state:
+                body = "Invalid MCP OAuth state."
+            elif not code and not error:
+                body = "MCP OAuth callback is missing code or error."
+            else:
+                status = "200 OK"
+                body = "MCP OAuth callback received. You can close this window."
+                notify_payload = {
+                    "listener_id": listener_id,
+                    "redirect_uri": redirect_uri,
+                    "state": state,
+                    "code": code,
+                    "error": error or None,
+                    "error_description": error_description or None,
+                }
+        except Exception:
+            logger.warning(
+                "executor: failed to handle OAuth loopback callback",
+                extra={"extra_data": {"listener_id": listener_id}},
+                exc_info=True,
+            )
+        finally:
+            escaped_body = body.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            content = (f"<!doctype html><html><body><h1>{escaped_body}</h1></body></html>").encode()
+            writer.write(
+                (
+                    f"HTTP/1.1 {status}\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    f"Content-Length: {len(content)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode()
+                + content
+            )
+            with contextlib.suppress(Exception):
+                await writer.drain()
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+        if notify_payload is not None:
+            await self._send_ws(
+                ws,
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "oauth.loopback_callback",
+                        "params": notify_payload,
+                    }
+                ),
+            )
+            await self._close_oauth_loopback_listener(listener_id)
+
+    async def _expire_oauth_loopback_listener(self, listener_id: str, ttl_seconds: int) -> None:
+        try:
+            await asyncio.sleep(ttl_seconds)
+            await self._close_oauth_loopback_listener(listener_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "executor: failed to expire OAuth loopback listener",
+                extra={"extra_data": {"listener_id": listener_id}},
+                exc_info=True,
+            )
+
+    async def _close_oauth_loopback_listener(self, listener_id: str) -> bool:
+        if not listener_id:
+            return False
+        listener = self._oauth_loopback_listeners.pop(listener_id, None)
+        if listener is None:
+            return False
+        cleanup_task = listener.get("cleanup_task")
+        if isinstance(cleanup_task, asyncio.Task) and cleanup_task is not asyncio.current_task():
+            cleanup_task.cancel()
+        server = listener.get("server")
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+        return True
+
+    async def _close_oauth_loopback_listeners(self) -> None:
+        for listener_id in list(self._oauth_loopback_listeners):
+            await self._close_oauth_loopback_listener(listener_id)
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:
         if msg_id is None:

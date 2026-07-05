@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,11 @@ from cognis.tools.executor.filesystem import (
     handle_write,
 )
 from cognis.tools.executor.lsp.tool import handle_lsp
+from cognis.tools.executor.lsp.types import (
+    DiagnosticCollection,
+    DiagnosticFreshness,
+    DiagnosticWaitResult,
+)
 from cognis.tools.executor.search import handle_glob, handle_grep
 from cognis.tools.executor.shell import (
     handle_bash,
@@ -155,10 +161,46 @@ class TestReadTool:
     async def test_read_directory(self, tmp_path: Path) -> None:
         (tmp_path / "a.txt").touch()
         (tmp_path / "subdir").mkdir()
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "__pycache__").mkdir()
         result = await handle_read({"file_path": str(tmp_path)}, _DUMMY_CONTEXT)
         assert not result.is_error
         assert "subdir/" in result.output
         assert "a.txt" in result.output
+        assert ".git/" not in result.output
+        assert "__pycache__/" not in result.output
+
+    @pytest.mark.asyncio()
+    async def test_read_ipynb_renders_cells_and_summarizes_outputs(self, tmp_path: Path) -> None:
+        notebook = tmp_path / "notebook.ipynb"
+        notebook.write_text(
+            json.dumps(
+                {
+                    "cells": [
+                        {"cell_type": "markdown", "source": ["# Title\n"]},
+                        {
+                            "cell_type": "code",
+                            "source": ["print('hi')\n"],
+                            "outputs": [
+                                {
+                                    "output_type": "stream",
+                                    "name": "stdout",
+                                    "text": ["hi\n"],
+                                }
+                            ],
+                        },
+                    ]
+                }
+            )
+        )
+
+        result = await handle_read({"file_path": str(notebook)}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "Notebook: notebook.ipynb" in result.output
+        assert "## Cell 1 [markdown]" in result.output
+        assert "# Title" in result.output
+        assert "Output 1: stream stdout" in result.output
 
     @pytest.mark.asyncio()
     async def test_read_nonexistent(self) -> None:
@@ -304,7 +346,7 @@ class TestWriteTool:
         assert target.read_text() == "hello"
 
     @pytest.mark.asyncio()
-    async def test_write_formats_python_file_when_formatter_exists(
+    async def test_write_formatter_records_fresh_stamp_and_diff(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         target = tmp_path / "format_me.py"
@@ -312,8 +354,10 @@ class TestWriteTool:
 
         async def fake_exec(*command: str, **_: object):
             class _Proc:
+                returncode = 0
+
                 async def communicate(self) -> tuple[bytes, bytes]:
-                    target.write_text("x = 1\n")
+                    target.write_text(target.read_text().replace("x=", "x = "))
                     return b"", b""
 
             assert command == ("ruff", "format", str(target))
@@ -327,6 +371,7 @@ class TestWriteTool:
         result = await handle_write({"file_path": str(target), "content": "x=1\n"}, context)
 
         assert not result.is_error
+        assert "Formatter diff" in result.output
         assert target.read_text() == "x = 1\n"
         assert result.metadata is not None
         assert result.metadata["file_diffs"][0]["diff"].endswith("+x = 1\n")
@@ -336,8 +381,69 @@ class TestWriteTool:
             context,
         )
 
-        assert follow_up.is_error
-        assert "Use the read tool first" in follow_up.output
+        assert not follow_up.is_error
+        assert target.read_text() == "x = 2\n"
+
+    @pytest.mark.asyncio()
+    async def test_write_does_not_run_global_ruff_without_project_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "plain.py"
+        context = _context()
+
+        monkeypatch.setattr(filesystem_module.shutil, "which", lambda _name: "/usr/bin/ruff")
+
+        async def fail_exec(*_args: object, **_kwargs: object):
+            raise AssertionError("formatter should not run without a ruff config")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_exec)
+
+        result = await handle_write({"file_path": str(target), "content": "x=1\n"}, context)
+
+        assert not result.is_error
+        assert target.read_text() == "x=1\n"
+
+    @pytest.mark.asyncio()
+    async def test_edit_reports_closest_match_and_line_number_hint(self, tmp_path: Path) -> None:
+        target = tmp_path / "sample.txt"
+        target.write_text("alpha\n  beta\nomega\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "2:   beta",
+                "new_string": "gamma",
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "old_string not found" in result.output
+        assert "oldString" not in result.output
+        assert "Closest match starts at line" in result.output
+        assert "line-number prefixes" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_edit_uses_unambiguous_rstrip_normalized_fallback(self, tmp_path: Path) -> None:
+        target = tmp_path / "sample.txt"
+        target.write_text("value   \nother\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "value\n",
+                "new_string": "done\n",
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "rstrip-normalized fallback" in result.output
+        assert target.read_text() == "done\nother\n"
 
     @pytest.mark.asyncio()
     async def test_artifact_save_writes_binary_artifact_content(self, tmp_path: Path) -> None:
@@ -370,8 +476,11 @@ class TestWriteTool:
         assert "Provide source_artifact_id" in result.output
 
     @pytest.mark.asyncio()
-    async def test_skill_asset_materialize_writes_attached_asset(self, tmp_path: Path) -> None:
-        target = tmp_path / "youtube_transcript.py"
+    async def test_skill_asset_materialize_writes_attached_asset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        target = tmp_path / "data" / "skill_assets" / "custom" / "youtube_transcript.py"
         context = _context(
             runtime_metadata={
                 "skill_manifests": [
@@ -403,6 +512,126 @@ class TestWriteTool:
         assert target.read_text() == "print('hi')\n"
         assert result.metadata is not None
         assert result.metadata["skill_asset"]["local_path"] == str(target)
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_overwrites_existing_without_prior_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        target = tmp_path / "data" / "skill_assets" / "custom" / "youtube_transcript.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("stale content\n")
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "youtube-transcript",
+                        "asset_manifest": [
+                            {
+                                "filename": "assets/youtube_transcript.py",
+                                "asset_id": "sa-script",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                                "content_type": "text/x-python",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {
+                "skill_id": "youtube-transcript",
+                "asset_id": "sa-script",
+                "target_path": str(target),
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "print('hi')\n"
+        assert "Use the read tool first" not in result.output
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_rejects_target_outside_managed_asset_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        outside = tmp_path / "system" / "passwd"
+        outside.parent.mkdir()
+        outside.write_text("root:x:0:0\n")
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "youtube-transcript",
+                        "asset_manifest": [
+                            {
+                                "filename": "assets/youtube_transcript.py",
+                                "asset_id": "sa-script",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                                "content_type": "text/x-python",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {
+                "skill_id": "youtube-transcript",
+                "asset_id": "sa-script",
+                "target_path": str(outside),
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "managed skill asset directory" in result.output
+        assert outside.read_text() == "root:x:0:0\n"
+
+    @pytest.mark.asyncio()
+    async def test_skill_asset_materialize_rejects_symlink_escape_from_managed_asset_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        outside = tmp_path / "system" / "passwd"
+        outside.parent.mkdir()
+        outside.write_text("root:x:0:0\n")
+        target = tmp_path / "data" / "skill_assets" / "custom" / "passwd"
+        target.parent.mkdir(parents=True)
+        target.symlink_to(outside)
+        context = _context(
+            runtime_metadata={
+                "skill_manifests": [
+                    {
+                        "skill_id": "youtube-transcript",
+                        "asset_manifest": [
+                            {
+                                "filename": "assets/youtube_transcript.py",
+                                "asset_id": "sa-script",
+                                "content_b64": "cHJpbnQoJ2hpJykK",
+                                "content_type": "text/x-python",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = await handle_skill_asset_materialize(
+            {
+                "skill_id": "youtube-transcript",
+                "asset_id": "sa-script",
+                "target_path": str(target),
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "managed skill asset directory" in result.output
+        assert outside.read_text() == "root:x:0:0\n"
 
     @pytest.mark.asyncio()
     async def test_skill_asset_materialize_defaults_to_cognis_data_dir(
@@ -448,10 +677,11 @@ class TestWriteTool:
 
     @pytest.mark.asyncio()
     async def test_skill_asset_materialize_rejects_directory_traversal_filename(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        target_dir = tmp_path / "assets"
-        target_dir.mkdir()
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        target_dir = tmp_path / "data" / "skill_assets" / "assets"
+        target_dir.mkdir(parents=True)
         context = _context(
             runtime_metadata={
                 "skill_manifests": [
@@ -479,8 +709,11 @@ class TestWriteTool:
         assert not (tmp_path / "outside.py").exists()
 
     @pytest.mark.asyncio()
-    async def test_skill_asset_materialize_rejects_hash_mismatch(self, tmp_path: Path) -> None:
-        target = tmp_path / "tool.py"
+    async def test_skill_asset_materialize_rejects_hash_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+        target = tmp_path / "data" / "skill_assets" / "tool.py"
         context = _context(
             runtime_metadata={
                 "skill_manifests": [
@@ -909,17 +1142,21 @@ class TestApplyPatchTool:
         assert target.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
-    async def test_apply_patch_add_file_fails_if_exists(self, tmp_path: Path) -> None:
+    async def test_apply_patch_add_file_overwrites_existing_like_codex(
+        self, tmp_path: Path
+    ) -> None:
         target = tmp_path / "test.txt"
         target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
 
         result = await handle_apply_patch(
             {"patchText": f"*** Begin Patch\n*** Add File: {target}\n+hi\n*** End Patch\n"},
-            _context(),
+            context,
         )
 
-        assert result.is_error
-        assert "already exists" in result.output
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
     async def test_apply_patch_formats_updated_file(
@@ -950,7 +1187,9 @@ class TestApplyPatchTool:
         assert calls == [target]
 
     @pytest.mark.asyncio()
-    async def test_apply_patch_does_not_wait_when_lsp_already_pending(self, tmp_path: Path) -> None:
+    async def test_apply_patch_waits_for_fresh_lsp_even_when_lsp_already_pending(
+        self, tmp_path: Path
+    ) -> None:
         target = tmp_path / "pending_lsp.py"
         target.write_text("x = 1\n")
 
@@ -962,13 +1201,28 @@ class TestApplyPatchTool:
             def has_pending_diagnostics(self, _paths: list[str]) -> bool:
                 return True
 
-            async def touch_file(self, _path: str, *, wait: bool = True) -> None:
+            async def touch_file(self, _path: str, *, wait: bool = True, **_: object):
                 if wait:
                     self.wait_calls += 1
+                    return DiagnosticCollection(
+                        waits=[
+                            DiagnosticWaitResult(
+                                server_id="ruff",
+                                uri="file:///pending_lsp.py",
+                                target_version=1,
+                                status=DiagnosticFreshness.TIMEOUT,
+                                duration_ms=1,
+                            )
+                        ]
+                    )
                 else:
                     self.warm_calls += 1
+                    return DiagnosticCollection()
 
             def get_diagnostics(self, *_: object) -> dict[str, list[object]]:
+                return {}
+
+            def get_diagnostic_snapshots(self, *_: object) -> dict[str, list[object]]:
                 return {}
 
         lsp = _PendingLSP()
@@ -986,8 +1240,9 @@ class TestApplyPatchTool:
 
         assert not result.is_error
         assert target.read_text() == "x = 2\n"
-        assert lsp.wait_calls == 0
+        assert lsp.wait_calls == 1
         assert lsp.warm_calls >= 1
+        assert "cached diagnostics were not shown" in result.output
 
     @pytest.mark.asyncio()
     async def test_apply_patch_delete_success(self, tmp_path: Path) -> None:
@@ -1122,13 +1377,14 @@ class TestApplyPatchTool:
         assert dest.read_text() == "hello\n"
 
     @pytest.mark.asyncio()
-    async def test_apply_patch_move_fails_if_destination_exists(self, tmp_path: Path) -> None:
+    async def test_apply_patch_move_overwrites_destination_like_codex(self, tmp_path: Path) -> None:
         source = tmp_path / "old.txt"
         dest = tmp_path / "new.txt"
         source.write_text("hello\n")
         dest.write_text("existing\n")
         context = _context()
         await handle_read({"file_path": str(source)}, context)
+        await handle_read({"file_path": str(dest)}, context)
 
         result = await handle_apply_patch(
             {
@@ -1139,8 +1395,13 @@ class TestApplyPatchTool:
             context,
         )
 
-        assert result.is_error
-        assert "destination already exists" in result.output
+        assert not result.is_error
+        assert not source.exists()
+        assert dest.read_text() == "hello\n"
+        assert result.metadata is not None
+        diff = result.metadata["file_diffs"][0]["diff"]
+        assert "-existing" in diff
+        assert "+hello" in diff
 
     @pytest.mark.asyncio()
     async def test_apply_patch_requires_prior_read(self, tmp_path: Path) -> None:
@@ -1196,6 +1457,82 @@ class TestApplyPatchTool:
 
         assert not result.is_error
         assert target.read_text() == "hi\nbye\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_repeated_update_file_sections_apply_sequentially(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "weekly.md"
+        target.write_text("## Open\n- old A\n\n## Done\n- old B\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n"
+                    f"*** Update File: {target}\n"
+                    f"@@\n"
+                    f"-- old A\n"
+                    f"+- new A\n"
+                    f"*** Update File: {target}\n"
+                    f"@@\n"
+                    f"-- old B\n"
+                    f"+- new B\n"
+                    f"*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "## Open\n- new A\n\n## Done\n- new B\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_update_accepts_implicit_first_hunk_like_codex(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "implicit.txt"
+        target.write_text("hello\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n*** Update File: {target}\n-hello\n+hi\n*** End Patch\n"
+                )
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
+
+    @pytest.mark.asyncio()
+    async def test_apply_patch_add_then_update_same_file_uses_staged_content(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "new-then-update.txt"
+
+        result = await handle_apply_patch(
+            {
+                "patchText": (
+                    f"*** Begin Patch\n"
+                    f"*** Add File: {target}\n"
+                    f"+hello\n"
+                    f"*** Update File: {target}\n"
+                    f"@@\n"
+                    f"-hello\n"
+                    f"+hi\n"
+                    f"*** End Patch\n"
+                )
+            },
+            _context(),
+        )
+
+        assert not result.is_error
+        assert target.read_text() == "hi\n"
 
     @pytest.mark.asyncio()
     async def test_apply_patch_context_anchor_selects_later_repeated_block(
@@ -1286,12 +1623,12 @@ class TestApplyPatchTool:
         original = filesystem_module._stage_patch_operations
         calls = 0
 
-        async def _wrapped_stage(operations: object, ctx: object):
+        async def _wrapped_stage(operations: Any, ctx: Any):
             nonlocal calls
             calls += 1
-            if calls == 2:
-                target.write_text("changed\n")
-            return await original(operations, ctx)
+            staged = await original(operations, ctx)
+            target.write_text("changed\n")
+            return staged
 
         monkeypatch.setattr(filesystem_module, "_stage_patch_operations", _wrapped_stage)
 
@@ -1305,6 +1642,7 @@ class TestApplyPatchTool:
         assert result.is_error
         assert "modified since it was last read" in result.output
         assert target.read_text() == "changed\n"
+        assert calls == 1
 
     @pytest.mark.asyncio()
     async def test_apply_patch_unified_diff_regression_success(self, tmp_path: Path) -> None:
@@ -1468,6 +1806,7 @@ class TestGlobTool:
         assert "a.py" in result.output
         assert "b.py" in result.output
         assert "c.txt" not in result.output
+        assert str(tmp_path / "a.py") in result.output
 
     @pytest.mark.asyncio()
     async def test_glob_no_matches(self, tmp_path: Path) -> None:
@@ -1532,6 +1871,7 @@ class TestGrepTool:
         assert not result.is_error
         assert "a.py" in result.output
         assert "hello" in result.output
+        assert str(tmp_path / "a.py") in result.output
 
     @pytest.mark.asyncio()
     async def test_grep_no_matches(self, tmp_path: Path) -> None:
@@ -1573,6 +1913,86 @@ class TestGrepTool:
         assert not result.is_error
         assert "a.py" in result.output
         assert "b.py" not in result.output
+        assert result.metadata is not None
+        assert result.metadata["content_trust"] == "untrusted"
+
+    @pytest.mark.asyncio()
+    async def test_grep_single_file_default_lifts_ten_match_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        monkeypatch.setattr(search_module, "_RG_PATH", None)
+        target = tmp_path / "a.py"
+        target.write_text("\n".join(f"needle {index}" for index in range(15)) + "\n")
+
+        result = await handle_grep({"pattern": "needle", "path": str(target)}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "needle 14" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_grep_directory_cap_has_actionable_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        monkeypatch.setattr(search_module, "_RG_PATH", None)
+        target = tmp_path / "a.py"
+        target.write_text("\n".join(f"needle {index}" for index in range(12)) + "\n")
+
+        result = await handle_grep({"pattern": "needle", "path": str(tmp_path)}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert "increase max_per_file" in result.output
+        assert str(target) in result.output
+
+    @pytest.mark.asyncio()
+    async def test_grep_case_insensitive_context_and_output_modes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        monkeypatch.setattr(search_module, "_RG_PATH", None)
+        target = tmp_path / "a.py"
+        target.write_text("before\nNeedle\nAfter\n")
+
+        content = await handle_grep(
+            {
+                "pattern": "needle",
+                "path": str(tmp_path),
+                "case_insensitive": True,
+                "context_lines": 1,
+            },
+            _DUMMY_CONTEXT,
+        )
+        files = await handle_grep(
+            {
+                "pattern": "needle",
+                "path": str(tmp_path),
+                "case_insensitive": True,
+                "output_mode": "files_with_matches",
+            },
+            _DUMMY_CONTEXT,
+        )
+        counts = await handle_grep(
+            {
+                "pattern": "needle",
+                "path": str(tmp_path),
+                "case_insensitive": True,
+                "output_mode": "count",
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert not content.is_error
+        assert f"{target}-1- before" in content.output
+        assert f"{target}:2: Needle" in content.output
+        assert not files.is_error
+        assert files.output.strip() == str(target)
+        assert not counts.is_error
+        assert f"{target}: 1" in counts.output
+        assert "Total matches: 1" in counts.output
 
     @pytest.mark.asyncio()
     async def test_grep_ignores_include_for_single_file_path(self, tmp_path: Path) -> None:
@@ -1786,14 +2206,46 @@ class TestBashTool:
         assert ("err\n", "stderr") in chunks
 
     @pytest.mark.asyncio()
-    async def test_bash_rejects_python_file_rewrite_one_liner(self) -> None:
+    async def test_bash_warns_on_python_file_rewrite_one_liner(self, tmp_path: Path) -> None:
         result = await handle_bash(
-            {"command": "python -c \"from pathlib import Path; Path('x.py').write_text('x=1')\""},
+            {
+                "command": (
+                    "python -c \"from pathlib import Path; Path('x.py').write_text('x=1')\""
+                ),
+                "workdir": str(tmp_path),
+            },
             _DUMMY_CONTEXT,
         )
 
-        assert result.is_error
-        assert "Use edit, multiedit, apply_patch, or write" in result.output
+        assert not result.is_error
+        assert "Prefer dedicated edit tools for rewriting source files." in result.output
+        assert result.metadata is not None
+        assert result.metadata["advisory"] == (
+            "Prefer dedicated edit tools for rewriting source files. "
+            "Use shell or interpreter rewrites only when they are necessary and intentional."
+        )
+        assert (tmp_path / "x.py").read_text() == "x=1"
+
+    @pytest.mark.asyncio()
+    async def test_bash_warns_on_embedded_python_file_rewrite(self, tmp_path: Path) -> None:
+        result = await handle_bash(
+            {
+                "command": (
+                    "python <<'PY'\nfrom pathlib import Path\nPath('x.py').write_text('x=1')\nPY"
+                ),
+                "workdir": str(tmp_path),
+            },
+            _DUMMY_CONTEXT,
+        )
+
+        assert not result.is_error
+        assert "Prefer dedicated edit tools for rewriting source files." in result.output
+        assert result.metadata is not None
+        assert result.metadata["advisory"] == (
+            "Prefer dedicated edit tools for rewriting source files. "
+            "Use shell or interpreter rewrites only when they are necessary and intentional."
+        )
+        assert (tmp_path / "x.py").read_text() == "x=1"
 
     @pytest.mark.asyncio()
     async def test_bash_allows_python_read_only_one_liner(self) -> None:
@@ -1816,7 +2268,7 @@ class TestBashTool:
         assert result.metadata is not None
         assert result.metadata["advisory"] == (
             "Prefer dedicated edit tools for rewriting source files. "
-            "Use shell redirection only when it is necessary and intentional."
+            "Use shell or interpreter rewrites only when they are necessary and intentional."
         )
         assert (tmp_path / "test.py").read_text() == "x"
 
@@ -1832,7 +2284,7 @@ class TestBashTool:
         assert result.metadata is not None
         assert result.metadata["advisory"] == (
             "Prefer dedicated edit tools for rewriting source files. "
-            "Use shell redirection only when it is necessary and intentional."
+            "Use shell or interpreter rewrites only when they are necessary and intentional."
         )
         assert (tmp_path / "test.py").read_text() == "x"
 
@@ -1947,7 +2399,7 @@ class TestBashTool:
         assert cleaned == [process]
         assert result.metadata is not None
         assert result.metadata["status"] == "timed_out"
-        assert result.metadata["process_cleanup"] == "killed"
+        assert result.metadata["process_cleanup"] == "terminated_then_killed"
         assert result.metadata["timeout_seconds"] == 1
 
     @pytest.mark.asyncio()
@@ -2059,6 +2511,20 @@ class TestBashTool:
         cleanup_grace_seconds = shell_module._FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS
         max_timeout_seconds = math.ceil(max_foreground_timeout_ms / 1000)
         assert BASH_TOOL.timeout_seconds >= max_timeout_seconds + cleanup_grace_seconds
+        assert cleanup_grace_seconds == 2
+
+    def test_foreground_output_buffer_preserves_head_and_tail(self) -> None:
+        from cognis.tools.executor.shell import _ForegroundOutputBuffer
+
+        buffer = _ForegroundOutputBuffer(head_limit=5, tail_limit=5)
+        buffer.append("abcdef")
+        buffer.append("ghijkl")
+
+        rendered = buffer.render()
+
+        assert rendered.startswith("abcde")
+        assert rendered.endswith("hijkl")
+        assert "foreground output truncated" in rendered
 
     @pytest.mark.asyncio()
     async def test_bash_defaults_to_home_when_workdir_omitted(
@@ -2107,6 +2573,12 @@ class TestBashTool:
         output = await handle_bash_output({"shell_id": shell_id}, read_ctx)
         assert not output.is_error
         assert "hello" in output.output or "no new output" in output.output.lower()
+
+        filtered = await handle_bash_output(
+            {"shell_id": shell_id, "filter_regex": "hello|ready"}, read_ctx
+        )
+        assert not filtered.is_error
+        assert "filter_regex" in (filtered.metadata or {})
 
         stopped = await handle_bash_kill({"shell_id": shell_id}, read_ctx)
         assert not stopped.is_error
@@ -2219,7 +2691,7 @@ class TestBashTool:
         assert start.metadata is not None
         assert start.metadata["advisory"] == (
             "Prefer dedicated edit tools for rewriting source files. "
-            "Use shell redirection only when it is necessary and intentional."
+            "Use shell or interpreter rewrites only when they are necessary and intentional."
         )
         shell_id = str(start.metadata.get("shell_id"))
 
@@ -2320,7 +2792,11 @@ class TestLspTool:
         target.write_text("value = 1\n")
 
         class _FakeLsp:
-            async def touch_file(self, *_: object, **__: object) -> None:
+            def __init__(self) -> None:
+                self.touch_kwargs: dict[str, object] = {}
+
+            async def touch_file(self, *_: object, **kwargs: object) -> None:
+                self.touch_kwargs = kwargs
                 return None
 
             async def has_clients(self, *_: object, **__: object) -> bool:
@@ -2329,7 +2805,8 @@ class TestLspTool:
             async def definition(self, *_: object, **__: object) -> list[dict[str, object]]:
                 return [{"uri": "file:///tmp/sample.py", "range": {}}]
 
-        context = _context(runtime_metadata={"lsp_manager": _FakeLsp()})
+        lsp = _FakeLsp()
+        context = _context(runtime_metadata={"lsp_manager": lsp})
         result = await handle_lsp(
             {
                 "operation": "goToDefinition",
@@ -2342,6 +2819,7 @@ class TestLspTool:
 
         assert not result.is_error
         assert '"uri": "file:///tmp/sample.py"' in result.output
+        assert lsp.touch_kwargs["purpose"] == "semantic"
 
     @pytest.mark.asyncio()
     async def test_lsp_requires_available_server(self, tmp_path: Path) -> None:

@@ -59,7 +59,13 @@ async def test_responses_stream_emits_provider_liveness_for_status_events() -> N
     async def _stream():
         yield {"type": "response.created"}
 
-    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
 
     assert chunks == [
         {
@@ -83,7 +89,13 @@ async def test_responses_stream_failed_event_includes_safe_error_details() -> No
             },
         }
 
-    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
 
     assert len(chunks) == 1
     chunk = chunks[0]
@@ -111,7 +123,13 @@ async def test_responses_stream_failed_event_preserves_prior_error_event() -> No
             "response": {"id": "resp_123", "status": "failed"},
         }
 
-    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
 
     assert len(chunks) == 2
     assert chunks[0]["provider_event_type"] == "error"
@@ -136,7 +154,13 @@ async def test_responses_stream_suppresses_unbound_text_delta() -> None:
     async def _stream():
         yield {"type": "response.output_text.delta", "delta": "hello"}
 
-    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
     assert chunks[0]["suppressed_output_text_delta"] is True
     assert all(
         not (choice.get("delta") or {}).get("content")
@@ -424,6 +448,131 @@ def test_messages_to_responses_input_replays_raw_responses_output_items() -> Non
     ]
 
 
+def test_messages_to_responses_input_reconstructs_durable_payload_snapshot() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": "I will inspect the file.",
+            "tool_calls": [
+                {
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"file_path": "a.py"}'},
+                }
+            ],
+            "_responses_output_items": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-ciphertext",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_read",
+                    "name": "read",
+                    "arguments": '{"file_path": "a.py"}',
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_read", "content": "line 1"},
+    ]
+
+    assert messages_to_responses_input(messages) == [
+        {
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque-ciphertext",
+        },
+        {"role": "assistant", "content": "I will inspect the file."},
+        {
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_read",
+            "name": "read",
+            "arguments": '{"file_path": "a.py"}',
+        },
+        {"type": "function_call_output", "call_id": "call_read", "output": "line 1"},
+    ]
+
+
+def test_messages_to_responses_input_backfills_missing_raw_tool_call_snapshot() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Calling grep.",
+            "tool_calls": [
+                {
+                    "id": "call_grep",
+                    "type": "function",
+                    "function": {"name": "grep", "arguments": '{"pattern": "x"}'},
+                }
+            ],
+            "_responses_output_items": [
+                {"type": "reasoning", "id": "rs_2", "encrypted_content": "opaque"}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_grep", "content": "match"},
+    ]
+
+    assert messages_to_responses_input(messages) == [
+        {"type": "reasoning", "id": "rs_2", "encrypted_content": "opaque"},
+        {"role": "assistant", "content": "Calling grep."},
+        {
+            "type": "function_call",
+            "call_id": "call_grep",
+            "name": "grep",
+            "arguments": '{"pattern": "x"}',
+        },
+        {"type": "function_call_output", "call_id": "call_grep", "output": "match"},
+    ]
+
+
+def test_messages_to_responses_input_backfills_missing_native_apply_patch_snapshot() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_patch",
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "arguments": (
+                            '{"operation":{"type":"update_file","path":"/tmp/a.txt","diff":"@@\\n-x\\n+y\\n"}}'
+                        ),
+                    },
+                }
+            ],
+            "_responses_output_items": [
+                {"type": "reasoning", "id": "rs_patch", "encrypted_content": "opaque"}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_patch",
+            "content": "Updated /tmp/a.txt",
+            "_tool_name": "apply_patch",
+        },
+    ]
+
+    assert messages_to_responses_input(messages) == [
+        {"type": "reasoning", "id": "rs_patch", "encrypted_content": "opaque"},
+        {
+            "type": "apply_patch_call",
+            "call_id": "call_patch",
+            "status": "completed",
+            "operation": {"type": "update_file", "path": "/tmp/a.txt", "diff": "@@\n-x\n+y\n"},
+        },
+        {
+            "type": "apply_patch_call_output",
+            "call_id": "call_patch",
+            "status": "completed",
+            "output": "Updated /tmp/a.txt",
+        },
+    ]
+
+
 def test_messages_to_responses_input_replays_custom_tool_output_items() -> None:
     call_item = {
         "type": "custom_tool_call",
@@ -545,6 +694,31 @@ def test_split_messages_for_responses_extracts_prefix_into_instructions() -> Non
     assert instructions == "Immutable persona block."
     assert tail == [
         {"role": "system", "content": "Project AGENTS.md"},
+        {"role": "user", "content": "Hello"},
+    ]
+
+
+def test_split_messages_for_responses_accepts_cache_breakpoint_list() -> None:
+    messages = [
+        {"role": "system", "content": "Immutable persona block."},
+        {"role": "user", "content": "Earlier history"},
+        {"role": "system", "content": "Mutable reminder"},
+        {"role": "user", "content": "Hello"},
+    ]
+
+    instructions, tail = split_messages_for_responses(
+        messages,
+        cache_breakpoint_index=[
+            {"index": 0, "ttl": "5m"},
+            {"index": 2, "ttl": "5m"},
+            {"index": 3, "ttl": "5m"},
+        ],
+    )
+
+    assert instructions == "Immutable persona block."
+    assert tail == [
+        {"role": "user", "content": "Earlier history"},
+        {"role": "system", "content": "Mutable reminder"},
         {"role": "user", "content": "Hello"},
     ]
 
@@ -742,7 +916,7 @@ def test_responses_to_chat_response_normalizes_apply_patch_call() -> None:
     tool_call = result["choices"][0]["message"]["tool_calls"][0]
     assert tool_call["id"] == "call_patch"
     assert tool_call["function"]["name"] == "apply_patch"
-    assert tool_call["function"]["arguments"] == "{}"
+    assert tool_call["function"]["arguments"] == "[patch body omitted]"
 
 
 def test_responses_to_chat_response_drops_incomplete_apply_patch_arguments() -> None:
@@ -1045,6 +1219,22 @@ async def test_responses_stream_to_chat_chunks_emits_reasoning_content() -> None
 
 
 @pytest.mark.asyncio
+async def test_responses_stream_usage_total_tokens_falls_back_to_input_plus_output() -> None:
+    async def _stream():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 7, "output_tokens": 8},
+            },
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert chunks[-1]["usage"]["total_tokens"] == 15
+
+
+@pytest.mark.asyncio
 async def test_responses_stream_to_chat_chunks_keeps_reasoning_summary_separate() -> None:
     async def _stream():
         yield {"type": "response.reasoning_text.delta", "delta": '{"decision":"revise"}'}
@@ -1231,9 +1421,7 @@ async def test_responses_stream_to_chat_chunks_preserves_message_phase_metadata(
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_to_chat_chunks_suppresses_duplicate_large_output_text_delta() -> (
-    None
-):
+async def test_responses_stream_to_chat_chunks_keeps_standard_duplicate_output_text_delta() -> None:
     repeated_delta = (
         "This is a long assistant response segment that is large enough to be "
         "classified as a replayed provider delta rather than intentional prose."
@@ -1267,8 +1455,135 @@ async def test_responses_stream_to_chat_chunks_suppresses_duplicate_large_output
         for choice in chunk.get("choices", [])
         if (choice.get("delta") or {}).get("content")
     ]
+    assert content_deltas == [repeated_delta, repeated_delta]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_can_dedupe_cumulative_output_text_delta() -> None:
+    repeated_delta = (
+        "This is a long assistant response segment that is large enough to be "
+        "classified as a replayed provider delta rather than intentional prose."
+    )
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": repeated_delta,
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": repeated_delta,
+        }
+
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
+    content_deltas = [
+        choice["delta"]["content"]
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+        if choice.get("delta", {}).get("content")
+    ]
     assert content_deltas == [repeated_delta]
     assert sum(1 for chunk in chunks if chunk.get("suppressed_output_text_delta") is True) == 1
+
+
+@pytest.mark.asyncio
+async def test_response_completed_tool_fallback_emits_raw_function_call_item() -> None:
+    raw_call = {
+        "type": "function_call",
+        "id": "fc_done",
+        "call_id": "call_done",
+        "name": "read",
+        "arguments": '{"file_path": "a.py"}',
+    }
+
+    async def _stream():
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [raw_call]},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    raw_items = [
+        chunk["responses_output_item"] for chunk in chunks if "responses_output_item" in chunk
+    ]
+    assert raw_items == [
+        {
+            "type": "function_call",
+            "id": "call_done",
+            "call_id": "call_done",
+            "name": "read",
+            "arguments": '{"file_path": "a.py"}',
+        }
+    ]
+    assert any(
+        choice.get("finish_reason") == "tool_calls"
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_response_completed_tool_fallback_dedupes_streamed_raw_item() -> None:
+    raw_call = {
+        "type": "function_call",
+        "id": "fc_streamed",
+        "call_id": "call_streamed",
+        "name": "read",
+        "arguments": '{"file_path": "a.py"}',
+    }
+
+    async def _stream():
+        yield {"type": "response.output_item.done", "item": raw_call}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [raw_call]},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    raw_items = [
+        chunk["responses_output_item"] for chunk in chunks if "responses_output_item" in chunk
+    ]
+
+    assert raw_items == [raw_call]
+
+
+@pytest.mark.asyncio
+async def test_response_completed_reasoning_fallback_emits_raw_reasoning_item() -> None:
+    raw_reasoning = {
+        "type": "reasoning",
+        "id": "rs_done",
+        "encrypted_content": "opaque-ciphertext",
+    }
+
+    async def _stream():
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [raw_reasoning, {"type": "message", "id": "msg_done"}],
+            },
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+
+    assert any(chunk.get("responses_output_item") == raw_reasoning for chunk in chunks)
 
 
 @pytest.mark.asyncio
@@ -1299,7 +1614,13 @@ async def test_responses_stream_to_chat_chunks_emits_only_suffix_for_cumulative_
             "response": {"status": "completed", "usage": {"total_tokens": 5}},
         }
 
-    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
 
     content_deltas = [
         (choice.get("delta") or {}).get("content")
@@ -1339,7 +1660,13 @@ async def test_responses_stream_to_chat_chunks_emits_only_suffix_for_overlapping
             "response": {"status": "completed", "usage": {"total_tokens": 5}},
         }
 
-    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    chunks = [
+        chunk
+        async for chunk in responses_stream_to_chat_chunks(
+            _stream(),
+            dedupe_output_text_delta=True,
+        )
+    ]
 
     content_deltas = [
         (choice.get("delta") or {}).get("content")
@@ -1416,6 +1743,98 @@ async def test_responses_stream_to_chat_chunks_preserves_message_bound_output_te
         if (choice.get("delta") or {}).get("content")
     ]
     assert content_deltas == ["I'll inspect", " that now."]
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_dedupes_repeated_terminal_text_snapshots() -> None:
+    report = (
+        "Fixed and committed.\n\n"
+        "Commit:\n"
+        "- `0529726c fix(chat): preserve Chat v2 message timestamps`\n\n"
+        "Validation:\n"
+        "- Backend focused tests passed\n"
+        "- UI focused tests passed\n"
+    )
+
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "Done.",
+        }
+        yield {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": report,
+        }
+        yield {
+            "type": "response.content_part.added",
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": report},
+        }
+        yield {
+            "type": "response.content_part.done",
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": report},
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "content": [{"type": "output_text", "text": report}],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    content = acc.get_content()
+    assert content == f"Done.{report}"
+    assert content.count("Fixed and committed.") == 1
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_to_chat_chunks_dedupes_short_terminal_text_snapshots() -> None:
+    async def _stream():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "Done. ",
+        }
+        yield {
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": "Saved.",
+        }
+        yield {
+            "type": "response.content_part.done",
+            "item_id": "msg_1",
+            "part": {"type": "output_text", "text": "Saved."},
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    assert acc.get_content() == "Done. Saved."
 
 
 @pytest.mark.asyncio
@@ -1783,6 +2202,7 @@ async def test_responses_stream_to_chat_chunks_emits_apply_patch_call() -> None:
     assert calls[0].name == "apply_patch"
     assert calls[0].call_id == "call_patch"
     assert isinstance(calls[0], ToolArgumentParseFailure)
+    assert calls[0].raw == "[patch body omitted]"
 
 
 @pytest.mark.asyncio
@@ -1987,3 +2407,189 @@ async def test_responses_stream_recovers_trailing_valid_object_suffix() -> None:
             },
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_reasoning_delta_streams_repeated_short_token() -> None:
+    """A short delta matching the emitted suffix must not be swallowed (A1)."""
+
+    async def _stream():
+        yield {"type": "response.reasoning_text.delta", "delta": "I am very"}
+        yield {"type": "response.reasoning_text.delta", "delta": " very"}
+        yield {"type": "response.reasoning_text.delta", "delta": " sure."}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    text = "".join(
+        chunk["choices"][0]["delta"].get("reasoning_content") or ""
+        for chunk in chunks
+        if chunk.get("choices")
+    )
+    assert text == "I am very very sure."
+
+
+@pytest.mark.asyncio
+async def test_reasoning_summary_delta_streams_repeated_short_token() -> None:
+    async def _stream():
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "step by"}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": " step"}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": " step"}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    text = "".join(
+        chunk["choices"][0]["delta"].get("reasoning") or ""
+        for chunk in chunks
+        if chunk.get("choices")
+    )
+    assert text == "step by step step"
+
+
+@pytest.mark.asyncio
+async def test_identical_repeated_reasoning_summary_parts_both_emitted() -> None:
+    """Two summary parts with identical done-only text must both survive (A2)."""
+
+    async def _stream():
+        yield {"type": "response.reasoning_summary_part.added", "part": {}}
+        yield {"type": "response.reasoning_summary_text.done", "text": "Analyzing the code"}
+        yield {"type": "response.reasoning_summary_part.done", "part": {}}
+        yield {"type": "response.reasoning_summary_part.added", "part": {}}
+        yield {"type": "response.reasoning_summary_text.done", "text": "Analyzing the code"}
+        yield {"type": "response.reasoning_summary_part.done", "part": {}}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    summary_texts = [
+        chunk["choices"][0]["delta"].get("reasoning")
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("reasoning")
+    ]
+    assert summary_texts == ["Analyzing the code", "Analyzing the code"]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_part_boundary_emitted_before_carried_text() -> None:
+    """Text carried on part.added must arrive after the boundary marker (A3)."""
+
+    async def _stream():
+        yield {"type": "response.reasoning_summary_part.added", "part": {"text": "First part"}}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    kinds: list[str] = []
+    for chunk in chunks:
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("reasoning_part_boundary"):
+                kinds.append("boundary")
+            if delta.get("reasoning"):
+                kinds.append("text")
+    assert kinds[:2] == ["boundary", "text"]
+
+
+@pytest.mark.asyncio
+async def test_summary_done_after_deltas_does_not_duplicate() -> None:
+    """A .done replay of already-streamed part text stays deduplicated."""
+
+    async def _stream():
+        yield {"type": "response.reasoning_summary_part.added", "part": {}}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "Plan "}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "steps"}
+        yield {"type": "response.reasoning_summary_text.done", "text": "Plan steps"}
+        yield {"type": "response.reasoning_summary_part.done", "part": {}}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    text = "".join(
+        chunk["choices"][0]["delta"].get("reasoning") or ""
+        for chunk in chunks
+        if chunk.get("choices")
+    )
+    assert text == "Plan steps"
+
+
+@pytest.mark.asyncio
+async def test_completed_fallback_dedups_against_all_emitted_parts() -> None:
+    """Completed fallback must not re-emit text already streamed across parts."""
+
+    async def _stream():
+        yield {"type": "response.reasoning_summary_part.added", "part": {}}
+        yield {"type": "response.reasoning_summary_text.done", "text": "Part one"}
+        yield {"type": "response.reasoning_summary_part.done", "part": {}}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Part one"}],
+                    }
+                ],
+                "usage": {"total_tokens": 5},
+            },
+        }
+
+    chunks = [chunk async for chunk in responses_stream_to_chat_chunks(_stream())]
+    summary_texts = [
+        chunk["choices"][0]["delta"].get("reasoning")
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("reasoning")
+    ]
+    assert summary_texts == ["Part one"]
+
+
+@pytest.mark.asyncio
+async def test_function_call_arguments_done_recovers_dropped_deltas() -> None:
+    """The real API sends item_id+arguments (no nested item) on .done.
+
+    When argument deltas were dropped before item registration, the done
+    event must recover the full arguments instead of being a no-op.
+    """
+
+    async def _stream():
+        # No output_item.added and no argument deltas — everything before the
+        # done event was lost/suppressed by the transport.
+        yield {
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_123",
+            "arguments": '{"path": "/tmp/foo.txt"}',
+        }
+        yield {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_123",
+                "name": "read",
+                "arguments": '{"path": "/tmp/foo.txt"}',
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    acc = StreamAccumulator()
+    async for chunk in responses_stream_to_chat_chunks(_stream()):
+        acc.feed(chunk)
+
+    calls = acc.get_tool_calls()
+    assert len(calls) == 1
+    assert calls[0].name == "read"
+    assert calls[0].arguments == {"path": "/tmp/foo.txt"}

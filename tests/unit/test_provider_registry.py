@@ -103,6 +103,8 @@ def _test_config(tmp_path: Path, database_url: str) -> CognisConfig:
         tool_output_max_size_mb=10,
         initial_admin_email=None,
         initial_admin_password=None,
+        default_memory_backend="mnemory",
+        default_guardrails_backend="intaris",
     )
 
 

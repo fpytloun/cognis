@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,7 +65,9 @@ class FileFreshnessTracker:
         current = self._stamp(path)
         if current.mtime_ns != stamp.mtime_ns or current.size != stamp.size:
             raise RuntimeError(
-                f"File {path} has been modified since it was last read. Please read the file again before modifying it."
+                f"File {path} has been modified since it was last read "
+                "(may have been changed by a recent bash command or formatter). "
+                "Please read the file again before modifying it."
             )
 
     def lock_for(self, path: Path) -> asyncio.Lock:
@@ -77,7 +79,7 @@ class FileFreshnessTracker:
         return lock
 
     @asynccontextmanager
-    async def locks_for(self, paths: Iterable[Path]):
+    async def locks_for(self, paths: Iterable[Path]) -> AsyncIterator[None]:
         normalized_paths = sorted({self._normalize(path) for path in paths})
         async with AsyncExitStack() as stack:
             for normalized in normalized_paths:

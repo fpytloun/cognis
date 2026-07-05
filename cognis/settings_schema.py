@@ -10,11 +10,20 @@ _POSITIVE_INT_KEYS = {
     "security.api_read_requests_per_minute",
     "security.api_write_requests_per_minute",
     "session.step_timeout_seconds",
+    "session.stale_after_seconds",
+    "session.compaction_llm_max_attempts",
+    "session.compaction_max_recursion",
     "session.llm_stream_idle_timeout_seconds",
     "session.llm_stream_max_retries",
+    "session.memory_instructions_max_tokens",
+    "session.core_memories_max_tokens",
+    "session.recall_ttl_seconds",
+    "session.max_tool_calls_per_turn",
+    "session.cache_max_entries",
     "session.long_lived_chat_idle_compaction_min_events",
     "session.max_active_turns_per_user",
     "session.max_queued_messages",
+    "session.step_request_questions_timeout_seconds",
     "evaluator.timeout_ms",
     "mcp.tool_timeout_seconds",
     "mcp.connect_timeout_seconds",
@@ -31,11 +40,14 @@ _POSITIVE_INT_KEYS = {
 }
 
 _NON_NEGATIVE_INT_KEYS = {
+    "session.compaction_max_input_tokens",
+    "session.immutable_prefix_repair_cooldown_seconds",
     "session.long_lived_chat_idle_compaction_seconds",
     "web.browser_fetch.network_idle_after_dom_seconds",
 }
 
 _ENUM_KEYS: dict[str, set[str]] = {
+    "session.anthropic_cache_ttl": {"5m", "1h"},
     "web.backend": {"direct", "tavily", "brave", "searxng"},
     "web.search_backend": {"direct", "tavily", "brave", "searxng"},
     "web.fetch_backend": {"direct", "tavily", "browser"},
@@ -43,6 +55,7 @@ _ENUM_KEYS: dict[str, set[str]] = {
 }
 
 _FLOAT_RANGE_KEYS: dict[str, tuple[float, float]] = {
+    "session.compaction_threshold": (0.3, 0.99),
     "search.display_min_score": (0.0, 1.0),
 }
 

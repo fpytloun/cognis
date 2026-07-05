@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from builtins import BaseExceptionGroup, ExceptionGroup
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
 
+from cognis import __version__ as COGNIS_VERSION
 from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
 from cognis.tools import mcp as mcp_module
 from cognis.tools.mcp import (
     AsyncExitStack,
     MCPClientError,
+    SSEMCPClient,
     StdioMCPClient,
     StreamableHTTPMCPClient,
     _normalize_call_result,
@@ -175,11 +179,42 @@ def test_mcp_tools_to_definitions_suffixes_actual_normalized_name_collisions() -
     }
 
 
+def test_mcp_tools_to_definitions_clamps_descriptions_and_strips_schema_metadata() -> None:
+    definitions = mcp_tools_to_definitions(
+        "github",
+        [
+            {
+                "name": "search",
+                "description": "x" * 2000,
+                "inputSchema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "$id": "inner",
+                            "$comment": "drop me",
+                            "type": "string",
+                        }
+                    },
+                },
+            }
+        ],
+        timeout_seconds=2,
+    )
+
+    definition = definitions[0]
+    assert len(definition.description) <= 1024
+    assert definition.description.endswith("(full description via search_tools)")
+    assert "$schema" not in definition.parameters
+    assert "$id" not in definition.parameters["properties"]["query"]
+    assert "$comment" not in definition.parameters["properties"]["query"]
+
+
 @pytest.mark.asyncio
 async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: dict[str, object] = {}
+    calls: dict[str, Any] = {}
 
     class _AsyncContext:
         def __init__(self, value: object) -> None:
@@ -222,6 +257,130 @@ async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
 
     assert calls["url"] == "http://mcp-gws.openwebui.svc.cluster.local/mcp"
     assert calls["http_kwargs"]["follow_redirects"] is True
+    assert calls["http_kwargs"]["headers"]["User-Agent"] == f"Cognis/{COGNIS_VERSION}"
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_client_preserves_configured_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class _AsyncContext:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        async def __aenter__(self) -> object:
+            return self.value
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class _HTTPClient:
+        def __init__(self, **kwargs: object) -> None:
+            calls["http_kwargs"] = kwargs
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    def _streamable_http_client(url: str, *, http_client: object) -> _AsyncContext:
+        calls["url"] = url
+        calls["http_client"] = http_client
+        return _AsyncContext((object(), object(), lambda: None))
+
+    monkeypatch.setattr(mcp_module.httpx, "AsyncClient", _HTTPClient)
+    monkeypatch.setattr(mcp_module, "streamable_http_client", _streamable_http_client)
+
+    client = StreamableHTTPMCPClient(
+        MCPServerConfig(
+            name="rohlik",
+            transport="streamable_http",
+            url="https://mcp.rohlik.cz/mcp",
+        ),
+        headers={"user-agent": "CustomMCP/1.0", "Rhl-Email": "$secret:email"},
+    )
+
+    async with mcp_module.AsyncExitStack() as stack:
+        await client._enter_transport(stack)
+
+    assert calls["http_kwargs"]["headers"] == {
+        "user-agent": "CustomMCP/1.0",
+        "Rhl-Email": "$secret:email",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sse_client_uses_default_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, Any] = {}
+
+    class _AsyncContext:
+        async def __aenter__(self) -> tuple[object, object]:
+            return object(), object()
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    def _sse_client(url: str, **kwargs: object) -> _AsyncContext:
+        calls["url"] = url
+        calls["kwargs"] = kwargs
+        return _AsyncContext()
+
+    monkeypatch.setattr(mcp_module, "sse_client", _sse_client)
+
+    client = SSEMCPClient(
+        MCPServerConfig(
+            name="legacy-sse",
+            transport="sse",
+            url="https://example.test/sse",
+        )
+    )
+
+    async with mcp_module.AsyncExitStack() as stack:
+        await client._enter_transport(stack)
+
+    assert calls["url"] == "https://example.test/sse"
+    assert calls["kwargs"]["headers"]["User-Agent"] == f"Cognis/{COGNIS_VERSION}"
+
+
+@pytest.mark.asyncio
+async def test_sse_client_preserves_configured_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+
+    class _AsyncContext:
+        async def __aenter__(self) -> tuple[object, object]:
+            return object(), object()
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    def _sse_client(url: str, **kwargs: object) -> _AsyncContext:
+        calls["url"] = url
+        calls["kwargs"] = kwargs
+        return _AsyncContext()
+
+    monkeypatch.setattr(mcp_module, "sse_client", _sse_client)
+
+    client = SSEMCPClient(
+        MCPServerConfig(
+            name="legacy-sse",
+            transport="sse",
+            url="https://example.test/sse",
+        ),
+        headers={"user-agent": "CustomMCP/1.0", "X-Test": "1"},
+    )
+
+    async with mcp_module.AsyncExitStack() as stack:
+        await client._enter_transport(stack)
+
+    assert calls["kwargs"]["headers"] == {
+        "user-agent": "CustomMCP/1.0",
+        "X-Test": "1",
+    }
 
 
 @pytest.mark.asyncio
@@ -482,6 +641,73 @@ async def test_mcp_connect_times_out_and_closes_owner_task() -> None:
     assert exc_info.value.timed_out is True
     assert client._task is None
     assert client._requests is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_connect_timeout_surfaces_late_auth_cleanup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = httpx.Request("POST", "https://mcp.example/mcp")
+    response = httpx.Response(
+        401,
+        headers={"www-authenticate": 'Bearer error="invalid_token"'},
+        request=request,
+    )
+    auth_error = ExceptionGroup(
+        "streamable-http cleanup",
+        [
+            httpx.HTTPStatusError(
+                "Client error '401 Unauthorized'",
+                request=request,
+                response=response,
+            )
+        ],
+    )
+
+    class _Context:
+        async def __aenter__(self) -> tuple[object, object]:
+            return object(), object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            raise auth_error
+
+    class _Session:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            await asyncio.Event().wait()
+
+    class _Client(_SessionMCPClient):
+        async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[object, object]:
+            return await exit_stack.enter_async_context(_Context())
+
+        async def _probe_timeout_authorization(self) -> MCPClientError | None:
+            return mcp_module._coerce_client_error("rohlik", "initialize", auth_error)
+
+    monkeypatch.setattr(mcp_module, "ClientSession", _Session)
+    client = _Client(
+        MCPServerConfig(
+            name="rohlik",
+            transport="streamable_http",
+            url="https://mcp.example/mcp",
+            timeout_seconds=1,
+            connect_timeout_seconds=1,
+        )
+    )
+
+    with pytest.raises(MCPClientError) as exc_info:
+        await client.connect()
+
+    assert exc_info.value.authorization_required is True
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.auth_error == "authorization_required"
 
 
 @pytest.mark.asyncio

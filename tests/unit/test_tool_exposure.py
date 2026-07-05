@@ -97,14 +97,47 @@ def test_prepare_tool_exposure_uses_anthropic_deferred_loading_with_controller_s
     assert result.debug_metadata["discovery_mode"] == "controller_search"
     assert tool_names == ["search_tools", "read", sanitize_mcp_tool_name("github", "search/issues")]
     assert tool_names != sorted(tool_names, key=str.casefold)
-    read_schema = next(
-        tool for tool in result.tools if tool.get("function", {}).get("name") == "read"
-    )
-    assert read_schema["function"]["cache_control"] == {"type": "ephemeral"}
+    assert result.tools[-1]["function"]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
     deferred = [
         tool for tool in result.tools if tool.get("function", {}).get("name", "").startswith("mcp_")
     ]
     assert deferred[0]["function"]["defer_loading"] is True
+
+
+def test_prepare_tool_exposure_strips_schema_metadata_recursively() -> None:
+    inventory = [
+        ToolDefinition(
+            name="schema_tool",
+            description="schema tool",
+            parameters={
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "$id": "query",
+                        "$comment": "drop me",
+                        "type": "string",
+                    }
+                },
+            },
+            source=ToolSource(type="builtin"),
+            category="system",
+            read_only=True,
+        )
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5"),
+        contract=_contract(),
+        promoted_tool_ids=set(),
+    )
+
+    parameters = result.tools[0]["function"]["parameters"]
+    assert "$schema" not in parameters
+    assert "$id" not in parameters["properties"]["query"]
+    assert "$comment" not in parameters["properties"]["query"]
 
 
 def test_prepare_tool_exposure_can_disable_anthropic_deferred_loading() -> None:
@@ -129,6 +162,20 @@ def test_prepare_tool_exposure_can_disable_anthropic_deferred_loading() -> None:
     assert result.debug_metadata["strategy"] == "generic_search_tools"
     assert "search_tools" in tool_names
     assert not any(tool.get("function", {}).get("defer_loading") is True for tool in result.tools)
+    assert result.tools[-1]["function"]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+
+
+def test_prepare_tool_exposure_uses_configured_anthropic_cache_ttl() -> None:
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("bash"), _tool("read")],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-sonnet-4-5", max_tools=2),
+        contract=_contract(),
+        promoted_tool_ids=set(),
+        anthropic_cache_ttl="1h",
+    )
+
+    assert result.tools[-1]["function"]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_prepare_tool_exposure_uses_generic_search_fallback_with_promoted_tools() -> None:
@@ -249,6 +296,29 @@ def test_prepare_tool_exposure_sorts_final_responses_tools_by_visible_name() -> 
         if tool.get("type") == "function"
     ]
     assert function_names == sorted(function_names, key=str.casefold)
+
+
+def test_prepare_tool_exposure_appends_promoted_tools_after_stable_sorted_block() -> None:
+    promoted = _tool("aaa_promoted", category="utility")
+    bash = _tool("bash", source_type="executor", category="shell")
+    read = _tool("read", source_type="executor", category="filesystem")
+
+    result = prepare_tool_exposure(
+        inventory_tools=[promoted, read, bash],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES, discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids={stable_tool_id(promoted)},
+        default_visible_tool_ids={stable_tool_id(bash), stable_tool_id(read)},
+        allow_tool_search=False,
+    )
+
+    function_names = [
+        tool.get("function", {}).get("name")
+        for tool in result.tools
+        if tool.get("type") == "function"
+    ]
+    assert function_names == ["bash", "read", "aaa_promoted"]
 
 
 def test_prepare_tool_exposure_orders_native_apply_patch_alphabetically() -> None:

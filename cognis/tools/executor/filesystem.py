@@ -12,7 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,7 +31,9 @@ logger = get_logger(__name__)
 
 _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
+_MAX_READ_OUTPUT_CHARS = 50_000
 _MAX_INLINE_BINARY_READ_BYTES = 10 * 1024 * 1024
+_MAX_FORMATTER_DIFF_CHARS = 2000
 _TEXTUAL_BINARY_MIME_TYPES = {"image/svg+xml"}
 
 
@@ -82,7 +84,7 @@ async def _with_file_lock(
 
 
 @contextlib.asynccontextmanager
-async def _with_file_locks(context: ToolExecutionContext, paths: list[Path]):
+async def _with_file_locks(context: ToolExecutionContext, paths: list[Path]) -> AsyncIterator[None]:
     tracker = get_file_freshness_tracker(context.runtime_metadata)
     async with tracker.locks_for(paths):
         yield
@@ -115,6 +117,13 @@ class _StagedPatchOperation:
     content: str | None = None
 
 
+@dataclass(slots=True)
+class _PatchOverlayEntry:
+    exists: bool
+    content: str = ""
+    on_disk: bool = False
+
+
 class PatchFormatError(ValueError):
     """Raised when patch input is syntactically invalid."""
 
@@ -123,11 +132,32 @@ class PatchConflictError(ValueError):
     """Raised when a patch is semantically invalid for the current workspace."""
 
 
+@dataclass(slots=True)
+class _LSPToolDiagnostics:
+    text: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class _FormatterResult:
+    status: str = "not_configured"
+    changed: bool = False
+    diff: str = ""
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class _EditMatchResult:
+    count: int
+    matched_old: str = ""
+    note: str | None = None
+
+
 async def _collect_lsp_diagnostics(
     context: ToolExecutionContext,
     file_path: str,
-) -> str:
-    """Touch LSP and return formatted diagnostics, or empty string.
+) -> _LSPToolDiagnostics:
+    """Touch LSP and return formatted diagnostics with provenance metadata.
 
     This is best-effort: any LSP failure returns an empty string so
     that the file operation result is never affected.
@@ -136,68 +166,167 @@ async def _collect_lsp_diagnostics(
 
     lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
     if lsp is None:
-        return ""
+        return _LSPToolDiagnostics(metadata={"status": "unavailable", "reason": "no_lsp_manager"})
     try:
         abs_path = os.path.abspath(file_path)
-        await lsp.touch_file(abs_path, wait=True)
-        diagnostics = lsp.get_diagnostics(abs_path)
-        if not diagnostics:
-            return ""
-        from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
-
-        return format_diagnostics_for_llm(diagnostics, abs_path)
+        collection = await lsp.touch_file(abs_path, wait=True, save=True, purpose="diagnostics")
+        return _format_lsp_collection(context, collection, abs_path)
     except Exception:
         logger.debug(
             "lsp: diagnostics collection failed",
             extra={"extra_data": {"file_path": file_path}},
+            exc_info=True,
         )
-        return ""
+        return _LSPToolDiagnostics(metadata={"status": "failed"})
 
 
 async def _collect_lsp_diagnostics_batch(
     context: ToolExecutionContext,
     file_paths: list[str],
-) -> str:
+) -> _LSPToolDiagnostics:
     """Collect LSP diagnostics for multiple files concurrently."""
     lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
     if lsp is None or not file_paths:
-        return ""
+        return _LSPToolDiagnostics(metadata={"status": "unavailable", "reason": "no_lsp_manager"})
     try:
         # Touch all files concurrently
-        await asyncio.gather(
-            *(lsp.touch_file(fp, wait=True) for fp in file_paths),
+        results = await asyncio.gather(
+            *(lsp.touch_file(fp, wait=True, save=True, purpose="diagnostics") for fp in file_paths),
             return_exceptions=True,
         )
-        # Collect all diagnostics
-        all_diagnostics: dict[str, list[Any]] = {}
-        for fp in file_paths:
-            diags = lsp.get_diagnostics(fp)
-            for path, path_diags in diags.items():
-                existing = all_diagnostics.get(path, [])
-                existing.extend(path_diags)
-                all_diagnostics[path] = existing
-
-        if not all_diagnostics:
-            return ""
-
-        from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
-
-        # Use the first file as the "edited file" for formatting
-        return format_diagnostics_for_llm(all_diagnostics, file_paths[0])
+        collections = [result for result in results if hasattr(result, "waits")]
+        return _format_lsp_collections(context, collections, os.path.abspath(file_paths[0]))
     except Exception:
         logger.debug(
             "lsp: batch diagnostics collection failed",
             extra={"extra_data": {"file_count": len(file_paths)}},
+            exc_info=True,
         )
-        return ""
+        return _LSPToolDiagnostics(metadata={"status": "failed"})
 
 
-def _should_wait_for_edit_diagnostics(context: ToolExecutionContext, file_paths: list[str]) -> bool:
-    """Return whether edit tools should synchronously wait for diagnostics."""
-    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
-    if lsp is None:
-        return False
-    return not (lsp.has_pending_diagnostics(file_paths) or lsp.has_cached_diagnostics(file_paths))
+def _format_lsp_collection(
+    context: ToolExecutionContext, collection: Any, edited_file: str
+) -> _LSPToolDiagnostics:
+    return _format_lsp_collections(context, [collection], edited_file)
+
+
+def _format_lsp_collections(
+    context: ToolExecutionContext, collections: list[Any], edited_file: str
+) -> _LSPToolDiagnostics:
+    from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
+    from cognis.tools.executor.lsp.types import Diagnostic, DiagnosticFreshness, DiagnosticSeverity
+
+    waits: list[Any] = [wait for collection in collections for wait in collection.waits]
+    snapshots_by_path: dict[str, list[Any]] = {}
+    for collection in collections:
+        for path, snapshots in collection.snapshots_by_path.items():
+            snapshots_by_path.setdefault(path, []).extend(snapshots)
+
+    diagnostics: dict[str, list[Diagnostic]] = {}
+    unchanged_warning_count = 0
+    previous_diagnostics = context.runtime_metadata.setdefault("_lsp_previous_diagnostics", {})
+    if not isinstance(previous_diagnostics, dict):
+        previous_diagnostics = {}
+        context.runtime_metadata["_lsp_previous_diagnostics"] = previous_diagnostics
+    for path, snapshots in snapshots_by_path.items():
+        for snapshot in snapshots:
+            if snapshot.is_fresh:
+                previous = previous_diagnostics.get(path, set())
+                if not isinstance(previous, set):
+                    previous = set(previous) if isinstance(previous, list) else set()
+                current = {_diagnostic_signature(diagnostic) for diagnostic in snapshot.diagnostics}
+                selected: list[Diagnostic] = []
+                for diagnostic in snapshot.diagnostics:
+                    signature = _diagnostic_signature(diagnostic)
+                    if diagnostic.severity is DiagnosticSeverity.ERROR or signature not in previous:
+                        selected.append(diagnostic)
+                    elif diagnostic.severity is DiagnosticSeverity.WARNING:
+                        unchanged_warning_count += 1
+                if selected:
+                    diagnostics.setdefault(path, []).extend(selected)
+                previous_diagnostics[path] = current
+
+    cwd = context.runtime_metadata.get("working_directory")
+    cwd = cwd if isinstance(cwd, str) else None
+    formatted = format_diagnostics_for_llm(diagnostics, edited_file, cwd=cwd) if diagnostics else ""
+    status_counts: dict[str, int] = {}
+    for wait in waits:
+        status_counts[wait.status.value] = status_counts.get(wait.status.value, 0) + 1
+
+    notices: list[str] = []
+    timeout_servers = [
+        wait.server_id for wait in waits if wait.status is DiagnosticFreshness.TIMEOUT
+    ]
+    failed_servers = [wait.server_id for wait in waits if wait.status is DiagnosticFreshness.FAILED]
+    fresh_waits = [
+        wait
+        for wait in waits
+        if wait.status in (DiagnosticFreshness.FRESH, DiagnosticFreshness.FRESH_UNVERSIONED)
+    ]
+    if timeout_servers:
+        notices.append(
+            "LSP diagnostics: timed out waiting for fresh diagnostics from "
+            f"{', '.join(sorted(set(timeout_servers)))}; cached diagnostics were not shown."
+        )
+    if failed_servers:
+        notices.append(
+            "LSP diagnostics: failed while waiting for "
+            f"{', '.join(sorted(set(failed_servers)))}; cached diagnostics were not shown."
+        )
+    if (
+        fresh_waits
+        and not formatted
+        and unchanged_warning_count == 0
+        and not timeout_servers
+        and not failed_servers
+    ):
+        source = ", ".join(sorted({wait.server_id for wait in fresh_waits}))
+        if any(wait.status is DiagnosticFreshness.FRESH_UNVERSIONED for wait in fresh_waits):
+            notices.append(f"LSP: clean ({source}; diagnostic versions unavailable).")
+        else:
+            notices.append(f"LSP: clean ({source}).")
+    if unchanged_warning_count:
+        notices.append(f"{unchanged_warning_count} pre-existing warning(s) unchanged.")
+
+    text = "\n\n".join(part for part in [formatted, *notices] if part)
+    metadata = {
+        "status_counts": status_counts,
+        "waits": [
+            {
+                "server_id": wait.server_id,
+                "uri": wait.uri,
+                "target_version": wait.target_version,
+                "status": wait.status.value,
+                "duration_ms": wait.duration_ms,
+                "error_count": wait.error_count,
+                "warning_count": wait.warning_count,
+                "message": wait.message,
+            }
+            for wait in waits
+        ],
+    }
+    if fresh_waits:
+        metadata["status"] = "fresh"
+    elif timeout_servers:
+        metadata["status"] = "timeout"
+    elif failed_servers:
+        metadata["status"] = "failed"
+    else:
+        metadata["status"] = "unavailable"
+    return _LSPToolDiagnostics(text=text, metadata=metadata)
+
+
+def _diagnostic_signature(diagnostic: Any) -> tuple[Any, ...]:
+    range_ = getattr(diagnostic, "range", None)
+    start = getattr(range_, "start", None)
+    return (
+        getattr(diagnostic, "severity", None),
+        getattr(start, "line", None),
+        getattr(start, "character", None),
+        getattr(diagnostic, "message", None),
+        getattr(diagnostic, "code", None),
+    )
 
 
 def _warm_lsp(context: ToolExecutionContext, file_path: str) -> None:
@@ -229,27 +358,6 @@ def _warm_lsp_batch(context: ToolExecutionContext, file_paths: list[str]) -> Non
         )
 
     asyncio.create_task(_warm())
-
-
-def _format_cached_lsp_diagnostics(context: ToolExecutionContext, file_paths: list[str]) -> str:
-    """Return already available diagnostics without touching or waiting on LSP."""
-    lsp: LSPManager | None = context.runtime_metadata.get(_LSP_MANAGER_KEY)
-    if lsp is None or not file_paths:
-        return ""
-
-    all_diagnostics: dict[str, list[Any]] = {}
-    for path in file_paths:
-        for diag_path, path_diags in lsp.get_diagnostics(path).items():
-            existing = all_diagnostics.get(diag_path, [])
-            existing.extend(path_diags)
-            all_diagnostics[diag_path] = existing
-
-    if not all_diagnostics:
-        return ""
-
-    from cognis.tools.executor.lsp.diagnostics import format_diagnostics_for_llm
-
-    return format_diagnostics_for_llm(all_diagnostics, file_paths[0])
 
 
 _DEFAULT_IGNORE = {
@@ -287,11 +395,12 @@ _PRETTIER_EXTENSIONS = {
 }
 
 
-async def _maybe_format_file(path: Path) -> bool:
+async def _maybe_format_file(path: Path) -> _FormatterResult:
     command = _formatter_command(path)
     if command is None:
-        return False
+        return _FormatterResult()
     before = path.read_bytes()
+    process: asyncio.subprocess.Process | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -299,30 +408,109 @@ async def _maybe_format_file(path: Path) -> bool:
             stderr=asyncio.subprocess.PIPE,
             cwd=str(path.parent),
         )
-        await asyncio.wait_for(process.communicate(), timeout=20)
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=20)
         after = path.read_bytes()
-        return before != after
-    except Exception:
+        changed = before != after
+        if process.returncode not in {0, None}:
+            error = (stderr or stdout).decode("utf-8", errors="replace").strip()
+            return _FormatterResult(status="failed", error=error or "formatter failed")
+        return _FormatterResult(
+            status="changed" if changed else "unchanged",
+            changed=changed,
+            diff=_capped_diff(
+                _unified_diff(
+                    path,
+                    before.decode("utf-8", errors="replace"),
+                    after.decode("utf-8", errors="replace"),
+                ),
+                _MAX_FORMATTER_DIFF_CHARS,
+            )
+            if changed
+            else "",
+        )
+    except TimeoutError:
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(ProcessLookupError, TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=2)
+        return _FormatterResult(status="timeout", error="formatter timed out after 20s")
+    except Exception as exc:
         logger.debug(
             "formatter: file format failed",
             extra={"extra_data": {"file_path": str(path)}},
+            exc_info=True,
         )
-        return False
+        return _FormatterResult(status="failed", error=str(exc) or exc.__class__.__name__)
 
 
 def _formatter_command(path: Path) -> list[str] | None:
     suffix = path.suffix.lower()
     if suffix == ".py":
+        if _find_ruff_config(path.parent) is None:
+            return None
         ruff = shutil.which("ruff")
         if ruff:
             return [ruff, "format", str(path)]
         return None
     if suffix not in _PRETTIER_EXTENSIONS:
         return None
-    prettier = _find_prettier_binary(path.parent)
+    prettier_root = _find_prettier_config(path.parent)
+    if prettier_root is None:
+        return None
+    prettier = _find_prettier_binary(prettier_root)
     if prettier is None:
         return None
     return [prettier, "--write", str(path)]
+
+
+def _find_ruff_config(start_dir: Path) -> Path | None:
+    for directory in [start_dir, *start_dir.parents]:
+        for name in ("ruff.toml", ".ruff.toml"):
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        pyproject = directory / "pyproject.toml"
+        if pyproject.is_file():
+            with contextlib.suppress(OSError, UnicodeDecodeError):
+                content = pyproject.read_text(encoding="utf-8", errors="replace")
+                if "[tool.ruff" in content:
+                    return pyproject
+    return None
+
+
+def _find_prettier_config(start_dir: Path) -> Path | None:
+    config_names = (
+        ".prettierrc",
+        ".prettierrc.json",
+        ".prettierrc.yml",
+        ".prettierrc.yaml",
+        ".prettierrc.toml",
+        "prettier.config.js",
+        "prettier.config.cjs",
+        "prettier.config.mjs",
+        "prettier.config.ts",
+    )
+    for directory in [start_dir, *start_dir.parents]:
+        if any((directory / name).is_file() for name in config_names):
+            return directory
+        package_json = directory / "package.json"
+        if package_json.is_file():
+            with contextlib.suppress(OSError, UnicodeDecodeError, json.JSONDecodeError):
+                package = json.loads(package_json.read_text(encoding="utf-8"))
+                if "prettier" in package:
+                    return directory
+                dependencies = package.get("dependencies")
+                dev_dependencies = package.get("devDependencies")
+                if (
+                    isinstance(dependencies, dict)
+                    and "prettier" in dependencies
+                    or isinstance(dev_dependencies, dict)
+                    and "prettier" in dev_dependencies
+                ):
+                    return directory
+            break
+    return None
 
 
 def _find_prettier_binary(start_dir: Path) -> str | None:
@@ -349,20 +537,51 @@ def _unified_diff(path: Path, before: str, after: str) -> str:
     )
 
 
+def _capped_diff(diff: str, max_chars: int) -> str:
+    if len(diff) <= max_chars:
+        return diff
+    return diff[:max_chars].rstrip() + "\n... (formatter diff truncated)\n"
+
+
+def _normalize_formatter_result(formatter: _FormatterResult | None) -> _FormatterResult:
+    return formatter if isinstance(formatter, _FormatterResult) else _FormatterResult()
+
+
+def _formatter_output(formatter: _FormatterResult | None) -> str:
+    formatter = _normalize_formatter_result(formatter)
+    if formatter.status == "changed" and formatter.diff:
+        return f"Formatter diff:\n```diff\n{formatter.diff}```"
+    if formatter.status == "timeout":
+        return "Formatter timed out and was killed before freshness was recorded."
+    if formatter.status == "failed" and formatter.error:
+        return f"Formatter failed without blocking the write: {formatter.error[:500]}"
+    return ""
+
+
 def _files_written_metadata(
-    paths: list[Path], diffs: list[dict[str, str]] | None = None
+    paths: list[Path],
+    diffs: list[dict[str, str]] | None = None,
+    lsp_diagnostics: _LSPToolDiagnostics | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {"files_written": [str(path) for path in paths]}
     if diffs:
         metadata["file_diffs"] = diffs
+    if lsp_diagnostics is not None and lsp_diagnostics.metadata:
+        metadata["lsp_diagnostics"] = lsp_diagnostics.metadata
     return metadata
 
 
 async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     """Read a file or directory, returning line-numbered content for text."""
     file_path = arguments.get("file_path", "")
-    offset = max(1, int(arguments.get("offset", 1)))
-    limit = int(arguments.get("limit", _MAX_READ_LINES))
+    try:
+        offset = max(1, int(arguments.get("offset", 1)))
+        requested_limit = int(arguments.get("limit", _MAX_READ_LINES))
+    except (TypeError, ValueError):
+        return ToolResult(output="offset and limit must be integers.", is_error=True)
+    if requested_limit < 1:
+        return ToolResult(output="limit must be >= 1.", is_error=True)
+    limit = min(requested_limit, _MAX_READ_LINES)
 
     try:
         path = _resolve_path(file_path, context)
@@ -384,22 +603,44 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
         await _record_read(context, path)
         return _binary_read_result(path, raw_content, mime_type)
 
-    content = raw_content.decode("utf-8", errors="replace")
+    if path.suffix.lower() == ".ipynb":
+        content = _render_notebook_content(path, raw_content)
+    else:
+        content = raw_content.decode("utf-8", errors="replace")
 
     lines = content.splitlines(keepends=True)
     total = len(lines)
     selected = lines[offset - 1 : offset - 1 + limit]
 
     output_lines: list[str] = []
+    emitted = 0
     for i, line in enumerate(selected, start=offset):
         line_content = line.rstrip("\n\r")
         if len(line_content) > _MAX_LINE_LENGTH:
             line_content = line_content[:_MAX_LINE_LENGTH] + "..."
-        output_lines.append(f"{i}: {line_content}")
+        candidate = f"{i}: {line_content}"
+        if (
+            output_lines
+            and sum(len(existing) + 1 for existing in output_lines) + len(candidate)
+            > _MAX_READ_OUTPUT_CHARS
+        ):
+            break
+        output_lines.append(candidate)
+        emitted += 1
 
     result = "\n".join(output_lines)
-    if offset + limit - 1 < total:
-        result += f"\n\n(Showing lines {offset}-{offset + len(selected) - 1} of {total}. Use offset={offset + limit} to continue.)"
+    next_offset = offset + emitted
+    if requested_limit > limit:
+        result += (
+            f"\n\n(Requested limit {requested_limit} exceeds the safe read cap; used "
+            f"limit={limit}. Re-read with limit≤{limit}.)"
+        )
+    if next_offset <= total:
+        shown_end = offset + max(0, emitted - 1)
+        result += (
+            f"\n\n(Showing lines {offset}-{shown_end} of {total}. "
+            f"Use offset={next_offset} and limit≤{limit} to continue.)"
+        )
 
     # Warm LSP for subsequent edits (non-blocking)
     if path.is_file():
@@ -473,7 +714,10 @@ def _binary_read_result(path: Path, content: bytes, mime_type: str) -> ToolResul
 def _read_directory(path: Path) -> ToolResult:
     """List directory entries."""
     try:
-        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        entries = sorted(
+            (entry for entry in path.iterdir() if entry.name not in _DEFAULT_IGNORE),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
     except (OSError, PermissionError) as exc:
         return ToolResult(output=f"Cannot read directory: {exc}", is_error=True)
 
@@ -484,6 +728,66 @@ def _read_directory(path: Path) -> ToolResult:
     if len(entries) > 200:
         lines.append(f"... and {len(entries) - 200} more entries")
     return ToolResult(output="\n".join(lines))
+
+
+def _render_notebook_content(path: Path, raw_content: bytes) -> str:
+    try:
+        payload = json.loads(raw_content.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return raw_content.decode("utf-8", errors="replace")
+    cells = payload.get("cells")
+    if not isinstance(cells, list):
+        return raw_content.decode("utf-8", errors="replace")
+
+    lines = [f"Notebook: {path.name}", f"Cells: {len(cells)}"]
+    for index, cell in enumerate(cells, start=1):
+        if not isinstance(cell, dict):
+            continue
+        cell_type = str(cell.get("cell_type") or "unknown")
+        source = _notebook_join_text(cell.get("source"))
+        lines.append("")
+        lines.append(f"## Cell {index} [{cell_type}]")
+        if source:
+            lines.extend(source.rstrip("\n").splitlines())
+        else:
+            lines.append("(empty)")
+        outputs = cell.get("outputs")
+        if isinstance(outputs, list) and outputs:
+            lines.append(f"Outputs: {len(outputs)}")
+            for output_index, output in enumerate(outputs[:5], start=1):
+                if isinstance(output, dict):
+                    lines.append(f"- {_summarize_notebook_output(output_index, output)}")
+            if len(outputs) > 5:
+                lines.append(f"- ... {len(outputs) - 5} more output(s) omitted")
+    return "\n".join(lines) + "\n"
+
+
+def _notebook_join_text(value: Any) -> str:
+    if isinstance(value, list):
+        return "".join(str(part) for part in value)
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _summarize_notebook_output(index: int, output: dict[str, Any]) -> str:
+    output_type = str(output.get("output_type") or "output")
+    if output_type == "stream":
+        text = _notebook_join_text(output.get("text"))
+        return f"Output {index}: stream {output.get('name') or ''} ({len(text)} chars)"
+    if output_type == "execute_result":
+        data = output.get("data")
+        keys = sorted(data) if isinstance(data, dict) else []
+        return f"Output {index}: execute_result ({', '.join(keys[:5]) or 'no data'})"
+    if output_type == "display_data":
+        data = output.get("data")
+        keys = sorted(data) if isinstance(data, dict) else []
+        return f"Output {index}: display_data ({', '.join(keys[:5]) or 'no data'})"
+    if output_type == "error":
+        ename = output.get("ename") or "error"
+        evalue = output.get("evalue") or ""
+        return f"Output {index}: error {ename}: {evalue}"
+    return f"Output {index}: {output_type}"
 
 
 async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -513,23 +817,25 @@ async def handle_write(arguments: dict[str, Any], context: ToolExecutionContext)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content_to_write, encoding="utf-8", newline="")
-            formatter_changed = await _maybe_format_file(path)
+            formatter = await _maybe_format_file(path)
             final_content = _read_text_preserving_newlines(path)
-            if formatter_changed:
-                _remove_tracked_path(context, path)
-            else:
-                await _record_write(context, path)
+            await _record_write(context, path)
         except (OSError, PermissionError, UnicodeDecodeError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
         output = f"Wrote {len(content_to_write.encode('utf-8'))} bytes to {file_path}"
-        diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
-        if diagnostics_text:
-            output += f"\n\n{diagnostics_text}"
+        formatter_output = _formatter_output(formatter)
+        if formatter_output:
+            output += f"\n\n{formatter_output}"
+        lsp_diagnostics = await _collect_lsp_diagnostics(context, file_path)
+        if lsp_diagnostics.text:
+            output += f"\n\n{lsp_diagnostics.text}"
         return ToolResult(
             output=output,
             metadata=_files_written_metadata(
-                [path], [{"path": str(path), "diff": _unified_diff(path, before, final_content)}]
+                [path],
+                [{"path": str(path), "diff": _unified_diff(path, before, final_content)}],
+                lsp_diagnostics,
             ),
         )
 
@@ -633,17 +939,13 @@ async def handle_skill_asset_materialize(
             path = _resolve_path(target_path, context)
             if path.exists() and path.is_dir():
                 path = _resolve_asset_target_in_directory(path, filename)
+            _validate_skill_asset_target_path(path)
         else:
             path = _default_skill_asset_path(skill_id, asset, filename)
     except ValueError as exc:
         return ToolResult(output=str(exc), is_error=True)
 
     async def _write_asset() -> ToolResult:
-        if path.exists():
-            try:
-                await _assert_can_modify_existing(context, path)
-            except RuntimeError as exc:
-                return ToolResult(output=str(exc), is_error=True)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
@@ -734,7 +1036,7 @@ async def _load_skill_asset_content(asset: dict[str, Any], context: ToolExecutio
     if artifact_store is not None and artifact_oid and filename:
         namespace = str(asset.get("artifact_namespace") or "skills")
         content, _content_type = await artifact_store.async_load(namespace, artifact_oid, filename)
-        return content
+        return content if isinstance(content, bytes) else bytes(content)
 
     raise ValueError("asset has no materializable content, URL, or artifact store reference")
 
@@ -749,12 +1051,27 @@ def _default_skill_asset_path(skill_id: str, asset: dict[str, Any], filename: st
         ).strip("._")
         or "asset"
     )
-    data_dir = Path(os.environ.get("COGNIS_DATA_DIR") or "~/.cognis").expanduser()
-    root = data_dir / "skill_assets" / safe_skill / safe_asset
+    root = _skill_asset_materialization_root() / safe_skill / safe_asset
     target = (root / filename).resolve()
     if not target.is_relative_to(root.resolve()):
         raise ValueError(f"Unsafe skill asset filename rejected: {filename}")
     return target
+
+
+def _skill_asset_materialization_root() -> Path:
+    data_dir = Path(os.environ.get("COGNIS_DATA_DIR") or "~/.cognis").expanduser()
+    return (data_dir / "skill_assets").resolve()
+
+
+def _validate_skill_asset_target_path(path: Path) -> None:
+    root = _skill_asset_materialization_root()
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    if not resolved_path.is_relative_to(resolved_root):
+        raise ValueError(
+            "Skill assets can only be materialized under the managed skill asset "
+            f"directory: {resolved_root}"
+        )
 
 
 def _resolve_asset_target_in_directory(directory: Path, filename: str) -> Path:
@@ -777,6 +1094,100 @@ def _validate_skill_asset_url(url: str, context: ToolExecutionContext) -> None:
     )
     if controller.netloc and parsed.netloc != controller.netloc:
         raise ValueError("skill asset URL host does not match the configured controller")
+
+
+def _find_edit_match(content: str, old_string: str) -> _EditMatchResult:
+    count = content.count(old_string)
+    if count:
+        return _EditMatchResult(count=count, matched_old=old_string)
+
+    rstrip_matches = _find_rstrip_normalized_matches(content, old_string)
+    if len(rstrip_matches) == 1:
+        return _EditMatchResult(
+            count=1,
+            matched_old=rstrip_matches[0],
+            note="used rstrip-normalized fallback match",
+        )
+    if len(rstrip_matches) > 1:
+        return _EditMatchResult(count=len(rstrip_matches))
+    return _EditMatchResult(count=0)
+
+
+def _find_rstrip_normalized_matches(content: str, old_string: str) -> list[str]:
+    pattern_lines = old_string.splitlines(keepends=True)
+    content_lines = content.splitlines(keepends=True)
+    if not pattern_lines or len(pattern_lines) > len(content_lines):
+        return []
+
+    normalized_pattern = [_line_stripped(line).rstrip() for line in pattern_lines]
+    matches: list[str] = []
+    width = len(pattern_lines)
+    for index in range(0, len(content_lines) - width + 1):
+        candidate_lines = content_lines[index : index + width]
+        normalized_candidate = [_line_stripped(line).rstrip() for line in candidate_lines]
+        if normalized_candidate == normalized_pattern:
+            matches.append("".join(candidate_lines))
+    return matches
+
+
+def _old_string_not_found_message(content: str, old_string: str, *, prefix: str = "") -> str:
+    lines = [f"{prefix}old_string not found in content."]
+    closest = _closest_line_window(content, old_string)
+    if closest is not None:
+        line_number, snippet = closest
+        lines.append(f"Closest match starts at line {line_number}:")
+        lines.append("```text")
+        lines.append(snippet)
+        lines.append("```")
+    hints = _edit_failure_hints(content, old_string)
+    if hints:
+        lines.append("Hints:")
+        lines.extend(f"- {hint}" for hint in hints)
+    return "\n".join(lines)
+
+
+def _closest_line_window(content: str, old_string: str) -> tuple[int, str] | None:
+    old_lines = old_string.splitlines() or [old_string]
+    content_lines = content.splitlines()
+    if not content_lines:
+        return None
+    width = max(1, min(len(old_lines), len(content_lines)))
+    best_ratio = -1.0
+    best_index = 0
+    best_window: list[str] = []
+    for index in range(0, len(content_lines) - width + 1):
+        window = content_lines[index : index + width]
+        ratio = difflib.SequenceMatcher(None, old_string, "\n".join(window)).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_index = index
+            best_window = window
+    snippet_lines = [
+        f"{best_index + offset + 1}: {line}" for offset, line in enumerate(best_window[:12])
+    ]
+    return best_index + 1, "\n".join(snippet_lines)
+
+
+def _edit_failure_hints(content: str, old_string: str) -> list[str]:
+    hints: list[str] = []
+    if _looks_like_line_number_prefixed(old_string):
+        hints.append(
+            "old_string appears to include read-tool line-number prefixes; remove the "
+            "leading 'N:' prefixes but preserve the whitespace after them."
+        )
+    if _normalize_horizontal_whitespace(old_string) in _normalize_horizontal_whitespace(content):
+        hints.append("The text appears to differ only by tabs versus spaces.")
+    if _normalize_patch_line_for_match(old_string) in _normalize_patch_line_for_match(content):
+        hints.append("The text appears to contain smart quotes/dashes or non-breaking spaces.")
+    return hints
+
+
+def _looks_like_line_number_prefixed(text: str) -> bool:
+    return any(re.match(r"^\s*\d+:\s", line) for line in text.splitlines())
+
+
+def _normalize_horizontal_whitespace(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", text)
 
 
 async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -811,42 +1222,49 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
         normalized_old = _normalize_text_for_newline(old_string, newline)
         normalized_new = _normalize_text_for_newline(new_string, newline)
 
-        count = content.count(normalized_old)
-        if count == 0:
-            return ToolResult(output="oldString not found in content.", is_error=True)
-        if count > 1 and not replace_all:
+        match = _find_edit_match(content, normalized_old)
+        if match.count == 0:
             return ToolResult(
-                output=f"Found {count} matches for oldString. Use replace_all=true or provide more context to make the match unique.",
+                output=_old_string_not_found_message(content, old_string),
+                is_error=True,
+            )
+        if match.count > 1 and not replace_all:
+            return ToolResult(
+                output=f"Found {match.count} matches for old_string. Use replace_all=true or provide more context to make the match unique.",
                 is_error=True,
             )
 
         new_content = (
-            content.replace(normalized_old, normalized_new)
+            content.replace(match.matched_old, normalized_new)
             if replace_all
-            else content.replace(normalized_old, normalized_new, 1)
+            else content.replace(match.matched_old, normalized_new, 1)
         )
         try:
             path.write_text(new_content, encoding="utf-8", newline="")
-            formatter_changed = await _maybe_format_file(path)
+            formatter = await _maybe_format_file(path)
             final_content = _read_text_preserving_newlines(path)
-            if formatter_changed:
-                _remove_tracked_path(context, path)
-            else:
-                await _record_write(context, path)
+            await _record_write(context, path)
         except (OSError, PermissionError, UnicodeDecodeError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
-        replacements = count if replace_all else 1
+        replacements = match.count if replace_all else 1
         output = f"Replaced {replacements} occurrence(s) in {file_path}"
-        if formatter_changed:
+        if match.note:
+            output += f" ({match.note})"
+        if formatter.changed:
             output += " (reformatted by formatter)"
-        diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
-        if diagnostics_text:
-            output += f"\n\n{diagnostics_text}"
+        formatter_output = _formatter_output(formatter)
+        if formatter_output:
+            output += f"\n\n{formatter_output}"
+        lsp_diagnostics = await _collect_lsp_diagnostics(context, file_path)
+        if lsp_diagnostics.text:
+            output += f"\n\n{lsp_diagnostics.text}"
         return ToolResult(
             output=output,
             metadata=_files_written_metadata(
-                [path], [{"path": str(path), "diff": _unified_diff(path, content, final_content)}]
+                [path],
+                [{"path": str(path), "diff": _unified_diff(path, content, final_content)}],
+                lsp_diagnostics,
             ),
         )
 
@@ -883,9 +1301,6 @@ async def handle_apply_patch(
     try:
         async with _with_file_locks(context, touched_paths):
             staged = await _stage_patch_operations(operations, context)
-            # Re-stage once more immediately before apply so we catch files
-            # that changed after the initial read but before the write phase.
-            staged = await _stage_patch_operations(operations, context)
             summary_lines, diagnostic_paths, file_diffs = await _apply_staged_patch_operations(
                 staged, context
             )
@@ -903,22 +1318,15 @@ async def handle_apply_patch(
         return ToolResult(output="No files were patched.", is_error=True)
 
     diagnostics_targets = [str(path) for path in diagnostic_paths]
+    lsp_diagnostics = _LSPToolDiagnostics()
     if diagnostics_targets:
-        if _should_wait_for_edit_diagnostics(context, diagnostics_targets):
-            diagnostics_text = await _collect_lsp_diagnostics_batch(context, diagnostics_targets)
-        else:
-            _warm_lsp_batch(context, diagnostics_targets)
-            diagnostics_text = ""
-        if diagnostics_text:
-            summary_lines.append(diagnostics_text)
-
-    stale_diagnostics = _format_cached_lsp_diagnostics(context, diagnostics_targets)
-    if stale_diagnostics:
-        summary_lines.append(stale_diagnostics)
+        lsp_diagnostics = await _collect_lsp_diagnostics_batch(context, diagnostics_targets)
+        if lsp_diagnostics.text:
+            summary_lines.append(lsp_diagnostics.text)
 
     return ToolResult(
         output="\n".join(summary_lines),
-        metadata=_files_written_metadata(diagnostic_paths, file_diffs),
+        metadata=_files_written_metadata(diagnostic_paths, file_diffs, lsp_diagnostics),
     )
 
 
@@ -949,6 +1357,7 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
 
         newline = _detect_newline(content)
         original_content = content
+        fallback_notes: list[str] = []
 
         applied = 0
         for i, edit in enumerate(edits):
@@ -960,45 +1369,53 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
                 continue
             normalized_old = _normalize_text_for_newline(old_string, newline)
             normalized_new = _normalize_text_for_newline(new_string, newline)
-            count = content.count(normalized_old)
-            if count == 0:
+            match = _find_edit_match(content, normalized_old)
+            if match.count == 0:
                 return ToolResult(
-                    output=f"Edit {i + 1}: oldString not found in content.", is_error=True
-                )
-            if count > 1 and not replace_all:
-                return ToolResult(
-                    output=f"Edit {i + 1}: Found {count} matches. Use replace_all or provide more context.",
+                    output=_old_string_not_found_message(
+                        content, old_string, prefix=f"Edit {i + 1}: "
+                    ),
                     is_error=True,
                 )
+            if match.count > 1 and not replace_all:
+                return ToolResult(
+                    output=f"Edit {i + 1}: Found {match.count} matches for old_string. Use replace_all or provide more context.",
+                    is_error=True,
+                )
+            if match.note:
+                fallback_notes.append(f"edit {i + 1}: {match.note}")
             content = (
-                content.replace(normalized_old, normalized_new)
+                content.replace(match.matched_old, normalized_new)
                 if replace_all
-                else content.replace(normalized_old, normalized_new, 1)
+                else content.replace(match.matched_old, normalized_new, 1)
             )
             applied += 1
 
         try:
             path.write_text(content, encoding="utf-8", newline="")
-            formatter_changed = await _maybe_format_file(path)
+            formatter = await _maybe_format_file(path)
             final_content = _read_text_preserving_newlines(path)
-            if formatter_changed:
-                _remove_tracked_path(context, path)
-            else:
-                await _record_write(context, path)
+            await _record_write(context, path)
         except (OSError, PermissionError, UnicodeDecodeError) as exc:
             return ToolResult(output=f"Cannot write file: {exc}", is_error=True)
 
         output = f"Applied {applied} edit(s) to {file_path}"
-        if formatter_changed:
+        if fallback_notes:
+            output += f" ({'; '.join(fallback_notes)})"
+        if formatter.changed:
             output += " (reformatted by formatter)"
-        diagnostics_text = await _collect_lsp_diagnostics(context, file_path)
-        if diagnostics_text:
-            output += f"\n\n{diagnostics_text}"
+        formatter_output = _formatter_output(formatter)
+        if formatter_output:
+            output += f"\n\n{formatter_output}"
+        lsp_diagnostics = await _collect_lsp_diagnostics(context, file_path)
+        if lsp_diagnostics.text:
+            output += f"\n\n{lsp_diagnostics.text}"
         return ToolResult(
             output=output,
             metadata=_files_written_metadata(
                 [path],
                 [{"path": str(path), "diff": _unified_diff(path, original_content, final_content)}],
+                lsp_diagnostics,
             ),
         )
 
@@ -1256,7 +1673,7 @@ def _parse_patch_envelope(patch_text: str, context: ToolExecutionContext) -> lis
                     continue
                 if _is_patch_envelope_header(stripped) and not stripped.startswith("@@"):
                     break
-                if not lines[index].startswith("@@"):
+                if not lines[index].startswith(("@@", "-", "+", " ")):
                     raise PatchFormatError(
                         f"Unexpected line in update patch: {stripped or '<blank>'}"
                     )
@@ -1325,9 +1742,14 @@ def _parse_patch_envelope(patch_text: str, context: ToolExecutionContext) -> lis
 def _parse_patch_envelope_hunk(lines: list[str], start_index: int) -> tuple[_PatchHunk, int]:
     header = _line_stripped(lines[start_index])
     change_context = None
-    if header.startswith("@@ "):
-        change_context = header[3:]
-    index = start_index + 1
+    if lines[start_index].startswith("@@"):
+        if header.startswith("@@ "):
+            change_context = header[3:]
+        index = start_index + 1
+    else:
+        # Codex accepts the first update chunk directly after
+        # `*** Update File:` without an explicit `@@` marker.
+        index = start_index
     old_parts: list[str] = []
     new_parts: list[str] = []
     last_line_kind: str | None = None
@@ -1501,67 +1923,105 @@ async def _stage_patch_operations(
     operations: list[_PatchOperation], context: ToolExecutionContext
 ) -> list[_StagedPatchOperation]:
     staged: list[_StagedPatchOperation] = []
-    seen_paths: set[Path] = set()
+    overlay: dict[Path, _PatchOverlayEntry] = {}
+
+    async def load_path(path: Path) -> _PatchOverlayEntry:
+        entry = overlay.get(path)
+        if entry is not None:
+            return entry
+        if path.exists():
+            if not path.is_file():
+                raise PatchConflictError(f"Not a file: {path}")
+            entry = _PatchOverlayEntry(exists=True, content=_read_text_file(path), on_disk=True)
+        else:
+            entry = _PatchOverlayEntry(exists=False)
+        overlay[path] = entry
+        return entry
+
     for operation in operations:
-        op_paths = {
-            path for path in (operation.source_path, operation.destination_path) if path is not None
-        }
-        for path in op_paths:
-            if path in seen_paths:
-                raise PatchConflictError(f"Patch touches the same file multiple times: {path}")
-        seen_paths.update(op_paths)
-        staged.append(await _stage_patch_operation(operation, context))
-    return staged
-
-
-async def _stage_patch_operation(
-    operation: _PatchOperation, context: ToolExecutionContext
-) -> _StagedPatchOperation:
-    if operation.kind == "add":
-        assert operation.destination_path is not None
-        if operation.destination_path.exists():
-            raise PatchConflictError(
-                f"Add File target already exists: {operation.destination_path}"
+        if operation.kind == "add":
+            assert operation.destination_path is not None
+            destination = await load_path(operation.destination_path)
+            if destination.exists and destination.on_disk:
+                await _assert_can_modify_existing(context, operation.destination_path)
+            staged.append(
+                _StagedPatchOperation(
+                    kind="add",
+                    destination_path=operation.destination_path,
+                    previous_content=destination.content if destination.exists else "",
+                    content=operation.add_content,
+                )
             )
-        return _StagedPatchOperation(
-            kind="add",
-            destination_path=operation.destination_path,
-            previous_content="",
-            content=operation.add_content,
-        )
+            overlay[operation.destination_path] = _PatchOverlayEntry(
+                exists=True,
+                content=operation.add_content,
+                on_disk=destination.on_disk,
+            )
+            continue
 
-    source_path = operation.source_path
-    assert source_path is not None
-    if not source_path.exists():
-        raise PatchConflictError(f"File not found: {source_path}")
-    if not source_path.is_file():
-        raise PatchConflictError(f"Not a file: {source_path}")
+        source_path = operation.source_path
+        assert source_path is not None
+        source = await load_path(source_path)
+        if not source.exists:
+            raise PatchConflictError(f"File not found: {source_path}")
+        if operation.kind in {"update", "delete", "move"} and source.on_disk:
+            await _assert_can_modify_existing(context, source_path)
 
-    if operation.kind in {"update", "delete", "move"}:
-        await _assert_can_modify_existing(context, source_path)
-    source_content = _read_text_file(source_path)
-    newline = _detect_newline(source_content)
+        if operation.kind == "delete":
+            staged.append(
+                _StagedPatchOperation(
+                    kind="delete",
+                    source_path=source_path,
+                    previous_content=source.content,
+                )
+            )
+            overlay[source_path] = _PatchOverlayEntry(exists=False)
+            continue
 
-    if operation.kind == "delete":
-        return _StagedPatchOperation(
-            kind="delete", source_path=source_path, previous_content=source_content
-        )
+        newline = _detect_newline(source.content)
+        staged_content = _apply_envelope_hunks(source.content, operation.hunks, newline)
 
-    destination_path = operation.destination_path or source_path
-    if operation.kind == "move":
-        if destination_path == source_path:
-            raise PatchConflictError(f"Move destination must differ from source: {source_path}")
-        if destination_path.exists():
-            raise PatchConflictError(f"Move destination already exists: {destination_path}")
+        if operation.kind == "update":
+            staged.append(
+                _StagedPatchOperation(
+                    kind="update",
+                    source_path=source_path,
+                    destination_path=source_path,
+                    previous_content=source.content,
+                    content=staged_content,
+                )
+            )
+            overlay[source_path] = _PatchOverlayEntry(
+                exists=True, content=staged_content, on_disk=source.on_disk
+            )
+            continue
 
-    staged_content = _apply_envelope_hunks(source_content, operation.hunks, newline)
-    return _StagedPatchOperation(
-        kind=operation.kind,
-        source_path=source_path,
-        destination_path=destination_path,
-        previous_content=source_content,
-        content=staged_content,
-    )
+        if operation.kind == "move":
+            destination_path = operation.destination_path or source_path
+            if destination_path == source_path:
+                raise PatchConflictError(f"Move destination must differ from source: {source_path}")
+            destination = await load_path(destination_path)
+            if destination.exists and destination.on_disk:
+                await _assert_can_modify_existing(context, destination_path)
+            staged.append(
+                _StagedPatchOperation(
+                    kind="move",
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    previous_content=destination.content if destination.exists else source.content,
+                    content=staged_content,
+                )
+            )
+            overlay[source_path] = _PatchOverlayEntry(exists=False)
+            overlay[destination_path] = _PatchOverlayEntry(
+                exists=True,
+                content=staged_content,
+                on_disk=destination.on_disk,
+            )
+            continue
+
+        raise PatchConflictError(f"Unsupported patch operation: {operation.kind}")
+    return staged
 
 
 def _apply_envelope_hunks(content: str, hunks: list[_PatchHunk], newline: str) -> str:
@@ -1715,24 +2175,27 @@ async def _apply_staged_patch_operations(
             assert operation.destination_path is not None and operation.content is not None
             operation.destination_path.parent.mkdir(parents=True, exist_ok=True)
             operation.destination_path.write_text(operation.content, encoding="utf-8", newline="")
-            formatter_changed = await _maybe_format_file(operation.destination_path)
+            formatter = await _maybe_format_file(operation.destination_path)
             final_content = _read_text_file(operation.destination_path)
-            if formatter_changed:
-                _remove_tracked_path(context, operation.destination_path)
-            else:
-                await _record_write(context, operation.destination_path)
+            await _record_write(context, operation.destination_path)
             summary_lines.append(f"Added {operation.destination_path}")
+            formatter_output = _formatter_output(formatter)
+            if formatter_output:
+                summary_lines.append(formatter_output)
             diagnostic_paths.append(operation.destination_path)
             file_diffs.append(
                 {
                     "path": str(operation.destination_path),
-                    "diff": _unified_diff(operation.destination_path, "", final_content),
+                    "diff": _unified_diff(
+                        operation.destination_path, operation.previous_content, final_content
+                    ),
                 }
             )
             continue
 
         if operation.kind == "delete":
             assert operation.source_path is not None
+            await _assert_can_modify_existing(context, operation.source_path)
             operation.source_path.unlink()
             _remove_tracked_path(context, operation.source_path)
             summary_lines.append(f"Deleted {operation.source_path}")
@@ -1749,14 +2212,15 @@ async def _apply_staged_patch_operations(
             if operation.content == operation.previous_content:
                 summary_lines.append(f"Unchanged {operation.source_path}")
                 continue
+            await _assert_can_modify_existing(context, operation.source_path)
             operation.source_path.write_text(operation.content, encoding="utf-8", newline="")
-            formatter_changed = await _maybe_format_file(operation.source_path)
+            formatter = await _maybe_format_file(operation.source_path)
             final_content = _read_text_file(operation.source_path)
-            if formatter_changed:
-                _remove_tracked_path(context, operation.source_path)
-            else:
-                await _record_write(context, operation.source_path)
+            await _record_write(context, operation.source_path)
             summary_lines.append(f"Updated {operation.source_path}")
+            formatter_output = _formatter_output(formatter)
+            if formatter_output:
+                summary_lines.append(formatter_output)
             diagnostic_paths.append(operation.source_path)
             file_diffs.append(
                 {
@@ -1774,10 +2238,12 @@ async def _apply_staged_patch_operations(
                 and operation.destination_path is not None
                 and operation.content is not None
             )
+            await _assert_can_modify_existing(context, operation.source_path)
             source_content = _read_text_file(operation.source_path)
+            formatter = _FormatterResult()
             if source_content == operation.content:
                 operation.destination_path.parent.mkdir(parents=True, exist_ok=True)
-                operation.source_path.rename(operation.destination_path)
+                operation.source_path.replace(operation.destination_path)
                 await _move_tracked_path(context, operation.source_path, operation.destination_path)
                 final_content = operation.content
             else:
@@ -1785,15 +2251,15 @@ async def _apply_staged_patch_operations(
                 operation.destination_path.write_text(
                     operation.content, encoding="utf-8", newline=""
                 )
-                formatter_changed = await _maybe_format_file(operation.destination_path)
+                formatter = await _maybe_format_file(operation.destination_path)
                 final_content = _read_text_file(operation.destination_path)
-                if formatter_changed:
-                    _remove_tracked_path(context, operation.destination_path)
-                else:
-                    await _record_write(context, operation.destination_path)
+                await _record_write(context, operation.destination_path)
                 operation.source_path.unlink()
                 _remove_tracked_path(context, operation.source_path)
             summary_lines.append(f"Moved {operation.source_path} -> {operation.destination_path}")
+            formatter_output = _formatter_output(formatter)
+            if formatter_output:
+                summary_lines.append(formatter_output)
             diagnostic_paths.append(operation.destination_path)
             file_diffs.append(
                 {

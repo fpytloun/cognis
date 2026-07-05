@@ -40,6 +40,7 @@ class LSPActiveServerStatus(BaseModel):
     error_count: int
     warning_count: int
     idle_seconds: int
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class LSPBrokenServerStatus(BaseModel):
@@ -186,6 +187,7 @@ async def build_lsp_status_report(
             error_count=int(item["error_count"]),
             warning_count=int(item["warning_count"]),
             idle_seconds=int(item["idle_seconds"]),
+            diagnostics=dict(item.get("diagnostics", {})),
         )
         for item in raw_status.get("active_servers", [])
     ]

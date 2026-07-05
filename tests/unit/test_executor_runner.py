@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -55,6 +56,48 @@ class ClosingWebSocket(DummyWebSocket):
         from websockets.frames import Close
 
         raise ConnectionClosedError(Close(1011, "test"), Close(1011, "test"), True)
+
+
+@pytest.mark.asyncio
+async def test_oauth_loopback_listener_relays_callback_and_cleans_up() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    await runner._handle_oauth_loopback_start(
+        ws,
+        "rpc-1",
+        {"state": "state-1", "ttl_seconds": 30, "callback_path": "/oauth/callback"},
+    )
+
+    start_response = ws.sent[0]
+    assert start_response["id"] == "rpc-1"
+    redirect_uri = start_response["result"]["redirect_uri"]
+    listener_id = start_response["result"]["listener_id"]
+    parsed = urlsplit(redirect_uri)
+    assert parsed.hostname == "127.0.0.1"
+    assert parsed.path == "/oauth/callback"
+
+    reader, writer = await asyncio.open_connection("127.0.0.1", parsed.port)
+    writer.write(
+        b"GET /oauth/callback?state=state-1&code=code-1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    )
+    await writer.drain()
+    response = await reader.read(1024)
+    writer.close()
+    await writer.wait_closed()
+
+    assert b"200 OK" in response
+    callback = ws.sent[1]
+    assert callback["method"] == "oauth.loopback_callback"
+    assert callback["params"] == {
+        "listener_id": listener_id,
+        "redirect_uri": redirect_uri,
+        "state": "state-1",
+        "code": "code-1",
+        "error": None,
+        "error_description": None,
+    }
+    assert listener_id not in runner._oauth_loopback_listeners
 
 
 @pytest.mark.asyncio
@@ -253,10 +296,13 @@ async def test_handle_configure_retries_pending_background_shell_completion() ->
 
 
 @pytest.mark.asyncio
-async def test_handle_configure_exposes_skill_assets_to_materialize_tool(tmp_path: Path) -> None:
+async def test_handle_configure_exposes_skill_assets_to_materialize_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
-    target = tmp_path / "youtube_transcript.py"
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "data"))
+    target = tmp_path / "data" / "skill_assets" / "custom" / "youtube_transcript.py"
 
     await runner._handle_configure(
         ws,

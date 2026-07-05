@@ -2,29 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import socket
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 from fastapi import HTTPException
 
 from cognis.api import app as app_module
+from cognis.api.mcp_reconfigure import schedule_mcp_server_executor_reconfigure_for_app
 from cognis.api.models import MCPServerCreateRequest
 from cognis.api.routes.mcp_oauth import (
-    _schedule_mcp_executor_reconfigure,
     mcp_oauth_callback,
     mcp_oauth_status,
+    schedule_mcp_executor_reconfigure_for_app,
 )
 from cognis.api.routes.notifications import ResolveRequest, resolve_notification
 from cognis.api.runtime_support import _resolve_executor_mcp_servers
 from cognis.core.mcp_oauth import (
     MCPOAuthError,
     MCPOAuthService,
+    OAuthClientRegistration,
     _safe_url,
     oauth_status_payload,
     parse_www_authenticate,
@@ -344,6 +348,24 @@ def test_mcp_server_create_request_rejects_reserved_oauth_authorization_params()
         )
 
 
+def test_mcp_oauth_config_accepts_executor_loopback_callback_mode() -> None:
+    config = MCPServerConfig(
+        name="oauth",
+        transport="sse",
+        url="https://mcp.example/sse",
+        auth_config={
+            "type": "oauth2",
+            "flow": "auto",
+            "callback_mode": "executor_loopback",
+            "oauth_executor_id": "exec-1",
+        },
+    )
+
+    assert config.auth_config is not None
+    assert config.auth_config.callback_mode == "executor_loopback"
+    assert config.auth_config.oauth_executor_id == "exec-1"
+
+
 class _MemorySession:
     def __init__(self, token=None, server=None) -> None:
         self.token = token
@@ -369,6 +391,112 @@ class _MemorySessionFactory:
 
     def __call__(self) -> _MemorySession:
         return self.session
+
+
+def _oauth_service_for_tests(tmp_path, memory_session: _MemorySession) -> MCPOAuthService:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"9" * 32))
+    return MCPOAuthService(
+        session_factory=_MemorySessionFactory(memory_session),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_token_invalid_for_server_invalidates_active_oauth_token(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = SimpleNamespace(
+        server_id="mcp-1",
+        headers={},
+        auth_config={"type": "oauth2", "issuer": "https://issuer.example"},
+    )
+    token = SimpleNamespace(token_id="tok-1", status="active")
+    memory_session = _MemorySession(token=token, server=server)
+    service = _oauth_service_for_tests(tmp_path, memory_session)
+
+    async def fake_get_server(*_args, **_kwargs):
+        return memory_session.server
+
+    async def fake_get_token(*_args, **_kwargs):
+        return memory_session.token
+
+    async def fake_mark_status(session, *, token_id: str, status: str) -> None:
+        assert token_id == "tok-1"
+        session.token.status = status
+
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_server", fake_get_server)
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_oauth_token_for_server", fake_get_token)
+    monkeypatch.setattr("cognis.core.mcp_oauth.mark_mcp_oauth_token_status", fake_mark_status)
+
+    assert await service.mark_token_invalid_for_server(
+        user_email="alice@example.com", server_id="mcp-1"
+    )
+    assert token.status == "invalid"
+    assert memory_session.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_token_invalid_for_server_requests_retry_when_token_already_invalid(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = SimpleNamespace(
+        server_id="mcp-1",
+        headers={},
+        auth_config={"type": "oauth2", "issuer": "https://issuer.example"},
+    )
+    token = SimpleNamespace(token_id="tok-1", status="invalid")
+    memory_session = _MemorySession(token=token, server=server)
+    service = _oauth_service_for_tests(tmp_path, memory_session)
+
+    async def fake_get_server(*_args, **_kwargs):
+        return memory_session.server
+
+    async def fake_get_token(*_args, **_kwargs):
+        return memory_session.token
+
+    mark_status = AsyncMock()
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_server", fake_get_server)
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_oauth_token_for_server", fake_get_token)
+    monkeypatch.setattr("cognis.core.mcp_oauth.mark_mcp_oauth_token_status", mark_status)
+
+    assert await service.mark_token_invalid_for_server(
+        user_email="alice@example.com", server_id="mcp-1"
+    )
+    assert token.status == "invalid"
+    assert memory_session.commits == 0
+    mark_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mark_token_invalid_for_server_ignores_non_oauth_servers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = SimpleNamespace(
+        server_id="mcp-1",
+        headers={},
+        auth_config={"type": "none"},
+    )
+    token = SimpleNamespace(token_id="tok-1", status="active")
+    memory_session = _MemorySession(token=token, server=server)
+    service = _oauth_service_for_tests(tmp_path, memory_session)
+
+    async def fake_get_server(*_args, **_kwargs):
+        return memory_session.server
+
+    get_token = AsyncMock()
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_server", fake_get_server)
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_oauth_token_for_server", get_token)
+
+    assert not await service.mark_token_invalid_for_server(
+        user_email="alice@example.com", server_id="mcp-1"
+    )
+    get_token.assert_not_awaited()
+    assert token.status == "active"
 
 
 @pytest.mark.asyncio
@@ -443,6 +571,324 @@ async def test_start_authorization_uses_dynamic_client_registration_when_client_
     assert "cognis-mcp-" not in result.authorization_url
     assert transaction_rows[0].client_id == "registered-client"
     register_dynamic_client.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_authorization_uses_executor_loopback_redirect_uri(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    server = SimpleNamespace(
+        server_id="mcp-1",
+        name="OAuth MCP",
+        transport="streamable_http",
+        command=None,
+        url="https://mcp.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={
+            "type": "oauth2",
+            "resource": "https://mcp.example/mcp",
+            "oauth_executor_id": "exec-1",
+            "dynamic_client_registration": True,
+        },
+        timeout_seconds=30,
+    )
+    memory_session = _MemorySession(server=server)
+    started_states: list[str] = []
+
+    class FakeExecutorConnection:
+        async def oauth_loopback_start(
+            self, *, state: str, ttl_seconds: int, callback_path: str
+        ) -> dict[str, str]:
+            started_states.append(state)
+            assert ttl_seconds == 900
+            assert callback_path == "/oauth/callback"
+            return {
+                "listener_id": "listener-1",
+                "redirect_uri": "http://127.0.0.1:4567/oauth/callback",
+                "expires_at": "2026-01-01T00:00:00+00:00",
+            }
+
+    class FakeExecutorProvider:
+        def get_connection(self, executor_id: str) -> FakeExecutorConnection | None:
+            assert executor_id == "exec-1"
+            return FakeExecutorConnection()
+
+    service = MCPOAuthService(
+        session_factory=_MemorySessionFactory(memory_session),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+        executor_provider=FakeExecutorProvider(),
+    )
+    transaction_rows: list[SimpleNamespace] = []
+
+    async def fake_get_mcp_server(*args, **kwargs):
+        return server
+
+    async def fake_get_executor_row(*args, **kwargs):
+        return SimpleNamespace(executor_id="exec-1", name="Olorin")
+
+    async def fake_create_transaction(session, **kwargs):
+        row = SimpleNamespace(notification_id=None, **kwargs)
+        transaction_rows.append(row)
+        return row
+
+    async def fake_resolve_client_registration(**kwargs):
+        assert kwargs["redirect_uri"] == "http://127.0.0.1:4567/oauth/callback"
+        return OAuthClientRegistration(client_id="registered-client")
+
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_executor_row", fake_get_executor_row)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+    )
+    monkeypatch.setattr(
+        "cognis.core.mcp_oauth.create_mcp_oauth_transaction",
+        fake_create_transaction,
+    )
+    monkeypatch.setattr(
+        service,
+        "discover_metadata",
+        AsyncMock(
+            return_value={
+                "issuer": "https://issuer.example",
+                "authorization_endpoint": "https://issuer.example/authorize",
+                "registration_endpoint": "https://issuer.example/register",
+                "device_authorization_endpoint": "https://issuer.example/device",
+            }
+        ),
+    )
+    monkeypatch.setattr(service, "_resolve_client_registration", fake_resolve_client_registration)
+
+    result = await service.start_authorization(
+        user_email="alice@example.com",
+        server_id="mcp-1",
+    )
+
+    query = parse_qs(urlsplit(result.authorization_url).query)
+    assert query["redirect_uri"] == ["http://127.0.0.1:4567/oauth/callback"]
+    assert result.callback_mode == "executor_loopback"
+    assert result.oauth_executor_id == "exec-1"
+    assert result.oauth_executor_name == "Olorin"
+    assert result.redirect_uri == "http://127.0.0.1:4567/oauth/callback"
+    assert started_states == [query["state"][0]]
+    assert transaction_rows[0].redirect_uri == "http://127.0.0.1:4567/oauth/callback"
+    payload = service._decrypt(transaction_rows[0].encrypted_payload)
+    assert payload["callback_mode"] == "executor_loopback"
+    assert payload["oauth_executor_id"] == "exec-1"
+    assert payload["loopback_listener_id"] == "listener-1"
+
+
+@pytest.mark.asyncio
+async def test_executor_loopback_uses_default_executor_when_not_configured(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    server = SimpleNamespace(
+        server_id="mcp-1",
+        name="OAuth MCP",
+        transport="streamable_http",
+        command=None,
+        url="https://mcp.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={
+            "type": "oauth2",
+            "resource": "https://mcp.example/mcp",
+            "callback_mode": "executor_loopback",
+            "client_id": "static-client",
+        },
+        timeout_seconds=30,
+    )
+    memory_session = _MemorySession(server=server)
+
+    class FakeExecutorConnection:
+        async def oauth_loopback_start(
+            self, *, state: str, ttl_seconds: int, callback_path: str
+        ) -> dict[str, str]:
+            assert state
+            assert ttl_seconds == 900
+            assert callback_path == "/oauth/callback"
+            return {
+                "listener_id": "listener-default",
+                "redirect_uri": "http://127.0.0.1:5678/oauth/callback",
+            }
+
+    class FakeExecutorProvider:
+        def get_connection(self, executor_id: str) -> FakeExecutorConnection | None:
+            assert executor_id == "default-exec"
+            return FakeExecutorConnection()
+
+    service = MCPOAuthService(
+        session_factory=_MemorySessionFactory(memory_session),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+        executor_provider=FakeExecutorProvider(),
+    )
+
+    async def fake_get_mcp_server(*args, **kwargs):
+        return server
+
+    async def fake_list_executors(*args, **kwargs):
+        assert kwargs == {"owner_email": "alice@example.com", "include_shared": True}
+        return [
+            SimpleNamespace(
+                executor_id="default-inprocess",
+                name="In-process",
+                executor_type="in_process",
+                is_default=True,
+            ),
+            SimpleNamespace(
+                executor_id="other-exec",
+                name="Other Workstation",
+                executor_type="websocket",
+                is_default=False,
+            ),
+            SimpleNamespace(
+                executor_id="default-exec",
+                name="Default Laptop",
+                executor_type="websocket",
+                is_default=True,
+            ),
+        ]
+
+    async def fake_create_transaction(session, **kwargs):
+        return SimpleNamespace(notification_id=None, **kwargs)
+
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr("cognis.core.mcp_oauth.list_executors", fake_list_executors)
+    monkeypatch.setattr(
+        "cognis.core.mcp_oauth.create_mcp_oauth_transaction", fake_create_transaction
+    )
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+    )
+    monkeypatch.setattr(
+        service,
+        "discover_metadata",
+        AsyncMock(
+            return_value={
+                "issuer": "https://issuer.example",
+                "authorization_endpoint": "https://issuer.example/authorize",
+            }
+        ),
+    )
+
+    result = await service.start_authorization(user_email="alice@example.com", server_id="mcp-1")
+
+    assert result.callback_mode == "executor_loopback"
+    assert result.oauth_executor_id == "default-exec"
+    assert result.oauth_executor_name == "Default Laptop"
+    assert result.redirect_uri == "http://127.0.0.1:5678/oauth/callback"
+
+
+@pytest.mark.asyncio
+async def test_executor_loopback_callback_rejects_executor_mismatch(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    service = MCPOAuthService(
+        session_factory=_MemorySessionFactory(_MemorySession()),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+    )
+    state = base64.urlsafe_b64encode(
+        json.dumps({"t": "txn-1", "s": "nonce"}, separators=(",", ":")).encode()
+    ).decode()
+    row = SimpleNamespace(
+        transaction_id="txn-1",
+        state_hash=hashlib.sha256(state.encode()).hexdigest(),
+        notification_id=None,
+        status="pending",
+        used_at=None,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        encrypted_payload=service._encrypt(
+            {
+                "code_verifier": "verifier",
+                "state": state,
+                "callback_mode": "executor_loopback",
+                "oauth_executor_id": "exec-1",
+                "loopback_listener_id": "listener-1",
+                "redirect_uri": "http://127.0.0.1:4567/oauth/callback",
+            }
+        ),
+        mcp_server_id="mcp-1",
+        user_email="alice@example.com",
+        redirect_uri="http://127.0.0.1:4567/oauth/callback",
+        client_id="client",
+        resource=None,
+        scopes=[],
+    )
+    server = SimpleNamespace(
+        server_id="mcp-1",
+        name="OAuth MCP",
+        transport="streamable_http",
+        url="https://mcp.example/mcp",
+        headers={},
+        auth_config={"type": "oauth2", "issuer": "https://issuer.example"},
+    )
+
+    async def fake_get_transaction(*args, **kwargs):
+        return row
+
+    async def fake_get_mcp_server(*args, **kwargs):
+        return server
+
+    monkeypatch.setattr(
+        "cognis.core.mcp_oauth.get_mcp_oauth_transaction",
+        fake_get_transaction,
+    )
+    monkeypatch.setattr("cognis.core.mcp_oauth.get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(
+        service,
+        "discover_metadata",
+        AsyncMock(return_value={"issuer": "https://issuer.example", "token_endpoint": "x"}),
+    )
+
+    with pytest.raises(MCPOAuthError, match="executor mismatch"):
+        await service.complete_loopback_callback(
+            executor_id="other-exec",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code="code",
+        )
+    assert row.status == "pending"
+    assert row.used_at is None
+
+    row.status = "pending"
+    with pytest.raises(MCPOAuthError, match="executor mismatch"):
+        await service.complete_loopback_callback(
+            executor_id="other-exec",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code=None,
+            error="access_denied",
+        )
+    assert row.status == "pending"
+
+    row.status = "completed"
+    with pytest.raises(MCPOAuthError, match="expired or already used"):
+        await service.complete_loopback_callback(
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code=None,
+            error="access_denied",
+        )
+    assert row.status == "completed"
 
 
 @pytest.mark.asyncio
@@ -812,7 +1258,7 @@ async def test_oauth_status_exposes_safe_pending_device_authorization(
 
 
 @pytest.mark.asyncio
-async def test_device_dynamic_client_registration_sends_empty_redirect_uris(
+async def test_device_dynamic_client_registration_sends_loopback_redirect_uri(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     key_path = tmp_path / "key"
@@ -826,7 +1272,14 @@ async def test_device_dynamic_client_registration_sends_empty_redirect_uris(
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_payloads.append(json.loads(request.content.decode()))
-        return httpx.Response(201, request=request, json={"client_id": "device-client"})
+        return httpx.Response(
+            201,
+            request=request,
+            json={
+                "client_id": "device-client",
+                "grant_types": ["urn:ietf:params:oauth:grant-type:device_code"],
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     original_client = httpx.AsyncClient
@@ -852,7 +1305,7 @@ async def test_device_dynamic_client_registration_sends_empty_redirect_uris(
 
     assert client.client_id == "device-client"
     assert len(captured_payloads) == 1
-    assert captured_payloads[0]["redirect_uris"] == []
+    assert captured_payloads[0]["redirect_uris"] == ["http://127.0.0.1/oauth/callback"]
     assert "https://cognis.example/api/v1/mcp/oauth/callback" not in json.dumps(
         captured_payloads[0]
     )
@@ -863,7 +1316,7 @@ async def test_device_dynamic_client_registration_sends_empty_redirect_uris(
 
 
 @pytest.mark.asyncio
-async def test_device_dynamic_client_registration_retries_without_redirect_uris(
+async def test_device_dynamic_client_registration_retries_empty_then_omitted_redirect_uris(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     key_path = tmp_path / "key"
@@ -877,16 +1330,23 @@ async def test_device_dynamic_client_registration_retries_without_redirect_uris(
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_payloads.append(json.loads(request.content.decode()))
-        if len(captured_payloads) == 1:
+        if len(captured_payloads) < 3:
             return httpx.Response(
                 400,
                 request=request,
                 json={
                     "error": "invalid_client_metadata",
-                    "error_description": "redirect_uris must be omitted",
+                    "error_description": "redirect_uris not accepted",
                 },
             )
-        return httpx.Response(201, request=request, json={"client_id": "device-client"})
+        return httpx.Response(
+            201,
+            request=request,
+            json={
+                "client_id": "device-client",
+                "grant_types": ["urn:ietf:params:oauth:grant-type:device_code"],
+            },
+        )
 
     transport = httpx.MockTransport(handler)
     original_client = httpx.AsyncClient
@@ -911,12 +1371,149 @@ async def test_device_dynamic_client_registration_retries_without_redirect_uris(
     )
 
     assert client.client_id == "device-client"
-    assert captured_payloads[0]["redirect_uris"] == []
-    assert "redirect_uris" not in captured_payloads[1]
-    assert captured_payloads[1]["grant_types"] == [
+    assert captured_payloads[0]["redirect_uris"] == ["http://127.0.0.1/oauth/callback"]
+    assert captured_payloads[1]["redirect_uris"] == []
+    assert "redirect_uris" not in captured_payloads[2]
+    assert captured_payloads[2]["grant_types"] == [
         "urn:ietf:params:oauth:grant-type:device_code",
         "refresh_token",
     ]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_client_registration_wraps_non_json_success(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    service = MCPOAuthService(
+        session_factory=AsyncMock(),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            201,
+            request=request,
+            text="",
+            headers={"content-type": "text/html"},
+        )
+    )
+    original_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+    )
+
+    with pytest.raises(
+        MCPOAuthError, match="dynamic client registration response was not valid JSON"
+    ):
+        await service._register_dynamic_client(
+            registration_endpoint="https://issuer.example/register",
+            redirect_uri=None,
+            scopes=[],
+            client_metadata_document_url=None,
+            flow="device_code",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_payload",
+    [
+        {
+            "client_id": "auth-code-client",
+            "grant_types": ["refresh_token", "authorization_code"],
+            "redirect_uris": ["http://127.0.0.1/oauth/callback"],
+        },
+        {"client_id": "unknown-grants-client"},
+    ],
+)
+async def test_device_dynamic_client_registration_rejects_auth_code_only_client(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, response_payload: dict[str, object]
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    service = MCPOAuthService(
+        session_factory=AsyncMock(),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            201,
+            request=request,
+            json=response_payload,
+        )
+    )
+    original_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+    )
+
+    with pytest.raises(
+        MCPOAuthError,
+        match="did not register a device-code client",
+    ):
+        await service._register_dynamic_client(
+            registration_endpoint="https://issuer.example/register",
+            redirect_uri=None,
+            scopes=[],
+            client_metadata_document_url=None,
+            flow="device_code",
+        )
+
+
+@pytest.mark.asyncio
+async def test_device_authorization_wraps_non_json_success(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    service = MCPOAuthService(
+        session_factory=AsyncMock(),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+    )
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            request=request,
+            text="",
+            headers={"content-type": "text/plain"},
+        )
+    )
+    original_client = httpx.AsyncClient
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = transport
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(MCPOAuthError, match="device authorization response was not valid JSON"):
+        await service._request_device_authorization(
+            device_endpoint="https://issuer.example/device",
+            client_id="device-client",
+            client_secret=None,
+            scopes=[],
+            resource=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -1927,12 +2524,9 @@ def test_runtime_access_context_preserves_step_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_oauth_completion_schedules_assigned_executor_reconfigure(
+async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class _Transaction:
-        mcp_server_id = "mcp-1"
-
     class _Executor:
         executor_id = "olorin"
         desired_config_version = 4
@@ -1953,29 +2547,22 @@ async def test_oauth_completion_schedules_assigned_executor_reconfigure(
     runtime_updates = []
     scheduled = []
 
-    async def fake_get_transaction(_session: object, transaction_id: str) -> _Transaction:
-        assert transaction_id == "txn-1"
-        return _Transaction()
-
     async def fake_list_executors(_session: object, server_id: str) -> list[_Executor]:
         assert server_id == "mcp-1"
         return [_Executor()]
 
-    async def fake_update_runtime(_session: object, executor_id: str, **kwargs: object) -> None:
-        runtime_updates.append((executor_id, kwargs))
+    async def fake_bump_runtime(_session: object, executor_id: str, *, runtime_state: str) -> bool:
+        runtime_updates.append((executor_id, runtime_state))
+        return True
 
     monkeypatch.setattr(
-        "cognis.api.routes.mcp_oauth.get_mcp_oauth_transaction", fake_get_transaction
+        "cognis.api.mcp_reconfigure.list_websocket_executors_for_mcp_server", fake_list_executors
     )
     monkeypatch.setattr(
-        "cognis.api.routes.mcp_oauth.list_websocket_executors_for_mcp_server",
-        fake_list_executors,
+        "cognis.api.mcp_reconfigure.bump_executor_reconfigure_generation", fake_bump_runtime
     )
     monkeypatch.setattr(
-        "cognis.api.routes.mcp_oauth.update_executor_runtime_state", fake_update_runtime
-    )
-    monkeypatch.setattr(
-        "cognis.api.routes.mcp_oauth.schedule_executor_reconfigure",
+        "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
         lambda _app, executor_id: scheduled.append(executor_id),
     )
 
@@ -1989,15 +2576,68 @@ async def test_oauth_completion_schedules_assigned_executor_reconfigure(
             ),
         )
     )
-    request = SimpleNamespace(app=app)
+    result = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="test",
+    )
 
-    await _schedule_mcp_executor_reconfigure(request, transaction_id="txn-1")
-
-    assert runtime_updates == [
-        ("olorin", {"desired_config_version": 5, "runtime_state": "reconfiguring"})
-    ]
+    assert runtime_updates == [("olorin", "reconfiguring")]
     assert session.committed is True
     assert scheduled == ["olorin"]
+    assert result == ["olorin"]
+
+
+@pytest.mark.asyncio
+async def test_oauth_completion_schedules_reconfigure_and_emits_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Transaction:
+        mcp_server_id = "mcp-1"
+        user_email = "alice@example.com"
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    scheduled = []
+    emitted_status = []
+
+    async def fake_get_transaction(_session: object, transaction_id: str) -> _Transaction:
+        assert transaction_id == "txn-1"
+        return _Transaction()
+
+    async def fake_schedule(_app: object, **kwargs: object) -> list[str]:
+        scheduled.append(kwargs)
+        return ["olorin"]
+
+    monkeypatch.setattr(
+        "cognis.api.routes.mcp_oauth.get_mcp_oauth_transaction", fake_get_transaction
+    )
+    monkeypatch.setattr(
+        "cognis.api.routes.mcp_oauth.schedule_mcp_server_executor_reconfigure_for_app",
+        fake_schedule,
+    )
+    monkeypatch.setattr(
+        "cognis.api.routes.mcp_oauth._emit_mcp_oauth_status_changed",
+        AsyncMock(side_effect=lambda _app, **kwargs: emitted_status.append(kwargs)),
+    )
+
+    app = SimpleNamespace(state=SimpleNamespace(session_factory=lambda: _Session()))
+
+    await schedule_mcp_executor_reconfigure_for_app(app, transaction_id="txn-1")
+
+    assert scheduled == [
+        {
+            "server_id": "mcp-1",
+            "reason": "mcp_oauth_authorization",
+            "log_context": {"transaction_id": "txn-1"},
+        }
+    ]
+    assert emitted_status == [{"user_email": "alice@example.com", "server_id": "mcp-1"}]
 
 
 @pytest.mark.asyncio

@@ -91,13 +91,45 @@ class LiteLLMExecutorBackend:
                         usage = payload["usage"]
                     if payload.get("response_status"):
                         response_status = str(payload["response_status"])
+                    # Structured stream fields beyond the flat text/tool
+                    # whitelist. Dropping these made executor-routed Responses
+                    # providers diverge from controller-direct behavior:
+                    # multi-block thinking collapsed into one block (no
+                    # boundary markers), Responses-native replay was silently
+                    # unavailable (no raw output items), apply_patch progress
+                    # was invisible, and liveness markers never reached the
+                    # controller's idle-timeout policy.
+                    chunk_extras: dict[str, Any] = {}
+                    output_item = payload.get("responses_output_item")
+                    if isinstance(output_item, dict):
+                        chunk_extras["responses_output_item"] = output_item
+                    provider_event_type = payload.get("provider_event_type")
+                    if isinstance(provider_event_type, str) and provider_event_type:
+                        chunk_extras["provider_event_type"] = provider_event_type
+                    response_item_id = payload.get("response_item_id")
+                    if isinstance(response_item_id, str) and response_item_id:
+                        chunk_extras["response_item_id"] = response_item_id
+                    content_source = payload.get("content_source")
+                    if isinstance(content_source, str) and content_source:
+                        chunk_extras["content_source"] = content_source
+                    response_message_phase = payload.get("response_message_phase")
+                    if isinstance(response_message_phase, str | int):
+                        chunk_extras["response_message_phase"] = response_message_phase
                     choices = payload.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0]
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
+                    delta: dict[str, Any] = {}
+                    if choices:
+                        choice = choices[0]
+                        raw_delta = choice.get("delta")
+                        delta = raw_delta if isinstance(raw_delta, dict) else {}
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    delta_extras: dict[str, Any] = {}
+                    boundary = delta.get("reasoning_part_boundary")
+                    if isinstance(boundary, dict):
+                        delta_extras["reasoning_part_boundary"] = boundary
+                    tool_progress = delta.get("tool_progress")
+                    if isinstance(tool_progress, dict):
+                        delta_extras["tool_progress"] = tool_progress
                     content = delta.get("content")
                     tool_calls = delta.get("tool_calls")
                     reasoning_content = delta.get("reasoning_content")
@@ -109,6 +141,8 @@ class LiteLLMExecutorBackend:
                         and reasoning_content is None
                         and reasoning is None
                         and refusal is None
+                        and not delta_extras
+                        and not chunk_extras
                     ):
                         continue
                     yield {
@@ -118,6 +152,8 @@ class LiteLLMExecutorBackend:
                         "reasoning": reasoning,
                         "refusal": refusal,
                         "index": index,
+                        **delta_extras,
+                        **chunk_extras,
                     }
                     index += 1
             else:

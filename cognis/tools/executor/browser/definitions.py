@@ -8,7 +8,7 @@ _SOURCE = ToolSource(type="executor")
 
 
 def browser_tool_definitions() -> list[ToolDefinition]:
-    return [
+    definitions = [
         ToolDefinition(
             name="browser_open",
             description=(
@@ -648,3 +648,6 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             timeout_seconds=60,
         ),
     ]
+    for definition in definitions:
+        definition.content_trust = "untrusted"
+    return definitions

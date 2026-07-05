@@ -10,7 +10,8 @@ import httpx
 
 from cognis.providers.llm.codex import CODEX_RESPONSES_URL, CodexAuth
 
-DEFAULT_CODEX_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+DEFAULT_CODEX_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0)
+DEFAULT_CODEX_STREAM_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
 
 _TRANSPORT_KWARGS = {
     "api_base",
@@ -146,7 +147,9 @@ class DirectCodexTransport:
         headers = _codex_headers(self._auth, kwargs)
         timeout = kwargs.get("timeout")
         client = httpx.AsyncClient(
-            timeout=timeout if timeout is not None else DEFAULT_CODEX_HTTP_TIMEOUT
+            timeout=timeout
+            if timeout is not None
+            else (DEFAULT_CODEX_STREAM_HTTP_TIMEOUT if stream else DEFAULT_CODEX_HTTP_TIMEOUT)
         )
         if stream:
             request = client.build_request(

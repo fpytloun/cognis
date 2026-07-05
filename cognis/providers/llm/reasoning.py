@@ -10,7 +10,7 @@ from cognis.models.config import ModelInfo, normalize_reasoning_level
 
 _OPENAI_PRESETS = {"openai", "openai_compatible", "litellm_proxy", "azure", "chatgpt"}
 _GOOGLE_PRESETS = {"gemini", "google", "vertex_ai"}
-_ANTHROPIC_BUDGET_BUFFER = 1024
+_ANTHROPIC_MIN_VISIBLE_OUTPUT_TOKENS = 4096
 _MIN_ANTHROPIC_MAX_TOKENS = 2048
 _THINKING_EFFORT_ORDER: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 _ANTHROPIC_THINKING_BUDGETS: dict[str, int] = {
@@ -289,20 +289,13 @@ def apply_reasoning_config(
     )
     stripped_params: list[str] = []
 
-    if supports_reasoning:
-        for key in ("temperature", "top_p", "top_k"):
-            if key in result:
-                result.pop(key, None)
-                stripped_params.append(key)
-        if (
-            profile.family == "openai"
-            and "max_tokens" in result
-            and "max_completion_tokens" not in result
-        ):
-            result["max_completion_tokens"] = result.pop("max_tokens")
-            translated_max_tokens = True
-        else:
-            translated_max_tokens = False
+    if (
+        profile.family == "openai"
+        and "max_tokens" in result
+        and "max_completion_tokens" not in result
+    ):
+        result["max_completion_tokens"] = result.pop("max_tokens")
+        translated_max_tokens = True
     else:
         translated_max_tokens = False
 
@@ -310,8 +303,8 @@ def apply_reasoning_config(
         _coerce_reasoning_value(result.pop("reasoning_effort", None))
     )
     if requested is None:
-        if profile.family == "anthropic":
-            result = _enforce_anthropic_thinking_budget(result)
+        if _is_openai_reasoning_model(model_id):
+            stripped_params = _strip_sampling_params(result)
         return PreparedReasoningConfig(
             request_kwargs=result,
             family=profile.family,
@@ -327,9 +320,10 @@ def apply_reasoning_config(
         )
 
     resolved = _resolve_requested_effort(requested, profile)
+    stripped_params = _strip_sampling_params(result)
     effective = _apply_resolved_effort(result, resolved=resolved, profile=profile)
     if profile.family == "anthropic":
-        result = _enforce_anthropic_thinking_budget(result)
+        result = _enforce_anthropic_thinking_budget(result, model_info=model_info)
     return PreparedReasoningConfig(
         request_kwargs=result,
         family=profile.family,
@@ -402,6 +396,20 @@ def _detect_reasoning_family(model_id: str, provider_preset: str) -> str:
     return "unsupported"
 
 
+def _is_openai_reasoning_model(model_id: str) -> bool:
+    normalized = model_id.lower()
+    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def _strip_sampling_params(request_kwargs: dict[str, Any]) -> list[str]:
+    stripped: list[str] = []
+    for key in ("temperature", "top_p", "top_k"):
+        if key in request_kwargs:
+            request_kwargs.pop(key, None)
+            stripped.append(key)
+    return stripped
+
+
 def _normalize_model_name(model_name: str) -> str:
     lowered = model_name.strip().lower()
     for prefix in ("litellm_proxy/", "openai/", "azure/", "openai_compatible/", "chatgpt/"):
@@ -425,6 +433,12 @@ def _is_known_anthropic_reasoning_model(normalized_model: str) -> bool:
     return any(
         token in normalized_model
         for token in (
+            "fable-5",
+            "haiku-3-5",
+            "haiku-3.5",
+            "haiku-4",
+            "mythos-5",
+            "sonnet-5",
             "claude-3-7",
             "sonnet-4",
             "sonnet-4.5",
@@ -438,13 +452,18 @@ def _is_known_anthropic_reasoning_model(normalized_model: str) -> bool:
             "opus-4.6",
             "opus-4-7",
             "opus-4.7",
+            "opus-4-8",
+            "opus-4.8",
         )
     )
 
 
 def _anthropic_series_version(model_name: str) -> tuple[str, int, int | None] | None:
     normalized = model_name.lower().replace("_", "-")
-    match = re.search(r"(opus|sonnet)[\s-]+(\d+)(?:[.-](\d+))?", normalized)
+    match = re.search(
+        r"(fable|mythos|opus|sonnet)[\s-]+(\d+)(?:[.-](\d+))?",
+        normalized,
+    )
     if match is None:
         return None
     family = match.group(1)
@@ -618,18 +637,43 @@ def _remove_output_config_effort(request_kwargs: dict[str, Any]) -> None:
         request_kwargs.pop("output_config", None)
 
 
-def _enforce_anthropic_thinking_budget(request_kwargs: dict[str, Any]) -> dict[str, Any]:
+def _enforce_anthropic_thinking_budget(
+    request_kwargs: dict[str, Any],
+    *,
+    model_info: ModelInfo | None,
+) -> dict[str, Any]:
     thinking = request_kwargs.get("thinking")
     if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
         return request_kwargs
     budget = thinking.get("budget_tokens")
     if not isinstance(budget, int) or budget <= 0:
         return request_kwargs
-    max_tokens = request_kwargs.get("max_tokens")
-    if isinstance(max_tokens, int) and max_tokens > budget:
-        return request_kwargs
-    request_kwargs["max_tokens"] = max(
+    requested_max_tokens = request_kwargs.get("max_tokens")
+    if not isinstance(requested_max_tokens, int):
+        requested_max_tokens = None
+    minimum = max(
         _MIN_ANTHROPIC_MAX_TOKENS,
-        budget + _ANTHROPIC_BUDGET_BUFFER,
+        budget + max(_ANTHROPIC_MIN_VISIBLE_OUTPUT_TOKENS, budget // 2),
     )
+    target = max(requested_max_tokens or 0, minimum)
+    model_max = _model_max_output_tokens(model_info)
+    if model_max is not None:
+        target = min(target, model_max)
+    if requested_max_tokens != target:
+        request_kwargs["max_tokens"] = target
     return request_kwargs
+
+
+def _model_max_output_tokens(model_info: ModelInfo | None) -> int | None:
+    if model_info is None:
+        return None
+    for attr in (
+        "max_output_tokens",
+        "max_completion_tokens",
+        "output_token_limit",
+        "max_tokens",
+    ):
+        value = getattr(model_info, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None

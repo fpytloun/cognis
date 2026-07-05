@@ -336,6 +336,15 @@ async def _resolve_executor_mcp_payload(
                             reason=result.reason,
                             transaction_id=result.transaction_id,
                             authorization_url=result.authorization_url,
+                            flow=result.flow,
+                            verification_uri=result.verification_uri,
+                            verification_uri_complete=result.verification_uri_complete,
+                            user_code=result.user_code,
+                            callback_mode=result.callback_mode,
+                            oauth_executor_id=result.oauth_executor_id,
+                            oauth_executor_name=result.oauth_executor_name,
+                            redirect_uri=result.redirect_uri,
+                            instructions=result.instructions,
                         )
                     )
                     _logger.warning(

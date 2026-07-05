@@ -140,6 +140,32 @@ class _StructuredProvider:
         return self.connection
 
 
+class _ResponseItemMetadataConnection:
+    async def llm_complete_stream(self, **_: object):
+        yield {
+            "content": "Hello",
+            "tool_calls": None,
+            "reasoning_content": None,
+            "response_item_id": "msg_1",
+            "content_source": "response.output_text.delta",
+            "response_message_phase": "commentary",
+            "index": 0,
+        }
+        yield {"done": True, "usage": {"total_tokens": 3}, "finish_reason": "stop"}
+
+
+class _ResponseItemMetadataProvider:
+    def __init__(self) -> None:
+        self.connection = _ResponseItemMetadataConnection()
+
+    async def list_active(self):
+        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+
+    async def get_executor(self, handle: SimpleNamespace):
+        assert handle.executor_id == "exec-1"
+        return self.connection
+
+
 @pytest.mark.asyncio
 async def test_inference_router_route_generate_serializes_structured_reasoning_fields() -> None:
     router = InferenceRouter(_StructuredProvider())
@@ -154,6 +180,24 @@ async def test_inference_router_route_generate_serializes_structured_reasoning_f
     assert '"decision": "revise"' in result["choices"][0]["message"]["reasoning_content"]
     assert result["choices"][0]["message"]["reasoning"] == '["Need tests"]'
     assert result["response_status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_inference_router_forwards_response_item_metadata() -> None:
+    router = InferenceRouter(_ResponseItemMetadataProvider())
+
+    chunks = [
+        chunk
+        async for chunk in router.route_stream(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+            executor_labels={"location": "local"},
+        )
+    ]
+
+    assert chunks[0]["response_item_id"] == "msg_1"
+    assert chunks[0]["content_source"] == "response.output_text.delta"
+    assert chunks[0]["response_message_phase"] == "commentary"
 
 
 class _ErrorConnection:
@@ -219,6 +263,74 @@ async def test_inference_router_generate_raises_structured_provider_error() -> N
 
     assert exc_info.value.to_payload()["category"] == "rate_limit"
     assert exc_info.value.to_payload()["retry_after_seconds"] == 23
+
+
+class _FragmentedToolConnection:
+    async def llm_complete_stream(self, **_: object):
+        # A streamed tool call arrives as a name-only fragment plus N
+        # argument fragments, all sharing the same index.
+        yield {
+            "content": None,
+            "tool_calls": [{"index": 0, "id": "call_frag", "function": {"name": "write_file"}}],
+            "reasoning_content": None,
+            "index": 0,
+        }
+        yield {
+            "content": None,
+            "tool_calls": [{"index": 0, "function": {"arguments": '{"path": "/tmp'}}],
+            "reasoning_content": None,
+            "index": 1,
+        }
+        yield {
+            "content": None,
+            "tool_calls": [{"index": 0, "function": {"arguments": '/foo.txt"}'}}],
+            "reasoning_content": None,
+            "index": 2,
+        }
+        yield {
+            "content": None,
+            "tool_calls": [
+                {
+                    "index": 1,
+                    "id": "call_second",
+                    "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                }
+            ],
+            "reasoning_content": None,
+            "index": 3,
+        }
+        yield {"done": True, "usage": {"total_tokens": 5}, "finish_reason": "tool_calls"}
+
+
+class _FragmentedToolProvider:
+    def __init__(self) -> None:
+        self.connection = _FragmentedToolConnection()
+
+    async def list_active(self):
+        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+
+    async def get_executor(self, handle: SimpleNamespace):
+        return self.connection
+
+
+@pytest.mark.asyncio
+async def test_inference_router_route_generate_merges_fragmented_tool_calls() -> None:
+    router = InferenceRouter(_FragmentedToolProvider())
+
+    result = await router.route_generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        executor_labels={"location": "local"},
+    )
+
+    tool_calls = result["choices"][0]["message"]["tool_calls"]
+    assert len(tool_calls) == 2
+    assert tool_calls[0]["id"] == "call_frag"
+    assert tool_calls[0]["function"]["name"] == "write_file"
+    assert tool_calls[0]["function"]["arguments"] == '{"path": "/tmp/foo.txt"}'
+    assert tool_calls[1]["id"] == "call_second"
+    assert tool_calls[1]["function"]["arguments"] == '{"command": "ls"}'
+    assert result["choices"][0]["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.asyncio

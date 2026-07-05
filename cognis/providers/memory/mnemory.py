@@ -176,6 +176,7 @@ class MnemoryProvider:
         include_instructions: bool = False,
         managed: bool = False,
         instruction_mode: str | None = None,
+        ttl: int | None = None,
     ) -> dict[str, Any]:
         bounded_query, query_truncated = _truncate_recall_text(query)
         bounded_context, context_truncated = _truncate_recall_text(context or "")
@@ -188,7 +189,7 @@ class MnemoryProvider:
             "search_mode": search_mode,
             "context": bounded_context or None,
             "labels": labels or {},
-            "ttl": 86400,
+            "ttl": ttl if isinstance(ttl, int) and ttl > 0 else 86400,
         }
         if instruction_mode is not None:
             payload["instruction_mode"] = instruction_mode

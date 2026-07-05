@@ -185,6 +185,7 @@ def prepare_tool_exposure(
     promoted_tool_ids: set[str],
     default_visible_tool_ids: set[str] | None = None,
     allow_tool_search: bool = True,
+    anthropic_cache_ttl: str | None = "5m",
 ) -> ToolExposureResult:
     """Prepare provider-specific model-facing tool schemas.
 
@@ -313,10 +314,6 @@ def prepare_tool_exposure(
             alias_map,
             deferred_tool_ids=deferred_tool_ids,
         )
-        _mark_anthropic_cache_breakpoint(
-            tool_schemas,
-            stable_anchor_tool_ids={stable_tool_id(tool) for tool in policy_visible_tools},
-        )
         request_kwargs = {
             "extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"},
             "disable_parallel_tool_use": False,
@@ -393,17 +390,25 @@ def prepare_tool_exposure(
     }
     promoted_inventory_ids = {stable_tool_id(tool) for tool in promoted_visible}
     promoted_visible_ids = visible_tool_ids & promoted_inventory_ids
-    final_tool_schemas = _strip_internal_schema_metadata(
-        [*filtered_controller_tool_schemas, *tool_schemas]
-    )
+    final_tool_schema_sources = [*filtered_controller_tool_schemas, *tool_schemas]
+    if not use_anthropic_defer:
+        final_tool_schema_sources = _sort_model_facing_tool_schemas(
+            final_tool_schema_sources,
+            promoted_tool_ids=promoted_visible_ids,
+        )
+    final_tool_schemas = _strip_internal_schema_metadata(final_tool_schema_sources)
     argument_alias_map: dict[str, dict[str, Any]] = {}
     if edit_tool_family is EditToolFamily.ANTHROPIC or contract.anthropic_schema_compatible:
         final_tool_schemas, argument_alias_map = _normalize_anthropic_tool_schema_arguments(
             final_tool_schemas,
             alias_map=alias_map,
         )
-    if not use_anthropic_defer:
-        final_tool_schemas = _sort_model_facing_tool_schemas(final_tool_schemas)
+    if edit_tool_family is EditToolFamily.ANTHROPIC or contract.anthropic_schema_compatible:
+        _mark_anthropic_cache_breakpoint(
+            final_tool_schemas,
+            stable_anchor_tool_ids=set(),
+            ttl=anthropic_cache_ttl,
+        )
     return ToolExposureResult(
         tools=final_tool_schemas,
         alias_map=alias_map,
@@ -516,7 +521,7 @@ def _build_inventory_schemas(
         function_schema: dict[str, Any] = {
             "name": visible_name,
             "description": tool.description,
-            "parameters": tool.parameters,
+            "parameters": _strip_schema_metadata(tool.parameters),
             "x-stable-tool-id": stable_tool_id(tool),
         }
         if stable_tool_id(tool) in deferred_tool_ids:
@@ -529,6 +534,7 @@ def _mark_anthropic_cache_breakpoint(
     tool_schemas: list[dict[str, Any]],
     *,
     stable_anchor_tool_ids: set[str],
+    ttl: str | None = None,
 ) -> None:
     """Attach Anthropic tool-array cache_control to a stable schema edge.
 
@@ -551,7 +557,10 @@ def _mark_anthropic_cache_breakpoint(
 
     function = tool_schemas[anchor_index].get("function")
     if isinstance(function, dict):
-        function["cache_control"] = {"type": "ephemeral"}
+        cache_control = {"type": "ephemeral"}
+        if isinstance(ttl, str) and ttl.strip():
+            cache_control["ttl"] = ttl.strip().lower()
+        function["cache_control"] = cache_control
 
 
 def _strip_internal_schema_metadata(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -626,6 +635,18 @@ def _collect_local_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
             if isinstance(name, str):
                 refs[f"#/{definition_key}/{name}"] = definition
     return refs
+
+
+def _strip_schema_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_schema_metadata(item)
+            for key, item in value.items()
+            if key not in _JSON_SCHEMA_METADATA_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_schema_metadata(item) for item in value]
+    return value
 
 
 def _normalize_anthropic_schema_node(
@@ -829,17 +850,36 @@ def reverse_tool_argument_aliases(arguments: Any, alias_tree: dict[str, Any]) ->
     return translated
 
 
-def _sort_model_facing_tool_schemas(tool_schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return provider-facing tool schemas sorted by model-visible tool name.
+def _sort_model_facing_tool_schemas(
+    tool_schemas: list[dict[str, Any]],
+    *,
+    promoted_tool_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return provider-facing schemas in stable order, then promoted order.
 
     Tool arrays are part of provider prompt-cache prefixes.  Sorting only object
     keys during diagnostics is not enough: equivalent tools in a different list
-    order produce a different schema hash and can miss provider caches.  Keep
-    Anthropic deferred-loading order separate because cache_control placement
-    encodes a provider-specific cache boundary there.
+    order produce a different schema hash and can miss provider caches.
+    Promoted tools are volatile (search/skill surfaced), so append them after
+    the stable sorted block on non-defer paths.
     """
 
-    return sorted(tool_schemas, key=_model_facing_tool_schema_sort_key)
+    promoted_tool_ids = promoted_tool_ids or set()
+    return sorted(
+        tool_schemas,
+        key=lambda schema: (
+            1 if _model_facing_tool_schema_stable_id(schema) in promoted_tool_ids else 0,
+            *_model_facing_tool_schema_sort_key(schema),
+        ),
+    )
+
+
+def _model_facing_tool_schema_stable_id(schema: dict[str, Any]) -> str | None:
+    function = schema.get("function")
+    if not isinstance(function, dict):
+        return None
+    tool_id = function.get("x-stable-tool-id")
+    return tool_id if isinstance(tool_id, str) else None
 
 
 def _model_facing_tool_schema_sort_key(schema: dict[str, Any]) -> tuple[str, str, str]:
@@ -896,7 +936,7 @@ def _build_openai_deferred_namespaces(
                     "type": "function",
                     "name": visible_name,
                     "description": tool.description,
-                    "parameters": tool.parameters,
+                    "parameters": _strip_schema_metadata(tool.parameters),
                     "defer_loading": True,
                 }
             )

@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.api.mcp_reconfigure import schedule_mcp_server_executor_reconfigure_for_app
 from cognis.api.runtime_support import select_static_tools
 from cognis.models.tool import (
     MCP_SERVER_IDS_KEY,
@@ -19,6 +20,8 @@ from cognis.store.queries import (
     create_mcp_server,
     create_user,
     delete_user_cascade,
+    get_executor_row,
+    upsert_mcp_oauth_token,
 )
 
 
@@ -666,6 +669,13 @@ def test_list_observed_local_mcp_tools_dedupes_and_filters_scope(
                     executor_type="websocket",
                     owner_email="alice@example.com",
                 )
+                alice_stale = await create_executor(
+                    session,
+                    executor_id="alice_exec_stale",
+                    name="Alice stale exec",
+                    executor_type="websocket",
+                    owner_email="alice@example.com",
+                )
                 bob_exec = await create_executor(
                     session,
                     executor_id="bob_exec",
@@ -704,6 +714,19 @@ def test_list_observed_local_mcp_tools_dedupes_and_filters_scope(
                     {"bad": "row"},
                 ]
                 alice_two.observed_tools = [observed_local]
+                alice_stale.desired_config_version = 2
+                alice_stale.applied_config_version = 1
+                alice_stale.observed_tools = [
+                    {
+                        **observed_local,
+                        "source": ToolSource(
+                            type="local_mcp",
+                            server_id="srv_stale",
+                            server_name="stale-github",
+                            raw_tool_name="search/issues",
+                        ).model_dump(mode="json"),
+                    }
+                ]
                 bob_exec.observed_tools = [
                     {
                         **observed_local,
@@ -806,6 +829,211 @@ def test_update_mcp_server_revalidates_transport(monkeypatch: object, tmp_path: 
             json={"transport": "sse", "command": None},
         )
         assert response.status_code == 422
+
+
+def test_update_mcp_server_schedules_executor_reconfigure(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    scheduled: list[tuple[str, str]] = []
+
+    async def _fake_schedule(
+        _app: object,
+        *,
+        server_id: str,
+        reason: str,
+        log_context: dict[str, object] | None = None,
+    ) -> list[str]:
+        del log_context
+        scheduled.append((server_id, reason))
+        return ["exec_update"]
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "cognis.api.routes.tools.schedule_mcp_server_executor_reconfigure_for_app",
+        _fake_schedule,
+    )
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        import asyncio
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                server = await create_mcp_server(
+                    session,
+                    server_id="mcp_update_reconfigure",
+                    name="update-me",
+                    transport="stdio",
+                    command="/bin/echo",
+                    owner_email="admin@example.com",
+                )
+                await create_executor(
+                    session,
+                    executor_id="exec_update",
+                    name="Update executor",
+                    executor_type="websocket",
+                    config={MCP_SERVER_IDS_KEY: [server.server_id]},
+                    owner_email="admin@example.com",
+                )
+                await session.commit()
+                return server.server_id
+
+        server_id = asyncio.run(_seed())
+        response = client.put(
+            f"/api/v1/mcp-servers/{server_id}",
+            headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
+            json={"name": "updated"},
+        )
+
+        assert response.status_code == 200
+        assert scheduled == [(server_id, "mcp_server_update")]
+
+
+def test_oauth_disconnect_schedules_executor_reconfigure(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    scheduled: list[tuple[str, str]] = []
+
+    async def _fake_schedule(
+        _app: object,
+        *,
+        server_id: str,
+        reason: str,
+        log_context: dict[str, object] | None = None,
+    ) -> list[str]:
+        del log_context
+        scheduled.append((server_id, reason))
+        return ["exec_oauth"]
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "cognis.api.routes.mcp_oauth.schedule_mcp_server_executor_reconfigure_for_app",
+        _fake_schedule,
+    )
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        import asyncio
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                server = await create_mcp_server(
+                    session,
+                    server_id="mcp_oauth_disconnect",
+                    name="oauth",
+                    transport="streamable_http",
+                    url="https://mcp.example.com",
+                    auth_config={
+                        "type": "oauth2",
+                        "issuer": "https://auth.example.com",
+                        "resource": "https://mcp.example.com",
+                    },
+                    owner_email="admin@example.com",
+                )
+                await upsert_mcp_oauth_token(
+                    session,
+                    user_email="admin@example.com",
+                    mcp_server_id=server.server_id,
+                    issuer="https://auth.example.com",
+                    resource="https://mcp.example.com",
+                    client_id="client-1",
+                    scopes=["tools.read"],
+                    token_type="Bearer",
+                    expires_at=None,
+                    encrypted_payload=b"token",
+                )
+                await session.commit()
+                return server.server_id
+
+        server_id = asyncio.run(_seed())
+        response = client.post(
+            f"/api/v1/mcp-servers/{server_id}/oauth/disconnect",
+            headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
+        )
+
+        assert response.status_code == 200
+        assert scheduled == [(server_id, "mcp_oauth_disconnect")]
+
+
+def test_mcp_reconfigure_helper_bumps_desired_version_each_time(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    scheduled: list[str] = []
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
+        lambda _app, executor_id: scheduled.append(executor_id),
+    )
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        app.state.providers.executor.websocket.get_connection = lambda _executor_id: None  # type: ignore[method-assign]
+
+        import asyncio
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                server = await create_mcp_server(
+                    session,
+                    server_id="mcp_bump",
+                    name="bump",
+                    transport="stdio",
+                    command="/bin/echo",
+                    owner_email="admin@example.com",
+                )
+                executor = await create_executor(
+                    session,
+                    executor_id="exec_bump",
+                    name="Bump executor",
+                    executor_type="websocket",
+                    config={MCP_SERVER_IDS_KEY: [server.server_id]},
+                    owner_email="admin@example.com",
+                )
+                executor.desired_config_version = 4
+                executor.applied_config_version = 4
+                executor.runtime_state = "active"
+                await session.commit()
+                return server.server_id, executor.executor_id
+
+        async def _run() -> tuple[int, str]:
+            server_id, executor_id = await _seed()
+            await schedule_mcp_server_executor_reconfigure_for_app(
+                app,
+                server_id=server_id,
+                reason="first",
+            )
+            await schedule_mcp_server_executor_reconfigure_for_app(
+                app,
+                server_id=server_id,
+                reason="second",
+            )
+            async with app.state.session_factory() as session:
+                row = await get_executor_row(session, executor_id)
+                assert row is not None
+                return row.desired_config_version, row.runtime_state
+
+        desired_config_version, runtime_state = asyncio.run(_run())
+
+        assert desired_config_version == 6
+        assert runtime_state == "stale"
+        assert scheduled == ["exec_bump", "exec_bump"]
 
 
 def test_invalid_http_mcp_server_is_flagged_in_list(monkeypatch: object, tmp_path: Path) -> None:

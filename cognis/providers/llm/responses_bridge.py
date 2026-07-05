@@ -83,7 +83,7 @@ def normalize_openai_model_name(model_name: str) -> str:
 
 def split_messages_for_responses(
     messages: list[dict[str, Any]],
-    cache_breakpoint_index: int | None,
+    cache_breakpoint_index: Any,
 ) -> tuple[str | None, list[dict[str, Any]]]:
     """Split canonical messages into (instructions, remaining_tail).
 
@@ -98,7 +98,8 @@ def split_messages_for_responses(
     callers can fall back to the legacy input-only shape.
     """
 
-    if cache_breakpoint_index is None or cache_breakpoint_index < 0:
+    cache_breakpoint_index = _responses_instruction_breakpoint_index(cache_breakpoint_index)
+    if cache_breakpoint_index is None:
         return None, messages
     if cache_breakpoint_index >= len(messages):
         return None, messages
@@ -124,6 +125,31 @@ def split_messages_for_responses(
 
     instructions = "\n\n".join(instructions_parts)
     return instructions, tail_slice
+
+
+def _responses_instruction_breakpoint_index(value: Any) -> int | None:
+    """Return the immutable-prefix breakpoint for Responses instructions."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if not isinstance(value, list):
+        return None
+    valid_indexes: list[int] = []
+    for item in value:
+        raw_index: Any
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            raw_index = item
+        elif isinstance(item, dict):
+            raw_index = item.get("index")
+        else:
+            continue
+        if isinstance(raw_index, int) and not isinstance(raw_index, bool) and raw_index >= 0:
+            valid_indexes.append(raw_index)
+    return min(valid_indexes) if valid_indexes else None
 
 
 def split_system_messages_for_responses(
@@ -183,9 +209,28 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
         content = message.get("content")
         raw_responses_output_items = message.get("_responses_output_items")
         if role == "assistant" and isinstance(raw_responses_output_items, list):
+            normalized_content = _normalize_message_content(
+                content,
+                allow_native_attachments=False,
+            )
+            has_content = normalized_content not in (None, "", [])
+            has_raw_message_item = any(
+                isinstance(item, dict) and str(item.get("type") or "") == "message"
+                for item in raw_responses_output_items
+            )
+            reconstructed_content_emitted = False
+
             for raw_item in raw_responses_output_items:
                 if isinstance(raw_item, dict):
                     raw_type = str(raw_item.get("type") or "")
+                    if (
+                        not has_raw_message_item
+                        and not reconstructed_content_emitted
+                        and has_content
+                        and raw_type in RESPONSES_TOOL_CALL_TYPES
+                    ):
+                        items.append({"role": "assistant", "content": normalized_content})
+                        reconstructed_content_emitted = True
                     if raw_type == "function_call":
                         call_id = raw_item.get("call_id")
                         if isinstance(call_id, str) and call_id:
@@ -199,6 +244,47 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         if isinstance(call_id, str) and call_id:
                             native_apply_patch_call_ids.add(call_id)
                     items.append(dict(raw_item))
+            if not has_raw_message_item and has_content and not reconstructed_content_emitted:
+                items.append({"role": "assistant", "content": normalized_content})
+                reconstructed_content_emitted = True
+            for tool_index, tool_call in enumerate(message.get("tool_calls") or []):
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function") or {}
+                if not isinstance(function, dict):
+                    function = {}
+                call_id = normalize_tool_call_id(
+                    tool_call.get("id"), tool_call.get("id"), f"{index}:{tool_index}"
+                )
+                if (
+                    call_id in function_call_ids
+                    or call_id in custom_tool_call_ids
+                    or call_id in native_apply_patch_call_ids
+                ):
+                    continue
+                function_name = str(function.get("name", "unknown_tool"))
+                arguments = str(function.get("arguments", "{}"))
+                native_operation = _extract_native_apply_patch_operation(function_name, arguments)
+                if native_operation is not None:
+                    items.append(
+                        {
+                            "type": "apply_patch_call",
+                            "call_id": call_id,
+                            "status": "completed",
+                            "operation": native_operation,
+                        }
+                    )
+                    native_apply_patch_call_ids.add(call_id)
+                else:
+                    items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": function_name,
+                            "arguments": arguments,
+                        }
+                    )
+                    function_call_ids.add(call_id)
             continue
         if role in {"system", "user", "assistant"} and not message.get("tool_calls"):
             items.append(
@@ -429,7 +515,11 @@ def _tool_call_item_arguments(item: dict[str, Any]) -> str:
         if operation is None:
             return ""
         patch_text = _native_apply_patch_operation_to_patch_text(operation)
-        return json.dumps({"patchText": patch_text}) if patch_text is not None else ""
+        if patch_text is not None:
+            return json.dumps({"patchText": patch_text})
+        if str(operation.get("type") or "").strip() == "update_file":
+            return "[patch body omitted]"
+        return ""
     if str(item.get("type")) == "custom_tool_call":
         if not item.get("input"):
             return ""
@@ -471,7 +561,8 @@ def _native_apply_patch_operation_to_patch_text(operation: dict[str, Any]) -> st
         return f"*** Begin Patch\n*** Add File: {path}\n{added}\n*** End Patch\n"
     if operation_type == "update_file":
         # Native Responses update operations do not carry a canonical unified
-        # patch body. Do not replay them as controller apply_patch calls.
+        # patch body. Keep them non-dispatchable; _tool_call_item_arguments()
+        # emits a conspicuous marker string instead of executable patch JSON.
         return None
     return None
 
@@ -501,6 +592,8 @@ def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 async def responses_stream_to_chat_chunks(
     stream: AsyncIterator[Any],
+    *,
+    dedupe_output_text_delta: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Normalize Responses streaming events into chat-like delta chunks."""
 
@@ -523,6 +616,7 @@ async def responses_stream_to_chat_chunks(
                     text_chunk = state.output_text_delta(
                         event,
                         delta,
+                        dedupe_cumulative=dedupe_output_text_delta,
                     )
                     if text_chunk is not None:
                         text_chunk.update(provider_liveness_chunk)
@@ -590,12 +684,21 @@ async def responses_stream_to_chat_chunks(
                     event.get("delta") or event.get("text") or event.get("part")
                 )
                 if part_text:
-                    reasoning_chunk = state.final_text_delta(part_text, field="reasoning_content")
+                    if event_type == "response.reasoning_text.delta":
+                        reasoning_chunk = state.streamed_text_delta(
+                            part_text, field="reasoning_content"
+                        )
+                    else:
+                        reasoning_chunk = state.final_text_delta(
+                            part_text, field="reasoning_content"
+                        )
                     if reasoning_chunk is not None:
                         reasoning_chunk.update(provider_liveness_chunk)
                         yield reasoning_chunk
                 else:
                     yield provider_liveness_chunk
+                if event_type == "response.reasoning_text.done":
+                    state.reset_segment("reasoning_content")
                 continue
             if event_type in {
                 "response.reasoning_summary_text.delta",
@@ -606,18 +709,18 @@ async def responses_stream_to_chat_chunks(
                 part_text = _extract_text_value(
                     event.get("delta") or event.get("text") or event.get("part")
                 )
-                if part_text:
-                    reasoning_chunk = state.final_text_delta(part_text, field="reasoning")
-                    if reasoning_chunk is not None:
-                        reasoning_chunk.update(provider_liveness_chunk)
-                        yield reasoning_chunk
-                # Emit part boundary markers so the agent loop can detect
-                # block transitions for assistant_thinking event recording.
+                # Emit the part boundary marker BEFORE any text carried on the
+                # same event: the consumer opens a new thinking block on the
+                # boundary chunk, so text yielded first would be grouped into
+                # the previous block.
                 if event_type == "response.reasoning_summary_part.added":
                     part = event.get("part") or {}
                     provider_title = (
                         _extract_text_value(part.get("title")) if isinstance(part, dict) else None
                     )
+                    # A new part starts a fresh dedup segment so identical
+                    # repeated summary parts are not swallowed.
+                    state.reset_segment("reasoning")
                     yield {
                         **provider_liveness_chunk,
                         "choices": [
@@ -633,7 +736,15 @@ async def responses_stream_to_chat_chunks(
                         ],
                     }
                     state.reasoning_part_count += 1
-                elif event_type == "response.reasoning_summary_part.done":
+                if part_text:
+                    if event_type == "response.reasoning_summary_text.delta":
+                        reasoning_chunk = state.streamed_text_delta(part_text, field="reasoning")
+                    else:
+                        reasoning_chunk = state.final_text_delta(part_text, field="reasoning")
+                    if reasoning_chunk is not None:
+                        reasoning_chunk.update(provider_liveness_chunk)
+                        yield reasoning_chunk
+                if event_type == "response.reasoning_summary_part.done":
                     yield {
                         **provider_liveness_chunk,
                         "choices": [
@@ -648,6 +759,7 @@ async def responses_stream_to_chat_chunks(
                             }
                         ],
                     }
+                    state.reset_segment("reasoning")
                 if not part_text and event_type not in {
                     "response.reasoning_summary_part.added",
                     "response.reasoning_summary_part.done",
@@ -659,7 +771,10 @@ async def responses_stream_to_chat_chunks(
                     event.get("delta") or event.get("text") or event.get("part")
                 )
                 if refusal_text:
-                    refusal_chunk = state.final_text_delta(refusal_text, field="refusal")
+                    if event_type == "response.refusal.delta":
+                        refusal_chunk = state.streamed_text_delta(refusal_text, field="refusal")
+                    else:
+                        refusal_chunk = state.final_text_delta(refusal_text, field="refusal")
                     if refusal_chunk is not None:
                         refusal_chunk.update(provider_liveness_chunk)
                         yield refusal_chunk
@@ -690,6 +805,20 @@ async def responses_stream_to_chat_chunks(
                 continue
             if event_type == "response.function_call_arguments.done":
                 item = _get_output_item(event)
+                if item is None:
+                    # The real Responses API sends this event with item_id +
+                    # arguments and NO nested item. Synthesize one so argument
+                    # recovery works when deltas were dropped before item
+                    # registration (otherwise recovery depends solely on
+                    # output_item.done arriving intact).
+                    item_id = str(event.get("item_id") or "").strip()
+                    done_arguments = event.get("arguments")
+                    if item_id and isinstance(done_arguments, str) and done_arguments:
+                        item = {
+                            "type": "function_call",
+                            "id": item_id,
+                            "arguments": done_arguments,
+                        }
                 if item is not None:
                     state.register_item(item)
                     initial_chunk = state.initial_tool_delta(item, emit_name=True)
@@ -732,6 +861,7 @@ async def responses_stream_to_chat_chunks(
                 if item is None:
                     continue
                 state.complete_item(item)
+                state.note_raw_output_item_emitted(item)
                 yield {
                     **provider_liveness_chunk,
                     "responses_output_item": item,
@@ -870,6 +1000,15 @@ class _ResponsesStreamState:
         self._emitted_reasoning = ""
         self._emitted_reasoning_summary = ""
         self._emitted_refusal = ""
+        # Segment-scoped emitted text: reset at part/item boundaries so
+        # dedup never misfires across distinct reasoning parts or message
+        # items that legitimately repeat earlier text.
+        self._emitted_segments: dict[str, str] = {
+            "content": "",
+            "reasoning_content": "",
+            "reasoning": "",
+            "refusal": "",
+        }
         self.event_counts: dict[str, int] = {}
         self.recent_event_types: deque[str] = deque(maxlen=20)
         self.text_emissions = 0
@@ -878,6 +1017,7 @@ class _ResponsesStreamState:
         self.completed_seen = False
         # Counter for reasoning summary parts (used for boundary markers)
         self.reasoning_part_count = 0
+        self._emitted_raw_output_item_keys: set[str] = set()
 
     def note_event(self, event_type: str) -> None:
         normalized = event_type or "unknown"
@@ -903,6 +1043,8 @@ class _ResponsesStreamState:
             self._emitted_refusal += text
         else:
             self._emitted_content += text
+        segment_key = field if field in self._emitted_segments else "content"
+        self._emitted_segments[segment_key] += text
         self.text_emissions += 1
 
     def _emitted_value(self, field: str) -> str:
@@ -913,6 +1055,17 @@ class _ResponsesStreamState:
         if field == "refusal":
             return self._emitted_refusal
         return self._emitted_content
+
+    def _emitted_for_scope(self, field: str, scope: str) -> str:
+        if scope == "segment":
+            segment_key = field if field in self._emitted_segments else "content"
+            return self._emitted_segments[segment_key]
+        return self._emitted_value(field)
+
+    def reset_segment(self, field: str) -> None:
+        """Reset segment-scoped dedup state at a part/item boundary."""
+        segment_key = field if field in self._emitted_segments else "content"
+        self._emitted_segments[segment_key] = ""
 
     def register_item(self, item: dict[str, Any]) -> tuple[dict[str, Any] | None, bool]:
         item_key, aliases = self._item_identity(item)
@@ -950,6 +1103,10 @@ class _ResponsesStreamState:
         }
         self._items[item_key] = state
         self._bind_item_aliases(item_key, aliases)
+        if state["item_type"] == "message":
+            # A new message item starts a fresh dedup segment so text that
+            # legitimately repeats a previous item is not swallowed.
+            self.reset_segment("content")
         return state, True
 
     @staticmethod
@@ -999,6 +1156,39 @@ class _ResponsesStreamState:
         for alias in aliases:
             self._item_aliases[alias] = state_key
 
+    def _raw_output_item_key(self, item: dict[str, Any]) -> str:
+        keys = self._raw_output_item_keys(item)
+        if keys:
+            return sorted(keys)[0]
+        return json.dumps(item, sort_keys=True, default=str)
+
+    def _raw_output_item_keys(self, item: dict[str, Any]) -> set[str]:
+        raw_item_id = str(item.get("id") or "").strip()
+        raw_call_id = str(item.get("call_id") or "").strip()
+        normalized_call_id = normalize_tool_call_id(
+            raw_call_id or None,
+            raw_item_id or None,
+            raw_call_id or raw_item_id or "",
+        )
+        return {
+            key
+            for key in (raw_item_id, raw_call_id, normalized_call_id)
+            if isinstance(key, str) and key
+        }
+
+    def note_raw_output_item_emitted(self, item: dict[str, Any]) -> None:
+        keys = self._raw_output_item_keys(item)
+        if keys:
+            self._emitted_raw_output_item_keys.update(keys)
+        else:
+            self._emitted_raw_output_item_keys.add(self._raw_output_item_key(item))
+
+    def raw_output_item_emitted(self, item: dict[str, Any]) -> bool:
+        keys = self._raw_output_item_keys(item)
+        if keys:
+            return any(key in self._emitted_raw_output_item_keys for key in keys)
+        return self._raw_output_item_key(item) in self._emitted_raw_output_item_keys
+
     def _resolve_item_state(self, *aliases: str) -> dict[str, Any] | None:
         for alias in aliases:
             if not alias:
@@ -1013,6 +1203,8 @@ class _ResponsesStreamState:
         self,
         event: dict[str, Any],
         delta: str,
+        *,
+        dedupe_cumulative: bool = False,
     ) -> dict[str, Any] | None:
         state = self._resolve_item_state(str(event.get("item_id") or ""))
         if state is None:
@@ -1021,7 +1213,9 @@ class _ResponsesStreamState:
             return None
         if state is None:
             return None
-        normalized_delta = self.incremental_text_delta(delta, field="content")
+        normalized_delta = (
+            self.incremental_text_delta(delta, field="content") if dedupe_cumulative else delta
+        )
         if normalized_delta is None:
             return None
         self.note_text_emitted("content", normalized_delta)
@@ -1090,8 +1284,10 @@ class _ResponsesStreamState:
         text = _extract_message_item_text(item)
         if not text:
             return None
-        self.note_text_emitted("content", text)
+        # Register first so a brand-new message item resets the content
+        # segment before this item's text is recorded against it.
         state, _ = self.register_item(item)
+        self.note_text_emitted("content", text)
         if state is None:
             return {"choices": [{"delta": {"content": text}}]}
         return {
@@ -1133,6 +1329,16 @@ class _ResponsesStreamState:
         # scratchpad leak in output_text can become a persisted assistant_message.
         envelope = _extract_response_envelope(response_payload)
         chunks: list[dict[str, Any]] = []
+        raw_reasoning_items: list[dict[str, Any]] = []
+        for raw_item in response_payload.get("output") or []:
+            if not isinstance(raw_item, dict):
+                continue
+            if str(raw_item.get("type") or "") != "reasoning":
+                continue
+            if self.raw_output_item_emitted(raw_item):
+                continue
+            self.note_raw_output_item_emitted(raw_item)
+            raw_reasoning_items.append(dict(raw_item))
         for response_field, fallback_text in (
             ("reasoning_content", envelope.reasoning_content),
             ("reasoning", envelope.reasoning_summary),
@@ -1140,28 +1346,74 @@ class _ResponsesStreamState:
         ):
             if not fallback_text:
                 continue
-            chunk = self.final_text_delta(fallback_text, field=response_field)
+            # Fallback payloads aggregate text across all parts, so dedup must
+            # compare against everything emitted for the field, not the
+            # current segment.
+            chunk = self.final_text_delta(fallback_text, field=response_field, scope="total")
             if chunk is not None:
                 self.completed_fallback_used = True
                 chunks.append(chunk)
+        if raw_reasoning_items:
+            self.completed_fallback_used = True
+            chunks.extend(
+                {"responses_output_item": dict(raw_item)} for raw_item in raw_reasoning_items
+            )
         return chunks
 
-    def final_text_delta(self, text: str, *, field: str = "content") -> dict[str, Any] | None:
+    def streamed_text_delta(self, text: str, *, field: str) -> dict[str, Any] | None:
+        """Handle a true incremental delta event (``*.delta``).
+
+        Unlike :meth:`final_text_delta` this never drops short deltas that
+        happen to match the emitted suffix — a legitimately repeated token
+        (e.g. "very very") must stream through. Only large overlaps are
+        treated as provider replays via :meth:`incremental_text_delta`.
+        """
         if not text:
             return None
-        emitted = self._emitted_value(field)
+        normalized_delta = self.incremental_text_delta(text, field=field)
+        if not normalized_delta:
+            return None
+        self.note_text_emitted(field, normalized_delta)
+        return {"choices": [{"delta": {field: normalized_delta}}]}
+
+    def final_text_delta(
+        self,
+        text: str,
+        *,
+        field: str = "content",
+        scope: str = "segment",
+    ) -> dict[str, Any] | None:
+        """Handle terminal/cumulative text (``*.done``, part text, fallbacks).
+
+        Dedup compares against segment-scoped emitted text by default so a
+        later part/item that legitimately repeats an earlier one is not
+        swallowed. Completed-response fallbacks pass ``scope="total"`` because
+        they aggregate text across all parts.
+        """
+        if not text:
+            return None
+        emitted = self._emitted_for_scope(field, scope)
         if text == emitted:
             return None
-        if text.startswith(emitted):
-            delta = text[len(emitted) :]
-            if not delta:
-                return None
-            self.note_text_emitted(field, delta)
-            return {"choices": [{"delta": {field: delta}}]}
-        self.note_text_emitted(field, text)
-        return {"choices": [{"delta": {field: text}}]}
+        if emitted and emitted.endswith(text):
+            return None
+        normalized_delta: str | None
+        if emitted and text.startswith(emitted):
+            normalized_delta = text[len(emitted) :]
+        else:
+            normalized_delta = self.incremental_text_delta(text, field=field, scope=scope)
+        if not normalized_delta:
+            return None
+        self.note_text_emitted(field, normalized_delta)
+        return {"choices": [{"delta": {field: normalized_delta}}]}
 
-    def incremental_text_delta(self, delta: str, *, field: str = "content") -> str | None:
+    def incremental_text_delta(
+        self,
+        delta: str,
+        *,
+        field: str = "content",
+        scope: str = "segment",
+    ) -> str | None:
         """Normalize Responses text deltas that replay already emitted text.
 
         Responses streams usually send true deltas, but Codex/direct transports
@@ -1172,7 +1424,7 @@ class _ResponsesStreamState:
 
         if not delta:
             return None
-        emitted = self._emitted_value(field)
+        emitted = self._emitted_for_scope(field, scope)
         if not emitted:
             return delta
 
@@ -1219,9 +1471,17 @@ class _ResponsesStreamState:
             ]
         }
         function = chunk["choices"][0]["delta"]["tool_calls"][0]["function"]
-        if emit_name and not bool(state.get("name_emitted")):
+        name_pending = not bool(state.get("name_emitted"))
+        # Re-emit the name when a placeholder was emitted first: an item
+        # registered from an arguments.done event (no nested item on the real
+        # API) has no name yet; the real name arrives with output_item.done.
+        name_upgraded = (
+            bool(state.get("name_emitted_placeholder")) and state["name"] != "unknown_tool"
+        )
+        if emit_name and (name_pending or name_upgraded):
             function["name"] = state["name"]
             state["name_emitted"] = True
+            state["name_emitted_placeholder"] = state["name"] == "unknown_tool"
         unseen_arguments = str(state["arguments"])[int(state["emitted"]) :]
         if unseen_arguments:
             function["arguments"] = unseen_arguments
@@ -1444,6 +1704,10 @@ class _ResponsesStreamState:
                 "name": str(function.get("name") or "unknown_tool"),
                 "arguments": str(function.get("arguments") or "{}"),
             }
+            if not self.raw_output_item_emitted(item):
+                self.note_raw_output_item_emitted(item)
+                self.completed_fallback_used = True
+                chunks.append({"responses_output_item": dict(item)})
             self.register_item(item)
             initial_chunk = self.initial_tool_delta(item, emit_name=True)
             if initial_chunk is not None:
@@ -1537,12 +1801,27 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
 def _extract_finish_reason(payload: dict[str, Any]) -> str:
     status = str(payload.get("status") or "completed")
     if status == "completed":
+        if _payload_has_tool_calls(payload):
+            return "tool_calls"
         return "stop"
     if status == "incomplete":
         return "length"
     if status == "failed":
         return "error"
     return "stop"
+
+
+def _payload_has_tool_calls(payload: dict[str, Any]) -> bool:
+    for item in payload.get("output") or []:
+        if isinstance(item, dict) and str(item.get("type") or "") in RESPONSES_TOOL_CALL_TYPES:
+            return True
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") or {}
+        if isinstance(message, dict) and message.get("tool_calls"):
+            return True
+    return False
 
 
 def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1555,12 +1834,17 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         return {}
+    input_token_count = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+    output_token_count = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
     normalized = dict(usage)
     normalized.update(
         {
-            "prompt_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
-            "completion_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
-            "total_tokens": usage.get("total_tokens", 0),
+            "prompt_tokens": input_token_count,
+            "completion_tokens": output_token_count,
+            "total_tokens": usage.get(
+                "total_tokens",
+                input_token_count + output_token_count,
+            ),
         }
     )
     input_details = usage.get("input_tokens_details")
@@ -1708,13 +1992,13 @@ def _normalize_message_content(content: Any, *, allow_native_attachments: bool =
                         {"type": "input_text", "text": _non_user_attachment_content_text(part)}
                     )
                     continue
-                item = {"type": "input_file"}
+                input_file_item = {"type": "input_file"}
                 if isinstance(part.get("file_id"), str) and part["file_id"]:
-                    item["file_id"] = part["file_id"]
+                    input_file_item["file_id"] = part["file_id"]
                 elif isinstance(part.get("file_url"), str) and part["file_url"]:
-                    item["file_url"] = part["file_url"]
-                if len(item) > 1:
-                    normalized.append(item)
+                    input_file_item["file_url"] = part["file_url"]
+                if len(input_file_item) > 1:
+                    normalized.append(input_file_item)
                 continue
             if part_type == "input_image":
                 if allow_native_attachments:
@@ -1741,10 +2025,13 @@ def _normalize_message_content(content: Any, *, allow_native_attachments: bool =
                 else:
                     url = image_url
                 if isinstance(url, str) and url:
-                    item: dict[str, Any] = {"type": "input_image", "image_url": url}
+                    input_image_item: dict[str, Any] = {
+                        "type": "input_image",
+                        "image_url": url,
+                    }
                     if isinstance(detail, str) and detail:
-                        item["detail"] = detail
-                    normalized.append(item)
+                        input_image_item["detail"] = detail
+                    normalized.append(input_image_item)
                 continue
             if part_type == "file":
                 if not allow_native_attachments:

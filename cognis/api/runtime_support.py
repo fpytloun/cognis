@@ -93,6 +93,7 @@ logger = get_logger(__name__)
 
 
 MCP_TOOL_SOURCE_TYPES = frozenset({"local_mcp", "intaris_mcp"})
+LEGACY_DISABLED_CATEGORY_IGNORES = frozenset({"mcp"})
 
 
 def mcp_server_assignment_key(source: ToolSource) -> str | None:
@@ -124,7 +125,10 @@ def tool_disabled_by_agent_config(
 ) -> bool:
     """Return whether an agent-level tool disable rule hides this tool."""
 
-    if tool.category in disabled_categories:
+    if (
+        tool.category in disabled_categories
+        and tool.category not in LEGACY_DISABLED_CATEGORY_IGNORES
+    ):
         return True
     if any(tool_matches_identifier(tool, identifier) for identifier in disabled_tools):
         return True
@@ -704,6 +708,8 @@ def select_static_tools(
     skill_tool_names = load_skill_tool_names(agent)
     allow_all_builtins = allowlist is None or "*" in allowlist
     delegation_enabled = bool(agent_tools_config.get("delegation_tools", True))
+    capabilities = getattr(agent, "capabilities", None)
+    memory_disabled = capabilities is not None and not capabilities.memory_enabled
 
     disabled_categories = set(agent_tools_config.get("disabled_categories") or [])
     disabled_tools = set(agent_tools_config.get("disabled_tools") or [])
@@ -720,6 +726,8 @@ def select_static_tools(
 
     selected: list[ToolDefinition] = []
     for tool in definitions:
+        if memory_disabled and tool.category == "memory":
+            continue
         default_off_allowed = False
         if tool.name in DEFAULT_OFF_BUILTIN_TOOLS:
             default_off_allowed = _management_tools_allowed(agent, access_context)
@@ -1941,6 +1949,11 @@ async def _resolve_executor_mcp_servers(
                                 result, "verification_uri_complete", None
                             ),
                             user_code=getattr(result, "user_code", None),
+                            callback_mode=getattr(result, "callback_mode", None),
+                            oauth_executor_id=getattr(result, "oauth_executor_id", None),
+                            oauth_executor_name=getattr(result, "oauth_executor_name", None),
+                            redirect_uri=getattr(result, "redirect_uri", None),
+                            instructions=getattr(result, "instructions", None),
                         )
                     )
                     logger.warning(

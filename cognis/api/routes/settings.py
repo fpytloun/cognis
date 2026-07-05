@@ -10,12 +10,18 @@ from typing import Any
 from fastapi import APIRouter, Request
 from sqlalchemy import select
 
-from cognis.api.common import api_exception, require_admin, require_current_user
+from cognis.api.common import (
+    api_exception,
+    forbid_mutation_for_viewer,
+    require_admin,
+    require_current_user,
+)
 from cognis.api.models import (
     CodexUsageResponse,
     CursorPage,
     EnrichModelsPreviewRequest,
     EnrichModelsRequest,
+    LLMProviderOAuthCompleteRequest,
     LLMProviderOAuthStatusResponse,
     LLMProviderRequest,
     LLMProviderResponse,
@@ -30,6 +36,8 @@ from cognis.api.models import (
     StepProfileCreateRequest,
     StepProfileResponse,
     StepProfileUpdateRequest,
+    UserPreferencesResponse,
+    UserPreferencesUpdateRequest,
     WebConfigStatusResponse,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
@@ -54,6 +62,7 @@ from cognis.store.queries import (
     delete_setting,
     get_llm_provider,
     get_setting,
+    get_user_ui_state_value,
     get_visible_llm_provider,
     list_llm_providers,
     list_model_routing,
@@ -61,11 +70,13 @@ from cognis.store.queries import (
     update_llm_provider,
     upsert_model_routing,
     upsert_setting,
+    upsert_user_ui_state,
 )
 
 router = APIRouter(tags=["settings"])
 PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
 SAME_SESSION_MODEL_SENTINEL = "__same_session_model__"
+USER_PREFERENCES_STATE_KEY = "ui.preferences"
 _ROUTING_TASK_TYPES: tuple[str, ...] = (
     "default",
     "classifier",
@@ -239,6 +250,23 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
             "validation_error",
             "ChatGPT OAuth providers must use controller execution location",
         )
+    auth_config = config.get("auth_config")
+    auth_provider = ""
+    auth_mode = ""
+    if isinstance(auth_config, dict):
+        auth_mode = str(auth_config.get("mode") or "").strip().lower()
+        auth_provider = str(auth_config.get("provider") or "").strip().lower()
+    if (
+        preset == "anthropic"
+        and auth_mode == "oauth"
+        and auth_provider in {"anthropic", "anthropic_subscription", "claude_subscription"}
+        and location == "executor"
+    ):
+        raise api_exception(
+            400,
+            "validation_error",
+            "Claude subscription OAuth providers must use controller execution location",
+        )
     if location != "executor":
         return
     executor_id = config.get("executor_id")
@@ -272,6 +300,40 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
             "validation_error",
             "Executor-routed providers must specify executor_id or executor_labels",
         )
+
+
+def _preferences_from_state(value: dict[str, Any] | None) -> UserPreferencesResponse:
+    if not value:
+        return UserPreferencesResponse()
+    return UserPreferencesResponse.model_validate(value)
+
+
+@router.get("/api/v1/user-preferences", response_model=UserPreferencesResponse)
+async def user_preferences_detail(request: Request) -> UserPreferencesResponse:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        value = await get_user_ui_state_value(session, user.email, USER_PREFERENCES_STATE_KEY)
+    return _preferences_from_state(value)
+
+
+@router.put("/api/v1/user-preferences", response_model=UserPreferencesResponse)
+async def user_preferences_update(
+    request: Request,
+    payload: UserPreferencesUpdateRequest,
+) -> UserPreferencesResponse:
+    user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
+    preferences = UserPreferencesResponse.model_validate(payload.model_dump(mode="json"))
+    async with request.app.state.session_factory() as session:
+        row = await upsert_user_ui_state(
+            session,
+            user.email,
+            USER_PREFERENCES_STATE_KEY,
+            preferences.model_dump(mode="json"),
+        )
+        await session.commit()
+        await session.refresh(row)
+    return preferences
 
 
 @router.get("/api/v1/settings", response_model=list[SettingsCategoryResponse])
@@ -874,6 +936,77 @@ async def llm_provider_chatgpt_oauth_clear(request: Request, provider_id: str) -
     return {"ok": ok}
 
 
+@router.post(
+    "/api/v1/llm-providers/{provider_id}/oauth/anthropic/start",
+    response_model=LLMProviderOAuthStatusResponse,
+)
+async def llm_provider_anthropic_oauth_start(
+    request: Request, provider_id: str
+) -> LLMProviderOAuthStatusResponse:
+    await _require_visible_provider_manager(request, provider_id)
+    try:
+        status = await request.app.state.providers.llm.start_anthropic_oauth(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(502, "provider_error", f"Failed to start OAuth: {exc!s}"[:300]) from exc
+    status.pop("provider_id", None)
+    return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
+
+
+@router.post(
+    "/api/v1/llm-providers/{provider_id}/oauth/anthropic/complete",
+    response_model=LLMProviderOAuthStatusResponse,
+)
+async def llm_provider_anthropic_oauth_complete(
+    request: Request, provider_id: str, payload: LLMProviderOAuthCompleteRequest
+) -> LLMProviderOAuthStatusResponse:
+    await _require_visible_provider_manager(request, provider_id)
+    try:
+        status = await request.app.state.providers.llm.complete_anthropic_oauth(
+            provider_id, payload.callback_input
+        )
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(
+            502, "provider_error", f"Failed to complete OAuth: {exc!s}"[:300]
+        ) from exc
+    status.pop("provider_id", None)
+    return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
+
+
+@router.get(
+    "/api/v1/llm-providers/{provider_id}/oauth/anthropic/status",
+    response_model=LLMProviderOAuthStatusResponse,
+)
+async def llm_provider_anthropic_oauth_status(
+    request: Request, provider_id: str
+) -> LLMProviderOAuthStatusResponse:
+    await _require_visible_provider_manager(request, provider_id)
+    try:
+        status = await request.app.state.providers.llm.get_anthropic_oauth_status(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    except Exception as exc:
+        raise api_exception(502, "provider_error", f"Failed to check OAuth: {exc!s}"[:300]) from exc
+    status.pop("provider_id", None)
+    return LLMProviderOAuthStatusResponse(provider_id=provider_id, **status)
+
+
+@router.delete(
+    "/api/v1/llm-providers/{provider_id}/oauth/anthropic",
+    response_model=dict,
+)
+async def llm_provider_anthropic_oauth_clear(request: Request, provider_id: str) -> dict[str, bool]:
+    await _require_visible_provider_manager(request, provider_id)
+    try:
+        ok = await request.app.state.providers.llm.clear_anthropic_oauth(provider_id)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
+    return {"ok": ok}
+
+
 @router.get("/api/v1/llm-providers/{provider_id}/codex/usage", response_model=CodexUsageResponse)
 async def llm_provider_codex_usage(request: Request, provider_id: str) -> CodexUsageResponse:
     require_admin(request)
@@ -1041,8 +1174,8 @@ async def model_routing_put(
             prepared_updates[task_type] = (None, None, None)
             continue
 
-        normalized_model = entry.model.strip()
-        if normalized_model == SAME_SESSION_MODEL_SENTINEL:
+        normalized_model_input = entry.model.strip()
+        if normalized_model_input == SAME_SESSION_MODEL_SENTINEL:
             if task_type != "compaction":
                 raise api_exception(
                     422,
@@ -1055,11 +1188,25 @@ async def model_routing_put(
                     "validation_error",
                     "compaction reasoning_effort cannot be set when using the same-session model",
                 )
-            prepared_updates[task_type] = (normalized_model, None, None)
+            prepared_updates[task_type] = (normalized_model_input, None, None)
             continue
-        resolved_provider_id = await llm.find_provider_for_model(
-            normalized_model, acting_user_email=SYSTEM_USER_EMAIL
-        )
+        try:
+            if hasattr(llm, "resolve_model_reference"):
+                normalized_model, resolved_provider_id = await llm.resolve_model_reference(
+                    normalized_model_input,
+                    acting_user_email=SYSTEM_USER_EMAIL,
+                )
+            else:
+                normalized_model = normalized_model_input
+                resolved_provider_id = await llm.find_provider_for_model(
+                    normalized_model, acting_user_email=SYSTEM_USER_EMAIL
+                )
+        except ValueError as exc:
+            raise api_exception(
+                422,
+                "validation_error",
+                f"{task_type} {exc}",
+            ) from exc
         if resolved_provider_id is None:
             raise api_exception(
                 422,
@@ -1108,7 +1255,12 @@ async def model_routing_put(
                     f"{task_type} reasoning_effort {normalized_effort!r} is not supported by model {normalized_model!r}",
                 )
             config = {"reasoning_effort": normalized_effort}
-        prepared_updates[task_type] = (normalized_model, None, config)
+        explicit_provider_reference = normalized_model_input != normalized_model
+        prepared_updates[task_type] = (
+            normalized_model,
+            resolved_provider_id if explicit_provider_reference else None,
+            config,
+        )
 
     async with request.app.state.session_factory() as session:
         existing_rows = await list_model_routing(session, owner_email=SYSTEM_USER_EMAIL)

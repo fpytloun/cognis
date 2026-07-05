@@ -57,7 +57,7 @@ async def handle_lsp(arguments: dict[str, Any], context: ToolExecutionContext) -
     if not os.path.isfile(resolved_path):
         return ToolResult(output=f"Not a file: {file_path}", is_error=True)
 
-    await lsp.touch_file(resolved_path, wait=True)
+    await lsp.touch_file(resolved_path, wait=True, purpose="semantic")
     if not await lsp.has_clients(resolved_path):
         return ToolResult(output="No LSP server available for this file type.", is_error=True)
     method_name = _LSP_TOOL_OPERATIONS[operation]

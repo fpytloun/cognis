@@ -196,7 +196,9 @@ export function createProviderForm(provider: LLMProvider | null = null): Provide
   return {
     provider_id: provider?.provider_id ?? '',
     display_name: provider?.display_name ?? '',
-    location: preset === 'chatgpt' ? 'controller' : (provider?.location ?? 'controller'),
+    location: preset === 'chatgpt' || (preset === 'anthropic' && authInfo.auth_mode === 'oauth')
+      ? 'controller'
+      : (provider?.location ?? 'controller'),
     executor_id: typeof config.executor_id === 'string' ? config.executor_id : '',
     executor_selector:
       typeof config.executor_labels === 'object' && config.executor_labels !== null && !Array.isArray(config.executor_labels)
@@ -284,11 +286,12 @@ export function providerFormToPayload(form: ProviderFormState): Record<string, u
   // Serialize models with full properties (only non-default values)
   const serializedModels = form.models.map(serializeModelEntry);
 
+  const oauthProvider = form.preset === 'anthropic' ? 'anthropic_subscription' : form.preset;
   const authConfig: Record<string, unknown> =
     form.auth_mode === 'secret'
       ? { mode: 'secret', secret_name: form.auth_secret_name }
       : form.auth_mode === 'oauth'
-        ? { mode: 'oauth', provider: form.preset }
+        ? { mode: 'oauth', provider: oauthProvider }
       : form.auth_mode === 'env'
         ? { mode: 'env', env_var: form.auth_env_var }
         : { mode: 'none' };

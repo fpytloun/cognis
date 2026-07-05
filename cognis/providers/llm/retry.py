@@ -9,6 +9,7 @@ backoff with jitter for retryable errors.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -193,10 +194,14 @@ def is_retryable_error(exc: Exception) -> bool:
     if exc_name in retryable_names:
         return True
 
-    # Check HTTP status codes embedded in error messages
-    for code in ("429", "500", "502", "503", "504"):
-        if code in exc_msg:
-            return True
+    # Check HTTP status codes embedded in status-like error contexts without
+    # treating unrelated identifiers such as model-5000 as retryable.
+    if re.search(
+        r"\b(?:status|status_code|http|response|code)\b[^\n\r]{0,32}\b(?:429|5\d\d)\b",
+        exc_msg,
+        flags=re.IGNORECASE,
+    ):
+        return True
 
     # Connection-related errors
     connection_keywords = (

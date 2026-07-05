@@ -180,6 +180,7 @@ def _build_web_fetch(
         source=_EXECUTOR_SOURCE,
         category="web",
         read_only=True,
+        content_trust="untrusted",
         timeout_seconds=60,
     )
 
@@ -341,6 +342,7 @@ def _build_web_search(
         source=_EXECUTOR_SOURCE,
         category="web",
         read_only=True,
+        content_trust="untrusted",
         timeout_seconds=60,
     )
 
@@ -391,6 +393,7 @@ def _build_web_crawl(has_tavily_fetch: bool) -> ToolDefinition:
         source=_EXECUTOR_SOURCE,
         category="web",
         read_only=True,
+        content_trust="untrusted",
         timeout_seconds=120,
     )
 
@@ -431,6 +434,7 @@ def _build_web_map(has_tavily_fetch: bool) -> ToolDefinition:
         source=_EXECUTOR_SOURCE,
         category="web",
         read_only=True,
+        content_trust="untrusted",
         timeout_seconds=150,
     )
 
@@ -460,6 +464,7 @@ def _build_web_research() -> ToolDefinition:
         source=_EXECUTOR_SOURCE,
         category="web",
         read_only=True,
+        content_trust="untrusted",
         timeout_seconds=300,
     )
 

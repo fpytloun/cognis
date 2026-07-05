@@ -1,11 +1,11 @@
 <script lang="ts">
   import { beforeNavigate, goto } from '$app/navigation';
-import { onMount, tick } from 'svelte';
+  import { onMount, tick } from 'svelte';
 
   import type { MCPEnvVar } from '$lib/agents';
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
-  import { formatMcpOAuthStatus, type MCPOAuthStatus } from '$lib/mcp-oauth-status';
+  import { formatMcpOAuthStatus, isMcpOAuthStatusCritical, type MCPOAuthStatus } from '$lib/mcp-oauth-status';
   import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
@@ -28,6 +28,8 @@ import { onMount, tick } from 'svelte';
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
   import { thinkingEffortLabel } from '$lib/thinking';
   import { auth } from '$lib/stores/auth';
+  import { loadUserPreferences, saveUserPreferences, userPreferences } from '$lib/stores/userPreferences';
+  import { wsClient } from '$lib/ws/client';
   import {
     disableWebPushForCurrentDevice,
     enableWebPush,
@@ -70,13 +72,15 @@ import { onMount, tick } from 'svelte';
     StepProfileDefinition,
     ToolDefinitionSummary,
     UserDetail,
+    UserPreferences,
     UserRole,
     WebConfigStatus
   } from '$lib/types/api';
 
-  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'notifications' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
+  type SettingsTab = 'providers' | 'routing' | 'secrets' | 'notifications' | 'display' | 'web' | 'tools' | 'executors' | 'users' | 'system' | 'account';
   type CredentialKind = 'token' | 'text' | 'username_password' | 'totp_seed' | 'recovery_codes' | 'browser_storage_state';
   type MCPAuthType = 'none' | 'static_headers' | 'oauth2';
+  type MCPOAuthCallbackMode = 'auto' | 'controller_public' | 'executor_loopback';
   type MCPServerFormState = {
     name: string;
     transport: string;
@@ -96,9 +100,19 @@ import { onMount, tick } from 'svelte';
     oauthClientId: string;
     oauthClientSecretRef: string;
     oauthRedirectUri: string;
+    oauthCallbackMode: MCPOAuthCallbackMode;
+    oauthExecutorId: string;
     oauthDynamicClientRegistration: boolean;
     oauthClientMetadataDocumentUrl: string;
     oauthAuthorizationParams: MCPEnvVar[];
+  };
+  type MCPOAuthStartState = {
+    authorizationUrl: string;
+    callbackMode?: string | null;
+    oauthExecutorId?: string | null;
+    oauthExecutorName?: string | null;
+    instructions?: string | null;
+    copied: boolean;
   };
 
   const CREDENTIAL_PAYLOAD_TEMPLATES: Record<CredentialKind, string> = {
@@ -119,13 +133,14 @@ import { onMount, tick } from 'svelte';
     browser_storage_state: 'Set metadata.origin to the bound site origin when entering this manually, for example https://www.rohlik.cz.'
   };
 
-  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'notifications', 'web', 'tools', 'executors', 'users', 'system', 'account'];
-  const USER_TABS: SettingsTab[] = ['providers', 'secrets', 'notifications', 'tools', 'executors', 'account'];
+  const ALL_TABS: SettingsTab[] = ['providers', 'routing', 'secrets', 'notifications', 'display', 'web', 'tools', 'executors', 'users', 'system', 'account'];
+  const USER_TABS: SettingsTab[] = ['providers', 'secrets', 'notifications', 'display', 'tools', 'executors', 'account'];
   const TAB_LABELS: Record<SettingsTab, string> = {
     providers: 'providers',
     routing: 'routing',
     secrets: 'secrets',
     notifications: 'notifications',
+    display: 'display',
     web: 'web search',
     tools: 'tools',
     executors: 'executors',
@@ -303,6 +318,7 @@ import { onMount, tick } from 'svelte';
   let editingMcpServer = $state<MCPServerConfigResponse | null>(null);
   let mcpForm = $state<MCPServerFormState>(createEmptyMcpForm());
   let mcpOAuthStatuses = $state<Record<string, MCPOAuthStatus>>({});
+  let mcpOAuthStarts = $state<Record<string, MCPOAuthStartState>>({});
   let isAdmin = $state(false);
   let tabs = $derived(isAdmin ? ALL_TABS : USER_TABS);
   let selectedProviderId = $state('');
@@ -313,6 +329,7 @@ import { onMount, tick } from 'svelte';
   let providerOAuthStatus = $state<LLMProviderOAuthStatus | null>(null);
   let providerCodexUsage = $state<CodexUsage | null>(null);
   let providerCodexUsageError = $state('');
+  let anthropicOAuthCallbackInput = $state('');
   let showModelDiscovery = $state(false);
   let editingModel = $state<ModelEntry | null>(null);
   let addModelId = $state('');
@@ -426,13 +443,13 @@ import { onMount, tick } from 'svelte';
     blockNavigationIfDirty(navigation, isDirty);
   });
 
-  async function confirmDiscardChanges(): Promise<boolean> {
+  async function confirmDiscardChanges(message = 'Switching tabs or providers will replace the current unsaved edits.'): Promise<boolean> {
     if (!isDirty()) {
       return true;
     }
     return confirmAction({
       title: 'Discard unsaved changes?',
-      message: 'Switching tabs or providers will replace the current unsaved edits.',
+      message,
       confirmLabel: 'Discard changes'
     });
   }
@@ -781,6 +798,7 @@ import { onMount, tick } from 'svelte';
     providerOAuthStatus = null;
     providerCodexUsage = null;
     providerCodexUsageError = '';
+    anthropicOAuthCallbackInput = '';
   }
 
   async function selectProvider(provider: LLMProvider): Promise<void> {
@@ -802,6 +820,19 @@ import { onMount, tick } from 'svelte';
     providerOAuthStatus = null;
     providerCodexUsage = null;
     providerCodexUsageError = '';
+    anthropicOAuthCallbackInput = '';
+  }
+
+  async function startNewProvider(): Promise<void> {
+    if (!(await confirmDiscardChanges('Starting a new provider will replace the current unsaved edits.'))) {
+      return;
+    }
+    clearProviderSelection();
+    initialSnapshot = snapshotState();
+    await tick();
+    if (window.innerWidth < 1024) {
+      providerEditorEl?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
   }
 
   function handleProviderPresetChange(): void {
@@ -820,11 +851,33 @@ import { onMount, tick } from 'svelte';
     }
   }
 
+  function handleProviderAuthModeChange(): void {
+    if (providerForm.preset === 'anthropic' && providerForm.auth_mode === 'oauth') {
+      providerForm.location = 'controller';
+      providerForm.executor_id = '';
+      providerForm.executor_selector = '';
+      providerForm.backend = 'litellm';
+    }
+    providerOAuthStatus = null;
+    providerCodexUsage = null;
+    providerCodexUsageError = '';
+    anthropicOAuthCallbackInput = '';
+  }
+
+  function isAnthropicSubscriptionOAuth(): boolean {
+    return providerForm.preset === 'anthropic' && providerForm.auth_mode === 'oauth';
+  }
+
   async function resetProviderForm(): Promise<void> {
-    if (!(await confirmDiscardChanges())) {
+    if (!(await confirmDiscardChanges('Discarding changes will restore the current provider form.'))) {
       return;
     }
-    clearProviderSelection();
+    const provider = selectedProvider();
+    if (provider) {
+      applySelectedProvider(provider);
+    } else {
+      clearProviderSelection();
+    }
     initialSnapshot = snapshotState();
   }
 
@@ -969,6 +1022,35 @@ import { onMount, tick } from 'svelte';
     );
   }
 
+  function defaultOAuthExecutorLabel(): string {
+    const candidates = executorConfigs.filter((executor) => executor.executor_type !== 'in_process');
+    const defaultExecutor = candidates.find((executor) => executor.is_default) ?? candidates[0];
+    if (!defaultExecutor) {
+      return 'Default executor';
+    }
+    return `Default executor (${defaultExecutor.name || defaultExecutor.executor_id})`;
+  }
+
+  function oauthBarClasses(status: MCPOAuthStatus | undefined): string {
+    if (isMcpOAuthStatusCritical(status)) {
+      return 'border-rose-500/40 bg-rose-500/15 text-rose-50';
+    }
+    if (!status) {
+      return 'border-amber-500/30 bg-amber-500/10 text-amber-50';
+    }
+    return 'border-sky-500/20 bg-sky-500/10 text-sky-100';
+  }
+
+  function oauthMutedTextClasses(status: MCPOAuthStatus | undefined): string {
+    if (isMcpOAuthStatusCritical(status)) {
+      return 'text-rose-50/85';
+    }
+    if (!status) {
+      return 'text-amber-50/85';
+    }
+    return 'text-sky-100/80';
+  }
+
   function createEmptyMcpForm(): MCPServerFormState {
     return {
       name: '',
@@ -989,6 +1071,8 @@ import { onMount, tick } from 'svelte';
       oauthClientId: '',
       oauthClientSecretRef: '',
       oauthRedirectUri: '',
+      oauthCallbackMode: 'auto',
+      oauthExecutorId: '',
       oauthDynamicClientRegistration: false,
       oauthClientMetadataDocumentUrl: '',
       oauthAuthorizationParams: []
@@ -1024,6 +1108,8 @@ import { onMount, tick } from 'svelte';
         ? authConfig.client_secret_ref.slice('$secret:'.length)
         : authConfig?.client_secret_ref || '',
       oauthRedirectUri: authConfig?.redirect_uri || '',
+      oauthCallbackMode: authConfig?.callback_mode || 'auto',
+      oauthExecutorId: authConfig?.oauth_executor_id || '',
       oauthDynamicClientRegistration: authConfig?.dynamic_client_registration === true,
       oauthClientMetadataDocumentUrl: authConfig?.client_metadata_document_url || '',
       oauthAuthorizationParams: parseMcpEntries(authConfig?.authorization_params || {})
@@ -1047,6 +1133,8 @@ import { onMount, tick } from 'svelte';
         ? (clientSecretRef.startsWith('$secret:') ? clientSecretRef : `$secret:${clientSecretRef}`)
         : null,
       redirect_uri: mcpForm.oauthRedirectUri.trim() || null,
+      callback_mode: mcpForm.oauthCallbackMode,
+      oauth_executor_id: mcpForm.oauthExecutorId.trim() || null,
       dynamic_client_registration: mcpForm.oauthDynamicClientRegistration,
       client_metadata_document_url: mcpForm.oauthClientMetadataDocumentUrl.trim() || null,
       authorization_params: serializeMcpEntries(mcpForm.oauthAuthorizationParams)
@@ -1067,8 +1155,53 @@ import { onMount, tick } from 'svelte';
     error = '';
     try {
       const started = await api.tools.startMcpOAuth(server.server_id);
-      openUrlInNewTab(started.authorization_url);
-      addToast('MCP OAuth authorization opened in a new tab.', 'success');
+      if (started.callback_mode === 'executor_loopback') {
+        let copied = false;
+        if (typeof navigator !== 'undefined' && navigator.clipboard) {
+          try {
+            await navigator.clipboard.writeText(started.authorization_url);
+            copied = true;
+          } catch {
+            copied = false;
+          }
+        }
+        const baseInstructions =
+          started.instructions ||
+          `Open the authorization URL on executor ${started.oauth_executor_name || started.oauth_executor_id || 'selected executor'}.`;
+        mcpOAuthStarts = {
+          ...mcpOAuthStarts,
+          [server.server_id]: {
+            authorizationUrl: started.authorization_url,
+            callbackMode: started.callback_mode,
+            oauthExecutorId: started.oauth_executor_id,
+            oauthExecutorName: started.oauth_executor_name,
+            instructions: baseInstructions,
+            copied
+          }
+        };
+        addToast(
+          copied
+            ? `${baseInstructions} Authorization URL copied to clipboard.`
+            : `${baseInstructions} Authorization URL: ${started.authorization_url}`,
+          'success',
+          12_000,
+          'MCP OAuth authorization'
+        );
+      } else {
+        mcpOAuthStarts = {
+          ...mcpOAuthStarts,
+          [server.server_id]: {
+            authorizationUrl: started.authorization_url,
+            callbackMode: started.callback_mode,
+            oauthExecutorId: started.oauth_executor_id,
+            oauthExecutorName: started.oauth_executor_name,
+            instructions: null,
+            copied: false
+          }
+        };
+        openUrlInNewTab(started.authorization_url);
+        addToast('MCP OAuth authorization opened in a new tab.', 'success');
+      }
       await refreshMcpOAuthStatus(server.server_id);
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1333,6 +1466,7 @@ import { onMount, tick } from 'svelte';
       api.executor.list().catch(() => []),
       api.tools.executorTools().catch(() => [])
     ]);
+    await loadUserPreferences(auth.getSnapshot().user?.email);
 
     if (isAdmin) {
       [settings, modelRouting] = await Promise.all([
@@ -1507,6 +1641,12 @@ import { onMount, tick } from 'svelte';
         pushStatus = await api.push.status().catch(() => pushStatus);
       }
     }
+  }
+
+  async function refreshExecutorsOnly(): Promise<void> {
+    if (typeof document !== 'undefined' && document.hidden) return;
+    if (savingExecutorIds.length > 0 || toolUpdateQueues.size > 0) return;
+    executorConfigs = await api.executor.list().catch(() => executorConfigs);
   }
 
   async function enableDeviceNotifications(): Promise<void> {
@@ -1726,6 +1866,75 @@ import { onMount, tick } from 'svelte';
       providerCodexUsage = null;
       providerCodexUsageError = '';
       addToast('ChatGPT OAuth tokens removed.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to remove OAuth tokens');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function startAnthropicOAuth(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    error = '';
+    try {
+      providerOAuthStatus = await api.llmProviders.startAnthropicOAuth(selectedProviderId);
+      anthropicOAuthCallbackInput = '';
+      addToast('Claude subscription OAuth started. Open the authorization URL and paste the callback below.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to start OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function completeAnthropicOAuth(): Promise<void> {
+    if (!selectedProviderId || !anthropicOAuthCallbackInput.trim()) return;
+    busy = true;
+    error = '';
+    try {
+      providerOAuthStatus = await api.llmProviders.completeAnthropicOAuth(
+        selectedProviderId,
+        anthropicOAuthCallbackInput.trim()
+      );
+      anthropicOAuthCallbackInput = '';
+      addToast('Claude subscription OAuth is authorized.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to complete OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function checkAnthropicOAuth(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    error = '';
+    try {
+      providerOAuthStatus = await api.llmProviders.anthropicOAuthStatus(selectedProviderId);
+      if (providerOAuthStatus.status === 'authorized') {
+        addToast('Claude subscription OAuth is authorized.', 'success');
+      }
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to check OAuth');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function clearAnthropicOAuth(): Promise<void> {
+    if (!selectedProviderId) return;
+    busy = true;
+    error = '';
+    try {
+      await api.llmProviders.clearAnthropicOAuth(selectedProviderId);
+      providerOAuthStatus = null;
+      anthropicOAuthCallbackInput = '';
+      addToast('Claude subscription OAuth tokens removed.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to remove OAuth tokens');
@@ -2302,9 +2511,62 @@ import { onMount, tick } from 'svelte';
     }
   }
 
+  async function updateUserPreferences(next: UserPreferences): Promise<void> {
+    busy = true;
+    error = '';
+    try {
+      await saveUserPreferences(next);
+      addToast('Display preferences saved.', 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, 'Unable to save display preferences');
+      await loadUserPreferences();
+    } finally {
+      busy = false;
+    }
+  }
+
+  function updateDisplayPreference<K extends keyof UserPreferences['display']>(
+    key: K,
+    value: UserPreferences['display'][K],
+  ): Promise<void> {
+    return updateUserPreferences({
+      ...$userPreferences,
+      display: {
+        ...$userPreferences.display,
+        [key]: value
+      }
+    });
+  }
+
+  function updateChatPreference<K extends keyof UserPreferences['chat']>(
+    key: K,
+    value: UserPreferences['chat'][K],
+  ): Promise<void> {
+    return updateUserPreferences({
+      ...$userPreferences,
+      chat: {
+        ...$userPreferences.chat,
+        [key]: value
+      }
+    });
+  }
+
   onMount(() => {
     const cleanup = installBeforeUnloadGuard(isDirty);
     void loadSettings();
+    const unsubscribeWs = wsClient.subscribe((event) => {
+      if (event.type !== 'mcp_oauth_status_changed') {
+        return;
+      }
+      const status = event.status as MCPOAuthStatus;
+      mcpOAuthStatuses = { ...mcpOAuthStatuses, [event.server_id]: status };
+      if (status.connected) {
+        const nextStarts = { ...mcpOAuthStarts };
+        delete nextStarts[event.server_id];
+        mcpOAuthStarts = nextStarts;
+      }
+    });
 
     // Same-tab tap on Settings: reset to the default sub-tab
     // and scroll the content shell to the top. The bottom tab bar has
@@ -2321,6 +2583,7 @@ import { onMount, tick } from 'svelte';
       if (executorPollTimer) clearInterval(executorPollTimer);
       cleanup();
       unsubTabReset();
+      unsubscribeWs();
     };
   });
 
@@ -2338,7 +2601,7 @@ import { onMount, tick } from 'svelte';
     }
     if (activeTab !== 'executors') return;
     executorPollTimer = setInterval(() => {
-      void refreshPageState();
+      void refreshExecutorsOnly();
     }, 5000);
     return () => {
       if (executorPollTimer) {
@@ -2397,9 +2660,14 @@ import { onMount, tick } from 'svelte';
       <div class="grid gap-5 lg:grid-cols-[340px_minmax(0,1fr)]">
         <Card class="p-5">
           <div class="space-y-4">
-            <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Providers</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">LLM providers</h2>
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Providers</p>
+                <h2 class="mt-1 text-lg font-semibold text-white">LLM providers</h2>
+              </div>
+              <Button size="sm" variant={!selectedProviderId ? 'primary' : 'secondary'} onclick={startNewProvider} disabled={busy}>
+                + New provider
+              </Button>
             </div>
             {#each providers as provider}
               <button class={`w-full rounded-2xl border px-4 py-3 text-left transition ${selectedProviderId === provider.provider_id ? 'border-sky-400/40 bg-sky-500/10' : 'border-slate-800 bg-slate-950/70 hover:border-slate-700'}`} onclick={() => selectProvider(provider)}>
@@ -2468,12 +2736,14 @@ import { onMount, tick } from 'svelte';
               <span>Execution location</span>
               <select bind:value={providerForm.location} onchange={handleProviderLocationChange} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="controller" disabled={providerRequiresExecutorLocation(providerForm.preset)}>Controller</option>
-                {#if providerForm.preset !== 'chatgpt'}
+                {#if providerForm.preset !== 'chatgpt' && !isAnthropicSubscriptionOAuth()}
                   <option value="executor">Via executor</option>
                 {/if}
               </select>
               {#if providerForm.preset === 'chatgpt'}
                 <span class="block text-xs text-slate-400">ChatGPT OAuth tokens are hydrated on the controller, so executor routing is disabled for this preset.</span>
+              {:else if isAnthropicSubscriptionOAuth()}
+                <span class="block text-xs text-slate-400">Claude subscription OAuth tokens are managed on the controller, so executor routing is disabled for this auth mode.</span>
               {/if}
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
@@ -2526,11 +2796,11 @@ import { onMount, tick } from 'svelte';
               <div class="mt-3 grid gap-3 md:grid-cols-2">
                 <label class="space-y-2 text-sm font-medium text-slate-200">
                   <span>Auth mode</span>
-                  <select bind:value={providerForm.auth_mode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
+                  <select bind:value={providerForm.auth_mode} onchange={handleProviderAuthModeChange} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                     <option value="env">Environment variable</option>
                     <option value="secret">Credential store</option>
-                    {#if providerForm.preset === 'chatgpt'}
-                      <option value="oauth">OAuth device flow</option>
+                    {#if providerForm.preset === 'chatgpt' || providerForm.preset === 'anthropic'}
+                      <option value="oauth">{providerForm.preset === 'chatgpt' ? 'OAuth device flow' : 'Claude subscription OAuth'}</option>
                     {/if}
                   </select>
                 </label>
@@ -2538,22 +2808,51 @@ import { onMount, tick } from 'svelte';
                 {#if providerForm.auth_mode === 'oauth'}
                   <div class="space-y-2 text-sm text-slate-300">
                     <p class="font-medium text-slate-200">Encrypted OAuth token storage</p>
-                    <p class="text-xs text-slate-400">Tokens are stored in the encrypted Cognis secrets table. LiteLLM token files are temporary per request.</p>
-                    {#if selectedProviderId}
-                      <div class="flex flex-wrap gap-2">
-                        <Button size="sm" variant="secondary" onclick={startChatgptOAuth} disabled={busy}>Start OAuth</Button>
-                        <Button size="sm" variant="secondary" onclick={checkChatgptOAuth} disabled={busy}>Check status</Button>
-                        <Button size="sm" variant="ghost" onclick={clearChatgptOAuth} disabled={busy}>Clear tokens</Button>
+                    {#if isAnthropicSubscriptionOAuth()}
+                      <div class="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-100">
+                        This uses Claude Pro/Max subscription authentication through Anthropic's Claude Code OAuth flow.
+                        It is an unofficial integration and may be affected by Anthropic account, subscription, or API policy changes.
+                        Use it only with an account where this risk is acceptable.
                       </div>
+                      <p class="text-xs text-slate-400">Tokens are stored in the encrypted Cognis secrets table and used only by controller-side Anthropic Messages calls.</p>
+                    {:else}
+                      <p class="text-xs text-slate-400">Tokens are stored in the encrypted Cognis secrets table. LiteLLM token files are temporary per request.</p>
+                    {/if}
+                    {#if selectedProviderId}
+                      {#if isAnthropicSubscriptionOAuth()}
+                        <div class="flex flex-wrap gap-2">
+                          <Button size="sm" variant="secondary" onclick={startAnthropicOAuth} disabled={busy}>Start OAuth</Button>
+                          <Button size="sm" variant="secondary" onclick={checkAnthropicOAuth} disabled={busy}>Check status</Button>
+                          <Button size="sm" variant="ghost" onclick={clearAnthropicOAuth} disabled={busy}>Clear tokens</Button>
+                        </div>
+                      {:else}
+                        <div class="flex flex-wrap gap-2">
+                          <Button size="sm" variant="secondary" onclick={startChatgptOAuth} disabled={busy}>Start OAuth</Button>
+                          <Button size="sm" variant="secondary" onclick={checkChatgptOAuth} disabled={busy}>Check status</Button>
+                          <Button size="sm" variant="ghost" onclick={clearChatgptOAuth} disabled={busy}>Clear tokens</Button>
+                        </div>
+                      {/if}
                       {#if providerOAuthStatus}
                         <div class="rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
                           <p>Status: <span class="font-mono text-slate-100">{providerOAuthStatus.status}</span></p>
+                          {#if isAnthropicSubscriptionOAuth() && (providerOAuthStatus.authorization_url || providerOAuthStatus.verification_url)}
+                            <p class="mt-2">Open <a class="text-sky-300 underline" href={providerOAuthStatus.authorization_url ?? providerOAuthStatus.verification_url ?? '#'} target="_blank" rel="noreferrer">Claude authorization</a>, then paste the final callback URL or <span class="font-mono">code#state</span> below.</p>
+                          {/if}
                           {#if providerOAuthStatus.verification_url && providerOAuthStatus.user_code}
                             <p class="mt-2">Visit <a class="text-sky-300 underline" href={providerOAuthStatus.verification_url} target="_blank" rel="noreferrer">{providerOAuthStatus.verification_url}</a></p>
                             <p class="mt-1">Code: <span class="font-mono text-sky-100">{providerOAuthStatus.user_code}</span></p>
                           {/if}
                         </div>
                       {/if}
+                      {#if isAnthropicSubscriptionOAuth()}
+                        <div class="space-y-2 rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
+                          <label class="block space-y-2">
+                            <span class="text-slate-200">Callback URL or code#state</span>
+                            <Input bind:value={anthropicOAuthCallbackInput} placeholder="https://platform.claude.com/oauth/code/callback?code=...&state=..." />
+                          </label>
+                          <Button size="sm" variant="secondary" onclick={completeAnthropicOAuth} disabled={busy || !anthropicOAuthCallbackInput.trim()}>Complete OAuth</Button>
+                        </div>
+                      {:else}
                       <div class="rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
                         <div class="flex flex-wrap items-center justify-between gap-2">
                           <p class="font-medium text-slate-200">Codex usage and limits</p>
@@ -2583,8 +2882,9 @@ import { onMount, tick } from 'svelte';
                           <p class="mt-2 text-slate-400">Fetches the same Codex usage windows used by the Codex client. Exact remaining messages are not exposed.</p>
                         {/if}
                       </div>
+                      {/if}
                     {:else}
-                      <p class="text-xs text-sky-300">Create the provider first, then start the OAuth device flow.</p>
+                      <p class="text-xs text-sky-300">Create the provider first, then start OAuth.</p>
                     {/if}
                   </div>
                 {:else if providerForm.auth_mode === 'env'}
@@ -2737,7 +3037,7 @@ import { onMount, tick } from 'svelte';
           -->
           <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-4">
             <Button onclick={saveProvider} disabled={Boolean(providerSaveDisabledReason())}>{selectedProviderId ? 'Save provider' : 'Create provider'}</Button>
-            <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>Reset</Button>
+            <Button variant="secondary" onclick={resetProviderForm} disabled={busy}>{selectedProviderId ? 'Discard changes' : 'Clear form'}</Button>
             {#if selectedProviderId}
               <Button variant="secondary" onclick={() => testProvider(selectedProviderId)} disabled={!canManageProvider(selectedProvider()) || busy}>Test provider</Button>
               <Button variant="secondary" onclick={setDefaultProvider} disabled={!canManageProvider(selectedProvider()) || busy}>Set as default</Button>
@@ -3052,6 +3352,94 @@ import { onMount, tick } from 'svelte';
             <p class="text-sm leading-6 text-slate-400">For reliable delivery, set <code>COGNIS_VAPID_SUBJECT</code> to a real <code>mailto:</code> or <code>https:</code> contact URI. Development defaults such as <code>mailto:admin@localhost</code> may be rejected by Apple Web Push or FCM.</p>
           </Card>
         </div>
+      </div>
+    {:else if activeTab === 'display'}
+      <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
+        <Card class="space-y-5 p-5">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Display</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Appearance</h2>
+            <p class="mt-2 text-sm leading-6 text-slate-400">Per-user preferences for visual presentation in the web UI.</p>
+          </div>
+
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Theme</span>
+            <select
+              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+              value={$userPreferences.display.theme}
+              disabled={busy}
+              onchange={(event) => void updateDisplayPreference('theme', event.currentTarget.value as UserPreferences['display']['theme'])}
+            >
+              <option value="system">System</option>
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+            <span class="block text-xs text-slate-500">Theme selection is persisted now; full theme switching can build on this setting.</span>
+          </label>
+
+          <label class="space-y-2 text-sm font-medium text-slate-200">
+            <span>Language</span>
+            <Input
+              value={$userPreferences.display.language}
+              placeholder="auto"
+              disabled={busy}
+              onchange={(event) => void updateDisplayPreference('language', event.currentTarget.value.trim() || 'auto')}
+            />
+            <span class="block text-xs text-slate-500">Use <code>auto</code> or a language tag such as <code>en</code> or <code>cs-CZ</code>.</span>
+          </label>
+        </Card>
+
+        <Card class="space-y-5 p-5">
+          <div>
+            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Chat timeline</p>
+            <h2 class="mt-1 text-lg font-semibold text-white">Runtime detail visibility</h2>
+            <p class="mt-2 text-sm leading-6 text-slate-400">Control how much of the agent execution trace is shown in normal chat.</p>
+          </div>
+
+          <div class="space-y-3">
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+              <input
+                type="checkbox"
+                checked={$userPreferences.chat.show_thinking_blocks}
+                disabled={busy}
+                class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                onchange={(event) => void updateChatPreference('show_thinking_blocks', event.currentTarget.checked)}
+              />
+              <span>
+                <span class="block font-medium text-slate-100">Show thinking blocks</span>
+                <span class="mt-1 block text-xs leading-5 text-slate-500">When disabled, reasoning/thinking blocks are hidden from the normal timeline but remain available in raw logs.</span>
+              </span>
+            </label>
+
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+              <input
+                type="checkbox"
+                checked={$userPreferences.chat.group_tool_calls}
+                disabled={busy}
+                class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                onchange={(event) => void updateChatPreference('group_tool_calls', event.currentTarget.checked)}
+              />
+              <span>
+                <span class="block font-medium text-slate-100">Group tool and thinking activity</span>
+                <span class="mt-1 block text-xs leading-5 text-slate-500">Collapse consecutive tool activity and multi-block thinking under compact semantic groups.</span>
+              </span>
+            </label>
+
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+              <input
+                type="checkbox"
+                checked={$userPreferences.chat.show_internal_tool_calls}
+                disabled={busy}
+                class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                onchange={(event) => void updateChatPreference('show_internal_tool_calls', event.currentTarget.checked)}
+              />
+              <span>
+                <span class="block font-medium text-slate-100">Show internal helper tool calls</span>
+                <span class="mt-1 block text-xs leading-5 text-slate-500">Includes low-level helper calls such as todo updates. Keep this off for a cleaner chat transcript.</span>
+              </span>
+            </label>
+          </div>
+        </Card>
       </div>
     {:else if activeTab === 'web'}
       <div class="grid gap-5 lg:grid-cols-[360px_minmax(0,1fr)]">
@@ -4687,6 +5075,32 @@ import { onMount, tick } from 'svelte';
                         <Input bind:value={mcpForm.oauthRedirectUri} placeholder="Optional override" />
                       </label>
                       <label class="space-y-1 text-sm text-slate-200">
+                        <span>Callback mode</span>
+                        <select
+                          bind:value={mcpForm.oauthCallbackMode}
+                          class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        >
+                          <option value="auto">Auto</option>
+                          <option value="controller_public">Controller public callback</option>
+                          <option value="executor_loopback">Executor loopback callback</option>
+                        </select>
+                        <span class="block text-xs text-slate-500">
+                          Executor loopback starts a temporary 127.0.0.1 callback listener on the selected executor.
+                        </span>
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
+                        <span>OAuth executor</span>
+                        <select bind:value={mcpForm.oauthExecutorId} disabled={mcpForm.oauthCallbackMode !== 'executor_loopback' && mcpForm.oauthCallbackMode !== 'auto'} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100 disabled:opacity-60">
+                          <option value="">{defaultOAuthExecutorLabel()}</option>
+                          {#each executorConfigs.filter((executor) => executor.executor_type !== 'in_process') as executor}
+                            <option value={executor.executor_id}>{executor.name || executor.executor_id}</option>
+                          {/each}
+                        </select>
+                        <span class="block text-xs text-slate-500">
+                          Configure this when a provider only accepts loopback redirect URIs.
+                        </span>
+                      </label>
+                      <label class="space-y-1 text-sm text-slate-200">
                         <span>Client metadata document URL</span>
                         <Input bind:value={mcpForm.oauthClientMetadataDocumentUrl} placeholder="Optional" />
                       </label>
@@ -4801,13 +5215,27 @@ import { onMount, tick } from 'svelte';
             {/if}
             {#if srv.auth_config?.type === 'oauth2'}
               {@const oauthStatus = mcpOAuthStatuses[srv.server_id]}
-              <div class="rounded-2xl border border-sky-500/20 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+              {@const oauthStart = mcpOAuthStarts[srv.server_id]}
+              <div class={`rounded-2xl border px-4 py-3 text-sm ${oauthBarClasses(oauthStatus)}`}>
                 <div class="flex flex-wrap items-center justify-between gap-3">
-                  <div>
+                  <div class="min-w-0 flex-1">
                     <p class="font-medium">OAuth authorization</p>
-                    <p class="text-xs text-sky-100/80">
+                    <p class={`text-xs ${oauthMutedTextClasses(oauthStatus)}`}>
                       {formatMcpOAuthStatus(oauthStatus)}
                     </p>
+                    {#if oauthStart}
+                      <div class="mt-3 space-y-2">
+                        {#if oauthStart.instructions}
+                          <p class={`text-xs ${oauthMutedTextClasses(oauthStatus)}`}>{oauthStart.instructions}</p>
+                        {/if}
+                        <div class="rounded-xl border border-white/10 bg-slate-950/70 p-3">
+                          <p class="mb-1 text-[11px] uppercase tracking-[0.18em] text-slate-400">
+                            Authorization URL{oauthStart.copied ? ' · copied to clipboard' : ''}
+                          </p>
+                          <p class="break-all font-mono text-xs text-slate-100">{oauthStart.authorizationUrl}</p>
+                        </div>
+                      </div>
+                    {/if}
                   </div>
                   <div class="flex gap-2">
                     <Button variant="secondary" size="sm" onclick={() => refreshMcpOAuthStatus(srv.server_id)}>Check</Button>

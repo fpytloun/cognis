@@ -304,7 +304,15 @@ async def test_stream_complete_emits_message_item_text_without_output_delta(
         )
     ]
 
-    assert chunks[0]["content"] == "Hello from item"
+    # The raw Responses output item is now forwarded as its own chunk
+    # (needed for Responses-native replay); the text follows it.
+    content_chunks = [chunk for chunk in chunks if chunk.get("content")]
+    assert content_chunks[0]["content"] == "Hello from item"
+    assert any(
+        isinstance(chunk.get("responses_output_item"), dict)
+        and chunk["responses_output_item"].get("type") == "message"
+        for chunk in chunks
+    )
     assert chunks[-1]["usage"]["total_tokens"] == 6
 
 
@@ -786,3 +794,63 @@ async def test_transcribe_preserves_prefixed_model_for_litellm_proxy(
     )
 
     assert captured["data"] == {"model": "openai/gpt-4o-transcribe"}
+
+
+@pytest.mark.asyncio
+async def test_stream_complete_forwards_thinking_boundaries_and_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-block thinking must survive executor routing.
+
+    Dropping reasoning_part_boundary chunks collapsed executor-routed
+    multi-block thinking into a single block; dropping liveness markers made
+    the controller's reasoning-phase idle-timeout policy blind.
+    """
+    handler = InferenceHandler()
+
+    async def fake_stream():
+        yield {"type": "response.reasoning_summary_part.added", "part": {}}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "First part"}
+        yield {"type": "response.reasoning_summary_part.done", "part": {}}
+        yield {"type": "response.reasoning_summary_part.added", "part": {}}
+        yield {"type": "response.reasoning_summary_text.delta", "delta": "Second part"}
+        yield {"type": "response.reasoning_summary_part.done", "part": {}}
+        yield {
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {"total_tokens": 5}},
+        }
+
+    async def fake_aresponses(**_: object):
+        return fake_stream()
+
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", fake_aresponses)
+
+    chunks = [
+        chunk
+        async for chunk in handler.stream_complete(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            request_kwargs={"cognis_llm_api": "responses"},
+        )
+    ]
+
+    boundaries = [
+        chunk["reasoning_part_boundary"]
+        for chunk in chunks
+        if isinstance(chunk.get("reasoning_part_boundary"), dict)
+    ]
+    # Two parts: added (complete=False) + done (complete=True) each.
+    assert [bool(boundary.get("complete")) for boundary in boundaries] == [
+        False,
+        True,
+        False,
+        True,
+    ]
+    reasoning_text = "".join(
+        chunk.get("reasoning") or "" for chunk in chunks if chunk.get("reasoning")
+    )
+    assert reasoning_text == "First partSecond part"
+    assert any(
+        isinstance(chunk.get("provider_event_type"), str) and chunk["provider_event_type"]
+        for chunk in chunks
+    )

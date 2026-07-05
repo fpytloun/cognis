@@ -22,49 +22,40 @@ from cognis.tools.registry import ToolExecutionContext
 _DEFAULT_TIMEOUT_MS = 120_000
 _DEFAULT_BACKGROUND_TIMEOUT_MS = 5_000
 _MAX_FOREGROUND_TIMEOUT_MS = 3_600_000
-_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS = 5
+_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS = 2
 _PROCESS_KILL_WAIT_SECONDS = 5
+_FOREGROUND_OUTPUT_HEAD_CHARS = 100_000
+_FOREGROUND_OUTPUT_TAIL_CHARS = 300_000
 _SHELL_OVERRIDE_ENV = "COGNIS_EXECUTOR_SHELL"
 SHELL_MANAGER_KEY = "shell_session_manager"
 _MAX_BACKGROUND_OUTPUT_CHARS = 200_000
-_BLOCKED_EDIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(r'(^|\s)sed\s+-i(?:[\s\'"]|$)'),
-        "Use edit, multiedit, apply_patch, or write instead of sed -i for file content changes.",
-    ),
-    (
-        re.compile(r'(^|\s)perl\s+-pi(?:[\s\'"]|$)'),
-        "Use edit, multiedit, apply_patch, or write instead of perl -pi for file content changes.",
-    ),
-    (
-        re.compile(r'(^|\s)ruby\s+-pi(?:[\s\'"]|$)'),
-        "Use edit, multiedit, apply_patch, or write instead of ruby -pi for file content changes.",
-    ),
-    (
-        re.compile(
-            r"(^|\s)python(?:3)?\s+-c\s+.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
-            re.DOTALL,
-        ),
-        "Use edit, multiedit, apply_patch, or write instead of Python one-liners that rewrite files.",
-    ),
-    (
-        re.compile(
-            r"(^|\s)python(?:3)?\s+.*<<[-~]?['\"]?(?:PY|EOF)['\"]?.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
-            re.DOTALL,
-        ),
-        "Use edit, multiedit, apply_patch, or write instead of embedded Python scripts that rewrite files.",
-    ),
-)
+# Hard blocks are reserved for clearly unsafe shell patterns. Source-file rewrite
+# shortcuts are advisory so intentional commands can still run.
+_BLOCKED_EDIT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = ()
 _SOURCE_REWRITE_ADVISORY = (
     "Prefer dedicated edit tools for rewriting source files. "
-    "Use shell redirection only when it is necessary and intentional."
+    "Use shell or interpreter rewrites only when they are necessary and intentional."
 )
 _BACKGROUND_SHELL_OUTPUT_REMINDER = (
     "Completion reminder: the parent conversation will be notified/resumed when this "
     "background command finishes. If there is nothing else independently actionable, "
     "end this turn now instead of polling or duplicating the same work."
 )
+_BACKGROUND_SHELL_OUTPUT_SHORT_REMINDER = (
+    "Background command is running; use bash_output only when you need new output."
+)
 _SOURCE_REWRITE_ADVISORY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'(^|\s)sed\s+-i(?:[\s\'"]|$)'),
+    re.compile(r'(^|\s)perl\s+-pi(?:[\s\'"]|$)'),
+    re.compile(r'(^|\s)ruby\s+-pi(?:[\s\'"]|$)'),
+    re.compile(
+        r"(^|\s)python(?:3)?\s+-c\s+.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"(^|\s)python(?:3)?\s+.*<<[-~]?['\"]?(?:PY|EOF)['\"]?.*(write_text|write_bytes|open\s*\([^\)]*,\s*['\"](?:w|a|x|w\+|a\+|x\+)['\"]).*",
+        re.DOTALL,
+    ),
     re.compile(r"(?:>>|>)\s*[^\s]+\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
     re.compile(r"(^|\s)tee\s+[^\n]*\.(?:py|js|jsx|ts|tsx|json|md|ya?ml|html|css|scss|toml)\b"),
 )
@@ -74,6 +65,37 @@ _SHELL_PARSE_ERROR_PATTERN = re.compile(
 )
 _BACKGROUND_COMPLETION_CALLBACK_KEY = "background_shell_completion_callback"
 BackgroundShellCompletionCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class _ForegroundOutputBuffer:
+    head_limit: int = _FOREGROUND_OUTPUT_HEAD_CHARS
+    tail_limit: int = _FOREGROUND_OUTPUT_TAIL_CHARS
+    head: str = ""
+    tail: str = ""
+    total_chars: int = 0
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        self.total_chars += len(text)
+        remaining_head = self.head_limit - len(self.head)
+        if remaining_head > 0:
+            self.head += text[:remaining_head]
+            text = text[remaining_head:]
+        if text:
+            self.tail = (self.tail + text)[-self.tail_limit :]
+
+    def render(self) -> str:
+        retained = len(self.head) + len(self.tail)
+        if self.total_chars <= retained:
+            return self.head + self.tail
+        omitted = self.total_chars - retained
+        marker = (
+            f"\n... foreground output truncated; omitted {omitted} chars "
+            f"between head {len(self.head)} chars and tail {len(self.tail)} chars ...\n"
+        )
+        return self.head + marker + self.tail
 
 
 @dataclass(slots=True)
@@ -491,12 +513,27 @@ async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(process.wait(), timeout=_PROCESS_KILL_WAIT_SECONDS)
 
 
+async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        if sys.platform != "win32" and hasattr(process, "pid"):
+            os.killpg(process.pid, signal.SIGTERM)
+        elif hasattr(process, "terminate"):
+            process.terminate()
+        else:
+            await _kill_process_tree(process)
+            return
+    except ProcessLookupError:
+        return
+    with contextlib.suppress(ProcessLookupError, TimeoutError):
+        await asyncio.wait_for(process.wait(), timeout=_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS)
+        return
+    await _kill_process_tree(process)
+
+
 async def _cleanup_process_tree(process: asyncio.subprocess.Process) -> None:
-    cleanup_task = asyncio.create_task(_kill_process_tree(process))
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(
-            asyncio.shield(cleanup_task), timeout=_FOREGROUND_TIMEOUT_CLEANUP_GRACE_SECONDS
-        )
+    await _terminate_process_tree(process)
 
 
 def _parse_timeout(timeout_ms: Any, *, run_in_background: bool) -> tuple[int | None, str | None]:
@@ -530,9 +567,9 @@ async def _read_process_stream(
     stream: asyncio.StreamReader | None,
     *,
     stream_name: str,
-    chunks: list[str],
+    chunks: _ForegroundOutputBuffer,
     context: ToolExecutionContext,
-    mirror_chunks: list[str] | None = None,
+    mirror_chunks: _ForegroundOutputBuffer | None = None,
 ) -> None:
     if stream is None:
         return
@@ -657,13 +694,14 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         preview = initial_output.strip() or "(no initial output yet)"
         description_line = f"Description: {description}\n" if description else ""
         advisory_line = f"Advisory: {advisory}\n" if advisory else ""
+        reminder = _background_shell_reminder(context)
         return ToolResult(
             output=(
                 advisory_line + f"Started background shell {shell_id}.\n"
                 f"Status: {status}\n"
                 f"{description_line}"
                 f"Use bash_output with shell_id='{shell_id}' to read output and bash_kill to stop it.\n\n"
-                f"{_BACKGROUND_SHELL_OUTPUT_REMINDER}\n\n"
+                f"{reminder}\n\n"
                 f"Initial output:\n{preview}"
             ),
             is_error=done and exit_code not in {None, 0},
@@ -684,8 +722,8 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
             },
         )
 
-    output_chunks: list[str] = []
-    stderr_chunks: list[str] = []
+    output_chunks = _ForegroundOutputBuffer()
+    stderr_chunks = _ForegroundOutputBuffer()
     try:
         if (
             not hasattr(process, "stdout")
@@ -722,12 +760,12 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     except TimeoutError:
         await _cleanup_process_tree(process)
         return ToolResult(
-            output=f"Command timed out after {timeout_seconds}s; process cleanup requested.",
+            output=f"Command timed out after {timeout_seconds}s; sent SIGTERM, then SIGKILL if still running.",
             is_error=True,
             metadata={
                 "status": "timed_out",
                 "timeout_seconds": timeout_seconds,
-                "process_cleanup": "killed",
+                "process_cleanup": "terminated_then_killed",
                 "commands": [
                     _command_metadata(command, resolved_cwd, ok=False, exit_code=process.returncode)
                 ],
@@ -737,8 +775,8 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
         await _cleanup_process_tree(process)
         raise
 
-    terminal_text = "".join(output_chunks)
-    stderr_text = "".join(stderr_chunks)
+    terminal_text = output_chunks.render()
+    stderr_text = stderr_chunks.render()
     exit_code = process.returncode or 0
     shell_hint = _shell_parse_error_hint(stderr_text)
 
@@ -765,16 +803,39 @@ async def handle_bash(arguments: dict[str, Any], context: ToolExecutionContext) 
     )
 
 
+def _background_shell_reminder(context: ToolExecutionContext) -> str:
+    if context.runtime_metadata.get("_background_shell_full_reminder_sent"):
+        return _BACKGROUND_SHELL_OUTPUT_SHORT_REMINDER
+    context.runtime_metadata["_background_shell_full_reminder_sent"] = True
+    return _BACKGROUND_SHELL_OUTPUT_REMINDER
+
+
 async def handle_bash_output(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     """Return new output for a background shell session."""
     shell_id = str(arguments.get("shell_id", "")).strip()
     cursor = int(arguments.get("cursor", 0) or 0)
+    filter_regex = arguments.get("filter_regex")
     if not shell_id:
         return ToolResult(output="shell_id is required.", is_error=True)
     manager = _background_shell_manager(context)
-    return await manager.read(shell_id, cursor=cursor)
+    result = await manager.read(shell_id, cursor=cursor)
+    if filter_regex is None or result.is_error:
+        return result
+    try:
+        regex = re.compile(str(filter_regex), flags=re.IGNORECASE)
+    except re.error as exc:
+        return ToolResult(output=f"Invalid filter_regex: {exc}", is_error=True)
+    filtered_lines = [line for line in result.output.splitlines() if regex.search(line)]
+    metadata = dict(result.metadata or {})
+    metadata["filter_regex"] = str(filter_regex)
+    return result.model_copy(
+        update={
+            "output": "\n".join(filtered_lines) if filtered_lines else "(no matching output)",
+            "metadata": metadata,
+        }
+    )
 
 
 async def handle_bash_kill(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:

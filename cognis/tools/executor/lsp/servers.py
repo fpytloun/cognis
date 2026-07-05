@@ -10,7 +10,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from cognis.tools.executor.lsp.install import (
     InstallStrategy,
@@ -555,15 +555,27 @@ BUILTIN_SERVERS: list[LSPServerDefinition] = [
 _EXTENSION_MAP: dict[str, list[LSPServerDefinition]] | None = None
 
 
-def get_servers_for_extension(extension: str) -> list[LSPServerDefinition]:
-    """Return server definitions that handle the given file extension."""
+def get_servers_for_extension(
+    extension: str,
+    *,
+    purpose: Literal["diagnostics", "semantic"] = "semantic",
+) -> list[LSPServerDefinition]:
+    """Return server definitions that handle the given file extension.
+
+    Python edit-time diagnostics intentionally prefer Ruff only.  Pyright is
+    still available for explicit semantic LSP queries where project-wide type
+    analysis is useful and the caller opted into a semantic operation.
+    """
     global _EXTENSION_MAP
     if _EXTENSION_MAP is None:
         _EXTENSION_MAP = {}
         for server in BUILTIN_SERVERS:
             for ext in server.extensions:
                 _EXTENSION_MAP.setdefault(ext, []).append(server)
-    return _EXTENSION_MAP.get(extension, [])
+    servers = _EXTENSION_MAP.get(extension, [])
+    if purpose == "diagnostics" and extension in {".py", ".pyi"}:
+        return [server for server in servers if server.server_id == "ruff"]
+    return servers
 
 
 def get_server_by_id(server_id: str) -> LSPServerDefinition | None:

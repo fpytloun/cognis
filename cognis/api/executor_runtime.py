@@ -10,7 +10,11 @@ from typing import Any
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import ExecutorCapabilities, ToolDefinition
-from cognis.store.queries import get_executor_row, update_executor_runtime_state
+from cognis.store.queries import (
+    bump_executor_reconfigure_generation,
+    get_executor_row,
+    update_executor_runtime_state,
+)
 from cognis.tools.skills import resolve_skills_for_agent
 
 _logger = get_logger(__name__)
@@ -236,6 +240,11 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 observed_tools=observed_tools,
                 runtime_metadata=runtime_metadata,
             )
+            await _invalidate_mcp_oauth_tokens_for_runtime_failures(
+                app,
+                row,
+                runtime_metadata=runtime_metadata,
+            )
 
             async with app.state.session_factory() as session:
                 refreshed = await get_executor_row(session, executor_id)
@@ -293,6 +302,87 @@ async def _persist_runtime_state(
             },
             exc_info=True,
         )
+
+
+async def _invalidate_mcp_oauth_tokens_for_runtime_failures(
+    app: Any,
+    row: Any,
+    *,
+    runtime_metadata: dict[str, Any],
+) -> None:
+    """Invalidate OAuth tokens rejected by MCP resource servers and request one retry."""
+
+    service = getattr(app.state.providers, "mcp_oauth_service", None)
+    if service is None:
+        return
+    failed_server_ids = _authorization_failed_mcp_server_ids(runtime_metadata)
+    if not failed_server_ids:
+        return
+
+    invalidated = False
+    for server_id in failed_server_ids:
+        try:
+            marked = await service.mark_token_invalid_for_server(
+                user_email=str(getattr(row, "owner_email", "") or ""),
+                server_id=server_id,
+                reason="mcp_resource_authorization_failed",
+            )
+        except Exception:
+            _logger.warning(
+                "executor_runtime: failed to invalidate rejected MCP OAuth token",
+                extra={
+                    "extra_data": {
+                        "executor_id": row.executor_id,
+                        "server_id": server_id,
+                    }
+                },
+                exc_info=True,
+            )
+            continue
+        invalidated = invalidated or bool(marked)
+
+    if not invalidated:
+        return
+
+    async with app.state.session_factory() as session:
+        bumped = await bump_executor_reconfigure_generation(
+            session,
+            row.executor_id,
+            runtime_state="reconfiguring",
+        )
+        await session.commit()
+    if not bumped:
+        return
+    _logger.info(
+        "executor_runtime: scheduled executor reconfigure after MCP OAuth token invalidation",
+        extra={
+            "extra_data": {
+                "executor_id": row.executor_id,
+                "server_ids": failed_server_ids,
+            }
+        },
+    )
+
+
+def _authorization_failed_mcp_server_ids(runtime_metadata: dict[str, Any]) -> list[str]:
+    servers = runtime_metadata.get("mcp_servers")
+    if not isinstance(servers, list):
+        return []
+    server_ids: list[str] = []
+    seen: set[str] = set()
+    for item in servers:
+        if not isinstance(item, dict):
+            continue
+        server_id = item.get("server_id")
+        if not isinstance(server_id, str) or not server_id or server_id in seen:
+            continue
+        if item.get("authorization_required") is not True:
+            continue
+        if item.get("status") != "failed":
+            continue
+        server_ids.append(server_id)
+        seen.add(server_id)
+    return server_ids
 
 
 async def _mark_reconcile_unavailable(app: Any, row: Any) -> None:

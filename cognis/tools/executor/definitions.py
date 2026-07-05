@@ -107,12 +107,18 @@ READ_TOOL = ToolDefinition(
     source=_EXECUTOR_SOURCE,
     category="filesystem",
     read_only=True,
+    content_trust="untrusted",
     timeout_seconds=30,
 )
 
 WRITE_TOOL = ToolDefinition(
     name="write",
-    description="Write content to a file, creating it and parent directories if needed.",
+    description=(
+        "Write content to a file, creating it and parent directories if needed. "
+        "Overwrites the whole file; for existing files you must use read first so "
+        "the executor can verify freshness before writing. Prefer edit/apply_patch "
+        "for focused source changes."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -128,7 +134,7 @@ WRITE_TOOL = ToolDefinition(
     category="filesystem",
     read_only=False,
     non_bypassable=True,
-    timeout_seconds=30,
+    timeout_seconds=60,
 )
 
 ARTIFACT_SAVE_TOOL = ToolDefinition(
@@ -181,7 +187,10 @@ SKILL_ASSET_MATERIALIZE_TOOL = ToolDefinition(
             },
             "target_path": {
                 "type": "string",
-                "description": "Optional absolute executor path to write. Defaults to a stable temp-cache path.",
+                "description": (
+                    "Optional path under the managed skill asset cache to write. "
+                    "Defaults to a stable managed cache path."
+                ),
             },
         },
         "required": ["skill_id"],
@@ -195,7 +204,13 @@ SKILL_ASSET_MATERIALIZE_TOOL = ToolDefinition(
 
 EDIT_TOOL = ToolDefinition(
     name="edit",
-    description="Edit a file by replacing an exact text match with new text.",
+    description=(
+        "Edit a file by replacing an exact text match with new text. You must call "
+        "read first and copy text from the file content, never including the read "
+        "line-number prefix such as '12:'. Preserve the exact whitespace after that "
+        "prefix. old_string must be unique unless replace_all=true; prefer larger "
+        "disambiguating blocks when nearby text repeats."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -216,14 +231,17 @@ EDIT_TOOL = ToolDefinition(
     category="filesystem",
     read_only=False,
     non_bypassable=True,
-    timeout_seconds=30,
+    timeout_seconds=60,
 )
 
 APPLY_PATCH_TOOL = ToolDefinition(
     name="apply_patch",
     description=(
-        "Apply a strict patch to one or more text files using the apply_patch "
-        "envelope or supported unified diff update subset."
+        "Apply a strict patch to one or more text files. Supports the apply_patch "
+        "envelope grammar: *** Begin Patch, then one or more *** Add File, "
+        "*** Delete File, or *** Update File sections, ending with *** End Patch. "
+        "Unsupported operations such as chmod, binary patches, and arbitrary shell "
+        "commands are rejected."
     ),
     parameters={
         "type": "object",
@@ -240,7 +258,7 @@ APPLY_PATCH_TOOL = ToolDefinition(
     category="filesystem",
     read_only=False,
     non_bypassable=True,
-    timeout_seconds=30,
+    timeout_seconds=60,
 )
 
 MULTIEDIT_TOOL = ToolDefinition(
@@ -273,7 +291,7 @@ MULTIEDIT_TOOL = ToolDefinition(
     category="filesystem",
     read_only=False,
     non_bypassable=True,
-    timeout_seconds=30,
+    timeout_seconds=60,
 )
 
 LIST_DIRECTORY_TOOL = ToolDefinition(
@@ -354,7 +372,8 @@ GLOB_TOOL = ToolDefinition(
     name="glob",
     description=(
         "Preferred tool for discovering files by name/path patterns. Use this instead of bash "
-        "commands such as find or ls when available. Returns paths sorted by modification time."
+        "commands such as find or ls when available. Returns absolute file paths sorted by "
+        "modification time."
     ),
     parameters={
         "type": "object",
@@ -377,8 +396,8 @@ GREP_TOOL = ToolDefinition(
     name="grep",
     description=(
         "Preferred tool for searching file contents using regex. Use this instead of bash "
-        "commands such as grep or rg when available. Returns matching file paths and line "
-        "numbers."
+        "commands such as grep or rg when available. Returns absolute matching file paths "
+        "and line numbers."
     ),
     parameters={
         "type": "object",
@@ -391,6 +410,23 @@ GREP_TOOL = ToolDefinition(
             "include": {
                 "type": "string",
                 "description": "Optional file pattern filter when path is a directory. Use brace syntax or comma-separated globs for multiple patterns (e.g. '*.py', '*.{ts,tsx}', '*.ts,*.svelte').",
+            },
+            "case_insensitive": {
+                "type": "boolean",
+                "description": "Case-insensitive regex search (default false).",
+            },
+            "context_lines": {
+                "type": "integer",
+                "description": "Number of context lines before and after each match in content mode (default 0).",
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["content", "files_with_matches", "count"],
+                "description": "Output mode: content (default), files_with_matches, or count.",
+            },
+            "max_per_file": {
+                "type": "integer",
+                "description": "Maximum content-mode matches to show per file. Defaults to 10 for directories and no small per-file cap for single-file searches.",
             },
         },
         "required": ["pattern"],
@@ -415,7 +451,8 @@ BASH_TOOL = ToolDefinition(
         "containing spaces, parentheses, globs, $, or other shell metacharacters. For background "
         "commands, provide a concise description so completion follow-ups and per-turn reminders "
         "identify the job; running jobs are summarized in prompt reminders and completion triggers "
-        "a follow-up turn."
+        "a follow-up turn. Each call runs in a fresh shell: cd/export do not persist; use workdir "
+        "and env parameters."
     ),
     parameters={
         "type": "object",
@@ -455,6 +492,7 @@ BASH_TOOL = ToolDefinition(
     category="shell",
     read_only=False,
     non_bypassable=True,
+    content_trust="untrusted",
     timeout_seconds=3605,
 )
 
@@ -469,12 +507,21 @@ BASH_OUTPUT_TOOL = ToolDefinition(
                 "type": "integer",
                 "description": "Optional output cursor from the previous bash_output call. Defaults to 0.",
             },
+            "target_executor": {
+                "type": "string",
+                "description": "Optional executor id that owns the background shell session.",
+            },
+            "filter_regex": {
+                "type": "string",
+                "description": "Optional case-insensitive regex used to return only matching output lines.",
+            },
         },
         "required": ["shell_id"],
     },
     source=_EXECUTOR_SOURCE,
     category="shell",
     read_only=True,
+    content_trust="untrusted",
     timeout_seconds=30,
 )
 
@@ -485,6 +532,10 @@ BASH_KILL_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "shell_id": {"type": "string", "description": "Background shell session id."},
+            "target_executor": {
+                "type": "string",
+                "description": "Optional executor id that owns the background shell session.",
+            },
         },
         "required": ["shell_id"],
     },

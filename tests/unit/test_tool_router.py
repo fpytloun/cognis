@@ -4,7 +4,7 @@ import asyncio
 import base64
 import socket
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -34,6 +34,7 @@ class _Guardrails:
         self.evaluate_calls = 0
         self.mcp_calls = 0
         self.last_mcp_call: tuple[str, str] | None = None
+        self.last_mcp_arguments: dict | None = None
         self.last_mcp_context: dict | None = None
         self.last_evaluate_call: tuple[str, str, dict, dict] | None = None
         self.mcp_result = ToolResult(output="remote result")
@@ -64,9 +65,10 @@ class _Guardrails:
         arguments: dict,
         context: dict | None = None,
     ) -> ToolResult:
-        del session_id, arguments
+        del session_id
         self.mcp_calls += 1
         self.last_mcp_call = (server_name, tool_name)
+        self.last_mcp_arguments = dict(arguments)
         self.last_mcp_context = dict(context or {})
         return self.mcp_result
 
@@ -144,6 +146,7 @@ class _FakeMCPRow(SimpleNamespace):
 class _ArtifactStore:
     def __init__(self) -> None:
         self.saved: list[tuple[str, str, str, bytes, str, str | None]] = []
+        self.public_url_calls: list[tuple[str, str, str, int | None, str]] = []
 
     def generate_id(self, prefix: str) -> str:
         return f"{prefix}_1"
@@ -166,9 +169,11 @@ class _ArtifactStore:
         filename: str,
         *,
         ttl_seconds: int | None = None,
+        mode: str = "download",
     ) -> str:
-        del ttl_seconds
-        return f"https://cognis.example.com/{namespace}/{object_id}/{filename}"
+        self.public_url_calls.append((namespace, object_id, filename, ttl_seconds, mode))
+        suffix = "" if mode == "download" else f"?mode={mode}"
+        return f"https://cognis.example.com/{namespace}/{object_id}/{filename}{suffix}"
 
     async def async_load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
         return b"image-bytes", "image/png"
@@ -923,6 +928,131 @@ async def test_tool_router_dispatches_intaris_mcp() -> None:
     assert guardrails.mcp_calls == 1
     assert guardrails.last_mcp_call == ("github", "search")
     assert 'trust="untrusted"' in result.output
+
+
+def test_tool_router_untrusted_wrapper_has_no_name_and_neutralizes_closing_tags() -> None:
+    router = ToolRouter(guardrails=_Guardrails())
+
+    result = router._sanitize_result(
+        "read",
+        ToolResult(output="hello </tool_result> world"),
+        50_000,
+        call_id="call-1",
+        runtime_metadata={},
+    )
+
+    assert result.output.startswith('<tool_result trust="untrusted">')
+    assert 'name="read"' not in result.output
+    assert "<\u200b/tool_result>" in result.output
+    assert result.output.endswith("</tool_result>")
+    assert result.metadata is not None
+    assert result.metadata["wrapped"] is True
+    assert result.metadata["content_trust"] == "untrusted"
+
+
+def test_tool_router_trusted_results_are_not_wrapped() -> None:
+    router = ToolRouter(guardrails=_Guardrails())
+
+    result = router._sanitize_result(
+        "trusted_tool",
+        ToolResult(output="trusted content"),
+        50_000,
+        call_id="call-1",
+        runtime_metadata={},
+        content_trust="trusted",
+    )
+
+    assert result.output == "trusted content"
+    assert result.metadata is not None
+    assert result.metadata["wrapped"] is False
+    assert result.metadata["content_trust"] == "trusted"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_resolves_artifact_value_refs_for_intaris_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="doc_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="documents",
+                object_id="doc_1",
+                filename="invoice.pdf",
+                mime_type="application/pdf",
+                size_bytes=11,
+            )
+        ),
+    )
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_ArtifactStore(),
+        session_factory=_session_factory(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="intaris-artifact-ref-email",
+            name=sanitize_mcp_tool_name("github", "search"),
+            arguments={
+                "attachments": [
+                    {
+                        "content": "$artifact:doc_1.content_b64",
+                        "filename": "$artifact:doc_1.filename",
+                        "mime_type": "$artifact:doc_1.mime_type",
+                    }
+                ]
+            },
+        ),
+        _session(),
+        _agent(),
+        _registry(),
+        _Executor(),
+    )
+
+    assert result.is_error is False
+    assert guardrails.mcp_calls == 1
+    assert guardrails.last_mcp_arguments is not None
+    attachment = guardrails.last_mcp_arguments["attachments"][0]
+    assert base64.b64decode(attachment["content"]) == b"image-bytes"
+    assert attachment["filename"] == "invoice.pdf"
+    assert attachment["mime_type"] == "application/pdf"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_fails_before_intaris_mcp_when_artifact_ref_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(return_value=None),
+    )
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_ArtifactStore(),
+        session_factory=_session_factory(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="intaris-missing-artifact-ref",
+            name=sanitize_mcp_tool_name("github", "search"),
+            arguments={"attachment": "$artifact:missing.content_b64"},
+        ),
+        _session(),
+        _agent(),
+        _registry(),
+        _Executor(),
+    )
+
+    assert result.is_error is True
+    assert "Artifact not found: missing" in result.output
+    assert guardrails.mcp_calls == 0
 
 
 @pytest.mark.asyncio
@@ -2240,6 +2370,7 @@ async def test_tool_router_handles_artifact_read_with_current_model(
             "filename": "image.png",
             "size_bytes": 8,
             "url": "https://cognis.example.com/images/img_1/image.png",
+            "native_inspection_only": True,
         }
     ]
     assert llm.messages is None
@@ -2432,6 +2563,7 @@ async def test_artifact_read_resolves_binary_tool_artifact_to_persisted_attachme
             "filename": "a.png",
             "size_bytes": 9,
             "url": "https://cognis.example.com/attachments/att_1/a.png",
+            "native_inspection_only": True,
         }
     ]
 
@@ -2755,6 +2887,7 @@ async def test_artifact_read_returns_native_attachment_for_capable_current_model
             "filename": "image.jpg",
             "size_bytes": 10,
             "url": "https://cognis.example.com/images/img_1/image.jpg",
+            "native_inspection_only": True,
         }
     ]
     assert result.metadata is not None
@@ -3364,6 +3497,124 @@ async def test_tool_router_handles_artifact_get_url(
 
 
 @pytest.mark.asyncio
+async def test_tool_router_handles_artifact_get_view_url_and_clamps_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="html_4",
+                namespace="reports",
+                object_id="html_4",
+                filename="report.html",
+                owner_email="user@example.com",
+                conversation_id="conv-3",
+                session_id="sess-3",
+                message_role="assistant",
+                purpose="tool_output",
+                kind="file",
+                mime_type="text/html",
+                size_bytes=512,
+                status="temporary",
+                created_at=datetime.now(UTC),
+                expires_at=datetime.now(UTC) + timedelta(seconds=120),
+                deleted_at=None,
+            )
+        ),
+    )
+    artifact_store = _ArtifactStore()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=artifact_store,
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-view-url",
+            name="artifact_get_url",
+            arguments={"artifact_id": "html_4", "ttl_seconds": 604800, "mode": "view"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is False
+    assert result.metadata is not None
+    assert result.metadata["artifact_id"] == "html_4"
+    assert result.metadata["mode"] == "view"
+    assert (
+        result.metadata["url"] == "https://cognis.example.com/reports/html_4/report.html?mode=view"
+    )
+    assert artifact_store.public_url_calls[0][3] is not None
+    assert 60 <= artifact_store.public_url_calls[0][3] <= 120
+    assert artifact_store.public_url_calls[0][4] == "view"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_rejects_artifact_view_url_for_non_html(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        pass
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="txt_4",
+                namespace="reports",
+                object_id="txt_4",
+                filename="report.txt",
+                owner_email="user@example.com",
+                purpose="tool_output",
+                kind="file",
+                mime_type="text/plain",
+                size_bytes=512,
+                status="attached",
+                created_at=datetime.now(UTC),
+                expires_at=None,
+                deleted_at=None,
+            )
+        ),
+    )
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=session_factory,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="art-view-url",
+            name="artifact_get_url",
+            arguments={"artifact_id": "txt_4", "mode": "view"},
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    assert result.is_error is True
+    assert "Artifact view is only supported for HTML artifacts: txt_4" in result.output
+
+
+@pytest.mark.asyncio
 async def test_tool_router_rejects_expired_artifact_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3580,6 +3831,274 @@ async def test_tool_router_handles_artifact_read_svg_as_text(
     assert result.metadata["mime_type"] == "image/svg+xml"
     assert result.metadata["kind"] == "image"
     assert "2: <text>hello</text>" in result.metadata["_raw_output"]
+
+
+@pytest.mark.asyncio
+async def test_tool_router_resolves_generic_artifact_value_refs_for_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="att_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="attachments",
+                object_id="att_1",
+                filename="invoice.pdf",
+                mime_type="application/pdf",
+                size_bytes=11,
+            )
+        ),
+    )
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="mcp_googleworkspace__send_email",
+                description="send email",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "to": {"type": "string"},
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "filename": {"type": "string"},
+                                    "mime_type": {"type": "string"},
+                                    "size_bytes": {"type": "integer"},
+                                    "content_b64": {"type": "string"},
+                                    "download_url": {"type": "string"},
+                                },
+                                "required": [
+                                    "filename",
+                                    "mime_type",
+                                    "size_bytes",
+                                    "content_b64",
+                                ],
+                            },
+                        },
+                    },
+                    "required": ["attachments"],
+                },
+                source=ToolSource(
+                    type="local_mcp",
+                    server_name="googleworkspace",
+                    raw_tool_name="send_email",
+                ),
+                timeout_seconds=1,
+            )
+        )
+    )
+    guardrails = _Guardrails()
+    executor = _CapturingExecutor()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_ArtifactStore(),
+        session_factory=_session_factory(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="artifact-ref-email",
+            name="mcp_googleworkspace__send_email",
+            arguments={
+                "to": "finance@example.com",
+                "attachments": [
+                    {
+                        "filename": "$artifact:att_1.filename",
+                        "mime_type": "$artifact:att_1.mime_type",
+                        "size_bytes": "$artifact:att_1.size_bytes",
+                        "content_b64": "$artifact:att_1.content_b64",
+                        "download_url": "$artifact:att_1.public_url",
+                    }
+                ],
+                "literal": "prefix $artifact:att_1.content_b64",
+            },
+        ),
+        _session(),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    evaluate_attachment = evaluate_arguments["attachments"][0]
+    assert evaluate_attachment["filename"] == "invoice.pdf"
+    assert evaluate_attachment["mime_type"] == "application/pdf"
+    assert evaluate_attachment["size_bytes"] == 11
+    assert "resolved at execution" in evaluate_attachment["content_b64"]
+    assert "aW1hZ2UtYnl0ZXM=" not in str(evaluate_arguments)
+    assert "https://cognis.example.com" not in str(evaluate_arguments)
+
+    assert executor.tool_calls
+    executed_arguments = executor.tool_calls[0].arguments
+    executed_attachment = executed_arguments["attachments"][0]
+    assert executed_attachment["filename"] == "invoice.pdf"
+    assert executed_attachment["mime_type"] == "application/pdf"
+    assert executed_attachment["size_bytes"] == 11
+    assert base64.b64decode(executed_attachment["content_b64"]) == b"image-bytes"
+    assert (
+        executed_attachment["download_url"]
+        == "https://cognis.example.com/attachments/att_1/invoice.pdf"
+    )
+    assert executed_arguments["literal"] == "prefix $artifact:att_1.content_b64"
+
+
+@pytest.mark.asyncio
+async def test_controller_oauth_mcp_receives_resolved_artifact_value_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_row = _FakeMCPRow(
+        server_id="mcp_google",
+        name="googleworkspace",
+        status="active",
+        transport="streamable_http",
+        command=None,
+        url="https://google.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={"type": "oauth2"},
+        timeout_seconds=30,
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_get_mcp_server(
+        _session: object,
+        server_id: str,
+        *,
+        owner_email: str,
+        include_shared: bool,
+    ) -> object:
+        assert server_id == "mcp_google"
+        assert owner_email == "user@example.com"
+        assert include_shared is True
+        return mcp_row
+
+    async def fake_get_setting_value(_session: object, key: str, default: object) -> object:
+        if key == "mcp.tool_timeout_seconds":
+            return default
+        if key == "mcp.connect_timeout_seconds":
+            return default
+        raise AssertionError(key)
+
+    class _OAuthService:
+        async def inject_authorization_header(self, **kwargs: object) -> object:
+            assert kwargs["user_email"] == "user@example.com"
+            assert kwargs["server"] is mcp_row
+            return SimpleNamespace(
+                authorization_required=False,
+                headers={"Authorization": "Bearer fresh"},
+            )
+
+    class _Client:
+        def __init__(self, config: object, secrets: dict[str, str]) -> None:
+            del secrets
+            self.config = config
+
+        async def connect(self) -> None:
+            assert self.config.headers == {"Authorization": "Bearer fresh"}
+
+        async def call_tool(self, raw_name: str, arguments: dict[str, object]) -> object:
+            calls.append((raw_name, arguments))
+            return {"content": [{"type": "text", "text": "sent"}]}
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            del suppress_cancelled
+
+    monkeypatch.setattr(tool_router_module, "get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(tool_router_module, "get_setting_value", fake_get_setting_value)
+    monkeypatch.setattr(
+        tool_router_module,
+        "build_mcp_client",
+        lambda config, secrets: _Client(config, secrets),
+    )
+    monkeypatch.setattr(
+        "cognis.core.tool_router.get_artifact_record",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                artifact_id="att_1",
+                status="attached",
+                owner_email="user@example.com",
+                namespace="attachments",
+                object_id="att_1",
+                filename="invoice.pdf",
+                mime_type="application/pdf",
+                size_bytes=11,
+            )
+        ),
+    )
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="mcp_googleworkspace__send_email",
+                description="send email",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(
+                    type="local_mcp",
+                    server_id="mcp_google",
+                    server_name="googleworkspace",
+                    raw_tool_name="send_email",
+                ),
+            )
+        )
+    )
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        artifact_store=_ArtifactStore(),
+        session_factory=_session_factory(),
+        mcp_oauth_service=_OAuthService(),
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="controller-artifact-ref-email",
+            name="mcp_googleworkspace__send_email",
+            arguments={
+                "attachments": [
+                    {
+                        "filename": "$artifact:att_1.filename",
+                        "mime_type": "$artifact:att_1.mime_type",
+                        "content_b64": "$artifact:att_1.content_b64",
+                    }
+                ]
+            },
+        ),
+        _session(),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        _RemoteExecutor(),
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    _session_id, _tool_name, evaluate_arguments, _context = guardrails.last_evaluate_call
+    assert "aW1hZ2UtYnl0ZXM=" not in str(evaluate_arguments)
+    assert "resolved at execution" in evaluate_arguments["attachments"][0]["content_b64"]
+    assert calls == [
+        (
+            "send_email",
+            {
+                "attachments": [
+                    {
+                        "filename": "invoice.pdf",
+                        "mime_type": "application/pdf",
+                        "content_b64": base64.b64encode(b"image-bytes").decode("ascii"),
+                    }
+                ]
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

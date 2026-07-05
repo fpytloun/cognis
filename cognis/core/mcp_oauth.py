@@ -32,10 +32,12 @@ from cognis.models.tool import effective_mcp_auth_config
 from cognis.store.models import MCPServerRow
 from cognis.store.queries import (
     create_mcp_oauth_transaction,
+    get_executor_row,
     get_mcp_oauth_token,
     get_mcp_oauth_token_for_server,
     get_mcp_oauth_transaction,
     get_mcp_server,
+    list_executors,
     list_pending_mcp_oauth_transactions,
     mark_mcp_oauth_token_status,
     mcp_oauth_resource_key,
@@ -51,6 +53,8 @@ _MAX_METADATA_BYTES = 128 * 1024
 _REFRESH_SKEW_SECONDS = 60
 _DYNAMIC_CLIENT_NAME = "Cognis MCP"
 _DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
+_DEVICE_DCR_REDIRECT_URI = "http://127.0.0.1/oauth/callback"
+_EXECUTOR_LOOPBACK_CALLBACK_PATH = "/oauth/callback"
 _RESERVED_AUTHORIZATION_PARAMS = {
     "client_id",
     "code_challenge",
@@ -91,12 +95,18 @@ class AuthorizationStart:
     verification_uri_complete: str | None = None
     user_code: str | None = None
     interval: int | None = None
+    callback_mode: str = "controller_public"
+    oauth_executor_id: str | None = None
+    oauth_executor_name: str | None = None
+    redirect_uri: str | None = None
+    instructions: str | None = None
 
 
 @dataclass(frozen=True)
 class OAuthClientRegistration:
     client_id: str
     client_secret: str | None = None
+    grant_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,6 +121,11 @@ class TokenInjectionResult:
     verification_uri: str | None = None
     verification_uri_complete: str | None = None
     user_code: str | None = None
+    callback_mode: str | None = None
+    oauth_executor_id: str | None = None
+    oauth_executor_name: str | None = None
+    redirect_uri: str | None = None
+    instructions: str | None = None
 
 
 def oauth_required_mcp_status(
@@ -124,6 +139,11 @@ def oauth_required_mcp_status(
     verification_uri: str | None = None,
     verification_uri_complete: str | None = None,
     user_code: str | None = None,
+    callback_mode: str | None = None,
+    oauth_executor_id: str | None = None,
+    oauth_executor_name: str | None = None,
+    redirect_uri: str | None = None,
+    instructions: str | None = None,
 ) -> dict[str, Any]:
     """Return safe runtime metadata for an MCP server awaiting OAuth authorization."""
 
@@ -141,6 +161,11 @@ def oauth_required_mcp_status(
         "verification_uri": verification_uri,
         "verification_uri_complete": verification_uri_complete,
         "user_code": user_code,
+        "callback_mode": callback_mode,
+        "oauth_executor_id": oauth_executor_id,
+        "oauth_executor_name": oauth_executor_name,
+        "redirect_uri": redirect_uri,
+        "instructions": instructions,
     }
 
 
@@ -187,6 +212,18 @@ def _safe_provider_error(response: httpx.Response, *, operation: str) -> str:
             )
             parts.append(sanitized[:500])
     return ": ".join(parts)
+
+
+def _parse_oauth_json_response(response: httpx.Response, *, operation: str) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        content_type = response.headers.get("content-type")
+        suffix = f" ({content_type})" if content_type else ""
+        raise MCPOAuthError(f"{operation} response was not valid JSON{suffix}") from exc
+    if not isinstance(payload, dict):
+        raise MCPOAuthError(f"{operation} response was not a JSON object")
+    return payload
 
 
 def _safe_url(url: str, *, allow_http_localhost: bool = True) -> str:
@@ -257,11 +294,13 @@ class MCPOAuthService:
         public_base_url: str,
         notification_service: NotificationService | None = None,
         on_authorization_completed: Callable[[str], Awaitable[None]] | None = None,
+        executor_provider: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._public_base_url = public_base_url.rstrip("/")
         self._notification_service = notification_service
         self._on_authorization_completed = on_authorization_completed
+        self._executor_provider = executor_provider
         self._refresh_locks: dict[tuple[str, str, str, str], asyncio.Lock] = {}
         self._device_poll_tasks: dict[str, asyncio.Task[None]] = {}
         with open(key_path, "rb") as key_file:
@@ -296,6 +335,80 @@ class MCPOAuthService:
         if not self._public_base_url:
             raise MCPOAuthError("COGNIS_PUBLIC_BASE_URL is required for MCP OAuth")
         return f"{self._public_base_url}/api/v1/mcp/oauth/callback"
+
+    def _callback_mode(self, auth_config: Any) -> str:
+        mode = str(getattr(auth_config, "callback_mode", "auto") or "auto")
+        if mode == "auto" and getattr(auth_config, "oauth_executor_id", None):
+            return "executor_loopback"
+        if mode == "auto":
+            return "controller_public"
+        return mode
+
+    async def _start_executor_loopback_listener(
+        self,
+        *,
+        executor_id: str,
+        state: str,
+    ) -> dict[str, Any]:
+        if self._executor_provider is None:
+            raise MCPOAuthError("OAuth executor callback is unavailable")
+        get_connection = getattr(self._executor_provider, "get_connection", None)
+        if get_connection is None:
+            raise MCPOAuthError("OAuth executor callback is unavailable")
+        conn = get_connection(executor_id)
+        if conn is None:
+            raise MCPOAuthError(f"OAuth executor {executor_id} is not connected")
+        start_listener = getattr(conn, "oauth_loopback_start", None)
+        if start_listener is None:
+            raise MCPOAuthError(f"OAuth executor {executor_id} does not support loopback OAuth")
+        result = await start_listener(
+            state=state,
+            ttl_seconds=_STATE_TTL_SECONDS,
+            callback_path=_EXECUTOR_LOOPBACK_CALLBACK_PATH,
+        )
+        listener_id = result.get("listener_id")
+        redirect_uri = result.get("redirect_uri")
+        if not isinstance(listener_id, str) or not listener_id:
+            raise MCPOAuthError("OAuth executor did not return a listener ID")
+        if not isinstance(redirect_uri, str) or not redirect_uri:
+            raise MCPOAuthError("OAuth executor did not return a redirect URI")
+        parsed = urlsplit(redirect_uri)
+        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost"}:
+            raise MCPOAuthError("OAuth executor returned an invalid loopback redirect URI")
+        if parsed.path != _EXECUTOR_LOOPBACK_CALLBACK_PATH:
+            raise MCPOAuthError("OAuth executor returned an invalid callback path")
+        return result
+
+    async def _stop_executor_loopback_listener(
+        self,
+        *,
+        executor_id: str | None,
+        listener_id: str | None,
+    ) -> None:
+        if not executor_id or not listener_id or self._executor_provider is None:
+            return
+        get_connection = getattr(self._executor_provider, "get_connection", None)
+        if get_connection is None:
+            return
+        conn = get_connection(executor_id)
+        if conn is None:
+            return
+        stop_listener = getattr(conn, "oauth_loopback_stop", None)
+        if stop_listener is None:
+            return
+        try:
+            await stop_listener(listener_id=listener_id)
+        except Exception:
+            logger.debug(
+                "mcp oauth: failed to stop executor loopback listener",
+                extra={
+                    "extra_data": {
+                        "executor_id": executor_id,
+                        "listener_id": listener_id,
+                    }
+                },
+                exc_info=True,
+            )
 
     async def discover_metadata(self, server: MCPServerRow) -> dict[str, Any]:
         auth_config = effective_mcp_auth_config(server.auth_config, server.headers)
@@ -423,7 +536,7 @@ class MCPOAuthService:
             "token_endpoint_auth_method": "none",
         }
         if flow == "device_code":
-            payload["redirect_uris"] = []
+            payload["redirect_uris"] = [_DEVICE_DCR_REDIRECT_URI]
             payload["grant_types"] = [_DEVICE_GRANT_TYPE, "refresh_token"]
         else:
             if not redirect_uri:
@@ -435,15 +548,23 @@ class MCPOAuthService:
             payload["scope"] = " ".join(scopes)
         if client_metadata_document_url:
             payload["client_uri"] = client_metadata_document_url
+        device_fallback_payloads: list[dict[str, Any]] = []
+        if flow == "device_code":
+            empty_redirects_payload = dict(payload)
+            empty_redirects_payload["redirect_uris"] = []
+            device_fallback_payloads.append(empty_redirects_payload)
+            omitted_redirects_payload = dict(payload)
+            omitted_redirects_payload.pop("redirect_uris", None)
+            device_fallback_payloads.append(omitted_redirects_payload)
         async with httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False) as client:
             response = await client.post(
                 _safe_url(registration_endpoint),
                 json=payload,
                 headers={"Accept": "application/json"},
             )
-            if flow == "device_code" and response.status_code == 400:
-                fallback_payload = dict(payload)
-                fallback_payload.pop("redirect_uris", None)
+            for fallback_payload in device_fallback_payloads:
+                if response.status_code != 400:
+                    break
                 response = await client.post(
                     _safe_url(registration_endpoint),
                     json=fallback_payload,
@@ -464,13 +585,27 @@ class MCPOAuthService:
                 },
             )
             raise MCPOAuthError(message)
-        data = response.json()
+        data = _parse_oauth_json_response(
+            response,
+            operation="OAuth dynamic client registration",
+        )
         if not isinstance(data, dict) or not isinstance(data.get("client_id"), str):
             raise MCPOAuthError("OAuth dynamic client registration response missing client_id")
+        registered_grant_types = data.get("grant_types")
+        grant_types = (
+            tuple(str(grant_type) for grant_type in registered_grant_types)
+            if isinstance(registered_grant_types, list)
+            else ()
+        )
+        if flow == "device_code" and _DEVICE_GRANT_TYPE not in grant_types:
+            raise MCPOAuthError(
+                "OAuth dynamic client registration did not register a device-code client"
+            )
         client_secret = data.get("client_secret")
         return OAuthClientRegistration(
             client_id=str(data["client_id"]),
             client_secret=str(client_secret) if client_secret else None,
+            grant_types=grant_types,
         )
 
     def _select_flow(
@@ -486,6 +621,8 @@ class MCPOAuthService:
                     "does not advertise device_authorization_endpoint"
                 )
             return "device_code"
+        if getattr(auth_config, "oauth_executor_id", None):
+            return "authorization_code"
         if auth_config.client_id or auth_config.redirect_uri:
             return "authorization_code"
         if isinstance(device_endpoint, str) and device_endpoint:
@@ -680,16 +817,6 @@ class MCPOAuthService:
                 )
             authorization_endpoint = _safe_url(str(metadata.get("authorization_endpoint") or ""))
             issuer = str(metadata["issuer"]).rstrip("/")
-            redirect_uri = auth_config.redirect_uri or self.redirect_uri()
-            client = await self._resolve_client_registration(
-                metadata=metadata,
-                configured_client_id=auth_config.client_id,
-                configured_client_secret=None,
-                redirect_uri=redirect_uri,
-                scopes=auth_config.scopes,
-                client_metadata_document_url=auth_config.client_metadata_document_url,
-                flow="authorization_code",
-            )
             verifier = _b64url(secrets.token_bytes(48))
             challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
             transaction_id = f"mcpoauth_{uuid.uuid4().hex[:16]}"
@@ -699,6 +826,76 @@ class MCPOAuthService:
             state_hash = hashlib.sha256(state.encode()).hexdigest()
             expires_at = _utcnow() + timedelta(seconds=_STATE_TTL_SECONDS)
             scopes = list(dict.fromkeys(auth_config.scopes))
+            callback_mode = self._callback_mode(auth_config)
+            oauth_executor_id = None
+            oauth_executor_name = None
+            loopback_listener_id = None
+            loopback_started = False
+            instructions = None
+            if callback_mode == "executor_loopback":
+                oauth_executor_id = str(auth_config.oauth_executor_id or "").strip()
+                if not oauth_executor_id:
+                    executor_rows = await list_executors(
+                        session,
+                        owner_email=user_email,
+                        include_shared=True,
+                    )
+                    websocket_rows = [
+                        row
+                        for row in executor_rows
+                        if getattr(row, "executor_type", None) == "websocket"
+                    ]
+                    executor_row = next(
+                        (row for row in websocket_rows if getattr(row, "is_default", False)), None
+                    ) or (websocket_rows[0] if websocket_rows else None)
+                    if executor_row is None:
+                        raise MCPOAuthError(
+                            "A connected websocket OAuth executor is required for executor loopback callback"
+                        )
+                    oauth_executor_id = executor_row.executor_id
+                else:
+                    executor_row = await get_executor_row(
+                        session,
+                        oauth_executor_id,
+                        owner_email=user_email,
+                        include_shared=True,
+                    )
+                if executor_row is None:
+                    raise MCPOAuthError(f"OAuth executor {oauth_executor_id} was not found")
+                oauth_executor_name = executor_row.name
+                loopback = await self._start_executor_loopback_listener(
+                    executor_id=oauth_executor_id,
+                    state=state,
+                )
+                redirect_uri = str(loopback["redirect_uri"])
+                loopback_listener_id = str(loopback["listener_id"])
+                loopback_started = True
+                instructions = (
+                    f"Open this authorization URL in a browser running on executor "
+                    f"{oauth_executor_name or oauth_executor_id}. If you are not on that "
+                    "executor, use a remote browser or tunnel so the loopback callback "
+                    "resolves on that executor."
+                )
+            else:
+                redirect_uri = auth_config.redirect_uri or self.redirect_uri()
+                callback_mode = "controller_public"
+            try:
+                client = await self._resolve_client_registration(
+                    metadata=metadata,
+                    configured_client_id=auth_config.client_id,
+                    configured_client_secret=None,
+                    redirect_uri=redirect_uri,
+                    scopes=auth_config.scopes,
+                    client_metadata_document_url=auth_config.client_metadata_document_url,
+                    flow="authorization_code",
+                )
+            except Exception:
+                if loopback_started:
+                    await self._stop_executor_loopback_listener(
+                        executor_id=oauth_executor_id,
+                        listener_id=loopback_listener_id,
+                    )
+                raise
             params = {
                 "response_type": "code",
                 "client_id": client.client_id,
@@ -740,6 +937,11 @@ class MCPOAuthService:
                         "code_verifier": verifier,
                         "state": state,
                         "client_secret": client.client_secret,
+                        "callback_mode": callback_mode,
+                        "oauth_executor_id": oauth_executor_id,
+                        "oauth_executor_name": oauth_executor_name,
+                        "loopback_listener_id": loopback_listener_id,
+                        "redirect_uri": redirect_uri,
                     }
                 ),
                 expires_at=expires_at,
@@ -763,7 +965,8 @@ class MCPOAuthService:
                     payload={
                         "kind": "oauth_authorization",
                         "label": "Authorize MCP server",
-                        "message": "Open the authorization link to connect this MCP server.",
+                        "message": instructions
+                        or "Open the authorization link to connect this MCP server.",
                         "required_fields": [],
                         "metadata": {
                             "authorization_url": authorization_url,
@@ -774,6 +977,11 @@ class MCPOAuthService:
                             "authorization_server": issuer,
                             "expires_at": expires_at.isoformat(),
                             "callback_only": True,
+                            "callback_mode": callback_mode,
+                            "oauth_executor_id": oauth_executor_id,
+                            "oauth_executor_name": oauth_executor_name,
+                            "redirect_uri": redirect_uri,
+                            "instructions": instructions,
                         },
                     },
                     suppress_event=delivery_mode == "silent",
@@ -789,6 +997,11 @@ class MCPOAuthService:
             authorization_server=issuer,
             scopes=scopes,
             flow="authorization_code",
+            callback_mode=callback_mode,
+            oauth_executor_id=oauth_executor_id,
+            oauth_executor_name=oauth_executor_name,
+            redirect_uri=redirect_uri,
+            instructions=instructions,
         )
 
     async def start_authorization_for_server(
@@ -875,9 +1088,187 @@ class MCPOAuthService:
             if authorization
             else None,
             user_code=getattr(authorization, "user_code", None) if authorization else None,
+            callback_mode=getattr(authorization, "callback_mode", None) if authorization else None,
+            oauth_executor_id=getattr(authorization, "oauth_executor_id", None)
+            if authorization
+            else None,
+            oauth_executor_name=getattr(authorization, "oauth_executor_name", None)
+            if authorization
+            else None,
+            redirect_uri=getattr(authorization, "redirect_uri", None) if authorization else None,
+            instructions=getattr(authorization, "instructions", None) if authorization else None,
         )
 
-    async def complete_callback(self, *, state: str, code: str) -> str:
+    async def mark_token_invalid_for_server(
+        self,
+        *,
+        user_email: str,
+        server_id: str,
+        reason: str = "authorization_failed",
+    ) -> bool:
+        """Ensure a server has no active token after a resource-server auth failure.
+
+        The boolean return value means the caller should reconfigure stale
+        executors. Multiple executors can observe the same rejected shared token;
+        the first one marks it invalid, while later ones still need a reconfigure
+        to drop the now-unauthorized MCP server from their applied config.
+        """
+
+        if not user_email or not server_id:
+            return False
+        async with self._session_factory() as session:
+            server = await get_mcp_server(
+                session,
+                server_id,
+                owner_email=user_email,
+                include_shared=True,
+            )
+            if server is None:
+                return False
+            auth_config = effective_mcp_auth_config(
+                getattr(server, "auth_config", None),
+                getattr(server, "headers", None),
+            )
+            if auth_config.type != "oauth2":
+                return False
+            row = await get_mcp_oauth_token_for_server(
+                session,
+                user_email=user_email,
+                mcp_server_id=server_id,
+            )
+            if row is None or row.status != "active":
+                logger.info(
+                    "mcp oauth: authorization failure observed after token was already unavailable",
+                    extra={
+                        "extra_data": {
+                            "server_id": server_id,
+                            "user_email": user_email,
+                            "reason": reason,
+                            "token_status": getattr(row, "status", None)
+                            if row is not None
+                            else None,
+                        }
+                    },
+                )
+                return True
+            await mark_mcp_oauth_token_status(session, token_id=row.token_id, status="invalid")
+            await session.commit()
+        logger.warning(
+            "mcp oauth: token marked invalid after MCP resource authorization failure",
+            extra={
+                "extra_data": {
+                    "server_id": server_id,
+                    "user_email": user_email,
+                    "reason": reason,
+                }
+            },
+        )
+        return True
+
+    async def complete_loopback_callback(
+        self,
+        *,
+        executor_id: str,
+        listener_id: str,
+        redirect_uri: str,
+        state: str,
+        code: str | None,
+        error: str | None = None,
+        error_description: str | None = None,
+    ) -> str:
+        if error:
+            await self._mark_callback_error(
+                state=state,
+                error_code="provider_error",
+                error_description=error_description or error,
+                source_executor_id=executor_id,
+                listener_id=listener_id,
+                callback_redirect_uri=redirect_uri,
+            )
+            raise MCPOAuthError("OAuth provider returned an error")
+        if not code:
+            raise MCPOAuthError("OAuth callback is missing authorization code")
+        return await self.complete_callback(
+            state=state,
+            code=code,
+            source_executor_id=executor_id,
+            listener_id=listener_id,
+            callback_redirect_uri=redirect_uri,
+        )
+
+    async def _mark_callback_error(
+        self,
+        *,
+        state: str,
+        error_code: str,
+        error_description: str,
+        source_executor_id: str | None = None,
+        listener_id: str | None = None,
+        callback_redirect_uri: str | None = None,
+    ) -> str:
+        try:
+            state_payload = json.loads(base64.urlsafe_b64decode(state + "==="))
+            transaction_id = str(state_payload["t"])
+        except Exception as exc:
+            raise MCPOAuthError("Invalid OAuth state") from exc
+        state_hash = hashlib.sha256(state.encode()).hexdigest()
+        async with self._session_factory() as session:
+            row = await get_mcp_oauth_transaction(session, transaction_id)
+            if row is None or not hmac.compare_digest(row.state_hash, state_hash):
+                raise MCPOAuthError("Invalid OAuth transaction")
+            if row.status != "pending" or row.used_at is not None or row.expires_at < _utcnow():
+                raise MCPOAuthError("OAuth transaction is expired or already used")
+            payload = self._decrypt(row.encrypted_payload)
+            self._validate_callback_source(
+                row=row,
+                payload=payload,
+                source_executor_id=source_executor_id,
+                listener_id=listener_id,
+                callback_redirect_uri=callback_redirect_uri,
+            )
+            row.status = "failed"
+            row.error_code = error_code
+            row.error_description = error_description[:500]
+            await session.commit()
+            if row.notification_id and self._notification_service is not None:
+                await self._notification_service.resolve_internal(
+                    row.notification_id,
+                    "failed",
+                    {"transaction_id": transaction_id, "provider": "mcp"},
+                )
+        return transaction_id
+
+    def _validate_callback_source(
+        self,
+        *,
+        row: Any,
+        payload: dict[str, Any],
+        source_executor_id: str | None,
+        listener_id: str | None,
+        callback_redirect_uri: str | None,
+    ) -> None:
+        callback_mode = str(payload.get("callback_mode") or "controller_public")
+        if callback_mode == "executor_loopback":
+            if not source_executor_id:
+                raise MCPOAuthError("OAuth callback must be completed by the selected executor")
+            if source_executor_id != payload.get("oauth_executor_id"):
+                raise MCPOAuthError("OAuth callback executor mismatch")
+            if listener_id != payload.get("loopback_listener_id"):
+                raise MCPOAuthError("OAuth callback listener mismatch")
+            if callback_redirect_uri != row.redirect_uri:
+                raise MCPOAuthError("OAuth callback redirect URI mismatch")
+        elif source_executor_id:
+            raise MCPOAuthError("Executor loopback callback is not valid for this transaction")
+
+    async def complete_callback(
+        self,
+        *,
+        state: str,
+        code: str,
+        source_executor_id: str | None = None,
+        listener_id: str | None = None,
+        callback_redirect_uri: str | None = None,
+    ) -> str:
         try:
             state_payload = json.loads(base64.urlsafe_b64decode(state + "==="))
             transaction_id = str(state_payload["t"])
@@ -893,20 +1284,28 @@ class MCPOAuthService:
             now = _utcnow()
             if row.status != "pending" or row.used_at is not None or row.expires_at < now:
                 raise MCPOAuthError("OAuth transaction is expired or already used")
+
+            payload = self._decrypt(row.encrypted_payload)
+            if payload.get("flow") == "device_code":
+                raise MCPOAuthError("OAuth callback is not valid for device-code transactions")
+            self._validate_callback_source(
+                row=row,
+                payload=payload,
+                source_executor_id=source_executor_id,
+                listener_id=listener_id,
+                callback_redirect_uri=callback_redirect_uri,
+            )
             row.status = "exchanging"
             row.used_at = now
             await session.commit()
 
             try:
-                payload = self._decrypt(row.encrypted_payload)
                 server = await get_mcp_server(
                     session, row.mcp_server_id, owner_email=row.user_email, include_shared=True
                 )
                 if server is None:
                     raise MCPOAuthError("MCP server not found")
                 metadata = await self.discover_metadata(server)
-                if payload.get("flow") == "device_code":
-                    raise MCPOAuthError("OAuth callback is not valid for device-code transactions")
                 token_endpoint = _safe_url(str(metadata.get("token_endpoint") or ""))
                 token_response = await self._exchange_code(
                     token_endpoint=token_endpoint,
@@ -986,9 +1385,10 @@ class MCPOAuthService:
             raise MCPOAuthError(
                 _safe_provider_error(response, operation="OAuth device authorization")
             )
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise MCPOAuthError("OAuth device authorization response was not valid JSON")
+        payload = _parse_oauth_json_response(
+            response,
+            operation="OAuth device authorization",
+        )
         return payload
 
     async def _exchange_device_code(
@@ -1035,7 +1435,10 @@ class MCPOAuthService:
             raise MCPOAuthError(
                 _safe_provider_error(response, operation="OAuth device token exchange")
             )
-        payload = response.json()
+        payload = _parse_oauth_json_response(
+            response,
+            operation="OAuth device token exchange",
+        )
         if not isinstance(payload, dict) or not payload.get("access_token"):
             raise MCPOAuthError("OAuth token response missing access token")
         return payload
@@ -1220,7 +1623,7 @@ class MCPOAuthService:
             response = await client.post(token_endpoint, data=data)
         if response.status_code >= 400:
             raise MCPOAuthError("OAuth token exchange failed")
-        payload = response.json()
+        payload = _parse_oauth_json_response(response, operation="OAuth token exchange")
         if not isinstance(payload, dict) or not payload.get("access_token"):
             raise MCPOAuthError("OAuth token response missing access token")
         return payload
@@ -1372,6 +1775,21 @@ class MCPOAuthService:
                     if authorization
                     else None,
                     user_code=getattr(authorization, "user_code", None) if authorization else None,
+                    callback_mode=getattr(authorization, "callback_mode", None)
+                    if authorization
+                    else None,
+                    oauth_executor_id=getattr(authorization, "oauth_executor_id", None)
+                    if authorization
+                    else None,
+                    oauth_executor_name=getattr(authorization, "oauth_executor_name", None)
+                    if authorization
+                    else None,
+                    redirect_uri=getattr(authorization, "redirect_uri", None)
+                    if authorization
+                    else None,
+                    instructions=getattr(authorization, "instructions", None)
+                    if authorization
+                    else None,
                 )
             payload = self._decrypt(row.encrypted_payload)
             now = _utcnow()
@@ -1420,6 +1838,21 @@ class MCPOAuthService:
                             if authorization
                             else None,
                             user_code=getattr(authorization, "user_code", None)
+                            if authorization
+                            else None,
+                            callback_mode=getattr(authorization, "callback_mode", None)
+                            if authorization
+                            else None,
+                            oauth_executor_id=getattr(authorization, "oauth_executor_id", None)
+                            if authorization
+                            else None,
+                            oauth_executor_name=getattr(authorization, "oauth_executor_name", None)
+                            if authorization
+                            else None,
+                            redirect_uri=getattr(authorization, "redirect_uri", None)
+                            if authorization
+                            else None,
+                            instructions=getattr(authorization, "instructions", None)
                             if authorization
                             else None,
                         )

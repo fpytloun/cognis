@@ -19,7 +19,10 @@ from urllib.parse import quote, unquote, urlparse
 from cognis.logging import get_logger
 from cognis.tools.executor.lsp.types import (
     Diagnostic,
+    DiagnosticFreshness,
     DiagnosticSeverity,
+    DiagnosticSnapshot,
+    DiagnosticWaitResult,
     Position,
     Range,
 )
@@ -84,8 +87,13 @@ class LSPClient:
 
         # Diagnostics state
         self._diagnostics: dict[str, list[Diagnostic]] = {}
+        self._diagnostic_snapshots: dict[str, DiagnosticSnapshot] = {}
         self._diag_events: dict[str, asyncio.Event] = {}
         self._pending_diagnostics: set[str] = set()
+        self._document_versions: dict[str, int] = {}
+        self._document_update_sequences: dict[str, int] = {}
+        self._diagnostic_sequence = 0
+        self._last_waits: list[DiagnosticWaitResult] = []
 
         # Background tasks
         self._reader_task: asyncio.Task[None] | None = None
@@ -234,13 +242,15 @@ class LSPClient:
 
     async def did_open(self, uri: str, language_id: str, text: str) -> None:
         """Send ``textDocument/didOpen`` notification."""
+        version = 0
+        self._mark_document_updated(uri, version)
         await self._notify(
             "textDocument/didOpen",
             {
                 "textDocument": {
                     "uri": uri,
                     "languageId": language_id,
-                    "version": 0,
+                    "version": version,
                     "text": text,
                 },
             },
@@ -252,12 +262,14 @@ class LSPClient:
                     "server_id": self.server_id,
                     "uri": uri,
                     "language_id": language_id,
+                    "version": version,
                 }
             },
         )
 
     async def did_change(self, uri: str, version: int, text: str) -> None:
         """Send ``textDocument/didChange`` notification (full sync)."""
+        self._mark_document_updated(uri, version)
         await self._notify(
             "textDocument/didChange",
             {
@@ -282,6 +294,16 @@ class LSPClient:
             "textDocument/didSave",
             {"textDocument": {"uri": uri}},
         )
+        logger.debug(
+            "lsp: didSave",
+            extra={
+                "extra_data": {
+                    "server_id": self.server_id,
+                    "uri": uri,
+                    "version": self._document_versions.get(uri),
+                }
+            },
+        )
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -293,6 +315,17 @@ class LSPClient:
             diags = self._diagnostics.get(uri, [])
             return {uri: diags} if diags else {}
         return dict(self._diagnostics)
+
+    def get_diagnostic_snapshots(self, uri: str | None = None) -> dict[str, DiagnosticSnapshot]:
+        """Return current diagnostic snapshots, optionally filtered to a URI."""
+        if uri is not None:
+            snapshot = self._diagnostic_snapshots.get(uri)
+            return {uri: snapshot} if snapshot is not None else {}
+        return dict(self._diagnostic_snapshots)
+
+    def current_document_version(self, uri: str) -> int | None:
+        """Return the last document version sent to the server for a URI."""
+        return self._document_versions.get(uri)
 
     def has_pending_diagnostics(self, uri: str) -> bool:
         """Return whether a diagnostics wait is already active for a URI."""
@@ -306,20 +339,24 @@ class LSPClient:
         self,
         uri: str,
         *,
+        target_version: int | None = None,
         timeout_ms: int = 10_000,
         debounce_ms: int = _DIAGNOSTICS_DEBOUNCE_MS,
-    ) -> list[Diagnostic]:
+    ) -> DiagnosticWaitResult:
         """Wait for diagnostics for a specific URI.
 
         Uses a debounce strategy: waits ``debounce_ms`` after the last
         ``publishDiagnostics`` notification for this URI.  If no
-        notification arrives within ``timeout_ms``, returns whatever
-        diagnostics are available.
+        matching fresh notification arrives within ``timeout_ms``, returns
+        an explicit timeout result instead of pretending stale cache is fresh.
 
         The ``timeout_ms`` is an *absolute* deadline from call start.
         """
         start = monotonic()
         deadline = start + timeout_ms / 1000.0
+        target_version = (
+            target_version if target_version is not None else self._document_versions.get(uri)
+        )
 
         # Ensure we have an event for this URI
         if uri not in self._diag_events:
@@ -327,11 +364,18 @@ class LSPClient:
         event = self._diag_events[uri]
         event.clear()
         self._pending_diagnostics.add(uri)
+        snapshot = None
+        if self._matching_snapshot(uri, target_version) is not None:
+            # A matching snapshot may arrive between didChange/didSave and the
+            # wait setup.  Treat it as an immediate event but still pass
+            # through the debounce window so a follow-up batch can supersede it.
+            event.set()
 
         try:
-            while True:
+            while snapshot is None:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
+                    cached_snapshot = self._diagnostic_snapshots.get(uri)
                     logger.debug(
                         "lsp: diagnostics timeout",
                         extra={
@@ -339,7 +383,10 @@ class LSPClient:
                                 "server_id": self.server_id,
                                 "uri": uri,
                                 "timeout_ms": timeout_ms,
-                                "diagnostics_count": len(self._diagnostics.get(uri, [])),
+                                "target_version": target_version,
+                                "cached_version": cached_snapshot.diagnostic_version
+                                if cached_snapshot is not None
+                                else None,
                             }
                         },
                     )
@@ -371,12 +418,34 @@ class LSPClient:
                         break
 
                 if settled:
-                    break
+                    snapshot = self._matching_snapshot(uri, target_version)
+                    if snapshot is not None:
+                        break
         finally:
             self._pending_diagnostics.discard(uri)
 
         duration_ms = int((monotonic() - start) * 1000)
-        diags = self._diagnostics.get(uri, [])
+        if snapshot is None:
+            diags: list[Diagnostic] = []
+            status = DiagnosticFreshness.TIMEOUT
+            message: str | None = "timed out waiting for fresh diagnostics"
+        else:
+            diags = snapshot.diagnostics
+            status = snapshot.freshness
+            message = snapshot.reason
+        result = DiagnosticWaitResult(
+            server_id=self.server_id,
+            uri=uri,
+            target_version=target_version,
+            status=status,
+            duration_ms=duration_ms,
+            snapshot=snapshot,
+            message=message,
+            error_count=sum(1 for d in diags if d.severity == DiagnosticSeverity.ERROR),
+            warning_count=sum(1 for d in diags if d.severity == DiagnosticSeverity.WARNING),
+        )
+        self._last_waits.append(result)
+        self._last_waits = self._last_waits[-20:]
         logger.debug(
             "lsp: diagnostics collected",
             extra={
@@ -384,15 +453,53 @@ class LSPClient:
                     "server_id": self.server_id,
                     "uri": uri,
                     "duration_ms": duration_ms,
+                    "target_version": target_version,
+                    "status": result.status.value,
+                    "diagnostic_version": snapshot.diagnostic_version if snapshot else None,
                     "count": len(diags),
-                    "error_count": sum(1 for d in diags if d.severity == DiagnosticSeverity.ERROR),
-                    "warning_count": sum(
-                        1 for d in diags if d.severity == DiagnosticSeverity.WARNING
-                    ),
+                    "error_count": result.error_count,
+                    "warning_count": result.warning_count,
                 }
             },
         )
-        return diags
+        return result
+
+    def diagnostic_status(self) -> dict[str, Any]:
+        """Return compact diagnostic status for observability and /lsp."""
+        return {
+            "tracked_uri_count": len(self._diagnostic_snapshots),
+            "pending_uri_count": len(self._pending_diagnostics),
+            "latest_sequence": self._diagnostic_sequence,
+            "latest_snapshots": [
+                {
+                    "uri": uri,
+                    "document_version": snapshot.document_version,
+                    "diagnostic_version": snapshot.diagnostic_version,
+                    "received_sequence": snapshot.received_sequence,
+                    "freshness": snapshot.freshness.value,
+                    "diagnostic_count": len(snapshot.diagnostics),
+                    "error_count": sum(
+                        1 for d in snapshot.diagnostics if d.severity == DiagnosticSeverity.ERROR
+                    ),
+                    "warning_count": sum(
+                        1 for d in snapshot.diagnostics if d.severity == DiagnosticSeverity.WARNING
+                    ),
+                }
+                for uri, snapshot in sorted(self._diagnostic_snapshots.items())
+            ],
+            "last_waits": [
+                {
+                    "uri": wait.uri,
+                    "target_version": wait.target_version,
+                    "status": wait.status.value,
+                    "duration_ms": wait.duration_ms,
+                    "error_count": wait.error_count,
+                    "warning_count": wait.warning_count,
+                    "message": wait.message,
+                }
+                for wait in self._last_waits
+            ],
+        }
 
     # ------------------------------------------------------------------
     # Query operations
@@ -460,7 +567,7 @@ class LSPClient:
 
     async def _request(
         self, method: str, params: dict[str, Any] | None, *, timeout: float = 30.0
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Send a JSON-RPC request and await the response."""
         process = self.process
         if process is None or process.stdin is None:
@@ -504,7 +611,7 @@ class LSPClient:
             )
             raise RuntimeError(f"LSP error: {json.dumps(error)}")
 
-        return response.get("result", {})
+        return response.get("result")
 
     async def _notify(self, method: str, params: dict[str, Any] | None) -> None:
         """Send a JSON-RPC notification (no response expected)."""
@@ -650,6 +757,8 @@ class LSPClient:
     def _handle_publish_diagnostics(self, params: dict[str, Any]) -> None:
         """Process a ``textDocument/publishDiagnostics`` notification."""
         uri = params.get("uri", "")
+        raw_version = params.get("version")
+        diagnostic_version = raw_version if isinstance(raw_version, int) else None
         raw_diagnostics = params.get("diagnostics", [])
 
         diagnostics: list[Diagnostic] = []
@@ -680,7 +789,53 @@ class LSPClient:
             except Exception:
                 continue
 
-        self._diagnostics[uri] = diagnostics
+        self._diagnostic_sequence += 1
+        received_sequence = self._diagnostic_sequence
+        document_version = self._document_versions.get(uri)
+        min_sequence = self._document_update_sequences.get(uri, 0)
+        freshness = _diagnostic_freshness(
+            document_version=document_version,
+            diagnostic_version=diagnostic_version,
+            received_sequence=received_sequence,
+            min_sequence=min_sequence,
+        )
+        reason = _diagnostic_freshness_reason(
+            document_version=document_version,
+            diagnostic_version=diagnostic_version,
+            received_sequence=received_sequence,
+            min_sequence=min_sequence,
+        )
+        snapshot = DiagnosticSnapshot(
+            server_id=self.server_id,
+            uri=uri,
+            document_version=document_version,
+            diagnostic_version=diagnostic_version,
+            received_sequence=received_sequence,
+            received_at_monotonic=monotonic(),
+            diagnostics=diagnostics,
+            freshness=freshness,
+            reason=reason,
+        )
+
+        previous = self._diagnostic_snapshots.get(uri)
+        if freshness is DiagnosticFreshness.STALE:
+            logger.debug(
+                "lsp: stale publishDiagnostics discarded",
+                extra={
+                    "extra_data": {
+                        "server_id": self.server_id,
+                        "uri": uri,
+                        "document_version": document_version,
+                        "diagnostic_version": diagnostic_version,
+                        "received_sequence": received_sequence,
+                        "reason": reason,
+                    }
+                },
+            )
+        else:
+            if previous is None or _should_replace_snapshot(previous, snapshot):
+                self._diagnostic_snapshots[uri] = snapshot
+                self._diagnostics[uri] = diagnostics
 
         # Signal waiters
         event = self._diag_events.get(uri)
@@ -693,6 +848,10 @@ class LSPClient:
                 "extra_data": {
                     "server_id": self.server_id,
                     "uri": uri,
+                    "document_version": document_version,
+                    "diagnostic_version": diagnostic_version,
+                    "received_sequence": received_sequence,
+                    "freshness": freshness.value,
                     "count": len(diagnostics),
                     "error_count": sum(
                         1 for d in diagnostics if d.severity == DiagnosticSeverity.ERROR
@@ -703,6 +862,32 @@ class LSPClient:
                 }
             },
         )
+
+    def _mark_document_updated(self, uri: str, version: int) -> None:
+        self._document_versions[uri] = version
+        self._document_update_sequences[uri] = self._diagnostic_sequence + 1
+        logger.debug(
+            "lsp: document version advanced",
+            extra={
+                "extra_data": {
+                    "server_id": self.server_id,
+                    "uri": uri,
+                    "version": version,
+                    "minimum_diagnostic_sequence": self._document_update_sequences[uri],
+                }
+            },
+        )
+
+    def _matching_snapshot(self, uri: str, target_version: int | None) -> DiagnosticSnapshot | None:
+        snapshot = self._diagnostic_snapshots.get(uri)
+        if snapshot is None or not snapshot.is_fresh:
+            return None
+        if target_version is None:
+            return snapshot
+        if snapshot.diagnostic_version is not None:
+            return snapshot if snapshot.diagnostic_version >= target_version else None
+        min_sequence = self._document_update_sequences.get(uri, 0)
+        return snapshot if snapshot.received_sequence >= min_sequence else None
 
     def _handle_log_message(self, params: dict[str, Any]) -> None:
         """Process a ``window/logMessage`` notification."""
@@ -748,6 +933,58 @@ class LSPClient:
     def is_alive(self) -> bool:
         """Check if the server process is still running."""
         return self.process is not None and self.process.returncode is None and not self._closed
+
+
+def _diagnostic_freshness(
+    *,
+    document_version: int | None,
+    diagnostic_version: int | None,
+    received_sequence: int,
+    min_sequence: int,
+) -> DiagnosticFreshness:
+    if diagnostic_version is not None and document_version is not None:
+        return (
+            DiagnosticFreshness.FRESH
+            if diagnostic_version >= document_version
+            else DiagnosticFreshness.STALE
+        )
+    if diagnostic_version is None:
+        return (
+            DiagnosticFreshness.FRESH_UNVERSIONED
+            if received_sequence >= min_sequence
+            else DiagnosticFreshness.STALE
+        )
+    return DiagnosticFreshness.FRESH
+
+
+def _diagnostic_freshness_reason(
+    *,
+    document_version: int | None,
+    diagnostic_version: int | None,
+    received_sequence: int,
+    min_sequence: int,
+) -> str | None:
+    if diagnostic_version is not None and document_version is not None:
+        if diagnostic_version < document_version:
+            return (
+                f"diagnostic version {diagnostic_version} is older than document "
+                f"version {document_version}"
+            )
+        return None
+    if diagnostic_version is None:
+        if received_sequence < min_sequence:
+            return (
+                f"unversioned diagnostics sequence {received_sequence} predates "
+                f"document update sequence {min_sequence}"
+            )
+        return "server did not include publishDiagnostics.version"
+    return None
+
+
+def _should_replace_snapshot(previous: DiagnosticSnapshot, incoming: DiagnosticSnapshot) -> bool:
+    if incoming.diagnostic_version is not None and previous.diagnostic_version is not None:
+        return incoming.diagnostic_version >= previous.diagnostic_version
+    return incoming.received_sequence >= previous.received_sequence
 
 
 def _position_params(file_path: str, line: int, character: int) -> dict[str, Any]:

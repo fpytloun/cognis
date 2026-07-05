@@ -8,6 +8,7 @@ import pytest
 from cognis.providers.llm.codex import CodexAuth
 from cognis.providers.llm.codex_transport import (
     DEFAULT_CODEX_HTTP_TIMEOUT,
+    DEFAULT_CODEX_STREAM_HTTP_TIMEOUT,
     DirectCodexResponsesStream,
     _codex_headers,
     _codex_payload,
@@ -76,7 +77,8 @@ def test_default_codex_timeout_does_not_use_httpx_five_second_read_timeout() -> 
     assert DEFAULT_CODEX_HTTP_TIMEOUT.connect == 30.0
     assert DEFAULT_CODEX_HTTP_TIMEOUT.write == 30.0
     assert DEFAULT_CODEX_HTTP_TIMEOUT.pool == 30.0
-    assert DEFAULT_CODEX_HTTP_TIMEOUT.read is None
+    assert DEFAULT_CODEX_HTTP_TIMEOUT.read == 90.0
+    assert DEFAULT_CODEX_STREAM_HTTP_TIMEOUT.read is None
 
 
 def test_direct_codex_bad_request_preserves_error_body_for_fallbacks() -> None:

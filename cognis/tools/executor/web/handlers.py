@@ -878,8 +878,8 @@ async def handle_web_map(arguments: dict[str, Any], context: ToolExecutionContex
     """Map a website's URLs.
 
     Uses Tavily's native mapper when ``fetch_backend=tavily``; otherwise
-    discovers URLs via ``sitemap.xml`` / ``sitemap_index.xml`` and falls
-    back to ``<a href>`` enumeration on the start page.
+    expands robots.txt/common sitemaps and falls back to a bounded link-only
+    crawl of the site.
     """
     url = arguments.get("url", "")
     if not url:
@@ -911,16 +911,10 @@ async def handle_web_map(arguments: dict[str, Any], context: ToolExecutionContex
             return tavily
         return await tavily.map_site(url, options=options if options else None)
 
-    from cognis.tools.executor.web.sitemap import discover_sitemap_urls
+    from cognis.tools.executor.web.sitemap import map_site_urls
 
-    limit = options.get("limit") if isinstance(options.get("limit"), int) else 200
-    same_host_only = not bool(options.get("allow_external"))
     try:
-        urls, source = await discover_sitemap_urls(
-            url,
-            limit=int(limit) if isinstance(limit, int) else 200,
-            same_host_only=same_host_only,
-        )
+        urls, source = await map_site_urls(url, options=options)
     except ValueError as exc:
         return ToolResult(output=str(exc), is_error=True)
 

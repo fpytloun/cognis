@@ -20,7 +20,7 @@ CODEX_CLIENT_VERSION = "0.124.0"
 CODEX_MODEL_CACHE_TTL_SECONDS = 300.0
 
 _CODEX_CATALOG: dict[str, dict[str, Any]] | None = None
-_CODEX_MODEL_INFO_OVERRIDES: dict[str, dict[str, int]] = {
+_CODEX_MODEL_INFO_OVERRIDES: dict[str, dict[str, Any]] = {
     # Spark is not present in the upstream Codex catalog and the ChatGPT
     # Responses backend currently rejects requests just above 128k input
     # tokens with context_length_exceeded. Keep this as a Cognis runtime
@@ -31,6 +31,17 @@ _CODEX_MODEL_INFO_OVERRIDES: dict[str, dict[str, int]] = {
         "max_context_window": 272_000,
         "max_output_tokens": 128_000,
     },
+}
+_CODEX_NATIVE_PDF_MODELS = {
+    # Keep the downstreamed Codex catalog JSON intact. The upstream catalog
+    # currently advertises text/image modalities only, while the Responses
+    # transport accepts PDFs for these models.
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+    "gpt-5.3-codex",
+    "gpt-5.2",
 }
 
 
@@ -235,6 +246,12 @@ def _codex_model_info_from_entry(
         "supports_tools": True,
         "supports_streaming": True,
         "supports_vision": "image" in input_modalities,
+        "supports_pdf_input": (
+            bool(item.get("supports_pdf_input"))
+            or "pdf" in input_modalities
+            or slug in _CODEX_NATIVE_PDF_MODELS
+        ),
+        "supports_file_input": bool(item.get("supports_file_input")) or "file" in input_modalities,
         "supports_reasoning": supports_reasoning,
         "reasoning_efforts": reasoning_efforts,
         "reasoning_summary_format": item.get("reasoning_summary_format"),

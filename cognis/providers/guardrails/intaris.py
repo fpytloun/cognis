@@ -518,6 +518,7 @@ class IntarisProvider:
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        before_seq: int | None = None,
         seqs: list[int] | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult:
@@ -526,6 +527,10 @@ class IntarisProvider:
             params["seqs"] = ",".join(str(seq) for seq in seqs)
         elif last_n is not None:
             params["last_n"] = last_n
+        elif before_seq is not None:
+            params["before_seq"] = before_seq
+            if limit:
+                params["limit"] = limit
         else:
             params["after_seq"] = after_seq
             if limit:

@@ -610,6 +610,58 @@ def test_non_admin_can_manage_own_chatgpt_oauth_provider(
         assert oauth_stub.cleared == ["chatgpt-owner"]
 
 
+def test_non_admin_anthropic_oauth_start_state_is_readable(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_llm_provider(
+                    session,
+                    provider_id="anthropic-owner",
+                    display_name="Owner Anthropic",
+                    location="controller",
+                    backend="litellm",
+                    owner_email="owner@example.com",
+                    config={
+                        "preset": "anthropic",
+                        "auth_config": {"mode": "oauth", "provider": "anthropic_subscription"},
+                        "models": [{"model_id": "claude-sonnet-4-5"}],
+                        "default_model": "claude-sonnet-4-5",
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
+        headers = _auth_headers(app, email="owner@example.com", role="user")
+
+        response = client.post(
+            "/api/v1/llm-providers/anthropic-owner/oauth/anthropic/start",
+            headers=headers,
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "pending"
+        assert body["authorization_url"].startswith("https://claude.ai/oauth/authorize?")
+
+        response = client.get(
+            "/api/v1/llm-providers/anthropic-owner/oauth/anthropic/status",
+            headers=headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "pending"
+
+
 def test_non_admin_cannot_manage_other_users_chatgpt_oauth_provider(
     monkeypatch: object, tmp_path: Path
 ) -> None:

@@ -10,10 +10,11 @@ import mimetypes
 import os
 import re
 import threading
+from builtins import BaseExceptionGroup
 from collections.abc import Iterable, Sequence
 from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
-from typing import Any, Protocol
+from typing import Any, Protocol, TextIO, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -22,6 +23,7 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from cognis import __version__ as COGNIS_VERSION
 from cognis.logging import get_logger
 from cognis.models.tool import (
     MCPServerConfig,
@@ -40,6 +42,7 @@ logger = get_logger(__name__)
 
 _MAX_SAFE_STDERR_LENGTH = 240
 _HTTP_READ_TIMEOUT_SECONDS = 300
+_DEFAULT_HTTP_USER_AGENT = f"Cognis/{COGNIS_VERSION}"
 HTTP_MCP_TRANSPORTS = {"sse", "streamable_http"}
 _SENSITIVE_FRAGMENT_PATTERNS = [
     re.compile(r"(?i)\b(bearer)\s+([^\s,;]+)"),
@@ -136,7 +139,7 @@ class _StderrLogger(io.RawIOBase):
     def writable(self) -> bool:
         return True
 
-    def write(self, b: bytes | bytearray) -> int:
+    def write(self, b: Any) -> int:
         return os.write(self._write_fd, b)
 
     def summary(self) -> str | None:
@@ -161,6 +164,7 @@ class _SessionMCPClient:
         )
         self._ready: asyncio.Future[None] | None = None
         self._tool_schemas: dict[str, dict[str, Any]] = {}
+        self._last_owner_error: BaseException | None = None
 
     @staticmethod
     def _consume_future_result(future: asyncio.Future[Any]) -> None:
@@ -170,6 +174,9 @@ class _SessionMCPClient:
     async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[Any, Any]:
         raise NotImplementedError
 
+    async def _probe_timeout_authorization(self) -> MCPClientError | None:
+        return None
+
     async def connect(self) -> None:
         """Open the MCP transport and perform initialize."""
 
@@ -178,11 +185,37 @@ class _SessionMCPClient:
         loop = asyncio.get_running_loop()
         self._requests = asyncio.Queue()
         self._ready = loop.create_future()
+        self._last_owner_error = None
         self._task = asyncio.create_task(self._run_session_owner(), name=f"mcp:{self.config.name}")
+        ready = self._ready
         try:
-            await asyncio.wait_for(self._ready, timeout=self.config.connect_timeout_seconds)
+            await asyncio.wait_for(
+                asyncio.shield(ready),
+                timeout=self.config.connect_timeout_seconds,
+            )
         except TimeoutError as exc:
+            owner_task = self._task
             await self.close(suppress_cancelled=True)
+            late_error = _coerce_future_error(
+                self.config.name,
+                "initialize",
+                ready,
+            )
+            if late_error is None and self._last_owner_error is not None:
+                late_error = _coerce_client_error(
+                    self.config.name,
+                    "initialize",
+                    self._last_owner_error,
+                )
+            late_error = late_error or _coerce_owner_task_error(
+                self.config.name,
+                "initialize",
+                owner_task,
+            )
+            if late_error is None or not late_error.authorization_required:
+                late_error = await self._probe_timeout_authorization()
+            if late_error is not None and late_error.authorization_required:
+                raise late_error from exc
             raise MCPClientError(
                 self.config.name,
                 "initialize",
@@ -311,6 +344,7 @@ class _SessionMCPClient:
             )
             await session.initialize()
         except Exception as exc:
+            self._last_owner_error = exc
             await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
             if not self._ready.done():
                 self._ready.set_exception(_coerce_client_error(self.config.name, "initialize", exc))
@@ -327,6 +361,7 @@ class _SessionMCPClient:
                         future.set_result(None)
                     break
                 try:
+                    result: Any
                     if operation == "list_tools":
                         result = await session.list_tools()
                         if hasattr(session, "_tool_output_schemas"):
@@ -355,7 +390,11 @@ class _SessionMCPClient:
                     break
                 if not future.done():
                     future.set_exception(RuntimeError("MCP client closed"))
-            await exit_stack.aclose()
+            try:
+                await exit_stack.aclose()
+            except BaseException as exc:
+                self._last_owner_error = exc
+                raise
 
 
 class StdioMCPClient(_SessionMCPClient):
@@ -398,7 +437,7 @@ class StdioMCPClient(_SessionMCPClient):
         self._stderr_logger = _StderrLogger(self.config.name)
         try:
             return await exit_stack.enter_async_context(
-                stdio_client(params, errlog=self._stderr_logger)
+                stdio_client(params, errlog=cast(TextIO, self._stderr_logger))
             )
         except Exception as exc:
             stderr_summary = (
@@ -445,7 +484,7 @@ class SSEMCPClient(_SessionMCPClient):
 
     def __init__(self, config: MCPServerConfig, headers: dict[str, str] | None = None) -> None:
         super().__init__(config)
-        self.headers = headers
+        self.headers = _with_default_http_headers(headers)
 
     async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[Any, Any]:
         if self.config.url is None:
@@ -465,13 +504,23 @@ class SSEMCPClient(_SessionMCPClient):
             )
         )
 
+    async def _probe_timeout_authorization(self) -> MCPClientError | None:
+        if self.config.url is None:
+            return None
+        return await _probe_http_authorization(
+            server_name=self.config.name,
+            url=self.config.url,
+            headers=self.headers,
+            timeout_seconds=self.config.connect_timeout_seconds,
+        )
+
 
 class StreamableHTTPMCPClient(_SessionMCPClient):
     """MCP client for the streamable HTTP transport."""
 
     def __init__(self, config: MCPServerConfig, headers: dict[str, str] | None = None) -> None:
         super().__init__(config)
-        self.headers = headers
+        self.headers = _with_default_http_headers(headers)
 
     async def _enter_transport(self, exit_stack: AsyncExitStack) -> tuple[Any, Any]:
         if self.config.url is None:
@@ -499,6 +548,45 @@ class StreamableHTTPMCPClient(_SessionMCPClient):
         )
         return read_stream, write_stream
 
+    async def _probe_timeout_authorization(self) -> MCPClientError | None:
+        if self.config.url is None:
+            return None
+        return await _probe_http_authorization(
+            server_name=self.config.name,
+            url=normalize_streamable_http_url(self.config.url),
+            headers=self.headers,
+            timeout_seconds=self.config.connect_timeout_seconds,
+        )
+
+
+async def _probe_http_authorization(
+    *,
+    server_name: str,
+    url: str,
+    headers: dict[str, str],
+    timeout_seconds: int,
+) -> MCPClientError | None:
+    """Best-effort HTTP auth probe after an MCP initialize timeout."""
+
+    try:
+        async with (
+            httpx.AsyncClient(
+                headers=headers,
+                follow_redirects=True,
+                timeout=httpx.Timeout(max(timeout_seconds, 1), read=2),
+            ) as client,
+            client.stream("GET", url) as response,
+        ):
+            if response.status_code not in {401, 403}:
+                return None
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        error = _coerce_client_error(server_name, "initialize", exc)
+        return error if error.authorization_required else None
+    except httpx.HTTPError:
+        return None
+    return None
+
 
 def normalize_streamable_http_url(url: str) -> str:
     """Return a redirect-resistant streamable HTTP MCP endpoint URL."""
@@ -509,6 +597,13 @@ def normalize_streamable_http_url(url: str) -> str:
             (parsed.scheme, parsed.netloc, parsed.path[:-1], parsed.query, parsed.fragment)
         )
     return url
+
+
+def _with_default_http_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    resolved = dict(headers or {})
+    if not any(key.lower() == "user-agent" for key in resolved):
+        resolved["User-Agent"] = _DEFAULT_HTTP_USER_AGENT
+    return resolved
 
 
 def mcp_tools_to_definitions(
@@ -527,10 +622,14 @@ def mcp_tools_to_definitions(
         parameters = tool.get("inputSchema")
         if not isinstance(parameters, dict):
             parameters = {"type": "object", "properties": {}}
+        else:
+            parameters = _strip_json_schema_metadata(parameters)
         definitions.append(
             ToolDefinition(
                 name=sanitize_mcp_tool_name(server_name, name),
-                description=str(tool.get("description") or f"MCP tool {name}"),
+                description=_clamp_mcp_description(
+                    str(tool.get("description") or f"MCP tool {name}")
+                ),
                 parameters=parameters,
                 source=ToolSource(
                     type="local_mcp",
@@ -539,10 +638,35 @@ def mcp_tools_to_definitions(
                     raw_tool_name=name,
                 ),
                 category="mcp",
+                content_trust="untrusted",
                 timeout_seconds=timeout_seconds,
             )
         )
     return disambiguate_mcp_tool_name_collisions(definitions)
+
+
+_MCP_DESCRIPTION_MAX_CHARS = 1024
+_MCP_DESCRIPTION_TAIL = " ... (full description via search_tools)"
+_JSON_SCHEMA_METADATA_KEYS = {"$schema", "$id", "$comment"}
+
+
+def _clamp_mcp_description(description: str) -> str:
+    if len(description) <= _MCP_DESCRIPTION_MAX_CHARS:
+        return description
+    prefix_len = max(0, _MCP_DESCRIPTION_MAX_CHARS - len(_MCP_DESCRIPTION_TAIL))
+    return description[:prefix_len].rstrip() + _MCP_DESCRIPTION_TAIL
+
+
+def _strip_json_schema_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_json_schema_metadata(item)
+            for key, item in value.items()
+            if key not in _JSON_SCHEMA_METADATA_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_json_schema_metadata(item) for item in value]
+    return value
 
 
 def disambiguate_mcp_tool_name_collisions(
@@ -621,7 +745,7 @@ async def _close_exit_stack_after_connect_failure(
 def runtime_mcp_server_key(config: MCPServerConfig | ToolSource) -> str:
     """Return the immutable routing key for an MCP server."""
 
-    return (
+    return str(
         getattr(config, "server_id", None)
         or getattr(config, "server_name", None)
         or getattr(config, "name", "unknown")
@@ -844,11 +968,11 @@ def _redact_match(match: re.Match[str]) -> str:
     return "[redacted]"
 
 
-def _is_timeout(exc: Exception) -> bool:
+def _is_timeout(exc: BaseException) -> bool:
     return "timed out" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
 
 
-def _error_class(exc: Exception) -> str:
+def _error_class(exc: BaseException) -> str:
     return "timeout" if _is_timeout(exc) else type(exc).__name__.lower()
 
 
@@ -859,7 +983,7 @@ def _iter_exception_tree(exc: BaseException) -> Iterable[BaseException]:
             yield from _iter_exception_tree(child)
 
 
-def _coerce_client_error(server_name: str, phase: str, exc: Exception) -> MCPClientError:
+def _coerce_client_error(server_name: str, phase: str, exc: BaseException) -> MCPClientError:
     if isinstance(exc, MCPClientError):
         return exc
     status_code = None
@@ -892,3 +1016,39 @@ def _coerce_client_error(server_name: str, phase: str, exc: Exception) -> MCPCli
         auth_error=auth_error,
         www_authenticate=_safe_message(www_authenticate) if www_authenticate else None,
     )
+
+
+def _coerce_owner_task_error(
+    server_name: str,
+    phase: str,
+    task: asyncio.Task[None] | None,
+) -> MCPClientError | None:
+    """Return a structured owner-task error when timeout cleanup exposed one."""
+
+    if task is None or not task.done() or task.cancelled():
+        return None
+    try:
+        exc = task.exception()
+    except (asyncio.CancelledError, Exception):
+        return None
+    if exc is None:
+        return None
+    return _coerce_client_error(server_name, phase, exc)
+
+
+def _coerce_future_error(
+    server_name: str,
+    phase: str,
+    future: asyncio.Future[None] | None,
+) -> MCPClientError | None:
+    """Return a structured future error when a late initialize result arrived."""
+
+    if future is None or not future.done() or future.cancelled():
+        return None
+    try:
+        exc = future.exception()
+    except (asyncio.CancelledError, Exception):
+        return None
+    if not isinstance(exc, Exception):
+        return None
+    return _coerce_client_error(server_name, phase, exc)

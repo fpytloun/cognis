@@ -33,6 +33,23 @@ from cognis.tools.executor.lsp.runtime import (
 
 _logger = get_logger(__name__)
 
+
+def _inference_chunk_timeout_seconds() -> float:
+    """Max inter-chunk wait for executor-routed inference streams.
+
+    Executors forward provider liveness markers as chunks, so a healthy
+    provider produces at least one chunk per liveness event even during long
+    reasoning phases. This timeout is a dead-man's switch for a genuinely
+    stalled executor/provider, not a policy limit — the previous hard-coded
+    120s killed long thinking phases whose liveness chunks were filtered.
+    """
+    raw = os.environ.get("COGNIS_EXECUTOR_INFERENCE_CHUNK_TIMEOUT_SECONDS", "300")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 300.0
+    return value if value > 0 else 300.0
+
 # ---------------------------------------------------------------------------
 # Prometheus metrics
 # ---------------------------------------------------------------------------
@@ -179,6 +196,7 @@ class WebSocketExecutorConnection:
         self._channel_message_callbacks: dict[str, Any] = {}
         self._channel_status_callbacks: dict[str, Any] = {}
         self._background_shell_completed_callback: Any | None = None
+        self._oauth_loopback_callback: Any | None = None
 
     @property
     def connected(self) -> bool:
@@ -384,8 +402,9 @@ class WebSocketExecutorConnection:
             await self.rpc_call("llm.complete", params, timeout=10.0)
 
             # Yield chunks from the queue until llm.done arrives
+            chunk_timeout = _inference_chunk_timeout_seconds()
             while True:
-                chunk = await asyncio.wait_for(queue.get(), timeout=120.0)
+                chunk = await asyncio.wait_for(queue.get(), timeout=chunk_timeout)
                 if chunk.get("done"):
                     yield chunk
                     break
@@ -453,6 +472,34 @@ class WebSocketExecutorConnection:
         return await self.rpc_call(
             "shell.background_status",
             {"include_completed": include_completed},
+            timeout=10.0,
+        )
+
+    async def oauth_loopback_start(
+        self,
+        *,
+        state: str,
+        ttl_seconds: int,
+        callback_path: str = "/oauth/callback",
+    ) -> dict[str, Any]:
+        """Start a temporary executor-local OAuth loopback callback listener."""
+
+        return await self.rpc_call(
+            "oauth.loopback_start",
+            {
+                "state": state,
+                "ttl_seconds": ttl_seconds,
+                "callback_path": callback_path,
+            },
+            timeout=10.0,
+        )
+
+    async def oauth_loopback_stop(self, *, listener_id: str) -> dict[str, Any]:
+        """Stop a temporary executor-local OAuth loopback callback listener."""
+
+        return await self.rpc_call(
+            "oauth.loopback_stop",
+            {"listener_id": listener_id},
             timeout=10.0,
         )
 
@@ -548,6 +595,15 @@ class WebSocketExecutorConnection:
                     cb = self._channel_status_callbacks.get(acct_id) if acct_id else None
                     if cb is not None:
                         cb(params.get("status", {}))
+                elif method == "oauth.loopback_callback":
+                    params = data.get("params", {})
+                    if self._oauth_loopback_callback is not None:
+                        asyncio.create_task(
+                            self._oauth_loopback_callback(
+                                self.executor_id,
+                                params if isinstance(params, dict) else {},
+                            )
+                        )
                 else:
                     _logger.debug(
                         "executor_ws: unknown notification",
@@ -595,6 +651,11 @@ class WebSocketExecutorConnection:
 
         self._background_shell_completed_callback = callback
 
+    def register_oauth_loopback_callback(self, callback: Any | None) -> None:
+        """Register a callback for executor-local OAuth callback notifications."""
+
+        self._oauth_loopback_callback = callback
+
     def _fail_pending(self, reason: str) -> None:
         """Fail all pending RPC futures with a disconnection error."""
         for future in self._pending.values():
@@ -623,6 +684,7 @@ class WebSocketExecutorProvider:
         self._ready_events: dict[str, asyncio.Event] = {}
         self._connection_waiters: dict[str, set[asyncio.Event]] = {}
         self._background_shell_completed_callback: Any | None = None
+        self._oauth_loopback_callback: Any | None = None
 
     # ------------------------------------------------------------------
     # Called by the WS endpoint when an executor connects
@@ -644,6 +706,7 @@ class WebSocketExecutorProvider:
         """
         conn = WebSocketExecutorConnection(ws, executor_id, capabilities or ExecutorCapabilities())
         conn.register_background_shell_completed_callback(self._background_shell_completed_callback)
+        conn.register_oauth_loopback_callback(self._oauth_loopback_callback)
         conn.start_receiver()
 
         # If this is a reconnection, close the old connection so its receiver
@@ -747,6 +810,13 @@ class WebSocketExecutorProvider:
         self._background_shell_completed_callback = callback
         for connection in self._connections.values():
             connection.register_background_shell_completed_callback(callback)
+
+    def register_oauth_loopback_callback(self, callback: Any | None) -> None:
+        """Register callback for all current and future OAuth loopback callbacks."""
+
+        self._oauth_loopback_callback = callback
+        for connection in self._connections.values():
+            connection.register_oauth_loopback_callback(callback)
 
     def first_ready_connection(self) -> WebSocketExecutorConnection | None:
         for executor_id, conn in self._connections.items():

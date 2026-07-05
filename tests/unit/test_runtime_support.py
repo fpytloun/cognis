@@ -12,6 +12,7 @@ from cognis.api.runtime_support import (
     _resolve_intaris_mcp_tools,
     mcp_server_assignment_key,
     select_static_tools,
+    tool_disabled_by_agent_config,
 )
 from cognis.core.executor_policy import ExecutorPolicy
 from cognis.core.tool_router import ToolRoute, ToolRouter
@@ -77,6 +78,28 @@ def test_mcp_server_assignment_key_prefers_stable_server_id() -> None:
     tool = _mcp_tool(name="search", server_name="github", server_id="srv-github")
 
     assert mcp_server_assignment_key(tool.source) == "local_mcp:srv-github"
+
+
+def test_legacy_mcp_disabled_category_does_not_disable_mcp_tools() -> None:
+    tool = _mcp_tool(name="search", server_name="github", server_id="srv-github")
+
+    assert not tool_disabled_by_agent_config(
+        tool,
+        disabled_categories={"mcp"},
+        disabled_tools=set(),
+        disabled_mcp_servers=set(),
+    )
+
+
+def test_mcp_server_disable_still_disables_mcp_tools() -> None:
+    tool = _mcp_tool(name="search", server_name="github", server_id="srv-github")
+
+    assert tool_disabled_by_agent_config(
+        tool,
+        disabled_categories=set(),
+        disabled_tools=set(),
+        disabled_mcp_servers={"local_mcp:srv-github"},
+    )
 
 
 def test_manage_agents_is_default_off_without_opt_in() -> None:

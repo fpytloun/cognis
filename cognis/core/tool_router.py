@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from fnmatch import fnmatchcase
 from time import monotonic, perf_counter
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from prometheus_client import Counter
@@ -24,6 +25,7 @@ from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.core.chat_modes import is_plan_hidden_tool
 from cognis.core.content_refs import (
+    build_deliverable_public_url,
     continuation_scope_task_id,
     get_accessible_deliverable_ref,
     is_deliverable_ref,
@@ -87,7 +89,7 @@ from cognis.tools.mcp import (
     _normalize_call_result,
     build_mcp_client,
 )
-from cognis.tools.registry import ToolExecutionContext, ToolRegistry
+from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 TOOL_ROUTE_DECISIONS = Counter(
     "cognis_tool_route_decisions_total",
@@ -118,6 +120,23 @@ def _mcp_oauth_setup_failed_result(
             "retryable": retryable,
         },
     )
+
+
+def _effective_content_trust(
+    registered_tool: RegisteredTool, result: ToolResult | None = None
+) -> str:
+    definition = registered_tool.definition
+    if definition.content_trust == "untrusted":
+        return "untrusted"
+    if definition.category == "mcp" or definition.source.type in {"intaris_mcp", "local_mcp"}:
+        return "untrusted"
+    if (
+        isinstance(result, ToolResult)
+        and isinstance(result.metadata, dict)
+        and result.metadata.get("content_trust") == "untrusted"
+    ):
+        return "untrusted"
+    return definition.content_trust
 
 
 def _mcp_oauth_authorization_required_result(
@@ -194,6 +213,18 @@ logger = get_logger(__name__)
 ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 _MAX_BROWSER_UPLOAD_BYTES = 50 * 1024 * 1024
 _MAX_BROWSER_UPLOAD_FILES = 10
+_MAX_ARTIFACT_VALUE_REF_BYTES = 50 * 1024 * 1024
+_ARTIFACT_VALUE_REF_PREFIX = "$artifact:"
+_ARTIFACT_VALUE_REF_FIELDS = frozenset(
+    {
+        "content_b64",
+        "filename",
+        "mime_type",
+        "size_bytes",
+        "signed_url",
+        "public_url",
+    }
+)
 _GUARDRAILS_RUNTIME_CONTEXT_KEYS = (
     "workspace_root",
     "working_directory",
@@ -435,6 +466,17 @@ class ToolRouter:
                 ),
                 source="chat_mode",
             )
+
+        # When guardrails are disabled for this agent, auto-approve all tools
+        # (including non-bypassable ones — guardrails=none means no guardrails).
+        capabilities = getattr(agent, "capabilities", None)
+        if capabilities is not None and not capabilities.guardrails_enabled:
+            return PermissionDecision(
+                decision="approve",
+                reasoning="Guardrails disabled for this agent (capability-disabled).",
+                source="capability-disabled",
+            )
+
         if self._is_non_bypassable(
             registered_tool.definition.name, registered_tool.definition.non_bypassable
         ):
@@ -763,25 +805,6 @@ class ToolRouter:
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
             )
-        if route is ToolRoute.LOCAL and registered_tool is not None:
-            validation_error = validate_tool_arguments(
-                tool_call.name,
-                tool_call.arguments,
-                schema=registered_tool.definition.parameters,
-            )
-            if validation_error is not None:
-                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
-                return self._sanitize_result(
-                    tool_call.name,
-                    ToolResult(
-                        output=json.dumps(validation_error.as_tool_result()),
-                        is_error=True,
-                        metadata={"code": "invalid_tool_arguments"},
-                    ),
-                    _tool_max_size(registry, tool_call.name),
-                    call_id=cid,
-                    runtime_metadata=tool_call.runtime_metadata,
-                )
         if route is ToolRoute.ORCHESTRATION:
             result, _child = await handle_delegate_tool_call(tool_call)
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
@@ -793,7 +816,13 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.MEMORY:
-            if self.memory is None:
+            capabilities = getattr(agent, "capabilities", None)
+            if capabilities is not None and not capabilities.memory_enabled:
+                result = ToolResult(
+                    output="Memory backend is disabled for this agent.",
+                    is_error=True,
+                )
+            elif self.memory is None:
                 result = ToolResult(output="Memory provider not available.", is_error=True)
             else:
                 from cognis.runtime_context import current_user_email
@@ -938,7 +967,7 @@ class ToolRouter:
                     runtime_metadata=tool_call.runtime_metadata,
                 )
             decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
-            eval_meta: dict[str, Any] = {
+            eval_meta = {
                 "decision": decision.decision,
                 "reasoning": decision.reasoning,
                 "source": decision.source,
@@ -1001,7 +1030,7 @@ class ToolRouter:
             # Skill management mutations go through guardrails evaluation
             # (non-bypassable tools are always evaluated).
             decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
-            eval_meta: dict[str, Any] = {
+            eval_meta = {
                 "decision": decision.decision,
                 "reasoning": decision.reasoning,
                 "source": decision.source,
@@ -1045,7 +1074,7 @@ class ToolRouter:
                     tool_name=tool_call.name,
                     arguments=dict(tool_call.arguments),
                     session_factory=self._session_factory,
-                    user_email=current_user_email.get(),
+                    user_email=current_user_email.get() or session.user_email,
                     llm=self.llm,
                     artifact_store=self.artifact_store,
                     current_agent_id=current_agent_id.get() or agent.agent_id,
@@ -1061,7 +1090,7 @@ class ToolRouter:
                 "skill_asset_delete",
             }
             needs_refresh = tool_call.name in _SKILL_MUTATION_TOOLS and not result.is_error
-            combined_meta: dict[str, Any] = {"evaluation": eval_meta}
+            combined_meta = {"evaluation": eval_meta}
             if needs_refresh:
                 combined_meta["skill_epoch_stale"] = True
             if result.metadata is not None:
@@ -1087,7 +1116,7 @@ class ToolRouter:
                     arguments=dict(tool_call.arguments),
                     session_factory=self._session_factory,
                     scheduler=self._scheduler,
-                    user_email=current_user_email.get(),
+                    user_email=current_user_email.get() or session.user_email,
                     agent_id=agent.agent_id if agent else None,
                 )
             outcome = "success" if not result.is_error else "failure"
@@ -1100,6 +1129,17 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.INTARIS_MCP:
+            try:
+                tool_call = await self._prepare_intaris_mcp_tool_call(tool_call, session)
+            except ValueError as exc:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(output=str(exc), is_error=True),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
             result = await self._call_intaris_mcp(tool_call, session, registry)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
             if (
@@ -1108,7 +1148,7 @@ class ToolRouter:
                 and result.metadata.get("decision") == "escalate"
                 and result.metadata.get("call_id")
             ):
-                eval_meta: dict[str, Any] = {
+                eval_meta = {
                     "decision": "escalate",
                     "reasoning": result.metadata.get("reasoning"),
                     "source": "guardrails",
@@ -1156,9 +1196,28 @@ class ToolRouter:
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
             )
+        if route is ToolRoute.LOCAL and registered_tool is not None:
+            validation_error = validate_tool_arguments(
+                guardrails_tool_call.name,
+                guardrails_tool_call.arguments,
+                schema=registered_tool.definition.parameters,
+            )
+            if validation_error is not None:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=json.dumps(validation_error.as_tool_result()),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    ),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
 
         decision = await self.evaluate_tool_call(guardrails_tool_call, agent, session, registry)
-        eval_meta: dict[str, Any] = {
+        eval_meta = {
             "decision": decision.decision,
             "reasoning": decision.reasoning,
             "source": decision.source,
@@ -1217,6 +1276,25 @@ class ToolRouter:
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
             )
+        if route is ToolRoute.LOCAL and registered_tool is not None:
+            validation_error = validate_tool_arguments(
+                tool_call.name,
+                tool_call.arguments,
+                schema=registered_tool.definition.parameters,
+            )
+            if validation_error is not None:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=json.dumps(validation_error.as_tool_result()),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    ),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
 
         registered_tool = registry.get(tool_call.name)
         if registered_tool is None:
@@ -1256,6 +1334,7 @@ class ToolRouter:
                 registered_tool.definition.max_result_size,
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
+                content_trust=_effective_content_trust(registered_tool, result),
             )
         try:
             controller_result = await self._execute_controller_oauth_mcp_if_applicable(
@@ -1266,13 +1345,15 @@ class ToolRouter:
             if controller_result is not None:
                 result = controller_result
             else:
+                inner_timeout = registered_tool.definition.timeout_seconds
+                outer_timeout = inner_timeout + 10 if inner_timeout > 0 else inner_timeout
                 result = await asyncio.wait_for(
                     executor.tool_execute(
                         scoped_tool_call,
-                        timeout_seconds=registered_tool.definition.timeout_seconds,
+                        timeout_seconds=inner_timeout,
                         output_chunk_callback=output_chunk_callback,
                     ),
-                    timeout=registered_tool.definition.timeout_seconds,
+                    timeout=outer_timeout,
                 )
                 result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
@@ -1282,7 +1363,11 @@ class ToolRouter:
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
             result = ToolResult(
-                output="Tool execution timed out.",
+                output=(
+                    "Tool execution timed out. If this was a write/edit operation, "
+                    "the write may have succeeded on the executor; read the target file "
+                    "before retrying."
+                ),
                 is_error=True,
                 metadata={"code": "tool_execution_timeout", "retryable": False},
             )
@@ -1293,6 +1378,7 @@ class ToolRouter:
                 registered_tool.definition.max_result_size,
                 call_id=cid,
                 runtime_metadata=tool_call.runtime_metadata,
+                content_trust=_effective_content_trust(registered_tool, result),
             )
         # Attach evaluation metadata to the result
         if result.metadata is None:
@@ -1310,6 +1396,7 @@ class ToolRouter:
             registered_tool.definition.max_result_size,
             call_id=cid,
             runtime_metadata=tool_call.runtime_metadata,
+            content_trust=_effective_content_trust(registered_tool, result),
         )
 
     async def _execute_controller_oauth_mcp_if_applicable(
@@ -1380,10 +1467,10 @@ class ToolRouter:
                 transaction_id=token_result.transaction_id,
                 authorization_url=token_result.authorization_url,
                 authorization_expires_at=getattr(token_result, "authorization_expires_at", None),
-                flow=token_result.flow,
-                verification_uri=token_result.verification_uri,
-                verification_uri_complete=token_result.verification_uri_complete,
-                user_code=token_result.user_code,
+                flow=getattr(token_result, "flow", None),
+                verification_uri=getattr(token_result, "verification_uri", None),
+                verification_uri_complete=getattr(token_result, "verification_uri_complete", None),
+                user_code=getattr(token_result, "user_code", None),
             )
 
         if isinstance(tool_timeout_raw, int | float | str):
@@ -1501,7 +1588,7 @@ class ToolRouter:
             if isinstance(tool_call.runtime_metadata.get("resolved_provider_id"), str)
             else None
         )
-        if resolved_model:
+        if resolved_model and self.llm is not None:
             try:
                 model_info = await self.llm.get_model_info(
                     resolved_model,
@@ -1707,6 +1794,9 @@ class ToolRouter:
                     item.setdefault("size_bytes", metadata["size_bytes"])
                 sanitized_assets.append(item)
             arguments["assets"] = sanitized_assets
+        arguments = await self._sanitize_artifact_value_refs_for_guardrails(
+            arguments, session, tool_call
+        )
         arguments = self._sanitize_sensitive_refs_for_guardrails(arguments, root=True)
         return tool_call.model_copy(update={"arguments": arguments})
 
@@ -1796,6 +1886,7 @@ class ToolRouter:
                     item.setdefault("filename", filename)
                 resolved_assets.append(item)
             arguments["assets"] = resolved_assets
+        arguments = await self._resolve_artifact_value_refs(arguments, session, tool_call)
         arguments = await self._resolve_sensitive_refs(arguments, session, agent, tool_call)
         return tool_call.model_copy(update={"arguments": arguments})
 
@@ -1835,6 +1926,123 @@ class ToolRouter:
             return "<resolved-at-execution>"
         return value
 
+    async def _sanitize_artifact_value_refs_for_guardrails(
+        self,
+        value: Any,
+        session: SessionModel,
+        tool_call: ToolCall,
+    ) -> Any:
+        """Resolve artifact value refs to bounded guardrails-safe metadata."""
+
+        if isinstance(value, dict):
+            return {
+                str(key): await self._sanitize_artifact_value_refs_for_guardrails(
+                    item, session, tool_call
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                await self._sanitize_artifact_value_refs_for_guardrails(item, session, tool_call)
+                for item in value
+            ]
+        if not isinstance(value, str) or not value.startswith(_ARTIFACT_VALUE_REF_PREFIX):
+            return value
+        content_ref, field = self._parse_artifact_value_ref(value)
+        metadata = await self._get_accessible_content_ref_metadata(
+            content_ref,
+            session.user_email,
+            scope_task_id=self._content_ref_scope_task_id(tool_call),
+        )
+        if field == "filename":
+            return metadata["filename"]
+        if field == "mime_type":
+            return metadata["mime_type"]
+        if field == "size_bytes":
+            return metadata["size_bytes"]
+        if field in {"content_b64", "signed_url", "public_url"}:
+            size = int(metadata.get("size_bytes") or 0)
+            label = "artifact-content-b64" if field == "content_b64" else "artifact-public-url"
+            return (
+                f"<{label} resolved at execution: artifact_id={content_ref} "
+                f"filename={metadata['filename']} mime_type={metadata['mime_type']} "
+                f"size_bytes={size}>"
+            )
+        raise ValueError(f"Unsupported artifact value ref field: {field}")
+
+    async def _resolve_artifact_value_refs(
+        self,
+        value: Any,
+        session: SessionModel,
+        tool_call: ToolCall,
+    ) -> Any:
+        """Resolve exact-string artifact value refs in arbitrary tool arguments."""
+
+        if isinstance(value, dict):
+            return {
+                str(key): await self._resolve_artifact_value_refs(item, session, tool_call)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                await self._resolve_artifact_value_refs(item, session, tool_call) for item in value
+            ]
+        if not isinstance(value, str) or not value.startswith(_ARTIFACT_VALUE_REF_PREFIX):
+            return value
+        content_ref, field = self._parse_artifact_value_ref(value)
+        scope_task_id = self._content_ref_scope_task_id(tool_call)
+        if field == "content_b64":
+            content, _mime_type, _filename = await self._load_binary_content_ref(
+                content_ref,
+                session.user_email,
+                scope_task_id=scope_task_id,
+            )
+            if len(content) > _MAX_ARTIFACT_VALUE_REF_BYTES:
+                raise ValueError(
+                    "Artifact value ref payload is too large: "
+                    f"{len(content)} bytes exceeds {_MAX_ARTIFACT_VALUE_REF_BYTES} bytes"
+                )
+            return base64.b64encode(content).decode("ascii")
+        if field in {"filename", "mime_type", "size_bytes"}:
+            metadata = await self._get_accessible_content_ref_metadata(
+                content_ref,
+                session.user_email,
+                scope_task_id=scope_task_id,
+            )
+            return metadata[field]
+        if field in {"signed_url", "public_url"}:
+            return await self._get_content_ref_public_url(
+                content_ref,
+                session.user_email,
+                scope_task_id=scope_task_id,
+            )
+        raise ValueError(f"Unsupported artifact value ref field: {field}")
+
+    async def _prepare_intaris_mcp_tool_call(
+        self,
+        tool_call: ToolCall,
+        session: SessionModel,
+    ) -> ToolCall:
+        arguments = await self._resolve_artifact_value_refs(tool_call.arguments, session, tool_call)
+        return tool_call.model_copy(update={"arguments": arguments})
+
+    @staticmethod
+    def _parse_artifact_value_ref(ref: str) -> tuple[str, str]:
+        raw = ref[len(_ARTIFACT_VALUE_REF_PREFIX) :].strip()
+        if "." not in raw:
+            raise ValueError("Artifact value ref must use $artifact:<artifact_id>.<field> syntax")
+        content_ref, field = raw.rsplit(".", 1)
+        content_ref = content_ref.strip()
+        field = field.strip()
+        if not content_ref:
+            raise ValueError("Artifact value ref is missing artifact_id")
+        if field not in _ARTIFACT_VALUE_REF_FIELDS:
+            supported = ", ".join(sorted(_ARTIFACT_VALUE_REF_FIELDS))
+            raise ValueError(
+                f"Unsupported artifact value ref field: {field} (expected {supported})"
+            )
+        return content_ref, field
+
     async def _resolve_sensitive_refs(
         self,
         arguments: dict[str, Any],
@@ -1867,6 +2075,12 @@ class ToolRouter:
             ]
         auth_state_ref_raw = resolved.get("auth_state_ref")
         if isinstance(auth_state_ref_raw, str) and auth_state_ref_raw.strip():
+            if self.credentials_provider is None:
+                raise CredentialAccessError(
+                    "credentials_unavailable",
+                    "Credential resolution not available for auth_state_ref.",
+                    hint=_AUTH_STATE_KIND_HINT,
+                )
             auth_state_ref = auth_state_ref_raw.strip()
             cred = await self._resolve_credential_value(auth_state_ref, session, agent)
             credential_id = auth_state_ref[len("$credential:") :].split(".", 1)[0]
@@ -2076,9 +2290,10 @@ class ToolRouter:
     ) -> CredentialResolution:
         if self.credentials_provider is None:
             raise ValueError("Credential resolution not available")
-        return await self.credentials_provider.resolve_ref(
+        resolution = await self.credentials_provider.resolve_ref(
             ref, agent=agent, user_email=session.user_email
         )
+        return cast(CredentialResolution, resolution)
 
     async def _persist_browser_auth_state_if_needed(
         self, result: ToolResult, session: SessionModel, agent: AgentDefinition
@@ -2256,6 +2471,40 @@ class ToolRouter:
             "size_bytes": row.size_bytes,
         }
 
+    async def _get_content_ref_public_url(
+        self,
+        artifact_id: str,
+        user_email: str,
+        *,
+        scope_task_id: str | None = None,
+        ttl_seconds: int = 3600,
+    ) -> str:
+        if self.artifact_store is None:
+            raise ValueError("Artifact support not available")
+        ttl_seconds = max(60, min(int(ttl_seconds), 604800))
+        if is_deliverable_ref(artifact_id):
+            if self._session_factory is None:
+                raise ValueError("Artifact support not available")
+            async with self._session_factory() as db_session:
+                ref = await get_accessible_deliverable_ref(
+                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                )
+            if ref is None:
+                raise ValueError(f"Artifact not found: {artifact_id}")
+            return build_deliverable_public_url(
+                self.artifact_store,
+                ref,
+                ttl_seconds=ttl_seconds,
+            )
+        row = await self._get_accessible_artifact_record(artifact_id, user_email)
+        url = await self.artifact_store.async_get_public_url(
+            row.namespace,
+            row.object_id,
+            row.filename,
+            ttl_seconds=ttl_seconds,
+        )
+        return str(url)
+
     async def _load_text_artifact(self, artifact_id: str, user_email: str) -> str:
         if self.artifact_store is None:
             raise ValueError("Artifact support not available")
@@ -2263,7 +2512,7 @@ class ToolRouter:
         content, _content_type = await self.artifact_store.async_load(
             row.namespace, row.object_id, row.filename
         )
-        return content.decode("utf-8", errors="replace")
+        return str(content.decode("utf-8", errors="replace"))
 
     async def _load_binary_artifact(
         self, artifact_id: str, user_email: str
@@ -2294,7 +2543,7 @@ class ToolRouter:
             return False
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
-        return expires_at <= datetime.now(UTC)
+        return bool(expires_at <= datetime.now(UTC))
 
     async def _materialize_inline_attachments(
         self,
@@ -2597,7 +2846,9 @@ class ToolRouter:
         *,
         call_id: str | None = None,
         runtime_metadata: dict[str, Any] | None = None,
+        content_trust: str = "untrusted",
     ) -> ToolResult:
+        del tool_name
         raw_output = result.output
         token_counter = None
         max_tokens = None
@@ -2607,9 +2858,11 @@ class ToolRouter:
             if isinstance(resolved_model, str) and resolved_model.strip():
                 model = resolved_model
         if self.llm is not None and model is not None:
+            model_id = model
+            llm = self.llm
 
-            def token_counter(text: str, _model: str = model) -> int:
-                return self.llm.count_tokens(text, _model)
+            def token_counter(text: str) -> int:
+                return int(llm.count_tokens(text, model_id))
 
             max_tokens = max(256, max_size // 4)
         if call_id and _has_artifact_candidate_anchor(result.metadata):
@@ -2641,9 +2894,16 @@ class ToolRouter:
             max_tokens=max_tokens,
             anchors=anchor_names,
         )
-        wrapped = f'<tool_result name="{tool_name}" trust="untrusted">\n{presentation.result}\n</tool_result>'
+        rendered_output = presentation.result
+        if content_trust == "untrusted":
+            rendered_output = (
+                '<tool_result trust="untrusted">\n'
+                f"{_neutralize_tool_result_closing_tags(rendered_output)}\n"
+                "</tool_result>"
+            )
         metadata = dict(result.metadata or {})
-        metadata["wrapped"] = True
+        metadata["wrapped"] = content_trust == "untrusted"
+        metadata["content_trust"] = content_trust
         metadata["truncated"] = presentation.truncated
         metadata["original_size"] = len(raw_output)
         metadata.update(presentation.event_fields())
@@ -2652,7 +2912,16 @@ class ToolRouter:
         # Preserve raw output for the ToolOutputStore (before wrapping/truncation).
         # The agent loop reads this to save the full output to disk.
         metadata["_raw_output"] = raw_output
-        return result.model_copy(update={"output": wrapped, "metadata": metadata})
+        return result.model_copy(update={"output": rendered_output, "metadata": metadata})
+
+
+_TOOL_RESULT_CLOSE_TAG_RE = re.compile(r"</\s*tool_result\s*>", re.IGNORECASE)
+
+
+def _neutralize_tool_result_closing_tags(text: str) -> str:
+    """Prevent embedded tool_result closing tags from escaping the trust wrapper."""
+
+    return _TOOL_RESULT_CLOSE_TAG_RE.sub("<\u200b/tool_result>", text)
 
 
 def _extract_output_anchor_names(
