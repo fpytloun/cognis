@@ -14,6 +14,14 @@
       if (option === 'concatenated') return 'Concatenated';
       if (option === 'immediate') return 'Immediate';
     }
+    if (fieldName === 'dm_conversation_mode' || fieldName === 'group_conversation_mode') {
+      if (option === 'default') return 'Default (continue chat, fork threads)';
+      if (option === 'threads') return 'Threads (one thread per top-level message)';
+    }
+    if (fieldName === 'thread_start_mode') {
+      if (option === 'fork') return 'Fork from source turn';
+      if (option === 'fresh') return 'Fresh session with root context';
+    }
     return option;
   }
 </script>

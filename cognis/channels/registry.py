@@ -291,19 +291,19 @@ SLACK_META = ChannelMeta(
 MATRIX_META = ChannelMeta(
     channel_type="matrix",
     label="Matrix",
-    description="Matrix protocol via matrix-nio. Supports any Matrix homeserver.",
+    description="Matrix protocol via the Client-Server API. Supports unencrypted rooms on any Matrix homeserver.",
     icon="matrix",
     docs_url="https://matrix.org/docs/",
     capabilities=ChannelCapabilities(
         chat_types=["direct", "group"],
         supports_threads=True,
-        supports_reactions=True,
-        supports_edits=True,
+        supports_reactions=False,
+        supports_edits=False,
         supports_media=True,
         supports_typing=True,
         supports_markdown=True,
         supports_read_receipts=True,
-        max_message_length=65536,
+        max_message_length=4000,
     ),
     credential_fields=[
         CredentialField(
@@ -316,12 +316,137 @@ MATRIX_META = ChannelMeta(
             name="user_id",
             label="User ID",
             description="Matrix user ID (e.g., @bot:matrix.org)",
+            required=False,
             secret=False,
         ),
         CredentialField(
             name="access_token",
             label="Access token",
-            description="Matrix access token",
+            description="Matrix access token. Preferred for stable bot accounts.",
+            required=False,
+        ),
+        CredentialField(
+            name="username",
+            label="Username",
+            description="Optional Matrix username for password login when no access token is provided.",
+            required=False,
+            secret=False,
+        ),
+        CredentialField(
+            name="password",
+            label="Password",
+            description="Optional Matrix password for login when no access token is provided.",
+            required=False,
+        ),
+        CredentialField(
+            name="device_id",
+            label="Device ID",
+            description="Optional device ID used for password login.",
+            required=False,
+            secret=False,
+        ),
+    ],
+    setting_fields=[
+        SettingField(
+            name="require_mention",
+            label="Require mention in group rooms",
+            description="Ignore group-room messages unless they mention the Matrix bot account.",
+            field_type="boolean",
+            default=False,
+        ),
+        SettingField(
+            name="auto_join_invites",
+            label="Auto-join invited rooms",
+            description=(
+                "Automatically join rooms where the bot account is invited. "
+                "When Allowed group rooms is set, only those room IDs are auto-joined; "
+                "invite metadata is not trusted to distinguish DMs from groups."
+            ),
+            field_type="boolean",
+            default=False,
+        ),
+        SettingField(
+            name="allowed_rooms",
+            label="Allowed group rooms",
+            description=(
+                "Optional comma-separated allowlist of Matrix group room IDs. "
+                "Listed rooms are treated as group rooms; DM rooms are exempt "
+                "unless listed here and are otherwise controlled by DM policy."
+            ),
+        ),
+        SettingField(
+            name="direct_rooms",
+            label="Rooms treated as DM",
+            description=(
+                "Optional comma-separated Matrix room IDs to treat as direct messages "
+                "when Matrix direct-room metadata or member counts are missing."
+            ),
+        ),
+        SettingField(
+            name="group_rooms",
+            label="Rooms treated as group",
+            description=(
+                "Optional comma-separated Matrix room IDs to treat as group rooms even "
+                "when they only have two members. Use this for small private rooms where "
+                "group-room policies and thread mode should apply."
+            ),
+        ),
+        SettingField(
+            name="dm_conversation_mode",
+            label="DM conversation mode",
+            description=(
+                "'default' continues one DM conversation and forks Matrix threads when needed. "
+                "'threads' creates a Matrix thread/session for each accepted top-level user message."
+            ),
+            field_type="select",
+            default="default",
+            options=["default", "threads"],
+        ),
+        SettingField(
+            name="group_conversation_mode",
+            label="Group conversation mode",
+            description=(
+                "'default' continues one room conversation and forks Matrix threads when needed. "
+                "'threads' creates a Matrix thread/session for each accepted top-level user message."
+            ),
+            field_type="select",
+            default="default",
+            options=["default", "threads"],
+        ),
+        SettingField(
+            name="thread_start_mode",
+            label="Thread start mode",
+            description=(
+                "Only used in default conversation mode. 'fork' starts a Matrix thread from the exact "
+                "source turn when available; 'fresh' starts a new session seeded with root-message context."
+            ),
+            field_type="select",
+            default="fork",
+            options=["fork", "fresh"],
+        ),
+        SettingField(
+            name="ignored_senders",
+            label="Ignored senders",
+            description="Optional comma-separated Matrix user IDs to ignore.",
+        ),
+        SettingField(
+            name="ignored_sender_patterns",
+            label="Ignored sender patterns",
+            description="Optional comma-separated regular expressions for Matrix user IDs to ignore.",
+        ),
+        SettingField(
+            name="suppress_startup_replay",
+            label="Suppress startup replay",
+            description="Drop old timeline messages during adapter startup.",
+            field_type="boolean",
+            default=True,
+        ),
+        SettingField(
+            name="ignore_appservice_senders",
+            label="Ignore appservice senders",
+            description="Ignore Matrix appservice sender IDs that start with @_.",
+            field_type="boolean",
+            default=True,
         ),
     ],
     connection_mode="long_poll",

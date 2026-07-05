@@ -18,6 +18,28 @@ from cognis.store.queries import (
 )
 
 
+class _FakeChannelStatus:
+    def model_dump(self) -> dict[str, str]:
+        return {"status": "connected"}
+
+
+class _FakeChannelManager:
+    def __init__(self, *, running: bool = True) -> None:
+        self.running = running
+        self.restarted: list[str] = []
+        self.stopped: list[str] = []
+
+    async def get_account_status(self, account_id: str) -> _FakeChannelStatus | None:
+        del account_id
+        return _FakeChannelStatus() if self.running else None
+
+    async def restart_account(self, account_id: str) -> None:
+        self.restarted.append(account_id)
+
+    async def stop_account(self, account_id: str) -> None:
+        self.stopped.append(account_id)
+
+
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
     monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")  # type: ignore[attr-defined]
@@ -293,6 +315,102 @@ def test_update_signal_account_accepts_partial_non_secret_updates(
             },
         )
         assert response.status_code == 200, response.text
+
+
+def test_update_channel_account_hot_reloads_running_account(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_channel_account(
+                    session,
+                    account_id="matrix-1",
+                    channel_type="matrix",
+                    display_name="Matrix",
+                    agent_id="agent-1",
+                    user_email="user@example.com",
+                    config={"homeserver_url": "https://matrix.example.org"},
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        manager = _FakeChannelManager(running=True)
+        app.state.channel_manager = manager
+
+        response = client.patch(
+            "/api/v1/channels/accounts/matrix-1",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={"config": {"direct_rooms": ["!dm:example.org"]}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert manager.restarted == ["matrix-1"]
+        assert manager.stopped == []
+
+
+def test_update_channel_account_does_not_start_stopped_account_on_config_edit(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await create_channel_account(
+                    session,
+                    account_id="matrix-1",
+                    channel_type="matrix",
+                    display_name="Matrix",
+                    agent_id="agent-1",
+                    user_email="user@example.com",
+                    config={"homeserver_url": "https://matrix.example.org"},
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        manager = _FakeChannelManager(running=False)
+        app.state.channel_manager = manager
+
+        response = client.patch(
+            "/api/v1/channels/accounts/matrix-1",
+            headers=_auth_headers(app, email="user@example.com"),
+            json={"config": {"direct_rooms": ["!dm:example.org"]}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert manager.restarted == []
+        assert manager.stopped == []
 
 
 def test_create_channel_account_rejects_secondary_agent(

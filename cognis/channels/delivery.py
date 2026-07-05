@@ -585,6 +585,16 @@ class ChannelDeliveryService:
         else:
             message = event.data.get("message", "You have a new notification.")
             content = f"[{notification_type}] {message}"
+
+        # For non-escalation types, prepend managed-origin context when present.
+        # Escalation already embeds it via _render_escalation_notification.
+        if notification_type != "escalation" and isinstance(payload, dict):
+            managed_title = payload.get("managed_conversation_title")
+            managed_agent = payload.get("managed_target_agent_id")
+            if managed_title or managed_agent:
+                origin = managed_title or managed_agent
+                content = f"_From managed conversation: {origin}_\n\n{content}"
+
         await self.send_to_conversation(conversation_id, content)
 
     def _render_step_question_notification(self, payload: dict[str, Any]) -> str:
@@ -721,8 +731,13 @@ class ChannelDeliveryService:
         tool_name = str(payload.get("tool_name") or "tool call")
         risk = payload.get("risk")
         reasoning = payload.get("reasoning")
+        managed_title = payload.get("managed_conversation_title")
+        managed_agent = payload.get("managed_target_agent_id")
 
         lines = [f"*[escalation]* Approval required for tool `{tool_name}`."]
+        if managed_title or managed_agent:
+            origin = managed_title or managed_agent
+            lines.append(f"_Requested by managed conversation: {origin}_")
         if risk:
             lines.append(f"**Risk:** {risk}")
         if reasoning:

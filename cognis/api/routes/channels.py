@@ -516,12 +516,38 @@ async def update_account(request: Request, account_id: str) -> Any:
         "webhook_secret",
     }
     updates = {k: v for k, v in body.items() if k in allowed_fields}
+    was_enabled = bool(existing_row.enabled)
+    channel_manager = getattr(request.app.state, "channel_manager", None)
+    was_running = False
+    if channel_manager:
+        try:
+            was_running = await channel_manager.get_account_status(account_id) is not None
+        except Exception:
+            logger.debug(
+                "channel route: failed to inspect account runtime before update",
+                extra={"extra_data": {"account_id": account_id}},
+                exc_info=True,
+            )
 
     async with session_factory() as session:
         row = await update_channel_account(session, account_id, **updates)
         if row is None:
             return error_response(404, "not_found", "Channel account not found")
         await session.commit()
+
+        if channel_manager:
+            try:
+                if not row.enabled:
+                    await channel_manager.stop_account(account_id)
+                elif was_running or ("enabled" in updates and not was_enabled):
+                    await channel_manager.restart_account(account_id)
+            except Exception as exc:
+                logger.warning(
+                    "channel route: failed to reload account runtime after update",
+                    extra={"extra_data": {"account_id": account_id}},
+                    exc_info=True,
+                )
+                return error_response(500, "reload_failed", str(exc))
 
         return {
             "account_id": row.account_id,

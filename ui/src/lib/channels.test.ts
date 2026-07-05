@@ -6,6 +6,7 @@ import {
   formatRemaining,
   getPendingPairingCount,
   normalizeSettingValue,
+  parseAllowlistText,
 } from '$lib/channels';
 import type { Agent, ChannelAccount, ChannelContact, ChannelMeta, PairingRequest } from '$lib/types/api';
 
@@ -52,11 +53,12 @@ describe('channels helpers', () => {
 
     const account = {
       account_id: 'acc', channel_type: 'signal', display_name: 'My Signal', enabled: true, agent_id: 'agent-1',
-      config: { use_tls: false }, credential_refs: {}, allowed_senders: [], dm_policy: 'pairing', group_policy: 'pairing',
+      config: { use_tls: false }, credential_refs: {}, allowed_senders: ['@filip:fpy.cz'], dm_policy: 'pairing', group_policy: 'pairing',
       created_at: null, updated_at: null,
     } satisfies ChannelAccount;
     const edited = createChannelDraft(meta, [agent], account);
     expect(edited.display_name).toBe('My Signal');
+    expect(edited.allowed_senders).toBe('@filip:fpy.cz');
     expect(edited.settingValues.use_tls).toBe('false');
   });
 
@@ -92,6 +94,13 @@ describe('channels helpers', () => {
   it('normalizes booleans and numbers safely', () => {
     expect(normalizeSettingValue(meta, 'use_tls', 'true')).toBe(true);
     expect(normalizeSettingValue(meta, 'missing', 'abc')).toBe('abc');
+  });
+
+  it('parses sender allowlist text as unique trimmed IDs', () => {
+    expect(parseAllowlistText(' @filip:fpy.cz\n@alice:matrix.org, @filip:fpy.cz ')).toEqual([
+      '@filip:fpy.cz',
+      '@alice:matrix.org',
+    ]);
   });
 
   it('derives pending pairing counts and summary placeholders', () => {

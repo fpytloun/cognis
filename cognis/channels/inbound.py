@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import os
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -44,7 +45,8 @@ from cognis.models.channel import (
     MediaAttachment,
     OutboundMessage,
 )
-from cognis.models.session import ConversationContext
+from cognis.models.session import ConversationContext, SessionEvent
+from cognis.store.models import Conversation
 
 logger = get_logger(__name__)
 
@@ -90,7 +92,7 @@ def _fallback_attachment_content(
     if content.strip():
         return content
     if attachments:
-        return attachment_placeholder_text(attachment.kind for attachment in attachments)
+        return content
     if media:
         kinds: list[ArtifactKind] = []
         for item in media:
@@ -109,6 +111,31 @@ def _fallback_attachment_content(
     return content
 
 
+def _format_system_message_for_channel(channel_type: str, text: str) -> str:
+    """Return a compact channel-specific rendering for system command output."""
+
+    if not text:
+        return text
+    if channel_type == "signal":
+        escaped_lines = [
+            line.replace("\\", "\\\\").replace("`", "\\`") or " " for line in text.splitlines()
+        ]
+        formatted = "\n".join(f"`{line}`" for line in escaped_lines)
+        return f"*{formatted}*"
+    if channel_type != "matrix":
+        return text
+    longest_backtick_run = 0
+    current_run = 0
+    for char in text:
+        if char == "`":
+            current_run += 1
+            longest_backtick_run = max(longest_backtick_run, current_run)
+        else:
+            current_run = 0
+    fence = "`" * max(3, longest_backtick_run + 1)
+    return f"{fence}text\n{text}\n{fence}"
+
+
 def _filter_turn_attachments_for_voice_input(
     message: InboundMessage,
     attachments: list[AttachmentRef],
@@ -116,6 +143,83 @@ def _filter_turn_attachments_for_voice_input(
     if not bool(message.platform_data.get("voice_input")):
         return attachments
     return [attachment for attachment in attachments if attachment.kind != ArtifactKind.AUDIO]
+
+
+def _conversation_mode_for_message(message: InboundMessage, config: ChannelAccountConfig) -> str:
+    key = "dm_conversation_mode" if message.chat_type == "direct" else "group_conversation_mode"
+    mode = str(config.settings.get(key) or "default").strip().lower()
+    return mode if mode in {"default", "threads"} else "default"
+
+
+def _thread_start_mode(config: ChannelAccountConfig) -> str:
+    mode = str(config.settings.get("thread_start_mode") or "fork").strip().lower()
+    return mode if mode in {"fork", "fresh"} else "fork"
+
+
+def _thread_reference_ids(message: InboundMessage) -> list[str]:
+    ids: list[str] = []
+    for value in (message.thread_id, message.reply_to_id):
+        if isinstance(value, str) and value and value not in ids:
+            ids.append(value)
+    root = message.platform_data.get("thread_root_event_id")
+    if isinstance(root, str) and root and root not in ids:
+        ids.insert(0, root)
+    return ids
+
+
+def _effective_thread_message(
+    message: InboundMessage,
+    config: ChannelAccountConfig,
+) -> InboundMessage:
+    """Apply channel conversation-mode settings to the inbound message shape."""
+
+    if message.thread_id:
+        return message
+    if _conversation_mode_for_message(message, config) != "threads":
+        return message
+    platform_data = dict(message.platform_data)
+    platform_data.setdefault("thread_root_event_id", message.message_id)
+    platform_data.setdefault("thread_created_by_mode", "threads")
+    return message.model_copy(
+        update={
+            "thread_id": message.message_id,
+            "platform_data": platform_data,
+        }
+    )
+
+
+def _is_unmentioned_matrix_thread_followup(message: InboundMessage) -> bool:
+    return bool(
+        message.channel_type == "matrix"
+        and message.chat_type == "group"
+        and message.thread_id
+        and not message.was_mentioned
+        and message.platform_data.get("unmentioned_thread_followup_candidate") is True
+    )
+
+
+def _thread_root_excerpt(message: InboundMessage) -> str | None:
+    root = message.platform_data.get("thread_root")
+    if not isinstance(root, dict):
+        return None
+    body = root.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return None
+    sender = root.get("sender")
+    sender_prefix = f"{sender}: " if isinstance(sender, str) and sender.strip() else ""
+    return f"{sender_prefix}{body.strip()}"
+
+
+def _fresh_thread_user_content(message: InboundMessage, user_content: str) -> str:
+    excerpt = _thread_root_excerpt(message)
+    if not excerpt:
+        root_id = message.platform_data.get("thread_root_event_id") or message.thread_id
+        if not isinstance(root_id, str) or not root_id:
+            return user_content
+        excerpt = f"Matrix thread root event: {root_id}"
+    if user_content.strip():
+        return f"Thread started from:\n> {excerpt}\n\nUser continuation:\n{user_content}"
+    return f"Thread started from:\n> {excerpt}"
 
 
 class InboundPipeline:
@@ -154,6 +258,8 @@ class InboundPipeline:
         config: ChannelAccountConfig,
     ) -> None:
         """Process an inbound message through the full pipeline."""
+        message = _effective_thread_message(message, config)
+
         # 1. Access control
         if not self._check_access(message, config):
             logger.info(
@@ -245,7 +351,7 @@ class InboundPipeline:
             return
 
         try:
-            attachments = await self._normalize_media_attachments(
+            attachments, attachment_failures = await self._normalize_media_attachments(
                 message=message,
                 conversation_id=conversation_id,
                 user_email=user_email,
@@ -269,6 +375,15 @@ class InboundPipeline:
                     }
                 },
             )
+        if attachment_failures > 0 and not self._is_voice_input(message):
+            noun = "attachment" if attachment_failures == 1 else "attachments"
+            await self._send_system_message(
+                message,
+                config,
+                f"I couldn't download {attachment_failures} {noun} from this message. "
+                "The file may be unavailable or require authentication. "
+                "Please try resending or share the file another way.",
+            )
         user_content = message.content
         if self._is_voice_input(message):
             try:
@@ -281,6 +396,8 @@ class InboundPipeline:
                 return
         turn_attachments = _filter_turn_attachments_for_voice_input(message, attachments)
         user_content = _fallback_attachment_content(user_content, attachments, message.media)
+        if bool(message.platform_data.get("fresh_thread_context")):
+            user_content = _fresh_thread_user_content(message, user_content)
 
         # 4. Register observer for response delivery
         observer = ChannelTurnObserver(
@@ -307,6 +424,7 @@ class InboundPipeline:
             user_email=user_email,
             attachments=[item.model_dump(mode="json") for item in turn_attachments],
             turn_observers=[observer],
+            client_message_id=message.message_id,
         )
 
         if error is not None:
@@ -440,7 +558,7 @@ class InboundPipeline:
             if config.group_policy == "disabled":
                 return False
             if config.group_policy == "mention":
-                return message.was_mentioned
+                return message.was_mentioned or _is_unmentioned_matrix_thread_followup(message)
             if config.group_policy == "allowlist":
                 return message.sender_id in config.allowed_senders
             # "open" and "pairing" — allow pipeline to continue
@@ -475,6 +593,9 @@ class InboundPipeline:
             if contact is not None and contact.verified:
                 return contact.user_email
 
+        if policy == "pairing" and _is_unmentioned_matrix_thread_followup(message):
+            return None
+
         if policy == "pairing":
             return await self._pairing_service.ensure_verified_sender(
                 message=message, config=config
@@ -485,6 +606,172 @@ class InboundPipeline:
     # ------------------------------------------------------------------
     # Conversation resolution
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _base_context_ref(message: InboundMessage) -> str:
+        return f"{message.channel_type}:{message.account_id}:{message.chat_id}"
+
+    @staticmethod
+    def _context_ref(message: InboundMessage) -> str:
+        context_ref = InboundPipeline._base_context_ref(message)
+        if message.thread_id:
+            return f"{context_ref}:{message.thread_id}"
+        return context_ref
+
+    @staticmethod
+    def _conversation_context(message: InboundMessage, *, context_ref: str) -> ConversationContext:
+        return ConversationContext(
+            type=message.channel_type,
+            ref=context_ref,
+            platform_data={
+                "channel_type": message.channel_type,
+                "account_id": message.account_id,
+                "chat_id": message.chat_id,
+                "chat_name": message.chat_name,
+                "chat_type": message.chat_type,
+                "thread_id": message.thread_id,
+                "thread_root_event_id": message.platform_data.get("thread_root_event_id")
+                or message.thread_id,
+                "thread_conversation_mode": message.platform_data.get("thread_created_by_mode")
+                or "default",
+            },
+        )
+
+    async def _latest_conversation_for_context(
+        self,
+        *,
+        user_email: str,
+        agent_id: str,
+        context_ref: str,
+    ) -> Conversation | None:
+        from cognis.store.queries import get_latest_active_conversation_for_context
+
+        async with self._session_factory() as session:
+            return await get_latest_active_conversation_for_context(
+                session,
+                user_email=user_email,
+                agent_id=agent_id,
+                context_ref=context_ref,
+            )
+
+    async def _find_thread_fork_source(
+        self,
+        *,
+        room_conversation: Conversation,
+        message: InboundMessage,
+    ) -> tuple[Any, int, str] | None:
+        """Find the backing session and cutoff seq for the Matrix thread root event."""
+
+        if room_conversation.active_session_id is None:
+            return None
+        reference_ids = _thread_reference_ids(message)
+        if not reference_ids:
+            return None
+
+        from cognis.store.queries import get_root_session_chain
+
+        target_rank: dict[str, tuple[int, str]] = {}
+        for rank, event_id in enumerate(reference_ids):
+            target_rank[event_id] = (rank, event_id)
+            target_rank[f"client:{event_id}"] = (rank, event_id)
+
+        async with self._session_factory() as session:
+            chain, _truncated = await get_root_session_chain(
+                session,
+                room_conversation.conversation_id,
+                room_conversation.active_session_id,
+            )
+        if not chain:
+            return None
+
+        best: tuple[int, Any, int, str] | None = None
+        for source_session in chain:
+            session_model = self._session_row_to_model(source_session)
+            events = await self._session_manager._read_history_events(session_model)
+            event_by_rank: list[tuple[int, Any, str]] = []
+            for event in events:
+                data = event.data or {}
+                candidates = [
+                    data.get("message_id"),
+                    data.get("client_message_id"),
+                    data.get("platform_message_id"),
+                ]
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate in target_rank:
+                        rank, matched = target_rank[candidate]
+                        event_by_rank.append((rank, event, matched))
+                        break
+            if not event_by_rank:
+                continue
+            rank, matched_event, matched_id = min(
+                event_by_rank, key=lambda item: (item[0], item[1].seq)
+            )
+            turn_id = matched_event.data.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                cutoff_seq = max(
+                    (event.seq for event in events if (event.data or {}).get("turn_id") == turn_id),
+                    default=matched_event.seq,
+                )
+            else:
+                cutoff_seq = matched_event.seq
+            candidate = (rank, source_session, cutoff_seq, matched_id)
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+
+        if best is None:
+            return None
+        _rank, source_session, cutoff_seq, matched_id = best
+        return source_session, cutoff_seq, matched_id
+
+    @staticmethod
+    def _session_row_to_model(row: Any) -> Any:
+        from cognis.core.session import _to_session_model
+
+        return _to_session_model(row)
+
+    @staticmethod
+    def _conversation_row_to_model(row: Conversation) -> Any:
+        from cognis.core.session import _to_conversation_model
+
+        return _to_conversation_model(row)
+
+    async def _fork_thread_conversation(
+        self,
+        *,
+        room_conversation: Conversation,
+        source_session_row: Any,
+        cutoff_seq: int,
+        matched_event_id: str,
+        message: InboundMessage,
+        user_email: str,
+        context_ref: str,
+    ) -> str | None:
+        from cognis.api.serializers import agent_to_response
+        from cognis.models.agent import AgentDefinition
+        from cognis.store.queries import get_agent
+
+        async with self._session_factory() as session:
+            agent_row = await get_agent(session, room_conversation.agent_id)
+        if agent_row is None:
+            return None
+        agent = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+        conversation, _session, _copied = await self._session_manager.fork_into_new_conversation(
+            source_session=self._session_row_to_model(source_session_row),
+            source_conversation=self._conversation_row_to_model(room_conversation),
+            agent=agent,
+            user_email=user_email,
+            title=message.chat_name or f"{message.channel_type} chat",
+            intention=f"Matrix thread from {matched_event_id}",
+            context=self._conversation_context(message, context_ref=context_ref),
+            max_source_seq=cutoff_seq,
+            snapshot_extras={
+                "forked_from_channel": message.channel_type,
+                "forked_from_chat_id": message.chat_id,
+                "forked_from_platform_event_id": matched_event_id,
+                "thread_id": message.thread_id,
+            },
+        )
+        return conversation.conversation_id
 
     async def _resolve_conversation(
         self,
@@ -497,47 +784,84 @@ class InboundPipeline:
         Uses the conversation context ref (e.g., "signal:+1234567890:chat123")
         to find an existing conversation, or creates a new one.
         """
-        context_ref = f"{message.channel_type}:{message.account_id}:{message.chat_id}"
-        if message.thread_id:
-            context_ref = f"{context_ref}:{message.thread_id}"
+        context_ref = self._context_ref(message)
+        base_context_ref = self._base_context_ref(message)
+        unmentioned_thread_followup = _is_unmentioned_matrix_thread_followup(message)
 
         # Check for default conversation
-        if config.default_conversation_id:
+        if config.default_conversation_id and not unmentioned_thread_followup:
             return config.default_conversation_id
 
         # Try to find existing conversation by context ref
-        from cognis.store.queries import get_latest_active_conversation_for_context
+        existing = await self._latest_conversation_for_context(
+            user_email=user_email,
+            agent_id=config.agent_id,
+            context_ref=context_ref,
+        )
+        if existing is not None:
+            return existing.conversation_id
 
-        async with self._session_factory() as session:
-            existing = await get_latest_active_conversation_for_context(
-                session,
-                user_email=user_email,
-                agent_id=config.agent_id,
-                context_ref=context_ref,
+        if unmentioned_thread_followup:
+            logger.info(
+                "channel inbound: unmentioned Matrix thread follow-up has no conversation",
+                extra={
+                    "extra_data": {
+                        "channel_type": message.channel_type,
+                        "account_id": message.account_id,
+                        "chat_id": message.chat_id,
+                        "thread_id": message.thread_id,
+                    }
+                },
             )
-            if existing is not None:
-                return existing.conversation_id
+            return None
 
         # Create new conversation if allowed
         if not config.allow_new_conversations:
             return None
 
+        mode = _conversation_mode_for_message(message, config)
+        if message.thread_id and mode == "default":
+            room_conversation = await self._latest_conversation_for_context(
+                user_email=user_email,
+                agent_id=config.agent_id,
+                context_ref=base_context_ref,
+            )
+            if room_conversation is not None and _thread_start_mode(config) == "fork":
+                source = await self._find_thread_fork_source(
+                    room_conversation=room_conversation,
+                    message=message,
+                )
+                if source is not None:
+                    source_session_row, cutoff_seq, matched_id = source
+                    forked_id = await self._fork_thread_conversation(
+                        room_conversation=room_conversation,
+                        source_session_row=source_session_row,
+                        cutoff_seq=cutoff_seq,
+                        matched_event_id=matched_id,
+                        message=message,
+                        user_email=user_email,
+                        context_ref=context_ref,
+                    )
+                    if forked_id is not None:
+                        return forked_id
+                logger.info(
+                    "channel inbound: thread source event not found; using fresh thread context",
+                    extra={
+                        "extra_data": {
+                            "channel_type": message.channel_type,
+                            "account_id": message.account_id,
+                            "chat_id": message.chat_id,
+                            "thread_id": message.thread_id,
+                        }
+                    },
+                )
+            message.platform_data["fresh_thread_context"] = True
+
         try:
             conversation, _ = await self._session_manager.create_conversation_with_root_session(
                 user_email=user_email,
                 agent_id=config.agent_id,
-                context=ConversationContext(
-                    type=message.channel_type,
-                    ref=context_ref,
-                    platform_data={
-                        "channel_type": message.channel_type,
-                        "account_id": message.account_id,
-                        "chat_id": message.chat_id,
-                        "chat_name": message.chat_name,
-                        "chat_type": message.chat_type,
-                        "thread_id": message.thread_id,
-                    },
-                ),
+                context=self._conversation_context(message, context_ref=context_ref),
                 title=message.chat_name or f"{message.channel_type} chat",
                 title_source="channel_seed",
             )
@@ -604,7 +928,7 @@ class InboundPipeline:
                     channel_type=message.channel_type,
                     account_id=message.account_id,
                     chat_id=message.chat_id,
-                    content=text,
+                    content=_format_system_message_for_channel(message.channel_type, text),
                     reply_to_id=message.message_id,
                 )
             )
@@ -733,17 +1057,24 @@ class InboundPipeline:
         message: InboundMessage,
         conversation_id: str,
         user_email: str,
-    ) -> list[AttachmentRef]:
+    ) -> tuple[list[AttachmentRef], int]:
+        """Download and store channel media attachments.
+
+        Returns ``(refs, failed_count)`` where ``failed_count`` is the number
+        of attachments that could not be downloaded.  Callers should surface a
+        non-fatal notice to the user when ``failed_count > 0``.
+        """
         if not message.media:
-            return []
+            return [], 0
         manager = self._channel_manager_ref()
         if manager is None:
-            return []
+            return [], 0
         adapter = manager.get_adapter(message.account_id)
         if adapter is None:
-            return []
+            return [], 0
 
         refs: list[AttachmentRef] = []
+        failed_count = 0
         async with self._session_factory() as session:
             from cognis.store.queries import create_artifact_record
 
@@ -765,6 +1096,7 @@ class InboundPipeline:
                     else:
                         fetched = await adapter.download_attachment(message, attachment)
                     if fetched is None:
+                        failed_count += 1
                         continue
                     content, content_type, filename = fetched
                     kind = _kind_for_media(content_type)
@@ -819,9 +1151,10 @@ class InboundPipeline:
                         "audio/"
                     ):
                         raise
+                    failed_count += 1
                     continue
             await session.commit()
-        return refs
+        return refs, failed_count
 
 
 def _kind_for_media(content_type: str) -> ArtifactKind:
@@ -909,8 +1242,10 @@ class ChannelTurnObserver:
         tool_name: str,
         arguments: dict[str, Any] | None,
         turn_id: str | None = None,
+        assistant_phase_index: int | None = None,
     ) -> None:
         """Flush buffered text (immediate mode) and send typing indicator."""
+        del assistant_phase_index
         self._turn_active = True
 
         # In immediate mode, deliver any accumulated assistant text before
@@ -921,7 +1256,11 @@ class ChannelTurnObserver:
         ):
             adapter = self._get_adapter()
             if adapter is not None:
-                await self._send_text(self._accumulated_text, adapter=adapter)
+                await self._send_text(
+                    self._accumulated_text,
+                    adapter=adapter,
+                    delivery_result=SimpleNamespace(session_id=session_id, turn_id=turn_id),
+                )
                 self._accumulated_text = ""
                 return  # typing indicator is implicit after a sent message
 
@@ -961,8 +1300,10 @@ class ChannelTurnObserver:
         file_diffs: list[dict[str, Any]] | None = None,
         turn_id: str | None = None,
         presentation: dict[str, Any] | None = None,
+        assistant_phase_index: int | None = None,
     ) -> None:
         """No-op for tool results."""
+        del assistant_phase_index
 
     async def on_tool_output_chunk(
         self,
@@ -1057,6 +1398,7 @@ class ChannelTurnObserver:
                     media=outbound_media,
                 )
             )
+            await self._record_delivery_mapping(result, delivery_id)
             if self._channel_type == "signal" and (
                 not isinstance(delivery_id, str) or not delivery_id.strip()
             ):
@@ -1094,6 +1436,78 @@ class ChannelTurnObserver:
                         "conversation_id": self._conversation_id,
                         "has_text": bool(content),
                         "media_count": len(outbound_media),
+                    }
+                },
+                exc_info=True,
+            )
+
+    async def _record_delivery_mapping(self, result: Any, delivery_id: str | None) -> None:
+        if not isinstance(delivery_id, str) or not delivery_id.strip():
+            return
+        session_id = getattr(result, "session_id", None)
+        if not isinstance(session_id, str) or not session_id:
+            return
+        providers = getattr(self._turn_scheduler, "_providers", None)
+        guardrails = getattr(providers, "guardrails", None)
+        if guardrails is None:
+            return
+        turn_id = getattr(result, "turn_id", None)
+        # NOTE: recorded as a "lifecycle" event — "channel_delivery" is not a
+        # valid Intaris event type, so the previous shape was rejected with a
+        # 400 on every call and the reply-threading mapping (platform message
+        # id -> turn) silently never reached the durable stream. Lifecycle
+        # events outside the visible allowlist stay hidden from chat
+        # projections while remaining readable by the reply-threading scan.
+        event = SessionEvent(
+            type="lifecycle",
+            data={
+                "event": "channel_delivery",
+                "channel_type": self._channel_type,
+                "account_id": self._account_id,
+                "chat_id": self._chat_id,
+                "thread_id": self._thread_id,
+                "platform_message_id": delivery_id,
+                "message_id": delivery_id,
+                "reply_to_id": self._reply_to_id,
+                "turn_id": turn_id if isinstance(turn_id, str) and turn_id else None,
+            },
+        )
+        try:
+            append_result = await guardrails.record_events(
+                session_id=session_id,
+                events=[event],
+                source="cognis:channel",
+            )
+            if (
+                not bool(getattr(append_result, "ok", True))
+                or int(getattr(append_result, "count", 1) or 0) < 1
+            ):
+                return
+            session_cache = getattr(self._turn_scheduler, "_session_cache", None)
+            manager = self._channel_manager_ref()
+            session_factory = (
+                getattr(manager, "_session_factory", None) if manager is not None else None
+            )
+            if session_cache is not None and session_factory is not None:
+                from cognis.core.session import _to_session_model
+                from cognis.store.queries import get_session_row
+
+                async with session_factory() as db_session:
+                    session_row = await get_session_row(db_session, session_id)
+                if session_row is not None:
+                    await session_cache.append_recorded_events(
+                        _to_session_model(session_row),
+                        [event],
+                        append_result,
+                    )
+        except Exception:
+            logger.warning(
+                "channel observer: failed to record delivery mapping",
+                extra={
+                    "extra_data": {
+                        "channel_type": self._channel_type,
+                        "account_id": self._account_id,
+                        "session_id": session_id,
                     }
                 },
                 exc_info=True,
@@ -1254,7 +1668,13 @@ class ChannelTurnObserver:
             return None
         return manager.get_adapter(self._account_id)
 
-    async def _send_text(self, text: str, *, adapter: BaseChannelAdapter | None = None) -> None:
+    async def _send_text(
+        self,
+        text: str,
+        *,
+        adapter: BaseChannelAdapter | None = None,
+        delivery_result: Any | None = None,
+    ) -> None:
         from cognis.channels.formatting import format_for_channel
 
         if not text:
@@ -1265,7 +1685,7 @@ class ChannelTurnObserver:
 
         if self._channel_type == "signal":
             with contextlib.suppress(Exception):
-                await resolved_adapter.send_message(
+                delivery_id = await resolved_adapter.send_message(
                     OutboundMessage(
                         channel_type=self._channel_type,
                         account_id=self._account_id,
@@ -1275,6 +1695,7 @@ class ChannelTurnObserver:
                         thread_id=self._thread_id,
                     )
                 )
+                await self._record_delivery_mapping(delivery_result, delivery_id)
                 CHANNEL_OUTBOUND_TOTAL.labels(
                     channel_type=self._channel_type,
                     account_id=self._account_id,
@@ -1285,7 +1706,7 @@ class ChannelTurnObserver:
         chunks = format_for_channel(text, resolved_adapter.capabilities)
         for chunk in chunks:
             with contextlib.suppress(Exception):
-                await resolved_adapter.send_message(
+                delivery_id = await resolved_adapter.send_message(
                     OutboundMessage(
                         channel_type=self._channel_type,
                         account_id=self._account_id,
@@ -1295,6 +1716,7 @@ class ChannelTurnObserver:
                         thread_id=self._thread_id,
                     )
                 )
+                await self._record_delivery_mapping(delivery_result, delivery_id)
                 CHANNEL_OUTBOUND_TOTAL.labels(
                     channel_type=self._channel_type,
                     account_id=self._account_id,

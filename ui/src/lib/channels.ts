@@ -10,6 +10,7 @@ export interface ChannelEditorDraft {
   executor_id: string;
   dm_policy: string;
   group_policy: string;
+  allowed_senders: string;
   allow_new_conversations: boolean;
   preferred_for_task_delivery: boolean;
   credentialValues: Record<string, string>;
@@ -90,8 +91,9 @@ export const guides: Record<string, SetupGuide> = {
     publicUrlNeeded: false,
     steps: [
       'Create or choose a Matrix account for the bot.',
-      'Generate an access token by logging in or from an existing client session.',
+      'Generate an access token from an existing Matrix client session, or provide username/password credentials for bot login.',
       'Invite the bot account to the rooms it should join.',
+      'For group rooms, enable mention gating or configure an explicit room allowlist before switching the account to open access.',
     ],
   },
   irc: {
@@ -181,6 +183,20 @@ export function normalizeSettingValue(meta: ChannelMeta, fieldName: string, valu
   return value;
 }
 
+export function parseAllowlistText(value: string): string[] {
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const item of value.split(/[\n,]+/)) {
+    const normalized = item.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    items.push(normalized);
+  }
+  return items;
+}
+
 function normalizeSettingDisplayValue(fieldName: string, value: unknown, fallback: unknown, editing: boolean): string {
   if (fieldName === 'assistant_delivery_mode' && editing && value === undefined) {
     return 'concatenated';
@@ -208,6 +224,7 @@ export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?:
     executor_id: account?.executor_id ?? '',
     dm_policy: account?.dm_policy ?? 'pairing',
     group_policy: account?.group_policy ?? 'pairing',
+    allowed_senders: (account?.allowed_senders ?? []).join('\n'),
     allow_new_conversations: account?.allow_new_conversations ?? true,
     preferred_for_task_delivery: account?.preferred_for_task_delivery ?? false,
     credentialValues,

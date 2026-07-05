@@ -485,26 +485,35 @@ class ChannelManager:
 
         avatar_image_id = getattr(row, "avatar_image_id", None)
         if avatar_image_id and self._artifact_store:
-            try:
-                avatar_url = await self._artifact_store.async_get_signed_url(
-                    "avatars",
-                    avatar_image_id,
-                    "avatar",
-                    ttl_seconds=6 * 3600,
-                )
-                content, ct = await self._artifact_store.async_load(
-                    "avatars",
-                    avatar_image_id,
-                    "avatar",
-                )
-                avatar_bytes = content
-                avatar_content_type = ct
-            except Exception:
-                logger.debug(
-                    "channel manager: avatar resolution failed",
-                    extra={"extra_data": {"agent_id": agent_id}},
-                    exc_info=True,
-                )
+            for artifact_name in ("image", "avatar"):
+                try:
+                    resolved_url = await self._artifact_store.async_get_signed_url(
+                        "avatars",
+                        avatar_image_id,
+                        artifact_name,
+                        ttl_seconds=6 * 3600,
+                    )
+                    content, ct = await self._artifact_store.async_load(
+                        "avatars",
+                        avatar_image_id,
+                        artifact_name,
+                    )
+                    avatar_url = resolved_url
+                    avatar_bytes = content
+                    avatar_content_type = ct
+                    break
+                except Exception:
+                    logger.debug(
+                        "channel manager: avatar resolution failed",
+                        extra={
+                            "extra_data": {
+                                "agent_id": agent_id,
+                                "avatar_image_id": avatar_image_id,
+                                "artifact_name": artifact_name,
+                            }
+                        },
+                        exc_info=True,
+                    )
 
         return AgentProfile(
             name=name,

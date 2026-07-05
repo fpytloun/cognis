@@ -129,6 +129,9 @@
                 <option value={option.value}>{option.label}</option>
               {/each}
             </select>
+            <span class="text-xs text-slate-500">
+              Controls direct Matrix chats. Use Disabled to prevent DMs entirely.
+            </span>
           </label>
 
           <label class="grid gap-2 text-sm text-slate-300">
@@ -138,8 +141,24 @@
                 <option value={option.value}>{option.label}</option>
               {/each}
             </select>
+            <span class="text-xs text-slate-500">
+              Controls group rooms after any Matrix room allowlist and mention gate.
+            </span>
           </label>
         </div>
+
+        <label class="grid gap-2 text-sm text-slate-300">
+          Allowed Matrix senders
+          <textarea
+            bind:value={draft.allowed_senders}
+            rows="3"
+            placeholder="@filip:fpy.cz, @teammate:matrix.org"
+            class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+          ></textarea>
+          <span class="text-xs text-slate-500">
+            One Matrix user ID per line or comma-separated. Used only when DM policy or group policy is Allowlist.
+          </span>
+        </label>
 
         <label class="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-300">
           <input bind:checked={draft.allow_new_conversations} type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900" />

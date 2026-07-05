@@ -962,14 +962,14 @@ LLM request to maximize cache hits.
 | Provider | Type | Min tokens | TTL | Control |
 |----------|------|-----------|-----|---------|
 | OpenAI (direct) | Automatic prefix | 1024 | 5-10 min (up to 1h off-peak) | ``prompt_cache_key`` for routing |
-| ChatGPT/Codex OAuth | Automatic prefix | 1024 | 5-10 min | ``prompt_cache_key`` via Cognis patch (see below) |
-| Anthropic | Explicit breakpoints | 1024-2048 | 5 min (refreshed on hit) | ``cache_control`` (up to 4 breakpoints) |
+| ChatGPT/Codex OAuth | Automatic prefix | 1024 | 5-10 min | Optional explicit ``prompt_cache_key`` opt-in via Cognis patch (see below) |
+| Anthropic | Explicit breakpoints | 1024-2048 | ``session.anthropic_cache_ttl`` default ``5m``; ``1h`` opt-in for tools/prefix | ``cache_control`` (up to 4 breakpoints) |
 | Gemini | Implicit + explicit | 1024-4096 | Configurable TTL | ``cache_control`` or ``cachedContents`` API |
 
 **What Cognis caches (ordered by stability):**
 
 1. **Tool definitions** — stable across turns within a session.  For Anthropic,
-   mark the last tool with ``cache_control: {"type": "ephemeral"}``.
+   mark the last provider-facing tool with ``cache_control``.
 2. **System prompt** — stable across the entire session.
 3. **Memory instructions + core memories** — stable within the session cache
    TTL (30 min refresh).
@@ -979,7 +979,10 @@ LLM request to maximize cache hits.
 **Implementation in Cognis:**
 
 - ``_apply_message_cache_hints()`` in ``LiteLLMProvider`` marks Anthropic messages
-  with ``cache_control``.  It should also mark the last tool definition.
+  with ordered ``cache_control`` breakpoints: immutable prefix, prior-turn
+  boundary, and current request tail.  ``tool_exposure`` marks the final
+  provider-facing tool schema.  Breakpoint positions are recomputed per LLM
+  cycle rather than once per turn.
 - For OpenAI, automatic prefix caching works without code changes as long as
   the ``tools`` array and message prefix remain stable.
 - Responses-capable OpenAI models use a provider-boundary bridge: Cognis keeps
@@ -998,9 +1001,9 @@ LLM request to maximize cache hits.
   LiteLLM's default-instructions helper so the prepend becomes a no-op.  Both
   patches are idempotent and respect operator
   overrides (set ``CHATGPT_DEFAULT_INSTRUCTIONS`` before startup to keep custom
-  framing).  The feature flag ``COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=false``
-  disables cache-key attachment globally; per-provider ``use_prompt_cache_key:
-  false`` disables it for a single provider.  If the backend rejects the cache
+  framing).  Explicit cache-key attachment is disabled by default because Codex
+  currently rejects explicit keys; set ``COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=true``
+  or per-provider ``use_prompt_cache_key: true`` to opt in.  If the backend rejects the cache
   params with an "Unknown parameter" error, Cognis marks the ``(provider_id,
   model)`` pair as broken, retries once without the params, and stops attaching
   them until the runtime capability fallback TTL expires (default one hour).

@@ -11,6 +11,7 @@ from cognis.channels.inbound import (
     InboundPipeline,
     _fallback_attachment_content,
     _filter_turn_attachments_for_voice_input,
+    _is_unmentioned_matrix_thread_followup,
     _normalize_assistant_delivery_mode,
     _prepare_audio_for_stt,
     _signal_image_preview_payload,
@@ -99,7 +100,107 @@ async def test_channel_inbound_dispatches_approve_before_submit_turn() -> None:
     turn_scheduler.submit_turn.assert_not_called()
     adapter.send_message.assert_awaited_once()
     outbound = adapter.send_message.await_args.args[0]
-    assert outbound.content == "User approved tool call"
+    assert outbound.content == "*`User approved tool call`*"
+    assert outbound.reply_to_id == "msg-1"
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_formats_matrix_system_message_as_preformatted_text() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock()
+    turn_scheduler.has_active_turn = MagicMock(return_value=False)
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(  # type: ignore[method-assign]
+        return_value=CommandResult(type="system_message", text="Mode: build\nExecutor: maitrea")
+    )
+
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        content="/build",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    turn_scheduler.submit_turn.assert_not_called()
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "```text\nMode: build\nExecutor: maitrea\n```"
+    assert outbound.reply_to_id == "msg-1"
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_formats_signal_system_message_as_italic_monospace() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock()
+    turn_scheduler.has_active_turn = MagicMock(return_value=False)
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(  # type: ignore[method-assign]
+        return_value=CommandResult(type="system_message", text="Mode: default\nExecutor: maitrea")
+    )
+
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="/default",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    turn_scheduler.submit_turn.assert_not_called()
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "*`Mode: default`\n`Executor: maitrea`*"
     assert outbound.reply_to_id == "msg-1"
 
 
@@ -122,7 +223,7 @@ async def test_channel_inbound_submits_normal_messages() -> None:
 
     pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
     pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
-    pipeline._normalize_media_attachments = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 0))  # type: ignore[method-assign]
     pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     message = InboundMessage(
@@ -149,7 +250,317 @@ async def test_channel_inbound_submits_normal_messages() -> None:
     turn_observers = turn_scheduler.submit_turn.await_args.kwargs["turn_observers"]
     assert len(turn_observers) == 1
     assert isinstance(turn_observers[0], ChannelTurnObserver)
+    assert turn_scheduler.submit_turn.await_args.kwargs["client_message_id"] == "msg-1"
     adapter.mark_read.assert_awaited_once_with("chat-1", "msg-1")
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_threads_mode_uses_message_as_thread_root() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    turn_scheduler.has_active_turn = MagicMock(return_value=False)
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 0))  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$root",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="hello",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+        settings={"group_conversation_mode": "threads"},
+    )
+
+    await pipeline.process(message, config)
+
+    resolved_message = pipeline._resolve_conversation.await_args.args[0]
+    assert resolved_message.thread_id == "$root"
+    observer = turn_scheduler.submit_turn.await_args.kwargs["turn_observers"][0]
+    assert observer._thread_id == "$root"
+
+
+def test_channel_inbound_allows_unmentioned_matrix_thread_candidate_for_mention_policy() -> None:
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=MagicMock(),
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=MagicMock(),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        agent_id="agent-1",
+        user_email="user@example.com",
+        group_policy="mention",
+    )
+    candidate = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$reply",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="follow up",
+        thread_id="$root",
+        was_mentioned=False,
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"unmentioned_thread_followup_candidate": True},
+    )
+    unrelated = candidate.model_copy(update={"thread_id": None, "platform_data": {}})
+
+    assert _is_unmentioned_matrix_thread_followup(candidate) is True
+    assert pipeline._check_access(candidate, config) is True
+    assert pipeline._check_access(unrelated, config) is False
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_pairing_policy_does_not_challenge_unmentioned_thread_candidate() -> None:
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    session.execute = AsyncMock(return_value=MagicMock(scalar_one_or_none=MagicMock(return_value=None)))
+    session_factory = MagicMock(return_value=session)
+    pairing_service = MagicMock()
+    pairing_service.ensure_verified_sender = AsyncMock(return_value="user@example.com")
+    pipeline = InboundPipeline(
+        session_factory=session_factory,
+        turn_scheduler=MagicMock(),
+        session_manager=MagicMock(),
+        pairing_service=pairing_service,
+        channel_manager_ref=MagicMock(),
+    )
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$reply",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="follow up",
+        thread_id="$root",
+        was_mentioned=False,
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"unmentioned_thread_followup_candidate": True},
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        agent_id="agent-1",
+        user_email="user@example.com",
+        group_policy="pairing",
+    )
+
+    result = await pipeline._resolve_user(message, config)
+
+    assert result is None
+    pairing_service.ensure_verified_sender.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_resolves_unmentioned_matrix_thread_candidate_only_if_existing() -> None:
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=MagicMock(),
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=MagicMock(),
+    )
+    pipeline._latest_conversation_for_context = AsyncMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(conversation_id="conv-thread")
+    )
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$reply",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="follow up",
+        thread_id="$root",
+        was_mentioned=False,
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"unmentioned_thread_followup_candidate": True},
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        agent_id="agent-1",
+        user_email="user@example.com",
+        settings={"group_conversation_mode": "threads"},
+    )
+
+    result = await pipeline._resolve_conversation(message, config, "user@example.com")
+
+    assert result == "conv-thread"
+    pipeline._latest_conversation_for_context.assert_awaited_once_with(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context_ref="matrix:acct-1:!room:fpy.cz:$root",
+    )
+    pipeline._session_manager.create_conversation_with_root_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_drops_unknown_unmentioned_matrix_thread_candidate() -> None:
+    session_manager = MagicMock()
+    session_manager.create_conversation_with_root_session = AsyncMock()
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=MagicMock(),
+        session_manager=session_manager,
+        pairing_service=MagicMock(),
+        channel_manager_ref=MagicMock(),
+    )
+    pipeline._latest_conversation_for_context = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$reply",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="follow up",
+        thread_id="$unknown",
+        was_mentioned=False,
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"unmentioned_thread_followup_candidate": True},
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        agent_id="agent-1",
+        user_email="user@example.com",
+        default_conversation_id="conv-default",
+        settings={"group_conversation_mode": "threads"},
+    )
+
+    result = await pipeline._resolve_conversation(message, config, "user@example.com")
+
+    assert result is None
+    session_manager.create_conversation_with_root_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_creates_conversation_for_mentioned_matrix_thread() -> None:
+    session_manager = MagicMock()
+    session_manager.create_conversation_with_root_session = AsyncMock(
+        return_value=(SimpleNamespace(conversation_id="conv-new"), SimpleNamespace())
+    )
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=MagicMock(),
+        session_manager=session_manager,
+        pairing_service=MagicMock(),
+        channel_manager_ref=MagicMock(),
+    )
+    pipeline._latest_conversation_for_context = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$reply",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="hello @bot:fpy.cz",
+        thread_id="$user-thread",
+        was_mentioned=True,
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        agent_id="agent-1",
+        user_email="user@example.com",
+        settings={"group_conversation_mode": "threads"},
+    )
+
+    result = await pipeline._resolve_conversation(message, config, "user@example.com")
+
+    assert result == "conv-new"
+    session_manager.create_conversation_with_root_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_fresh_thread_context_includes_root_excerpt() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    turn_scheduler.has_active_turn = MagicMock(return_value=False)
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 0))  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="$reply",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        chat_type="group",
+        content="continuation",
+        thread_id="$root",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={
+            "fresh_thread_context": True,
+            "thread_root": {"sender": "@filip:fpy.cz", "body": "original message"},
+        },
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    submitted_content = turn_scheduler.submit_turn.await_args.args[1]
+    assert "Thread started from:" in submitted_content
+    assert "@filip:fpy.cz: original message" in submitted_content
+    assert "User continuation:\ncontinuation" in submitted_content
 
 
 @pytest.mark.asyncio
@@ -172,7 +583,7 @@ async def test_channel_inbound_mark_read_failure_is_non_fatal() -> None:
 
     pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
     pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
-    pipeline._normalize_media_attachments = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 0))  # type: ignore[method-assign]
     pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     message = InboundMessage(
@@ -200,6 +611,173 @@ async def test_channel_inbound_mark_read_failure_is_non_fatal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_channel_inbound_submits_matrix_image_as_attachment() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    turn_scheduler.has_active_turn = MagicMock(return_value=False)
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+
+    image_ref = AttachmentRef(
+        artifact_id="att-1",
+        kind=ArtifactKind.IMAGE,
+        mime_type="image/png",
+        filename="obrazek.png",
+        size_bytes=128,
+    )
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([image_ref], 0))  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        content="",
+        media=[
+            MediaAttachment(url="mxc://fpy.cz/media", mime_type="image/png", filename="obrazek.png")
+        ],
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    turn_scheduler.submit_turn.assert_awaited_once()
+    assert turn_scheduler.submit_turn.await_args.args[1] == ""
+    assert turn_scheduler.submit_turn.await_args.kwargs["attachments"] == [
+        image_ref.model_dump(mode="json")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_uses_placeholder_when_matrix_image_normalization_fails() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    turn_scheduler.has_active_turn = MagicMock(return_value=False)
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    # Simulate: normalization returned no refs but 1 failure
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 1))  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        content="",
+        media=[
+            MediaAttachment(url="mxc://fpy.cz/media", mime_type="image/png", filename="obrazek.png")
+        ],
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    # A system notice is sent to the channel about the failed download
+    adapter.send_message.assert_awaited_once()
+    notice_outbound = adapter.send_message.await_args.args[0]
+    assert "couldn't download" in notice_outbound.content
+    assert "1 attachment" in notice_outbound.content
+    # The turn still proceeds with the placeholder text
+    turn_scheduler.submit_turn.assert_awaited_once()
+    assert turn_scheduler.submit_turn.await_args.args[1] == "User attached an image file."
+    assert turn_scheduler.submit_turn.await_args.kwargs["attachments"] == []
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_attachment_failure_notice_is_not_sent_for_voice_input() -> None:
+    """Voice-input attachment failures raise rather than sending a notice."""
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock(return_value=None)
+    llm_provider = MagicMock()
+    llm_provider.transcribe = AsyncMock(return_value=SimpleNamespace(text="ok"))
+
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        llm_provider=llm_provider,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+    )
+    pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    # Voice input: 0 refs, 0 failures (failures would raise for voice)
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 0))  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
+        platform_data={"voice_input": True},
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        credential_refs={},
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(message, config)
+
+    # No attachment-failure notice for voice input (failures raise instead)
+    for call in adapter.send_message.await_args_list:
+        outbound = call.args[0]
+        assert "couldn't download" not in outbound.content
+
+
+@pytest.mark.asyncio
 async def test_channel_inbound_transcribes_voice_input_before_submit() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
@@ -223,15 +801,18 @@ async def test_channel_inbound_transcribes_voice_input_before_submit() -> None:
     pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
     pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
     pipeline._normalize_media_attachments = AsyncMock(  # type: ignore[method-assign]
-        return_value=[
-            AttachmentRef(
-                artifact_id="att-1",
-                kind=ArtifactKind.AUDIO,
-                mime_type="audio/ogg",
-                filename="voice.ogg",
-                size_bytes=128,
-            )
-        ]
+        return_value=(
+            [
+                AttachmentRef(
+                    artifact_id="att-1",
+                    kind=ArtifactKind.AUDIO,
+                    mime_type="audio/ogg",
+                    filename="voice.ogg",
+                    size_bytes=128,
+                )
+            ],
+            0,
+        )
     )
     pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
@@ -283,15 +864,18 @@ async def test_channel_inbound_reports_voice_transcription_errors() -> None:
     pipeline._resolve_user = AsyncMock(return_value="user@example.com")  # type: ignore[method-assign]
     pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
     pipeline._normalize_media_attachments = AsyncMock(  # type: ignore[method-assign]
-        return_value=[
-            AttachmentRef(
-                artifact_id="att-1",
-                kind=ArtifactKind.AUDIO,
-                mime_type="audio/ogg",
-                filename="voice.ogg",
-                size_bytes=128,
-            )
-        ]
+        return_value=(
+            [
+                AttachmentRef(
+                    artifact_id="att-1",
+                    kind=ArtifactKind.AUDIO,
+                    mime_type="audio/ogg",
+                    filename="voice.ogg",
+                    size_bytes=128,
+                )
+            ],
+            0,
+        )
     )
     pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
@@ -691,6 +1275,50 @@ async def test_channel_turn_observer_legacy_final_mode_is_concatenated() -> None
     adapter.send_message.assert_awaited_once()
     outbound = adapter.send_message.await_args.args[0]
     assert outbound.content == "Progress update.Final answer."
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_records_outbound_delivery_mapping() -> None:
+    adapter = _FakeAdapter()
+    adapter.send_message.return_value = "$assistant"
+    manager = _FakeManager(adapter)
+    guardrails = SimpleNamespace(
+        record_events=AsyncMock(return_value=SimpleNamespace(first_seq=10, last_seq=10))
+    )
+    turn_scheduler = MagicMock()
+    turn_scheduler._providers = SimpleNamespace(guardrails=guardrails)
+
+    observer = ChannelTurnObserver(
+        channel_type="matrix",
+        account_id="acct-1",
+        chat_id="!room:fpy.cz",
+        thread_id="$root",
+        conversation_id="conv-1",
+        turn_scheduler=turn_scheduler,
+        reply_to_id="$user",
+        channel_manager_ref=lambda: manager,
+    )
+
+    await observer.on_token("conv-1", "sess-1", "msg-2", delta="reply")
+    await observer.on_turn_complete(
+        TurnResult(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            message_id="turn-1",
+            turn_id="turn-1",
+            final_content="reply",
+        )
+    )
+
+    guardrails.record_events.assert_awaited_once()
+    event = guardrails.record_events.await_args.kwargs["events"][0]
+    # Recorded as a valid Intaris event type — "channel_delivery" is not in
+    # the Intaris VALID_EVENT_TYPES set and was rejected with a 400.
+    assert event.type == "lifecycle"
+    assert event.data["event"] == "channel_delivery"
+    assert event.data["platform_message_id"] == "$assistant"
+    assert event.data["turn_id"] == "turn-1"
+    assert event.data["thread_id"] == "$root"
 
 
 @pytest.mark.asyncio

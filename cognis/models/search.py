@@ -31,9 +31,11 @@ class SearchRequestFilters(BaseModel):
 class ConversationSearchFilters(SearchRequestFilters):
     """Cognis-only metadata filters layered on top of Intaris search."""
 
+    agent_ids: list[str] | None = None
     project_id: str | None = None
     status: Literal["active", "starred", "archived", "all"] = "active"
     context_type: str | None = None
+    context_types: list[str] | None = None
 
 
 class SearchRequest(BaseModel):

@@ -100,6 +100,84 @@ def test_render_credential_request_notification_includes_form_link() -> None:
     assert "Do not send credential values in this chat." in content
 
 
+def test_render_escalation_notification_includes_managed_origin_context() -> None:
+    service = _make_service()
+
+    content = service._render_escalation_notification(
+        {
+            "tool_name": "bash",
+            "risk": "low",
+            "reasoning": "runs a command",
+            "managed_conversation_title": "Research sub-task",
+            "managed_target_agent_id": "agent-researcher",
+        }
+    )
+
+    assert "Approval required for tool `bash`." in content
+    assert "Research sub-task" in content
+    assert "/approve" in content
+    # Must not double-prefix (escalation renderer handles origin, not the event handler)
+    assert content.count("Research sub-task") == 1
+
+
+@pytest.mark.asyncio
+async def test_notification_event_prepends_managed_origin_for_non_escalation() -> None:
+    service = _make_service()
+    service._resolve_channel = AsyncMock(return_value=("matrix", "acct-1", "!room:fpy.cz", None))  # type: ignore[method-assign]
+    service.send_to_conversation = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    event = Event(
+        type=EventType.NOTIFICATION_CREATED,
+        data={
+            "conversation_id": "conv-parent",
+            "notification_type": "step_question",
+            "payload": {
+                "questions": [{"question": "Which approach?", "header": "Approach", "options": []}],
+                "managed_conversation_title": "Coding sub-task",
+                "managed_target_agent_id": "agent-coder",
+            },
+        },
+    )
+
+    await service._handle_notification_event(event)
+
+    service.send_to_conversation.assert_awaited_once()
+    content = service.send_to_conversation.await_args.args[1]
+    assert "Coding sub-task" in content
+    # Prefix must appear before the question body
+    assert content.index("Coding sub-task") < content.index("Which approach?")
+
+
+@pytest.mark.asyncio
+async def test_notification_event_escalation_does_not_double_prefix_managed_origin() -> None:
+    service = _make_service()
+    service._resolve_channel = AsyncMock(return_value=("matrix", "acct-1", "!room:fpy.cz", None))  # type: ignore[method-assign]
+    service.send_to_conversation = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    event = Event(
+        type=EventType.NOTIFICATION_CREATED,
+        data={
+            "conversation_id": "conv-parent",
+            "notification_type": "escalation",
+            "payload": {
+                "tool_name": "bash",
+                "risk": "medium",
+                "reasoning": "shell command",
+                "managed_conversation_title": "Sub-task",
+                "managed_target_agent_id": "agent-sub",
+            },
+        },
+    )
+
+    await service._handle_notification_event(event)
+
+    service.send_to_conversation.assert_awaited_once()
+    content = service.send_to_conversation.await_args.args[1]
+    assert "Sub-task" in content
+    # Origin must appear exactly once (from escalation renderer, not the prefix path)
+    assert content.count("Sub-task") == 1
+
+
 @pytest.mark.asyncio
 async def test_notification_event_delivers_rich_escalation_text() -> None:
     service = _make_service()
