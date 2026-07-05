@@ -7,18 +7,28 @@
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import ToolOutputDrawer from '$lib/components/ToolOutputDrawer.svelte';
+  import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
+  import { visibleTodos as activeVisibleTodos } from '$lib/todos';
   import { addToast } from '$lib/stores/toasts';
   import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
   import { renderTerminalOutput } from '$lib/syntax/terminal-output';
   import { highlightToolOutput, inferLanguageFromPath, isReadToolName, pathFromToolArguments } from '$lib/syntax/tool-output';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import { canOpenToolOutput, toolOutputOpenLabel } from '$lib/tool-output-status';
-  import { skillLoadDisplayName, stepTodoWriteStatusSummary, workflowToolPresentation } from '$lib/tool-call-summary';
-  import { formatStepQuestionResponse, legacyStepRequestOptions, normalizeStepQuestions, stepQuestionOptionLabel } from '$lib/tool-call-question-set';
+  import { delegationToolCallDisplayTitle, skillLoadDisplayName, stepTodoWriteStatusSummary, toolOutputHelperPresentation, workflowToolPresentation } from '$lib/tool-call-summary';
+  import { formatStepQuestionResponse, normalizeStepQuestionAnswers, normalizeStepQuestions, type StepQuestionAnswer } from '$lib/tool-call-question-set';
   import { displayToolName } from '$lib/tools-display';
   import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
 
-  let { item, live = false } = $props<{ item: ToolCallTimelineItem; live?: boolean }>();
+  let {
+    item,
+    sourceToolCalls = new Map<string, ToolCallTimelineItem>(),
+    onViewSession,
+  } = $props<{
+    item: ToolCallTimelineItem;
+    sourceToolCalls?: Map<string, ToolCallTimelineItem>;
+    onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+  }>();
 
   type StructuredEntry = { key: string; value: unknown };
 
@@ -26,33 +36,61 @@
   let inputExpanded = $state(false);
   let outputExpanded = $state(false);
   let rawExpanded = $state(false);
+  let originalCallExpanded = $state(false);
   let evalExpanded = $state(false);
+  let completedQuestionPage = $state(0);
   let autoExpanded = $state(false);
   let terminalPinned = $state(false);
   let outputDrawerOpen = $state(false);
   let terminalTailing = $state(true);
   let terminalEl = $state<HTMLPreElement | null>(null);
+  let outputDrawerTarget = $state<ToolCallTimelineItem | null>(null);
   let copiedBox = $state<'input' | 'output' | null>(null);
+  let delegateAutoExpanded = $state(false);
   let bashExpandTimer: number | null = null;
   let bashCollapseTimer: number | null = null;
   let bashAutoExpanded = false;
   let copyResetTimer: number | null = null;
+  let delegateDurationNowMs = $state(Date.now());
   const nowDate = new Date();
+  const drawerItem = $derived(outputDrawerTarget ?? item);
 
   const LINES_PER_PAGE = 50;
-  const BASH_AUTO_EXPAND_DELAY_MS = 450;
+  const BASH_AUTO_EXPAND_DELAY_MS = 10_000;
   const BASH_AUTO_COLLAPSE_DELAY_MS = 4000;
   const startsExpanded = $derived(
     (isQuestionRequestTool() && item.status !== 'started')
       || ['requestauthchallenge', 'requestcredential'].includes(item.toolName.toLowerCase().replace(/_/g, ''))
       || ['writedeliverable', 'stepcomplete'].includes(item.toolName.toLowerCase().replace(/_/g, '')) && workflowToolPresentation(item) !== null
+      // Delegate/fork: auto-expand while running so the delegation progress
+      // (title, tool-call stats, todo pie) is visible without a manual click.
+      || (isDelegateTool() && (isActiveToolStatus(item.status) || isDelegationActive()))
   );
 
   $effect(() => {
     if (startsExpanded && !autoExpanded) {
       expanded = true;
       autoExpanded = true;
+      if (isDelegateTool() && isDelegationActive()) {
+        delegateAutoExpanded = true;
+      }
     }
+  });
+
+  $effect(() => {
+    if (isDelegateTool() && delegateAutoExpanded && isDelegationTerminal()) {
+      expanded = false;
+      delegateAutoExpanded = false;
+    }
+  });
+
+  $effect(() => {
+    if (!isDelegateTool() || !delegationRunning) return;
+    delegateDurationNowMs = Date.now();
+    const timer = window.setInterval(() => {
+      delegateDurationNowMs = Date.now();
+    }, 1000);
+    return () => window.clearInterval(timer);
   });
 
   $effect(() => {
@@ -120,6 +158,9 @@
       terminalPinned = true;
       clearBashCollapseTimer();
     }
+    if (isDelegateTool()) {
+      delegateAutoExpanded = false;
+    }
     expanded = !expanded;
   }
 
@@ -146,12 +187,12 @@
     return s.length > max ? `${s.slice(0, max)}...` : s;
   }
 
-  function normalizedToolName(): string {
-    return item.toolName.toLowerCase().replace(/_/g, '');
+  function normalizedToolName(target: ToolCallTimelineItem = item): string {
+    return target.toolName.toLowerCase().replace(/_/g, '');
   }
 
-  function isBashTool(): boolean {
-    const name = normalizedToolName();
+  function isBashTool(target: ToolCallTimelineItem = item): boolean {
+    const name = normalizedToolName(target);
     return name.includes('bash') || name.includes('shell');
   }
 
@@ -160,16 +201,29 @@
     return match?.[1] ? decodeURIComponent(match[1]) : null;
   }
 
-  function isApplyPatchTool(): boolean {
-    return normalizedToolName().includes('applypatch');
+  function isApplyPatchTool(target: ToolCallTimelineItem = item): boolean {
+    return normalizedToolName(target).includes('applypatch');
   }
 
-  function descriptionText(): string {
-    return typeof item.arguments?.description === 'string' ? item.arguments.description.trim() : '';
+  function isDelegateTool(target: ToolCallTimelineItem = item): boolean {
+    const name = normalizedToolName(target);
+    return name === 'delegate' || name === 'fork';
   }
 
-  function patchFiles(): string[] {
-    const patch = item.arguments?.patchText;
+  // Delegation details folded onto the delegate tool call (title/progress/
+  // todos/result). Present only for delegate/fork tool calls.
+  const delegation = $derived(item.delegation ?? null);
+  const delegationVisibleTodos = $derived(activeVisibleTodos(delegation?.todos ?? undefined));
+  const delegationRunning = $derived(
+    isDelegateTool() && (isActiveToolStatus(item.status) || isDelegationActive())
+  );
+
+  function descriptionText(target: ToolCallTimelineItem = item): string {
+    return typeof target.arguments?.description === 'string' ? target.arguments.description.trim() : '';
+  }
+
+  function patchFiles(target: ToolCallTimelineItem = item): string[] {
+    const patch = target.arguments?.patchText;
     if (typeof patch !== 'string') return [];
     const files = new Set<string>();
     for (const line of patch.split('\n')) {
@@ -194,6 +248,16 @@
     return workflowToolPresentation(item) !== null;
   }
 
+  function isRichToolOutputHelper(): boolean {
+    return toolOutputHelperPresentation(item) !== null;
+  }
+
+  function sourceToolCall(): ToolCallTimelineItem | null {
+    const presentation = toolOutputHelperPresentation(item);
+    if (!presentation) return null;
+    return sourceToolCalls.get(presentation.sourceCallId) ?? null;
+  }
+
   function hasDeliverableFooter(presentation: ReturnType<typeof workflowToolPresentation>): boolean {
     return presentation?.kind === 'write_deliverable'
       && (Boolean(presentation.deliverableId) || presentation.outputKeys.length > 0);
@@ -203,11 +267,161 @@
     return Boolean((item.arguments && Object.keys(item.arguments).length > 0) || item.result != null);
   }
 
-  function subtitle(): string {
-    // Normalize: strip underscores for matching (web_fetch -> webfetch)
-    const name = normalizedToolName();
+  function isDelegationActive(): boolean {
+    const status = item.delegation?.status ?? null;
+    return status === 'started' || status === 'running' || status === 'active';
+  }
 
-    const workflowPresentation = workflowToolPresentation(item);
+  function isDelegationTerminal(): boolean {
+    const status = item.delegation?.status ?? null;
+    return status === 'completed'
+      || status === 'complete'
+      || status === 'failed'
+      || status === 'cancelled'
+      || status === 'canceled';
+  }
+
+  function delegationChildSessionId(): string {
+    return delegation?.childSessionId ?? '';
+  }
+
+  function canViewDelegationSession(): boolean {
+    const sessionId = delegationChildSessionId();
+    return Boolean(onViewSession && sessionId.startsWith('sess_'));
+  }
+
+  function delegationTitle(): string {
+    return delegation?.title
+      || delegation?.summary
+      || delegationToolCallDisplayTitle(item.arguments)
+      || 'Delegated sub-session';
+  }
+
+  function delegationAgentLabel(): string {
+    return delegation?.usedAgentId ?? delegation?.agentId ?? (
+      typeof item.arguments?.agent_id === 'string' ? item.arguments.agent_id : ''
+    );
+  }
+
+  function delegationStatusLabel(): string {
+    return delegation?.status ?? (isActiveToolStatus(item.status) ? 'running' : item.status);
+  }
+
+  function delegationStatusDisplayText(): string {
+    const status = delegationStatusLabel();
+    return status ? status.charAt(0).toUpperCase() + status.slice(1) : '';
+  }
+
+  function delegationSummaryText(): string {
+    if (delegation?.error) return delegation.error;
+    if (delegationRunning) return delegation?.summary ?? 'Working…';
+    return delegation?.resultSummary ?? delegation?.summary ?? '';
+  }
+
+  function delegationOutputText(): string {
+    if (delegation?.error) return '';
+    return delegation?.resultContent ?? delegation?.resultSummary ?? '';
+  }
+
+  function stripDelegateDisplayAnchors(content: string): string {
+    const cleaned: string[] = [];
+    let inFence = false;
+
+    for (const line of content.split('\n')) {
+      if (/^ {0,3}(```+|~~~+)/.test(line)) {
+        inFence = !inFence;
+        cleaned.push(line);
+        continue;
+      }
+      if (!inFence && /^\[\[message:\d+\]\]\s*$/.test(line)) continue;
+      if (!inFence && /^--- Assistant message \d+ ---\s*$/.test(line)) continue;
+      cleaned.push(line);
+    }
+
+    return cleaned.join('\n').trim();
+  }
+
+  function delegationOutputHtml(): string {
+    const output = stripDelegateDisplayAnchors(delegationOutputText());
+    return output ? renderMarkdown(output) : '';
+  }
+
+  function parseTimeMs(value: string | null | undefined): number | null {
+    if (!value) return null;
+    const parsed = new Date(value).getTime();
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  function formatDurationMs(durationMs: number | null | undefined): string {
+    if (durationMs == null) return '';
+    if (durationMs < 1000) return `${durationMs}ms`;
+    if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+    const totalSeconds = Math.floor(durationMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
+  }
+
+  function delegationDurationMs(): number | null {
+    if (typeof delegation?.durationMs === 'number') return delegation.durationMs;
+    if (typeof item.durationMs === 'number' && isDelegationTerminal()) return item.durationMs;
+    const start = parseTimeMs(delegation?.startedAt ?? item.timestamp);
+    if (start == null) return null;
+    const end = delegationRunning ? delegateDurationNowMs : parseTimeMs(item.timestamp) ?? Date.now();
+    return Math.max(0, end - start);
+  }
+
+  function delegationDurationText(): string {
+    return formatDurationMs(delegationDurationMs());
+  }
+
+  function delegationStatusTextClass(): string {
+    const status = delegationStatusLabel();
+    if (status === 'completed') return 'text-emerald-300';
+    if (status === 'failed' || status === 'cancelled' || status === 'canceled') return 'text-rose-300';
+    return 'text-sky-300';
+  }
+
+  function delegationStatusDotClass(): string {
+    const status = delegationStatusLabel();
+    if (status === 'completed') return 'bg-emerald-300';
+    if (status === 'failed' || status === 'cancelled' || status === 'canceled') return 'bg-rose-300';
+    return 'bg-sky-300';
+  }
+
+  function compactSessionId(sessionId: string): string {
+    if (!sessionId) return '';
+    if (sessionId.length <= 18) return sessionId;
+    return `${sessionId.slice(0, 10)}…${sessionId.slice(-6)}`;
+  }
+
+  function delegationProgressPercent(): number {
+    const current = delegation?.toolCallCount;
+    const max = delegation?.maxToolCalls;
+    if (typeof current !== 'number' || typeof max !== 'number' || max <= 0) return 0;
+    return Math.min((current / max) * 100, 100);
+  }
+
+  function hasDelegationProgressStats(): boolean {
+    return delegation?.toolCallCount != null || Boolean(delegation?.lastTool);
+  }
+
+  function hasDelegationProgressLead(): boolean {
+    return delegationVisibleTodos.length > 0
+      || (delegationRunning && !delegation?.error)
+      || (!delegationRunning && !delegation?.error && Boolean(delegationSummaryText()) && !delegationOutputText());
+  }
+
+  function toolCallSubtitle(target: ToolCallTimelineItem): string {
+    // Normalize: strip underscores for matching (web_fetch -> webfetch)
+    const name = normalizedToolName(target);
+
+    const outputHelperPresentation = toolOutputHelperPresentation(target);
+    if (outputHelperPresentation) {
+      return truncate(outputHelperPresentation.summary, 120);
+    }
+
+    const workflowPresentation = workflowToolPresentation(target);
     if (workflowPresentation?.kind === 'write_deliverable') {
       return truncate(workflowPresentation.title, 120);
     }
@@ -219,19 +433,19 @@
     }
 
     if (name === 'skillload') {
-      const skillName = skillLoadDisplayName(item);
+      const skillName = skillLoadDisplayName(target);
       if (skillName) return truncate(skillName, 120);
     }
 
     if (name === 'steptodowrite') {
-      const todoSummary = stepTodoWriteStatusSummary(item);
+      const todoSummary = stepTodoWriteStatusSummary(target);
       if (todoSummary) return truncate(todoSummary, 120);
     }
 
-    if (!item.arguments) {
+    if (!target.arguments) {
       return '';
     }
-    const args = item.arguments;
+    const args = target.arguments;
 
     if (name === 'skillload') {
       if (typeof args.skill === 'string') return truncate(args.skill);
@@ -240,8 +454,8 @@
 
     // File operations
     if (name.includes('read') || name.includes('write') || name.includes('edit') || name.includes('patch') || name.includes('multiedit') || name === 'listdirectory') {
-      if (isApplyPatchTool()) {
-        const files = patchFiles();
+      if (isApplyPatchTool(target)) {
+        const files = patchFiles(target);
         if (files.length > 0) return truncate(files.join(', '), 120);
       }
       if (typeof args.filePath === 'string') return args.filePath;
@@ -249,7 +463,7 @@
     }
     // Shell
     if (name.includes('bash') || name.includes('shell')) {
-      const description = descriptionText();
+      const description = descriptionText(target);
       if (description) return truncate(description, 120);
       if (typeof args.command === 'string') return truncate(args.command);
     }
@@ -277,7 +491,8 @@
     }
     // Delegation
     if (name.includes('delegate') || name.includes('fork') || name.includes('spawn')) {
-      if (typeof args.task === 'string') return truncate(args.task);
+      const displayTitle = delegationToolCallDisplayTitle(args);
+      if (displayTitle) return truncate(displayTitle);
     }
     // Step tools
     if (name.includes('stepcomplete')) {
@@ -293,6 +508,10 @@
     return '';
   }
 
+  function subtitle(): string {
+    return toolCallSubtitle(item);
+  }
+
   function statusIcon(): string {
     if (item.status === 'completed') return '\u2713';
     if (item.status === 'failed') return '\u2717';
@@ -306,9 +525,7 @@
   }
 
   function durationText(): string {
-    if (item.durationMs == null) return '';
-    if (item.durationMs < 1000) return `${item.durationMs}ms`;
-    return `${(item.durationMs / 1000).toFixed(1)}s`;
+    return formatDurationMs(item.durationMs);
   }
 
   function isPreparingPatch(): boolean {
@@ -329,11 +546,20 @@
 
   function formatArguments(): string {
     if (!item.arguments) return '';
+    return formatCallArguments(item);
+  }
+
+  function formatCallArguments(target: ToolCallTimelineItem): string {
+    if (!target.arguments) return '';
     try {
-      return JSON.stringify(item.arguments, null, 2);
+      return JSON.stringify(target.arguments, null, 2);
     } catch {
-      return String(item.arguments);
+      return String(target.arguments);
     }
+  }
+
+  function canShowInlineOriginalOutput(target: ToolCallTimelineItem): boolean {
+    return cleanResult(target.result).length > 0 && cleanResult(target.result).length <= 4000;
   }
 
   async function copyBox(kind: 'input' | 'output', text: string): Promise<void> {
@@ -434,10 +660,6 @@
     return Boolean(item.fileDiffs && item.fileDiffs.length > 0);
   }
 
-  function stepRequestOptions(): string[] {
-    return legacyStepRequestOptions(item);
-  }
-
   function stepRequestContext(): string {
     const context = item.arguments?.context;
     if (typeof context === 'string') return context;
@@ -462,13 +684,29 @@
     return formatStepQuestionResponse(item, parsedToolResult());
   }
 
+  function stepRequestAnswers(): StepQuestionAnswer[] {
+    return normalizeStepQuestionAnswers(item, parsedToolResult());
+  }
+
+  function completedQuestionPageIndex(answers: StepQuestionAnswer[]): number {
+    return Math.min(completedQuestionPage, Math.max(answers.length - 1, 0));
+  }
+
+  function completedQuestionAt(answers: StepQuestionAnswer[]): StepQuestionAnswer | null {
+    return answers[completedQuestionPageIndex(answers)] ?? null;
+  }
+
+  function goToCompletedQuestion(index: number, answers: StepQuestionAnswer[]): void {
+    completedQuestionPage = Math.min(Math.max(index, 0), Math.max(answers.length - 1, 0));
+  }
+
   function stepRequestError(): string {
     const error = parsedToolResult()?.error;
     return typeof error === 'string' ? error : '';
   }
 
-  function commandText(): string {
-    return typeof item.arguments?.command === 'string' ? item.arguments.command : item.toolName;
+  function commandText(target: ToolCallTimelineItem = item): string {
+    return typeof target.arguments?.command === 'string' ? target.arguments.command : target.toolName;
   }
 
   function terminalTitle(): string {
@@ -516,6 +754,25 @@
     return `${workingDirectory()} $ ${commandText()}`;
   }
 
+  function openToolOutput(target: ToolCallTimelineItem): void {
+    outputDrawerTarget = target;
+    outputDrawerOpen = true;
+  }
+
+  function openReferencedToolOutput(callId: string): void {
+    outputDrawerTarget = {
+      id: `referenced-tool-output:${callId}`,
+      kind: 'tool_call',
+      callId,
+      toolName: 'tool_output',
+      displayToolName: 'Referenced tool output',
+      status: 'completed',
+      timestamp: null,
+      sessionId: item.sessionId,
+    };
+    outputDrawerOpen = true;
+  }
+
   function onTerminalScroll(): void {
     if (!terminalEl) return;
     const atTail = terminalEl.scrollHeight - terminalEl.scrollTop - terminalEl.clientHeight < 16;
@@ -539,14 +796,16 @@
       {/if}
     </span>
     <span class={`flex shrink-0 items-center gap-1.5 self-start text-xs font-medium ${statusColor()} sm:self-auto`}>
-      {#if isActiveToolStatus(item.status) && live}
-        <span class="inline-block h-3 w-3 animate-spin rounded-full border border-sky-400 border-t-transparent"></span>
-        <span>{isPreparingPatch() ? 'preparing' : 'running'}</span>
+      {#if isActiveToolStatus(item.status)}
+        <LiveDots inline={true} size="sm" tone="sky" />
+        <span class="sr-only">{isPreparingPatch() ? 'Preparing' : 'Running'}</span>
       {:else}
         <span>{statusIcon()}</span>
         <span>{item.status}</span>
       {/if}
-      {#if durationText()}
+      {#if isDelegateTool() && delegationDurationText()}
+        <span class="text-slate-500">{delegationDurationText()}</span>
+      {:else if durationText()}
         <span class="text-slate-500">{durationText()}</span>
       {/if}
     </span>
@@ -560,6 +819,140 @@
           <span>Executed</span>
           <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
         </div>
+      {/if}
+      {#if isDelegateTool()}
+        <div class="overflow-hidden rounded-2xl border border-sky-500/25 bg-slate-950/35 text-sm text-slate-100 shadow-inner">
+          <div class="flex flex-wrap items-start justify-between gap-3 px-4 py-3">
+            <div class="min-w-0 flex-1 space-y-1.5">
+              <p class="text-[11px] font-medium uppercase tracking-[0.22em] text-slate-400">Delegated sub-session</p>
+              <h4 class="truncate text-base font-semibold text-slate-50" title={delegationTitle()}>{delegationTitle()}</h4>
+              <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-400">
+                {#if delegationAgentLabel()}
+                  <span class="font-mono text-slate-300">{delegationAgentLabel()}</span>
+                  <span class="text-slate-600">·</span>
+                {/if}
+                {#if delegationChildSessionId()}
+                  <span class="font-mono text-slate-400" title={delegationChildSessionId()}>{compactSessionId(delegationChildSessionId())}</span>
+                  <span class="text-slate-600">·</span>
+                {/if}
+                <span class={`inline-flex items-center gap-1.5 font-medium ${delegationStatusTextClass()}`}>
+                  <span class={`h-1.5 w-1.5 rounded-full ${delegationStatusDotClass()}`}></span>
+                  {delegationStatusDisplayText()}
+                </span>
+                {#if delegationDurationText()}
+                  <span class="text-slate-600">·</span>
+                  <span class="tabular-nums text-slate-400">{delegationDurationText()}</span>
+                {/if}
+              </div>
+            </div>
+            <div class="flex shrink-0 items-center">
+              {#if canViewDelegationSession()}
+                <button
+                  class="rounded-lg border border-slate-600/70 bg-slate-900/70 px-3 py-1.5 text-xs font-medium text-slate-100 transition hover:border-sky-300/50 hover:bg-sky-500/10"
+                  type="button"
+                  onclick={() => { const sessionId = delegationChildSessionId(); if (sessionId) void onViewSession?.(sessionId); }}
+                >
+                  View session
+                </button>
+              {/if}
+            </div>
+          </div>
+
+          <div class="space-y-3 border-t border-slate-800/70 px-4 py-3">
+            {#if delegationRunning || hasDelegationProgressStats() || delegationVisibleTodos.length > 0}
+              <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-300">
+                {#if delegationVisibleTodos.length > 0}
+                  <TodoProgressPopover todos={delegationVisibleTodos} label="Delegated todo progress" />
+                {/if}
+                {#if delegationRunning && !delegation?.error}
+                  <span class="inline-flex min-w-0 items-center gap-2">
+                    <LiveDots inline={true} size="sm" tone="sky" />
+                    <span class="min-w-0 truncate">{delegationSummaryText()}</span>
+                  </span>
+                {:else if !delegation?.error && delegationSummaryText() && !delegationOutputText()}
+                  <span class="min-w-0 whitespace-pre-wrap text-slate-300">{delegationSummaryText()}</span>
+                {/if}
+                {#if delegation?.toolCallCount != null}
+                  {#if hasDelegationProgressLead()}
+                    <span class="text-slate-600">·</span>
+                  {/if}
+                  <span class="tabular-nums text-slate-400">
+                    {#if delegation?.maxToolCalls != null && delegation.maxToolCalls > 0}
+                      {delegation.toolCallCount}/{delegation.maxToolCalls} tool calls
+                    {:else}
+                      {delegation.toolCallCount} tool calls
+                    {/if}
+                  </span>
+                {/if}
+                {#if delegation?.lastTool}
+                  {#if hasDelegationProgressLead() || delegation?.toolCallCount != null}
+                    <span class="text-slate-600">·</span>
+                  {/if}
+                  <span class="min-w-0 truncate text-slate-400" title={delegation.lastTool}>last: <span class="font-mono text-slate-300">{delegation.lastTool}</span></span>
+                {/if}
+              </div>
+              {#if delegation?.toolCallCount != null && delegation?.maxToolCalls != null && delegation.maxToolCalls > 0}
+                <div class="h-1 overflow-hidden rounded-full bg-slate-800/80">
+                  <div class="h-full rounded-full bg-sky-400 transition-all duration-500" style={`width: ${delegationProgressPercent()}%`}></div>
+                </div>
+              {/if}
+            {/if}
+
+            {#if delegationOutputText() && !delegationRunning && !delegation?.error}
+              <div class="rounded-xl border border-sky-400/15 bg-slate-950/35">
+                <div class="flex items-center justify-between gap-2 border-b border-sky-400/10 px-3 py-2">
+                  <span class="text-[10px] font-semibold uppercase tracking-[0.18em] text-sky-100/60">Output</span>
+                  {#if delegation?.resultTruncated}
+                    <span class="rounded-full border border-amber-300/25 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-widest text-amber-100">truncated</span>
+                  {/if}
+                </div>
+                <div class="prose prose-sm prose-invert max-h-[34vh] max-w-none overflow-auto px-3 py-2 text-slate-200">
+                  {@html delegationOutputHtml()}
+                </div>
+              </div>
+            {:else if delegationSummaryText() && (!delegationRunning || delegation?.error)}
+              <div class={`rounded-xl border px-3 py-2 text-xs leading-5 ${delegation?.error ? 'border-rose-400/25 bg-rose-500/10 text-rose-100' : 'border-slate-700/70 bg-slate-950/35 text-slate-300'}`}>
+                <p class="line-clamp-5 whitespace-pre-wrap">{delegationSummaryText()}</p>
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        {#if hasRawPayload()}
+          {@const rawOutputText = cleanResult(item.result)}
+          {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
+          <div>
+            <button
+              class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+              onclick={() => { rawExpanded = !rawExpanded; }}
+              type="button"
+            >
+              <span>{rawExpanded ? '▼' : '▶'}</span>
+              <span>Raw payload</span>
+            </button>
+            {#if rawExpanded}
+              <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                {#if item.arguments && Object.keys(item.arguments).length > 0}
+                  <div>
+                    <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                    <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                  </div>
+                {/if}
+                {#if item.result != null}
+                  <div>
+                    <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                    <div class="relative">
+                      <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                      <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                        {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                      </button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
       {/if}
       {#if isStepRequestInput()}
         <div>
@@ -608,6 +1001,99 @@
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Resolution</p>
             <div class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
               {stepRequestError()}
+            </div>
+          {:else if stepRequestAnswers().length > 0}
+            {@const answers = stepRequestAnswers()}
+            {@const answer = completedQuestionAt(answers)}
+            <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Submitted answers</p>
+            <div class="overflow-hidden rounded-2xl border border-emerald-500/20 bg-emerald-500/5 text-sm text-emerald-50">
+              {#if answers.length > 1}
+                <div class="flex items-center justify-between gap-3 border-b border-emerald-400/15 px-4 py-3">
+                  <span class="font-semibold">Answered questions</span>
+                  <span class="rounded-full border border-emerald-300/25 bg-slate-950/40 px-2 py-0.5 font-mono text-[11px] text-emerald-100">
+                    {completedQuestionPageIndex(answers) + 1}/{answers.length}
+                  </span>
+                </div>
+              {/if}
+              <div class="max-h-[min(42vh,28rem)] overflow-y-auto overscroll-contain px-4 py-3">
+                {#if answer}
+                  <section class="rounded-2xl border border-emerald-400/20 bg-slate-950/30 p-3">
+                    {#if answer.question.header}
+                      <p class="text-xs uppercase tracking-[0.2em] text-emerald-100/70">{answer.question.header}</p>
+                    {/if}
+                    <p class="text-sm font-medium leading-6 text-emerald-50">{answer.question.question}</p>
+                    <div class="mt-1 flex flex-wrap gap-2">
+                      {#if answer.question.required}
+                        <span class="rounded-full border border-emerald-300/20 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-emerald-100/65">Required</span>
+                      {:else}
+                        <span class="rounded-full border border-emerald-300/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-emerald-100/50">Optional</span>
+                      {/if}
+                      {#if answer.question.multiple}
+                        <span class="rounded-full border border-emerald-300/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.18em] text-emerald-100/50">Multi-select</span>
+                      {/if}
+                    </div>
+                    {#if answer.selected.length > 0}
+                      <div class="mt-3 space-y-2">
+                        {#each answer.selected as option, optionIndex (`${option.id}:${optionIndex}`)}
+                          <div class={`flex w-full items-start gap-3 rounded-2xl border px-3 py-2 text-left text-xs ${option.unknown ? 'border-amber-400/30 bg-amber-400/10 text-amber-100' : 'border-emerald-400/30 bg-emerald-400/10 text-emerald-100'}`}>
+                            <span class={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center border ${answer.question.multiple ? 'rounded' : 'rounded-full'} ${option.unknown ? 'border-amber-300/60 bg-amber-300/20' : 'border-emerald-300/70 bg-emerald-300 text-slate-950'}`}>
+                              {#if answer.question.multiple}
+                                ✓
+                              {:else}
+                                <span class={`h-1.5 w-1.5 rounded-full ${option.unknown ? 'bg-amber-100' : 'bg-slate-950'}`}></span>
+                              {/if}
+                            </span>
+                            <span class="min-w-0">
+                              <span class="block font-medium">{option.label}</span>
+                              {#if option.description}
+                                <span class="mt-0.5 block text-emerald-100/60">{option.description}</span>
+                              {:else if option.unknown}
+                                <span class="mt-0.5 block text-amber-100/65">Unknown option id from the submitted response.</span>
+                              {/if}
+                            </span>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                    {#if answer.custom}
+                      <div class="mt-3 rounded-2xl border border-emerald-400/20 bg-slate-950/60 px-3 py-2">
+                        <p class="mb-1 text-[11px] uppercase tracking-[0.18em] text-emerald-100/55">Custom answer</p>
+                        <p class="whitespace-pre-wrap leading-6">{answer.custom}</p>
+                      </div>
+                    {/if}
+                  </section>
+                {/if}
+                {#if answers.length > 1}
+                  <div class="mt-3 grid gap-1" style={`grid-template-columns: repeat(${Math.min(answers.length, 7)}, minmax(0, 1fr));`} aria-hidden="true">
+                    {#each answers as entry, index (`${entry.question.id}:${index}`)}
+                      <span class={`h-1.5 rounded-full ${index === completedQuestionPageIndex(answers) ? 'bg-emerald-200' : 'bg-emerald-900/70'}`}></span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+              {#if answers.length > 1}
+                <div class="flex items-center gap-2 border-t border-emerald-400/15 bg-slate-950/80 px-4 py-3">
+                  {#if completedQuestionPageIndex(answers) > 0}
+                    <button
+                      class="rounded-lg border border-emerald-300/20 bg-emerald-300/10 px-3 py-1.5 text-xs text-emerald-100 transition hover:bg-emerald-300/20"
+                      type="button"
+                      aria-label="Previous answered question"
+                      onclick={() => { goToCompletedQuestion(completedQuestionPageIndex(answers) - 1, answers); }}
+                    >
+                      ←
+                    </button>
+                  {/if}
+                  {#if completedQuestionPageIndex(answers) < answers.length - 1}
+                    <button
+                      class="ml-auto rounded-lg border border-emerald-300/20 bg-emerald-300/10 px-3 py-1.5 text-xs text-emerald-100 transition hover:bg-emerald-300/20"
+                      type="button"
+                      onclick={() => { goToCompletedQuestion(completedQuestionPageIndex(answers) + 1, answers); }}
+                    >
+                      Next →
+                    </button>
+                  {/if}
+                </div>
+              {/if}
             </div>
           {:else if stepRequestResponse()}
             <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Submitted answers</p>
@@ -659,7 +1145,171 @@
         {/if}
 
       {:else}
-        {#if workflowToolPresentation(item)}
+        {#if isRichToolOutputHelper()}
+          {@const outputHelper = toolOutputHelperPresentation(item)}
+          {@const originalCall = sourceToolCall()}
+          {#if outputHelper}
+            <div class="overflow-hidden rounded-2xl border border-cyan-500/25 bg-cyan-500/5">
+              <div class="flex flex-wrap items-start justify-between gap-3 border-b border-cyan-500/15 px-4 py-3">
+                <div class="min-w-0">
+                  <p class="text-xs font-medium uppercase tracking-widest text-cyan-300">Stored tool output query</p>
+                  <h4 class="mt-1 truncate text-sm font-semibold text-cyan-50">{outputHelper.title}</h4>
+                  <p class="mt-2 text-xs leading-5 text-cyan-100/80">{outputHelper.summary}</p>
+                </div>
+                <span class="rounded-full border border-cyan-400/25 px-2.5 py-1 font-mono text-[11px] text-cyan-100">{outputHelper.sourceCallId}</span>
+              </div>
+
+              <div class="grid gap-3 px-4 py-3 md:grid-cols-2">
+                <section class="rounded-xl border border-cyan-400/15 bg-slate-950/30 px-3 py-2">
+                  <p class="mb-2 text-xs font-medium uppercase tracking-widest text-cyan-300">Query</p>
+                  <dl class="space-y-2 text-xs">
+                    {#each outputHelper.queryEntries as entry}
+                      <div>
+                        <dt class="font-medium uppercase tracking-wider text-cyan-100/70">{entry.key}</dt>
+                        <dd class="mt-1 font-mono text-slate-100 [overflow-wrap:anywhere]">{formatStructuredValue(entry.value)}</dd>
+                      </div>
+                    {/each}
+                  </dl>
+                </section>
+
+                <section class="rounded-xl border border-cyan-400/15 bg-slate-950/30 px-3 py-2">
+                  <p class="mb-2 text-xs font-medium uppercase tracking-widest text-cyan-300">Received</p>
+                  <p class="text-xs leading-5 text-slate-100">{outputHelper.receivedSummary}</p>
+                  {#if outputHelper.receivedDetails.length > 0}
+                    <dl class="mt-2 space-y-2 text-xs">
+                      {#each outputHelper.receivedDetails as entry}
+                        <div>
+                          <dt class="font-medium uppercase tracking-wider text-cyan-100/70">{entry.key}</dt>
+                          <dd class="mt-1 font-mono text-slate-100">{formatStructuredValue(entry.value)}</dd>
+                        </div>
+                      {/each}
+                    </dl>
+                  {/if}
+                  {#if outputHelper.continuationHint}
+                    <p class="mt-2 rounded-lg border border-sky-400/20 bg-sky-500/10 px-2 py-1.5 text-xs text-sky-100">{outputHelper.continuationHint}</p>
+                  {/if}
+                </section>
+              </div>
+
+              <section class="border-t border-cyan-500/15 px-4 py-3">
+                <p class="mb-2 text-xs font-medium uppercase tracking-widest text-cyan-300">Original tool call</p>
+                {#if originalCall}
+                  <div class="rounded-xl border border-cyan-400/15 bg-slate-950/30 px-3 py-2">
+                    <div class="flex flex-wrap items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <p class="font-semibold text-slate-100 [overflow-wrap:anywhere]">{displayToolName(originalCall.displayToolName ?? originalCall.toolName)}</p>
+                        {#if toolCallSubtitle(originalCall)}
+                          <p class="mt-1 text-xs leading-5 text-slate-300 [overflow-wrap:anywhere]">{toolCallSubtitle(originalCall)}</p>
+                        {/if}
+                      </div>
+                      <div class="flex flex-wrap gap-2 text-[11px] text-cyan-100/75">
+                        <span class="rounded-full border border-cyan-400/25 px-2 py-0.5">{originalCall.status}</span>
+                        {#if originalCall.timestamp}
+                          <span class="rounded-full border border-cyan-400/25 px-2 py-0.5" title={formatAbsoluteTime(originalCall.timestamp)}>{formatCompactTime(originalCall.timestamp, nowDate)}</span>
+                        {/if}
+                      </div>
+                    </div>
+                    <div class="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                      <span>Call ID: <span class="font-mono text-slate-200">{originalCall.callId}</span></span>
+                      {#if originalCall.outputSize != null}
+                        <span>Output: <span class="text-slate-200">{originalCall.outputSize.toLocaleString()} chars</span></span>
+                      {/if}
+                      {#if originalCall.hasFullOutput}
+                        <span class="rounded-full border border-emerald-400/25 px-2 py-0.5 text-emerald-100">full output available</span>
+                      {/if}
+                      {#if originalCall.anchorsAvailable}
+                        <span class="rounded-full border border-sky-400/25 px-2 py-0.5 text-sky-100">anchors available</span>
+                      {/if}
+                    </div>
+                    {#if canOpenToolOutput(originalCall) && conversationId()}
+                      <button class="mt-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { openToolOutput(originalCall); }}>
+                        Open original output
+                      </button>
+                    {/if}
+                  </div>
+                {:else}
+                  <div class="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-100">
+                    <p>The original tool call is not present in the loaded timeline page. The referenced call ID is <span class="font-mono">{outputHelper.sourceCallId}</span>.</p>
+                    {#if conversationId()}
+                      <button class="mt-2 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-500/20" type="button" onclick={() => { openReferencedToolOutput(outputHelper.sourceCallId); }}>
+                        Open referenced output
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              </section>
+            </div>
+
+            {#if originalCall}
+              <div>
+                <button
+                  class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+                  onclick={() => { originalCallExpanded = !originalCallExpanded; }}
+                  type="button"
+                >
+                  <span>{originalCallExpanded ? '▼' : '▶'}</span>
+                  <span>Original call raw</span>
+                </button>
+                {#if originalCallExpanded}
+                  {@const originalOutputText = cleanResult(originalCall.result)}
+                  {@const originalOutputData = formatOutput(originalOutputText, outputExpanded)}
+                  <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                    {#if originalCall.arguments && Object.keys(originalCall.arguments).length > 0}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                        <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatCallArguments(originalCall)}</pre>
+                      </div>
+                    {/if}
+                    {#if canShowInlineOriginalOutput(originalCall)}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                        <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 text-xs leading-5 ${originalCall.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if originalOutputData.html}{@html originalOutputData.html}{:else}{originalOutputData.text}{/if}</pre>
+                      </div>
+                    {:else if originalCall.result}
+                      <p class="rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-400">Original output is too large to embed here. Use “Open original output” instead.</p>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+
+            {#if hasRawPayload()}
+              {@const rawOutputText = cleanResult(item.result)}
+              {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
+              <div>
+                <button
+                  class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+                  onclick={() => { rawExpanded = !rawExpanded; }}
+                  type="button"
+                >
+                  <span>{rawExpanded ? '▼' : '▶'}</span>
+                  <span>Raw payload</span>
+                </button>
+                {#if rawExpanded}
+                  <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                    {#if item.arguments && Object.keys(item.arguments).length > 0}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                        <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                      </div>
+                    {/if}
+                    {#if item.result != null}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                        <div class="relative">
+                          <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                          <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                            {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                          </button>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+        {:else if workflowToolPresentation(item)}
           {@const workflowPresentation = workflowToolPresentation(item)}
           {#if workflowPresentation?.kind === 'write_deliverable'}
             <div class="overflow-hidden rounded-2xl border border-emerald-500/25 bg-emerald-500/5">
@@ -877,21 +1527,24 @@
             <div class={`overflow-hidden rounded-xl border ${item.isError ? 'border-rose-500/30' : 'border-slate-700/70'} bg-[#05070a] shadow-inner`}>
               <div class="flex items-center justify-between border-b border-white/10 bg-slate-950/90 px-3 py-2 text-[11px] text-slate-400">
                 <span class="truncate font-medium text-slate-300">{terminalTitle()}</span>
-                <span>{item.status === 'started' ? 'live' : item.status}</span>
+                {#if isActiveToolStatus(item.status)}
+                  <LiveDots inline={true} size="sm" tone="emerald" />
+                {:else}
+                  <span>{item.status}</span>
+                {/if}
               </div>
               <pre bind:this={terminalEl} onscroll={onTerminalScroll} onpointerdown={pinTerminal} class={`max-h-[50vh] overflow-auto p-3 pr-10 font-mono text-xs leading-5 ${item.isError ? 'text-rose-200' : 'text-emerald-100'}`}><span class="text-sky-300">{terminalPrompt()}</span>{#if outputText}
-{@html renderTerminalOutput(`\n${outputText}`)}{:else if item.status === 'started'}
-Running...{/if}</pre>
+{@html renderTerminalOutput(`\n${outputText}`)}{/if}</pre>
             </div>
             {#if canOpenToolOutput(item) && conversationId()}
-              <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { pinTerminal(); outputDrawerOpen = true; }}>
+              <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { pinTerminal(); openToolOutput(item); }}>
                 {toolOutputOpenLabel(item)}
               </button>
             {/if}
           </div>
         {/if}
 
-        {#if (!hasDiffs() || rawExpanded) && !isBashTool() && !isRichWorkflowTool()}
+        {#if (!hasDiffs() || rawExpanded) && !isBashTool() && !isDelegateTool() && !isRichWorkflowTool() && !isRichToolOutputHelper()}
           {#if item.arguments && Object.keys(item.arguments).length > 0}
             {@const inputText = formatArguments()}
             {@const inputData = formatMaybeJson(inputText, inputExpanded)}
@@ -938,7 +1591,7 @@ Running...{/if}</pre>
                   </button>
                 </div>
                 {#if canOpenToolOutput(item) && conversationId()}
-                  <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { outputDrawerOpen = true; }}>
+                  <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { openToolOutput(item); }}>
                     {toolOutputOpenLabel(item)}
                   </button>
                 {/if}
@@ -1038,9 +1691,9 @@ Running...{/if}</pre>
 <ToolOutputDrawer
   open={outputDrawerOpen}
   conversationId={conversationId()}
-  sessionId={item.sessionId}
-  callId={item.recoveryCallId ?? item.callId}
-  toolName={item.toolName}
-  isTerminal={isBashTool()}
-  onClose={() => { outputDrawerOpen = false; }}
+  sessionId={drawerItem.sessionId}
+  callId={drawerItem.recoveryCallId ?? drawerItem.callId}
+  toolName={drawerItem.toolName}
+  isTerminal={isBashTool(drawerItem)}
+  onClose={() => { outputDrawerOpen = false; outputDrawerTarget = null; }}
 />

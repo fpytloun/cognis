@@ -79,6 +79,26 @@ describe('session log helpers', () => {
     const refreshed = await refreshSessionLog(initial, async () => ({
       session_id: 'sess_child',
       items: [],
+      timeline_items: [
+        {
+          id: 'thinking:msg_think:think_1',
+          kind: 'thinking',
+          messageId: 'msg_think',
+          turnId: 'turn_1',
+          blocks: [
+            {
+              block_id: 'think_1',
+              title: 'Thinking',
+              content: 'checking',
+              source: 'reasoning',
+              complete: false
+            }
+          ],
+          streaming: true,
+          activeTitle: 'Thinking',
+          timestamp: '2026-01-01T00:00:02Z'
+        }
+      ],
       last_seq: 1,
       has_more: false,
       active_thinking: [
@@ -102,5 +122,46 @@ describe('session log helpers', () => {
 
     expect(refreshed.events).toHaveLength(1);
     expect(refreshed.timeline.some((item) => item.kind === 'thinking' && item.streaming)).toBe(true);
+  });
+
+  it('does not duplicate items when a projection refresh follows an events-built timeline', async () => {
+    // The events builder and the server projection use different item id
+    // schemes. A refresh carrying the full projection must REPLACE the
+    // timeline, not upsert into it — otherwise every already-rendered
+    // message re-appears at the bottom under its projection id.
+    const initial = await loadSessionLog('sess_child', async () => response([event(1)]));
+    expect(initial.timelineSource).toBe('events');
+
+    const refreshed = await refreshSessionLog(initial, async () => ({
+      session_id: 'sess_child',
+      items: [event(2, 'assistant_message', 'the reply')],
+      timeline_items: [
+        {
+          id: 'message:sess_child:1',
+          kind: 'message',
+          role: 'user',
+          content: 'message 1',
+          timestamp: '2026-01-01T00:00:01Z'
+        },
+        {
+          id: 'message:turn-1:phase:0',
+          kind: 'message',
+          role: 'assistant',
+          content: 'the reply',
+          timestamp: '2026-01-01T00:00:02Z'
+        }
+      ],
+      last_seq: 2,
+      has_more: false,
+      active_thinking: []
+    }));
+
+    expect(refreshed.timelineSource).toBe('projection');
+    const contents = refreshed.timeline
+      .filter((item) => item.kind === 'message')
+      .map((item) => (item.kind === 'message' ? item.content : ''));
+    // Each message appears exactly once.
+    expect(contents.filter((content) => content === 'message 1')).toHaveLength(1);
+    expect(contents.filter((content) => content === 'the reply')).toHaveLength(1);
   });
 });

@@ -26,7 +26,6 @@ import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
-  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import ChatSearchBar from '$lib/components/ChatSearchBar.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
@@ -36,7 +35,7 @@ import X from 'lucide-svelte/icons/x';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import NewChatModal from '$lib/components/NewChatModal.svelte';
-  import TimelineList from '$lib/components/timeline/TimelineList.svelte';
+  import ChatV2TimelineList from '$lib/components/chat-v2/ChatV2TimelineList.svelte';
   import TimelineTodoDrawer from '$lib/components/timeline/TimelineTodoDrawer.svelte';
   import TimelineViewport from '$lib/components/timeline/TimelineViewport.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
@@ -50,7 +49,7 @@ import X from 'lucide-svelte/icons/x';
     buildConversationUrl,
     CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
     CHAT_USER_SCROLL_DELTA_THRESHOLD_PX,
-    cloneSidebarProjection,
+    conversationPendingSnapshotFlags,
     conversationMatchesSidebarProjectionFilter,
     conversationAttentionDotClass,
     conversationAttentionLabel,
@@ -63,8 +62,8 @@ import X from 'lucide-svelte/icons/x';
     conversationUpdatedRowPatch,
     distanceFromScrollBottom,
     getConversationRetryScope,
-    hasRetryableFailedTurnTail,
     groupConversationsByActivity,
+    lastOpenedConversationEntry,
     managedConversationTurnState,
     mergeConversationPreservingActivity,
     getNextHistoryAfterSeq,
@@ -81,11 +80,22 @@ import X from 'lucide-svelte/icons/x';
     optimisticConversationTurnPatch,
     pendingDirectQuestionFromAuthChallengeEvent,
     parseConversationStatusFilter,
+    parseLastOpenedConversationEntry,
+    pendingInputRequestKind,
+    questionSetReplyText,
     rememberSidebarProjectionSnapshot,
+    serializeLastOpenedConversationEntry,
     isPreSessionChatConversation,
     pendingNotificationTypesFromNotifications,
     setConversationStatusSearchParam,
+    chatScrollDimensionsChanged,
+    shouldApplyScrollRestore,
+    shouldAttemptStaleRuntimeRefresh,
+    shouldDebounceConversationViewRefresh,
     shouldReconcileAfterReconnect,
+    shouldPreserveLiveTailOnResize,
+    shouldRefreshForStaleRuntime,
+    isRuntimeSnapshotOlderThanView,
     shouldAdoptConversationSessionId,
     shouldSuppressPreSessionSocketError,
     nextConversationLoadId,
@@ -99,13 +109,24 @@ import X from 'lucide-svelte/icons/x';
   import { loadSessionLog, refreshSessionLog, type SessionLogState } from '$lib/session-log';
   import { edgeSwipe } from '$lib/actions/edgeSwipe';
   import { scrollPersist } from '$lib/actions/scrollPersist';
+  import { auth } from '$lib/stores/auth';
   import { confirmAction } from '$lib/stores/confirm';
   import { mobileNavOpen as mobileNavOpenStore, requestOpenMobileNav } from '$lib/stores/mobileNav';
   import { registerOverlay } from '$lib/stores/overlays';
   import { canAttemptPwaAuxiliaryWindow } from '$lib/stores/pwa';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
+  import { loadUserPreferences, userPreferences } from '$lib/stores/userPreferences';
   import { haptic } from '$lib/haptics';
+  import {
+    clearQuestionDraft,
+    readOptimisticUserMessageDrafts,
+    readQuestionDraft,
+    removeOptimisticUserMessageDraft,
+    saveOptimisticUserMessageDraft,
+    writeQuestionDraft,
+    type QuestionDraftAnswers,
+  } from '$lib/interactive-drafts';
   import { onCancelActiveTurnRequest, onChatComposerFocusRequest } from '$lib/shortcuts';
   import { pastedFileFingerprint, pastedFilesFromClipboardData, readPastedFilesFromNavigator } from '$lib/clipboard';
   import {
@@ -129,35 +150,32 @@ import X from 'lucide-svelte/icons/x';
     type LocalChatMatch
   } from '$lib/chat-search';
   import {
-    annotateStepRequestInputWithNotification,
-    applyRuntimeSnapshotOverlay,
-    applyRuntimeTimelineEvent,
-    applyTimelinePatch,
-    applyWebSocketEvent,
-    appendOptimisticUserMessage,
-    clearRuntimeOverlayForCanonicalEvent,
-    createRuntimeTimelineOverlay,
+    applySlashSuggestion,
+    isSystemSlashCommand,
+    localSlashCommandSuggestions,
+    normalizeSlashCommandInput,
+    parseChatModeDirectiveInput,
+    slashParameterSuggestionCommand
+  } from '$lib/slash-commands';
+  import {
     findPendingStepRequestInputCall,
-    hydrateMessageCompleteFromRuntimeOverlay,
-    isActiveToolStatus,
-    isRuntimeTimelineEvent,
-    latestTodoSnapshot,
     parseTodoSnapshot,
-    projectDisplayTimeline,
-    promoteRuntimeOverlayForCanonicalEvent,
-    optimisticallyResolveStepRequestInput,
-    normalizeHistory,
-    removeQueuedOptimisticUserMessage,
     type MessageTimelineItem,
-    timelineFromProjection,
     timelinePatchContainsActiveWork,
-    timelineItemKey,
     type TimelineItem,
     type TodoSnapshotItem
   } from '$lib/chat';
+  import { chatV2Api } from '$lib/chat-v2/api';
+  import { MemoryChatV2Outbox, createIndexedDbChatV2Outbox, type OutboxEntry } from '$lib/chat-v2/outbox';
+  import { ChatV2Store } from '$lib/chat-v2/store.svelte';
+  import { selectRenderItems } from '$lib/chat-v2/selectors';
+  import { isRenderableChatV2Item } from '$lib/chat-v2/render-adapter';
+  import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
+  import type { ChatRealtimeFrame, ChatSnapshot, TimelineItem as ChatV2TimelineItem } from '$lib/chat-v2/types';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
-  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, Escalation, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection } from '$lib/types/api';
+  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, Escalation, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection, SlashCommandSuggestion } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
+  import { isNonFatalWebSocketBackpressureError } from '$lib/ws/errors';
 
   let initializing = $state(true);
   let initialLoadTimedOut = $state(false);
@@ -196,6 +214,8 @@ import X from 'lucide-svelte/icons/x';
   let lastChatSearchConversationId = '';
   let agents = $state<Agent[]>([]);
   let agentDirectChats = $state<AgentDirectChat[]>([]);
+  let sidebarProjectionLoaded = $state(false);
+  let sidebarProjectionFailed = $state(false);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
   let conversationTodoSnapshots = $state<Record<string, TodoSnapshotItem[]>>({});
@@ -204,6 +224,10 @@ import X from 'lucide-svelte/icons/x';
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
+  let managedInstructionOpen = $state(false);
+  let managedInstruction = $state('');
+  let managedActionBusy = $state<string | null>(null);
+  let managedActionError = $state('');
   let recentPastedFileFingerprints = new Map<string, number>();
   let conversationModeOpen = $state(false);
   let voiceTranscribing = $state(false);
@@ -243,14 +267,16 @@ import X from 'lucide-svelte/icons/x';
   const PASTE_DUPLICATE_SUPPRESSION_MS = 2000;
   const CONTEXT_DONUT_RADIUS = 15.5;
   const CONTEXT_DONUT_CIRCUMFERENCE = 2 * Math.PI * CONTEXT_DONUT_RADIUS;
-  let selectedAgentId = $state('');
+  let selectedAgentIds = $state<string[]>([]);
   let selectedConversationStatus = $state<ConversationStatusFilter>(parseConversationStatusFilter(page.url.searchParams.get('status')));
   let starringConversationId = $state<string | null>(null);
   let archivingConversation = $state(false);
   let deletingConversation = $state(false);
   let mobileListOpen = $state(false);
   let mobileListOverlayCleanup: (() => void) | null = null;
-  let conversationFiltersOpen = $state(false);
+  let conversationFiltersOpen = $state(true);
+  let agentFilterDropdownOpen = $state(false);
+  let channelFilterDropdownOpen = $state(false);
   // Unified flag for the expanded header info panel. Replaces the older
   // pair of `sessionInfoOpen` (desktop popover) + `mobileHeaderDetailsOpen`
   // (mobile-only panel) with one state so the Info button has a single,
@@ -264,16 +290,29 @@ import X from 'lucide-svelte/icons/x';
   let queuedCount = $state(0);
   let queuedMessages = $state<QueuedMessage[]>([]);
   let queueBusyId = $state<string | null>(null);
+  let queueExpandedIds = $state<string[]>([]);
   let queueEditingId = $state<string | null>(null);
   let queueEditContent = $state('');
-  let queueExpandedIds = $state<string[]>([]);
-  let timeline = $state<TimelineItem[]>([]);
-  let runtimeOverlay = $state(createRuntimeTimelineOverlay());
+  let queueEditError = $state('');
+  const chatV2Store = new ChatV2Store();
+  const chatV2Outbox = typeof indexedDB === 'undefined'
+    ? new MemoryChatV2Outbox()
+    : createIndexedDbChatV2Outbox();
+  let chatV2OutboxReady = false;
+  let chatV2OutboxDraining = false;
 
   let visibleStartIndex = $state(0);
   let activeConversationId = '';
   let routeConversationId = $derived(page.params.conversationId ?? '');
   let activeSessionLastSeq = 0;
+  let conversationViewServerTimeMs = 0;
+  let lastConversationViewRefreshAt = 0;
+  let lastRuntimeSnapshotAt = 0;
+  let lastStaleRuntimeRefreshAttemptAt = 0;
+  let staleRuntimeRefreshAttempts = 0;
+  let viewRefreshInFlight: Promise<void> | null = null;
+  let staleRuntimeGuardTimer: number | null = null;
+  const STALE_RUNTIME_REFRESH_MS = 30000;
   let olderMessagesCursor = $state<string | null>(null);
   let hasOlderMessages = $state(false);
   const CONVERSATION_VIEW_CACHE_LIMIT = 8;
@@ -293,6 +332,12 @@ import X from 'lucide-svelte/icons/x';
   let pushDeliveryError = $state('');
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
+  // Track the turn_id of the most recently settled/cancelled turn so that a
+  // late timeline_patch (arriving after cancel teardown due to the coalesce
+  // buffer race) cannot re-arm turnInProgress for an already-finished turn.
+  let lastSettledTurnId = $state<string | null>(null);
+  // Track the turn_id of the currently running turn (set on turn_started).
+  let currentActiveTurnId = $state<string | null>(null);
   let activeTurnChatMode = $state<ChatModeTone>('default');
   let lastSubmittedMessage = '';
   let lastRecoverableMessage = $state('');
@@ -321,14 +366,281 @@ import X from 'lucide-svelte/icons/x';
   let timelineEl = $state<HTMLDivElement | null>(null);
   let timelineContentEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
+  let tailPinned = $state(false);
   let loadingOlderMessages = $state(false);
   let programmaticScroll = false;
+  // The scrollTop value written by the most recent programmatic scroll. Used
+  // to suppress the async scroll event that the browser delivers after a
+  // programmatic scrollTop write — that event can arrive after programmaticScroll
+  // has already been cleared (it is dispatched on the next animation frame, not
+  // synchronously), causing handleTimelineScroll to treat the programmatic
+  // position as a user gesture and falsely re-pin the tail.
+  let programmaticScrollTarget: number | null = null;
+  let bottomScrollPending = false;
   let userScrollIntentUp = false;
   let lastTimelineTouchY: number | null = null;
   let lastTimelineScrollTop = $state(0);
   let footerChromeEl = $state<HTMLDivElement | null>(null);
-  let selectedChannel = $state('all');
+  let selectedChannels = $state<string[]>([]);
   let chatSidebarCollapsed = $state(false);
+  const chatV2CanonicalRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const chatV2CanonicalRecoveryInFlight = new Set<string>();
+  const CHAT_V2_CANONICAL_RECOVERY_DEBOUNCE_MS = 1_000;
+
+  function applyChatV2Snapshot(snapshot: ChatSnapshot): void {
+    chatV2Store.replaceFromSnapshot(snapshot);
+    conversationViewServerTimeMs = Date.parse(snapshot.server_time) || Date.now();
+    lastConversationViewRefreshAt = Date.now();
+    lastRuntimeSnapshotAt = Date.now();
+    applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
+    applyChatV2StateToTimeline();
+    wsClient.subscribeChatV2Conversation(snapshot.conversation.conversation_id, snapshot.cursor);
+  }
+
+  function chatV2OwnsActiveConversation(conversationId: string | null = conversationIdFromRoute()): boolean {
+    return Boolean(
+      conversationId
+      && chatV2Store.snapshot.cursor
+      && chatV2Store.snapshot.conversationId === conversationId
+    );
+  }
+
+  async function applyChatV2Frame(frame: ChatRealtimeFrame): Promise<void> {
+    const previousStatus = chatV2Store.snapshot.syncStatus;
+    const result = chatV2Store.applyRealtime(frame);
+    if (result.outcome === 'cursor_mismatch' || result.outcome === 'reset_required') {
+      await recoverChatV2Canonical(frame.conversation_id);
+      return;
+    }
+    if (chatV2Store.snapshot.syncStatus === 'gapped' && previousStatus !== 'gapped') {
+      await recoverChatV2Canonical(frame.conversation_id);
+      return;
+    }
+    // A frame that actually advanced state is proof the stream is healthy.
+    // Bump the runtime freshness marker so the 30s stale-runtime guard does not
+    // fire a full refreshConversationView mid-stream (which would replace and
+    // re-sort the live timeline) for a turn driven purely by chat_v2 frames.
+    // Only 'applied' frames count: 'duplicate' frames carry no new state, so
+    // counting them could mask a genuinely stalled stream that keeps receiving
+    // duplicate/heartbeat frames while content stops advancing.
+    if (result.outcome === 'applied') {
+      lastRuntimeSnapshotAt = Date.now();
+      // A genuine live frame proves the WebSocket works: re-arm the
+      // stale-runtime refresh budget.
+      staleRuntimeRefreshAttempts = 0;
+      applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
+    }
+    if (frame.ops.length === 0 && frame.runtime?.has_active_turn === true) {
+      applyChatV2RuntimeToTimeline();
+    } else {
+      applyChatV2StateToTimeline();
+    }
+    if (chatV2Store.snapshot.conversationId === frame.conversation_id && chatV2Store.snapshot.cursor) {
+      wsClient.updateChatV2Cursor(frame.conversation_id, chatV2Store.snapshot.cursor);
+    }
+  }
+
+  async function recoverChatV2Canonical(conversationId: string): Promise<void> {
+    if (chatV2CanonicalRecoveryInFlight.has(conversationId)) return;
+    chatV2CanonicalRecoveryInFlight.add(conversationId);
+    try {
+      const cursor = chatV2Store.snapshot.conversationId === conversationId
+        ? chatV2Store.snapshot.cursor
+        : null;
+      if (!cursor) {
+        await recoverChatV2Snapshot(conversationId);
+        return;
+      }
+      const response = await chatV2Api.sync(conversationId, cursor);
+      const result = chatV2Store.applySync(response);
+      if (response.reset_required || result.outcome === 'reset_required' || result.outcome === 'cursor_mismatch') {
+        await recoverChatV2Snapshot(conversationId);
+        return;
+      }
+      applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
+      applyChatV2StateToTimeline();
+      if (chatV2Store.snapshot.cursor) {
+        wsClient.updateChatV2Cursor(conversationId, chatV2Store.snapshot.cursor);
+      }
+    } catch (error) {
+      const apiError = asApiError(error);
+      if (apiError.status === 503 || apiError.code === 'event_store_unavailable') {
+        historyError = apiError.message;
+        reportError(error);
+        return;
+      }
+      await recoverChatV2Snapshot(conversationId);
+    } finally {
+      chatV2CanonicalRecoveryInFlight.delete(conversationId);
+    }
+  }
+
+  async function recoverChatV2Snapshot(conversationId: string): Promise<void> {
+    try {
+      applyChatV2Snapshot(await chatV2Api.snapshot(conversationId));
+    } catch (error) {
+      const failureMessage = asApiError(error).message;
+      if (conversationIdFromRoute() !== conversationId) {
+        reportError(error);
+        return;
+      }
+      historyError = failureMessage;
+      if (chatV2Store.snapshot.conversationId === conversationId) {
+        if (chatV2Store.visibleItems.length === 0) {
+          chatV2Store.reset();
+          applyChatV2StateToTimeline();
+          wsClient.clearChatV2Cursor(conversationId);
+          olderMessagesCursor = null;
+          hasOlderMessages = false;
+          queuedMessages = [];
+          queuedCount = 0;
+          awaitingAssistantStart = false;
+          turnInProgress = false;
+          currentActiveTurnId = null;
+        }
+      }
+      reportError(error);
+      addToast(failureMessage, 'error');
+    }
+  }
+
+  function cancelActiveTurnWithChatV2(): void {
+    if (!currentConversation || !turnInProgress) return;
+    const cancelConversationId = currentConversation.conversation_id;
+    void chatV2Api.cancelTurn(cancelConversationId, {
+      client_txn_id: crypto.randomUUID()
+    }).then(() => recoverChatV2Snapshot(cancelConversationId)).catch((caughtError) => {
+      addToast(asApiError(caughtError).message, 'error');
+    });
+  }
+
+  function scheduleChatV2CanonicalRecovery(
+    conversationId: string,
+    { immediate = false }: { immediate?: boolean } = {},
+  ): void {
+    if (!chatV2OwnsActiveConversation(conversationId)) return;
+    // Terminal turn boundaries (message_complete, turn_settled, workflow
+    // terminal states) settle the runtime overlay: the server clears volatile
+    // items, so the client must pull canonical state right away rather than
+    // after the debounce, otherwise the just-streamed content briefly
+    // disappears until the debounced sync lands. Running an immediate recovery
+    // reuses the single, cursor-correct REST /sync path (no parallel
+    // server-side ops/cursor logic to keep in sync).
+    if (immediate) {
+      const pending = chatV2CanonicalRecoveryTimers.get(conversationId);
+      if (pending) {
+        clearTimeout(pending);
+        chatV2CanonicalRecoveryTimers.delete(conversationId);
+      }
+      void recoverChatV2Canonical(conversationId);
+      return;
+    }
+    if (chatV2CanonicalRecoveryTimers.has(conversationId)) return;
+    const timer = setTimeout(() => {
+      chatV2CanonicalRecoveryTimers.delete(conversationId);
+      if (chatV2OwnsActiveConversation(conversationId)) {
+        void recoverChatV2Canonical(conversationId);
+      }
+    }, CHAT_V2_CANONICAL_RECOVERY_DEBOUNCE_MS);
+    chatV2CanonicalRecoveryTimers.set(conversationId, timer);
+  }
+
+  async function drainChatV2Outbox(conversationId: string): Promise<void> {
+    if (chatV2OutboxDraining) return;
+    chatV2OutboxDraining = true;
+    let sentAny = false;
+    try {
+      const pendingEntries = (await chatV2Outbox.list())
+        .filter((entry) => entry.conversation_id === conversationId && entry.status !== 'acked')
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      for (const entry of pendingEntries) {
+        try {
+          await chatV2Outbox.update(entry.client_txn_id, {
+            status: 'sending',
+            updated_at: new Date().toISOString(),
+            last_error: undefined
+          });
+          await chatV2Api.sendMessage(entry.conversation_id, entry.client_txn_id, {
+            content: entry.content,
+            attachments: entry.attachments,
+            client_message_id: entry.client_message_id
+          });
+          await chatV2Outbox.update(entry.client_txn_id, {
+            status: 'acked',
+            updated_at: new Date().toISOString(),
+            last_error: undefined
+          });
+          await chatV2Outbox.delete(entry.client_txn_id);
+          sentAny = true;
+        } catch (caughtError) {
+          await chatV2Outbox.update(entry.client_txn_id, {
+            status: 'failed',
+            updated_at: new Date().toISOString(),
+            last_error: asApiError(caughtError).message
+          }).catch(() => undefined);
+        }
+      }
+    } catch (caughtError) {
+      reportError(caughtError);
+    } finally {
+      chatV2OutboxDraining = false;
+    }
+    if (sentAny) {
+      await recoverChatV2Snapshot(conversationId);
+    }
+  }
+
+  // Synchronize page-level state (queue, turn flags) from the Chat v2 store.
+  // The rendered timeline reads `chatV2Store.visibleItems` reactively, so no
+  // imperative timeline mutation is needed here. Scroll position is owned by
+  // the Chat v2 viewport (anchor/follow), not by replacement side effects.
+  function applyChatV2StateToTimeline(): void {
+    const state = chatV2Store.snapshot;
+    queuedMessages = (state.queue?.messages ?? []) as QueuedMessage[];
+    queuedCount = state.queue?.queued_count ?? queuedMessages.length;
+    turnInProgress = state.runtime?.has_active_turn === true;
+    awaitingAssistantStart = false;
+    currentActiveTurnId = state.runtime?.active_turn?.turn_id ?? null;
+    if (!turnInProgress) currentActiveTurnId = null;
+  }
+
+  function applyChatV2RuntimeToTimeline(): void {
+    // Runtime overlay items are part of `chatV2Store.visibleItems`; the native
+    // renderer picks them up reactively. Only page-level flags are synced here.
+    applyChatV2StateToTimeline();
+  }
+
+  let localCommandResultOrdinal = 0;
+
+  function appendChatV2LocalSystemMessage(text: string, idHint: string): void {
+    const content = text.trim();
+    const targetConversationId = currentConversation?.conversation_id ?? conversationIdFromRoute();
+    if (!content || !chatV2OwnsActiveConversation(targetConversationId)) return;
+    localCommandResultOrdinal += 1;
+    const idSafeHint = idHint.replace(/[^a-zA-Z0-9_.:-]/g, '_').slice(0, 80) || 'result';
+    chatV2Store.addLocalSystemMessage({
+      id: `local-command:${idSafeHint}:${Date.now()}:${localCommandResultOrdinal}`,
+      content
+    });
+    applyChatV2StateToTimeline();
+    saveCurrentConversationView();
+    scrollToBottom(true);
+  }
+
+  function commandQueuedMessage(event: Extract<CognisWebSocketEvent, { type: 'queued' }>): string {
+    const lines = [event.reason?.trim() || 'Working on that in the background.'];
+    if (event.task_id) lines.push(`Task: ${event.task_id}`);
+    return lines.join('\n');
+  }
+
+  function sessionCompactedMessage(event: Extract<CognisWebSocketEvent, { type: 'session_compacted' }>): string {
+    const lines = [event.message?.trim() || 'Conversation history compacted.'];
+    lines.push(`New session: ${event.session_id}`);
+    if (event.previous_session_id) lines.push(`Previous session: ${event.previous_session_id}`);
+    if (event.summary_preview) lines.push('', event.summary_preview);
+    return lines.join('\n');
+  }
+
   interface SessionInfoData {
     intaris_session_id: string;
     intention: string | null;
@@ -348,7 +660,7 @@ import X from 'lucide-svelte/icons/x';
   interface ConversationViewCacheEntry {
     conversation: Conversation;
     sessions: Session[];
-    timeline: TimelineItem[];
+    chatV2State: ChatV2ClientState;
     queuedCount: number;
     queuedMessages: QueuedMessage[];
     contextUsage: ContextUsage | null;
@@ -366,6 +678,117 @@ import X from 'lucide-svelte/icons/x';
   }
 
   const conversationViewCache = new Map<string, ConversationViewCacheEntry>();
+  const EMPTY_RENDER_ITEMS: TimelineItem[] = [];
+  let conversationViewSaveTimer: number | null = null;
+  const RETRYABLE_FAILED_TURN_NOTICE_MARKERS = [
+    'Your tool results have been saved. Please try sending your message again.',
+    'A model error occurred while generating the response.',
+    'Turn failed: the model did not produce output',
+  ];
+
+  function projectRenderItems(items: ChatV2TimelineItem[] = renderableVisibleItems): TimelineItem[] {
+    return selectRenderItems(items);
+  }
+
+  function latestTodoSnapshotFromChatV2(items: ChatV2TimelineItem[], resetOnUserMessage = false): TodoSnapshotItem[] {
+    let lowerBound = 0;
+    if (resetOnUserMessage) {
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const item = items[index];
+        if (item?.kind === 'message' && item.role === 'user') {
+          lowerBound = index;
+          break;
+        }
+      }
+    }
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      if (index < lowerBound) break;
+      const item = items[index];
+      if (item?.kind === 'todo_state') {
+        return parseTodoSnapshot(item.todos);
+      }
+    }
+    return [];
+  }
+
+  function isChatV2MessageStreaming(item: ChatV2TimelineItem): boolean {
+    return item.kind === 'message'
+      && item.role === 'assistant'
+      && item.stable === false
+      && (item.status === 'running' || item.partial === true);
+  }
+
+  function isChatV2ThinkingStreaming(item: ChatV2TimelineItem): boolean {
+    return item.kind === 'thinking'
+      && (
+        item.status === 'running'
+        || item.blocks.some((block) => (block.status ?? item.status) === 'running')
+      );
+  }
+
+  function isChatV2ToolActive(item: ChatV2TimelineItem): boolean {
+    return item.kind === 'tool_call' && !['complete', 'failed', 'cancelled', 'compacted', 'skipped'].includes(item.status ?? '');
+  }
+
+  function isChatV2DelegationActive(item: ChatV2TimelineItem): boolean {
+    return item.kind === 'delegation' && ['pending', 'running', 'waiting'].includes(item.status ?? '');
+  }
+
+  function isInlineLiveChatV2Item(item: ChatV2TimelineItem): boolean {
+    return isChatV2MessageStreaming(item) || isChatV2ThinkingStreaming(item) || isChatV2ToolActive(item);
+  }
+
+  function isRecoverableFailedTurnChatV2Notice(item: ChatV2TimelineItem): boolean {
+    if (item.kind === 'notice') {
+      const text = `${item.title ?? ''}\n${item.message ?? ''}`;
+      return RETRYABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => text.includes(marker));
+    }
+    if (item.kind === 'message' && item.role === 'system') {
+      return RETRYABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => item.content.includes(marker));
+    }
+    return false;
+  }
+
+  function hasRetryableFailedTurnTailChatV2(items: ChatV2TimelineItem[]): boolean {
+    let latestUserTurnId: string | null | undefined = null;
+    let latestUserOrderKey: string | null = null;
+    for (let index = items.length - 1; index >= 0; index -= 1) {
+      const item = items[index];
+      if (item?.kind === 'message' && item.role === 'user') {
+        latestUserTurnId = item.turn_id ?? null;
+        latestUserOrderKey = item.sort_key ?? null;
+        break;
+      }
+    }
+    if (latestUserTurnId == null && latestUserOrderKey == null) return false;
+
+    let sawCompletedAssistant = false;
+    let sawFailureNotice = false;
+    for (const item of items) {
+      if (
+        item.kind === 'message'
+        && item.role === 'assistant'
+        && item.partial !== true
+        && (
+          (latestUserTurnId != null && item.turn_id === latestUserTurnId)
+          || (latestUserTurnId == null && latestUserOrderKey != null && (item.sort_key ?? '') > latestUserOrderKey)
+        )
+      ) {
+        sawCompletedAssistant = true;
+      }
+      if (isRecoverableFailedTurnChatV2Notice(item)) {
+        const noticeOrderKey = item.sort_key ?? null;
+        if (latestUserOrderKey === null || noticeOrderKey === null || noticeOrderKey > latestUserOrderKey) {
+          sawFailureNotice = true;
+        }
+      }
+    }
+    return !sawCompletedAssistant && sawFailureNotice;
+  }
+
+  function findPendingStepRequestInputCallFromChatV2(): ReturnType<typeof findPendingStepRequestInputCall> {
+    return findPendingStepRequestInputCall(projectRenderItems(renderableVisibleItems.filter((item) => item.kind === 'tool_call')));
+  }
 
   function nextSessionInfoRequestId(): number {
     sessionInfoRequestId += 1;
@@ -456,7 +879,15 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function activeContextUsage(): ContextUsage | null {
-    return sessionInfo?.context_usage ?? contextUsage;
+    return contextUsage ?? sessionInfo?.context_usage ?? null;
+  }
+
+  function applyContextUsageSnapshot(usage: ContextUsage | null | undefined): void {
+    if (!usage) return;
+    contextUsage = usage;
+    if (sessionInfo) {
+      sessionInfo = { ...sessionInfo, context_usage: usage };
+    }
   }
 
   function sessionNarrativeText(info: SessionInfoData | null): string | null {
@@ -640,34 +1071,44 @@ import X from 'lucide-svelte/icons/x';
   function applyQueuedMessageSnapshot(messages: QueuedMessage[], count = messages.length): void {
     queuedMessages = messages;
     queuedCount = count;
+    // Optimistic local user messages are reconciled by the Chat v2 store; only
+    // the persisted optimistic drafts need clearing here.
     for (const message of messages) {
-      timeline = removeQueuedOptimisticUserMessage(
-        timeline,
-        message.queue_id,
-        message.client_message_id,
-        message.content,
-        message.attachments,
-      );
+      if (message.client_message_id) {
+        removeOptimisticUserMessageDraft(directQuestionDraftConversationId() ?? routeConversationId, message.client_message_id);
+      }
     }
     const liveQueueIds = new Set(messages.map((message) => message.queue_id));
     queueExpandedIds = queueExpandedIds.filter((queueId) => liveQueueIds.has(queueId));
     if (queueEditingId && !liveQueueIds.has(queueEditingId)) {
       queueEditingId = null;
       queueEditContent = '';
+      queueEditError = '';
     }
   }
 
   function applyConversationRuntimeSnapshot(
     event: Extract<CognisWebSocketEvent, { type: 'conversation_runtime_snapshot' }>
   ): void {
+    if (isRuntimeSnapshotOlderThanView(event.server_time, conversationViewServerTimeMs)) {
+      void refreshConversationView('stale-runtime-snapshot');
+      return;
+    }
     applyQueuedMessageSnapshot(event.queued_messages, event.queued_count);
+    lastRuntimeSnapshotAt = Date.now();
+    // A genuine runtime snapshot proves the WebSocket works: re-arm the
+    // stale-runtime refresh budget.
+    staleRuntimeRefreshAttempts = 0;
     const hasRuntimeActivity = (
       event.active_streams.length > 0
       || event.active_tool_outputs.length > 0
       || event.active_thinking.length > 0
     );
-    runtimeOverlay = applyRuntimeSnapshotOverlay(runtimeOverlay, event);
-    const hasActiveTurn = event.has_active_turn ?? currentConversation?.has_active_turn ?? turnInProgress;
+    const hasActiveTurn = event.has_active_turn ?? hasRuntimeActivity;
+
+    // Legacy runtime-snapshot path. With Chat v2 owning the canonical timeline
+    // this only updates page-level turn flags; the visible timeline is driven
+    // by Chat v2 frames, not by this snapshot.
     turnInProgress = hasRuntimeActivity || hasActiveTurn;
     if (typeof event.has_active_turn === 'boolean' && currentConversation) {
       patchConversationInList(currentConversation.conversation_id, {
@@ -702,35 +1143,77 @@ import X from 'lucide-svelte/icons/x';
     const conversationId = conversation.conversation_id;
     const previous = queuedMessages;
     queueBusyId = queueId;
-    queuedMessages = queuedMessages.filter((item) => item.queue_id !== queueId);
-    queuedCount = queuedMessages.length;
+    applyQueuedMessageSnapshot(
+      queuedMessages.filter((item) => item.queue_id !== queueId),
+      Math.max(queuedCount - 1, 0),
+    );
     try {
-      await api.conversations.deleteQueuedMessage(conversationId, queueId);
+      await chatV2Api.deleteQueuedMessage(conversationId, queueId, {
+        client_txn_id: crypto.randomUUID()
+      });
+      await recoverChatV2Snapshot(conversationId);
     } catch (caughtError) {
-      queuedMessages = previous;
-      queuedCount = previous.length;
+      applyQueuedMessageSnapshot(previous, previous.length);
       addToast(asApiError(caughtError).message, 'error');
-      await refreshQueuedMessages();
+      await recoverChatV2Snapshot(conversationId);
     } finally {
       queueBusyId = null;
     }
   }
 
-  async function saveQueuedMessage(queueId: string): Promise<void> {
+  function startQueuedMessageEdit(message: QueuedMessage): void {
+    queueEditingId = message.queue_id;
+    queueEditContent = message.content;
+    queueEditError = '';
+    if (!queueIsExpanded(message.queue_id)) {
+      queueExpandedIds = [...queueExpandedIds, message.queue_id];
+    }
+  }
+
+  function cancelQueuedMessageEdit(): void {
+    queueEditingId = null;
+    queueEditContent = '';
+    queueEditError = '';
+  }
+
+  async function saveQueuedMessageEdit(queueId: string): Promise<void> {
     const conversation = mutableQueuedMessagesConversation();
     if (!conversation) return;
-    const conversationId = conversation.conversation_id;
     const content = queueEditContent.trim();
-    if (!content) return;
+    if (!content) {
+      queueEditError = 'Queued message cannot be empty.';
+      return;
+    }
+
+    const conversationId = conversation.conversation_id;
+    const previous = queuedMessages;
     queueBusyId = queueId;
+    queueEditError = '';
+    applyQueuedMessageSnapshot(
+      queuedMessages.map((item) => (
+        item.queue_id === queueId
+          ? { ...item, content, updated_at: new Date().toISOString() }
+          : item
+      )),
+      queuedCount,
+    );
+
     try {
-      const updated = await api.conversations.updateQueuedMessage(conversationId, queueId, content);
-      queuedMessages = queuedMessages.map((item) => item.queue_id === queueId ? updated : item);
-      queueEditingId = null;
-      queueEditContent = '';
+      await chatV2Api.updateQueuedMessage(conversationId, queueId, {
+        client_txn_id: crypto.randomUUID(),
+        content,
+      });
+      if (queueEditingId === queueId) {
+        cancelQueuedMessageEdit();
+      }
+      await recoverChatV2Snapshot(conversationId);
     } catch (caughtError) {
-      addToast(asApiError(caughtError).message, 'error');
-      await refreshQueuedMessages();
+      applyQueuedMessageSnapshot(previous, previous.length);
+      queueEditingId = queueId;
+      queueEditContent = content;
+      queueEditError = asApiError(caughtError).message;
+      addToast(queueEditError, 'error');
+      await recoverChatV2Snapshot(conversationId);
     } finally {
       queueBusyId = null;
     }
@@ -744,20 +1227,6 @@ import X from 'lucide-svelte/icons/x';
     queueExpandedIds = queueIsExpanded(queueId)
       ? queueExpandedIds.filter((id) => id !== queueId)
       : [...queueExpandedIds, queueId];
-  }
-
-  function startQueuedMessageEdit(queued: QueuedMessage): void {
-    if (!canMutateQueuedMessages()) return;
-    queueEditingId = queued.queue_id;
-    queueEditContent = queued.content;
-    if (!queueIsExpanded(queued.queue_id)) {
-      queueExpandedIds = [...queueExpandedIds, queued.queue_id];
-    }
-  }
-
-  function cancelQueuedMessageEdit(): void {
-    queueEditingId = null;
-    queueEditContent = '';
   }
 
   function canMutateQueuedMessages(): boolean {
@@ -775,12 +1244,12 @@ import X from 'lucide-svelte/icons/x';
   type ChatTodo = TodoSnapshotItem;
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
-  let directQuestionAnswers = $state<Record<string, { selected: string[]; custom: string }>>({});
+  let directQuestionAnswers = $state<QuestionDraftAnswers>({});
   let directQuestionPageIndex = $state(0);
   let directQuestionCollapsed = $state(false);
   let pendingCredentialRequest = $state<Notification | null>(null);
   let directQuestionSubmitting = $state(false);
-  let chatTodoDrawerOpen = $state(true);
+  let chatTodoDrawerOpen = $state(false);
   let retainedChatTodos = $state<ChatTodo[]>([]);
   let backendConversationState = $state<ConversationStateEnvelope | null>(null);
 
@@ -831,6 +1300,22 @@ import X from 'lucide-svelte/icons/x';
 
   function managedTurnState(conversation: Conversation | null): string {
     return managedConversationTurnState(conversation);
+  }
+
+  function managedConversationActive(conversation: Conversation | null): boolean {
+    const state = managedTurnState(conversation);
+    return state === 'running' || state === 'queued';
+  }
+
+  function applyManagedActionResponse(response: { managed_agent?: Conversation['managed_agent'] | null }): void {
+    if (!currentConversation || !response.managed_agent) return;
+    const updated = {
+      ...currentConversation,
+      managed_agent: response.managed_agent,
+      has_active_turn: response.managed_agent.turn_state === 'running' || response.managed_agent.turn_state === 'queued',
+    };
+    currentConversation = updated;
+    patchConversationInList(updated.conversation_id, updated);
   }
 
   let showPushPrompt = $derived.by(() => {
@@ -906,6 +1391,37 @@ import X from 'lucide-svelte/icons/x';
 
     return count;
   }
+
+  function backingSessionBadgeLabel(): string | null {
+    const count = backingSessionCount();
+    return count > 1 ? `${count} backing sessions` : null;
+  }
+
+  let backingSessionBadge = $derived(backingSessionBadgeLabel());
+
+  /**
+   * The set of session IDs in the active session's compaction lineage.
+   * Walks the previous_session_id chain from the active session, stopping
+   * at any session with parent_session_id set (sub-sessions are not lineage).
+   * Used by the session filter in ChatTimeline.applyEvent to allow in-flight
+   * items from compaction predecessors while rejecting sub-session items.
+   */
+  let activeSessionLineage: ReadonlySet<string> = $derived.by(() => {
+    const activeSessionId = currentConversation?.active_session_id;
+    if (!activeSessionId) return new Set<string>();
+    const byId = new Map(sessions.map((s) => [s.session_id, s]));
+    const lineage = new Set<string>();
+    const visited = new Set<string>();
+    let currentId: string | null = activeSessionId;
+    while (currentId && !visited.has(currentId)) {
+      visited.add(currentId);
+      const s = byId.get(currentId);
+      if (!s || s.parent_session_id) break; // stop at sub-sessions
+      lineage.add(currentId);
+      currentId = s.previous_session_id ?? null;
+    }
+    return lineage;
+  });
 
   function isSessionBlocked(): boolean {
     const status = activeSessionStatus();
@@ -1028,12 +1544,68 @@ import X from 'lucide-svelte/icons/x';
     return directQuestionAnswers[questionId] ?? { selected: [], custom: '' };
   }
 
+  function directQuestionDraftConversationId(): string | null {
+    return currentConversation?.conversation_id ?? routeConversationId ?? null;
+  }
+
+  function activeDirectQuestionNotificationId(): string | null {
+    return pendingDirectQuestion?.notificationId ?? null;
+  }
+
+  function persistDirectQuestionDraft(): void {
+    const conversationId = directQuestionDraftConversationId();
+    const notificationId = activeDirectQuestionNotificationId();
+    writeQuestionDraft(conversationId, notificationId, directQuestionAnswers);
+  }
+
+  function restoreDirectQuestionDraft(question: PendingDirectQuestion | null): QuestionDraftAnswers {
+    if (!question) return {};
+    const conversationId = directQuestionDraftConversationId();
+    return readQuestionDraft(conversationId, question.notificationId);
+  }
+
+  function clearActiveDirectQuestionDraft(): void {
+    const conversationId = directQuestionDraftConversationId();
+    const notificationId = activeDirectQuestionNotificationId();
+    clearQuestionDraft(conversationId, notificationId);
+  }
+
+  function reconcileOptimisticUserMessageDrafts(): void {
+    const conversationId = directQuestionDraftConversationId();
+    const queuedClientMessageIds = new Set<string>();
+    for (const message of queuedMessages) {
+      if (conversationId && message.client_message_id) {
+        removeOptimisticUserMessageDraft(conversationId, message.client_message_id);
+        queuedClientMessageIds.add(message.client_message_id);
+      }
+    }
+    if (!conversationId) return;
+    // Optimistic user messages are reconciled in the Chat v2 store. A draft is
+    // settled once a canonical user message with the same client_message_id is
+    // present in the visible timeline.
+    const confirmedClientMessageIds = new Set<string>();
+    for (const item of chatV2Store.visibleItems) {
+      if (item.kind === 'message' && item.role === 'user' && item.client_message_id && item.stable !== false) {
+        confirmedClientMessageIds.add(item.client_message_id);
+      }
+    }
+    const drafts = readOptimisticUserMessageDrafts(conversationId).filter(
+      (draft) => !queuedClientMessageIds.has(draft.clientMessageId)
+    );
+    for (const draft of drafts) {
+      if (confirmedClientMessageIds.has(draft.clientMessageId)) {
+        removeOptimisticUserMessageDraft(conversationId, draft.clientMessageId);
+      }
+    }
+  }
+
   function setDirectQuestionCustom(questionId: string, value: string): void {
     const current = directQuestionState(questionId);
     directQuestionAnswers = {
       ...directQuestionAnswers,
       [questionId]: { ...current, custom: value }
     };
+    persistDirectQuestionDraft();
   }
 
   function buildDirectQuestionReply(
@@ -1104,6 +1676,13 @@ import X from 'lucide-svelte/icons/x';
     return directQuestionReplyHasAnswer(reply) && directQuestionReplySatisfiesRequired(questions, reply);
   }
 
+  function pendingInputToolKind(pendingStepTool: ReturnType<typeof findPendingStepRequestInputCall>): PendingDirectQuestion['kind'] {
+    return pendingInputRequestKind({
+      pendingStepTool,
+      pendingDirectKind: pendingDirectQuestion?.kind ?? null
+    });
+  }
+
   function canGoToNextDirectQuestion(): boolean {
     const question = visibleDirectQuestion();
     return question !== null && directQuestionAnswerSatisfies(question);
@@ -1167,10 +1746,11 @@ import X from 'lucide-svelte/icons/x';
   function persistLastOpenedConversation(conversation: Conversation): void {
     if (typeof window === 'undefined') return;
     if (conversation.status === 'active' && isWebConversation(conversation) && !isAgentDirectConversation(conversation)) {
-      window.sessionStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
-      window.sessionStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
-      window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversation.conversation_id);
-      window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), conversation.conversation_id);
+      const entry = serializeLastOpenedConversationEntry(lastOpenedConversationEntry(conversation));
+      window.sessionStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, entry);
+      window.sessionStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), entry);
+      window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, entry);
+      window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), entry);
       void api.conversations.rememberOpened(conversation.conversation_id).catch((error) => {
         console.debug('Failed to persist opened conversation', error);
       });
@@ -1195,7 +1775,7 @@ import X from 'lucide-svelte/icons/x';
       for (let index = storage.length - 1; index >= 0; index -= 1) {
         const key = storage.key(index);
         if (!key || !isLastOpenedConversationStorageKey(key)) continue;
-        if (storage.getItem(key) === conversationId) {
+        if (parseLastOpenedConversationEntry(storage.getItem(key))?.conversation_id === conversationId) {
           storage.removeItem(key);
         }
       }
@@ -1216,7 +1796,7 @@ import X from 'lucide-svelte/icons/x';
     if (backendTodos !== null) {
       return backendTodos;
     }
-    const latestTodos = latestTodoSnapshot(timeline, currentConversation?.context?.type === 'web');
+    const latestTodos = latestTodoSnapshotFromChatV2(chatV2Store.visibleItems, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       return latestTodos;
     }
@@ -1296,10 +1876,14 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function backendTodoSnapshot(state: ConversationStateEnvelope | null): TodoSnapshotItem[] | null {
-    if (!state?.task) return null;
-    const step = state.task.relevant_step ?? state.task.current_step ?? null;
-    if (!step) return null;
-    return step.todos.map((todo) => ({
+    if (!state) return null;
+    const activeSessionTodos = state.active_session?.todos;
+    const taskTodos = (state.task?.relevant_step ?? state.task?.current_step ?? null)?.todos;
+    const sourceTodos = Array.isArray(activeSessionTodos)
+      ? activeSessionTodos
+      : taskTodos;
+    if (!Array.isArray(sourceTodos)) return null;
+    return sourceTodos.map((todo) => ({
       content: todo.content,
       status: todo.status,
       priority: todo.priority ?? 'normal',
@@ -1331,7 +1915,20 @@ import X from 'lucide-svelte/icons/x';
     const conversationId = state.conversation_id;
     if (conversationId === currentConversation?.conversation_id) {
       backendConversationState = state;
-      turnInProgress = state.active_turn?.has_active_turn ?? turnInProgress;
+      turnInProgress = Boolean(state.active_turn?.has_active_turn);
+      const pendingFlags = conversationPendingSnapshotFlags(state);
+      if (!pendingFlags.hasDirectQuestion) {
+        pendingDirectQuestion = null;
+      }
+      if (!pendingFlags.hasCredentialRequest) {
+        pendingCredentialRequest = null;
+      }
+      if (!pendingFlags.hasEscalation) {
+        escalations = [];
+        escalationBusyCallId = null;
+        escalationError = '';
+        escalationResolutionPending = null;
+      }
     }
     if (patchConversationRows) {
       patchConversationInList(conversationId, conversationStateConversationPatch(state));
@@ -1351,16 +1948,9 @@ import X from 'lucide-svelte/icons/x';
         reloadSessions: false,
         reloadHistory: true,
         resubscribe: false,
-        preserveTimelineOnHistoryFailure: true,
-        mergeTimeline: true,
       });
     }
   }
-  let showTurnProgress = $derived.by(() =>
-    turnInProgress
-      && liveTailTimelineItemKey === null
-  );
-
   $effect(() => {
     if (currentConversation && chatTodos.length > 0) {
       setConversationTodoSnapshot(currentConversation.conversation_id, chatTodos);
@@ -1614,10 +2204,6 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  function copyTimelineItems(items: TimelineItem[]): TimelineItem[] {
-    return items.map((item) => ({ ...item }));
-  }
-
   function touchConversationViewCache(conversationId: string, entry: ConversationViewCacheEntry): void {
     conversationViewCache.delete(conversationId);
     conversationViewCache.set(conversationId, entry);
@@ -1630,10 +2216,14 @@ import X from 'lucide-svelte/icons/x';
 
   function saveCurrentConversationView(): void {
     if (!currentConversation) return;
+    if (conversationViewSaveTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(conversationViewSaveTimer);
+      conversationViewSaveTimer = null;
+    }
     touchConversationViewCache(currentConversation.conversation_id, {
       conversation: { ...currentConversation },
       sessions: sessions.map((session) => ({ ...session })),
-      timeline: copyTimelineItems(timeline),
+      chatV2State: chatV2Store.serializeState(),
       queuedCount,
       queuedMessages: queuedMessages.map((message) => ({ ...message })),
       contextUsage,
@@ -1641,14 +2231,31 @@ import X from 'lucide-svelte/icons/x';
       visibleStartIndex,
       scrollTop: timelineEl?.scrollTop ?? lastTimelineScrollTop,
       userScrolledUp,
-      turnInProgress,
-      awaitingAssistantStart,
+      // Active/progress state is backend-owned and must not be
+      // resurrected from the client view cache after a missed terminal
+      // websocket event. It is refreshed by Chat v2 snapshots or runtime frames.
+      turnInProgress: false,
+      awaitingAssistantStart: false,
       activeSessionLastSeq,
       olderMessagesCursor,
       hasOlderMessages,
       activeTurnChatMode,
       fetchedAt: Date.now(),
     });
+  }
+
+  function scheduleCurrentConversationViewSave(): void {
+    if (typeof window === 'undefined') {
+      saveCurrentConversationView();
+      return;
+    }
+    if (conversationViewSaveTimer !== null) {
+      window.clearTimeout(conversationViewSaveTimer);
+    }
+    conversationViewSaveTimer = window.setTimeout(() => {
+      conversationViewSaveTimer = null;
+      saveCurrentConversationView();
+    }, 1000);
   }
 
   function restoreConversationView(conversationId: string): ConversationViewCacheEntry | null {
@@ -1658,29 +2265,32 @@ import X from 'lucide-svelte/icons/x';
     activeConversationId = conversationId;
     currentConversation = { ...entry.conversation };
     sessions = entry.sessions.map((session) => ({ ...session }));
-    timeline = copyTimelineItems(entry.timeline);
-    runtimeOverlay = createRuntimeTimelineOverlay();
+    chatV2Store.restoreState(entry.chatV2State);
+    // The cached entry may have been saved mid-turn. Turn/progress state is
+    // backend-owned and forced off here, so clear any stale runtime overlay so
+    // no streaming rows hang until the background refresh re-confirms runtime.
+    chatV2Store.settleRuntimeOverlay();
     queuedCount = entry.queuedCount;
     queuedMessages = entry.queuedMessages.map((message) => ({ ...message }));
     contextUsage = entry.contextUsage;
     sessionInfo = entry.sessionInfo ? { ...entry.sessionInfo } : null;
-    turnInProgress = entry.turnInProgress;
-    awaitingAssistantStart = entry.awaitingAssistantStart;
+    turnInProgress = false;
+    awaitingAssistantStart = false;
     activeSessionLastSeq = entry.activeSessionLastSeq;
     olderMessagesCursor = entry.olderMessagesCursor ?? null;
     hasOlderMessages = entry.hasOlderMessages ?? false;
     activeTurnChatMode = entry.activeTurnChatMode ?? 'default';
-    visibleStartIndex = Math.min(entry.visibleStartIndex, Math.max(0, timeline.length - 1));
-    userScrolledUp = entry.userScrolledUp;
+    // Opening a conversation always lands at the latest message (auto-tail),
+    // regardless of where the user was scrolled when they last left it. The
+    // cached mid-history scroll position is intentionally not restored on a
+    // switch — a chat should show the newest content when opened.
+    syncVisibleWindow();
+    userScrolledUp = false;
+    tailPinned = true;
     initialLoadTimedOut = false;
     mergeConversationList([entry.conversation]);
     requestAnimationFrame(() => {
-      if (timelineEl) {
-        programmaticScroll = true;
-        timelineEl.scrollTop = entry.scrollTop;
-        lastTimelineScrollTop = timelineEl.scrollTop;
-        programmaticScroll = false;
-      }
+      scrollToBottom(true);
     });
     return entry;
   }
@@ -1688,8 +2298,9 @@ import X from 'lucide-svelte/icons/x';
   function clearConversationViewState(): void {
     sessions = [];
     sessionIds.clear();
-    timeline = [];
-    runtimeOverlay = createRuntimeTimelineOverlay();
+    // Reset the canonical Chat v2 store immediately so the outgoing
+    // conversation's content cannot flash into the incoming conversation.
+    chatV2Store.reset();
     visibleStartIndex = 0;
     activeSessionLastSeq = 0;
     olderMessagesCursor = null;
@@ -1711,66 +2322,11 @@ import X from 'lucide-svelte/icons/x';
     lastRecoverableMessage = '';
     editingTitle = false;
     subSessionPanelOpen = false;
+    // Opening/switching a conversation lands at the tail (latest message).
+    // Pinning here makes the post-load refresh auto-scroll to bottom.
     userScrolledUp = false;
+    tailPinned = true;
     lastTimelineScrollTop = 0;
-  }
-
-  function isLiveOnlyTimelineItem(item: TimelineItem): boolean {
-    if (item.kind === 'message') {
-      return item.optimistic === true || item.streaming === true;
-    }
-    if (item.kind === 'tool_call') {
-      return !['completed', 'failed', 'cancelled'].includes(item.status);
-    }
-    if (item.kind === 'delegation') {
-      return item.status === 'started' || item.status === 'running' || item.status === 'paused';
-    }
-    if (item.kind === 'thinking') {
-      return item.streaming;
-    }
-    return false;
-  }
-
-  function mergeTimelineRefresh(refreshed: TimelineItem[], existing: TimelineItem[]): TimelineItem[] {
-    if (existing.length === 0) return refreshed;
-    const refreshedKeys = new Set(refreshed.map(timelineItemKey));
-    const firstRefreshedExistingIndex = existing.findIndex((item) => refreshedKeys.has(timelineItemKey(item)));
-    const preservedOlderItems = firstRefreshedExistingIndex > 0
-      ? existing.slice(0, firstRefreshedExistingIndex).filter((item) => !refreshedKeys.has(timelineItemKey(item)))
-      : [];
-    const preservedLiveItems = existing.filter((item) => {
-      if (!isLiveOnlyTimelineItem(item)) return false;
-      return !refreshedKeys.has(timelineItemKey(item));
-    });
-    if (preservedOlderItems.length === 0 && preservedLiveItems.length === 0) return refreshed;
-    const result = [...preservedOlderItems, ...refreshed];
-    for (const item of preservedLiveItems) {
-      const previousIndex = existing.findIndex((candidate) => candidate.id === item.id);
-      const insertAfterKey = previousIndex > 0 ? timelineItemKey(existing[previousIndex - 1]) : null;
-      const insertAfterIndex = insertAfterKey
-        ? result.findIndex((candidate) => timelineItemKey(candidate) === insertAfterKey)
-        : -1;
-      if (insertAfterIndex >= 0) {
-        result.splice(insertAfterIndex + 1, 0, item);
-      } else {
-        result.push(item);
-      }
-    }
-    return result;
-  }
-
-  function prependOlderTimelinePage(existing: TimelineItem[], older: TimelineItem[]): TimelineItem[] {
-    if (older.length === 0) return existing;
-    const existingKeys = new Set(existing.map(timelineItemKey));
-    const uniqueOlder = older.filter((item) => !existingKeys.has(timelineItemKey(item)));
-    return uniqueOlder.length > 0 ? [...uniqueOlder, ...existing] : existing;
-  }
-
-  function messageHistoryOlderCursor(
-    response: import('$lib/types/api').MessageHistoryResponse,
-  ): string | null {
-    const cursor = (response as unknown as { older_cursor?: unknown }).older_cursor;
-    return typeof cursor === 'string' && cursor.length > 0 ? cursor : null;
   }
 
   function clearConversationTurnState(conversationId: string | null | undefined, lastMessageAt?: string | null): void {
@@ -1789,12 +2345,10 @@ import X from 'lucide-svelte/icons/x';
   async function loadConversationPage(reset = false): Promise<void> {
     conversationListLoadCount += 1;
     conversationListLoading = true;
-    const channelFilter = selectedChannel !== 'all' ? selectedChannel : null;
-    const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
     try {
       const response = await api.conversations.list(reset ? null : conversationCursor, {
-        contextType: channelFilter,
-        agentId: agentFilter,
+        contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
+        agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
         status: selectedConversationStatus,
       });
       mergeConversationList(response.items, { reset });
@@ -1808,16 +2362,16 @@ import X from 'lucide-svelte/icons/x';
 
   function sidebarProjectionCacheKey(): string {
     return JSON.stringify({
-      channel: selectedChannel,
-      agent: selectedAgentId,
+      channels: selectedChannels,
+      agents: selectedAgentIds,
       status: selectedConversationStatus,
     });
   }
 
   function currentSidebarProjectionFilter() {
     return {
-      selectedChannel,
-      selectedAgentId,
+      selectedChannels,
+      selectedAgentIds,
       selectedConversationStatus,
     };
   }
@@ -1847,18 +2401,20 @@ import X from 'lucide-svelte/icons/x';
     mergeConversationList(projection.conversations.items, { reset: true });
     conversationCursor = projection.conversations.cursor;
     conversationsHasMore = projection.conversations.has_more;
+    sidebarProjectionLoaded = true;
+    sidebarProjectionFailed = false;
   }
 
   function applyCachedSidebarProjection(key = sidebarProjectionCacheKey()): boolean {
     const cached = sidebarProjectionCache.get(key);
     if (!cached) return false;
-    applySidebarProjection(cloneSidebarProjection(cached));
+    applySidebarProjection(cached);
     return true;
   }
 
   function applyAvailableChannelTypes(contextTypes: string[]): void {
     const types = new Set(contextTypes.map((contextType) => contextType.toLowerCase()));
-    if (selectedChannel && selectedChannel !== 'all') {
+    for (const selectedChannel of selectedChannels) {
       types.add(selectedChannel.toLowerCase());
     }
     availableChannelTypes = [...types].sort();
@@ -1870,8 +2426,8 @@ import X from 'lucide-svelte/icons/x';
     const hadCachedProjection = applyCachedSidebarProjection(initialKey);
     conversationListLoading = conversationListLoadCount > 1 || !hadCachedProjection;
     const load = () => api.conversations.sidebar(null, {
-      contextType: selectedChannel !== 'all' ? selectedChannel : null,
-      agentId: selectedAgentId !== 'all' ? selectedAgentId : null,
+      contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
+      agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
       status: selectedConversationStatus,
     });
     try {
@@ -1887,6 +2443,9 @@ import X from 'lucide-svelte/icons/x';
       }
       applySidebarProjection(response);
       rememberSidebarProjection();
+    } catch (caughtError) {
+      sidebarProjectionFailed = true;
+      throw caughtError;
     } finally {
       conversationListLoadCount = Math.max(0, conversationListLoadCount - 1);
       conversationListLoading = conversationListLoadCount > 0;
@@ -1894,13 +2453,12 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function loadAgentDirectChats(): Promise<void> {
-    if (selectedChannel !== 'all' && selectedChannel !== 'web') {
+    if (selectedChannels.length > 0 && !selectedChannels.includes('web')) {
       agentDirectChats = [];
       return;
     }
-    const agentFilter = selectedAgentId !== 'all' ? selectedAgentId : null;
     agentDirectChats = await api.conversations.agentDirect({
-      agentId: agentFilter,
+      agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
       status: 'active'
     });
   }
@@ -1918,30 +2476,31 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function restoreSelectedAgent(): boolean {
-    const previous = selectedAgentId;
+    const previous = selectedAgentIds.join('\0');
     if (typeof window === 'undefined') return false;
     const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
-    if (stored && agents.some((a) => a.agent_id === stored && a.status === 'active')) {
-      selectedAgentId = stored;
-    } else {
-      selectedAgentId = 'all';
-    }
-    return selectedAgentId !== previous;
+    const validAgentIds = new Set(
+      agents
+        .filter((agent) => agent.status === 'active' && agent.agent_type === 'primary')
+        .map((agent) => agent.agent_id)
+    );
+    selectedAgentIds = parseStoredMultiFilter(stored).filter((agentId) => validAgentIds.has(agentId));
+    return selectedAgentIds.join('\0') !== previous;
   }
 
   function persistSelectedAgent(): void {
-    if (typeof window === 'undefined' || !selectedAgentId) return;
-    if (selectedAgentId === 'all') {
+    if (typeof window === 'undefined') return;
+    if (selectedAgentIds.length === 0) {
       window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedAgent);
       return;
     }
-    window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedAgent, selectedAgentId);
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedAgent, JSON.stringify(selectedAgentIds));
   }
 
   function clearSelectedAgentFilter(): boolean {
-    const hadFilter = selectedAgentId !== 'all'
+    const hadFilter = selectedAgentIds.length > 0
       || (typeof window !== 'undefined' && window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent) !== null);
-    selectedAgentId = 'all';
+    selectedAgentIds = [];
     if (typeof window !== 'undefined') {
       window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedAgent);
     }
@@ -2013,7 +2572,7 @@ import X from 'lucide-svelte/icons/x';
 
   function conversationTitle(conversation: Conversation): string {
     if (isAgentDirectConversation(conversation)) {
-      return agentLabel(conversationAgent(conversation));
+      return agentLabel(conversationAgentForDisplay(conversation));
     }
     return conversation.title?.trim() || 'Untitled conversation';
   }
@@ -2054,12 +2613,56 @@ import X from 'lucide-svelte/icons/x';
     return agents.find((agent) => agent.agent_id === conversation.agent_id);
   }
 
+  function fallbackAgentForConversation(conversation: Conversation): Agent {
+    const agentId = conversation.agent_id || 'agent';
+    return {
+      agent_id: agentId,
+      owner_email: conversation.user_email,
+      name: agentId,
+      display_name: agentId,
+      description: null,
+      system_prompt: null,
+      personality: null,
+      skills: null,
+      tools: null,
+      permissions: null,
+      llm_config: null,
+      execution: null,
+      personality_synced: false,
+      personality_sync_error: null,
+      personality_sync_checked_at: null,
+      avatar_url: null,
+      avatar_image_id: null,
+      agent_type: 'primary',
+      is_system: false,
+      hidden: false,
+      editable_fields: [],
+      has_overrides: false,
+      disabled: false,
+      disableable: false,
+      sync_metadata: null,
+      is_shared_with_me: false,
+      shared_by_email: null,
+      granted_permission: null,
+      executor_scope: null,
+      is_readonly_for_caller: false,
+      status: 'active',
+      created_at: null,
+      updated_at: null,
+    };
+  }
+
+  function conversationAgentForDisplay(conversation: Conversation): Agent {
+    return conversationAgent(conversation) ?? fallbackAgentForConversation(conversation);
+  }
+
   function messageAgent(item: MessageTimelineItem): Agent | null {
     const runtimeAgentId = item.runtime?.agent_id;
     if (runtimeAgentId) {
-      return agents.find((agent) => agent.agent_id === runtimeAgentId) ?? null;
+      return agents.find((agent) => agent.agent_id === runtimeAgentId)
+        ?? (currentConversation?.agent_id === runtimeAgentId ? fallbackAgentForConversation(currentConversation) : null);
     }
-    return currentConversation ? conversationAgent(currentConversation) ?? null : null;
+    return currentConversation ? conversationAgentForDisplay(currentConversation) : null;
   }
 
   async function refreshCurrentConversationMetadata(): Promise<void> {
@@ -2067,6 +2670,96 @@ import X from 'lucide-svelte/icons/x';
     const updated = await api.conversations.detail(currentConversation.conversation_id);
     currentConversation = updated;
     patchConversationInList(updated.conversation_id, updated);
+  }
+
+  async function stopManagedConversation(): Promise<void> {
+    if (!currentConversation || managedActionBusy) return;
+    managedActionBusy = 'stop';
+    managedActionError = '';
+    try {
+      const response = await api.conversations.managedAction(
+        currentConversation.conversation_id,
+        'stop',
+        { reason: 'Stopped by user from managed conversation UI' },
+      );
+      applyManagedActionResponse(response);
+      addToast(response.status === 'idle' ? 'No active managed turn to stop.' : 'Managed turn stopped.', 'success');
+      await refreshCurrentConversationMetadata();
+    } catch (caughtError) {
+      managedActionError = asApiError(caughtError).message;
+      addToast(managedActionError, 'error', 4_000, 'Unable to stop managed turn');
+    } finally {
+      managedActionBusy = null;
+    }
+  }
+
+  async function sendManagedInstruction(): Promise<void> {
+    if (!currentConversation || managedActionBusy) return;
+    const message = managedInstruction.trim();
+    if (!message) {
+      managedActionError = 'Message is required.';
+      return;
+    }
+    if (managedConversationActive(currentConversation)) {
+      managedActionError = 'Stop the current managed turn before sending a new message.';
+      return;
+    }
+    managedActionBusy = 'send';
+    managedActionError = '';
+    try {
+      const response = await api.conversations.managedAction(
+        currentConversation.conversation_id,
+        'send',
+        { message, wait: false },
+      );
+      applyManagedActionResponse(response);
+      managedInstruction = '';
+      managedInstructionOpen = false;
+      addToast('Instruction sent to managed conversation.', 'success');
+      await refreshCurrentConversationMetadata();
+    } catch (caughtError) {
+      managedActionError = asApiError(caughtError).message;
+      addToast(managedActionError, 'error', 4_000, 'Unable to send instruction');
+    } finally {
+      managedActionBusy = null;
+    }
+  }
+
+  async function takeControlOfManagedConversation(): Promise<void> {
+    if (!currentConversation || managedActionBusy) return;
+    if (managedConversationActive(currentConversation)) {
+      managedActionError = 'Stop the current managed turn before taking control.';
+      return;
+    }
+    const confirmed = await confirmAction({
+      title: 'Take control of managed conversation?',
+      message: 'The managed conversation will be closed read-only and forked into a normal conversation you can continue directly.',
+      confirmLabel: 'Take control'
+    });
+    if (!confirmed || !currentConversation) return;
+
+    managedActionBusy = 'take-control';
+    managedActionError = '';
+    try {
+      const response = await api.conversations.managedAction(
+        currentConversation.conversation_id,
+        'take-control',
+      );
+      applyManagedActionResponse(response);
+      const followUpConversationId = typeof response.result?.conversation_id === 'string'
+        ? response.result.conversation_id
+        : response.managed_agent?.follow_up_conversation_id;
+      addToast('Managed conversation forked for direct control.', 'success');
+      await refreshCurrentConversationMetadata();
+      if (followUpConversationId) {
+        await goto(conversationUrl(followUpConversationId));
+      }
+    } catch (caughtError) {
+      managedActionError = asApiError(caughtError).message;
+      addToast(managedActionError, 'error', 4_000, 'Unable to take control');
+    } finally {
+      managedActionBusy = null;
+    }
   }
 
   function agentLabel(agent: Agent | undefined): string {
@@ -2182,9 +2875,9 @@ import X from 'lucide-svelte/icons/x';
       const response = await api.search.conversations({
         q,
         filters: {
-          agent_id: selectedAgentId !== 'all' ? selectedAgentId : null,
+          agent_ids: selectedAgentIds.length > 0 ? selectedAgentIds : null,
           status: selectedConversationStatus,
-          context_type: selectedChannel !== 'all' ? selectedChannel : null,
+          context_types: selectedChannels.length > 0 ? selectedChannels : null,
         },
         kinds: ['reasoning', 'intention', 'summary'],
         limit: 25
@@ -2214,7 +2907,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function scrollToTimelineItem(id: string): void {
-    const fullIndex = timeline.findIndex((item) => item.id === id);
+    const fullIndex = renderableVisibleItems.findIndex((item) => item.id === id);
     if (fullIndex >= 0 && fullIndex < visibleStartIndex) {
       visibleStartIndex = Math.max(0, fullIndex - 5);
     }
@@ -2229,9 +2922,11 @@ import X from 'lucide-svelte/icons/x';
     const targetTime = Date.parse(timestamp);
     if (!Number.isFinite(targetTime)) return null;
     let best: { id: string; delta: number } | null = null;
-    for (const item of timeline) {
-      if (item.kind !== 'message' || !item.timestamp) continue;
-      const value = Date.parse(item.timestamp);
+    for (const item of renderableVisibleItems) {
+      if (item.kind !== 'message') continue;
+      const timestamp = item.created_at ?? item.updated_at ?? null;
+      if (!timestamp) continue;
+      const value = Date.parse(timestamp);
       if (!Number.isFinite(value)) continue;
       const delta = Math.abs(value - targetTime);
       if (best === null || delta < best.delta) best = { id: item.id, delta };
@@ -2258,7 +2953,7 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     const conversationId = currentConversation.conversation_id;
-    const local = findLocalChatMatches(timeline, q).map((match) => ({
+    const local = findLocalChatMatches(projectRenderItems(), q).map((match) => ({
       source: 'local' as const,
       local: match,
       targetId: localResultId(match)
@@ -2383,7 +3078,7 @@ import X from 'lucide-svelte/icons/x';
   const currentAgentDisplayName = $derived.by(() => {
     if (!currentConversation) return 'Cognis';
     const agent = conversationAgent(currentConversation);
-    return agent?.display_name ?? agent?.name ?? 'Cognis';
+    return agent?.display_name ?? agent?.name ?? currentConversation.agent_id ?? 'Cognis';
   });
 
   const persistentChatMode = $derived.by(() => {
@@ -2492,19 +3187,6 @@ import X from 'lucide-svelte/icons/x';
       !directQuestionSubmitting,
   );
 
-  async function loadHistory(
-    conversationId: string,
-    limit = 200,
-  ): Promise<import('$lib/types/api').TimelineProjectionResponse> {
-    return loadConversationHistoryPage(conversationId, null, limit);
-  }
-
-  function projectedTimelineItems(
-    response: import('$lib/types/api').TimelineProjectionResponse,
-  ): TimelineItem[] {
-    return timelineFromProjection(response.timeline_items);
-  }
-
   async function refreshSidebarData(): Promise<void> {
     await loadSidebarProjection();
   }
@@ -2538,6 +3220,76 @@ import X from 'lucide-svelte/icons/x';
   }
 
   /** Seed escalation list from Intaris on conversation open (catch up). */
+  function applyEscalationNotifications(notifications: Notification[], taskId: string | null): void {
+    const filtered = notifications
+      .filter((item) => item.notification_type === 'escalation')
+      .filter((item) => (taskId ? item.task_id === taskId : true))
+      .map((item) => ({
+        call_id: item.notification_id,
+        session_id: item.session_id,
+        tool_name: typeof item.payload.tool_name === 'string' ? item.payload.tool_name : null,
+        decision: 'escalate',
+        resolved: false,
+        reasoning: typeof item.payload.reasoning === 'string' ? item.payload.reasoning : null,
+        risk: typeof item.payload.risk === 'string' ? item.payload.risk : null,
+        timeout_seconds:
+          typeof item.payload.timeout_seconds === 'number'
+            ? item.payload.timeout_seconds
+            : escalationTimeoutSeconds,
+        received_at: item.created_at ? Date.parse(item.created_at) : Date.now()
+      }) satisfies Escalation);
+    const pendingEscalations = filtered.filter((item) => !isEscalationExpired(item));
+    for (const item of pendingEscalations) {
+      if (!escalations.some((e) => e.call_id === item.call_id)) {
+        item.timeout_seconds = item.timeout_seconds ?? escalationTimeoutSeconds;
+      }
+    }
+    const pendingStillExists = escalationResolutionPending
+      ? pendingEscalations.some((item) => item.call_id === escalationResolutionPending?.call_id)
+      : false;
+    if (escalationResolutionPending && !pendingStillExists) {
+      if (escalationBusyCallId === escalationResolutionPending.call_id) {
+        escalationBusyCallId = null;
+      }
+      escalationResolutionPending = null;
+    }
+    escalations = sortEscalations(
+      escalationResolutionPending
+        ? pendingEscalations.filter((item) => item.call_id !== escalationResolutionPending?.call_id)
+        : pendingEscalations
+    );
+    escalationError = '';
+    startEscalationCountdown();
+  }
+
+  function applyPendingDirectQuestionNotifications(notifications: Notification[]): void {
+    const pendingStepNotifications = notifications.filter(
+      (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
+    );
+    pendingCredentialRequest = notifications.find(
+      (item) => item.notification_type === 'credential_request' && item.status === 'pending',
+    ) ?? null;
+    // Send routing resolves the notification id from pendingDirectQuestion
+    // or a fresh notifications fetch (resolveDirectQuestionNotificationId),
+    // so no per-tool annotation on the canonical timeline is required.
+    const directQuestion = pendingStepNotifications
+      .filter((item) => item.task_id === null)
+      .map((item) => pendingDirectQuestionFromNotification(item))
+      .find((item): item is PendingDirectQuestion => item !== null) ?? null;
+    if (directQuestion?.notificationId !== pendingDirectQuestion?.notificationId) {
+      directQuestionAnswers = restoreDirectQuestionDraft(directQuestion);
+      directQuestionPageIndex = 0;
+      directQuestionCollapsed = false;
+    }
+    pendingDirectQuestion = directQuestion;
+    if (directQuestion === null) {
+      directQuestionSubmitting = false;
+      directQuestionAnswers = {};
+      directQuestionPageIndex = 0;
+      directQuestionCollapsed = false;
+    }
+  }
+
   async function refreshEscalations(): Promise<void> {
     if (!currentConversation || document.hidden) return;
     try {
@@ -2545,45 +3297,7 @@ import X from 'lucide-svelte/icons/x';
       const notifications = taskId
         ? await api.notifications.list(null, { taskId })
         : await api.notifications.list(currentConversation.conversation_id);
-      const filtered = notifications
-        .filter((item) => item.notification_type === 'escalation')
-        .filter((item) => (taskId ? item.task_id === taskId : true))
-        .map((item) => ({
-          call_id: item.notification_id,
-          session_id: item.session_id,
-          tool_name: typeof item.payload.tool_name === 'string' ? item.payload.tool_name : null,
-          decision: 'escalate',
-          resolved: false,
-          reasoning: typeof item.payload.reasoning === 'string' ? item.payload.reasoning : null,
-          risk: typeof item.payload.risk === 'string' ? item.payload.risk : null,
-          timeout_seconds:
-            typeof item.payload.timeout_seconds === 'number'
-              ? item.payload.timeout_seconds
-              : escalationTimeoutSeconds,
-          received_at: item.created_at ? Date.parse(item.created_at) : Date.now()
-        }) satisfies Escalation);
-      const pendingEscalations = filtered.filter((item) => !isEscalationExpired(item));
-      for (const item of pendingEscalations) {
-        if (!escalations.some((e) => e.call_id === item.call_id)) {
-          item.timeout_seconds = item.timeout_seconds ?? escalationTimeoutSeconds;
-        }
-      }
-      const pendingStillExists = escalationResolutionPending
-        ? pendingEscalations.some((item) => item.call_id === escalationResolutionPending?.call_id)
-        : false;
-      if (escalationResolutionPending && !pendingStillExists) {
-        if (escalationBusyCallId === escalationResolutionPending.call_id) {
-          escalationBusyCallId = null;
-        }
-        escalationResolutionPending = null;
-      }
-      escalations = sortEscalations(
-        escalationResolutionPending
-          ? pendingEscalations.filter((item) => item.call_id !== escalationResolutionPending?.call_id)
-          : pendingEscalations
-      );
-      escalationError = '';
-      startEscalationCountdown();
+      applyEscalationNotifications(notifications, taskId);
     } catch (caughtError) {
       escalationError = asApiError(caughtError).message;
     }
@@ -2592,39 +3306,24 @@ import X from 'lucide-svelte/icons/x';
   async function refreshPendingDirectQuestion(): Promise<void> {
     if (!currentConversation || document.hidden) return;
     try {
-      const notifications = await api.notifications.list(currentConversation.conversation_id);
-      const pendingStepNotifications = notifications.filter(
-        (item) => ['step_question', 'auth_challenge'].includes(item.notification_type) && item.status === 'pending',
-      );
-      pendingCredentialRequest = notifications.find(
-        (item) => item.notification_type === 'credential_request' && item.status === 'pending',
-      ) ?? null;
-      // Annotate any pending input/challenge tool call with a
-      // notification id so the send routing can resolve it without
-      // needing another round-trip. Task-scoped notifications count
-      // too — the UI uses the annotation purely for resolution, and
-      // the backend rejects unauthorized resolves.
-      for (const notif of pendingStepNotifications) {
-        timeline = annotateStepRequestInputWithNotification(timeline, notif.notification_id);
-      }
-      const directQuestion = pendingStepNotifications
-        .filter((item) => item.task_id === null)
-        .map((item) => pendingDirectQuestionFromNotification(item))
-        .find((item): item is PendingDirectQuestion => item !== null) ?? null;
-      if (directQuestion?.notificationId !== pendingDirectQuestion?.notificationId) {
-        directQuestionAnswers = {};
-        directQuestionPageIndex = 0;
-        directQuestionCollapsed = false;
-      }
-      pendingDirectQuestion = directQuestion;
-      if (directQuestion === null) {
-        directQuestionSubmitting = false;
-        directQuestionAnswers = {};
-        directQuestionPageIndex = 0;
-        directQuestionCollapsed = false;
-      }
+      applyPendingDirectQuestionNotifications(await api.notifications.list(currentConversation.conversation_id));
     } catch {
       // Ignore notification refresh failures here — they should not block chat.
+    }
+  }
+
+  async function refreshPendingNotifications(): Promise<void> {
+    if (!currentConversation || document.hidden) return;
+    try {
+      const taskId = conversationTaskId(currentConversation);
+      const conversationNotifications = await api.notifications.list(currentConversation.conversation_id);
+      const escalationNotifications = taskId
+        ? await api.notifications.list(null, { taskId })
+        : conversationNotifications;
+      applyEscalationNotifications(escalationNotifications, taskId);
+      applyPendingDirectQuestionNotifications(conversationNotifications);
+    } catch (caughtError) {
+      escalationError = asApiError(caughtError).message;
     }
   }
 
@@ -2657,13 +3356,13 @@ import X from 'lucide-svelte/icons/x';
     stopNotificationRefreshPolling();
     notificationRefreshTimer = window.setInterval(() => {
       if (document.hidden || !currentConversation) return;
-      void refreshEscalations();
-      void refreshPendingDirectQuestion();
-    }, 5000);
+      void refreshPendingNotifications();
+    }, 30000);
   }
 
   function syncVisibleWindow(): void {
-    visibleStartIndex = Math.max(0, timeline.length - 100);
+    // Window over renderable rows only (matches displayedTimeline slicing).
+    visibleStartIndex = Math.max(0, renderableVisibleItems.length - 100);
   }
 
   function timelineDistanceFromBottom(): number {
@@ -2679,12 +3378,18 @@ import X from 'lucide-svelte/icons/x';
     if (!timelineEl) return;
     userScrolledUp = true;
     userScrollIntentUp = true;
+    tailPinned = false;
   }
 
   function clearUserScrollIntentSoon(): void {
+    // 300ms covers typical trackpad inertia/momentum scroll bursts. The
+    // previous 120ms window was too short: sparse wheel events during a
+    // momentum scroll could let the intent expire between notches, leaving
+    // only userScrolledUp as the "scrolling up" signal — which the near-bottom
+    // branch could then clear on a reflow-induced position change.
     window.setTimeout(() => {
       userScrollIntentUp = false;
-    }, 120);
+    }, 300);
   }
 
   function scheduleScrollToBottom(force = false, frames = 2): void {
@@ -2696,22 +3401,67 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function scrollToBottom(force = false): void {
-    if (!timelineEl || (!force && userScrolledUp)) return;
-    if (force) userScrolledUp = false;
-    programmaticScroll = true;
+    // Idempotent auto-scroll: if the user is pinned to the tail (or force),
+    // re-pin to scrollHeight. Never infer userScrolledUp from a distance
+    // measurement — only genuine user gestures (handleTimelineScroll,
+    // wheel/touch/key intent) may un-pin. This is the baseline behavior that
+    // correctly handles messages taller than the viewport: as streaming content
+    // grows, each call simply re-pins to the new scrollHeight without any
+    // position-gate that could race the DOM growth and falsely dismount the tail.
+    if (!timelineEl) return;
+    if (!force && userScrolledUp) return;
+    if (force) {
+      userScrolledUp = false;
+      tailPinned = true;
+    }
+    bottomScrollPending = true;
     requestAnimationFrame(() => {
+      bottomScrollPending = false;
+      if (!force && userScrolledUp) return;
       if (timelineEl) {
+        programmaticScroll = true;
         timelineEl.scrollTop = timelineEl.scrollHeight;
         lastTimelineScrollTop = timelineEl.scrollTop;
-        if (force) userScrolledUp = false;
+        // Record the exact scrollTop we wrote so handleTimelineScroll can
+        // suppress the async scroll event the browser delivers for this write.
+        // The event is dispatched on the next animation frame (not synchronously),
+        // so it can arrive after programmaticScroll has been cleared — without
+        // this guard it would be processed as a user gesture.
+        programmaticScrollTarget = timelineEl.scrollTop;
+        tailPinned = true;
       }
       requestAnimationFrame(() => {
         programmaticScroll = false;
-        if (force && timelineEl) {
-          const distanceFromBottom = timelineDistanceFromBottom();
-          userScrolledUp = !isNearScrollBottom(distanceFromBottom, CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX);
+        if (timelineEl) {
           lastTimelineScrollTop = timelineEl.scrollTop;
         }
+        // Keep the target alive for one more frame to catch late-delivered
+        // scroll events, then clear it.
+        requestAnimationFrame(() => {
+          programmaticScrollTarget = null;
+        });
+      });
+    });
+  }
+
+  /**
+   * Write a programmatic scrollTop value with the same guards scrollToBottom
+   * uses: the boolean flag for same-frame scroll events plus the written-value
+   * target for the async scroll event the browser delivers on a later frame.
+   * Every programmatic scrollTop write on the timeline MUST go through this
+   * (or scrollToBottom) — an unguarded write is processed by
+   * handleTimelineScroll as a user gesture and corrupts the scroll state.
+   */
+  function writeProgrammaticScrollTop(value: number): void {
+    if (!timelineEl) return;
+    programmaticScroll = true;
+    timelineEl.scrollTop = value;
+    programmaticScrollTarget = timelineEl.scrollTop;
+    lastTimelineScrollTop = timelineEl.scrollTop;
+    requestAnimationFrame(() => {
+      programmaticScroll = false;
+      requestAnimationFrame(() => {
+        programmaticScrollTarget = null;
       });
     });
   }
@@ -2719,6 +3469,15 @@ import X from 'lucide-svelte/icons/x';
   function handleTimelineScroll(): void {
     if (!timelineEl || programmaticScroll) return;
     const currentScrollTop = timelineEl.scrollTop;
+    // Suppress scroll events whose position matches a recent programmatic write.
+    // The browser delivers the scroll event for a scrollTop assignment
+    // asynchronously (on the next animation frame), so it can arrive after
+    // programmaticScroll has been cleared. Without this guard, the event would
+    // be processed as a user gesture and could falsely clear userScrolledUp.
+    if (programmaticScrollTarget !== null && currentScrollTop === programmaticScrollTarget) {
+      lastTimelineScrollTop = currentScrollTop;
+      return;
+    }
     const distanceFromBottom = timelineDistanceFromBottom();
 
     const nextState = nextChatScrollState({
@@ -2731,6 +3490,11 @@ import X from 'lucide-svelte/icons/x';
       scrollDeltaThresholdPx: CHAT_USER_SCROLL_DELTA_THRESHOLD_PX,
     });
     userScrolledUp = nextState.userScrolledUp;
+    // Keep tailPinned as a strict mirror of !userScrolledUp so there is a
+    // single source of truth. Previously tailPinned could diverge from
+    // userScrolledUp, causing the ResizeObserver and shouldPreserveLiveTailOnResize
+    // to use stale state.
+    tailPinned = !userScrolledUp;
     if (isNearScrollBottom(nextState.distanceFromBottom, CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX)) {
       userScrollIntentUp = false;
       lastTimelineTouchY = null;
@@ -2747,6 +3511,7 @@ import X from 'lucide-svelte/icons/x';
     userScrolledUp = false;
     userScrollIntentUp = false;
     lastTimelineTouchY = null;
+    tailPinned = true;
     scrollToBottom(true);
   }
 
@@ -2792,9 +3557,47 @@ import X from 'lucide-svelte/icons/x';
     return channel.charAt(0).toUpperCase() + channel.slice(1);
   }
 
-  async function persistSelectedChannel(): Promise<void> {
+  function selectedChannelFilterLabel(): string {
+    if (selectedChannels.length === 0) return 'All channels';
+    const labels = selectedChannels.map(channelDisplayLabel);
+    if (labels.length <= 2) return labels.join(' + ');
+    return `${labels.slice(0, 2).join(' + ')} +${labels.length - 2}`;
+  }
+
+  function activePrimaryAgents(): Agent[] {
+    return agents.filter((agent) => agent.status === 'active' && agent.agent_type === 'primary');
+  }
+
+  function selectedAgentFilterLabel(): string {
+    if (selectedAgentIds.length === 0) return 'All agents';
+    const selectedAgents = activePrimaryAgents().filter((agent) => selectedAgentIds.includes(agent.agent_id));
+    const labels = selectedAgents.map((agent) => agent.display_name ?? agent.name ?? agent.agent_id);
+    const fallbackCount = selectedAgentIds.length - labels.length;
+    for (let index = 0; index < fallbackCount; index += 1) labels.push('Unknown agent');
+    if (labels.length <= 2) return labels.join(' + ');
+    return `${labels.slice(0, 2).join(' + ')} +${labels.length - 2}`;
+  }
+
+  function parseStoredMultiFilter(stored: string | null): string[] {
+    if (!stored || stored === 'all') return [];
+    try {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0);
+      }
+    } catch {
+      // Backwards-compatible single-value storage from the old select.
+    }
+    return [stored];
+  }
+
+  async function persistSelectedChannels(): Promise<void> {
     if (typeof window === 'undefined') return;
-    window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, selectedChannel);
+    if (selectedChannels.length === 0) {
+      window.localStorage.removeItem(CHAT_STORAGE_KEYS.selectedChannel);
+    } else {
+      window.localStorage.setItem(CHAT_STORAGE_KEYS.selectedChannel, JSON.stringify(selectedChannels));
+    }
     resetConversationSearchResults();
     await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
@@ -2802,7 +3605,21 @@ import X from 'lucide-svelte/icons/x';
   function restoreSelectedChannel(): void {
     if (typeof window === 'undefined') return;
     const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedChannel);
-    if (stored) selectedChannel = stored;
+    selectedChannels = parseStoredMultiFilter(stored);
+  }
+
+  async function toggleSelectedChannel(channel: string): Promise<void> {
+    selectedChannels = selectedChannels.includes(channel)
+      ? selectedChannels.filter((item) => item !== channel)
+      : [...selectedChannels, channel];
+    await persistSelectedChannels();
+  }
+
+  async function toggleSelectedAgent(agentId: string): Promise<void> {
+    selectedAgentIds = selectedAgentIds.includes(agentId)
+      ? selectedAgentIds.filter((item) => item !== agentId)
+      : [...selectedAgentIds, agentId];
+    await handleAgentFilterChange();
   }
 
   function restoreChatSidebarState(): void {
@@ -2935,9 +3752,7 @@ import X from 'lucide-svelte/icons/x';
         escalated_count: detail.escalated_count,
         context_usage: detail.context_usage ?? null
       };
-      if (detail.context_usage) {
-        contextUsage = detail.context_usage;
-      }
+      applyContextUsageSnapshot(detail.context_usage);
     } catch {
       if (!isStaleSessionInfoLoad(requestId, conversationId, sid)) {
         sessionInfo = null;
@@ -2962,9 +3777,7 @@ import X from 'lucide-svelte/icons/x';
       if (isStaleSessionInfoLoad(requestId, conversationId, sid)) {
         return;
       }
-      if (detail.context_usage) {
-        contextUsage = detail.context_usage;
-      }
+      applyContextUsageSnapshot(detail.context_usage);
     } catch {
       // Context diagnostics are opportunistic; the Info panel can still load details on demand.
     }
@@ -3000,39 +3813,34 @@ import X from 'lucide-svelte/icons/x';
       reloadSessions?: boolean;
       reloadHistory?: boolean;
       resubscribe?: boolean;
-      preserveTimelineOnHistoryFailure?: boolean;
       preserveScroll?: boolean;
-      mergeTimeline?: boolean;
     } = {},
   ): Promise<void> {
     const reloadSessions = options.reloadSessions ?? true;
     const reloadHistory = options.reloadHistory ?? true;
     const shouldResubscribe = options.resubscribe ?? false;
-    const preserveTimelineOnHistoryFailure = options.preserveTimelineOnHistoryFailure ?? false;
-    const shouldMergeTimeline = options.mergeTimeline ?? false;
-    const shouldPreserveScroll = options.preserveScroll === true && userScrolledUp && timelineEl !== null;
-    const preservedScrollTop = shouldPreserveScroll ? timelineEl?.scrollTop ?? 0 : 0;
+    // The ChatTimeline store handles live-item preservation automatically:
+    // replaceAll() re-applies any pending rAF patches after the snapshot,
+    // and the session filter bypasses during active turns (turnInProgress).
+    // NOTE: the scroll position itself is captured at APPLY time (right before
+    // the snapshot mutates the DOM), never here before the async fetch — a
+    // pre-fetch capture restored a stale position and yanked actively-scrolling
+    // users back to where they were when the refresh started.
+    const wantsPreserveScroll = options.preserveScroll === true;
+    let preservedScrollTop: number | null = null;
     const preservedVisibleStartIndex = visibleStartIndex;
+    // Capture tail-pinned state before the async fetch so the post-refresh
+    // scroll decision reflects where the user was, not where they ended up
+    // during the network round-trip. A refresh must never yank a reading user
+    // to the bottom.
+    const preTailPinned = tailPinned;
     const initialLoadPolicy = conversationInitialLoadPolicy(currentConversation);
-
-    const [sessionResult, historyResult] = await Promise.allSettled([
-      reloadSessions ? api.conversations.sessions(conversationId, initialLoadPolicy.sessionOptions) : Promise.resolve(sessions),
-      reloadHistory
-        ? loadHistory(conversationId, initialLoadPolicy.historyLimit)
-        : Promise.resolve({
-            items: [],
-            last_seq: 0,
-            has_more: false,
-            has_active_turn: false,
-            active_streams: [],
-            active_tool_outputs: [],
-            active_session_id: null,
-            active_session_last_seq: 0,
-            history_truncated: false,
-            truncation_reason: null,
-            state_snapshot: null,
-            timeline_items: []
-          }),
+    const [conversationResult, sessionResult, chatV2SnapshotResult] = await Promise.allSettled([
+      reloadSessions ? api.conversations.detail(conversationId) : Promise.resolve(null),
+      reloadSessions
+        ? api.conversations.sessions(conversationId, initialLoadPolicy.sessionOptions)
+        : Promise.resolve(sessions),
+      reloadHistory ? chatV2Api.snapshot(conversationId) : Promise.resolve(null),
     ]);
 
     if (isStaleConversationLoad(requestId)) {
@@ -3043,8 +3851,61 @@ import X from 'lucide-svelte/icons/x';
     historyError = '';
 
     const previousConversation = currentConversation;
+    const previousActiveSessionId = previousConversation?.active_session_id ?? null;
     let nextSessions = reloadSessions ? [] : sessions;
-    let nextActiveSessionId = previousConversation?.active_session_id ?? null;
+    let nextActiveSessionId = previousActiveSessionId;
+
+    const conversationDetail = conversationResult.status === 'fulfilled' ? conversationResult.value : null;
+    const conversationFailure = reloadSessions && conversationResult.status === 'rejected'
+      ? conversationResult.reason
+      : null;
+    if (reloadSessions && conversationDetail) {
+      currentConversation = conversationDetail;
+      patchConversationInList(conversationDetail.conversation_id, conversationDetail);
+      if (conversationDetail.active_session_id) {
+        nextActiveSessionId = conversationDetail.active_session_id;
+      }
+    }
+
+    const chatV2Snapshot = chatV2SnapshotResult.status === 'fulfilled'
+      ? chatV2SnapshotResult.value
+      : null;
+    if (reloadHistory && !chatV2Snapshot) {
+      const failure = chatV2SnapshotResult.status === 'rejected'
+        ? chatV2SnapshotResult.reason
+        : new Error('Chat v2 snapshot unavailable');
+      const failureMessage = asApiError(failure).message;
+      historyError = failureMessage;
+      if (!chatV2OwnsActiveConversation(conversationId) || chatV2Store.visibleItems.length === 0) {
+        chatV2Store.reset();
+        applyChatV2StateToTimeline();
+        olderMessagesCursor = null;
+        hasOlderMessages = false;
+        queuedMessages = [];
+        queuedCount = 0;
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+        currentActiveTurnId = null;
+        wsClient.clearChatV2Cursor(conversationId);
+      }
+      reportError(failure);
+      addToast(failureMessage, 'error');
+      return;
+    }
+    if (reloadHistory && chatV2Snapshot) {
+      // Capture the scroll position immediately before the snapshot mutates
+      // the timeline — the user's position NOW, not where they were when the
+      // network fetch started.
+      if (wantsPreserveScroll && userScrolledUp && timelineEl) {
+        preservedScrollTop = timelineEl.scrollTop;
+      }
+      applyChatV2Snapshot(chatV2Snapshot);
+      void drainChatV2Outbox(conversationId);
+      olderMessagesCursor = chatV2Snapshot.timeline.before_cursor ?? null;
+      hasOlderMessages = chatV2Snapshot.timeline.has_more_before;
+      nextActiveSessionId = chatV2Snapshot.conversation.active_session_id ?? nextActiveSessionId;
+      setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
+    }
 
     if (reloadSessions && sessionResult.status === 'fulfilled') {
       nextSessions = sessionResult.value;
@@ -3059,48 +3920,26 @@ import X from 'lucide-svelte/icons/x';
         sessionsError = nextError;
       }
     }
+    if (conversationFailure && !sessionsError) {
+      const nextError = asApiError(conversationFailure).message;
+      sessionsError = nextError;
+      reportError(conversationFailure);
+    }
 
-    if (reloadHistory && historyResult.status === 'fulfilled') {
-      nextActiveSessionId = historyResult.value.active_session_id ?? nextActiveSessionId;
-      activeSessionLastSeq = historyResult.value.active_session_last_seq ?? activeSessionLastSeq;
-      applyConversationStateSnapshot(historyResult.value.state_snapshot);
-      olderMessagesCursor = messageHistoryOlderCursor(historyResult.value);
-      hasOlderMessages = Boolean(historyResult.value.has_more && olderMessagesCursor);
-      timeline = shouldMergeTimeline
-        ? mergeTimelineRefresh(projectedTimelineItems(historyResult.value), timeline)
-        : projectedTimelineItems(historyResult.value);
-      runtimeOverlay = applyRuntimeSnapshotOverlay(createRuntimeTimelineOverlay(), {
-        active_streams: historyResult.value.active_streams ?? [],
-        active_tool_outputs: historyResult.value.active_tool_outputs ?? [],
-        active_thinking: [],
-        has_active_turn: historyResult.value.has_active_turn,
-      });
-      turnInProgress = historyResult.value.has_active_turn ?? hasActiveTurnTimelineItem();
-      setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
-      if (turnInProgress) {
-        awaitingAssistantStart = false;
-      }
-      syncConversationActiveSession(nextActiveSessionId);
-      if (shouldPreserveScroll) {
-        visibleStartIndex = Math.min(preservedVisibleStartIndex, Math.max(0, timeline.length - 100));
+    if (reloadHistory && chatV2Snapshot) {
+      if (preservedScrollTop !== null) {
+        visibleStartIndex = Math.min(preservedVisibleStartIndex, Math.max(0, renderableVisibleItems.length - 100));
       } else {
         syncVisibleWindow();
         userScrolledUp = false;
+        tailPinned = true;
       }
+      syncConversationActiveSession(nextActiveSessionId);
       if (!headerInfoOpen) {
         void refreshSessionContextUsage();
       }
       if (currentConversation) {
         saveCurrentConversationView();
-      }
-    } else if (reloadHistory && historyResult.status === 'rejected') {
-      if (!preserveTimelineOnHistoryFailure) {
-        timeline = [];
-        syncVisibleWindow();
-      }
-      const nextError = asApiError(historyResult.reason).message;
-      if (!(isPreSessionChatConversation(previousConversation, nextSessions.length) && isMissingSessionError(nextError))) {
-        historyError = nextError;
       }
     }
     if (reloadHistory) {
@@ -3108,17 +3947,12 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (shouldResubscribe) {
-      const subscribeSeq = reloadHistory && historyResult.status === 'fulfilled'
-        ? (historyResult.value.active_session_last_seq ?? 0)
-        : activeSessionLastSeq;
+      const subscribeSeq = nextActiveSessionId === previousActiveSessionId ? activeSessionLastSeq : 0;
       activeSessionLastSeq = subscribeSeq;
       wsClient.subscribeConversation(
         conversationId,
         subscribeSeq,
-        reloadHistory && historyResult.status === 'fulfilled'
-          ? (historyResult.value.active_session_id ?? null)
-          : nextActiveSessionId,
-        { replaceCursor: reloadHistory && historyResult.status === 'fulfilled' },
+        nextActiveSessionId,
       );
     }
 
@@ -3131,7 +3965,7 @@ import X from 'lucide-svelte/icons/x';
     );
 
     if (!sessionsError && !skipNotificationRefresh) {
-      await Promise.all([refreshEscalations(), refreshPendingDirectQuestion()]);
+      await refreshPendingNotifications();
       if (isStaleConversationLoad(requestId)) {
         return;
       }
@@ -3147,12 +3981,38 @@ import X from 'lucide-svelte/icons/x';
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        if (shouldPreserveScroll && timelineEl) {
-          timelineEl.scrollTop = preservedScrollTop;
-          userScrolledUp = true;
+        if (preservedScrollTop !== null && timelineEl) {
+          // Restore only if the viewport has not moved materially since the
+          // capture (taken right before the snapshot apply). If it has, the
+          // user kept scrolling while the refresh settled — never fight an
+          // active scroll gesture with a stale restore. The write goes through
+          // the programmatic guard so the resulting async scroll event is not
+          // misread as a user gesture (which could falsely re-attach the tail
+          // and trigger a jump to the bottom).
+          if (
+            shouldApplyScrollRestore({
+              capturedScrollTop: preservedScrollTop,
+              currentScrollTop: timelineEl.scrollTop,
+            })
+          ) {
+            writeProgrammaticScrollTop(preservedScrollTop);
+            userScrolledUp = true;
+            tailPinned = false;
+          }
+          // Restore skipped: the user moved during the refresh (scrolled
+          // further, or jumped back to the bottom). Their gesture state
+          // (userScrolledUp/tailPinned) already reflects where they are now —
+          // forcing userScrolledUp=true here would detach a user who
+          // deliberately returned to the tail from live auto-scroll.
           return;
         }
-        scrollToBottom(true);
+        // Only auto-scroll if the user was pinned to the tail before the
+        // refresh. A background refresh must never yank a reading user to the
+        // bottom. scrollToBottom() is idempotent: it re-pins iff !userScrolledUp,
+        // so if the user scrolled up during the async fetch this is a no-op.
+        if (preTailPinned) {
+          scrollToBottom(false);
+        }
       });
     });
   }
@@ -3180,38 +4040,20 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function appendLocalSystemMessage(text: string): void {
-    const lastItem = timeline[timeline.length - 1];
-    if (lastItem?.kind === 'system_message' && lastItem.text === text) {
-      return;
-    }
-    timeline = applyWebSocketEvent(timeline, {
-      type: 'system_message',
-      text,
-    });
-    syncVisibleWindow();
+    // Chat v2 owns the canonical timeline; local-only notices are surfaced as
+    // a transient toast instead of being injected into the timeline store.
+    addToast(text, 'warning');
   }
 
   function hasActiveTurnTimelineItem(): boolean {
-    const lastItem = projectedTimeline[projectedTimeline.length - 1];
-    return Boolean(lastItem && isInlineLiveTimelineItem(lastItem));
+    const lastItem = renderableVisibleItems[renderableVisibleItems.length - 1];
+    return Boolean(lastItem && isInlineLiveChatV2Item(lastItem));
   }
 
   function hasAnyActiveTurnTimelineItem(): boolean {
-    return projectedTimeline.some((item) => {
-      if (item.kind === 'message') {
-        return item.role === 'assistant' && item.streaming === true;
-      }
-      if (item.kind === 'thinking') {
-        return item.streaming === true;
-      }
-      if (item.kind === 'tool_call') {
-        return isActiveToolStatus(item.status);
-      }
-      if (item.kind === 'delegation') {
-        return ['started', 'running', 'pending'].includes(item.status ?? '');
-      }
-      return false;
-    });
+    return renderableVisibleItems.some((item) => (
+      isInlineLiveChatV2Item(item) || isChatV2DelegationActive(item)
+    ));
   }
 
   function timelinePatchHasActiveWork(event: CognisWebSocketEvent): boolean {
@@ -3221,59 +4063,70 @@ import X from 'lucide-svelte/icons/x';
     );
   }
 
-  function isInlineLiveTimelineItem(item: TimelineItem): boolean {
-    if (item.kind === 'message') {
-      return item.role === 'assistant' && item.streaming === true;
-    }
-    if (item.kind === 'thinking') {
-      return item.streaming === true;
-    }
-    if (item.kind === 'tool_call') {
-      return isActiveToolStatus(item.status);
-    }
-    return false;
-  }
-
-  function timelinePatchItemBelongsToActiveSession(item: TimelineItem): boolean {
-    if (item.kind !== 'message' && item.kind !== 'tool_call' && item.kind !== 'thinking') return true;
-    const sessionId = item.sessionId ?? null;
-    const activeSessionId = currentConversation?.active_session_id ?? null;
-    return !sessionId || !activeSessionId || sessionId === activeSessionId;
-  }
-
   function timelinePatchItemBelongsToActiveSessionFromProjection(item: import('$lib/types/api').TimelineProjectionItem): boolean {
     const kind = typeof item.kind === 'string' ? item.kind : '';
     if (kind !== 'message' && kind !== 'tool_call' && kind !== 'thinking') return true;
     const sessionId = typeof item.sessionId === 'string' ? item.sessionId : null;
     const activeSessionId = currentConversation?.active_session_id ?? null;
-    return !sessionId || !activeSessionId || sessionId === activeSessionId;
+    if (!sessionId || !activeSessionId) return true;
+    if (sessionId === activeSessionId) return true;
+    // During an active turn, allow items from the compaction lineage but reject
+    // sub-session items (same logic as _itemBelongsToSession in the store).
+    if (turnInProgress) {
+      return activeSessionLineage.has(sessionId);
+    }
+    return false;
   }
 
-  async function reconcileActiveConversation(): Promise<void> {
+  async function refreshConversationView(reason: string): Promise<void> {
     if (!currentConversation || document.hidden || initializing || switchingConversation) {
+      return;
+    }
+    // Debounce opportunistic refreshes (focus/visibility/online/stale-*): each
+    // one replaces the timeline from a fresh snapshot and restores scroll,
+    // which is disruptive while the user is reading or scrolling. Gap-driven
+    // refreshes (websocket-reconnect-gap) are never debounced.
+    if (
+      shouldDebounceConversationViewRefresh({
+        reason,
+        lastRefreshAt: lastConversationViewRefreshAt,
+        now: Date.now(),
+      })
+    ) {
+      return;
+    }
+    if (viewRefreshInFlight) {
+      await viewRefreshInFlight;
       return;
     }
 
     const requestId = beginConversationLoad();
     conversationSubloadsLoading = true;
-    try {
+    viewRefreshInFlight = (async () => {
       wsClient.connect();
       await reloadConversationSubloads(currentConversation.conversation_id, requestId, {
         reloadSessions: true,
         reloadHistory: true,
         resubscribe: true,
-        preserveTimelineOnHistoryFailure: true,
         preserveScroll: true,
       });
 
       if (!isStaleConversationLoad(requestId) && (historyError || sessionsError)) {
-        appendLocalSystemMessage('Chat refresh failed. History may be stale.');
+        appendLocalSystemMessage(`Chat refresh failed (${reason}). History may be stale.`);
       }
+    })();
+    try {
+      await viewRefreshInFlight;
     } finally {
+      viewRefreshInFlight = null;
       if (!isStaleConversationLoad(requestId)) {
         conversationSubloadsLoading = false;
       }
     }
+  }
+
+  async function reconcileActiveConversation(): Promise<void> {
+    await refreshConversationView('foreground');
   }
 
   function scheduleForegroundReconcile(delayMs = 150): void {
@@ -3283,7 +4136,7 @@ import X from 'lucide-svelte/icons/x';
     }
     foregroundSyncTimer = window.setTimeout(() => {
       foregroundSyncTimer = null;
-      void reconcileActiveConversation();
+      void refreshConversationView('foreground');
     }, delayMs);
   }
 
@@ -3367,9 +4220,7 @@ import X from 'lucide-svelte/icons/x';
           reloadSessions: true,
           reloadHistory: true,
           resubscribe: true,
-          preserveTimelineOnHistoryFailure: true,
           preserveScroll: true,
-          mergeTimeline: true,
         });
         if (isStaleConversationLoad(requestId)) {
           return;
@@ -3463,7 +4314,7 @@ import X from 'lucide-svelte/icons/x';
       clearLastOpenedConversation(conversationId);
       currentConversation = null;
       sessions = [];
-      timeline = [];
+      chatV2Store.reset();
       olderMessagesCursor = null;
       hasOlderMessages = false;
       escalations = [];
@@ -3517,8 +4368,8 @@ import X from 'lucide-svelte/icons/x';
 
   function preferredNewConversationAgentId(): string {
     const primaryAgents = agents.filter((agent) => agent.status === 'active' && agent.agent_type === 'primary');
-    if (selectedAgentId !== 'all' && primaryAgents.some((agent) => agent.agent_id === selectedAgentId)) {
-      return selectedAgentId;
+    if (selectedAgentIds.length === 1 && primaryAgents.some((agent) => agent.agent_id === selectedAgentIds[0])) {
+      return selectedAgentIds[0];
     }
     const currentAgentId = currentConversation?.agent_id ?? '';
     if (currentAgentId && primaryAgents.some((agent) => agent.agent_id === currentAgentId)) {
@@ -3526,8 +4377,9 @@ import X from 'lucide-svelte/icons/x';
     }
     if (typeof window !== 'undefined') {
       const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
-      if (stored && primaryAgents.some((agent) => agent.agent_id === stored)) {
-        return stored;
+      const storedAgents = parseStoredMultiFilter(stored);
+      if (storedAgents.length === 1 && primaryAgents.some((agent) => agent.agent_id === storedAgents[0])) {
+        return storedAgents[0];
       }
     }
     return primaryAgents[0]?.agent_id ?? '';
@@ -3769,77 +4621,64 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  /** Slash commands that are handled as system actions, not chat messages. */
-  const SYSTEM_SLASH_COMMANDS = ['/approve', '/deny', '/compact', '/summarize', '/fork', '/undo', '/redo', '/new', '/reset', '/clear', '/stop', '/cancel', '/context', '/info', '/lsp', '/executor', '/model', '/thinking', '/profile', '/help', '/retry', '/continue', '/plan', '/build', '/default'];
-
-  function normalizeSlashCommandInput(value: string): string {
-    const trimmed = value.trim();
-    if (!trimmed.startsWith('/')) return trimmed;
-    return `/${trimmed.slice(1).trimStart()}`;
-  }
-
-  function isSystemSlashCommand(value: string): boolean {
-    const normalized = normalizeSlashCommandInput(value);
-    return SYSTEM_SLASH_COMMANDS.some((command) => {
-      if (['/plan', '/build', '/default'].includes(command)) {
-        return normalized === command;
-      }
-      return normalized === command || normalized.startsWith(`${command} `);
-    });
-  }
-
-  /** Slash command suggestions shown when user types /. */
-  const SLASH_SUGGESTIONS = [
-    { command: '/help', description: 'Show available commands' },
-    { command: '/model', description: 'List or switch LLM model' },
-    { command: '/thinking', description: 'Set reasoning effort' },
-    { command: '/profile', description: 'List or switch agent runtime profile' },
-    { command: '/context', description: 'Show context usage' },
-    { command: '/info', description: 'Show session details' },
-    { command: '/lsp', description: 'Show LSP diagnostics status' },
-    { command: '/executor', description: 'Show or switch active executor' },
-    { command: '/plan', description: 'Plan/read-only mode; add text for one-shot planning' },
-    { command: '/build', description: 'Build/implementation mode; add text for one-shot build' },
-    { command: '/default', description: 'Return to agent default mode; add text for one-shot default' },
-    { command: '/compact', description: 'Compact conversation' },
-    { command: '/summarize', description: 'Alias for /compact' },
-    { command: '/fork', description: 'Fork conversation; add text to start the fork' },
-    { command: '/undo', description: 'Undo the last user turn in this chat' },
-    { command: '/redo', description: 'Redo the last undone turn in this chat' },
-    { command: '/new', description: 'Start new conversation' },
-    { command: '/reset', description: 'Alias for /new' },
-    { command: '/clear', description: 'Alias for /new' },
-    { command: '/stop', description: 'Stop current work' },
-    { command: '/cancel', description: 'Alias for /stop' },
-    { command: '/approve', description: 'Approve tool escalation' },
-    { command: '/deny', description: 'Deny tool escalation' },
-    { command: '/retry', description: 'Retry paused workflow gate' },
-    { command: '/continue', description: 'Continue paused workflow gate' },
-  ];
-
   let slashSuggestionsVisible = $state(false);
-  let slashFilteredSuggestions = $state<typeof SLASH_SUGGESTIONS>([]);
+  let slashFilteredSuggestions = $state<SlashCommandSuggestion[]>([]);
   let slashSelectedIndex = $state(0);
+  let slashSuggestionRequestSeq = 0;
+  let slashSuggestionTimer: ReturnType<typeof setTimeout> | null = null;
 
   function updateSlashSuggestions(): void {
-    const val = normalizeSlashCommandInput(composer);
-    if (val.startsWith('/') && !val.includes(' ') && val.length < 20) {
-      const filter = val.toLowerCase();
-      slashFilteredSuggestions = SLASH_SUGGESTIONS.filter((s) => s.command.startsWith(filter));
-      slashSuggestionsVisible = slashFilteredSuggestions.length > 0;
-      slashSelectedIndex = 0;
-    } else {
-      slashSuggestionsVisible = false;
+    if (slashSuggestionTimer) {
+      clearTimeout(slashSuggestionTimer);
+      slashSuggestionTimer = null;
     }
+    const currentInput = composer;
+    const parameterCommand = slashParameterSuggestionCommand(currentInput);
+    if (parameterCommand && currentConversation) {
+      const conversationId = currentConversation.conversation_id;
+      const requestSeq = slashSuggestionRequestSeq + 1;
+      slashSuggestionRequestSeq = requestSeq;
+      slashFilteredSuggestions = [];
+      slashSuggestionsVisible = false;
+      const delayMs = /\s$/.test(currentInput) ? 0 : 100;
+      slashSuggestionTimer = setTimeout(() => {
+        void (async () => {
+          try {
+            const response = await api.conversations.slashCommandSuggestions(
+              conversationId,
+              currentInput,
+              12
+            );
+            if (requestSeq !== slashSuggestionRequestSeq || composer !== currentInput) return;
+            slashFilteredSuggestions = response.items;
+            slashSuggestionsVisible = response.items.length > 0;
+            slashSelectedIndex = 0;
+          } catch {
+            if (requestSeq !== slashSuggestionRequestSeq) return;
+            slashSuggestionsVisible = false;
+            slashFilteredSuggestions = [];
+          }
+        })();
+      }, delayMs);
+      return;
+    }
+
+    const localSuggestions = localSlashCommandSuggestions(currentInput);
+    slashSuggestionRequestSeq += 1;
+    slashFilteredSuggestions = localSuggestions;
+    slashSuggestionsVisible = slashFilteredSuggestions.length > 0;
+    slashSelectedIndex = 0;
   }
 
   function acceptSlashSuggestion(index: number): void {
     const suggestion = slashFilteredSuggestions[index];
     if (!suggestion) return;
-    // Commands that take arguments get a trailing space
-    const needsArg = ['/model', '/thinking', '/executor', '/approve', '/deny', '/retry', '/continue'].includes(suggestion.command);
-    composer = needsArg ? suggestion.command + ' ' : suggestion.command;
-    slashSuggestionsVisible = false;
+    composer = applySlashSuggestion(suggestion);
+    if (suggestion.kind === 'command' && slashParameterSuggestionCommand(composer)) {
+      updateSlashSuggestions();
+    } else {
+      slashSuggestionsVisible = false;
+    }
     focusActiveComposer();
   }
 
@@ -3874,24 +4713,62 @@ import X from 'lucide-svelte/icons/x';
 
   async function submitDirectQuestionReply(reply: QuestionSetReply): Promise<boolean> {
     if (!pendingDirectQuestion) return false;
-    const pendingStepTool = findPendingStepRequestInputCall(timeline);
+    const pendingStepTool = findPendingStepRequestInputCallFromChatV2();
     const notificationId = await resolveDirectQuestionNotificationId(pendingStepTool);
     if (!notificationId) return false;
+    const inputKind = pendingInputToolKind(pendingStepTool);
+    const responseText = inputKind === 'auth_challenge' ? questionSetReplyText(reply) : '';
+    if (inputKind === 'auth_challenge' && !responseText) {
+      addToast('Enter a response before sending.', 'error');
+      return false;
+    }
 
     directQuestionSubmitting = true;
-    if (pendingStepTool) {
-      timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, reply);
-    }
+    // The tool card's resolved state is driven by the canonical Chat v2 frame
+    // that follows the respond call; no optimistic timeline mutation here.
     syncVisibleWindow();
     userScrolledUp = false;
-    scrollToBottom();
+    tailPinned = true;
+    scrollToBottom(true);
     const stepName =
       typeof pendingStepTool?.arguments?.step_name === 'string'
         ? (pendingStepTool.arguments.step_name as string)
         : pendingDirectQuestion.stepName;
     haptic.success();
-    wsClient.respondStepQuestion(notificationId, reply, stepName);
+    if (inputKind === 'auth_challenge') {
+      wsClient.respondAuthChallenge(notificationId, responseText, stepName);
+    } else {
+      wsClient.respondStepQuestion(notificationId, reply, stepName);
+    }
+    clearActiveDirectQuestionDraft();
     return true;
+  }
+
+  async function cancelDirectQuestionRequest(): Promise<void> {
+    if (!pendingDirectQuestion || directQuestionSubmitting) return;
+    const pendingStepTool = findPendingStepRequestInputCallFromChatV2();
+    const notificationId = await resolveDirectQuestionNotificationId(pendingStepTool);
+    if (!notificationId) {
+      addToast('Unable to find the pending input request to cancel.', 'error');
+      return;
+    }
+    directQuestionSubmitting = true;
+    try {
+      await api.notifications.resolve(notificationId, { decision: 'cancel' });
+      if (pendingStepTool) {
+        syncVisibleWindow();
+      }
+      pendingDirectQuestion = null;
+      clearActiveDirectQuestionDraft();
+      directQuestionAnswers = {};
+      directQuestionPageIndex = 0;
+      haptic.success();
+      await refreshPendingDirectQuestion();
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to cancel input request');
+    } finally {
+      directQuestionSubmitting = false;
+    }
   }
 
   function submitDirectQuestionOption(question: QuestionSetQuestion, optionId: string): void {
@@ -3916,6 +4793,7 @@ import X from 'lucide-svelte/icons/x';
       ...directQuestionAnswers,
       [question.id]: { ...current, selected: Array.from(selected) }
     };
+    persistDirectQuestionDraft();
   }
 
   function focusActiveComposer(): void {
@@ -3930,6 +4808,7 @@ import X from 'lucide-svelte/icons/x';
   async function handleSend(): Promise<void> {
     let content = composer.trim();
     if ((!content && composerAttachments.length === 0) || !currentConversation || isReadOnly(currentConversation)) return;
+    const sendConversationId = currentConversation.conversation_id;
     if (voiceTranscribing) return;
     if (pendingDirectQuestion && directQuestionSubmitting) return;
 
@@ -3972,13 +4851,19 @@ import X from 'lucide-svelte/icons/x';
     const normalizedSlashCommand = normalizeSlashCommandInput(content);
     const isSlashCommand = isSystemSlashCommand(content);
     const outboundContent = isSlashCommand ? normalizedSlashCommand : content;
+    const chatModeDirective = parseChatModeDirectiveInput(content);
+    const optimisticContent = chatModeDirective?.oneShot && chatModeDirective.content
+      ? chatModeDirective.content
+      : content;
+    const optimisticTurnMode = chatModeDirective?.oneShot ? chatModeDirective.mode : persistentChatMode;
 
-    // Detect a `step_request_questions` tool call sitting in the timeline
+    // Detect a pending input tool call sitting in the timeline
     // waiting for a reply. This is the source-of-truth signal that the
     // agent loop is paused for user input. `pendingDirectQuestion` is a
     // mirror of the same state but can drift (stale fetch, missed WS
     // event, reload race) — the tool-call entry does not.
-    const pendingStepTool = findPendingStepRequestInputCall(timeline);
+    const pendingStepTool = findPendingStepRequestInputCallFromChatV2();
+    const inputKind = pendingInputToolKind(pendingStepTool);
     const isStepInputReply =
       !isSlashCommand && (pendingDirectQuestion !== null || pendingStepTool !== null);
 
@@ -3986,7 +4871,7 @@ import X from 'lucide-svelte/icons/x';
       addToast('Attachments are not supported for clarification responses.', 'error');
       return;
     }
-    if (isStepInputReply && pendingDirectQuestion?.kind !== 'auth_challenge') {
+    if (isStepInputReply && inputKind !== 'auth_challenge') {
       const questions = directQuestionItems();
       const reply = buildDirectQuestionReply(questions, content);
       if (!directQuestionReplySatisfiesRequired(questions, reply)) {
@@ -4001,23 +4886,39 @@ import X from 'lucide-svelte/icons/x';
     const clientMessageId = (!isSlashCommand && !isStepInputReply)
       ? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
       : null;
-
     const willQueueBehindActiveTurn = !isSlashCommand && !isStepInputReply && turnInProgress;
 
-    if (!isSlashCommand && !isStepInputReply && !willQueueBehindActiveTurn) {
-      timeline = appendOptimisticUserMessage(timeline, content, composerAttachments, clientMessageId);
+    if (!isSlashCommand && !isStepInputReply && clientMessageId && !willQueueBehindActiveTurn) {
+      saveOptimisticUserMessageDraft({
+        conversationId: directQuestionDraftConversationId() ?? routeConversationId,
+        clientMessageId,
+        content: optimisticContent,
+        attachments: composerAttachments,
+        createdAt: Date.now(),
+      });
+      // Pass the current chat mode so the plan-mode marker is visible
+      // immediately on the optimistic bubble (Issue D — no blink).
+      chatV2Store.addOptimisticUser({
+        content: optimisticContent,
+        attachments: composerAttachments,
+        clientMessageId,
+      });
+      applyChatV2StateToTimeline();
     }
+
     if (!isSlashCommand) {
       lastSubmittedMessage = content;
       lastRecoverableMessage = '';
-      awaitingAssistantStart = true;
-      turnInProgress = true;
-      activeTurnChatMode = persistentChatMode;
-      patchConversationInList(
-        currentConversation.conversation_id,
-        optimisticConversationTurnPatch(persistentChatMode),
-        { touchLastMessageAt: true }
-      );
+      if (!willQueueBehindActiveTurn) {
+        awaitingAssistantStart = true;
+        turnInProgress = true;
+        activeTurnChatMode = optimisticTurnMode;
+        patchConversationInList(
+          sendConversationId,
+          optimisticConversationTurnPatch(optimisticTurnMode),
+          { touchLastMessageAt: true }
+        );
+      }
     }
     error = '';
     composer = '';
@@ -4044,25 +4945,18 @@ import X from 'lucide-svelte/icons/x';
 
       if (notificationId) {
         directQuestionSubmitting = true;
-        if (pendingStepTool) {
-          // Show the user's answer inside the tool call block immediately
-          // so the Resolution section stops saying "Waiting for user input"
-          // even before the backend tool_result arrives.
-          if (pendingDirectQuestion?.kind === 'auth_challenge') {
-            timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, content);
-          } else {
-            timeline = optimisticallyResolveStepRequestInput(timeline, pendingStepTool.id, buildDirectQuestionReply(directQuestionItems(), content));
-          }
-        }
+        // The tool call block's resolved state is driven by the canonical
+        // Chat v2 frame that follows the respond call.
         syncVisibleWindow();
         userScrolledUp = false;
-        scrollToBottom();
+        tailPinned = true;
+        scrollToBottom(true);
         const stepName =
           typeof pendingStepTool?.arguments?.step_name === 'string'
             ? (pendingStepTool.arguments.step_name as string)
             : pendingDirectQuestion?.stepName;
         haptic.success();
-        if (pendingDirectQuestion?.kind === 'auth_challenge') {
+        if (inputKind === 'auth_challenge') {
           wsClient.respondAuthChallenge(notificationId, content, stepName);
         } else {
           const questions = directQuestionItems();
@@ -4074,20 +4968,86 @@ import X from 'lucide-svelte/icons/x';
           }
           wsClient.respondStepQuestion(notificationId, reply, stepName);
         }
+        clearActiveDirectQuestionDraft();
         return;
       }
 
       // Fall back to a regular message: we saw a pending step_request_questions
       // but could not resolve a notification_id. Replace the missing
       // optimistic bubble so the user still sees their message.
-      timeline = appendOptimisticUserMessage(timeline, content, attachments);
+      chatV2Store.addOptimisticUser({
+        content,
+        attachments,
+        clientMessageId: `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`,
+      });
     }
 
     syncVisibleWindow();
     userScrolledUp = false;
-    scrollToBottom();
+    tailPinned = true;
+    scrollToBottom(true);
     haptic.success();
-    wsClient.sendMessage(currentConversation.conversation_id, outboundContent, attachments, clientMessageId);
+    if (isSlashCommand || chatModeDirective?.oneShot) {
+      // Chat v2 send intentionally rejects slash commands until the command
+      // dispatcher is modeled as a first-class v2 write operation. Keep the
+      // existing command transport for now instead of silently breaking
+      // /new, /plan, /build, and one-shot `/plan ...`/`/build ...`
+      // directives. Normal user messages use v2 below.
+      wsClient.sendMessage(sendConversationId, outboundContent, attachments, clientMessageId);
+      return;
+    }
+    const clientTxnId = clientMessageId ?? crypto.randomUUID();
+    const effectiveClientMessageId = clientMessageId ?? clientTxnId;
+    const createdAt = new Date().toISOString();
+    let outboxStored = false;
+    const outboxEntry: OutboxEntry = {
+      client_txn_id: clientTxnId,
+      client_message_id: effectiveClientMessageId,
+      conversation_id: sendConversationId,
+      content: outboundContent,
+      attachments,
+      status: 'pending',
+      created_at: createdAt,
+      updated_at: createdAt
+    };
+    try {
+      await chatV2Outbox.put(outboxEntry);
+      outboxStored = true;
+      await chatV2Outbox.update(clientTxnId, { status: 'sending', updated_at: new Date().toISOString() });
+    } catch (outboxError) {
+      console.warn('Chat v2 outbox persistence failed; sending online without durable retry', outboxError);
+    }
+    try {
+      await chatV2Api.sendMessage(sendConversationId, clientTxnId, {
+        content: outboundContent,
+        attachments,
+        client_message_id: effectiveClientMessageId
+      });
+      if (outboxStored) {
+        await chatV2Outbox.update(clientTxnId, { status: 'acked', updated_at: new Date().toISOString() }).catch(() => undefined);
+      }
+      // Cursor-correct incremental sync instead of a full snapshot fetch: a
+      // snapshot resolved while live WS frames are streaming replaces the
+      // cursor with a value BEHIND the frames already applied, making every
+      // subsequent frame mismatch -> gapped -> another recovery (visible
+      // re-sort/flicker at the start of each turn). /sync advances from the
+      // current cursor and falls back to a snapshot only when actually needed.
+      await recoverChatV2Canonical(sendConversationId);
+    } catch (caughtError) {
+      if (outboxStored) {
+        await chatV2Outbox.update(clientTxnId, {
+          status: 'failed',
+          updated_at: new Date().toISOString(),
+          last_error: asApiError(caughtError).message
+        }).catch(() => undefined);
+      }
+      awaitingAssistantStart = false;
+      turnInProgress = chatV2Store.snapshot.runtime?.has_active_turn === true;
+      currentActiveTurnId = chatV2Store.snapshot.runtime?.active_turn?.turn_id ?? null;
+      applyChatV2StateToTimeline();
+      await recoverChatV2Snapshot(sendConversationId).catch(() => undefined);
+      addToast(asApiError(caughtError).message, 'error');
+    }
   }
 
   async function uploadFiles(files: File[]): Promise<void> {
@@ -4254,59 +5214,66 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    const previousScrollHeight = timelineEl.scrollHeight;
-    const previousScrollTop = timelineEl.scrollTop;
     loadingOlderMessages = true;
 
     try {
+      // The scroll anchor MUST be captured immediately before the DOM-mutating
+      // apply — never before async work. Capturing before a network fetch and
+      // restoring after it snapped actively-scrolling users back to the
+      // pre-fetch position (the "jumps back while scrolling up" bug).
+      let anchor: { scrollHeight: number; scrollTop: number } | null = null;
       if (visibleStartIndex > 0) {
+        anchor = { scrollHeight: timelineEl.scrollHeight, scrollTop: timelineEl.scrollTop };
         visibleStartIndex = Math.max(0, visibleStartIndex - 50);
         await tick();
       } else if (olderMessagesCursor && currentConversation) {
-        const response = await loadConversationHistoryPage(
-          currentConversation.conversation_id,
-          olderMessagesCursor,
-        );
-        timeline = prependOlderTimelinePage(timeline, projectedTimelineItems(response));
-        olderMessagesCursor = messageHistoryOlderCursor(response);
-        hasOlderMessages = Boolean(response.has_more && olderMessagesCursor);
+        const response = await chatV2Api.timeline(currentConversation.conversation_id, {
+          before: olderMessagesCursor
+        });
+        if (timelineEl) {
+          anchor = { scrollHeight: timelineEl.scrollHeight, scrollTop: timelineEl.scrollTop };
+        }
+        chatV2Store.applyBackfill(response);
+        applyChatV2StateToTimeline();
+        olderMessagesCursor = response.before_cursor ?? null;
+        hasOlderMessages = Boolean(response.has_more_before && olderMessagesCursor);
         visibleStartIndex = 0;
         saveCurrentConversationView();
         await tick();
       }
+      const capturedAnchor = anchor;
       requestAnimationFrame(() => {
-        if (timelineEl) {
-          timelineEl.scrollTop = previousScrollTop + (timelineEl.scrollHeight - previousScrollHeight);
-          lastTimelineScrollTop = timelineEl.scrollTop;
+        if (timelineEl && capturedAnchor) {
+          const growth = timelineEl.scrollHeight - capturedAnchor.scrollHeight;
+          const target = capturedAnchor.scrollTop + growth;
+          const current = timelineEl.scrollTop;
+          // The browser's native scroll anchoring may have already applied the
+          // prepend compensation (target) or left the position untouched
+          // (captured value). Either way the adjustment write is safe. If the
+          // position matches neither, the user kept scrolling between capture
+          // and this frame — leave them alone instead of snapping them back.
+          const matchesUncompensated = shouldApplyScrollRestore({
+            capturedScrollTop: capturedAnchor.scrollTop,
+            currentScrollTop: current,
+          });
+          const matchesCompensated = shouldApplyScrollRestore({
+            capturedScrollTop: target,
+            currentScrollTop: current,
+          });
+          if (matchesUncompensated || matchesCompensated) {
+            writeProgrammaticScrollTop(target);
+          }
         }
         loadingOlderMessages = false;
-        programmaticScroll = false;
       });
     } catch (caughtError) {
       const message = asApiError(caughtError).message;
       addToast(`Unable to load older messages: ${message}`, 'error');
       loadingOlderMessages = false;
-      programmaticScroll = false;
-      if (timelineEl) {
-        timelineEl.scrollTop = previousScrollTop;
-        lastTimelineScrollTop = timelineEl.scrollTop;
-      }
+      // No scroll restore on failure: nothing mutated the timeline DOM, so the
+      // user's current position is already correct. The previous unguarded
+      // scrollTop restore here fought actively-scrolling users.
     }
-  }
-
-  async function loadConversationHistoryPage(
-    conversationId: string,
-    before: string | null = null,
-    limit = 200,
-  ): Promise<import('$lib/types/api').TimelineProjectionResponse> {
-    const conversationsApi = api.conversations as typeof api.conversations & {
-      timelinePage(
-        conversationId: string,
-        limit?: number,
-        before?: string | null,
-      ): Promise<import('$lib/types/api').TimelineProjectionResponse>;
-    };
-    return conversationsApi.timelinePage(conversationId, limit, before);
   }
 
   async function openCreatedConversation(conversationId: string): Promise<void> {
@@ -4356,9 +5323,23 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
+  function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent | ChatRealtimeFrame): void {
     const currentId = conversationIdFromRoute();
+    const chatV2OwnsCurrent = chatV2OwnsActiveConversation(currentId);
+    if (event.type === 'chat_v2_frame') {
+      if (event.conversation_id === currentId) {
+        void applyChatV2Frame(event);
+      }
+      return;
+    }
     const eventSessionId = 'session_id' in event && typeof event.session_id === 'string' ? event.session_id : null;
+    const eventPreviousSessionId = event.type === 'session_compacted' ? event.previous_session_id : null;
+    // A new conversation was created on another device/tab. Reload the sidebar
+    // so the new row appears without requiring a manual refresh.
+    if (event.type === 'sidebar_conversation_upsert') {
+      void refreshSidebarData();
+      return;
+    }
     if (event.type === 'conversation_created') {
       void openCreatedConversation(event.conversation_id);
       return;
@@ -4403,7 +5384,12 @@ import X from 'lucide-svelte/icons/x';
             touchLastMessageAt: typeof event.last_message_at === 'string',
           });
         }
-      } else if (event.type === 'turn_started' || event.type === 'queued' || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'delegation_started') {
+      } else if (
+        event.type === 'turn_started'
+        || (event.type === 'queued' && event.command_result !== true)
+        || event.type === 'timeline_patch'
+        || event.type === 'delegation_started'
+      ) {
         setConversationTurnIndicator(
           otherConvId,
           true,
@@ -4483,6 +5469,7 @@ import X from 'lucide-svelte/icons/x';
       isForeignSessionTimelineEvent({
         eventType: event.type,
         eventSessionId,
+        eventPreviousSessionId,
         rootSessionId: currentConversation?.active_session_id,
       })
     ) {
@@ -4490,15 +5477,12 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (event.type === 'session_compaction_started') {
-      timeline = applyWebSocketEvent(timeline, event);
-      syncVisibleWindow();
-      scrollToBottom();
+      // Chat v2 surfaces compaction lifecycle via canonical frames.
       return;
     }
 
     if (event.type === 'session_compaction_finished') {
-      timeline = applyWebSocketEvent(timeline, event);
-      syncVisibleWindow();
+      // Chat v2 surfaces compaction lifecycle via canonical frames.
       return;
     }
 
@@ -4510,9 +5494,7 @@ import X from 'lucide-svelte/icons/x';
           { touchLastMessageAt: true }
         );
       } else if (
-        event.type === 'chunk'
-        || event.type === 'tool_call'
-        || event.type === 'tool_result'
+        event.type === 'timeline_patch'
         || event.type === 'delegation_started'
         || event.type === 'delegation_completed'
         || event.type === 'delegation_failed'
@@ -4528,6 +5510,69 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
+    if (
+      chatV2OwnsCurrent
+      && (
+        event.type === 'delegation_completed'
+        || event.type === 'delegation_failed'
+        || event.type === 'workflow_step_completed'
+        || event.type === 'workflow_completed'
+        || event.type === 'workflow_failed'
+        || event.type === 'workflow_cancelled'
+        || event.type === 'message_complete'
+        || event.type === 'turn_settled'
+        || event.type === 'queued_messages_updated'
+      )
+    ) {
+      // Terminal turn boundaries pull canonical state immediately so streamed
+      // content does not blink out when the runtime overlay is cleared at
+      // settle. Progress-only events stay debounced to avoid refetch storms.
+      const immediate =
+        event.type === 'message_complete'
+        || event.type === 'turn_settled'
+        || event.type === 'workflow_completed'
+        || event.type === 'workflow_failed'
+        || event.type === 'workflow_cancelled';
+      scheduleChatV2CanonicalRecovery(currentId, { immediate });
+      return;
+    }
+
+    if (event.type === 'system_message' && event.command_result === true) {
+      if (
+        currentConversation &&
+        currentConversation.conversation_id === event.conversation_id &&
+        (event.chat_mode === 'plan' || event.chat_mode === 'build' || event.chat_mode === 'default')
+      ) {
+        const platformData = { ...(currentConversation.context?.platform_data ?? {}) };
+        if (event.chat_mode === 'default') {
+          delete platformData.chat_mode;
+        } else {
+          platformData.chat_mode = event.chat_mode;
+        }
+        const context = { ...currentConversation.context, platform_data: platformData };
+        currentConversation = { ...currentConversation, context };
+        patchConversationInList(currentConversation.conversation_id, { context });
+      }
+      if (currentConversation && event.resolved_agent_profile_id) {
+        patchConversationInList(currentConversation.conversation_id, {
+          agent_profile_id: event.resolved_agent_profile_id
+        });
+      }
+      if (currentConversation && event.executor_id) {
+        patchConversationInList(currentConversation.conversation_id, {
+          active_executor_id: event.executor_id,
+          active_executor_source: 'user'
+        });
+      }
+      appendChatV2LocalSystemMessage(event.text, `system:${event.command ?? event.code ?? 'message'}`);
+      return;
+    }
+
+    if (event.type === 'queued' && event.command_result === true) {
+      appendChatV2LocalSystemMessage(commandQueuedMessage(event), `queued:${event.command ?? event.task_id ?? 'task'}`);
+      return;
+    }
+
     if (event.type === 'queued_messages_updated' || event.type === 'queued' || event.type === 'message_complete' || event.type === 'turn_settled') {
       queuedCount = event.queued_count ?? 0;
       if ('messages' in event && Array.isArray(event.messages)) {
@@ -4540,6 +5585,12 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'turn_started' || event.type === 'queued') {
       turnInProgress = true;
       if (event.type === 'turn_started') {
+        // Track the current turn_id so we can guard against late patches
+        // re-arming turnInProgress after cancel (Issue B client guard).
+        if (event.turn_id) {
+          currentActiveTurnId = event.turn_id;
+          lastSettledTurnId = null;
+        }
         activeTurnChatMode = normalizeChatModeTone(event.chat_mode);
         if (currentConversation) {
           patchConversationInList(currentConversation.conversation_id, {
@@ -4553,6 +5604,9 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'error') {
       const nextError = socketErrorMessage(event);
+      if (isNonFatalWebSocketBackpressureError({ code: event.code, message: nextError })) {
+        return;
+      }
       if (shouldSuppressPreSessionSocketError({
         code: event.code,
         message: nextError,
@@ -4574,6 +5628,10 @@ import X from 'lucide-svelte/icons/x';
         error = '';
         awaitingAssistantStart = false;
         turnInProgress = false;
+        // Record the settled turn_id so late timeline_patches (from the
+        // coalesce buffer race) cannot re-arm turnInProgress (Issue B).
+        if (currentActiveTurnId) lastSettledTurnId = currentActiveTurnId;
+        currentActiveTurnId = null;
         clearConversationTurnState(currentConversation?.conversation_id);
         directQuestionSubmitting = false;
         pendingDirectQuestion = null;
@@ -4627,14 +5685,30 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (event.type === 'conversation_runtime_snapshot') {
-      applyConversationRuntimeSnapshot(event);
+      if (!chatV2OwnsCurrent) {
+        applyConversationRuntimeSnapshot(event);
+      }
       return;
     }
 
-    if (timelinePatchHasActiveWork(event) || event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_call' || event.type === 'tool_progress' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'delegation_started') {
-      awaitingAssistantStart = false;
-      turnInProgress = true;
-      setConversationTurnIndicator(currentConversation?.conversation_id, true);
+    if (!chatV2OwnsCurrent && (timelinePatchHasActiveWork(event) || event.type === 'delegation_started')) {
+      // Guard: don't re-arm turnInProgress for a late patch belonging to an
+      // already-settled/cancelled turn (Issue B). A coalesced live.thinking
+      // patch can arrive after the turn_cancelled error and after
+      // turnInProgress was cleared, re-arming the spinner indefinitely.
+      // Check if the patch's items all belong to the last settled turn_id.
+      const isLateSettledPatch = lastSettledTurnId !== null
+        && event.type === 'timeline_patch'
+        && event.items.length > 0
+        && event.items.every((item) => {
+          const itemTurnId = (item as unknown as { turnId?: string }).turnId;
+          return itemTurnId === lastSettledTurnId;
+        });
+      if (!isLateSettledPatch) {
+        awaitingAssistantStart = false;
+        turnInProgress = true;
+        setConversationTurnIndicator(currentConversation?.conversation_id, true);
+      }
     }
 
     recordTodoSnapshotFromSocketEvent(event);
@@ -4674,6 +5748,10 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
       awaitingAssistantStart = false;
       turnInProgress = false;
+      // Record the settled turn_id (same guard as cancel path — Issue B).
+      if (currentActiveTurnId) lastSettledTurnId = currentActiveTurnId;
+      if (event.type === 'message_complete' && event.turn_id) lastSettledTurnId = event.turn_id;
+      currentActiveTurnId = null;
       clearConversationTurnState(
         currentConversation?.conversation_id,
         event.type === 'message_complete' ? event.completed_at : undefined,
@@ -4686,7 +5764,7 @@ import X from 'lucide-svelte/icons/x';
       directQuestionSubmitting = false;
       // Update context usage from message_complete
       if (event.type === 'message_complete' && event.context_usage) {
-        contextUsage = event.context_usage;
+        applyContextUsageSnapshot(event.context_usage);
       }
       if (currentConversation && event.type === 'message_complete') {
         const agentObj = agents.find((a) => a.agent_id === currentConversation?.agent_id);
@@ -4717,8 +5795,6 @@ import X from 'lucide-svelte/icons/x';
 
     // Escalation push events
     if (event.type === 'escalation') {
-      timeline = applyWebSocketEvent(timeline, event);
-      syncVisibleWindow();
       const existing = escalations.find((e) => e.call_id === event.call_id);
       if (!existing && escalationResolutionPending?.call_id !== event.call_id) {
         escalations = sortEscalations([...escalations, {
@@ -4733,7 +5809,9 @@ import X from 'lucide-svelte/icons/x';
           received_at: Date.now(),
         }]);
         startEscalationCountdown();
-        scrollToBottom();
+        if (!chatV2OwnsCurrent) {
+          scrollToBottom(false);
+        }
       }
       return;
     }
@@ -4763,12 +5841,19 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    // Handle session_compacted: add to timeline and refresh sessions
+    // Handle session_compacted: Chat v2 frames carry the compaction summary;
+    // here we only refresh the session list and active session.
     if (event.type === 'session_compacted') {
       syncConversationActiveSession(event.session_id);
-      timeline = applyWebSocketEvent(timeline, event);
-      syncVisibleWindow();
-      scrollToBottom();
+      awaitingAssistantStart = false;
+      turnInProgress = false;
+      setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      if (event.command_result === true) {
+        appendChatV2LocalSystemMessage(sessionCompactedMessage(event), 'session_compacted');
+      }
+      if (chatV2OwnsCurrent) {
+        scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
+      }
       // Refresh session list to show the new session
       if (currentConversation) {
         api.conversations.sessions(currentConversation.conversation_id)
@@ -4790,13 +5875,11 @@ import X from 'lucide-svelte/icons/x';
       olderMessagesCursor = null;
       hasOlderMessages = false;
       setConversationTurnIndicator(currentConversation?.conversation_id, false);
-      runtimeOverlay = createRuntimeTimelineOverlay();
-      timeline = applyWebSocketEvent([], {
-        type: 'system_message',
-        conversation_id: event.conversation_id,
-        text: 'Started a new session.',
-      });
+      // Chat v2 owns the canonical timeline; reset the store and let the
+      // canonical snapshot/frames repopulate the new session.
+      chatV2Store.reset();
       syncVisibleWindow();
+      void recoverChatV2Snapshot(event.conversation_id);
       scrollToBottom(true);
       // Refresh session list
       if (currentConversation) {
@@ -4827,7 +5910,6 @@ import X from 'lucide-svelte/icons/x';
       escalationBusyCallId = null;
       escalationResolutionPending = null;
       setConversationTurnIndicator(currentConversation?.conversation_id, false);
-      runtimeOverlay = createRuntimeTimelineOverlay();
       if (event.session_id) {
         syncConversationActiveSession(event.session_id);
       }
@@ -4840,7 +5922,6 @@ import X from 'lucide-svelte/icons/x';
           reloadSessions: true,
           reloadHistory: true,
           resubscribe: true,
-          preserveTimelineOnHistoryFailure: true,
         });
       }
       return;
@@ -4851,34 +5932,19 @@ import X from 'lucide-svelte/icons/x';
       awaitingAssistantStart = false;
       turnInProgress = event.has_active_turn ?? hasAnyActiveTurnTimelineItem();
       setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
-      if (
-        currentConversation &&
-        shouldReconcileAfterReconnect({
+      if (currentConversation) {
+        const shouldRefresh = shouldReconcileAfterReconnect({
           remoteLastSeq: event.last_seq,
           activeSessionLastSeq,
           remoteHasActiveTurn: event.has_active_turn,
           localTurnInProgress: previousTurnInProgress,
-        })
-      ) {
-        const requestId = beginConversationLoad();
-        void reloadConversationSubloads(currentConversation.conversation_id, requestId, {
-          reloadSessions: true,
-          reloadHistory: true,
-          resubscribe: true,
-          preserveTimelineOnHistoryFailure: true,
-          preserveScroll: true,
-          mergeTimeline: true,
         });
+        void refreshConversationView(shouldRefresh ? 'websocket-reconnect-gap' : 'websocket-reconnect');
       }
       return;
     }
 
     if (event.type === 'workflow_step_question' && event.notification_id) {
-      // Annotate the matching step_request_questions tool call so the user's
-      // next reply can be routed to `respondStepQuestion` even if this
-      // banner-level pendingDirectQuestion state gets cleared (reload,
-      // compaction, or a message_complete arriving during submission).
-      timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
       if (!event.task_id) {
         pendingDirectQuestion = pendingDirectQuestionFromQuestionSet(
           event.notification_id,
@@ -4897,7 +5963,6 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (event.type === 'auth_challenge' && event.notification_id) {
-      timeline = annotateStepRequestInputWithNotification(timeline, event.notification_id);
       if (!event.task_id) {
         pendingDirectQuestion = pendingDirectQuestionFromAuthChallengeEvent(event);
         directQuestionPageIndex = 0;
@@ -4947,81 +6012,14 @@ import X from 'lucide-svelte/icons/x';
       void refreshPendingDirectQuestion();
     }
 
-    if (isRuntimeTimelineEvent(event)) {
-      runtimeOverlay = applyRuntimeTimelineEvent(runtimeOverlay, event);
-      const runtimeEventSeq = (event as { seq?: unknown; last_seq?: unknown }).seq
-        ?? (event as { last_seq?: unknown }).last_seq;
-      if (typeof runtimeEventSeq === 'number') {
-        activeSessionLastSeq = Math.max(activeSessionLastSeq, runtimeEventSeq);
-      }
-      if (event.type !== 'tool_progress' && event.type !== 'tool_result_chunk' && event.type !== 'tool_output_chunk') {
-        syncVisibleWindow();
-      }
-      if (
-        event.type === 'chunk'
-        || event.type === 'assistant_stream_snapshot'
-        || event.type === 'assistant_thinking_chunk'
-        || event.type === 'assistant_thinking_block'
-        || event.type === 'tool_progress'
-        || event.type === 'tool_result_chunk'
-        || event.type === 'tool_output_chunk'
-      ) {
-        scrollToBottom();
-      }
-      return;
-    }
-
-    const canonicalEvent = hydrateMessageCompleteFromRuntimeOverlay(event, runtimeOverlay);
-    const beforePromotion = timeline;
-    timeline = promoteRuntimeOverlayForCanonicalEvent(timeline, runtimeOverlay, canonicalEvent);
-    const messageCompletionPromoted = canonicalEvent.type === 'message_complete' && timeline !== beforePromotion;
-    runtimeOverlay = clearRuntimeOverlayForCanonicalEvent(runtimeOverlay, canonicalEvent);
-    if (!messageCompletionPromoted) {
-      timeline = canonicalEvent.type === 'timeline_patch'
-        ? applyTimelinePatch(timeline, canonicalEvent.items, { includeItem: timelinePatchItemBelongsToActiveSession })
-        : applyWebSocketEvent(timeline, canonicalEvent);
-    }
-    const eventSeq = (event as { seq?: unknown; last_seq?: unknown }).seq
-      ?? (event as { last_seq?: unknown }).last_seq;
-    if (typeof eventSeq === 'number') {
-      activeSessionLastSeq = Math.max(activeSessionLastSeq, eventSeq);
-    }
-    if (
-      hasOlderMessages
-      && currentConversation
-      && event.type === 'message_complete'
-      && event.session_id
-      && event.session_id !== currentConversation.active_session_id
-    ) {
-      olderMessagesCursor = null;
-      hasOlderMessages = false;
-    }
-    saveCurrentConversationView();
-    // Skip syncVisibleWindow for high-frequency streaming events to avoid
-    // triggering a full virtual-scroll recalculation on every delta.
-    if (
-      event.type !== 'tool_call' &&
-      event.type !== 'tool_progress' &&
-      event.type !== 'tool_result' &&
-      event.type !== 'tool_result_chunk' &&
-      event.type !== 'tool_output_chunk' &&
-      event.type !== 'assistant_thinking_chunk'
-    ) {
-      syncVisibleWindow();
-    }
-
-    // Auto-scroll on new content
-    if (event.type === 'chunk' || event.type === 'assistant_stream_snapshot' || event.type === 'assistant_thinking_chunk' || event.type === 'assistant_thinking_block' || event.type === 'tool_progress' || event.type === 'tool_result_chunk' || event.type === 'tool_output_chunk' || event.type === 'message_complete' || event.type === 'delegation_started' || event.type === 'delegation_completed' || event.type === 'system_message' || event.type === 'user_message') {
-      scrollToBottom();
-    }
-
+    // Chat v2 owns the canonical timeline for every conversation. The legacy
+    // per-event applyEvent path has been removed; canonical content arrives via
+    // chat_v2_frame (handled by applyChatV2Frame) and snapshots.
+    scheduleCurrentConversationViewSave();
     // No longer polling for escalations — they arrive via push events
   }
 
-  async function handleAgentFilterChange(next?: string): Promise<void> {
-    if (typeof next === 'string') {
-      selectedAgentId = next;
-    }
+  async function handleAgentFilterChange(): Promise<void> {
     persistSelectedAgent();
     resetConversationSearchResults();
     await refreshAvailableChannelTypes();
@@ -5125,24 +6123,42 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
-    if (shouldShowChatTodoDrawer) {
-      chatTodoDrawerOpen = true;
-    }
-  });
-
-  $effect(() => {
     currentConversation?.conversation_id;
     conversationModeOpen;
     syncServiceWorkerActiveConversation();
   });
 
   $effect(() => {
-    if ((!timelineContentEl && !footerChromeEl) || typeof ResizeObserver === 'undefined') {
+    if ((!timelineEl && !timelineContentEl && !footerChromeEl) || typeof ResizeObserver === 'undefined') {
       return;
     }
+    // Track scroll dimensions so no-op refreshes do not produce spurious
+    // bottom re-pins. Include clientHeight: composer/footer growth can shrink
+    // the timeline viewport without changing scrollHeight, and a pinned tail
+    // should stay pinned through that layout change.
+    let lastDimensions = {
+      scrollHeight: timelineEl?.scrollHeight ?? 0,
+      clientHeight: timelineEl?.clientHeight ?? 0,
+    };
     const observer = new ResizeObserver(() => {
-      scheduleScrollToBottom(false);
+      const currentDimensions = {
+        scrollHeight: timelineEl?.scrollHeight ?? 0,
+        clientHeight: timelineEl?.clientHeight ?? 0,
+      };
+      if (!chatScrollDimensionsChanged(lastDimensions, currentDimensions)) {
+        return;
+      }
+      lastDimensions = currentDimensions;
+      // Re-pin iff the user is pinned to the tail. tailPinned is always kept
+      // in sync with !userScrolledUp (single source of truth), so this is
+      // equivalent to: if (!userScrolledUp || bottomScrollPending) re-pin.
+      if (shouldPreserveLiveTailOnResize({ tailPinned, autoScrollPending: bottomScrollPending })) {
+        scheduleScrollToBottom(false, 2);
+      }
     });
+    if (timelineEl) {
+      observer.observe(timelineEl);
+    }
     if (timelineContentEl) {
       observer.observe(timelineContentEl);
     }
@@ -5153,7 +6169,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
-    const latestTodos = latestTodoSnapshot(timeline, currentConversation?.context?.type === 'web');
+    const latestTodos = latestTodoSnapshotFromChatV2(chatV2Store.visibleItems, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       retainedChatTodos = latestTodos;
       return;
@@ -5258,19 +6274,26 @@ import X from 'lucide-svelte/icons/x';
     if (query && (!searchEnabled || !conversationSearchSubmitted)) {
       list = list.filter((c) => conversationTitle(c).toLowerCase().includes(query));
     }
-    return sortConversationsByActivity(list);
+    return list;
   });
   let visibleConversationSections = $derived.by(() => groupConversationsByActivity(visibleConversationList, historySectionNow));
 
   let visibleAgentDirectChats = $derived.by(() => {
     return sortAgentDirectChats(agentDirectChats);
   });
-  let projectedTimeline = $derived.by(() => projectDisplayTimeline(timeline, runtimeOverlay));
-  let displayedTimeline = $derived(projectedTimeline.slice(visibleStartIndex));
-  let liveTailTimelineItemKey = $derived.by(() => {
-    const lastItem = projectedTimeline[projectedTimeline.length - 1];
-    return lastItem && isInlineLiveTimelineItem(lastItem) ? timelineItemKey(lastItem) : null;
-  });
+  // Canonical Chat v2 visible items are the single source of truth for the
+  // rendered timeline. The native renderer consumes them directly; read-only
+  // consumers (search, todos, retry-tail) use the per-item legacy-shape
+  // projection. There is no legacy ChatTimeline merge store in this path.
+  //
+  // Window over RENDERABLE items only. Non-row items (todo_state, unknown
+  // kinds) must be excluded before slicing so a tail of such items cannot push
+  // real messages out of the visible window (which would render blank rows).
+  let renderableVisibleItems = $derived.by<ChatV2TimelineItem[]>(() =>
+    chatV2Store.visibleItems.filter(isRenderableChatV2Item)
+  );
+  let displayedTimeline = $derived(renderableVisibleItems.slice(visibleStartIndex));
+  let displayedTimelineHasStreaming = $derived(displayedTimeline.some((item) => isInlineLiveChatV2Item(item)));
   const canRetryFailedTurn = $derived.by(() =>
     Boolean(currentConversation)
       && !turnInProgress
@@ -5278,7 +6301,7 @@ import X from 'lucide-svelte/icons/x';
       && !pendingDirectQuestion
       && !directQuestionSubmitting
       && !isReadOnly(currentConversation)
-      && hasRetryableFailedTurnTail(displayedTimeline)
+      && hasRetryableFailedTurnTailChatV2(displayedTimeline)
   );
   let chatSearchMatchedMessageIds = $derived.by(() => new Set(chatSearchResults.map((result) => result.targetId)));
   let selectedChatSearchTargetId = $derived(chatSearchResults[chatSearchSelectedIndex]?.targetId ?? null);
@@ -5312,6 +6335,7 @@ import X from 'lucide-svelte/icons/x';
   });
 
   onMount(() => {
+    void loadUserPreferences(auth.getSnapshot().user?.email);
     restoreEnterToSendPreference();
     restoreSelectedChannel();
     restoreChatSidebarState();
@@ -5321,33 +6345,71 @@ import X from 'lucide-svelte/icons/x';
       composerElement?.focus();
     });
     unsubscribeCancelTurn = onCancelActiveTurnRequest(() => {
-      if (currentConversation && turnInProgress) {
-        wsClient.cancelTurn(currentConversation.conversation_id);
-      }
+      cancelActiveTurnWithChatV2();
     });
     visibilityHandler = () => {
       syncServiceWorkerActiveConversation();
       if (!document.hidden) {
-        scheduleForegroundReconcile();
-        void refreshEscalations();
-        void refreshPendingDirectQuestion();
+        void refreshConversationView('visibility');
+        if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
+        void refreshPendingNotifications();
       }
     };
     focusHandler = () => {
       syncServiceWorkerActiveConversation();
-      scheduleForegroundReconcile();
+      void refreshConversationView('focus');
+      if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
     };
     pageShowHandler = () => {
-      scheduleForegroundReconcile();
+      void refreshConversationView('pageshow');
+      if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
     };
     onlineHandler = () => {
-      scheduleForegroundReconcile();
+      void refreshConversationView('online');
+      if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
     };
     document.addEventListener('visibilitychange', visibilityHandler);
     window.addEventListener('focus', focusHandler);
     window.addEventListener('pageshow', pageShowHandler);
     window.addEventListener('online', onlineHandler);
     startNotificationRefreshPolling();
+    staleRuntimeGuardTimer = window.setInterval(() => {
+      if (!currentConversation || document.hidden) return;
+      const hasActiveWork = turnInProgress || hasAnyActiveTurnTimelineItem();
+      if (!hasActiveWork) {
+        // The staleness inputs cleared (turn settled, items terminal): the
+        // refresh loop did its job. Re-arm the attempt budget.
+        staleRuntimeRefreshAttempts = 0;
+        return;
+      }
+      const lastRuntimeAt = Math.max(lastRuntimeSnapshotAt, lastConversationViewRefreshAt);
+      if (shouldRefreshForStaleRuntime({
+        turnInProgress,
+        hasActiveTimelineItem: hasActiveWork,
+        lastRuntimeAt,
+        now: Date.now(),
+        staleMs: STALE_RUNTIME_REFRESH_MS,
+      })) {
+        // Normal cadence for the first attempts, then a slow backoff: a
+        // persistently "active" item after several refreshes is usually a
+        // leaked non-terminal timeline item that refreshing cannot fix, and a
+        // tight refresh loop keeps disrupting the user's scroll position. The
+        // backoff never stops entirely — with a silently broken WebSocket the
+        // periodic refresh is the only way a really-completed turn ever
+        // settles in the UI.
+        if (!shouldAttemptStaleRuntimeRefresh({
+          attempts: staleRuntimeRefreshAttempts,
+          lastAttemptAt: lastStaleRuntimeRefreshAttemptAt,
+          now: Date.now(),
+          intervalMs: STALE_RUNTIME_REFRESH_MS,
+        })) {
+          return;
+        }
+        staleRuntimeRefreshAttempts += 1;
+        lastStaleRuntimeRefreshAttemptAt = Date.now();
+        void refreshConversationView('stale-runtime-ttl');
+      }
+    }, 5000);
     scheduleHistorySectionDayRefresh();
     void reconcileChatNotifications();
     void refreshSearchHealth();
@@ -5378,6 +6440,10 @@ import X from 'lucide-svelte/icons/x';
         window.clearTimeout(draftSaveTimer);
         draftSaveTimer = null;
       }
+      if (conversationViewSaveTimer !== null) {
+        window.clearTimeout(conversationViewSaveTimer);
+        conversationViewSaveTimer = null;
+      }
       // Flush a final draft write on unmount so the sessionStorage
       // value reflects the last in-memory state.
       if (currentDraftKey) writeDraft(currentDraftKey, composer);
@@ -5400,6 +6466,14 @@ import X from 'lucide-svelte/icons/x';
         window.clearTimeout(foregroundSyncTimer);
         foregroundSyncTimer = null;
       }
+      if (staleRuntimeGuardTimer !== null) {
+        window.clearInterval(staleRuntimeGuardTimer);
+        staleRuntimeGuardTimer = null;
+      }
+      for (const timer of chatV2CanonicalRecoveryTimers.values()) {
+        window.clearTimeout(timer);
+      }
+      chatV2CanonicalRecoveryTimers.clear();
       if (activeConversationId) {
         wsClient.unsubscribeConversation(activeConversationId);
       }
@@ -5463,7 +6537,8 @@ import X from 'lucide-svelte/icons/x';
         <div class="flex items-center justify-between">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Conversations</p>
           <div class="flex items-center gap-2">
-            <Button aria-expanded={conversationFiltersOpen} aria-label="Toggle filters" size="sm" variant="secondary" onclick={() => (conversationFiltersOpen = !conversationFiltersOpen)}>
+            <Button aria-expanded={conversationFiltersOpen} aria-label="Toggle conversation filters" size="sm" variant="secondary" onclick={() => (conversationFiltersOpen = !conversationFiltersOpen)}>
+              <span class="hidden sm:inline">Filters</span>
               {#if conversationFiltersOpen}
                 <ChevronUp class="h-4 w-4" />
               {:else}
@@ -5474,7 +6549,18 @@ import X from 'lucide-svelte/icons/x';
           </div>
         </div>
 
-        {#if agents.length === 0}
+        {#if !sidebarProjectionLoaded && conversationListLoading}
+          <div class="space-y-3">
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Loading setup</p>
+            <p class="text-sm leading-6 text-slate-400">Loading agents and conversations…</p>
+          </div>
+        {:else if sidebarProjectionFailed && agents.length === 0}
+          <div class="space-y-3">
+            <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup unavailable</p>
+            <p class="text-sm leading-6 text-slate-400">Could not load agents and setup state.</p>
+            <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => void loadSidebarProjection()}>Retry</Button>
+          </div>
+        {:else if sidebarProjectionLoaded && agents.length === 0}
           <div class="space-y-3">
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Setup incomplete</p>
             <p class="text-sm leading-6 text-slate-400">Create an agent to start chatting.</p>
@@ -5487,29 +6573,98 @@ import X from 'lucide-svelte/icons/x';
             <Button class="w-full justify-center" size="sm" onclick={() => goto('/settings?tab=providers')}>Open provider settings</Button>
           </div>
         {:else}
-          <div class={`space-y-3 ${conversationFiltersOpen ? 'block' : 'hidden'}`}>
-          <AgentSelect
-            label="Agent"
-            agents={agents.filter((a) => a.status === 'active' && a.agent_type === 'primary')}
-            value={selectedAgentId}
-            onchange={(next) => void handleAgentFilterChange(next)}
-            allowAll
-            allLabel="All agents"
-          />
+          <div class={`${conversationFiltersOpen ? 'grid' : 'hidden'} grid-cols-1 gap-2 sm:grid-cols-2`}>
+            <div class="relative">
+              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-slate-500" for="conversation-agent-filter">Agent</label>
+              <button
+                id="conversation-agent-filter"
+                type="button"
+                class="flex w-full items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-left text-xs font-medium text-slate-200 transition hover:border-slate-500 hover:text-white"
+                onclick={() => {
+                  agentFilterDropdownOpen = !agentFilterDropdownOpen;
+                  channelFilterDropdownOpen = false;
+                }}
+                aria-haspopup="listbox"
+                aria-expanded={agentFilterDropdownOpen}
+              >
+                <span class="truncate">{selectedAgentFilterLabel()}</span>
+                <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+              </button>
+              {#if agentFilterDropdownOpen}
+                <div class="absolute left-0 right-0 z-40 mt-1 max-h-64 overflow-y-auto rounded-xl border border-slate-700 bg-slate-950 p-1 shadow-xl shadow-black/40" role="listbox" aria-multiselectable="true">
+                  <button
+                    type="button"
+                    class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selectedAgentIds.length === 0 ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                    onclick={() => { selectedAgentIds = []; void handleAgentFilterChange(); }}
+                    aria-selected={selectedAgentIds.length === 0}
+                    role="option"
+                  >
+                    <span class="grid h-4 w-4 shrink-0 place-items-center">{#if selectedAgentIds.length === 0}<Check class="h-3 w-3" />{/if}</span>
+                    <span>All agents</span>
+                  </button>
+                  {#each activePrimaryAgents() as agent}
+                    {@const selected = selectedAgentIds.includes(agent.agent_id)}
+                    <button
+                      type="button"
+                      class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selected ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                      onclick={() => void toggleSelectedAgent(agent.agent_id)}
+                      aria-selected={selected}
+                      role="option"
+                      title={agent.display_name ?? agent.name ?? agent.agent_id}
+                    >
+                      <span class="grid h-4 w-4 shrink-0 place-items-center">{#if selected}<Check class="h-3 w-3" />{/if}</span>
+                      <AgentAvatar name={agent.display_name ?? agent.name ?? agent.agent_id} avatarUrl={agent.avatar_url ?? null} class="h-4 w-4" />
+                      <span class="truncate">{agent.display_name ?? agent.name ?? agent.agent_id}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
 
-          <label class="block space-y-1">
-            <span class="text-xs font-medium uppercase tracking-widest text-slate-500">Channel</span>
-            <select
-              bind:value={selectedChannel}
-              onchange={persistSelectedChannel}
-              class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-            >
-              <option value="all">All channels</option>
-              {#each channelTypes() as ch}
-                <option value={ch}>{channelDisplayLabel(ch)}</option>
-              {/each}
-            </select>
-          </label>
+            <div class="relative">
+              <label class="mb-1 block text-xs font-medium uppercase tracking-widest text-slate-500" for="conversation-channel-filter">Channel</label>
+              <button
+                id="conversation-channel-filter"
+                type="button"
+                class="flex w-full items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-950/80 px-3 py-2 text-left text-xs font-medium text-slate-200 transition hover:border-slate-500 hover:text-white"
+                onclick={() => {
+                  channelFilterDropdownOpen = !channelFilterDropdownOpen;
+                  agentFilterDropdownOpen = false;
+                }}
+                aria-haspopup="listbox"
+                aria-expanded={channelFilterDropdownOpen}
+              >
+                <span class="truncate">{selectedChannelFilterLabel()}</span>
+                <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
+              </button>
+              {#if channelFilterDropdownOpen}
+                <div class="absolute left-0 right-0 z-40 mt-1 max-h-64 overflow-y-auto rounded-xl border border-slate-700 bg-slate-950 p-1 shadow-xl shadow-black/40" role="listbox" aria-multiselectable="true">
+                  <button
+                    type="button"
+                    class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selectedChannels.length === 0 ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                    onclick={() => { selectedChannels = []; void persistSelectedChannels(); }}
+                    aria-selected={selectedChannels.length === 0}
+                    role="option"
+                  >
+                    <span class="grid h-4 w-4 shrink-0 place-items-center">{#if selectedChannels.length === 0}<Check class="h-3 w-3" />{/if}</span>
+                    <span>All channels</span>
+                  </button>
+                  {#each channelTypes() as ch}
+                    {@const selected = selectedChannels.includes(ch)}
+                    <button
+                      type="button"
+                      class={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition ${selected ? 'bg-sky-500/20 text-sky-100' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+                      onclick={() => void toggleSelectedChannel(ch)}
+                      aria-selected={selected}
+                      role="option"
+                    >
+                      <span class="grid h-4 w-4 shrink-0 place-items-center">{#if selected}<Check class="h-3 w-3" />{/if}</span>
+                      <span class="truncate">{channelDisplayLabel(ch)}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
           </div>
         {/if}
 
@@ -5734,7 +6889,7 @@ import X from 'lucide-svelte/icons/x';
               <section class="space-y-1" aria-labelledby={`history-section-${section.key}`}>
                 <p id={`history-section-${section.key}`} class="sticky top-0 z-10 rounded-lg bg-slate-950/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500 backdrop-blur first:mt-0">{section.label}</p>
                 {#each section.conversations as conversation (conversation.conversation_id)}
-                  {@const agent = conversationAgent(conversation)}
+                  {@const agent = conversationAgentForDisplay(conversation)}
                   {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
                   {@const unread = conversation.has_unread && !isActive}
                   {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
@@ -5917,22 +7072,20 @@ import X from 'lucide-svelte/icons/x';
             <div class="mt-1.5 hidden items-center justify-between gap-3 text-sm text-slate-400 sm:flex">
               <div class="flex min-w-0 flex-wrap items-center gap-3">
               {#if currentConversation}
-                {@const agent = conversationAgent(currentConversation)}
-                {#if agent}
-                  <div class="relative">
-                    <button
-                      type="button"
-                      class="flex items-center gap-1.5 rounded-lg px-1 py-0.5 transition hover:bg-slate-800"
-                      onclick={() => { showAgentProfile = !showAgentProfile; }}
-                    >
-                      <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
-                      <span>{agent.display_name ?? agent.name}</span>
-                    </button>
-                    {#if showAgentProfile}
-                      <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
-                    {/if}
-                  </div>
-                {/if}
+                {@const agent = conversationAgentForDisplay(currentConversation)}
+                <div class="relative">
+                  <button
+                    type="button"
+                    class="flex items-center gap-1.5 rounded-lg px-1 py-0.5 transition hover:bg-slate-800"
+                    onclick={() => { showAgentProfile = !showAgentProfile; }}
+                  >
+                    <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
+                    <span>{agent.display_name ?? agent.name}</span>
+                  </button>
+                  {#if showAgentProfile}
+                    <AgentProfilePopover {agent} onClose={() => { showAgentProfile = false; }} />
+                  {/if}
+                </div>
 
                 {#if currentConversation.active_session_id}
                   <button
@@ -5980,10 +7133,9 @@ import X from 'lucide-svelte/icons/x';
                   </span>
                 {/if}
 
-                {@const backingSessions = backingSessionCount()}
-                {#if backingSessions > 1}
+                {#if backingSessionBadge}
                   <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Backing sessions">
-                    {backingSessions} backing sessions
+                    {backingSessionBadge}
                   </span>
                 {/if}
 
@@ -6118,7 +7270,7 @@ import X from 'lucide-svelte/icons/x';
         chips that are hidden in the sub-header row above.
       -->
       {#if headerInfoOpen && currentConversation}
-        {@const panelAgent = conversationAgent(currentConversation)}
+        {@const panelAgent = conversationAgentForDisplay(currentConversation)}
         <div class="max-h-[min(70vh,calc(var(--app-viewport-height,100dvh)-8rem))] overflow-y-auto overscroll-contain border-b border-slate-800/80 bg-slate-900/40 px-3 py-3 sm:max-h-[min(72vh,calc(var(--app-viewport-height,100dvh)-9rem))] sm:px-4 sm:py-4 lg:px-5">
           {#if headerInfoMode === 'context'}
             <button
@@ -6131,12 +7283,10 @@ import X from 'lucide-svelte/icons/x';
             </button>
           {/if}
           <div class={`mb-3 flex-wrap items-center gap-2 text-sm text-slate-300 sm:hidden ${headerInfoMode === 'context' ? 'hidden' : 'flex'}`}>
-            {#if panelAgent}
-              <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
-                <AgentAvatar name={panelAgent.display_name ?? panelAgent.name} avatarUrl={panelAgent.avatar_url ?? null} class="h-5 w-5" />
-                <span>{panelAgent.display_name ?? panelAgent.name}</span>
-              </div>
-            {/if}
+            <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
+              <AgentAvatar name={panelAgent.display_name ?? panelAgent.name} avatarUrl={panelAgent.avatar_url ?? null} class="h-5 w-5" />
+              <span>{panelAgent.display_name ?? panelAgent.name}</span>
+            </div>
             {#if conversationTaskId(currentConversation)}
               <a
                 href="/tasks/{conversationTaskId(currentConversation)}"
@@ -6149,8 +7299,8 @@ import X from 'lucide-svelte/icons/x';
                 {contextTypeBadge(currentConversation)}
               </span>
             {/if}
-            {#if sessions.length > 1}
-              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400">{sessions.length} sessions</span>
+            {#if backingSessionBadge}
+              <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Backing sessions">{backingSessionBadge}</span>
             {/if}
             {#if currentConversation.active_session_id}
               <button
@@ -6171,7 +7321,7 @@ import X from 'lucide-svelte/icons/x';
           {#if sessionInfoLoading}
             <p class="text-xs text-slate-500">Loading session details…</p>
           {:else if sessionInfo}
-            {@const panelContextUsage = sessionInfo.context_usage ?? contextUsage}
+            {@const panelContextUsage = contextUsage ?? sessionInfo.context_usage}
             {@const narrativeText = sessionNarrativeText(sessionInfo)}
             {#if headerInfoMode !== 'context' && narrativeText}
               <div class="mb-3">
@@ -6352,7 +7502,6 @@ import X from 'lucide-svelte/icons/x';
                 {#each queuedMessages as queued (queued.queue_id)}
                   {@const canMutateQueue = canMutateQueuedMessages()}
                   {@const isExpanded = queueIsExpanded(queued.queue_id)}
-                  {@const isEditing = canMutateQueue && queueEditingId === queued.queue_id}
                   <div class="rounded-xl border border-sky-300/20 bg-slate-950/40 px-2.5 py-2">
                     <div class="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
                       <span class="shrink-0 rounded-full border border-sky-300/20 bg-sky-400/10 px-2 py-0.5 text-[11px] font-medium text-sky-100">#{queued.position}</span>
@@ -6369,17 +7518,30 @@ import X from 'lucide-svelte/icons/x';
                         {/if}
                       </div>
                     </div>
-                    {#if isExpanded || isEditing}
+                    {#if queueEditingId === queued.queue_id}
                       <div class="mt-2 rounded-lg border border-slate-800/70 bg-slate-950/70 p-2.5">
-                        {#if isEditing}
-                          <textarea class="max-h-[36vh] min-h-24 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100" bind:value={queueEditContent} rows="4"></textarea>
-                          <div class="mt-2 flex flex-wrap justify-end gap-2">
-                            <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id || !queueEditContent.trim()} onclick={() => void saveQueuedMessage(queued.queue_id)}>Save</Button>
-                            <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} onclick={cancelQueuedMessageEdit}>Cancel</Button>
-                          </div>
-                        {:else}
-                          <p class="max-h-[32vh] overflow-auto whitespace-pre-wrap break-words text-slate-100">{queued.content}</p>
+                        <textarea
+                          class="min-h-24 w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-sky-400"
+                          bind:value={queueEditContent}
+                          disabled={queueBusyId === queued.queue_id}
+                          aria-label={`Edit queued message #${queued.position}`}
+                        ></textarea>
+                        {#if queueEditError}
+                          <p class="mt-2 text-xs text-rose-200">{queueEditError}</p>
                         {/if}
+                        {#if queued.attachments?.length}
+                          <p class="mt-2 text-xs text-sky-100/70">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
+                        {/if}
+                        <div class="mt-2 flex justify-end gap-2">
+                          <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} onclick={cancelQueuedMessageEdit}>Cancel</Button>
+                          <Button size="sm" variant="primary" disabled={queueBusyId === queued.queue_id || !queueEditContent.trim()} onclick={() => void saveQueuedMessageEdit(queued.queue_id)}>
+                            {queueBusyId === queued.queue_id ? 'Saving…' : 'Save'}
+                          </Button>
+                        </div>
+                      </div>
+                    {:else if isExpanded}
+                      <div class="mt-2 rounded-lg border border-slate-800/70 bg-slate-950/70 p-2.5">
+                        <p class="max-h-[32vh] overflow-auto whitespace-pre-wrap break-words text-slate-100">{queued.content}</p>
                         {#if queued.attachments?.length}
                           <p class="mt-2 text-xs text-sky-100/70">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'} attached. To change attachments, delete this queued message and recreate it.</p>
                         {/if}
@@ -6479,8 +7641,9 @@ import X from 'lucide-svelte/icons/x';
 
         <!-- Timeline -->
         <TimelineViewport
-          items={displayedTimeline}
-          agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
+          items={EMPTY_RENDER_ITEMS}
+          hasStreamingItems={displayedTimelineHasStreaming}
+          agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
           bind:viewportElement={timelineEl}
           bind:contentElement={timelineContentEl}
           bind:userScrolledUp
@@ -6494,7 +7657,9 @@ import X from 'lucide-svelte/icons/x';
           onKeydown={handleTimelineKeydown}
           onPointerDown={closeHeaderInfo}
           onViewSession={handleViewSession}
+          autoScrollOnResize={false}
           followPausedLabel="Scroll to bottom"
+          testId="timeline-viewport"
         >
             {#if hasOlderMessages && visibleStartIndex === 0 && !loadingOlderMessages}
               <button
@@ -6532,12 +7697,14 @@ import X from 'lucide-svelte/icons/x';
                 </p>
               {/if}
             {:else}
-              <TimelineList
+              <ChatV2TimelineList
                 items={displayedTimeline}
-                agent={currentConversation ? conversationAgent(currentConversation) ?? null : null}
+                cycleStates={chatV2Store.cycleStates}
+                agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
                 searchQuery={chatSearchQuery}
                 searchMatchedIds={chatSearchOpen ? chatSearchMatchedMessageIds : emptySearchMatchedIds}
                 searchSelectedId={selectedChatSearchTargetId}
+                preferences={$userPreferences}
                 onViewSession={handleViewSession}
               />
             {/if}
@@ -6567,11 +7734,6 @@ import X from 'lucide-svelte/icons/x';
               </div>
             {/if}
 
-            {#if showTurnProgress}
-              <div class="flex items-center gap-3 px-2 py-2">
-                <LiveDots tone={activeTurnChatMode === 'plan' ? 'emerald' : activeTurnChatMode === 'build' ? 'amber' : 'sky'} />
-              </div>
-            {/if}
         </TimelineViewport>
 
         <div bind:this={footerChromeEl} class="shrink-0 space-y-3">
@@ -6582,26 +7744,91 @@ import X from 'lucide-svelte/icons/x';
           <!-- Composer or read-only banner -->
           {#if currentConversation && isManagedConversation(currentConversation)}
             <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
-              <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="flex flex-wrap items-start justify-between gap-3">
                 <div class="min-w-0 flex-1">
                   <p class="font-medium">Agent work</p>
                   <p class="mt-1 text-sky-100/80">
                     Read-only target conversation · state {managedConversationState(currentConversation)} · turn {managedTurnState(currentConversation)}
                   </p>
-                  {#if currentConversation.managed_agent?.controller_conversation_id}
-                    <a
-                      class="mt-2 inline-flex items-center gap-1 text-xs font-medium text-sky-100 underline-offset-4 hover:underline"
-                      href={conversationUrl(currentConversation.managed_agent.controller_conversation_id)}
-                    >
-                      Open controlling conversation
-                      <ExternalLink class="h-3 w-3" />
-                    </a>
-                  {/if}
+                  <div class="mt-2 flex flex-wrap items-center gap-3">
+                    {#if currentConversation.managed_agent?.controller_conversation_id}
+                      <a
+                        class="inline-flex items-center gap-1 text-xs font-medium text-sky-100 underline-offset-4 hover:underline"
+                        href={conversationUrl(currentConversation.managed_agent.controller_conversation_id)}
+                      >
+                        Open controlling conversation
+                        <ExternalLink class="h-3 w-3" />
+                      </a>
+                    {/if}
+                    {#if currentConversation.managed_agent?.follow_up_conversation_id}
+                      <a
+                        class="inline-flex items-center gap-1 text-xs font-medium text-sky-100 underline-offset-4 hover:underline"
+                        href={conversationUrl(currentConversation.managed_agent.follow_up_conversation_id)}
+                      >
+                        Open follow-up conversation
+                        <ExternalLink class="h-3 w-3" />
+                      </a>
+                    {/if}
+                  </div>
                   {#if currentConversation.managed_agent?.last_error && managedTurnState(currentConversation) !== 'running' && managedTurnState(currentConversation) !== 'queued'}
                     <p class="mt-2 break-words text-xs text-rose-100">Last error: {currentConversation.managed_agent.last_error}</p>
                   {/if}
                 </div>
+                <div class="flex shrink-0 flex-wrap justify-end gap-2">
+                  {#if managedConversationActive(currentConversation)}
+                    <Button size="sm" variant="danger" disabled={managedActionBusy !== null} onclick={stopManagedConversation}>
+                      {managedActionBusy === 'stop' ? 'Stopping…' : 'Stop'}
+                    </Button>
+                  {/if}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={managedActionBusy !== null || managedConversationState(currentConversation) === 'closed' || managedConversationActive(currentConversation)}
+                    onclick={() => {
+                      managedActionError = '';
+                      managedInstructionOpen = !managedInstructionOpen;
+                    }}
+                  >
+                    Send instruction
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    disabled={managedActionBusy !== null || managedConversationState(currentConversation) === 'closed' || managedConversationActive(currentConversation)}
+                    onclick={takeControlOfManagedConversation}
+                  >
+                    {managedActionBusy === 'take-control' ? 'Forking…' : 'Take control'}
+                  </Button>
+                </div>
               </div>
+              {#if managedConversationActive(currentConversation)}
+                <p class="mt-2 text-xs text-sky-100/70">Stop the current turn before sending a manual instruction or taking control.</p>
+              {/if}
+              {#if managedInstructionOpen && managedConversationState(currentConversation) !== 'closed'}
+                <form class="mt-3 space-y-2" onsubmit={(event) => { event.preventDefault(); void sendManagedInstruction(); }}>
+                  <textarea
+                    class="min-h-24 w-full rounded-2xl border border-sky-300/25 bg-slate-950/40 px-3 py-2 text-sm text-sky-50 outline-none placeholder:text-sky-100/45 focus:border-sky-200/60"
+                    placeholder="Send a message into this managed conversation while keeping the parent notification link intact…"
+                    value={managedInstruction}
+                    disabled={managedActionBusy !== null || managedConversationActive(currentConversation)}
+                    oninput={(event) => { managedInstruction = event.currentTarget.value; managedActionError = ''; }}
+                  ></textarea>
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <p class="text-xs text-sky-100/65">This uses the managed send path; the conversation remains managed.</p>
+                    <div class="flex items-center gap-2">
+                      <Button size="sm" variant="ghost" type="button" disabled={managedActionBusy !== null} onclick={() => { managedInstructionOpen = false; managedActionError = ''; }}>
+                        Cancel
+                      </Button>
+                      <Button size="sm" type="submit" disabled={managedActionBusy !== null || managedConversationActive(currentConversation) || !managedInstruction.trim()}>
+                        {managedActionBusy === 'send' ? 'Sending…' : 'Send'}
+                      </Button>
+                    </div>
+                  </div>
+                </form>
+              {/if}
+              {#if managedActionError}
+                <p class="mt-2 break-words text-xs text-rose-100">{managedActionError}</p>
+              {/if}
             </div>
           {:else if currentConversation && !isWebConversation(currentConversation)}
             <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
@@ -6658,8 +7885,26 @@ import X from 'lucide-svelte/icons/x';
                     onmousedown={(event) => handleSlashSuggestionPointerDown(event, i)}
                     type="button"
                   >
-                    <span class="font-mono font-medium text-sky-400">{suggestion.command}</span>
-                    <span class="opacity-70">{suggestion.description}</span>
+                    <span class="min-w-0 font-mono font-medium text-sky-400">
+                      {suggestion.kind === 'parameter' ? suggestion.value : suggestion.command}
+                    </span>
+                    <span class="min-w-0 flex-1 truncate opacity-70">
+                      {#if suggestion.kind === 'parameter' && suggestion.label !== suggestion.value}
+                        {suggestion.label}
+                        {#if suggestion.description}
+                          <span class="opacity-60"> — {suggestion.description}</span>
+                        {/if}
+                      {:else}
+                        {suggestion.description}
+                      {/if}
+                    </span>
+                    {#if suggestion.badges.length > 0}
+                      <span class="flex shrink-0 gap-1">
+                        {#each suggestion.badges as badge}
+                          <span class="rounded-full border border-slate-600 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-slate-300">{badge}</span>
+                        {/each}
+                      </span>
+                    {/if}
                   </button>
                 {/each}
               </div>
@@ -6770,6 +8015,15 @@ import X from 'lucide-svelte/icons/x';
                 </div>
                 {#if currentDirectQuestion}
                   <div class="flex shrink-0 items-center gap-2 border-t border-sky-400/15 bg-slate-950/90 px-4 py-3 backdrop-blur">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      class="border-rose-300/30 bg-rose-500/10 text-rose-100 hover:bg-rose-500/20"
+                      disabled={directQuestionSubmitting}
+                      onclick={() => { void cancelDirectQuestionRequest(); }}
+                    >
+                      Stop request
+                    </Button>
                     {#if directQuestionVisibleItems.length > 1 && directQuestionCurrentIndex > 0}
                       <Button
                         size="sm"
@@ -6905,10 +8159,11 @@ import X from 'lucide-svelte/icons/x';
                   type="button"
                   aria-label="Cancel turn"
                   title="Cancel turn"
-                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-800 text-slate-200 transition hover:bg-slate-700"
-                  onclick={() => { haptic.warning(); currentConversation && wsClient.cancelTurn(currentConversation.conversation_id); }}
+                  class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-800 text-slate-200 transition hover:bg-slate-700"
+                  onclick={() => { haptic.warning(); cancelActiveTurnWithChatV2(); }}
                 >
-                  <Square class="h-3 w-3 fill-current" />
+                  <span class={`conversation-turn-orbit ${turnOrbitClass(activeTurnChatMode)}`} aria-hidden="true"><span></span></span>
+                  <Square class="absolute h-2.5 w-2.5 fill-current text-slate-100" />
                 </button>
               {:else}
                 <button
@@ -7046,7 +8301,7 @@ import X from 'lucide-svelte/icons/x';
 <ConversationMode
   open={conversationModeOpen}
   conversationId={currentConversation?.conversation_id ?? ''}
-  agent={currentConversation ? (conversationAgent(currentConversation) ?? null) : null}
+  agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
   onclose={() => { conversationModeOpen = false; }}
   sendEnableTts={(voice) => wsClient.enableTts(voice)}
   sendDisableTts={() => wsClient.disableTts()}

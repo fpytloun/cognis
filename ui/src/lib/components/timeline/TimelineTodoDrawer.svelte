@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
   import type { TodoSnapshotItem } from '$lib/chat';
@@ -12,7 +13,11 @@
   }>();
 
   const terminalTodoStatuses = new Set(['completed', 'cancelled']);
+  const compactDrawerMaxWidthPx = 1023;
+  const compactDrawerMaxHeightPx = 719;
 
+  let compactViewport = $state(true);
+  let lastAutoOpenKey = $state('');
   const activeTodos = $derived.by(() => todos.filter((todo: TodoSnapshotItem) => !terminalTodoStatuses.has(todo.status)));
   const todoCounts = $derived.by(() => ({
     inProgress: activeTodos.filter((todo: TodoSnapshotItem) => todo.status === 'in_progress').length,
@@ -26,11 +31,36 @@
     return 'bg-sky-400';
   }
 
-  function todoPriorityClass(priority: string): string {
-    if (priority === 'high') return 'text-rose-300';
-    if (priority === 'low') return 'text-slate-500';
-    return 'text-slate-400';
+  function isCompactViewport(): boolean {
+    return window.innerWidth <= compactDrawerMaxWidthPx || window.innerHeight <= compactDrawerMaxHeightPx;
   }
+
+  function refreshCompactViewport(): void {
+    compactViewport = isCompactViewport();
+  }
+
+  onMount(() => {
+    refreshCompactViewport();
+    window.addEventListener('resize', refreshCompactViewport);
+    window.visualViewport?.addEventListener('resize', refreshCompactViewport);
+    return () => {
+      window.removeEventListener('resize', refreshCompactViewport);
+      window.visualViewport?.removeEventListener('resize', refreshCompactViewport);
+    };
+  });
+
+  $effect(() => {
+    if (todos.length === 0) {
+      lastAutoOpenKey = '';
+      return;
+    }
+
+    const autoOpenKey = compactViewport ? 'compact' : 'roomy';
+    if (autoOpenKey !== lastAutoOpenKey) {
+      open = !compactViewport;
+      lastAutoOpenKey = autoOpenKey;
+    }
+  });
 </script>
 
 {#if todos.length > 0}
@@ -60,9 +90,6 @@
               title={todo.status.replace('_', ' ')}
             ></span>
             <span class="min-w-0 flex-1 truncate">{todo.content}</span>
-            {#if todo.priority !== 'medium'}
-              <span class={`shrink-0 text-xs ${todoPriorityClass(todo.priority)}`}>{todo.priority}</span>
-            {/if}
           </li>
         {/each}
       </ul>

@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { ToolCallTimelineItem } from '$lib/chat';
+  import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/chat';
+  import LiveDots from '$lib/components/LiveDots.svelte';
   import { displayToolName } from '$lib/tools-display';
 
   let { item } = $props<{ item: ToolCallTimelineItem }>();
@@ -12,7 +13,12 @@
       <h3 class="mt-1 text-base font-semibold text-white" title={item.toolName}>{displayToolName(item.displayToolName ?? item.toolName)}</h3>
     </div>
     <span class="rounded-full border border-slate-700 bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200">
-      {item.status}
+      {#if isActiveToolStatus(item.status)}
+        <LiveDots inline={true} size="sm" tone="sky" />
+        <span class="sr-only">Running</span>
+      {:else}
+        {item.status}
+      {/if}
     </span>
   </div>
 </article>

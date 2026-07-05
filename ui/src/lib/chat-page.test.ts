@@ -6,6 +6,7 @@ import {
   cloneSidebarProjection,
   conversationActivityValue,
   conversationInitialLoadPolicy,
+  conversationPendingSnapshotFlags,
   conversationMatchesSidebarProjectionFilter,
   conversationAttentionDotClass,
   conversationAttentionLabel,
@@ -26,16 +27,23 @@ import {
   isForeignSessionTimelineEvent,
   isMissingSessionError,
   isLastOpenedConversationStorageKey,
+  dedupeLastOpenedConversationEntries,
+  lastOpenedConversationEntry,
   lastOpenedConversationStorageKey,
   mergeConversationPreservingActivity,
   normalizeChatModeTone,
+  nextChatAutoScrollState,
   nextChatScrollState,
   isPreSessionChatConversation,
   isRestorableChatConversation,
   optimisticConversationTurnPatch,
   pendingDirectQuestionFromAuthChallengeEvent,
+  pendingInputRequestKind,
   pendingNotificationTypesFromNotifications,
+  questionSetReplyText,
+  parseLastOpenedConversationEntry,
   rememberSidebarProjectionSnapshot,
+  serializeLastOpenedConversationEntry,
   hasRetryableFailedTurnTail,
   managedConversationTurnState,
   shouldAdoptConversationSessionId,
@@ -45,7 +53,19 @@ import {
   setConversationStatusSearchParam,
   nextPollDelayMs,
   nextConversationLoadId,
-  shouldReconcileAfterReconnect
+  shouldReconcileAfterReconnect,
+  shouldPreserveLiveTailOnResize,
+  chatScrollDimensionsChanged,
+  shouldApplyScrollRestore,
+  shouldAttemptStaleRuntimeRefresh,
+  shouldDebounceConversationViewRefresh,
+  shouldRefreshForStaleRuntime,
+  isRuntimeSnapshotOlderThanView,
+  isTimelinePatchStale,
+  CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX,
+  CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS,
+  STALE_RUNTIME_REFRESH_BACKOFF_MS,
+  STALE_RUNTIME_REFRESH_MAX_ATTEMPTS
 } from '$lib/chat-page';
 import type { SidebarProjection } from '$lib/types/api';
 
@@ -57,6 +77,94 @@ describe('chat page helpers', () => {
     } as never)).toEqual({
       historyLimit: DEFAULT_INITIAL_TIMELINE_LIMIT,
     });
+  });
+
+  it('extracts auth challenge response text from a question-set reply', () => {
+    expect(questionSetReplyText({
+      mode: 'structured',
+      answers: [
+        { question_id: 'confirmed', selected_option_ids: [], custom_answer: '  use b64 instead  ' },
+      ],
+    })).toBe('use b64 instead');
+
+    expect(questionSetReplyText({
+      mode: 'structured',
+      answers: [
+        { question_id: 'choice', selected_option_ids: ['approve'], custom_answer: null },
+        { question_id: 'note', selected_option_ids: [], custom_answer: 'continue' },
+      ],
+    })).toBe('approve\ncontinue');
+  });
+
+  it('refreshes stale runtime state only when active state is visible', () => {
+    expect(shouldRefreshForStaleRuntime({
+      turnInProgress: true,
+      hasActiveTimelineItem: false,
+      lastRuntimeAt: 1000,
+      now: 32000,
+      staleMs: 30000,
+    })).toBe(true);
+
+    expect(shouldRefreshForStaleRuntime({
+      turnInProgress: false,
+      hasActiveTimelineItem: false,
+      lastRuntimeAt: 1000,
+      now: 32000,
+      staleMs: 30000,
+    })).toBe(false);
+
+    expect(shouldRefreshForStaleRuntime({
+      turnInProgress: true,
+      hasActiveTimelineItem: false,
+      lastRuntimeAt: 0,
+      now: 32000,
+      staleMs: 30000,
+    })).toBe(false);
+  });
+
+  it('treats runtime snapshots older than the active view as stale', () => {
+    const viewTime = Date.parse('2026-01-01T00:00:30Z');
+    expect(isRuntimeSnapshotOlderThanView('2026-01-01T00:00:29Z', viewTime)).toBe(true);
+    expect(isRuntimeSnapshotOlderThanView('2026-01-01T00:00:30Z', viewTime)).toBe(false);
+    expect(isRuntimeSnapshotOlderThanView('2026-01-01T00:00:31Z', viewTime)).toBe(false);
+    expect(isRuntimeSnapshotOlderThanView(null, viewTime)).toBe(false);
+  });
+
+  it('treats timeline patches at or below the active high watermark as stale', () => {
+    expect(isTimelinePatchStale(99, 100)).toBe(true);
+    expect(isTimelinePatchStale(100, 100)).toBe(true);
+    expect(isTimelinePatchStale(101, 100)).toBe(false);
+    expect(isTimelinePatchStale(0, 100)).toBe(false);
+    expect(isTimelinePatchStale(null, 100)).toBe(false);
+    expect(isTimelinePatchStale(99, 0)).toBe(false);
+  });
+
+  it('prefers the pending tool call over stale direct-question kind when classifying input requests', () => {
+    expect(pendingInputRequestKind({
+      pendingDirectKind: 'auth_challenge',
+      pendingStepTool: {
+        id: 'tool:call_question',
+        kind: 'tool_call',
+        callId: 'call_question',
+        toolName: 'step_request_questions',
+        status: 'started',
+        timestamp: '2026-01-01T00:00:00Z',
+        arguments: { questions: [{ id: 'q1', question: 'Continue?' }] },
+      },
+    })).toBe('question');
+
+    expect(pendingInputRequestKind({
+      pendingDirectKind: 'question',
+      pendingStepTool: {
+        id: 'tool:call_auth',
+        kind: 'tool_call',
+        callId: 'call_auth',
+        toolName: 'request_auth_challenge',
+        status: 'started',
+        timestamp: '2026-01-01T00:00:00Z',
+        arguments: { required_fields: ['confirmed'] },
+      },
+    })).toBe('auth_challenge');
   });
 
   it('bounds initial sessions and timeline for agent direct conversations', () => {
@@ -232,19 +340,29 @@ describe('chat page helpers', () => {
     } as unknown as SidebarProjection['conversations']['items'][number];
 
     expect(conversationMatchesSidebarProjectionFilter(conversation, {
-      selectedChannel: 'slack',
-      selectedAgentId: 'agent-a',
+      selectedChannels: ['slack'],
+      selectedAgentIds: ['agent-a'],
       selectedConversationStatus: 'active',
     })).toBe(true);
     expect(conversationMatchesSidebarProjectionFilter(conversation, {
-      selectedChannel: 'web',
-      selectedAgentId: 'agent-a',
+      selectedChannels: ['web'],
+      selectedAgentIds: ['agent-a'],
       selectedConversationStatus: 'active',
     })).toBe(false);
     expect(conversationMatchesSidebarProjectionFilter({ ...conversation, starred_at: '2026-01-01T00:00:00Z' }, {
-      selectedChannel: 'slack',
-      selectedAgentId: 'agent-a',
+      selectedChannels: ['slack'],
+      selectedAgentIds: ['agent-a'],
       selectedConversationStatus: 'starred',
+    })).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(conversation, {
+      selectedChannels: ['web', 'slack'],
+      selectedAgentIds: ['agent-b', 'agent-a'],
+      selectedConversationStatus: 'active',
+    })).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(conversation, {
+      selectedChannels: [],
+      selectedAgentIds: [],
+      selectedConversationStatus: 'active',
     })).toBe(true);
   });
 
@@ -367,6 +485,102 @@ describe('chat page helpers', () => {
     ).toEqual([]);
   });
 
+  it('summarizes authoritative pending state for local runtime cleanup', () => {
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: { notification_id: 'step-1', notification_type: 'step_question' },
+        notification_types: ['escalation'],
+        credential_request: null,
+        auth_challenge: null,
+        escalation: null,
+      },
+    })).toEqual({
+      hasDirectQuestion: true,
+      hasCredentialRequest: false,
+      hasEscalation: true,
+      hasAnyPendingInput: true,
+    });
+
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: null,
+        notification_types: [],
+        credential_request: null,
+        auth_challenge: null,
+        escalation: null,
+      },
+    })).toEqual({
+      hasDirectQuestion: false,
+      hasCredentialRequest: false,
+      hasEscalation: false,
+      hasAnyPendingInput: false,
+    });
+
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: { notification_id: 'gate-1', notification_type: 'gate' },
+        notification_types: [],
+        credential_request: null,
+        auth_challenge: null,
+        escalation: null,
+      },
+    }).hasDirectQuestion).toBe(true);
+  });
+
+  it('classifies auth challenges as direct-question UI authority', () => {
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: { notification_id: 'auth-input-1', notification_type: 'auth_challenge' },
+        notification_types: [],
+        credential_request: null,
+        auth_challenge: null,
+        escalation: null,
+      },
+    })).toMatchObject({
+      hasDirectQuestion: true,
+      hasCredentialRequest: false,
+    });
+
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: null,
+        notification_types: [],
+        credential_request: { notification_id: 'cred-1', notification_type: 'credential_request' },
+        auth_challenge: null,
+        escalation: null,
+      },
+    })).toMatchObject({
+      hasDirectQuestion: false,
+      hasCredentialRequest: true,
+    });
+
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: null,
+        notification_types: [],
+        credential_request: null,
+        auth_challenge: { notification_id: 'auth-1', notification_type: 'auth_challenge' },
+        escalation: null,
+      },
+    })).toMatchObject({
+      hasDirectQuestion: true,
+      hasCredentialRequest: false,
+    });
+
+    expect(conversationPendingSnapshotFlags({
+      pending: {
+        pending_input: null,
+        notification_types: [],
+        credential_request: null,
+        auth_challenge: null,
+        escalation: { notification_id: 'esc-1', notification_type: 'escalation' },
+      },
+    })).toMatchObject({
+      hasDirectQuestion: false,
+      hasEscalation: true,
+    });
+  });
+
   it('normalizes chat mode tones for running indicators', () => {
     expect(normalizeChatModeTone('plan')).toBe('plan');
     expect(normalizeChatModeTone('build')).toBe('build');
@@ -443,19 +657,10 @@ describe('chat page helpers', () => {
     expect(managedConversationTurnState({ has_active_turn: false })).toBe('idle');
   });
 
-  it('detects a retryable failed turn when the timeline ends after a user message', () => {
+  it('detects a retryable failed turn when a recoverable model failure notice is present for the turn', () => {
     expect(
       hasRetryableFailedTurnTail([
-        { kind: 'message', role: 'assistant', content: 'previous reply' },
-        { kind: 'message', role: 'user', content: 'do work' },
-      ])
-    ).toBe(true);
-  });
-
-  it('detects a retryable failed turn when a recoverable model failure notice follows the user message', () => {
-    expect(
-      hasRetryableFailedTurnTail([
-        { kind: 'message', role: 'user', content: 'do work' },
+        { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
         {
           kind: 'system_message',
           text: 'A model error occurred while generating the response. Your tool results have been saved. Please try sending your message again.',
@@ -464,13 +669,78 @@ describe('chat page helpers', () => {
     ).toBe(true);
   });
 
-  it('does not offer failed-turn retry after a completed assistant reply', () => {
+  it('does not offer failed-turn retry after a completed assistant reply for the same turn', () => {
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
+        { kind: 'message', role: 'assistant', content: 'done', turnId: 'turn-1' },
+      ])
+    ).toBe(false);
+  });
+
+  it('does not offer failed-turn retry when user message has no turnId (turn still starting)', () => {
+    // A user message with no turnId means the turn has not yet been assigned
+    // a server turn ID — it is still in progress, not failed.
     expect(
       hasRetryableFailedTurnTail([
         { kind: 'message', role: 'user', content: 'do work' },
-        { kind: 'message', role: 'assistant', content: 'done' },
       ])
     ).toBe(false);
+  });
+
+  it('is order-independent: user message below streaming assistant does not trigger false failed-turn', () => {
+    // Simulates the ordering bug scenario: user row sinks below streaming
+    // assistant in the array due to orderKey sort.  The new turn-based logic
+    // must not fire because the assistant is still streaming (partial=true).
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'assistant', content: 'streaming...', partial: true, turnId: 'turn-1' },
+        { kind: 'message', role: 'user', content: 'hello', turnId: 'turn-1' },
+      ])
+    ).toBe(false);
+  });
+
+  it('does not offer failed-turn retry when user message is last but no failure notice exists', () => {
+    // User message is last in the array (old positional logic would return true).
+    // New turn-based logic requires an explicit failure notice.
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'assistant', content: 'previous reply', turnId: 'turn-0' },
+        { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
+      ])
+    ).toBe(false);
+  });
+
+  it('does not offer failed-turn retry when failure notice has a lower orderKey than the latest user message', () => {
+    // turn-0 failed and has a notice (lower orderKey); turn-1 is new (higher
+    // orderKey) and still in progress.  The stale notice must not trigger the
+    // retry banner for turn-1 because it sorts before the new user message.
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'first attempt', turnId: 'turn-0', orderKey: '9998:000000001000000001:000000:00:000000000' },
+        {
+          kind: 'system_message',
+          text: 'A model error occurred while generating the response. Your tool results have been saved. Please try sending your message again.',
+          orderKey: '9998:000000001000000002:000000:06:000000000',
+        },
+        { kind: 'message', role: 'user', content: 'second attempt', turnId: 'turn-1', orderKey: '9998:000000001000000003:000000:00:000000000' },
+      ])
+    ).toBe(false);
+  });
+
+  it('offers failed-turn retry when failure notice has a higher orderKey than the latest user message', () => {
+    // The failure notice appeared after the latest user message — it is from
+    // the current turn and should trigger the retry banner.
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1', orderKey: '9998:000000001000000001:000000:00:000000000' },
+        {
+          kind: 'system_message',
+          text: 'A model error occurred while generating the response. Your tool results have been saved. Please try sending your message again.',
+          orderKey: '9998:000000001000000002:000000:06:000000000',
+        },
+      ])
+    ).toBe(true);
   });
 
   it('keeps live auth challenge events routed as auth challenges', () => {
@@ -594,6 +864,46 @@ describe('chat page helpers', () => {
     expect(isLastOpenedConversationStorageKey('cognis-chat-selected-agent')).toBe(false);
   });
 
+  it('serializes timestamped last opened conversation entries and parses legacy ids', () => {
+    const entry = lastOpenedConversationEntry({
+      conversation_id: 'conv-current',
+      agent_id: 'laforge',
+      agent_profile_id: null,
+      context: { type: 'web' },
+    } as never, new Date('2026-06-22T10:00:00.000Z'));
+
+    expect(entry).toEqual({
+      conversation_id: 'conv-current',
+      opened_at: '2026-06-22T10:00:00.000Z',
+      agent_id: 'laforge',
+      agent_profile_id: null,
+      context_type: 'web',
+    });
+    expect(parseLastOpenedConversationEntry(serializeLastOpenedConversationEntry(entry))).toEqual(entry);
+    expect(parseLastOpenedConversationEntry('conv-legacy')).toEqual({
+      conversation_id: 'conv-legacy',
+      opened_at: null,
+    });
+    expect(parseLastOpenedConversationEntry('{"conversation_id":"conv-bad","opened_at":"bad"}')).toEqual({
+      conversation_id: 'conv-bad',
+      opened_at: null,
+      agent_id: null,
+      agent_profile_id: null,
+      context_type: null,
+    });
+  });
+
+  it('deduplicates last opened candidates while preserving first freshness source', () => {
+    expect(dedupeLastOpenedConversationEntries([
+      { conversation_id: ' conv-a ', opened_at: '2026-06-22T10:00:00.000Z' },
+      { conversation_id: 'conv-b', opened_at: '2026-06-22T09:00:00.000Z' },
+      { conversation_id: 'conv-a', opened_at: '2026-06-22T08:00:00.000Z' },
+    ])).toEqual([
+      { conversation_id: 'conv-a', opened_at: '2026-06-22T10:00:00.000Z' },
+      { conversation_id: 'conv-b', opened_at: '2026-06-22T09:00:00.000Z' },
+    ]);
+  });
+
   it('recognizes brand-new web conversations without a root session', () => {
     expect(
       isPreSessionChatConversation(
@@ -618,13 +928,13 @@ describe('chat page helpers', () => {
   it('only adopts websocket session ids while the conversation has no active root session yet', () => {
     expect(shouldAdoptConversationSessionId(null, 'turn_started', 'sess_root')).toBe(true);
     expect(shouldAdoptConversationSessionId(null, 'message_complete', 'sess_root')).toBe(true);
-    expect(shouldAdoptConversationSessionId(null, 'tool_call', 'sess_child')).toBe(false);
+    expect(shouldAdoptConversationSessionId(null, 'timeline_patch', 'sess_child')).toBe(false);
     expect(shouldAdoptConversationSessionId('sess_existing', 'message_complete', 'sess_child')).toBe(false);
   });
 
   it('filters child-session timeline events but keeps parent lifecycle events visible', () => {
     expect(isForeignSessionTimelineEvent({
-      eventType: 'tool_result_chunk',
+      eventType: 'timeline_patch',
       eventSessionId: 'sess_child',
       rootSessionId: 'sess_root',
     })).toBe(true);
@@ -639,10 +949,30 @@ describe('chat page helpers', () => {
       rootSessionId: 'sess_root',
     })).toBe(false);
     expect(isForeignSessionTimelineEvent({
-      eventType: 'tool_call',
+      eventType: 'timeline_patch',
       eventSessionId: 'sess_root',
       rootSessionId: 'sess_root',
     })).toBe(false);
+  });
+
+  it('keeps compaction rotation events from the current root session visible', () => {
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'session_compacted',
+      eventSessionId: 'sess_new',
+      eventPreviousSessionId: 'sess_old',
+      rootSessionId: 'sess_old',
+    })).toBe(false);
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'session_compacted',
+      eventSessionId: 'sess_unrelated_new',
+      eventPreviousSessionId: 'sess_unrelated_old',
+      rootSessionId: 'sess_old',
+    })).toBe(true);
+    expect(isForeignSessionTimelineEvent({
+      eventType: 'session_compacted',
+      eventSessionId: 'sess_new',
+      rootSessionId: 'sess_old',
+    })).toBe(true);
   });
 
   it('suppresses only pre-session websocket not_found errors for missing sessions', () => {
@@ -703,5 +1033,293 @@ describe('chat page helpers', () => {
       userScrolledUp: true,
       userScrollIntentUp: false,
     }).userScrolledUp).toBe(false);
+  });
+
+  it('does not resume live-tail when near bottom without downward movement (reflow-clamp regression)', () => {
+    // Root cause of the scroll-jump regression on tall messages: a reflow-induced
+    // scrollTop clamp, or a delayed scroll event from a programmatic scrollTop
+    // write, can land near the bottom without any user gesture. Previously the
+    // near-bottom branch cleared userScrolledUp on position alone, causing the
+    // ResizeObserver to re-pin and jump the viewport back to the bottom.
+    // Fix: require an explicit downward movement (currentScrollTop > lastScrollTop)
+    // before clearing userScrolledUp.
+
+    // Position unchanged (reflow/clamp with no movement) — must keep userScrolledUp.
+    expect(nextChatScrollState({
+      currentScrollTop: 976,
+      lastScrollTop: 976,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+      userScrolledUp: true,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(true);
+
+    // Position moved UP slightly but still within bottom threshold — must keep userScrolledUp.
+    expect(nextChatScrollState({
+      currentScrollTop: 960,
+      lastScrollTop: 976,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+      userScrolledUp: true,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(true);
+
+    // Programmatic scroll event: position jumped to bottom (scrollTop == scrollHeight)
+    // but lastScrollTop was already at bottom — no movement delta, must not re-pin.
+    expect(nextChatScrollState({
+      currentScrollTop: 2000,
+      lastScrollTop: 2000,
+      distanceFromBottom: 0,
+      userScrolledUp: true,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(true);
+  });
+
+  it('resumes live-tail only when the user actively scrolled down to the bottom', () => {
+    // Genuine user scroll-to-bottom: moved down AND within threshold → re-attach.
+    expect(nextChatScrollState({
+      currentScrollTop: 990,
+      lastScrollTop: 800,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+      userScrolledUp: true,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(false);
+
+    // Moved down but still far from bottom → keep userScrolledUp.
+    expect(nextChatScrollState({
+      currentScrollTop: 850,
+      lastScrollTop: 800,
+      distanceFromBottom: 200,
+      userScrolledUp: true,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(true);
+  });
+
+  it('never sets userScrolledUp=true from a distance measurement (tall-message regression)', () => {
+    // The position-gate branch that set userScrolledUp=true based on a racy
+    // distance measurement was the root cause of the scroll-jump regression:
+    // streaming content taller than the viewport caused distanceFromBottom to
+    // exceed the threshold between measurement and scroll, dismounting auto-tail
+    // even though the user never scrolled. The gate is now removed.
+    // A pinned user (userScrolledUp=false) must always get shouldScroll=true
+    // regardless of distanceFromBottom — the idempotent re-pin handles growth.
+    expect(nextChatAutoScrollState({
+      force: false,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX + 1000, // very far from bottom
+      userScrolledUp: false,
+      positionGate: true,
+    })).toEqual({
+      shouldScroll: true,
+      userScrolledUp: false,
+    });
+
+    expect(nextChatAutoScrollState({
+      force: false,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
+      userScrolledUp: false,
+      positionGate: true,
+    })).toEqual({
+      shouldScroll: true,
+      userScrolledUp: false,
+    });
+  });
+
+  it('preserves forced and resize-driven bottom anchoring', () => {
+    expect(nextChatAutoScrollState({
+      force: true,
+      distanceFromBottom: 500,
+      userScrolledUp: true,
+      positionGate: true,
+    })).toEqual({
+      shouldScroll: true,
+      userScrolledUp: false,
+    });
+
+    expect(nextChatAutoScrollState({
+      force: false,
+      distanceFromBottom: 500,
+      userScrolledUp: false,
+      positionGate: false,
+    })).toEqual({
+      shouldScroll: true,
+      userScrolledUp: false,
+    });
+  });
+
+  it('does not latch user-paused state while an accepted bottom scroll is pending', () => {
+    expect(nextChatAutoScrollState({
+      force: false,
+      distanceFromBottom: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX + 1,
+      userScrolledUp: false,
+      positionGate: true,
+      autoScrollPending: true,
+    })).toEqual({
+      shouldScroll: false,
+      userScrolledUp: false,
+    });
+  });
+
+  it('only preserves live-tail on resize while the tail is pinned or a scroll is pending', () => {
+    expect(shouldPreserveLiveTailOnResize({
+      tailPinned: false,
+      autoScrollPending: false,
+    })).toBe(false);
+
+    expect(shouldPreserveLiveTailOnResize({
+      tailPinned: true,
+      autoScrollPending: false,
+    })).toBe(true);
+
+    expect(shouldPreserveLiveTailOnResize({
+      tailPinned: false,
+      autoScrollPending: true,
+    })).toBe(true);
+  });
+
+  it('treats timeline viewport height changes as scroll dimension changes', () => {
+    expect(chatScrollDimensionsChanged(
+      { scrollHeight: 1200, clientHeight: 640 },
+      { scrollHeight: 1200, clientHeight: 560 },
+    )).toBe(true);
+
+    expect(chatScrollDimensionsChanged(
+      { scrollHeight: 1200, clientHeight: 640 },
+      { scrollHeight: 1240, clientHeight: 640 },
+    )).toBe(true);
+
+    expect(chatScrollDimensionsChanged(
+      { scrollHeight: 1200, clientHeight: 640 },
+      { scrollHeight: 1200, clientHeight: 640 },
+    )).toBe(false);
+  });
+
+  it('applies a scroll restore only when the viewport has not drifted since capture', () => {
+    // Within the drift threshold: layout noise, safe to restore.
+    expect(shouldApplyScrollRestore({
+      capturedScrollTop: 1000,
+      currentScrollTop: 1000,
+    })).toBe(true);
+    expect(shouldApplyScrollRestore({
+      capturedScrollTop: 1000,
+      currentScrollTop: 1000 + CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX,
+    })).toBe(true);
+
+    // Beyond the threshold in either direction: the user kept scrolling during
+    // the async work — restoring would snap them back to a stale position.
+    expect(shouldApplyScrollRestore({
+      capturedScrollTop: 1000,
+      currentScrollTop: 1000 + CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX + 1,
+    })).toBe(false);
+    expect(shouldApplyScrollRestore({
+      capturedScrollTop: 1000,
+      currentScrollTop: 1000 - CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX - 1,
+    })).toBe(false);
+  });
+
+  it('debounces opportunistic view refreshes but never gap-driven ones', () => {
+    const now = 100_000;
+
+    // Recent refresh: opportunistic reasons are debounced.
+    expect(shouldDebounceConversationViewRefresh({
+      reason: 'focus',
+      lastRefreshAt: now - CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS + 1,
+      now,
+    })).toBe(true);
+    expect(shouldDebounceConversationViewRefresh({
+      reason: 'stale-runtime-ttl',
+      lastRefreshAt: now - 1000,
+      now,
+    })).toBe(true);
+
+    // Reconnect with a known frame gap must never be debounced.
+    expect(shouldDebounceConversationViewRefresh({
+      reason: 'websocket-reconnect-gap',
+      lastRefreshAt: now - 1,
+      now,
+    })).toBe(false);
+
+    // Old refresh or no refresh yet: allow.
+    expect(shouldDebounceConversationViewRefresh({
+      reason: 'focus',
+      lastRefreshAt: now - CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS,
+      now,
+    })).toBe(false);
+    expect(shouldDebounceConversationViewRefresh({
+      reason: 'visibility',
+      lastRefreshAt: 0,
+      now,
+    })).toBe(false);
+  });
+
+  it('backs off stale-runtime refreshes without ever stopping recovery', () => {
+    const intervalMs = 30_000;
+    const now = 1_000_000;
+
+    // Within the attempt budget: normal cadence.
+    expect(shouldAttemptStaleRuntimeRefresh({
+      attempts: 0,
+      lastAttemptAt: now - intervalMs,
+      now,
+      intervalMs,
+    })).toBe(true);
+    expect(shouldAttemptStaleRuntimeRefresh({
+      attempts: STALE_RUNTIME_REFRESH_MAX_ATTEMPTS - 1,
+      lastAttemptAt: now - intervalMs + 1,
+      now,
+      intervalMs,
+    })).toBe(false);
+
+    // Budget exhausted: the normal interval no longer triggers…
+    expect(shouldAttemptStaleRuntimeRefresh({
+      attempts: STALE_RUNTIME_REFRESH_MAX_ATTEMPTS,
+      lastAttemptAt: now - intervalMs,
+      now,
+      intervalMs,
+    })).toBe(false);
+
+    // …but the slow backoff interval still does. A silently broken WebSocket
+    // during a real turn relies on this: recovery slows down, never stops.
+    expect(shouldAttemptStaleRuntimeRefresh({
+      attempts: STALE_RUNTIME_REFRESH_MAX_ATTEMPTS,
+      lastAttemptAt: now - STALE_RUNTIME_REFRESH_BACKOFF_MS,
+      now,
+      intervalMs,
+    })).toBe(true);
+    expect(shouldAttemptStaleRuntimeRefresh({
+      attempts: STALE_RUNTIME_REFRESH_MAX_ATTEMPTS + 5,
+      lastAttemptAt: now - STALE_RUNTIME_REFRESH_BACKOFF_MS + 1,
+      now,
+      intervalMs,
+    })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer B: stale-timeline-patch gating logic
+// ---------------------------------------------------------------------------
+
+describe('isTimelinePatchStale gating', () => {
+  it('flags a patch as stale when last_seq <= current high-watermark', () => {
+    expect(isTimelinePatchStale(5, 10)).toBe(true);
+    expect(isTimelinePatchStale(10, 10)).toBe(true);
+  });
+
+  it('does not flag a patch as stale when last_seq > current high-watermark', () => {
+    expect(isTimelinePatchStale(11, 10)).toBe(false);
+  });
+
+  it('does not flag a patch as stale when last_seq is 0 (streaming runtime patch)', () => {
+    // Streaming runtime patches carry last_seq=0 — they must never be flagged
+    // stale regardless of the current high-watermark.
+    expect(isTimelinePatchStale(0, 100)).toBe(false);
+  });
+
+  it('does not flag a patch as stale when last_seq is null or non-numeric', () => {
+    expect(isTimelinePatchStale(null, 10)).toBe(false);
+    expect(isTimelinePatchStale(undefined, 10)).toBe(false);
+  });
+
+  it('does not flag a patch as stale when high-watermark is 0 (no events seen yet)', () => {
+    // Before any events are processed, activeSessionLastSeq=0. A patch with
+    // last_seq=5 should not be flagged stale — it's the first real patch.
+    expect(isTimelinePatchStale(5, 0)).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 <script lang="ts">
   import TimelineItemRenderer from '$lib/components/timeline/TimelineItemRenderer.svelte';
-  import type { TimelineItem } from '$lib/chat';
+  import type { TimelineItem, ToolCallTimelineItem } from '$lib/chat';
   import type { Agent } from '$lib/types/api';
 
   let {
@@ -20,6 +20,18 @@
     searchSelectedId?: string | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
   }>();
+
+  const toolCallsByCallId = $derived.by(() => {
+    const lookup = new Map<string, ToolCallTimelineItem>();
+    for (const timelineItem of items) {
+      if (timelineItem.kind !== 'tool_call') continue;
+      lookup.set(timelineItem.callId, timelineItem);
+      if (timelineItem.recoveryCallId) {
+        lookup.set(timelineItem.recoveryCallId, timelineItem);
+      }
+    }
+    return lookup;
+  });
 </script>
 
 {#each items as item (item.id)}
@@ -31,6 +43,7 @@
     {searchQuery}
     {searchMatched}
     searchSelected={searchMatched && searchSelectedId === item.id}
+    {toolCallsByCallId}
     {onViewSession}
   />
 {/each}

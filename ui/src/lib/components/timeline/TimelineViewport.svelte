@@ -4,6 +4,7 @@
   import LiveDots from '$lib/components/LiveDots.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import TimelineList from '$lib/components/timeline/TimelineList.svelte';
+  import { observeTimelineResizeAutoScroll } from '$lib/timeline-viewport';
   import type { TimelineItem } from '$lib/chat';
   import type { Agent } from '$lib/types/api';
 
@@ -16,6 +17,7 @@
     error = '',
     emptyLabel = 'No events recorded yet.',
     live = false,
+    hasStreamingItems = undefined,
     liveLabel = 'Reading latest logs',
     followPausedLabel = 'Scroll to latest',
     viewportElement = $bindable<HTMLDivElement | null>(null),
@@ -32,6 +34,8 @@
     onTouchEnd,
     onKeydown,
     onViewSession,
+    autoScrollOnResize = true,
+    testId = undefined,
     children
   } = $props<{
     items: TimelineItem[];
@@ -42,6 +46,7 @@
     error?: string;
     emptyLabel?: string;
     live?: boolean;
+    hasStreamingItems?: boolean | undefined;
     liveLabel?: string;
     followPausedLabel?: string;
     viewportElement?: HTMLDivElement | null;
@@ -58,11 +63,21 @@
     onTouchEnd?: ((event: TouchEvent) => void) | undefined;
     onKeydown?: ((event: KeyboardEvent) => void) | undefined;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    autoScrollOnResize?: boolean;
+    testId?: string | undefined;
     children?: Snippet;
   }>();
 
   let programmaticScroll = false;
   let lastScrollTop = 0;
+  let wasStreaming = $state(false);
+  const computedHasStreamingItems = $derived(
+    items.some((item: TimelineItem) => (
+      ('streaming' in item && item.streaming === true)
+      || ('status' in item && item.status === 'streaming')
+    ))
+  );
+  const effectiveHasStreamingItems = $derived(hasStreamingItems ?? computedHasStreamingItems);
 
   type ViewportEventHandlers = {
     onScroll?: ((event: Event) => void) | undefined;
@@ -135,8 +150,6 @@
       userScrolledUp = true;
     } else if (distanceFromBottom <= 24) {
       userScrolledUp = false;
-    } else if (distanceFromBottom > 80) {
-      userScrolledUp = true;
     }
 
     lastScrollTop = currentScrollTop;
@@ -149,15 +162,27 @@
   }
 
   $effect(() => {
-    if ((!contentElement && !viewportElement) || typeof ResizeObserver === 'undefined') {
+    if (effectiveHasStreamingItems) {
+      wasStreaming = true;
       return;
     }
-    const observer = new ResizeObserver(() => {
-      requestAnimationFrame(() => scrollToBottom());
+    if (!wasStreaming) return;
+    wasStreaming = false;
+    if (userScrolledUp || !viewportElement) return;
+    requestAnimationFrame(() => {
+      if (!userScrolledUp) {
+        scrollToBottom(true);
+      }
     });
-    if (contentElement) observer.observe(contentElement);
-    if (viewportElement) observer.observe(viewportElement);
-    return () => observer.disconnect();
+  });
+
+  $effect(() => {
+    return observeTimelineResizeAutoScroll({
+      autoScrollOnResize,
+      contentElement,
+      viewportElement,
+      scrollToBottom,
+    }) ?? undefined;
   });
 
 </script>
@@ -166,11 +191,16 @@
   class={className}
   role="region"
   aria-label="Timeline"
+  data-testid={testId}
   bind:this={viewportElement}
   use:viewportEvents={{ onScroll, onWheel, onTouchStart, onTouchMove, onTouchEnd, onKeydown, onPointerDown }}
   tabindex="-1"
 >
-  <div bind:this={contentElement} class={contentClass}>
+  <div
+    bind:this={contentElement}
+    class={contentClass}
+    data-testid={testId ? `${testId}-content` : undefined}
+  >
     {#if children}
       {@render children()}
     {:else if loadingOlder}
@@ -194,6 +224,7 @@
       onclick={jumpToBottom}
       type="button"
       title={followPausedLabel}
+      data-testid={testId ? `${testId}-scroll-to-bottom` : undefined}
     >
       <ArrowDown class="h-4 w-4 text-slate-300" />
     </button>

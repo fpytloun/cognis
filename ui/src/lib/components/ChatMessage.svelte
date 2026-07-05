@@ -464,7 +464,7 @@
           {#if explicitChatMode === 'plan' || explicitChatMode === 'build'}
             <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
           {/if}
-          {#if item.partial}
+          {#if item.partial && !item.streaming}
             <span class="rounded-full border border-slate-600 bg-slate-800/80 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-slate-300" title={item.finishReason === 'user_cancelled' ? 'Response was stopped by the user before completion' : 'Partial response'}>partial</span>
           {/if}
           <span class="text-slate-500">·</span>

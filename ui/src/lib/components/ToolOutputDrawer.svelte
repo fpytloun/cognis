@@ -57,31 +57,33 @@
 </script>
 
 {#if open}
-  <div class="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-sm" role="presentation" onclick={onClose}></div>
-  <aside class="fixed right-0 top-0 z-50 flex h-full w-full max-w-4xl flex-col border-l border-slate-700 bg-slate-950 text-slate-100 shadow-2xl" aria-label="Tool output drawer">
-    <header class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
-      <div>
-        <p class="text-sm font-semibold" title={toolName}>{displayToolName(toolName)}</p>
-        <p class="text-xs text-slate-400">{callId}{#if page} · {page.source} · {page.status}{/if}</p>
+  <div class="app-viewport-overlay z-50" role="presentation">
+    <button class="absolute inset-0 bg-slate-950/70 backdrop-blur-sm" type="button" aria-label="Close tool output drawer" onclick={onClose}></button>
+    <aside class="app-safe-side-panel absolute bottom-0 right-0 top-0 z-10 flex w-full max-w-4xl flex-col border-l border-slate-700 bg-slate-950 text-slate-100 shadow-2xl" aria-label="Tool output drawer">
+      <header class="flex shrink-0 items-center justify-between border-b border-slate-800 px-4 py-3">
+        <div>
+          <p class="text-sm font-semibold" title={toolName}>{displayToolName(toolName)}</p>
+          <p class="text-xs text-slate-400">{callId}{#if page} · {page.source} · {page.status}{/if}</p>
+        </div>
+        <button class="min-h-10 rounded-lg border border-slate-700 px-3 py-1 text-sm text-slate-200 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-300" type="button" onclick={onClose}>Close</button>
+      </header>
+      <div class="flex shrink-0 gap-2 overflow-x-auto border-b border-slate-800 px-4 py-2 text-xs">
+        <button class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40" type="button" disabled={loading || !page?.has_more_before} onclick={() => void load({ offset: page?.prev_offset, prepend: true })}>Load earlier</button>
+        <button class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40" type="button" disabled={loading || !page?.has_more_after} onclick={() => void load({ offset: page?.next_offset })}>Load later</button>
+        <button class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40" type="button" disabled={loading} onclick={() => void load({ latest: true, replace: true })}>Jump to latest</button>
+        {#if page?.output_size}<span class="ml-auto text-slate-500">{page.output_size.toLocaleString()} bytes</span>{/if}
       </div>
-      <button class="rounded-lg border border-slate-700 px-3 py-1 text-sm text-slate-200 hover:bg-slate-800" type="button" onclick={onClose}>Close</button>
-    </header>
-    <div class="flex gap-2 border-b border-slate-800 px-4 py-2 text-xs">
-      <button class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40" type="button" disabled={loading || !page?.has_more_before} onclick={() => void load({ offset: page?.prev_offset, prepend: true })}>Load earlier</button>
-      <button class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40" type="button" disabled={loading || !page?.has_more_after} onclick={() => void load({ offset: page?.next_offset })}>Load later</button>
-      <button class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40" type="button" disabled={loading} onclick={() => void load({ latest: true, replace: true })}>Jump to latest</button>
-      {#if page?.output_size}<span class="ml-auto text-slate-500">{page.output_size.toLocaleString()} bytes</span>{/if}
-    </div>
-    {#if error}
-      <p class="m-4 rounded border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100">{error}</p>
-    {/if}
-    <div class="min-h-0 flex-1 overflow-auto p-4">
-      {#if isTerminal}
-        <pre class="min-h-full whitespace-pre-wrap rounded-xl bg-black p-3 font-mono text-xs leading-5 text-emerald-100">{@html renderTerminalOutput(content || 'No output available.')}</pre>
-      {:else}
-        <pre class="min-h-full whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-900/70 p-3 font-mono text-xs leading-5 text-slate-200">{content || 'No output available.'}</pre>
+      {#if error}
+        <p class="m-4 rounded border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-100">{error}</p>
       {/if}
-    </div>
-  </aside>
+      <div class="min-h-0 flex-1 overflow-auto p-4">
+        {#if isTerminal}
+          <pre class="min-h-full whitespace-pre-wrap rounded-xl bg-black p-3 font-mono text-xs leading-5 text-emerald-100">{@html renderTerminalOutput(content || 'No output available.')}</pre>
+        {:else}
+          <pre class="min-h-full whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-900/70 p-3 font-mono text-xs leading-5 text-slate-200">{content || 'No output available.'}</pre>
+        {/if}
+      </div>
+    </aside>
+  </div>
 {/if}
 

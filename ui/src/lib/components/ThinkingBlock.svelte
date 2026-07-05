@@ -5,7 +5,7 @@
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
   import Brain from 'lucide-svelte/icons/brain';
 
-  let { item, live = false } = $props<{ item: ThinkingTimelineItem; compact?: boolean; live?: boolean }>();
+  let { item, live = false } = $props<{ item: ThinkingTimelineItem; live?: boolean }>();
 
   let expanded = $state(false);
 
@@ -98,7 +98,7 @@
       <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
     {/if}
     {#if item.streaming && live}
-      <LiveDots inline={true} size="sm" tone="sky" label="Thinking" />
+      <LiveDots inline={true} size="sm" tone="sky" />
     {:else}
       {#if expanded}
         <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />

@@ -1,4 +1,14 @@
-import type { ChatMode, ChatModeSource, Conversation, QuestionSetQuestion, SidebarProjection } from '$lib/types/api';
+import type {
+  ChatMode,
+  ChatModeSource,
+  Conversation,
+  ConversationStateEnvelope,
+  LastOpenedConversationCandidate,
+  QuestionSetQuestion,
+  QuestionSetReply,
+  SidebarProjection,
+} from '$lib/types/api';
+import { isAuthChallengeInputToolCall, type ToolCallTimelineItem } from '$lib/chat';
 
 export interface ConversationRetryScope {
   sessions: boolean;
@@ -14,8 +24,8 @@ export const DIRECT_CHAT_INITIAL_SESSION_LIMIT = 20;
 export const DIRECT_CHAT_INITIAL_TIMELINE_LIMIT = 80;
 
 export interface SidebarProjectionFilter {
-  selectedChannel: string;
-  selectedAgentId: string;
+  selectedChannels: string[];
+  selectedAgentIds: string[];
   selectedConversationStatus: ConversationStatusFilter;
 }
 
@@ -31,6 +41,53 @@ export interface PendingDirectQuestion {
   structured?: boolean;
 }
 
+export interface ConversationPendingSnapshotFlags {
+  hasDirectQuestion: boolean;
+  hasCredentialRequest: boolean;
+  hasEscalation: boolean;
+  hasAnyPendingInput: boolean;
+}
+
+const DIRECT_QUESTION_NOTIFICATION_TYPES = new Set([
+  'step_question',
+  'gate',
+  'workflow_gate',
+  'auth_challenge',
+]);
+const CREDENTIAL_REQUEST_NOTIFICATION_TYPES = new Set(['credential_request']);
+
+export function conversationPendingSnapshotFlags(
+  state: Pick<ConversationStateEnvelope, 'pending'> | null | undefined,
+): ConversationPendingSnapshotFlags {
+  const pending = state?.pending;
+  const notificationTypes = new Set(pending?.notification_types ?? []);
+  const pendingInputType = pending?.pending_input?.notification_type ?? null;
+  if (pendingInputType) {
+    notificationTypes.add(pendingInputType);
+  }
+
+  return {
+    hasDirectQuestion: Boolean(
+      pending?.auth_challenge
+      || (pendingInputType && DIRECT_QUESTION_NOTIFICATION_TYPES.has(pendingInputType))
+      || [...notificationTypes].some((type) => DIRECT_QUESTION_NOTIFICATION_TYPES.has(type)),
+    ),
+    hasCredentialRequest: Boolean(
+      pending?.credential_request
+      || (pendingInputType && CREDENTIAL_REQUEST_NOTIFICATION_TYPES.has(pendingInputType))
+      || [...notificationTypes].some((type) => CREDENTIAL_REQUEST_NOTIFICATION_TYPES.has(type)),
+    ),
+    hasEscalation: Boolean(pending?.escalation || notificationTypes.has('escalation')),
+    hasAnyPendingInput: Boolean(
+      pending?.pending_input
+      || pending?.credential_request
+      || pending?.auth_challenge
+      || pending?.escalation
+      || notificationTypes.size > 0,
+    ),
+  };
+}
+
 export interface ConversationInitialLoadPolicy {
   historyLimit: number;
   sessionOptions?: {
@@ -38,6 +95,101 @@ export interface ConversationInitialLoadPolicy {
     order: 'asc' | 'desc';
     limit: number;
   };
+}
+
+export interface RuntimeStalenessInput {
+  turnInProgress: boolean;
+  hasActiveTimelineItem: boolean;
+  lastRuntimeAt: number;
+  now: number;
+  staleMs: number;
+}
+
+export function shouldRefreshForStaleRuntime(input: RuntimeStalenessInput): boolean {
+  if (!input.turnInProgress && !input.hasActiveTimelineItem) return false;
+  if (input.lastRuntimeAt <= 0) return false;
+  return input.now - input.lastRuntimeAt > input.staleMs;
+}
+
+/**
+ * Minimum interval between opportunistic conversation-view refreshes. Focus,
+ * visibility, pageshow, online, and stale-runtime triggers fire liberally
+ * (every window focus, every foregrounding); each refresh does a full snapshot
+ * replace plus a scroll restore, so an undebounced storm of them makes the
+ * timeline unstable under an actively scrolling user.
+ */
+export const CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS = 5000;
+
+/**
+ * Refresh reasons that must never be debounced: they indicate the client KNOWS
+ * it missed frames and the view is materially stale.
+ */
+const FORCED_VIEW_REFRESH_REASONS = new Set(['websocket-reconnect-gap']);
+
+/**
+ * Number of consecutive stale-runtime refreshes at the normal interval before
+ * backing off. A leaked non-terminal item (e.g. a tool call stuck in running
+ * state) makes the staleness condition permanent — refreshing cannot fix it,
+ * and an endless 30s refresh loop keeps disrupting the user's scroll position.
+ */
+export const STALE_RUNTIME_REFRESH_MAX_ATTEMPTS = 3;
+
+/**
+ * Interval between stale-runtime refreshes after the attempt budget is
+ * exhausted. Deliberately slow (leaked items cannot be fixed by refreshing)
+ * but never zero: if a REAL turn is active with a silently broken WebSocket,
+ * the periodic refresh is the only recovery path — it must not stop entirely.
+ */
+export const STALE_RUNTIME_REFRESH_BACKOFF_MS = 5 * 60_000;
+
+/**
+ * Decide whether a stale-runtime refresh attempt is due. Normal cadence for
+ * the first {@link STALE_RUNTIME_REFRESH_MAX_ATTEMPTS} consecutive attempts,
+ * then the slow backoff cadence. The attempt counter is reset by the caller
+ * when the active-work condition clears or a genuine runtime signal arrives.
+ */
+export function shouldAttemptStaleRuntimeRefresh(params: {
+  attempts: number;
+  lastAttemptAt: number;
+  now: number;
+  intervalMs: number;
+  maxAttempts?: number;
+  backoffMs?: number;
+}): boolean {
+  const maxAttempts = params.maxAttempts ?? STALE_RUNTIME_REFRESH_MAX_ATTEMPTS;
+  const backoffMs = params.backoffMs ?? STALE_RUNTIME_REFRESH_BACKOFF_MS;
+  const requiredIntervalMs = params.attempts >= maxAttempts ? backoffMs : params.intervalMs;
+  return params.now - params.lastAttemptAt >= requiredIntervalMs;
+}
+
+export function shouldDebounceConversationViewRefresh(params: {
+  reason: string;
+  lastRefreshAt: number;
+  now: number;
+  minIntervalMs?: number;
+}): boolean {
+  if (FORCED_VIEW_REFRESH_REASONS.has(params.reason)) return false;
+  if (params.lastRefreshAt <= 0) return false;
+  return params.now - params.lastRefreshAt < (params.minIntervalMs ?? CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS);
+}
+
+export function isRuntimeSnapshotOlderThanView(
+  snapshotServerTime: string | null | undefined,
+  viewServerTimeMs: number,
+): boolean {
+  if (!snapshotServerTime || viewServerTimeMs <= 0) return false;
+  const snapshotTimeMs = Date.parse(snapshotServerTime);
+  if (!Number.isFinite(snapshotTimeMs) || snapshotTimeMs <= 0) return false;
+  return snapshotTimeMs < viewServerTimeMs;
+}
+
+export function isTimelinePatchStale(
+  patchLastSeq: number | null | undefined,
+  currentHighWatermarkSeq: number,
+): boolean {
+  if (patchLastSeq === null || typeof patchLastSeq !== 'number') return false;
+  if (!Number.isFinite(patchLastSeq) || patchLastSeq <= 0 || currentHighWatermarkSeq <= 0) return false;
+  return patchLastSeq <= currentHighWatermarkSeq;
 }
 
 function timestampValue(value: string | null | undefined): number {
@@ -189,17 +341,19 @@ export function conversationMatchesSidebarProjectionFilter(
   conversation: Conversation,
   filter: SidebarProjectionFilter,
 ): boolean {
-  if (filter.selectedAgentId !== 'all' && conversation.agent_id !== filter.selectedAgentId) {
+  const selectedAgentIds = new Set(filter.selectedAgentIds);
+  if (selectedAgentIds.size > 0 && !selectedAgentIds.has(conversation.agent_id)) {
     return false;
   }
 
   const contextType = conversation.context?.type?.toLowerCase() ?? 'unknown';
+  const selectedChannels = new Set(filter.selectedChannels.map((channel) => channel.toLowerCase()));
   if (isAgentDirectConversationSummary(conversation)) {
-    const channelMatches = filter.selectedChannel === 'all' || filter.selectedChannel === 'web';
+    const channelMatches = selectedChannels.size === 0 || selectedChannels.has('web');
     return channelMatches && conversation.status === 'active';
   }
 
-  if (filter.selectedChannel !== 'all' && contextType !== filter.selectedChannel.toLowerCase()) {
+  if (selectedChannels.size > 0 && !selectedChannels.has(contextType)) {
     return false;
   }
 
@@ -214,6 +368,8 @@ export interface FailedTurnRetryTailItem {
   content?: string | null;
   text?: string | null;
   partial?: boolean | null;
+  turnId?: string | null;
+  orderKey?: string | null;
 }
 
 const ATTENTION_PENDING_NOTIFICATION_TYPES = new Set<string>([
@@ -238,21 +394,13 @@ const NORMAL_COMPLETION_REASONS = new Set<string>([
 ]);
 
 const ROOT_SESSION_TIMELINE_EVENT_TYPES = new Set<string>([
-  'assistant_stream_snapshot',
-  'assistant_thinking_block',
-  'assistant_thinking_chunk',
-  'chunk',
   'escalation',
   'escalation_resolved',
   'message_complete',
   'session_compaction_finished',
   'session_compaction_started',
   'session_compacted',
-  'tool_call',
-  'tool_progress',
-  'tool_output_chunk',
-  'tool_result',
-  'tool_result_chunk',
+  'timeline_patch',
 ]);
 
 const RECOVERABLE_FAILED_TURN_NOTICE_MARKERS = [
@@ -285,6 +433,11 @@ export interface ChatScrollState {
   userScrolledUp: boolean;
 }
 
+export interface ChatAutoScrollState {
+  shouldScroll: boolean;
+  userScrolledUp: boolean;
+}
+
 export function distanceFromScrollBottom(params: {
   scrollHeight: number;
   scrollTop: number;
@@ -312,6 +465,8 @@ export function nextChatScrollState(params: {
   const bottomThresholdPx = params.bottomThresholdPx ?? CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX;
   const scrollDeltaThresholdPx = params.scrollDeltaThresholdPx ?? CHAT_USER_SCROLL_DELTA_THRESHOLD_PX;
   const userMovedUp = params.currentScrollTop < params.lastScrollTop - scrollDeltaThresholdPx;
+  // Positive delta means the user (or a programmatic scroll) moved downward.
+  const userMovedDown = params.currentScrollTop > params.lastScrollTop + scrollDeltaThresholdPx;
 
   if (params.userScrollIntentUp || (userMovedUp && params.distanceFromBottom > 0)) {
     return {
@@ -320,7 +475,16 @@ export function nextChatScrollState(params: {
     };
   }
 
-  if (isNearScrollBottom(params.distanceFromBottom, bottomThresholdPx)) {
+  // Only re-attach live-tail when the user actively scrolled DOWN to the
+  // bottom threshold. Clearing userScrolledUp on position alone (without a
+  // downward movement) is the root cause of the scroll-jump regression on
+  // tall messages: a reflow-induced scrollTop clamp, or a delayed scroll
+  // event from a programmatic scrollTop write, can land near the bottom
+  // without any user gesture — falsely re-pinning the tail and causing the
+  // viewport to jump back to the bottom the next time the ResizeObserver
+  // fires. Requiring an explicit downward movement means only a real
+  // user-initiated scroll-to-bottom re-attaches the tail.
+  if (isNearScrollBottom(params.distanceFromBottom, bottomThresholdPx) && userMovedDown) {
     return {
       distanceFromBottom: params.distanceFromBottom,
       userScrolledUp: false,
@@ -331,6 +495,90 @@ export function nextChatScrollState(params: {
     distanceFromBottom: params.distanceFromBottom,
     userScrolledUp: params.userScrolledUp,
   };
+}
+
+export function nextChatAutoScrollState(params: {
+  force: boolean;
+  userScrolledUp: boolean;
+  autoScrollPending?: boolean;
+  // distanceFromBottom and positionGate are retained in the signature for
+  // backwards compatibility with existing call sites and tests, but are no
+  // longer used in the decision. The position-gate branch was the source of
+  // the scroll-jump regression: it inferred userScrolledUp=true from a racy
+  // distance measurement taken while streaming content was still growing,
+  // dismounting auto-tail for messages taller than the viewport. The correct
+  // rule is: only genuine user gestures (handleTimelineScroll, wheel/touch/key
+  // intent) may set userScrolledUp=true. Auto-scroll is purely idempotent —
+  // "if pinned, re-pin; else do nothing" — and never infers un-pinning.
+  distanceFromBottom?: number;
+  positionGate?: boolean;
+  bottomThresholdPx?: number;
+}): ChatAutoScrollState {
+  if (params.force) {
+    return {
+      shouldScroll: true,
+      userScrolledUp: false,
+    };
+  }
+
+  if (params.userScrolledUp) {
+    return {
+      shouldScroll: false,
+      userScrolledUp: true,
+    };
+  }
+
+  if (params.autoScrollPending) {
+    return {
+      shouldScroll: false,
+      userScrolledUp: false,
+    };
+  }
+
+  return {
+    shouldScroll: true,
+    userScrolledUp: false,
+  };
+}
+
+export function shouldPreserveLiveTailOnResize(params: {
+  tailPinned: boolean;
+  autoScrollPending: boolean;
+}): boolean {
+  // tailPinned is always kept in sync with !userScrolledUp (single source of
+  // truth). This function is equivalent to: !userScrolledUp || autoScrollPending.
+  return params.tailPinned || params.autoScrollPending;
+}
+
+export function chatScrollDimensionsChanged(
+  previous: { scrollHeight: number; clientHeight: number },
+  current: { scrollHeight: number; clientHeight: number },
+): boolean {
+  return previous.scrollHeight !== current.scrollHeight || previous.clientHeight !== current.clientHeight;
+}
+
+/**
+ * Maximum drift (px) between a captured scroll position and the current one
+ * before a scroll-position restore is considered stale and skipped. A user
+ * actively scrolling during an async fetch will move well beyond this; layout
+ * noise (scrollbar rounding, sub-pixel reflow) stays well under it.
+ */
+export const CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX = 40;
+
+/**
+ * Decide whether a scroll-position restore captured earlier is still safe to
+ * apply. Restoring an absolute scrollTop captured before async work (network
+ * fetch, snapshot replace) while the user kept scrolling yanks them back to a
+ * stale position — the "jumps back while scrolling" bug. The restore is only
+ * applied when the viewport has not moved materially since capture.
+ */
+export function shouldApplyScrollRestore(params: {
+  capturedScrollTop: number;
+  currentScrollTop: number;
+  driftThresholdPx?: number;
+}): boolean {
+  const threshold = params.driftThresholdPx ?? CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX;
+  return Math.abs(params.currentScrollTop - params.capturedScrollTop) <= threshold;
 }
 
 export function nextPollDelayMs(currentDelayMs: number): number {
@@ -511,36 +759,75 @@ function isRecoverableFailedTurnNotice(item: FailedTurnRetryTailItem): boolean {
 
 /**
  * Detects a conversation tail where the latest user turn did not produce a
- * completed assistant message. This covers both persisted model-failure
- * notices and the raw "last item is a user message" state seen after a turn
- * fails before any assistant output is saved.
+ * completed assistant message.
+ *
+ * **Turn-based, not positional.** We identify the latest user message's
+ * ``turnId`` and then scan the full item list for that turn's outcome.  This
+ * is order-independent: the user message can be anywhere in the array (e.g.
+ * temporarily below a streaming assistant due to orderKey ordering) and the
+ * result is still correct.
+ *
+ * Returns true only when:
+ *   - There is a latest user message with a turnId, AND
+ *   - No completed (non-partial) assistant message shares that turnId, AND
+ *   - At least one recoverable-failure notice is present for that turn.
+ *
+ * The "no assistant at all" case (turn failed before any output) is NOT
+ * treated as retryable here — that state is transient while the turn is
+ * still in progress and would produce false positives during streaming.
  */
 export function hasRetryableFailedTurnTail(items: FailedTurnRetryTailItem[]): boolean {
-  let latestUserIndex = -1;
+  // Find the latest user message and its turnId.
+  let latestUserTurnId: string | null | undefined = null;
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if (item?.kind === 'message' && item.role === 'user') {
-      latestUserIndex = index;
+      latestUserTurnId = (item as { turnId?: string | null }).turnId ?? null;
       break;
     }
   }
-  if (latestUserIndex < 0) return false;
+  if (latestUserTurnId == null) return false;
 
-  const tail = items.slice(latestUserIndex + 1);
-  if (tail.length === 0) return true;
-
-  let sawFailureNotice = false;
-  for (const item of tail) {
-    if (!item) continue;
-    if (item.kind === 'message' && item.role === 'assistant' && item.partial !== true) {
-      return false;
-    }
-    if (isRecoverableFailedTurnNotice(item)) {
-      sawFailureNotice = true;
+  // Find the latest user message's orderKey so we can determine whether a
+  // failure notice appeared before or after it in the canonical timeline order.
+  let latestUserOrderKey: string | null = null;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item?.kind === 'message' && item.role === 'user') {
+      latestUserOrderKey = (item as { orderKey?: string | null }).orderKey ?? null;
+      break;
     }
   }
 
-  return sawFailureNotice;
+  // Scan all items for this turn's outcome.
+  let sawCompletedAssistant = false;
+  let sawFailureNotice = false;
+  for (const item of items) {
+    if (!item) continue;
+    if (item.kind === 'message' && item.role === 'assistant' && item.partial !== true) {
+      const itemTurnId = (item as { turnId?: string | null }).turnId ?? null;
+      if (itemTurnId === latestUserTurnId) {
+        sawCompletedAssistant = true;
+      }
+    }
+    if (isRecoverableFailedTurnNotice(item)) {
+      // Only count a failure notice if it sorts AFTER the latest user message
+      // (i.e., it was produced by the current turn, not a previous one).
+      // We compare orderKeys: if the notice has a higher orderKey than the
+      // user message it is from the current turn; if lower it is stale.
+      // When either key is absent we conservatively count the notice.
+      const noticeOrderKey = (item as { orderKey?: string | null }).orderKey ?? null;
+      const isAfterUser =
+        latestUserOrderKey === null
+        || noticeOrderKey === null
+        || noticeOrderKey > latestUserOrderKey;
+      if (isAfterUser) {
+        sawFailureNotice = true;
+      }
+    }
+  }
+
+  return !sawCompletedAssistant && sawFailureNotice;
 }
 
 export function normalizeChatModeTone(value: unknown): ChatModeTone {
@@ -570,6 +857,67 @@ export function lastOpenedConversationStorageKey(agentId: string | null | undefi
 export function isLastOpenedConversationStorageKey(key: string): boolean {
   return key === CHAT_STORAGE_KEYS.lastOpenedConversation
     || key.startsWith(LAST_OPENED_CONVERSATION_STORAGE_PREFIX);
+}
+
+export function lastOpenedConversationEntry(
+  conversation: Pick<Conversation, 'conversation_id' | 'agent_id' | 'agent_profile_id' | 'context'>,
+  openedAt = new Date(),
+): LastOpenedConversationCandidate {
+  return {
+    conversation_id: conversation.conversation_id,
+    opened_at: openedAt.toISOString(),
+    agent_id: conversation.agent_id,
+    agent_profile_id: conversation.agent_profile_id ?? null,
+    context_type: conversation.context?.type ?? null,
+  };
+}
+
+export function serializeLastOpenedConversationEntry(
+  entry: LastOpenedConversationCandidate,
+): string {
+  return JSON.stringify(entry);
+}
+
+export function parseLastOpenedConversationEntry(
+  raw: string | null | undefined,
+): LastOpenedConversationCandidate | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  try {
+    const value = JSON.parse(trimmed) as unknown;
+    if (!value || typeof value !== 'object') return null;
+    const record = value as Record<string, unknown>;
+    const conversationId = record.conversation_id;
+    if (typeof conversationId !== 'string' || !conversationId.trim()) return null;
+    const openedAt = record.opened_at;
+    const agentId = record.agent_id;
+    const agentProfileId = record.agent_profile_id;
+    const contextType = record.context_type;
+    return {
+      conversation_id: conversationId.trim(),
+      opened_at: typeof openedAt === 'string' && Number.isFinite(Date.parse(openedAt)) ? openedAt : null,
+      agent_id: typeof agentId === 'string' && agentId.trim() ? agentId : null,
+      agent_profile_id: typeof agentProfileId === 'string' && agentProfileId.trim() ? agentProfileId : null,
+      context_type: typeof contextType === 'string' && contextType.trim() ? contextType : null,
+    };
+  } catch {
+    // Legacy format stored the conversation id directly.
+    return { conversation_id: trimmed, opened_at: null };
+  }
+}
+
+export function dedupeLastOpenedConversationEntries(
+  entries: LastOpenedConversationCandidate[],
+): LastOpenedConversationCandidate[] {
+  const seen = new Set<string>();
+  const unique: LastOpenedConversationCandidate[] = [];
+  for (const entry of entries) {
+    const conversationId = entry.conversation_id.trim();
+    if (!conversationId || seen.has(conversationId)) continue;
+    seen.add(conversationId);
+    unique.push({ ...entry, conversation_id: conversationId });
+  }
+  return unique;
 }
 
 function directQuestionContext(context: unknown): string {
@@ -604,6 +952,26 @@ export function pendingDirectQuestionFromAuthChallengeEvent(event: {
     context: directQuestionContext(event.metadata),
     kind: 'auth_challenge',
   };
+}
+
+export function questionSetReplyText(reply: QuestionSetReply): string {
+  const parts: string[] = [];
+  for (const answer of reply.answers) {
+    parts.push(...answer.selected_option_ids);
+    const customAnswer = answer.custom_answer?.trim();
+    if (customAnswer) parts.push(customAnswer);
+  }
+  return parts.join('\n').trim();
+}
+
+export function pendingInputRequestKind(params: {
+  pendingStepTool?: ToolCallTimelineItem | null;
+  pendingDirectKind?: PendingDirectQuestionKind | null;
+}): PendingDirectQuestionKind {
+  if (params.pendingStepTool) {
+    return isAuthChallengeInputToolCall(params.pendingStepTool) ? 'auth_challenge' : 'question';
+  }
+  return params.pendingDirectKind === 'auth_challenge' ? 'auth_challenge' : 'question';
 }
 
 export function buildConversationUrl(
@@ -698,8 +1066,17 @@ export function shouldAdoptConversationSessionId(
 export function isForeignSessionTimelineEvent(params: {
   eventType: string;
   eventSessionId?: string | null;
+  eventPreviousSessionId?: string | null;
   rootSessionId?: string | null;
 }): boolean {
+  if (
+    params.eventType === 'session_compacted'
+    && typeof params.rootSessionId === 'string'
+    && params.rootSessionId.length > 0
+    && params.eventPreviousSessionId === params.rootSessionId
+  ) {
+    return false;
+  }
   return ROOT_SESSION_TIMELINE_EVENT_TYPES.has(params.eventType)
     && typeof params.rootSessionId === 'string'
     && params.rootSessionId.length > 0

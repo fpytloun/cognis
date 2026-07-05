@@ -7,65 +7,111 @@
   import { api } from '$lib/api/client';
   import {
     CHAT_STORAGE_KEYS,
-    lastOpenedConversationStorageKey
+    dedupeLastOpenedConversationEntries,
+    lastOpenedConversationEntry,
+    lastOpenedConversationStorageKey,
+    parseLastOpenedConversationEntry,
+    serializeLastOpenedConversationEntry,
   } from '$lib/chat-page';
-  import type { Agent } from '$lib/types/api';
+  import type { Agent, Conversation, LastOpenedConversationCandidate } from '$lib/types/api';
 
   let loading = true;
   let error = '';
   let noAgents = false;
 
+  function storedAgentIds(value: string | null): string[] {
+    if (!value || value === 'all') return [];
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0);
+      }
+    } catch {
+      // Backwards-compatible single selected-agent storage.
+    }
+    return [value];
+  }
+
   function getSelectedAgentId(agents: Agent[]): string {
     const primary = agents.filter((a) => a.agent_type === 'primary');
     if (typeof window !== 'undefined') {
       const stored = window.localStorage.getItem(CHAT_STORAGE_KEYS.selectedAgent);
-      if (stored && primary.some((a) => a.agent_id === stored && a.status === 'active')) {
-        return stored;
+      const selected = storedAgentIds(stored);
+      if (selected.length === 1 && primary.some((a) => a.agent_id === selected[0] && a.status === 'active')) {
+        return selected[0];
       }
     }
     return primary.find((a) => a.status === 'active')?.agent_id ?? primary[0]?.agent_id ?? '';
   }
 
-  function lastOpenedConversationCandidates(selectedAgentId: string): string[] {
+  /**
+   * Read the global last-opened entry from localStorage (survives PWA relaunches).
+   * This is the conversation-first restore path: we prefer the last-opened
+   * conversation's agent over the UI-selected agent so PWA cold-starts always
+   * land on the genuinely last-active chat.
+   */
+  function globalLastOpenedEntry(): LastOpenedConversationCandidate | null {
+    if (typeof window === 'undefined') return null;
+    return parseLastOpenedConversationEntry(
+      window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation),
+    );
+  }
+
+  function lastOpenedConversationCandidates(selectedAgentId: string): LastOpenedConversationCandidate[] {
     if (typeof window === 'undefined') return [];
     const agentKey = lastOpenedConversationStorageKey(selectedAgentId);
-    return [
+    return dedupeLastOpenedConversationEntries([
       window.sessionStorage.getItem(agentKey),
       window.localStorage.getItem(agentKey),
       window.sessionStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation),
       window.localStorage.getItem(CHAT_STORAGE_KEYS.lastOpenedConversation),
-    ].filter((value, index, values): value is string => (
-      typeof value === 'string'
-      && value.length > 0
-      && values.indexOf(value) === index
-    ));
+    ].map(parseLastOpenedConversationEntry).filter((value): value is LastOpenedConversationCandidate => value !== null));
   }
 
-  function rememberOpenedConversation(agentId: string, conversationId: string): void {
+  function rememberOpenedConversation(conversation: Conversation): void {
     if (typeof window === 'undefined') return;
-    window.sessionStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversationId);
-    window.sessionStorage.setItem(lastOpenedConversationStorageKey(agentId), conversationId);
-    window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, conversationId);
-    window.localStorage.setItem(lastOpenedConversationStorageKey(agentId), conversationId);
+    const entry = serializeLastOpenedConversationEntry(lastOpenedConversationEntry(conversation));
+    window.sessionStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, entry);
+    window.sessionStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), entry);
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.lastOpenedConversation, entry);
+    window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), entry);
   }
 
   onMount(() => {
     void (async () => {
       try {
         const agents = await api.agents.listAll();
-        const agentId = getSelectedAgentId(agents);
-        if (!agentId) {
+
+        // Conversation-first restore: use the last-opened conversation's agent
+        // as the primary agent for the open request. This ensures PWA cold-starts
+        // (where sessionStorage is empty) always restore the genuinely last-active
+        // chat rather than defaulting to the first primary agent's latest conversation.
+        const globalEntry = globalLastOpenedEntry();
+        const globalAgentId = globalEntry?.agent_id ?? null;
+        const primary = agents.filter((a) => a.agent_type === 'primary');
+
+        // Resolve the agent to request: prefer the last-opened conversation's
+        // agent if it is still active, otherwise fall back to the UI selection.
+        const resolvedAgentId = (
+          globalAgentId && primary.some((a) => a.agent_id === globalAgentId && a.status === 'active')
+            ? globalAgentId
+            : getSelectedAgentId(agents)
+        );
+
+        if (!resolvedAgentId) {
           noAgents = true;
           loading = false;
           return;
         }
 
+        const candidates = lastOpenedConversationCandidates(resolvedAgentId);
         const conversation = await api.conversations.open({
-          agent_id: agentId,
+          agent_id: resolvedAgentId,
           context_type: 'web',
-          candidate_conversation_ids: lastOpenedConversationCandidates(agentId),
+          candidate_conversations: candidates,
+          candidate_conversation_ids: candidates.map((candidate) => candidate.conversation_id),
         });
-        rememberOpenedConversation(conversation.agent_id, conversation.conversation_id);
+        rememberOpenedConversation(conversation);
         await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
       } catch (caughtError) {
         error = caughtError instanceof Error ? caughtError.message : 'Unable to load conversations.';
