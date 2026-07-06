@@ -1463,6 +1463,7 @@ class WorkflowEngine:
         workflow: Workflow,
     ) -> StepEvaluation:
         """Run the step evaluator."""
+        step_output = await self._canonicalize_step_output_for_evaluation(step_output)
         step_index = self._find_step_index(workflow, step_def.name) or 0
         source_names = resolve_source_names(step_def, step_index, workflow.steps)
 
@@ -1480,6 +1481,78 @@ class WorkflowEngine:
             step_inputs=step_inputs,
             task_context=self._build_step_task_context(task, state),
             execution_evidence=execution_evidence,
+        )
+
+    async def _canonicalize_step_output_for_evaluation(
+        self,
+        step_output: StepOutput,
+    ) -> StepOutput:
+        """Use persisted deliverable content as the evaluator source of truth."""
+
+        if not step_output.deliverable_id:
+            return step_output
+
+        try:
+            async with self._session_factory() as db_session:
+                deliverable = await get_deliverable(db_session, step_output.deliverable_id)
+        except Exception:
+            logger.warning(
+                "workflow: failed to load persisted deliverable for evaluation",
+                extra={"extra_data": {"deliverable_id": step_output.deliverable_id}},
+                exc_info=True,
+            )
+            return step_output
+
+        if deliverable is None:
+            logger.warning(
+                "workflow: step output references missing deliverable during evaluation",
+                extra={"extra_data": {"deliverable_id": step_output.deliverable_id}},
+            )
+            return step_output
+
+        persisted_content = getattr(deliverable, "content", None)
+        if not isinstance(persisted_content, str) or not persisted_content.strip():
+            logger.warning(
+                "workflow: persisted deliverable has invalid content during evaluation",
+                extra={
+                    "extra_data": {
+                        "deliverable_id": step_output.deliverable_id,
+                        "content_type": type(persisted_content).__name__,
+                    }
+                },
+            )
+            return step_output
+
+        metadata = dict(step_output.metadata or {})
+        metadata["evaluator_deliverable_source"] = {
+            "source": "persisted_deliverable",
+            "deliverable_id": step_output.deliverable_id,
+            "content_mirror_changed": persisted_content != step_output.content,
+        }
+        if persisted_content != step_output.content:
+            logger.warning(
+                "workflow: evaluator deliverable content mirror mismatch; using persisted content",
+                extra={
+                    "extra_data": {
+                        "deliverable_id": step_output.deliverable_id,
+                        "step_output_content_len": len(step_output.content or ""),
+                        "persisted_content_len": len(persisted_content),
+                    }
+                },
+            )
+
+        return step_output.model_copy(
+            update={
+                "content": persisted_content,
+                "metadata": metadata,
+                "deliverable_version": getattr(
+                    deliverable, "version", step_output.deliverable_version
+                ),
+                "deliverable_format": getattr(
+                    deliverable, "format", step_output.deliverable_format
+                ),
+                "deliverable_title": getattr(deliverable, "title", step_output.deliverable_title),
+            }
         )
 
     async def _build_step_execution_evidence(self, step_output: StepOutput) -> dict[str, Any]:

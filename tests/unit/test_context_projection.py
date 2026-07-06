@@ -742,10 +742,11 @@ def test_decide_pressure_mode_escalates_to_critical_at_high_threshold() -> None:
     assert mode == PressureMode.critical
 
 
-def test_decide_pressure_mode_oversized_forces_critical() -> None:
+def test_decide_pressure_mode_oversized_stays_normal_below_pressure_threshold() -> None:
     snap = _make_snapshot(int(100_000 * 0.50), oversized=True)
-    mode, _ = decide_pressure_mode(snap, PressureMode.normal, under_threshold_cycles=0)
-    assert mode == PressureMode.critical
+    mode, under = decide_pressure_mode(snap, PressureMode.normal, under_threshold_cycles=0)
+    assert mode == PressureMode.normal
+    assert under == 1
 
 
 def test_decide_pressure_mode_demotion_requires_two_cycles() -> None:

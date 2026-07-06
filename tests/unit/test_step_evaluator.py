@@ -229,6 +229,33 @@ async def test_evaluator_middle_truncates_large_deliverable_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_evaluator_prompt_uses_plain_deliverable_text_exactly() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+    plain_text = "🏠 Osobní\nHotovo.\n\nPozn.: závěrečná věta."
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Write a plain evening summary."),
+        step_output=StepOutput(
+            summary="Summary written",
+            content=plain_text,
+            deliverable_id="dlv_plain",
+            deliverable_format="plain",
+        ),
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert "Assistant written deliverable:" in prompt
+    assert plain_text in prompt
+    assert "Execution evidence:" in prompt
+    assert "('🏠 Osobní" not in prompt
+    assert "', False)" not in prompt
+
+
+@pytest.mark.asyncio
 async def test_evaluator_uses_step_inputs() -> None:
     capture = _CaptureLLM()
     evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)

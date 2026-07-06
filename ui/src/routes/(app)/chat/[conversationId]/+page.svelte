@@ -7744,8 +7744,8 @@ import X from 'lucide-svelte/icons/x';
           <!-- Composer or read-only banner -->
           {#if currentConversation && isManagedConversation(currentConversation)}
             <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
-              <div class="flex flex-wrap items-start justify-between gap-3">
-                <div class="min-w-0 flex-1">
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div class="min-w-0 sm:flex-1">
                   <p class="font-medium">Agent work</p>
                   <p class="mt-1 text-sky-100/80">
                     Read-only target conversation · state {managedConversationState(currentConversation)} · turn {managedTurnState(currentConversation)}
@@ -7774,13 +7774,14 @@ import X from 'lucide-svelte/icons/x';
                     <p class="mt-2 break-words text-xs text-rose-100">Last error: {currentConversation.managed_agent.last_error}</p>
                   {/if}
                 </div>
-                <div class="flex shrink-0 flex-wrap justify-end gap-2">
+                <div class="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:shrink-0 sm:flex-wrap sm:justify-end">
                   {#if managedConversationActive(currentConversation)}
-                    <Button size="sm" variant="danger" disabled={managedActionBusy !== null} onclick={stopManagedConversation}>
+                    <Button class="w-full sm:w-auto" size="sm" variant="danger" disabled={managedActionBusy !== null} onclick={stopManagedConversation}>
                       {managedActionBusy === 'stop' ? 'Stopping…' : 'Stop'}
                     </Button>
                   {/if}
                   <Button
+                    class="w-full sm:w-auto"
                     size="sm"
                     variant="secondary"
                     disabled={managedActionBusy !== null || managedConversationState(currentConversation) === 'closed' || managedConversationActive(currentConversation)}
@@ -7792,6 +7793,7 @@ import X from 'lucide-svelte/icons/x';
                     Send instruction
                   </Button>
                   <Button
+                    class={managedConversationActive(currentConversation) ? 'col-span-2 w-full sm:col-span-1 sm:w-auto' : 'w-full sm:w-auto'}
                     size="sm"
                     variant="secondary"
                     disabled={managedActionBusy !== null || managedConversationState(currentConversation) === 'closed' || managedConversationActive(currentConversation)}

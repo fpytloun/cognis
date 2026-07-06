@@ -59,7 +59,12 @@ from cognis.core.agent_loop import (
     _validate_step_completion_notification,
     _visible_allowed_tool_names,
 )
-from cognis.core.context_projection import ProjectionPolicy, ProjectionResult, ProjectionTurnState
+from cognis.core.context_projection import (
+    PressureMode,
+    ProjectionPolicy,
+    ProjectionResult,
+    ProjectionTurnState,
+)
 from cognis.core.events import EventType
 from cognis.core.followups import LLM_CYCLE_CEILING_CONTINUATION_REASON, ContinuationFollowUp
 from cognis.core.project_context import ProjectContextEntry
@@ -6549,6 +6554,116 @@ def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() ->
     assert ctx.projection_state.forced_critical_count == 1
     assert "Tool output omitted from prompt." in str(projected.messages[1]["content"])
     assert projected.messages[4]["content"] == "new result"
+
+
+def test_projection_oversized_result_under_budget_preserves_normal_mode_evidence() -> None:
+    loop = object.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(
+            count_messages_tokens=lambda _messages, _model: 90_000,
+            count_tokens=lambda text, _model=None: len(str(text)) // 4,
+        )
+    )
+    prior_messages = [
+        {"role": "user", "content": "inspect files"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-old",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-old",
+            "content": "old evidence\n" * 1_000,
+            "_tool_name": "read",
+            "_recovery_call_id": "call-old",
+            "_output_size": 13_000,
+            "_token_estimate": 3_250,
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-middle",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-middle",
+            "content": "middle evidence\n" * 1_000,
+            "_tool_name": "read",
+            "_recovery_call_id": "call-middle",
+            "_output_size": 16_000,
+            "_token_estimate": 4_000,
+        },
+    ]
+    policy = ProjectionPolicy.from_budget(
+        max_context_tokens=272_000,
+        available_prompt_tokens=250_240,
+        phase="within_turn",
+        pressure_mode="normal",
+    )
+    ctx = SimpleNamespace(
+        current_model="test-model",
+        current_model_info=SimpleNamespace(max_input_tokens=272_000, max_output_tokens=0),
+        agent=SimpleNamespace(llm_config=None),
+        turn_id="turn-1",
+        session=SimpleNamespace(session_id="sess-1"),
+        projection_state=ProjectionTurnState(
+            turn_id="turn-1",
+            policy=policy,
+            last_result=ProjectionResult(messages=prior_messages, mutable_start_index=0),
+            last_message_count=len(prior_messages),
+            last_projected_token_estimate=20_000,
+        ),
+    )
+    messages = prior_messages + [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-new",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-new",
+            "content": "new oversized evidence\n" * 2_000,
+            "_tool_name": "read",
+            "_recovery_call_id": "call-new",
+            "_output_size": 46_000,
+            "_token_estimate": policy.max_historical_tool_result_tokens + 1,
+        },
+    ]
+
+    projected = loop._project_model_messages_for_budget(
+        ctx,
+        messages=messages,
+        tool_schemas=[],
+        resolved_model="test-model",
+        max_context_tokens=272_000,
+    )
+
+    assert projected.mode == "normal"
+    assert ctx.projection_state.pressure_mode == PressureMode.normal
+    assert ctx.projection_state.forced_critical_count == 0
+    assert "old evidence" in str(projected.messages)
+    assert "middle evidence" in str(projected.messages)
+    assert "new oversized evidence" in str(projected.messages)
 
 
 def test_projection_skip_reprojects_when_tool_prefix_mutates() -> None:

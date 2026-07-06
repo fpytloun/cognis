@@ -1897,6 +1897,66 @@ async def test_evaluate_step_includes_actual_session_tool_events(
 
 
 @pytest.mark.asyncio
+async def test_evaluate_step_uses_persisted_deliverable_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    captured: dict[str, object] = {}
+    task = TaskModel(
+        task_id="task-deliverable",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        workflow_state=WorkflowState(),
+    )
+    step_def = StepDefinition(
+        name="execute",
+        type="run",
+        prompt="Write the final plain text summary.",
+        completion=CompletionConfig(evaluate=True),
+    )
+    workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
+    persisted_text = "🏠 Osobní\nHotovo.\n\nPozn.: závěrečná věta."
+    output = StepOutput(
+        summary="Summary written",
+        content=f"{persisted_text!r}, False",
+        deliverable_id="dlv_plain",
+        deliverable_format="plain",
+    )
+
+    async def _get_deliverable(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            deliverable_id="dlv_plain",
+            content=persisted_text,
+            version=2,
+            format="plain",
+            title="Evening summary",
+        )
+
+    async def _evaluate(**kwargs: object) -> StepEvaluation:
+        captured.update(kwargs)
+        return StepEvaluation(decision="approved", reasoning="Canonical content used")
+
+    monkeypatch.setattr(workflow_engine_module, "get_deliverable", _get_deliverable)
+    monkeypatch.setattr(engine._step_evaluator, "evaluate", _evaluate, raising=False)
+
+    result = await engine._evaluate_step(step_def, output, WorkflowState(), task, workflow)
+
+    assert result.decision == "approved"
+    evaluated_output = captured["step_output"]
+    assert isinstance(evaluated_output, StepOutput)
+    assert evaluated_output.content == persisted_text
+    assert evaluated_output.deliverable_version == 2
+    assert evaluated_output.deliverable_format == "plain"
+    assert evaluated_output.metadata["evaluator_deliverable_source"] == {
+        "source": "persisted_deliverable",
+        "deliverable_id": "dlv_plain",
+        "content_mirror_changed": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_execute_workflow_pauses_after_transient_executor_deferral_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

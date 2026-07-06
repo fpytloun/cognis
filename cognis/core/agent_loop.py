@@ -8831,7 +8831,40 @@ class AgentLoop:
                         )
                         continue
 
-                    content = str(tc.arguments.get("content", ""))
+                    raw_content = tc.arguments.get("content")
+                    if not isinstance(raw_content, str):
+                        err_content = json.dumps(
+                            {
+                                "status": "rejected",
+                                "reason": "invalid_content_type",
+                                "message": (
+                                    "write_deliverable.content must be a string. "
+                                    "Reissue write_deliverable with the exact deliverable text, "
+                                    "not an array, object, tuple-like value, or other type."
+                                ),
+                                "received_type": type(raw_content).__name__,
+                            }
+                        )
+                        messages.append(_tool_result_message(tc, err_content, protected=True))
+                        _append_tool_result_event(
+                            events_to_record,
+                            tc,
+                            err_content,
+                            True,
+                            tool_id=tool_id,
+                            protect_from_pruning=True,
+                        )
+                        await self._flush_events_incremental(
+                            ctx,
+                            events_to_record,
+                            reason="tool_result:write_deliverable",
+                            on_token=on_token,
+                        )
+                        if on_tool_result:
+                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
+                        continue
+
+                    content = raw_content
                     format_name = str(tc.arguments.get("format") or "markdown")
                     title = tc.arguments.get("title")
                     target = tc.arguments.get("target")

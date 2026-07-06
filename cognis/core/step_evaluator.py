@@ -262,7 +262,7 @@ class StepEvaluator:
         # Include a middle-truncated deliverable so the evaluator sees both
         # the opening contract evidence and closing conclusions without
         # exceeding the evaluator prompt budget.
-        formatted_content = middle_truncate(
+        formatted_content, _content_truncated = middle_truncate(
             step_output.content or "(no content produced)",
             _EVALUATOR_CONTENT_MAX_CHARS,
         )

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.2] - 2026-07-06
+
+### Fixed
+
+- Fixed workflow step evaluation so persisted deliverable content is used instead of stale transient output.
+- Fixed oversized context projection handling to avoid entering critical mode solely because of a single large tool result.
+- Improved the managed-conversation mobile footer layout in the chat UI.
+
 ## [0.11.0] - 2026-07-05
 
 ### Added

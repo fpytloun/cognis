@@ -440,8 +440,9 @@ def decide_pressure_mode(
     Hysteresis rules
     ----------------
     * ``normal → pressure``: usage ≥ ``PRESSURE_ESCALATE_FRACTION`` for 1 cycle.
-    * ``pressure → critical``: usage ≥ ``CRITICAL_ESCALATE_FRACTION`` for 1 cycle,
-      OR ``oversized_result_appended`` is True.
+    * ``pressure → critical``: usage ≥ ``CRITICAL_ESCALATE_FRACTION`` for 1 cycle.
+      Oversized tool results trigger a re-projection, but do not by themselves
+      imply total prompt pressure.
     * Demotion (any → lower): requires ``PRESSURE_DEMOTION_CYCLES`` consecutive
       cycles back under the lower band.
 
@@ -454,7 +455,7 @@ def decide_pressure_mode(
     usage = snapshot.prompt_tokens / snapshot.available_prompt_tokens
 
     # Escalation paths (immediate, no hysteresis needed for going up).
-    if snapshot.oversized_result_appended or usage >= CRITICAL_ESCALATE_FRACTION:
+    if usage >= CRITICAL_ESCALATE_FRACTION:
         return PressureMode.critical, 0
 
     if usage >= PRESSURE_ESCALATE_FRACTION:

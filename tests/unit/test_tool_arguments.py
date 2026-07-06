@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
-from cognis.tools.builtin.workflow import REQUEST_CREDENTIAL_TOOL, STEP_COMPLETE_TOOL
+from cognis.tools.builtin.workflow import (
+    REQUEST_CREDENTIAL_TOOL,
+    STEP_COMPLETE_TOOL,
+    WRITE_DELIVERABLE_TOOL,
+)
 
 _STEP_TODO_SCHEMA = {
     "type": "object",
@@ -105,6 +109,18 @@ def test_step_complete_summary_schema_rejects_blank_strings() -> None:
     assert isinstance(error, ToolArgumentError)
     assert error.reason == "schema_violation"
     assert any("summary" in line for line in error.errors)
+
+
+def test_write_deliverable_content_schema_rejects_non_string() -> None:
+    error = validate_tool_arguments(
+        "write_deliverable",
+        {"content": ["plain text", False]},
+        schema=WRITE_DELIVERABLE_TOOL.parameters,
+    )
+
+    assert isinstance(error, ToolArgumentError)
+    assert error.reason == "schema_violation"
+    assert any("content" in line and "string" in line for line in error.errors)
 
 
 def test_request_credential_schema_rejects_invalid_kind() -> None:

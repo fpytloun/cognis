@@ -885,7 +885,7 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.11.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.11.2", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
