@@ -4,18 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from cognis.api.chat_v2.cycles import cycle_states_from_items
 from cognis.api.chat_v2.item_keys import (
     KIND_RANK,
     assistant_message_item_id,
     late_runtime_timeline_sort_key,
+    pre_turn_runtime_timeline_sort_key,
     runtime_timeline_sort_key,
     thinking_item_id,
 )
 from cognis.api.chat_v2.schemas import (
     ChatRealtimeFrame,
+    CompactionTimelineItem,
+    FileDiffRef,
     MessageTimelineItem,
     RuntimeActiveTurn,
     RuntimeOverlaySnapshot,
@@ -24,20 +27,41 @@ from cognis.api.chat_v2.schemas import (
     ThinkingTimelineItem,
     TimelineItem,
     TimelineItemStatus,
+    TimelineScope,
     ToolCallTimelineItem,
 )
-from cognis.api.chat_v2.sync import PROJECTION_VERSION, runtime_epoch_for
+from cognis.api.chat_v2.sync import current_projection_version, runtime_epoch_for
 from cognis.models.artifact import AttachmentRef
+from cognis.models.config import GenerationPerformanceSnapshot
+
+
+def scope_accepts_runtime(
+    scope: TimelineScope,
+    *,
+    conversation_id: str,
+    active_session_id: str | None,
+) -> bool:
+    """Return whether runtime from a conversation belongs to a subscribed scope."""
+
+    if scope.missing_stream:
+        return False
+    if scope.conversation_id != conversation_id:
+        return False
+    if scope.kind == "conversation":
+        return True
+    return bool(scope.session_id and scope.session_id == active_session_id)
 
 
 def runtime_overlay_from_items(
     *,
     conversation_id: str,
+    scope: TimelineScope | None = None,
     runtime_revision: int,
     has_active_turn: bool,
     active_turn: Mapping[str, Any] | None,
     volatile_items: Sequence[TimelineItem],
     context_usage: Mapping[str, Any] | None = None,
+    last_generation: Mapping[str, Any] | None = None,
     generated_at: str | None = None,
 ) -> RuntimeOverlaySnapshot:
     """Build a strict Chat v2 runtime overlay from native TimelineItem models."""
@@ -47,7 +71,9 @@ def runtime_overlay_from_items(
         active_turn_model = RuntimeActiveTurn.model_validate(active_turn)
     sorted_volatile_items = sorted(list(volatile_items), key=lambda item: item.sort_key)
     return RuntimeOverlaySnapshot(
-        runtime_epoch=runtime_epoch_for(conversation_id),
+        runtime_epoch=runtime_epoch_for(
+            scope.key if scope is not None else f"conversation:{conversation_id}"
+        ),
         runtime_revision=runtime_revision,
         generated_at=generated_at or datetime.now(UTC).isoformat(),
         has_active_turn=active_turn_model is not None,
@@ -55,20 +81,32 @@ def runtime_overlay_from_items(
         volatile_items=sorted_volatile_items,
         cycle_states=cycle_states_from_items(sorted_volatile_items),
         context_usage=dict(context_usage) if context_usage is not None else None,
+        last_generation=(
+            GenerationPerformanceSnapshot.model_validate(last_generation)
+            if last_generation is not None
+            else None
+        ),
     )
 
 
 def runtime_frame(
     *,
     conversation_id: str,
+    scope: TimelineScope | None = None,
     cursor: str,
     runtime: RuntimeOverlaySnapshot,
     server_time: str | None = None,
 ) -> ChatRealtimeFrame:
     """Build a runtime-only Chat v2 frame without advancing the canonical cursor."""
 
+    resolved_scope = scope or TimelineScope(
+        key=f"conversation:{conversation_id}",
+        kind="conversation",
+        conversation_id=conversation_id,
+    )
     return ChatRealtimeFrame(
-        projection_version=PROJECTION_VERSION,
+        projection_version=current_projection_version(),
+        scope=resolved_scope,
         conversation_id=conversation_id,
         cursor_before=cursor,
         cursor_after=cursor,
@@ -76,6 +114,57 @@ def runtime_frame(
         cycle_states=runtime.cycle_states,
         runtime=runtime,
         server_time=server_time or datetime.now(UTC).isoformat(),
+    )
+
+
+def compaction_runtime_item(
+    event_data: Mapping[str, Any],
+    *,
+    status: Literal["running", "compacted", "failed", "skipped"] = "running",
+) -> CompactionTimelineItem | None:
+    """Project an in-flight compaction lifecycle event into the runtime overlay."""
+
+    session_id = _str(event_data.get("session_id"))
+    if session_id is None:
+        return None
+    previous_session_id = _str(event_data.get("previous_session_id"))
+    source_session_id = previous_session_id or session_id
+    timestamp = datetime.now(UTC).isoformat()
+    return CompactionTimelineItem(
+        id=f"compaction:{source_session_id}",
+        kind="compaction",
+        sort_key=pre_turn_runtime_timeline_sort_key(
+            kind_rank=KIND_RANK["compaction"],
+            local=0,
+        ),
+        source_refs=[
+            SourceRef(
+                store="runtime",
+                session_id=session_id,
+                seq=0,
+                event_type="session_compaction_started",
+            )
+        ],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status=status,
+        stable=False,
+        session_id=session_id,
+        previous_session_id=previous_session_id,
+        summary_preview=(
+            _str(event_data.get("summary_preview"))
+            or (
+                "Compacting conversation history…"
+                if status == "running"
+                else "Conversation compaction did not complete."
+            )
+        ),
+        method=_str(event_data.get("method")) or "pending",
+        turns_compacted=max(0, _int(event_data.get("turns_compacted")) or 0),
+        trigger=_str(event_data.get("trigger")),
+        reason=_str(event_data.get("reason")),
+        hard_pressure_exceeded=bool(event_data.get("hard_pressure_exceeded", False)),
+        used_timeout_fallback=bool(event_data.get("used_timeout_fallback", False)),
     )
 
 
@@ -93,29 +182,29 @@ def runtime_items_from_snapshots(
     items: list[TimelineItem] = []
 
     for index, snapshot in enumerate(active_streams or []):
-        item = assistant_stream_runtime_item(
+        message_item = assistant_stream_runtime_item(
             snapshot,
             local=index,
             phase_hint_items=phase_hint_items,
             chat_mode=chat_mode,
             chat_mode_source=chat_mode_source,
         )
-        if item is not None:
-            items.append(item)
+        if message_item is not None:
+            items.append(message_item)
 
     for index, snapshot in enumerate(active_tool_outputs or []):
-        item = tool_output_runtime_item(snapshot, local=index)
-        if item is not None:
-            items.append(item)
+        tool_item = tool_output_runtime_item(snapshot, local=index)
+        if tool_item is not None:
+            items.append(tool_item)
 
     think_local = 0
     for snapshot in active_thinking or []:
-        for item in thinking_runtime_items(
+        for thinking_item in thinking_runtime_items(
             snapshot,
             local_start=think_local,
             phase_hint_items=phase_hint_items,
         ):
-            items.append(item)
+            items.append(thinking_item)
             think_local += 1
 
     return sorted(items, key=lambda item: item.sort_key)
@@ -139,9 +228,9 @@ def assistant_stream_runtime_item(
     phase = _phase(snapshot.get("assistant_phase_index"))
     if phase is None:
         phase = _next_runtime_assistant_phase(phase_hint_items, turn_id)
-    turn_cycle_index = _phase(snapshot.get("turn_cycle_index"))
-    if turn_cycle_index is None:
-        turn_cycle_index = _next_runtime_turn_cycle(phase_hint_items, turn_id, phase)
+    turn_cycle_index = _cycle(snapshot.get("turn_cycle_index"))
+    if "turn_cycle_index" not in snapshot and phase is not None:
+        turn_cycle_index = phase
     timestamp = _str(snapshot.get("updated_at"))
     return MessageTimelineItem(
         id=assistant_message_item_id(message_id=message_id, phase=phase),
@@ -206,7 +295,12 @@ def assistant_completion_runtime_item(
         message_id=message_id,
         turn_id=turn_id or message_id,
         assistant_phase_index=phase,
-        turn_cycle_index=turn_cycle_index if isinstance(turn_cycle_index, int) else None,
+        # Preserve None (do NOT coerce to 0). The completion frame shares the
+        # streamed item's id, and the client merges turn_cycle_index as
+        # `incoming ?? existing`. Coercing an unknown cycle to 0 would clobber
+        # the correct streamed cycle and make the settled message fold into the
+        # cycle-0 tool group. A genuine None lets the client keep what streamed.
+        turn_cycle_index=_phase(turn_cycle_index),
         partial=partial,
         chat_mode=cast(Any, chat_mode) if chat_mode in {"default", "plan", "build"} else None,
         chat_mode_source=chat_mode_source if isinstance(chat_mode_source, str) else None,
@@ -243,7 +337,7 @@ def tool_call_runtime_item(
         tool_name=tool_name,
         turn_id=turn_id,
         assistant_phase_index=assistant_phase_index,
-        turn_cycle_index=turn_cycle_index,
+        turn_cycle_index=_cycle(turn_cycle_index),
         arguments=arguments,
         arguments_preview=_preview(arguments),
     )
@@ -286,13 +380,12 @@ def tool_result_runtime_item(
         tool_name=tool_name,
         turn_id=turn_id,
         assistant_phase_index=assistant_phase_index,
-        turn_cycle_index=turn_cycle_index,
+        turn_cycle_index=_cycle(turn_cycle_index),
         result_preview=result,
-        streamed_output=result,
         is_error=is_error,
         duration_ms=duration_ms if isinstance(duration_ms, int) else None,
         attachments=_attachments(attachments),
-        file_diffs=file_diffs or [],
+        file_diffs=[FileDiffRef.model_validate(diff) for diff in file_diffs or []],
         output_size=_int(presentation.get("output_size")) or len(result),
         truncated=bool(presentation.get("truncated")),
         has_full_output=bool(presentation.get("has_full_output")),
@@ -333,12 +426,11 @@ def tool_output_runtime_item(
         tool_name=tool_name,
         turn_id=_str(snapshot.get("turn_id")),
         assistant_phase_index=phase,
-        turn_cycle_index=_phase(snapshot.get("turn_cycle_index")),
+        turn_cycle_index=_cycle(snapshot.get("turn_cycle_index")),
         arguments=snapshot.get("arguments")
         if isinstance(snapshot.get("arguments"), dict)
         else None,
         result_preview=result_text or None,
-        streamed_output=result_text or None,
         is_error=snapshot.get("is_error") is True,
         output_size=output_size,
         truncated=snapshot.get("truncated") is True,
@@ -350,6 +442,9 @@ def tool_output_runtime_item(
         progress_input_lines=_int(snapshot.get("progress_input_lines")),
         progress_complete=snapshot.get("progress_complete")
         if isinstance(snapshot.get("progress_complete"), bool)
+        else None,
+        managed_conversation=snapshot.get("managed_conversation")
+        if isinstance(snapshot.get("managed_conversation"), dict)
         else None,
     )
 
@@ -367,9 +462,9 @@ def thinking_runtime_items(
     phase = _phase(snapshot.get("assistant_phase_index"))
     if phase is None:
         phase = _next_runtime_assistant_phase(phase_hint_items, turn_id)
-    turn_cycle_index = _phase(snapshot.get("turn_cycle_index"))
-    if turn_cycle_index is None:
-        turn_cycle_index = _next_runtime_turn_cycle(phase_hint_items, turn_id, phase)
+    turn_cycle_index = _cycle(snapshot.get("turn_cycle_index"))
+    if "turn_cycle_index" not in snapshot and phase is not None:
+        turn_cycle_index = phase
     raw_blocks = snapshot.get("blocks")
     if not isinstance(raw_blocks, list):
         return []
@@ -378,7 +473,7 @@ def thinking_runtime_items(
     for offset, raw_block in enumerate(raw_blocks):
         if not isinstance(raw_block, Mapping):
             continue
-        block_id = _str(raw_block.get("block_id"))
+        block_id = _thinking_runtime_block_id(snapshot, raw_block, offset)
         content = raw_block.get("content")
         if not block_id or not isinstance(content, str) or not content:
             continue
@@ -418,6 +513,26 @@ def thinking_runtime_items(
     return items
 
 
+def _thinking_runtime_block_id(
+    snapshot: Mapping[str, Any], raw_block: Mapping[str, Any], offset: int
+) -> str | None:
+    explicit = _str(raw_block.get("block_id")) or _str(raw_block.get("id"))
+    if explicit:
+        return explicit
+    first_block_id = _str(snapshot.get("first_block_id"))
+    if first_block_id:
+        return first_block_id if offset == 0 else f"{first_block_id}:{offset}"
+    seq = (
+        _int(raw_block.get("seq"))
+        or _int(raw_block.get("source_seq"))
+        or _int(snapshot.get("seq"))
+        or _int(snapshot.get("source_seq"))
+    )
+    if seq is not None:
+        return f"seq-{seq}" if offset == 0 else f"seq-{seq}:{offset}"
+    return f"block-{offset}"
+
+
 def delegation_runtime_item(
     event_data: Mapping[str, Any], *, timestamp: str
 ) -> ToolCallTimelineItem | None:
@@ -443,12 +558,12 @@ def delegation_runtime_item(
             local=0,
         )
     )
-    delegation = {
+    delegation: dict[str, Any] = {
         "child_session_id": event_data.get("child_session_id") or event_data.get("session_id"),
         "status": status,
         "turn_id": _str(event_data.get("turn_id")),
         "assistant_phase_index": phase,
-        "turn_cycle_index": _phase(event_data.get("turn_cycle_index")),
+        "turn_cycle_index": _cycle(event_data.get("turn_cycle_index")),
         "agent_id": event_data.get("agent_id") or event_data.get("used_agent_id"),
         "used_agent_id": event_data.get("used_agent_id"),
         "title": event_data.get("title") or event_data.get("task_title") or event_data.get("label"),
@@ -481,7 +596,7 @@ def delegation_runtime_item(
         tool_name=str(tool_name),
         turn_id=_str(event_data.get("turn_id")),
         assistant_phase_index=phase,
-        turn_cycle_index=_phase(event_data.get("turn_cycle_index")),
+        turn_cycle_index=_cycle(event_data.get("turn_cycle_index")),
         delegation=delegation,
     )
 
@@ -504,9 +619,11 @@ def _next_runtime_assistant_phase(
     if not items:
         return None
     phases = [
-        item.assistant_phase_index
+        phase
         for item in items or []
-        if getattr(item, "turn_id", None) == turn_id and isinstance(item.assistant_phase_index, int)
+        if getattr(item, "turn_id", None) == turn_id
+        for phase in [getattr(item, "assistant_phase_index", None)]
+        if isinstance(phase, int)
     ]
     if phases:
         return max(phases) + 1
@@ -517,23 +634,6 @@ def _next_runtime_assistant_phase(
         and item.role == "assistant"
         and item.turn_id == turn_id
     )
-
-
-def _next_runtime_turn_cycle(
-    items: Sequence[TimelineItem] | None,
-    turn_id: str | None,
-    phase: int | None,
-) -> int | None:
-    if not turn_id:
-        return phase
-    cycles = [
-        item.turn_cycle_index
-        for item in items or []
-        if getattr(item, "turn_id", None) == turn_id and isinstance(item.turn_cycle_index, int)
-    ]
-    if cycles:
-        return max(cycles) + 1
-    return phase
 
 
 def _delegation_status(data: Mapping[str, Any]) -> str:
@@ -586,3 +686,8 @@ def _int(value: Any) -> int | None:
 
 def _phase(value: Any) -> int | None:
     return value if isinstance(value, int) and value >= 0 else None
+
+
+def _cycle(value: Any) -> int:
+    phase = _phase(value)
+    return phase if phase is not None else 0

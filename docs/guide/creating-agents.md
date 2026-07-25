@@ -67,9 +67,10 @@ Knowledgebase assignment is separate from tool assignment: `allowed_knowledgebas
 controls which KBs the agent can access, while knowledgebase tools control what
 the agent can do with those KBs.
 
-Use `manage_agents` tool CRUD actions (`tools_list_available`, `tools_get`,
-`tools_validate`, `tools_set/add/remove`, and `knowledgebases_*`) rather than
-guessing tool IDs or editing raw blobs.
+Use `manage_agents` tool CRUD actions (`tools_get`, `tools_set/add/remove`, and
+`knowledgebases_*`) rather than guessing tool IDs or editing raw blobs. Use
+`search_tools`, `describe_tool`, and `validate_tool_call` for authorized discovery,
+operation semantics, and mutation preflight.
 
 ### Additional executors (Stage 36)
 

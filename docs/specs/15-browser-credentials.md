@@ -558,6 +558,11 @@ Likely follow-ups:
 ### `browser_open`
 
 - creates or reuses a browser session in a lease
+- binds the lease and any in-flight persistent-profile reservation to the
+  executor-provided execution scope plus safe session, conversation, user,
+  agent, and direct-parent lineage metadata
+- only the owning execution may reuse or operate the session; a guessed
+  `session_id` does not grant access
 - defaults to headless mode
 - may accept `auth_state_ref`
 - may accept `browser_settings` with context-creation-only overrides:
@@ -566,6 +571,46 @@ Likely follow-ups:
 - rejects attempts to reuse an existing session with conflicting
   `browser_settings`; callers must use a new session or close/reopen
 - must fail if the selected executor does not support the requested mode
+
+### Browser lifecycle inspection and release
+
+- `browser_list_sessions` returns only sessions visible to the current
+  execution. Results include safe owner relationship (`self` or
+  `managed_descendant`) and lifecycle state, but never credential or auth
+  payloads.
+- `browser_list_profiles` hides profiles currently held by unrelated active
+  sessions. `include_unclaimed=true` also reports non-empty legacy profiles
+  without ownership metadata as `legacy_unclaimed`, without exposing profile
+  contents, but only when the selected executor is privately owned by the
+  acting user. Shared executors fail closed. `reclaim_stale=true` reruns
+  conservative local `SingletonLock` recovery for crash leftovers; it does not
+  override a live process lock.
+- Existing non-empty profiles without `.cognis-owner.json` fail closed after
+  upgrade and are never auto-claimed. After the user or operator verifies that
+  Chromium is stopped and identifies the owning Cognis user, an agent can call
+  `browser_claim_profile` with `confirm_profile_id` exactly matching
+  `profile_id`. The non-bypassable mutation atomically writes ownership for the
+  current authenticated user only when that user also privately owns the
+  selected executor, refuses active/locked profiles, and never transfers
+  profiles with existing ownership metadata. For a legacy shared executor, an
+  operator must first reconfigure it as private for the verified profile owner;
+  the owner can then complete the claim through browser tools without
+  filesystem surgery. Moving or deleting the legacy profile remains the safe
+  alternative when ownership cannot be established.
+- `browser_close` is idempotent. The owner may always release its session.
+  With `release_managed_descendant=true`, a controller execution may release
+  a directly linked child whose recorded `parent_session_id` and user match.
+  It cannot release an active unrelated session.
+- Idle reaping closes sessions rather than merely hiding them. Ephemeral
+  sessions use the 60-second ephemeral timeout unless a positive per-session
+  timeout is supplied. Executor shutdown and failed-open rollback continue to
+  close all executor-local resources.
+- Lifecycle failures distinguish unauthenticated ownership context, missing
+  sessions, expired sessions, unauthorized access, and locked profiles through
+  `browser_lifecycle_error` metadata where the handler returns a tool result.
+- Ownership remains executor-local. Remote executors enforce the same rules
+  because `execution_scope_id` and runtime lineage metadata are transported
+  with each tool call; no distributed lock service is introduced.
 
 ### `browser_fill`
 

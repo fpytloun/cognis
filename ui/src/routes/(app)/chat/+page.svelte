@@ -18,6 +18,8 @@
   let loading = true;
   let error = '';
   let noAgents = false;
+  let loadingSlow = false;
+  let loadingSlowTimer: ReturnType<typeof setTimeout> | null = null;
 
   function storedAgentIds(value: string | null): string[] {
     if (!value || value === 'all') return [];
@@ -77,48 +79,75 @@
     window.localStorage.setItem(lastOpenedConversationStorageKey(conversation.agent_id), entry);
   }
 
-  onMount(() => {
-    void (async () => {
-      try {
-        const agents = await api.agents.listAll();
+  function clearLoadingSlowTimer(): void {
+    if (loadingSlowTimer !== null) {
+      clearTimeout(loadingSlowTimer);
+      loadingSlowTimer = null;
+    }
+  }
 
-        // Conversation-first restore: use the last-opened conversation's agent
-        // as the primary agent for the open request. This ensures PWA cold-starts
-        // (where sessionStorage is empty) always restore the genuinely last-active
-        // chat rather than defaulting to the first primary agent's latest conversation.
-        const globalEntry = globalLastOpenedEntry();
-        const globalAgentId = globalEntry?.agent_id ?? null;
-        const primary = agents.filter((a) => a.agent_type === 'primary');
+  function startLoadingSlowTimer(): void {
+    clearLoadingSlowTimer();
+    loadingSlow = false;
+    loadingSlowTimer = setTimeout(() => {
+      loadingSlowTimer = null;
+      loadingSlow = true;
+    }, 10_000);
+  }
 
-        // Resolve the agent to request: prefer the last-opened conversation's
-        // agent if it is still active, otherwise fall back to the UI selection.
-        const resolvedAgentId = (
-          globalAgentId && primary.some((a) => a.agent_id === globalAgentId && a.status === 'active')
-            ? globalAgentId
-            : getSelectedAgentId(agents)
-        );
+  async function openDefaultConversation(): Promise<void> {
+    loading = true;
+    error = '';
+    noAgents = false;
+    startLoadingSlowTimer();
+    try {
+      const agents = await api.agents.listAll();
 
-        if (!resolvedAgentId) {
-          noAgents = true;
-          loading = false;
-          return;
-        }
+      // Conversation-first restore: use the last-opened conversation's agent
+      // as the primary agent for the open request. This ensures PWA cold-starts
+      // (where sessionStorage is empty) always restore the genuinely last-active
+      // chat rather than defaulting to the first primary agent's latest conversation.
+      const globalEntry = globalLastOpenedEntry();
+      const globalAgentId = globalEntry?.agent_id ?? null;
+      const primary = agents.filter((a) => a.agent_type === 'primary');
 
-        const candidates = lastOpenedConversationCandidates(resolvedAgentId);
-        const conversation = await api.conversations.open({
-          agent_id: resolvedAgentId,
-          context_type: 'web',
-          candidate_conversations: candidates,
-          candidate_conversation_ids: candidates.map((candidate) => candidate.conversation_id),
-        });
-        rememberOpenedConversation(conversation);
-        await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
-      } catch (caughtError) {
-        error = caughtError instanceof Error ? caughtError.message : 'Unable to load conversations.';
-      } finally {
+      // Resolve the agent to request: prefer the last-opened conversation's
+      // agent if it is still active, otherwise fall back to the UI selection.
+      const resolvedAgentId = (
+        globalAgentId && primary.some((a) => a.agent_id === globalAgentId && a.status === 'active')
+          ? globalAgentId
+          : getSelectedAgentId(agents)
+      );
+
+      if (!resolvedAgentId) {
+        noAgents = true;
         loading = false;
+        return;
       }
-    })();
+
+      const candidates = lastOpenedConversationCandidates(resolvedAgentId);
+      const conversation = await api.conversations.open({
+        agent_id: resolvedAgentId,
+        context_type: 'web',
+        include_state: false,
+        candidate_conversations: candidates,
+        candidate_conversation_ids: candidates.map((candidate) => candidate.conversation_id),
+      });
+      rememberOpenedConversation(conversation);
+      await goto(`/chat/${conversation.conversation_id}`, { replaceState: true });
+    } catch (caughtError) {
+      error = caughtError instanceof Error ? caughtError.message : 'Unable to load conversations.';
+    } finally {
+      loading = false;
+      clearLoadingSlowTimer();
+    }
+  }
+
+  onMount(() => {
+    void openDefaultConversation();
+    return () => {
+      clearLoadingSlowTimer();
+    };
   });
 </script>
 
@@ -127,7 +156,18 @@
 </svelte:head>
 
 {#if loading}
-  <LoadingState label="Opening chat" description="Resolving your default conversation." />
+  {#if loadingSlow}
+    <section class="rounded-3xl border border-sky-500/30 bg-sky-500/10 px-6 py-10 text-center text-sm text-sky-100">
+      <p class="font-medium">Chat is still opening.</p>
+      <p class="mt-2 text-sky-50/80">Resolving your default conversation is taking longer than expected.</p>
+      <div class="mt-4 flex justify-center gap-3">
+        <Button variant="secondary" onclick={() => void openDefaultConversation()}>Retry</Button>
+        <Button onclick={() => goto('/chat/new')}>Start a new conversation</Button>
+      </div>
+    </section>
+  {:else}
+    <LoadingState label="Opening chat" description="Resolving your default conversation." />
+  {/if}
 {:else if noAgents}
   <section class="rounded-3xl border border-sky-500/30 bg-sky-500/10 px-6 py-10 text-center text-sm text-sky-100">
     <p>Create an agent first before starting a conversation.</p>

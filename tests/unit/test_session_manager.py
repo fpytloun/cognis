@@ -6,12 +6,59 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognis.core.session import SessionManager, _map_cognis_to_intaris_status
-from cognis.models.session import ConversationContext, EventAppendResult, SessionEvent, SessionModel
+from cognis.core.session import (
+    SessionManager,
+    _explicit_profile_for_fork,
+    _map_cognis_to_intaris_status,
+)
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    EventAppendResult,
+    SessionEvent,
+    SessionModel,
+)
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
 from cognis.store.queries import get_conversation, get_session_row, list_conversation_sessions
+
+
+def test_fork_preserves_only_target_agent_explicit_profile() -> None:
+    conversation = ConversationModel(
+        conversation_id="conv",
+        user_email="user@example.com",
+        agent_id="primary",
+        agent_profile_id="primary-chat",
+        context=ConversationContext(type="web"),
+    )
+    primary_session = SessionModel(
+        session_id="sess-primary",
+        conversation_id="conv",
+        user_email="user@example.com",
+        agent_id="primary",
+        agent_profile_id="session-chat",
+    )
+    secondary_session = primary_session.model_copy(
+        update={"session_id": "sess-secondary", "agent_id": "secondary"}
+    )
+
+    assert (
+        _explicit_profile_for_fork(
+            primary_session,
+            conversation,
+            target_agent_id="primary",
+        )
+        == "session-chat"
+    )
+    assert (
+        _explicit_profile_for_fork(
+            secondary_session,
+            conversation,
+            target_agent_id="primary",
+        )
+        is None
+    )
 
 
 class _Guardrails:
@@ -417,6 +464,11 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
         intention="Continued after compaction",
         completion_reason="compacted",
         compaction_summary="Summary of older turns.",
+        compaction_summary_event_data={
+            "method": "llm",
+            "turns_compacted": 5,
+            "status": "compacted",
+        },
     )
 
     # Verify new session
@@ -461,6 +513,12 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
         key == f"{new_session.session_id}:compaction_summary:rotation"
         and events
         and getattr(events[0], "type", None) == "compaction_summary"
+        and events[0].data["session_id"] == new_session.session_id
+        and events[0].data["source_session_id"] == root_session.session_id
+        and events[0].data["method"] == "llm"
+        and events[0].data["timeline_visible"] is True
+        and events[0].data["turns_compacted"] == 5
+        and events[0].data["status"] == "compacted"
         for session_id, events, key in providers.guardrails.recorded_events
         if session_id == new_session.session_id
     )

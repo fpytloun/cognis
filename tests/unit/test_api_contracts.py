@@ -16,8 +16,6 @@ import pytest
 from pydantic import ValidationError
 
 from cognis.api.models import (
-    ActiveThinkingBlockResponse,
-    ActiveThinkingSnapshotResponse,
     AgentGrantResponse,
     AgentResponse,
     CreateScheduleRequest,
@@ -28,7 +26,6 @@ from cognis.api.models import (
     ModelRoutingResponse,
     PendingPauseResponse,
     ScheduleResponse,
-    SessionEventsResponse,
     SkillResponse,
     SkillVersionResponse,
     StepProfileResponse,
@@ -174,34 +171,6 @@ def test_executor_token_response_allows_non_expiring_tokens() -> None:
     response = ExecutorTokenResponse(executor_id="exec-1", token="jwt", expires_in=None)
 
     assert response.expires_in is None
-
-
-def test_session_events_response_round_trips_active_thinking() -> None:
-    response = SessionEventsResponse(
-        session_id="sess-1",
-        items=[],
-        active_thinking=[
-            ActiveThinkingSnapshotResponse(
-                session_id="sess-1",
-                message_id="sr-1",
-                turn_id="sr-1",
-                blocks=[
-                    ActiveThinkingBlockResponse(
-                        block_id="thk-1",
-                        title="Considering options",
-                        content="Considering options for the task",
-                        started_at="2026-04-20T00:00:00Z",
-                        duration_ms=1200,
-                    )
-                ],
-                updated_at="2026-04-20T00:00:00Z",
-            )
-        ],
-    )
-
-    assert response.active_thinking[0].message_id == "sr-1"
-    assert response.active_thinking[0].blocks[0].content == "Considering options for the task"
-    assert response.active_thinking[0].blocks[0].duration_ms == 1200
 
 
 def test_search_responses_round_trip_current_intaris_shape() -> None:

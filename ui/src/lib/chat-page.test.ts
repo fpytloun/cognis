@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   buildConversationUrl,
@@ -16,6 +16,7 @@ import {
   conversationStatusFilterForConversation,
   conversationTurnModeTone,
   conversationUpdatedRowPatch,
+  hasUnreadFromConversationTimestamps,
   DEFAULT_INITIAL_TIMELINE_LIMIT,
   DIRECT_CHAT_INITIAL_SESSION_LIMIT,
   DIRECT_CHAT_INITIAL_TIMELINE_LIMIT,
@@ -31,6 +32,9 @@ import {
   lastOpenedConversationEntry,
   lastOpenedConversationStorageKey,
   mergeConversationPreservingActivity,
+  mergeConversationRowPatch,
+  mergeSidebarConversationRows,
+  removeSidebarConversationRow,
   normalizeChatModeTone,
   nextChatAutoScrollState,
   nextChatScrollState,
@@ -49,27 +53,168 @@ import {
   shouldAdoptConversationSessionId,
   shouldSuppressPreSessionSocketError,
   isCurrentConversationLoad,
+  nextControllerRecoveryDelayMs,
+  shouldContinueControllerRecovery,
   parseConversationStatusFilter,
   setConversationStatusSearchParam,
   nextPollDelayMs,
   nextConversationLoadId,
   shouldReconcileAfterReconnect,
+  shouldApplyLegacyLifecycleFrame,
+  resolveTurnActivityAuthority,
+  applyRuntimeAuthoritySequence,
+  LEGACY_LIFECYCLE_EVENT_TYPES,
+  conversationStatePatchForAuthority,
+  conversationStateTurnActivity,
   shouldPreserveLiveTailOnResize,
   chatScrollDimensionsChanged,
   shouldApplyScrollRestore,
+  anchoredScrollTop,
+  timelineWindowEnd,
+  timelineWindowSize,
+  timelineWindowHasHiddenTail,
+  shouldAutoLoadOlderForViewport,
+  expandWindowUp,
+  expandWindowUpPreservingLiveTail,
+  expandWindowDown,
+  windowAfterPrepend,
+  windowAfterViewportFillBackfill,
+  clampWindow,
+  freezeTailWindow,
+  TIMELINE_WINDOW_TARGET_ROWS,
+  TIMELINE_WINDOW_PAGE_ROWS,
+  TIMELINE_WINDOW_MAX_ROWS,
   shouldAttemptStaleRuntimeRefresh,
+  shouldApplyPendingNotificationRefresh,
   shouldDebounceConversationViewRefresh,
+  shouldDebounceSidebarResync,
+  shouldRecoverMissingConversationRow,
+  shouldResetPendingDirectQuestionForm,
+  shouldApplyChatSendFailureSideEffects,
+  shouldApplyChatV2Recovery,
+  shouldClearRecoverableRetry,
+  settleWithTimeout,
   shouldRefreshForStaleRuntime,
   isRuntimeSnapshotOlderThanView,
   isTimelinePatchStale,
+  isConversationSwitchStale,
   CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX,
+  ChatV2ConversationLifecycle,
+  CONVERSATION_SWITCH_TIMEOUT_MS,
   CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS,
+  MISSING_CONVERSATION_RECOVERY_COOLDOWN_MS,
+  SIDEBAR_RESYNC_MIN_INTERVAL_MS,
   STALE_RUNTIME_REFRESH_BACKOFF_MS,
   STALE_RUNTIME_REFRESH_MAX_ATTEMPTS
 } from '$lib/chat-page';
-import type { SidebarProjection } from '$lib/types/api';
+import { conversationTimelineScope } from '$lib/chat-v2/types';
+import type { Conversation, SidebarProjection } from '$lib/types/api';
+
+describe('recoverable turn retry state', () => {
+  it('clears a stale retry affordance after the server rejects retry eligibility', () => {
+    expect(shouldClearRecoverableRetry({ code: 'retry_turn_not_available' })).toBe(true);
+    expect(shouldClearRecoverableRetry({ code: 'retry_source_not_persisted' })).toBe(true);
+    expect(shouldClearRecoverableRetry({ code: 'executor_unavailable' })).toBe(false);
+  });
+});
 
 describe('chat page helpers', () => {
+  it('keeps canonical runtime authoritative over reordered legacy lifecycle frames', () => {
+    expect(shouldApplyLegacyLifecycleFrame(true)).toBe(false);
+    expect(resolveTurnActivityAuthority({
+      chatV2OwnsConversation: true,
+      canonicalActive: false,
+      legacyActive: true,
+    })).toBe(false);
+    expect(resolveTurnActivityAuthority({
+      chatV2OwnsConversation: true,
+      canonicalActive: true,
+      legacyActive: false,
+    })).toBe(true);
+    expect(resolveTurnActivityAuthority({
+      chatV2OwnsConversation: false,
+      canonicalActive: false,
+      legacyActive: true,
+    })).toBe(true);
+    const staleFrames = LEGACY_LIFECYCLE_EVENT_TYPES.map((type, index) => ({
+      type,
+      active: index % 2 === 0,
+    }));
+    expect(applyRuntimeAuthoritySequence({
+      chatV2OwnsConversation: true,
+      canonicalActive: true,
+      legacyFrames: staleFrames,
+    })).toBe(true);
+    expect(applyRuntimeAuthoritySequence({
+      chatV2OwnsConversation: true,
+      canonicalActive: false,
+      legacyFrames: staleFrames,
+    })).toBe(false);
+  });
+
+  it('strips lifecycle fields from stale state snapshot and delta patches under ChatV2', () => {
+    const stale = {
+      has_active_turn: false,
+      active_session_status: 'completed',
+      active_turn_chat_mode: 'default',
+      pending_notification_types: ['question'],
+      title: 'Metadata survives',
+    };
+    expect(conversationStatePatchForAuthority(stale, true)).toEqual({
+      pending_notification_types: ['question'],
+      title: 'Metadata survives',
+    });
+    expect(conversationStatePatchForAuthority(stale, false)).toBe(stale);
+    let active = true;
+    active = conversationStateTurnActivity({
+      currentActive: active,
+      snapshotActive: false,
+      hasPendingInput: true,
+      chatV2OwnsConversation: true,
+    });
+    active = conversationStateTurnActivity({
+      currentActive: active,
+      snapshotActive: false,
+      hasPendingInput: false,
+      chatV2OwnsConversation: true,
+    });
+    expect(active).toBe(true);
+    active = false;
+    active = conversationStateTurnActivity({
+      currentActive: active,
+      snapshotActive: true,
+      hasPendingInput: false,
+      chatV2OwnsConversation: true,
+    });
+    expect(active).toBe(false);
+  });
+  it('main page lifecycle acquires on the initial snapshot and only updates on recovery/reset snapshots', () => {
+    const calls: string[] = [];
+    const realtime = {
+      acquireChatV2: (_scope: ReturnType<typeof conversationTimelineScope>, cursor: string) => calls.push(`acquire:${cursor}`),
+      updateChatV2Cursor: (_scope: ReturnType<typeof conversationTimelineScope>, cursor: string) => calls.push(`cursor:${cursor}`),
+      releaseChatV2: (scopeKey: string) => calls.push(`release:${scopeKey}`),
+    };
+    const lifecycle = new ChatV2ConversationLifecycle(realtime);
+    const scope = conversationTimelineScope('conv-main');
+
+    lifecycle.acceptSnapshot(scope, 'initial');
+    lifecycle.acceptSnapshot(scope, 'recovery-1');
+    lifecycle.acceptSnapshot(scope, 'reset-1');
+    lifecycle.acceptSnapshot(scope, 'recovery-2');
+    lifecycle.release();
+    lifecycle.release();
+
+    expect(calls).toEqual([
+      'acquire:initial',
+      'cursor:recovery-1',
+      'cursor:reset-1',
+      'cursor:recovery-2',
+      'release:conversation:conv-main',
+    ]);
+    expect(lifecycle.scopeKey).toBe(null);
+  });
+
   it('uses the default initial timeline size for topic conversations', () => {
     expect(conversationInitialLoadPolicy({
       conversation_id: 'conv-topic',
@@ -139,17 +284,70 @@ describe('chat page helpers', () => {
     expect(isTimelinePatchStale(99, 0)).toBe(false);
   });
 
+  it('bounds conversation switch visual state by elapsed time', () => {
+    const startedAt = 1_000;
+    expect(isConversationSwitchStale({
+      startedAt,
+      now: startedAt + CONVERSATION_SWITCH_TIMEOUT_MS - 1
+    })).toBe(false);
+    expect(isConversationSwitchStale({
+      startedAt,
+      now: startedAt + CONVERSATION_SWITCH_TIMEOUT_MS
+    })).toBe(true);
+    expect(isConversationSwitchStale({
+      startedAt: 0,
+      now: startedAt + CONVERSATION_SWITCH_TIMEOUT_MS
+    })).toBe(false);
+  });
+
+  it('only applies Chat v2 recovery results for the current route conversation', () => {
+    expect(shouldApplyChatV2Recovery('conv-source', 'conv-source')).toBe(true);
+    expect(shouldApplyChatV2Recovery('conv-source', 'conv-target')).toBe(false);
+    expect(shouldApplyChatV2Recovery('', 'conv-target')).toBe(false);
+  });
+
+  it('only applies failed-send side effects for the current route conversation', () => {
+    expect(shouldApplyChatSendFailureSideEffects('conv-source', 'conv-source')).toBe(true);
+    expect(shouldApplyChatSendFailureSideEffects('conv-source', 'conv-target')).toBe(false);
+    expect(shouldApplyChatSendFailureSideEffects('', 'conv-target')).toBe(false);
+  });
+
+  it('settles never-ending subload promises as rejected timeout results', async () => {
+    vi.useFakeTimers();
+    try {
+      const resultPromise = settleWithTimeout(new Promise<string>(() => {}), 25, 'Subload');
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      const result = await resultPromise;
+      expect(result.status).toBe('rejected');
+      if (result.status === 'rejected') {
+        expect(result.reason).toBeInstanceOf(Error);
+        expect(String(result.reason.message)).toContain('Subload timed out');
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('prefers the pending tool call over stale direct-question kind when classifying input requests', () => {
     expect(pendingInputRequestKind({
       pendingDirectKind: 'auth_challenge',
       pendingStepTool: {
         id: 'tool:call_question',
         kind: 'tool_call',
-        callId: 'call_question',
-        toolName: 'step_request_questions',
-        status: 'started',
-        timestamp: '2026-01-01T00:00:00Z',
+        sort_key: '0001',
+        source_refs: [],
+        stable: false,
+        call_id: 'call_question',
+        tool_name: 'step_request_questions',
+        status: 'waiting',
         arguments: { questions: [{ id: 'q1', question: 'Continue?' }] },
+        is_error: false,
+        attachments: [],
+        file_diffs: [],
+        truncated: false,
+        has_full_output: false,
       },
     })).toBe('question');
 
@@ -158,11 +356,18 @@ describe('chat page helpers', () => {
       pendingStepTool: {
         id: 'tool:call_auth',
         kind: 'tool_call',
-        callId: 'call_auth',
-        toolName: 'request_auth_challenge',
-        status: 'started',
-        timestamp: '2026-01-01T00:00:00Z',
+        sort_key: '0002',
+        source_refs: [],
+        stable: false,
+        call_id: 'call_auth',
+        tool_name: 'request_auth_challenge',
+        status: 'waiting',
         arguments: { required_fields: ['confirmed'] },
+        is_error: false,
+        attachments: [],
+        file_diffs: [],
+        truncated: false,
+        has_full_output: false,
       },
     })).toBe('auth_challenge');
   });
@@ -210,6 +415,212 @@ describe('chat page helpers', () => {
       last_message_at: '2026-01-01T00:05:00.000Z',
       updated_at: '2026-01-01T00:05:01.000Z',
     });
+  });
+
+  it('does not let a stale sidebar row re-arm completed runtime state', () => {
+    const existing = {
+      conversation_id: 'conv-a',
+      updated_at: '2026-01-01T00:05:01.000Z',
+      has_active_turn: false,
+      active_session_status: 'completed',
+      pending_notification_types: [],
+    } as never;
+    const incoming = {
+      conversation_id: 'conv-a',
+      updated_at: '2026-01-01T00:01:01.000Z',
+      has_active_turn: true,
+      active_session_status: 'running',
+      pending_notification_types: ['step_question'],
+    } as never;
+
+    expect(mergeConversationPreservingActivity(existing, incoming)).toMatchObject({
+      has_active_turn: false,
+      active_session_status: 'completed',
+      pending_notification_types: [],
+    });
+  });
+
+  it('resets a pending-question form only for a different notification', () => {
+    expect(shouldResetPendingDirectQuestionForm('notification-a', 'notification-a')).toBe(false);
+    expect(shouldResetPendingDirectQuestionForm('notification-a', 'notification-b')).toBe(true);
+    expect(shouldResetPendingDirectQuestionForm(null, 'notification-a')).toBe(true);
+  });
+
+  it('does not re-dot unread when a late frame predates local mark-read', () => {
+    const existing = {
+      conversation_id: 'conv-1',
+      last_message_at: '2026-01-01T00:00:10.000Z',
+      last_read_at: '2026-01-01T00:00:20.000Z',
+      has_unread: false,
+    } as Conversation;
+
+    const merged = mergeConversationRowPatch(existing, {
+      has_unread: true,
+      last_message_at: '2026-01-01T00:00:10.000Z',
+      last_read_at: '2026-01-01T00:00:05.000Z',
+    });
+
+    expect(merged.last_read_at).toBe('2026-01-01T00:00:20.000Z');
+    expect(merged.has_unread).toBe(false);
+  });
+
+  it('never regresses sidebar read or message timestamps while merging rows', () => {
+    const existing = {
+      conversation_id: 'conv-1',
+      last_message_at: '2026-01-01T00:00:20.000Z',
+      last_read_at: '2026-01-01T00:00:15.000Z',
+      has_unread: true,
+    } as Conversation;
+
+    const merged = mergeConversationRowPatch(existing, {
+      last_message_at: '2026-01-01T00:00:10.000Z',
+      last_read_at: '2026-01-01T00:00:05.000Z',
+    });
+
+    expect(merged.last_message_at).toBe('2026-01-01T00:00:20.000Z');
+    expect(merged.last_read_at).toBe('2026-01-01T00:00:15.000Z');
+    expect(merged.has_unread).toBe(true);
+    expect(hasUnreadFromConversationTimestamps(
+      '2026-01-01T00:00:20.000Z',
+      '2026-01-01T00:00:20.000Z',
+    )).toBe(false);
+  });
+
+  it('debounces sidebar resync after a recent successful sync', () => {
+    expect(shouldDebounceSidebarResync({
+      lastSuccessfulSyncAt: 10_000,
+      now: 10_000 + SIDEBAR_RESYNC_MIN_INTERVAL_MS - 1,
+    })).toBe(true);
+    expect(shouldDebounceSidebarResync({
+      lastSuccessfulSyncAt: 10_000,
+      now: 10_000 + SIDEBAR_RESYNC_MIN_INTERVAL_MS,
+    })).toBe(false);
+    expect(shouldDebounceSidebarResync({
+      lastSuccessfulSyncAt: 0,
+      now: 10_000,
+    })).toBe(false);
+  });
+
+  it('recovers unknown rows for unread or attention patches and dedupes by cooldown', () => {
+    const attempts = new Map<string, number>();
+
+    expect(shouldRecoverMissingConversationRow({
+      conversationId: 'conv-1',
+      patch: { title: 'metadata only' } as Partial<Conversation>,
+      lastAttemptByConversation: attempts,
+      now: 10_000,
+    })).toBe(false);
+
+    expect(shouldRecoverMissingConversationRow({
+      conversationId: 'conv-1',
+      patch: { has_unread: true },
+      lastAttemptByConversation: attempts,
+      now: 10_000,
+    })).toBe(true);
+    attempts.set('conv-1', 10_000);
+
+    expect(shouldRecoverMissingConversationRow({
+      conversationId: 'conv-1',
+      patch: { pending_notification_types: ['credential_request'] },
+      lastAttemptByConversation: attempts,
+      now: 10_000 + MISSING_CONVERSATION_RECOVERY_COOLDOWN_MS - 1,
+    })).toBe(false);
+
+    expect(shouldRecoverMissingConversationRow({
+      conversationId: 'conv-1',
+      patch: { active_session_status: 'failed' },
+      lastAttemptByConversation: attempts,
+      now: 10_000 + MISSING_CONVERSATION_RECOVERY_COOLDOWN_MS,
+    })).toBe(true);
+  });
+
+  it('discards stale pending-notification refresh responses', () => {
+    expect(shouldApplyPendingNotificationRefresh({
+      requestEpoch: 2,
+      currentEpoch: 2,
+    })).toBe(true);
+    expect(shouldApplyPendingNotificationRefresh({
+      requestEpoch: 2,
+      currentEpoch: 3,
+    })).toBe(false);
+  });
+
+  it('lets server-pushed pending types win over a stale refetch epoch', () => {
+    const requestEpoch = 4;
+    const serverPushEpoch = 5;
+
+    expect(shouldApplyPendingNotificationRefresh({
+      requestEpoch,
+      currentEpoch: serverPushEpoch,
+    })).toBe(false);
+  });
+
+  it('merges sidebar upsert rows without replacing the whole list', () => {
+    const baseConversation = (id: string, lastMessageAt: string | null): Conversation => ({
+      conversation_id: id,
+      user_email: 'user@example.test',
+      agent_id: 'agent-a',
+      agent_profile_id: null,
+      project_id: null,
+      title: id,
+      title_source: 'manual',
+      context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
+      active_session_id: null,
+      active_executor_id: null,
+      active_executor_assigned_at: null,
+      active_executor_expires_at: null,
+      active_executor_source: null,
+      active_session_status: null,
+      active_session_completion_reason: null,
+      active_turn_chat_mode: null,
+      active_turn_chat_mode_source: null,
+      pending_notification_types: [],
+      starred_at: null,
+      status: 'active',
+      last_message_at: lastMessageAt,
+      last_read_at: null,
+      has_unread: false,
+      has_active_turn: false,
+      managed_agent: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: lastMessageAt,
+      conversation_state: null,
+    });
+    const existing = [
+      baseConversation('conv-a', '2026-01-01T00:02:00.000Z'),
+      baseConversation('conv-b', '2026-01-01T00:01:00.000Z'),
+    ];
+
+    const merged = mergeSidebarConversationRows(existing, [
+      { ...baseConversation('conv-b', '2026-01-01T00:03:00.000Z'), title: 'Updated' },
+    ]);
+
+    expect(merged.map((conversation) => conversation.conversation_id)).toEqual(['conv-b', 'conv-a']);
+    expect(merged[0].title).toBe('Updated');
+    expect(merged).toHaveLength(2);
+
+    const inserted = mergeSidebarConversationRows(existing, [
+      baseConversation('conv-c', '2026-01-01T00:04:00.000Z'),
+    ]);
+    expect(inserted.map((conversation) => conversation.conversation_id)).toEqual([
+      'conv-c',
+      'conv-a',
+      'conv-b',
+    ]);
+  });
+
+  it('removes a sidebar conversation row without disturbing the rest of the list', () => {
+    const rows = [
+      { conversation_id: 'conv-a' },
+      { conversation_id: 'conv-b' },
+      { conversation_id: 'conv-c' },
+    ] as Conversation[];
+
+    expect(removeSidebarConversationRow(rows, 'conv-b').map((row) => row.conversation_id)).toEqual([
+      'conv-a',
+      'conv-c',
+    ]);
+    expect(removeSidebarConversationRow(rows, 'conv-missing')).toEqual(rows);
   });
 
   it('groups conversation history by last message activity date', () => {
@@ -669,6 +1080,34 @@ describe('chat page helpers', () => {
     ).toBe(true);
   });
 
+  it('detects a retryable failed turn from structured model_error notice metadata', () => {
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
+        {
+          kind: 'system_message',
+          text: 'Turn failed: anthropic-lumilens rate-limited claude-fable-5 after 1 attempt(s).',
+          noticeKind: 'model_error',
+          noticeScope: 'failed_turn',
+        },
+      ])
+    ).toBe(true);
+  });
+
+  it('does not treat non-failed-turn model_error notices as retryable', () => {
+    expect(
+      hasRetryableFailedTurnTail([
+        { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
+        {
+          kind: 'system_message',
+          text: 'Model provider changed.',
+          noticeKind: 'model_error',
+          noticeScope: 'diagnostic',
+        },
+      ])
+    ).toBe(false);
+  });
+
   it('does not offer failed-turn retry after a completed assistant reply for the same turn', () => {
     expect(
       hasRetryableFailedTurnTail([
@@ -928,18 +1367,13 @@ describe('chat page helpers', () => {
   it('only adopts websocket session ids while the conversation has no active root session yet', () => {
     expect(shouldAdoptConversationSessionId(null, 'turn_started', 'sess_root')).toBe(true);
     expect(shouldAdoptConversationSessionId(null, 'message_complete', 'sess_root')).toBe(true);
-    expect(shouldAdoptConversationSessionId(null, 'timeline_patch', 'sess_child')).toBe(false);
+     expect(shouldAdoptConversationSessionId(null, 'delegation_started', 'sess_child')).toBe(false);
     expect(shouldAdoptConversationSessionId('sess_existing', 'message_complete', 'sess_child')).toBe(false);
   });
 
-  it('filters child-session timeline events but keeps parent lifecycle events visible', () => {
-    expect(isForeignSessionTimelineEvent({
-      eventType: 'timeline_patch',
-      eventSessionId: 'sess_child',
-      rootSessionId: 'sess_root',
-    })).toBe(true);
-    expect(isForeignSessionTimelineEvent({
-      eventType: 'message_complete',
+   it('filters child-session events but keeps parent lifecycle events visible', () => {
+     expect(isForeignSessionTimelineEvent({
+       eventType: 'message_complete',
       eventSessionId: 'sess_child',
       rootSessionId: 'sess_root',
     })).toBe(true);
@@ -948,8 +1382,8 @@ describe('chat page helpers', () => {
       eventSessionId: 'sess_child',
       rootSessionId: 'sess_root',
     })).toBe(false);
-    expect(isForeignSessionTimelineEvent({
-      eventType: 'timeline_patch',
+     expect(isForeignSessionTimelineEvent({
+       eventType: 'message_complete',
       eventSessionId: 'sess_root',
       rootSessionId: 'sess_root',
     })).toBe(false);
@@ -1214,6 +1648,212 @@ describe('chat page helpers', () => {
     })).toBe(false);
   });
 
+  describe('timeline render window', () => {
+    it('resolves end and detects a hidden tail', () => {
+      expect(timelineWindowEnd({ start: 0, end: null }, 300)).toBe(300);
+      expect(timelineWindowEnd({ start: 0, end: 150 }, 300)).toBe(150);
+      expect(timelineWindowEnd({ start: 0, end: 500 }, 300)).toBe(300);
+      expect(timelineWindowHasHiddenTail({ start: 0, end: 150 }, 300)).toBe(true);
+      expect(timelineWindowHasHiddenTail({ start: 0, end: null }, 300)).toBe(false);
+      expect(timelineWindowSize({ start: 100, end: 250 }, 300)).toBe(150);
+    });
+
+    it('auto-loads older rows when collapsed groups leave the viewport under-filled', () => {
+      expect(shouldAutoLoadOlderForViewport({
+        visibleStartIndex: 400,
+        hasOlderMessages: false,
+        loadingOlderMessages: false,
+        scrollHeight: 520,
+        clientHeight: 640,
+      })).toBe(true);
+
+      expect(shouldAutoLoadOlderForViewport({
+        visibleStartIndex: 0,
+        hasOlderMessages: true,
+        loadingOlderMessages: false,
+        scrollHeight: 640,
+        clientHeight: 640,
+      })).toBe(true);
+    });
+
+    it('does not auto-load older rows when the viewport is scrollable or exhausted', () => {
+      expect(shouldAutoLoadOlderForViewport({
+        visibleStartIndex: 0,
+        hasOlderMessages: false,
+        loadingOlderMessages: false,
+        scrollHeight: 520,
+        clientHeight: 640,
+      })).toBe(false);
+
+      expect(shouldAutoLoadOlderForViewport({
+        visibleStartIndex: 400,
+        hasOlderMessages: false,
+        loadingOlderMessages: false,
+        scrollHeight: 900,
+        clientHeight: 640,
+      })).toBe(false);
+
+      expect(shouldAutoLoadOlderForViewport({
+        visibleStartIndex: 400,
+        hasOlderMessages: false,
+        loadingOlderMessages: true,
+        scrollHeight: 520,
+        clientHeight: 640,
+      })).toBe(false);
+    });
+
+    it('expands upward one page, bounding the mounted span', () => {
+      // Already windowed onto older rows (finite end) far from the tail.
+      const total = 1000;
+      const w0 = { start: 400, end: 500 };
+      const w1 = expandWindowUp(w0, total);
+      expect(w1.start).toBe(400 - TIMELINE_WINDOW_PAGE_ROWS);
+      // The end is bounded so the mounted span never exceeds max.
+      expect(w1.end).toBe(w1.start + TIMELINE_WINDOW_MAX_ROWS);
+      expect(timelineWindowSize(w1, total)).toBeLessThanOrEqual(TIMELINE_WINDOW_MAX_ROWS);
+    });
+
+    it('expands upward from a live tail, staying live when max reaches the end', () => {
+      // start 350 + max 150 == total 500 -> the whole tail fits, stays live.
+      const w1 = expandWindowUp({ start: 400, end: null }, 500);
+      expect(w1.start).toBe(350);
+      expect(w1.end).toBeNull();
+    });
+
+    it('auto-fill expansion preserves a live tail even when the raw span exceeds the steady-state cap', () => {
+      let window = { start: 900, end: null } as { start: number; end: number | null };
+      const total = 1000;
+
+      for (let i = 0; i < 4; i += 1) {
+        window = expandWindowUpPreservingLiveTail(window, total);
+      }
+
+      expect(window.start).toBe(900 - (4 * TIMELINE_WINDOW_PAGE_ROWS));
+      expect(window.end).toBeNull();
+      expect(timelineWindowSize(window, total)).toBeGreaterThan(TIMELINE_WINDOW_MAX_ROWS);
+    });
+
+    it('auto-fill expansion still uses capped paging for non-live windows', () => {
+      const total = 1000;
+      const window = expandWindowUpPreservingLiveTail({ start: 400, end: 500 }, total);
+      expect(window.start).toBe(400 - TIMELINE_WINDOW_PAGE_ROWS);
+      expect(timelineWindowSize(window, total)).toBeLessThanOrEqual(TIMELINE_WINDOW_MAX_ROWS);
+    });
+
+    it('expands downward one page — the missing inverse that remounts newer rows', () => {
+      const total = 500;
+      // Windowed onto older rows with a hidden tail.
+      const w0 = { start: 200, end: 300 };
+      const w1 = expandWindowDown(w0, total);
+      expect(timelineWindowEnd(w1, total)).toBe(300 + TIMELINE_WINDOW_PAGE_ROWS);
+      expect(timelineWindowSize(w1, total)).toBeLessThanOrEqual(TIMELINE_WINDOW_MAX_ROWS);
+
+      // Repeated downward expansion eventually reaches the tail and goes live.
+      let w = { start: 0, end: 60 } as { start: number; end: number | null };
+      const small = 80;
+      for (let i = 0; i < 10 && w.end !== null; i += 1) {
+        w = expandWindowDown(w, small);
+      }
+      expect(w.end).toBeNull();
+    });
+
+    it('shows the fetched older page AND keeps newer rows mounted after a prepend', () => {
+      // Before: rendered rows [0,150) of a 200-row timeline (start 50 after
+      // paging up). Prepend 100 older rows -> total 300, indices shift by 100.
+      const before = { start: 50, end: 150 };
+      const prepended = 100;
+      const total = 300;
+      const after = windowAfterPrepend(before, prepended, total);
+      // The fetched older page [0,100) MUST be visible (start at 0) — the user
+      // scrolled to the top to load it.
+      expect(after.start).toBe(0);
+      // The same newer rows that were rendered before must still be mounted:
+      // prior end 150 shifts to 250 (no tail cut).
+      expect(timelineWindowEnd(after, total)).toBe(250);
+    });
+
+    it('backfill at the very top reveals the fetched page (regression)', () => {
+      // User at the top (start 0), 150-row window; backfill prepends 100.
+      const after = windowAfterPrepend({ start: 0, end: 150 }, 100, 300);
+      // The just-fetched older rows must render, not be hidden behind start.
+      expect(after.start).toBe(0);
+      expect(timelineWindowEnd(after, 300)).toBe(250);
+    });
+
+    it('caps the mounted span for a pathological prepend, fetched page wins', () => {
+      const maxSpan = TIMELINE_WINDOW_MAX_ROWS * 3;
+      const after = windowAfterPrepend({ start: 0, end: 1000 }, 100, 2000);
+      expect(after.start).toBe(0);
+      expect(timelineWindowEnd(after, 2000)).toBe(maxSpan);
+    });
+
+    it('windowAfterPrepend handles an unbounded (live) prior end', () => {
+      // User was at the live tail (end null) over a 100-row timeline, prepend 40.
+      const after = windowAfterPrepend({ start: 0, end: null }, 40, 140);
+      // Everything fits -> stays live, fetched page visible.
+      expect(after.start).toBe(0);
+      expect(after.end).toBeNull();
+    });
+
+    it('viewport-fill backfill preserves the live tail for under-filled collapsed groups', () => {
+      const after = windowAfterViewportFillBackfill(
+        { start: 0, end: null },
+        100,
+        600,
+        true,
+      );
+
+      expect(after.start).toBe(0);
+      expect(after.end).toBeNull();
+      expect(timelineWindowSize(after, 600)).toBe(600);
+    });
+
+    it('viewport-fill backfill keeps capped prepend behavior when live-tail preservation is off', () => {
+      const after = windowAfterViewportFillBackfill(
+        { start: 0, end: null },
+        100,
+        600,
+        false,
+      );
+
+      expect(after.start).toBe(0);
+      expect(timelineWindowEnd(after, 600)).toBe(TIMELINE_WINDOW_MAX_ROWS * 3);
+    });
+
+    it('freezeTailWindow hides appends while scrolled up, never cuts on no growth', () => {
+      // Live tail, 100 rows previously; 3 new rows appended -> freeze at 100.
+      const frozen = freezeTailWindow({ start: 0, end: null }, 103, 100);
+      expect(frozen.end).toBe(100);
+      // No growth -> clamp only, stays live.
+      const unchanged = freezeTailWindow({ start: 0, end: null }, 100, 100);
+      expect(unchanged.end).toBeNull();
+      // Already bounded -> clamp, unaffected.
+      const bounded = freezeTailWindow({ start: 0, end: 80 }, 120, 90);
+      expect(bounded.end).toBe(80);
+    });
+
+    it('clampWindow collapses a full-tail end to null', () => {
+      expect(clampWindow({ start: 0, end: 300 }, 300).end).toBeNull();
+      expect(clampWindow({ start: 400, end: 100 }, 300)).toEqual({ start: 100, end: 100 });
+    });
+  });
+
+  it('anchors a scroll restore to a reference row offset (immune to tail cut)', () => {
+    // Reference row moved DOWN by 500px (older content prepended above it).
+    // The tail may have been cut below simultaneously — irrelevant to the math.
+    expect(anchoredScrollTop({
+      currentScrollTop: 200,
+      anchorTopBefore: 100,
+      anchorTopAfter: 600,
+    })).toBe(700);
+    // No movement -> no change.
+    expect(anchoredScrollTop({
+      currentScrollTop: 1000,
+      anchorTopBefore: 40,
+      anchorTopAfter: 40,
+    })).toBe(1000);
+  });
+
   it('debounces opportunistic view refreshes but never gap-driven ones', () => {
     const now = 100_000;
 
@@ -1321,5 +1961,20 @@ describe('isTimelinePatchStale gating', () => {
     // Before any events are processed, activeSessionLastSeq=0. A patch with
     // last_seq=5 should not be flagged stale — it's the first real patch.
     expect(isTimelinePatchStale(5, 0)).toBe(false);
+  });
+});
+
+describe('controller recovery backoff', () => {
+  it('uses capped exponential retries while the controller is unavailable', () => {
+    expect(nextControllerRecoveryDelayMs(0)).toBe(1_000);
+    expect(nextControllerRecoveryDelayMs(1)).toBe(2_000);
+    expect(nextControllerRecoveryDelayMs(5)).toBe(30_000);
+    expect(nextControllerRecoveryDelayMs(20)).toBe(30_000);
+  });
+
+  it('stops automatic retries after the bounded controller recovery budget', () => {
+    expect(shouldContinueControllerRecovery(0)).toBe(true);
+    expect(shouldContinueControllerRecovery(7)).toBe(true);
+    expect(shouldContinueControllerRecovery(8)).toBe(false);
   });
 });

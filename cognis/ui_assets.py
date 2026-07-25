@@ -10,11 +10,129 @@ Provides two mechanisms:
 
 from __future__ import annotations
 
+import json
 import mimetypes
+import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from starlette.responses import FileResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+STANDALONE_ASSET_URL_PREFIX = "/api/v1/deliverables/standalone-assets"
+_STANDALONE_ENTRY_KEY = "src/standalone.ts"
+_VITE_HASHED_ASSET = re.compile(r".*-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+$")
+
+
+@dataclass(frozen=True)
+class StandaloneAssetManifest:
+    """Resolved standalone client entry and its directly loaded styles."""
+
+    directory: Path
+    script: str
+    styles: tuple[str, ...]
+
+
+def resolve_standalone_build_dir() -> Path | None:
+    """Return the preferred standalone Vite build directory."""
+
+    repo_dir = Path(__file__).resolve().parents[1] / "ui" / "standalone-build"
+    if (repo_dir / ".vite" / "manifest.json").is_file():
+        return repo_dir
+
+    package_dir = Path(__file__).resolve().parent / "ui_dist" / "standalone"
+    if (package_dir / ".vite" / "manifest.json").is_file():
+        return package_dir
+
+    return None
+
+
+def resolve_standalone_manifest() -> StandaloneAssetManifest | None:
+    """Resolve and validate the standalone Vite entry manifest."""
+
+    directory = resolve_standalone_build_dir()
+    if directory is None:
+        return None
+    raw = _load_standalone_manifest(directory)
+    if not isinstance(raw, dict):
+        return None
+    entry = raw.get(_STANDALONE_ENTRY_KEY)
+    if not isinstance(entry, dict) or entry.get("isEntry") is not True:
+        return None
+    script = entry.get("file")
+    styles = entry.get("css", [])
+    if (
+        not isinstance(script, str)
+        or not isinstance(styles, list)
+        or not all(isinstance(style, str) for style in styles)
+    ):
+        return None
+    paths = (script, *styles)
+    if any(_resolve_confined_standalone_asset(directory, path) is None for path in paths):
+        return None
+    return StandaloneAssetManifest(directory=directory, script=script, styles=tuple(styles))
+
+
+def standalone_asset_url(relative_path: str) -> str:
+    """Return the same-origin URL for one standalone Vite asset."""
+
+    return f"{STANDALONE_ASSET_URL_PREFIX}/{relative_path}"
+
+
+def resolve_standalone_asset(
+    relative_path: str,
+    *,
+    directory: Path | None = None,
+) -> Path | None:
+    """Resolve one manifest-listed standalone asset without allowing traversal."""
+
+    build_dir = directory or resolve_standalone_build_dir()
+    if build_dir is None:
+        return None
+    manifest = _load_standalone_manifest(build_dir)
+    if manifest is None or relative_path not in _standalone_manifest_assets(manifest):
+        return None
+    return _resolve_confined_standalone_asset(build_dir, relative_path)
+
+
+def _load_standalone_manifest(directory: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads((directory / ".vite" / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _standalone_manifest_assets(manifest: dict[str, Any]) -> set[str]:
+    assets: set[str] = set()
+    for item in manifest.values():
+        if not isinstance(item, dict):
+            continue
+        file = item.get("file")
+        if isinstance(file, str):
+            assets.add(file)
+        for key in ("css", "assets"):
+            values = item.get(key)
+            if isinstance(values, list):
+                assets.update(value for value in values if isinstance(value, str))
+    return assets
+
+
+def _resolve_confined_standalone_asset(directory: Path, relative_path: str) -> Path | None:
+    if not relative_path or "\\" in relative_path:
+        return None
+    parts = Path(relative_path).parts
+    if any(part in {"", ".", ".."} for part in parts) or parts[0] != "assets":
+        return None
+    if _VITE_HASHED_ASSET.fullmatch(parts[-1]) is None:
+        return None
+    try:
+        resolved = (directory / relative_path).resolve()
+        resolved.relative_to(directory.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
 
 
 def resolve_ui_build_dir() -> Path | None:

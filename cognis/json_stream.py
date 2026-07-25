@@ -62,6 +62,18 @@ def merge_incremental_json_fragment(existing: str, incoming: str) -> Incremental
     object before retrying with a complete corrected object. This helper
     preserves the longest known valid accumulation and prefers a later complete
     object over concatenating corruption into the final payload.
+
+    Replacement is only applied when the incoming complete object is at least
+    as long as the existing accumulation. A large in-progress accumulation for
+    a big tool call (e.g. ``write_deliverable`` with substantial content) is
+    normally still-unparseable simply because it isn't finished yet, not
+    because it is corrupt. If a later, unrelated, *smaller* fragment happens to
+    parse as a complete JSON object on its own, it must never be allowed to
+    discard a longer legitimate accumulation — that would silently truncate the
+    tool call to a fraction of its intended arguments. Genuine "invalid partial
+    then complete corrected replay" recoveries are, in practice, at least as
+    long as what came before, so this preserves that behavior while closing the
+    truncation gap.
     """
 
     if not incoming:
@@ -78,7 +90,28 @@ def merge_incremental_json_fragment(existing: str, incoming: str) -> Incremental
 
     existing_object = _parse_json_object(existing)
     incoming_object = _parse_json_object(incoming)
-    if existing_object is None and incoming_object is not None:
+    if (
+        incoming_object is not None
+        and existing_object is None
+        and len(incoming) >= len(existing)
+    ):
+        return IncrementalJsonMergeResult(merged=incoming, emitted=incoming, replaced=True)
+    if (
+        incoming_object is not None
+        and existing_object is not None
+        and existing_object != incoming_object
+    ):
+        # Both the accumulation and the incoming fragment are complete,
+        # divergent, top-level JSON objects. Tool-call arguments are always a
+        # single top-level object, so two distinct complete objects on the same
+        # stream index are a provider double-feed (the same logical call resent
+        # with corrected/divergent arguments), never two intended parallel
+        # calls (those arrive on separate stream indexes). Concatenating them
+        # would corrupt the arguments and, downstream, fabricate a second tool
+        # call. Prefer the later complete object as the corrected replay even
+        # when it is shorter. The length guard applies only while the existing
+        # accumulation is incomplete; once both values are complete objects,
+        # appending either one is always invalid.
         return IncrementalJsonMergeResult(merged=incoming, emitted=incoming, replaced=True)
 
     max_overlap = min(len(existing), len(incoming))

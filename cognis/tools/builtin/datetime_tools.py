@@ -8,7 +8,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.relativedelta import relativedelta
 
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.tools.registry import ToolExecutionContext
 
 _BUILTIN_SOURCE = ToolSource(type="builtin")

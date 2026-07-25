@@ -15,7 +15,7 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { addToast } from '$lib/stores/toasts';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
+  import type { CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, SecretMetadata, Skill, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -23,6 +23,7 @@
   let tools = $state<EffectiveToolItem[]>([]);
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
+  let memoryBackends = $state<MemoryBackendDescriptor[]>([]);
   let executors = $state<ExecutorConfig[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
   let credentials = $state<CredentialMetadata[]>([]);
@@ -60,6 +61,7 @@
       try { skills = await api.skills.list(); } catch { skills = []; }
       try { executors = await api.executor.list(); } catch { executors = []; }
       try { providers = (await api.llmProviders.list()).items; } catch { providers = []; }
+      try { memoryBackends = (await api.agents.memoryBackends()).items; } catch { memoryBackends = []; }
       try { intarisMcpServers = await api.tools.intarisMcpServers(); } catch { intarisMcpServers = []; }
 
       // Update form with system workflows pre-selected
@@ -139,6 +141,6 @@
       <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Agent creator</p>
       <h1 class="mt-1 text-2xl font-semibold text-white">Create agent</h1>
     </div>
-    <AgentForm mode="create" {form} {tools} {workflows} {providers} {executors} {secrets} {credentials} {knowledgebases} {skills} {intarisMcpServers} {saving} {error} onSave={saveAgent} />
+    <AgentForm mode="create" {form} {tools} {workflows} {providers} {memoryBackends} {executors} {secrets} {credentials} {knowledgebases} {skills} {intarisMcpServers} {saving} {error} onSave={saveAgent} />
   </section>
 {/if}

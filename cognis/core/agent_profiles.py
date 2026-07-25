@@ -8,6 +8,40 @@ from hashlib import sha256
 from cognis.models.agent import AgentDefinition, AgentRuntimeProfile
 
 
+def agent_profile_options(agent: AgentDefinition) -> list[dict[str, str | bool]]:
+    """Return enabled runtime profiles in a tool-friendly discovery shape."""
+
+    options = [
+        {
+            "profile_id": profile_id,
+            "description": profile.description,
+            "is_default": profile_id == agent.default_agent_profile_id,
+            "synthetic": False,
+        }
+        for profile_id, profile in sorted(agent.agent_profiles.items())
+        if profile.enabled
+    ]
+    if options:
+        return options
+    return [
+        {
+            "profile_id": "default",
+            "description": "Synthetic default profile derived from the agent LLM configuration.",
+            "is_default": True,
+            "synthetic": True,
+        }
+    ]
+
+
+def format_available_agent_profiles(agent: AgentDefinition) -> str:
+    """Format discoverable profile IDs and descriptions for validation errors."""
+
+    return "; ".join(
+        f"{option['profile_id']}: {option['description']}"
+        for option in agent_profile_options(agent)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedAgentProfile:
     """Effective runtime profile for one agent execution."""
@@ -19,6 +53,8 @@ class ResolvedAgentProfile:
     model: str | None
     reasoning_effort: str | None
     system_prompt_extra: str | None
+    memory_enabled: bool | None
+    memory_backend_options: dict[str, object]
     description: str
     synthetic: bool = False
 
@@ -44,11 +80,20 @@ class ResolvedAgentProfile:
 
 
 def requested_agent_profile_id(session: object, conversation: object | None = None) -> str | None:
-    """Return the persisted profile request for a session/conversation pair."""
+    """Return the effective explicit or turn-scoped profile request."""
+
+    return requested_agent_profile_selection(session, conversation)[0]
+
+
+def requested_agent_profile_selection(
+    session: object,
+    conversation: object | None = None,
+) -> tuple[str | None, str | None]:
+    """Return the profile request and provenance for an interactive turn."""
 
     session_profile = getattr(session, "agent_profile_id", None)
     if isinstance(session_profile, str) and session_profile.strip():
-        return session_profile.strip()
+        return session_profile.strip(), "session"
     session_agent_id = getattr(session, "agent_id", None)
     conversation_agent_id = getattr(conversation, "agent_id", None)
     if (
@@ -57,11 +102,25 @@ def requested_agent_profile_id(session: object, conversation: object | None = No
         and isinstance(conversation_agent_id, str)
         and session_agent_id != conversation_agent_id
     ):
-        return None
+        return None, None
     conversation_profile = getattr(conversation, "agent_profile_id", None)
     if isinstance(conversation_profile, str) and conversation_profile.strip():
-        return conversation_profile.strip()
-    return None
+        return conversation_profile.strip(), "conversation"
+    channel_profile = getattr(session, "channel_default_agent_profile_id", None)
+    if isinstance(channel_profile, str) and channel_profile.strip():
+        return channel_profile.strip(), "channel_default"
+    return None, None
+
+
+def resolve_conversation_agent_profile(
+    agent: AgentDefinition,
+    session: object,
+    conversation: object | None = None,
+) -> ResolvedAgentProfile:
+    """Resolve an interactive turn using persisted overrides before channel fallback."""
+
+    profile_id, source = requested_agent_profile_selection(session, conversation)
+    return resolve_agent_profile(agent, profile_id, source=source or "explicit")
 
 
 def normalize_agent_profile_id(value: object) -> str | None:
@@ -77,6 +136,19 @@ def normalize_agent_profile_id(value: object) -> str | None:
     if "/" in normalized:
         raise ValueError("agent_profile_id must not contain '/'")
     return normalized
+
+
+def validate_agent_profile_configuration(agent: AgentDefinition) -> None:
+    """Validate configured default profile integrity without changing fallback semantics."""
+
+    default_id = normalize_agent_profile_id(agent.default_agent_profile_id)
+    if default_id is None:
+        return
+    default = agent.agent_profiles.get(default_id)
+    if default is None:
+        raise ValueError("default_agent_profile_id must reference an existing runtime profile")
+    if not default.enabled:
+        raise ValueError("default_agent_profile_id must reference an enabled runtime profile")
 
 
 def resolve_agent_profile(
@@ -99,7 +171,8 @@ def resolve_agent_profile(
             if requested == "default":
                 return _synthetic_default(agent, requested_profile_id=requested, source=source)
             raise ValueError(
-                f"Agent profile '{requested}' does not exist for agent '{agent.agent_id}'"
+                f"Agent profile '{requested}' does not exist for agent '{agent.agent_id}'. "
+                f"Available profiles: {format_available_agent_profiles(agent)}"
             )
         return _resolved_from_profile(requested, profile, requested, source)
 
@@ -127,6 +200,8 @@ def _synthetic_default(
         model=llm_config.model if llm_config else None,
         reasoning_effort=llm_config.reasoning_effort if llm_config else None,
         system_prompt_extra=None,
+        memory_enabled=None,
+        memory_backend_options={},
         description="Synthetic default profile derived from the agent LLM configuration.",
         synthetic=True,
     )
@@ -153,15 +228,32 @@ def _resolved_from_profile(
         model=profile.model,
         reasoning_effort=profile.reasoning_effort,
         system_prompt_extra=profile.system_prompt_extra,
+        memory_enabled=profile.memory_enabled,
+        memory_backend_options=dict(profile.memory_backend_options),
         description=profile.description,
         synthetic=False,
     )
 
 
-def render_agent_profile_context(resolved: ResolvedAgentProfile) -> str | None:
+def agent_switch_eligible_profiles(agent: AgentDefinition) -> list[tuple[str, str]]:
+    """Return enabled profiles an agent may select dynamically."""
+
+    return [
+        (profile_id, profile.description)
+        for profile_id, profile in sorted((getattr(agent, "agent_profiles", {}) or {}).items())
+        if profile.enabled and profile.agent_switchable
+    ]
+
+
+def render_agent_profile_context(
+    resolved: ResolvedAgentProfile,
+    *,
+    switch_eligible_profiles: list[tuple[str, str]] | None = None,
+) -> str | None:
     """Render the dynamic prompt block for a resolved runtime profile."""
 
-    if not resolved.system_prompt_extra and resolved.synthetic:
+    eligible_profiles = switch_eligible_profiles or []
+    if not resolved.system_prompt_extra and resolved.synthetic and not eligible_profiles:
         return None
     lines = [
         "<agent_runtime_profile>",
@@ -172,8 +264,9 @@ def render_agent_profile_context(resolved: ResolvedAgentProfile) -> str | None:
         lines.append(f"Description: {resolved.description}")
     lines.extend(
         [
-            "This profile may tune runtime behavior and inference only. It does not redefine "
-            "identity, memory scope, ownership, permissions, tools, or audit identity.",
+            "This profile may tune runtime behavior, inference, and provider-owned memory "
+            "behavior only. It does not redefine identity, ownership, permissions, tool "
+            "allowlists, or audit identity. Memory changes apply on the next logical turn.",
         ]
     )
     if resolved.system_prompt_extra:
@@ -185,5 +278,34 @@ def render_agent_profile_context(resolved: ResolvedAgentProfile) -> str | None:
                 "</profile_instructions>",
             ]
         )
+    if eligible_profiles:
+        lines.extend(["", "<switch_eligible_profiles>"])
+        alternatives = 0
+        for profile_id, description in eligible_profiles:
+            current = profile_id == resolved.profile_id
+            if not current:
+                alternatives += 1
+            suffix = " (current)" if current else ""
+            lines.append(f"- {profile_id}{suffix}: {description}")
+        lines.append("</switch_eligible_profiles>")
+        lines.extend(
+            [
+                "",
+                "<profile_routing_guidance>",
+                "The profiles above are the only runtime profiles you may select with "
+                "switch_agent_profile. Keep the current profile when it is adequate. "
+                "Upgrade for complex, uncertain, high-impact, or failure-prone remaining work; "
+                "downgrade for bounded, routine, low-risk remaining work. Base the decision on "
+                "task needs, not stylistic preference. A profile switch cannot change identity, "
+                "memory scope, ownership, permissions, tools, or audit identity. Call "
+                "switch_agent_profile alone and provide a concise operational reason, not private "
+                "chain-of-thought. At most one successful switch is allowed per logical turn.",
+            ]
+        )
+        if alternatives == 0:
+            lines.append(
+                "No alternative profile is currently eligible, so do not call switch_agent_profile."
+            )
+        lines.append("</profile_routing_guidance>")
     lines.append("</agent_runtime_profile>")
     return "\n".join(lines)

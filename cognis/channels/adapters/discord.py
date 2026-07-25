@@ -20,6 +20,8 @@ from typing import Any
 
 import httpx
 
+from cognis.channels.formatting import split_message
+from cognis.channels.markdown_rendering import markdown_to_discord_markdown
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import DISCORD_META
 from cognis.logging import get_logger
@@ -201,15 +203,38 @@ class DiscordAdapter(BaseChannelAdapter):
         if self._rest_client is None:
             return None
 
-        if message.media:
-            return await self._send_with_attachments(message)
-
-        payload: dict[str, Any] = {"content": message.content}
-        if message.reply_to_id:
-            payload["message_reference"] = {"message_id": message.reply_to_id}
-        resp = await self._rest_client.post(f"/channels/{message.chat_id}/messages", json=payload)
-        resp.raise_for_status()
-        return resp.json().get("id")
+        rendered = markdown_to_discord_markdown(message.content)
+        chunks = split_message(rendered, self.capabilities.max_message_length)
+        if not chunks and message.media:
+            chunks = [""]
+        last_message_id: str | None = None
+        for index, chunk in enumerate(chunks):
+            chunk_message = message.model_copy(
+                update={
+                    "content": chunk,
+                    "media": message.media if index == 0 else [],
+                    "reply_to_id": message.reply_to_id if index == 0 else None,
+                }
+            )
+            if chunk_message.media:
+                last_message_id = await self._send_with_attachments(chunk_message)
+                if not last_message_id:
+                    msg = "Discord attachment delivery returned no message ID"
+                    raise RuntimeError(msg)
+                continue
+            payload: dict[str, Any] = {
+                "content": chunk_message.content,
+                "allowed_mentions": {"parse": []},
+            }
+            if chunk_message.reply_to_id:
+                payload["message_reference"] = {"message_id": chunk_message.reply_to_id}
+            resp = await self._rest_client.post(
+                f"/channels/{message.chat_id}/messages",
+                json=payload,
+            )
+            resp.raise_for_status()
+            last_message_id = resp.json().get("id")
+        return last_message_id
 
     async def _send_with_attachments(self, message: OutboundMessage) -> str | None:
         if self._rest_client is None:
@@ -231,7 +256,12 @@ class DiscordAdapter(BaseChannelAdapter):
                 return None
             data: dict[str, Any] = {}
             if message.content.strip():
-                data["payload_json"] = json.dumps({"content": message.content})
+                data["payload_json"] = json.dumps(
+                    {
+                        "content": message.content,
+                        "allowed_mentions": {"parse": []},
+                    }
+                )
             resp = await self._rest_client.post(
                 f"/channels/{message.chat_id}/messages",
                 data=data,

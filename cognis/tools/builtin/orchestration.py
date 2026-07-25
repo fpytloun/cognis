@@ -5,7 +5,7 @@ They manage sub-sessions (delegate) and tasks (create/list/update/cancel).
 The executor never sees them.
 
 Tool taxonomy:
-  Sub-session tools: delegate, list_subsessions, get_subsession, cancel_subsession
+  Sub-session tools: delegate, retry/follow-up/fork, list/get/cancel
   Agent work tools: agent_conversation_*
   Task tools: create_task, list_tasks, get_task, update_task, cancel_task
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from enum import StrEnum
 from typing import Any
 
@@ -21,8 +22,26 @@ from cognis.core.agent_profiles import (
     normalize_agent_profile_id,
     resolve_agent_profile,
 )
+from cognis.core.orchestration_targets import (
+    OrchestrationTargetError,
+    OrchestrationTargetMode,
+    OrchestrationTargetService,
+    OrchestrationTargetSnapshot,
+)
 from cognis.models.session import SessionModel
-from cognis.models.tool import ToolCall, ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import (
+    NativeToolDefinition as ToolDefinition,
+)
+from cognis.models.tool import (
+    ToolCall,
+    ToolDynamicOption,
+    ToolResult,
+    ToolSource,
+    tool_input_schema,
+    tool_with_input_schema,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestrationMode(StrEnum):
@@ -39,7 +58,15 @@ class OrchestrationMode(StrEnum):
 
 
 # All orchestration tool names (for interception in agent loop)
-SUBSESSION_TOOL_NAMES = {"delegate", "list_subsessions", "get_subsession", "cancel_subsession"}
+SUBSESSION_TOOL_NAMES = {
+    "delegate",
+    "retry_subsession",
+    "follow_up_subsession",
+    "fork_subsession",
+    "list_subsessions",
+    "get_subsession",
+    "cancel_subsession",
+}
 TASK_TOOL_NAMES = {
     "create_task",
     "list_tasks",
@@ -65,6 +92,7 @@ COMPOSITION_TOOL_NAMES = {"compose_and_run_workflow"}
 MANAGED_CONVERSATION_TOOL_NAMES = {
     "agent_conversation_create",
     "agent_conversation_send",
+    "agent_conversation_set_profile",
     "agent_conversation_wait",
     "agent_conversation_interrupt",
     "agent_conversation_retry",
@@ -89,23 +117,19 @@ DELEGATE_TOOL = ToolDefinition(
     name="delegate",
     description=(
         "Delegate work to a focused sub-session and receive the result.\n\n"
-        "## When to use which agent\n\n"
-        "ALWAYS specify agent_id for non-trivial exploration, research, or "
-        "specialist work. The sub-session runs with a slim prompt tailored to "
-        "its role, keeping your context small for synthesis.\n\n"
-        "- `system:explore` — codebase exploration: tracing, 'where is X', "
-        "reading many files, understanding structure. Use this instead of "
-        "reading/grepping directly whenever more than 2-3 files are involved.\n"
-        "- `system:research` — external research, multi-source comparison, "
-        "web synthesis.\n"
-        "- `system:code-review` — findings-first review of a diff or file set.\n"
-        "- `system:architect` — architecture critique, design review, risk "
-        "analysis.\n"
-        "- `system:implement` — focused implementation that does not need the "
-        "current agent's personality or memories.\n\n"
-        "Omit agent_id (or pass your own agent_id) only when the work genuinely "
-        "requires your personality, tone, recalled memories, or conversational "
-        "continuity with the user.\n\n"
+        "Treat the child as an isolated context. For substantial work, provide a "
+        "proportional objective, context, scope, acceptance, and return contract; "
+        "do not make the child rediscover verified context.\n\n"
+        "agent_id is required and must identify an eligible secondary specialist "
+        "from the current caller-scoped target catalog. Use managed conversations "
+        "for primary user agents.\n\n"
+        "Before creating a fresh child, inspect existing sub-sessions. If one already "
+        "owns the same problem and has relevant context, use follow_up_subsession for "
+        "the same line of work or fork_subsession for an independent branch from that "
+        "context. Start fresh only for genuinely new scope, deliberate independence, "
+        "incompatible execution requirements, or demonstrably stale/polluted context. "
+        "This applies to implementation, research, debugging, review, and other delegated "
+        "work—not only code review.\n\n"
         "## Wait behavior\n\n"
         "Use wait=true when you need the result before continuing (e.g. joining "
         "parallel explorations). Multiple wait=true calls in one turn execute in "
@@ -127,16 +151,15 @@ DELEGATE_TOOL = ToolDefinition(
         "properties": {
             "task": {
                 "type": "string",
-                "description": "Clear description of what the sub-session should do.",
+                "description": (
+                    "Clear bounded objective. Include scope/non-goals and acceptance "
+                    "criteria here when they are central to the delegated task."
+                ),
             },
             "agent_id": {
                 "type": "string",
                 "description": (
-                    "Agent ID for specialist delegation. Use system:explore for codebase "
-                    "exploration, system:research for web research, system:code-review for "
-                    "code review, system:architect for architecture review, system:implement "
-                    "for focused implementation. Omit only when the work requires your own "
-                    "personality, memories, or conversational continuity."
+                    "Required eligible secondary specialist ID from the dynamic target catalog."
                 ),
             },
             "agent_profile_id": {
@@ -149,11 +172,18 @@ DELEGATE_TOOL = ToolDefinition(
             },
             "context": {
                 "type": "string",
-                "description": "Background context the sub-session needs.",
+                "description": (
+                    "Curated confirmed context, exact source-of-truth references, "
+                    "dependencies, relevant decisions, and explicitly marked assumptions. "
+                    "Do not dump the parent transcript."
+                ),
             },
             "expected_output": {
                 "type": "string",
-                "description": "What the result should look like.",
+                "description": (
+                    "Required return contract: status, summary, changes or findings, "
+                    "verification evidence, risks/assumptions, and open questions as relevant."
+                ),
             },
             "wait": {
                 "type": "boolean",
@@ -170,11 +200,17 @@ DELEGATE_TOOL = ToolDefinition(
                 "default": False,
             },
         },
-        "required": ["task"],
+        "required": ["task", "agent_id"],
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
     read_only=False,
+    dynamic_options=[
+        ToolDynamicOption(
+            path="$.agent_id",
+            source="orchestration.delegate_targets",
+        )
+    ],
 )
 
 LIST_SUBSESSIONS_TOOL = ToolDefinition(
@@ -239,6 +275,69 @@ CANCEL_SUBSESSION_TOOL = ToolDefinition(
             },
         },
         "required": ["session_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+RETRY_SUBSESSION_TOOL = ToolDefinition(
+    name="retry_subsession",
+    description=(
+        "Retry a failed, interrupted, or cancelled delegate task on a new derived "
+        "child session. The original remains inspectable. This reruns the original "
+        "task; use follow_up_subsession for a new instruction."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Terminal child session to retry."},
+        },
+        "required": ["session_id"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+FOLLOW_UP_SUBSESSION_TOOL = ToolDefinition(
+    name="follow_up_subsession",
+    description=(
+        "Send a new instruction using a terminal delegate child's full prior context. "
+        "Creates a derived child because delegate history and results are immutable. "
+        "Prefer this over a fresh delegate when continuing the same problem, correcting "
+        "prior work, requesting deeper analysis, or rechecking a result with context "
+        "that remains relevant."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Terminal child context to continue."},
+            "instruction": {"type": "string", "description": "New specialist instruction."},
+        },
+        "required": ["session_id", "instruction"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+FORK_SUBSESSION_TOOL = ToolDefinition(
+    name="fork_subsession",
+    description=(
+        "Branch from a terminal delegate child's full prior context with a new "
+        "instruction. Creates an independent derived child while preserving lineage. "
+        "Use this when the prior context is relevant but the new work should explore an "
+        "alternative, obtain an independent branch, or proceed without changing the "
+        "original continuation line."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Terminal child context to branch."},
+            "instruction": {"type": "string", "description": "Instruction for the branch."},
+        },
+        "required": ["session_id", "instruction"],
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
@@ -674,6 +773,9 @@ RESOLVE_TASK_PAUSE_TOOL = ToolDefinition(
 
 _ALL_SUBSESSION_TOOLS = [
     DELEGATE_TOOL,
+    RETRY_SUBSESSION_TOOL,
+    FOLLOW_UP_SUBSESSION_TOOL,
+    FORK_SUBSESSION_TOOL,
     LIST_SUBSESSIONS_TOOL,
     GET_SUBSESSION_TOOL,
     CANCEL_SUBSESSION_TOOL,
@@ -712,7 +814,12 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
         "needs a visible, inspectable, iterative agent session rather than a terminal "
         "delegate result or a structured workflow task. Target agent IDs must be "
         "primary/user agents; use delegate() for system specialist agents (`system:*`) "
-        "available in this agent session. Not available in tasks. With wait=false, this is "
+        "available in this agent session. Not available in tasks. "
+        "Treat the new conversation as an isolated context. For substantial work, "
+        "initial_message should include a proportional contract: objective, confirmed "
+        "context/references, scope and non-goals, acceptance/verification, and required "
+        "return status/evidence. Do not force rediscovery of known context. "
+        "With wait=false, this is "
         "fire-and-follow-up: after starting the managed turn, do "
         "not continue the same scoped work in parallel; finish the parent turn unless "
         "there is independent work that can safely proceed. The parent conversation "
@@ -739,13 +846,17 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
                 "description": (
                     "Optional runtime profile ID for the target agent. If omitted, the "
                     "managed conversation uses the target agent default profile and does "
-                    "not inherit the controller conversation profile."
+                    "not inherit the controller conversation profile. Eligible profile IDs "
+                    "and descriptions are included in the dynamic target catalog."
                 ),
             },
             "title": {"type": "string", "description": "Conversation title."},
             "initial_message": {
                 "type": "string",
-                "description": "First instruction to send to the managed agent.",
+                "description": (
+                    "First instruction and full relevant task contract for this new "
+                    "managed conversation."
+                ),
             },
             "wait": {
                 "type": "boolean",
@@ -763,6 +874,12 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
     source=ToolSource(type="builtin"),
     category="orchestration",
     read_only=False,
+    dynamic_options=[
+        ToolDynamicOption(
+            path="$.agent_id",
+            source="orchestration.managed_targets",
+        )
+    ],
 )
 
 AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
@@ -771,7 +888,9 @@ AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
         "Send a new turn into an existing managed agent conversation. Prefer this for "
         "same-problem continuation instead of creating a duplicate managed "
         "conversation, including plan/debug to implementation handoffs with "
-        'chat_mode="build". With wait=false, this is fire-and-follow-up: do not '
+        'chat_mode="build". Reuse context the target already owns: send the new '
+        "instruction and changed context, decisions, or acceptance criteria rather than "
+        "repeating stable history. With wait=false, this is fire-and-follow-up: do not "
         "continue the same scoped work in parallel after sending; finish the parent "
         "turn unless independent work can safely proceed. The parent conversation "
         "will be resumed or notified when the managed turn finishes."
@@ -780,7 +899,12 @@ AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
-            "message": {"type": "string", "description": "Message/instruction to send."},
+            "message": {
+                "type": "string",
+                "description": (
+                    "New instruction plus the context delta needed for this continuation."
+                ),
+            },
             "wait": {
                 "type": "boolean",
                 "description": (
@@ -803,7 +927,8 @@ AGENT_CONVERSATION_WAIT_TOOL = ToolDefinition(
     name="agent_conversation_wait",
     description=(
         "Wait for the currently running turn in a managed agent conversation. Returns "
-        "immediately when no turn is in progress so parent turns can safely re-attach."
+        "immediately when no turn is in progress. The parent join is bounded to 3600 seconds "
+        "by default; timing out never cancels the managed child."
     ),
     parameters={
         "type": "object",
@@ -811,7 +936,8 @@ AGENT_CONVERSATION_WAIT_TOOL = ToolDefinition(
             "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
             "timeout_seconds": {
                 "type": "integer",
-                "description": "Optional wait timeout in seconds.",
+                "description": "Optional wait timeout in seconds (default 3600).",
+                "default": 3600,
             },
         },
         "required": ["conversation_id"],
@@ -819,6 +945,33 @@ AGENT_CONVERSATION_WAIT_TOOL = ToolDefinition(
     source=ToolSource(type="builtin"),
     category="orchestration",
     read_only=True,
+)
+
+AGENT_CONVERSATION_SET_PROFILE_TOOL = ToolDefinition(
+    name="agent_conversation_set_profile",
+    description=(
+        "Change the runtime profile for an idle managed agent conversation. The target "
+        "profile must be enabled and agent-switchable for the managed agent. Active or "
+        "queued turns must finish before the profile can be changed."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
+            "agent_profile_id": {
+                "type": "string",
+                "description": "Agent-switchable runtime profile ID for the target agent.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Concise operational reason for changing the target profile.",
+            },
+        },
+        "required": ["conversation_id", "agent_profile_id", "reason"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
 )
 
 AGENT_CONVERSATION_INTERRUPT_TOOL = ToolDefinition(
@@ -866,7 +1019,11 @@ AGENT_CONVERSATION_RETRY_TOOL = ToolDefinition(
 
 AGENT_CONVERSATION_FORK_TOOL = ToolDefinition(
     name="agent_conversation_fork",
-    description="Fork a managed agent conversation and optionally start the fork with a message.",
+    description=(
+        "Fork a managed agent conversation and optionally start the fork with a message. "
+        "Use this when existing context is relevant but the work needs an independent "
+        "branch; use agent_conversation_send for ordinary same-problem continuation."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -931,6 +1088,7 @@ AGENT_CONVERSATION_GET_TOOL = ToolDefinition(
 _ALL_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_CREATE_TOOL,
     AGENT_CONVERSATION_SEND_TOOL,
+    AGENT_CONVERSATION_SET_PROFILE_TOOL,
     AGENT_CONVERSATION_WAIT_TOOL,
     AGENT_CONVERSATION_INTERRUPT_TOOL,
     AGENT_CONVERSATION_RETRY_TOOL,
@@ -972,27 +1130,49 @@ _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
 def _managed_conversation_sync_tool(tool: ToolDefinition) -> ToolDefinition:
     """Return a managed-conversation tool schema without async wait controls."""
 
-    parameters = copy.deepcopy(tool.parameters)
+    parameters = copy.deepcopy(tool_input_schema(tool))
     properties = parameters.get("properties")
     if isinstance(properties, dict):
         properties.pop("wait", None)
-    return tool.model_copy(
-        update={
-            "description": _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS.get(
-                tool.name,
-                (
-                    f"{tool.description} On this conversation surface, started turns "
-                    "are joined before returning."
-                ),
+    return tool_with_input_schema(
+        tool,
+        parameters,
+        description=_SYNC_MANAGED_CONVERSATION_DESCRIPTIONS.get(
+            tool.name,
+            (
+                f"{tool.description} On this conversation surface, started turns "
+                "are joined before returning."
             ),
-            "parameters": parameters,
-        }
+        ),
+    )
+
+
+def _managed_conversation_default_wait_tool(
+    tool: ToolDefinition, *, wait_default: bool
+) -> ToolDefinition:
+    """Return a managed-conversation tool schema with a surface-specific wait default."""
+
+    if wait_default is False:
+        return tool
+    parameters = copy.deepcopy(tool_input_schema(tool))
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict) or "wait" not in properties:
+        return tool
+    properties["wait"]["default"] = True
+    return tool_with_input_schema(
+        tool,
+        parameters,
+        description=(
+            f"{tool.description} On this conversation surface, wait defaults to true; "
+            "set wait=false only when independent parent work can safely proceed."
+        ),
     )
 
 
 _SYNC_MANAGED_CONVERSATION_TOOLS = [
     _managed_conversation_sync_tool(AGENT_CONVERSATION_CREATE_TOOL),
     _managed_conversation_sync_tool(AGENT_CONVERSATION_SEND_TOOL),
+    AGENT_CONVERSATION_SET_PROFILE_TOOL,
     AGENT_CONVERSATION_WAIT_TOOL,
     AGENT_CONVERSATION_INTERRUPT_TOOL,
     _managed_conversation_sync_tool(AGENT_CONVERSATION_RETRY_TOOL),
@@ -1245,43 +1425,110 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
 )
 
 # Sync-only delegate for task steps (no wait parameter exposed — always sync)
-_DELEGATE_SYNC_TOOL = DELEGATE_TOOL.model_copy(
-    update={
-        "name": "delegate",
-        "description": (
-            "Delegate work to a sub-session that runs synchronously. The sub-session "
-            "executes the task and returns its output directly as the tool result. "
-            "Use for focused sub-tasks within a workflow step. Multiple delegates "
-            "can run in parallel via parallel tool calls. Optionally specify "
-            "agent_id for specialist delegation."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "Clear description of what the sub-session should do.",
-                },
-                "agent_id": {
-                    "type": "string",
-                    "description": (
-                        "Optional agent ID for specialist delegation. Omit to use "
-                        "the current agent."
-                    ),
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Background context the sub-session needs.",
-                },
-                "expected_output": {
-                    "type": "string",
-                    "description": "What the result should look like.",
-                },
+_DELEGATE_SYNC_TOOL = tool_with_input_schema(
+    DELEGATE_TOOL,
+    {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Clear description of what the sub-session should do.",
             },
-            "required": ["task"],
+            "agent_id": {
+                "type": "string",
+                "description": "Required eligible secondary specialist ID.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Background context the sub-session needs.",
+            },
+            "expected_output": {
+                "type": "string",
+                "description": "What the result should look like.",
+            },
         },
-    }
+        "required": ["task", "agent_id"],
+    },
+    name="delegate",
+    description=(
+        "Delegate work to a sub-session that runs synchronously. The sub-session "
+        "executes the task and returns its output directly as the tool result. "
+        "Use for focused sub-tasks within a workflow step. Multiple delegates "
+        "can run in parallel via parallel tool calls. Target an eligible secondary "
+        "specialist from the dynamic catalog."
+    ),
 )
+
+
+def enrich_orchestration_target_catalog(
+    tool: ToolDefinition,
+    snapshot: OrchestrationTargetSnapshot | None,
+) -> ToolDefinition:
+    """Overlay one turn's target IDs and canonical metadata onto target tools."""
+
+    if snapshot is None:
+        return tool
+    if tool.name == DELEGATE_TOOL.name:
+        source = "orchestration.delegate_targets"
+        targets = snapshot.delegate
+    elif tool.name == AGENT_CONVERSATION_CREATE_TOOL.name:
+        source = "orchestration.managed_targets"
+        targets = snapshot.managed
+    else:
+        return tool
+
+    schema = copy.deepcopy(tool_input_schema(tool))
+    agent_field = schema.setdefault("properties", {}).setdefault("agent_id", {"type": "string"})
+    if targets:
+        agent_field["enum"] = [target.agent_id for target in targets]
+    else:
+        agent_field.pop("enum", None)
+        schema["not"] = {}
+    catalog_lines = []
+    for target in targets:
+        profiles = ", ".join(
+            f"{profile['profile_id']}: {profile['description']}" for profile in target.profiles
+        )
+        summary = f"{target.agent_id} — {target.name}"
+        if target.description:
+            summary += f": {target.description}"
+        if profiles:
+            summary += f" [profiles: {profiles}]"
+        catalog_lines.append(summary)
+    base_description = str(agent_field.get("description") or "").rstrip()
+    catalog = "\n".join(f"- {line}" for line in catalog_lines) or "- none"
+    agent_field["description"] = f"{base_description}\n\nEligible targets for this turn:\n{catalog}"
+    enriched = tool_with_input_schema(tool, schema)
+    operations = []
+    for operation in enriched.native_operations or []:
+        options = [
+            option.model_copy(update={"values": [target.as_dynamic_option() for target in targets]})
+            if option.source == source
+            else option
+            for option in operation.dynamic_options
+        ]
+        operations.append(operation.model_copy(update={"dynamic_options": options}))
+    if not operations:
+        return enriched
+    payload = enriched.model_dump(mode="python")
+    payload["descriptor"] = None
+    payload["native_operations"] = operations
+    return ToolDefinition.model_validate(payload)
+
+
+def orchestration_target_tool_available(
+    tool: ToolDefinition,
+    snapshot: OrchestrationTargetSnapshot | None,
+) -> bool:
+    """Return whether a target-creating tool has at least one discoverable target."""
+
+    if snapshot is None:
+        return True
+    if tool.name == DELEGATE_TOOL.name:
+        return bool(snapshot.delegate)
+    if tool.name == AGENT_CONVERSATION_CREATE_TOOL.name:
+        return bool(snapshot.managed)
+    return True
 
 
 def orchestration_tools(
@@ -1290,6 +1537,7 @@ def orchestration_tools(
     expose_delegate_wait_option: bool = True,
     expose_managed_conversation_tools: bool = True,
     expose_managed_conversation_wait_option: bool = True,
+    managed_conversation_wait_default: bool = False,
     expose_task_tools: bool = True,
     expose_workflow_tools: bool = True,
     expose_compose_workflow_tool: bool = True,
@@ -1314,7 +1562,13 @@ def orchestration_tools(
     tools = subsession_tools
     if expose_managed_conversation_tools:
         tools += (
-            _ALL_MANAGED_CONVERSATION_TOOLS
+            [
+                _managed_conversation_default_wait_tool(
+                    tool,
+                    wait_default=managed_conversation_wait_default,
+                )
+                for tool in _ALL_MANAGED_CONVERSATION_TOOLS
+            ]
             if expose_managed_conversation_wait_option
             else _SYNC_MANAGED_CONVERSATION_TOOLS
         )
@@ -1383,14 +1637,51 @@ async def handle_delegate_tool_call(
     args = tool_call.arguments
 
     if session_manager is not None and session is not None and agent is not None:
-        # Validate secondary agent binding if delegating to a different agent
-        target_agent_id = args.get("agent_id") or getattr(agent, "agent_id", "")
-        target_agent = agent if target_agent_id == getattr(agent, "agent_id", "") else None
-        if target_agent_id and target_agent_id != getattr(agent, "agent_id", "") and agent_registry:
-            target_agent = await agent_registry.get(
-                target_agent_id, owner_email=getattr(session, "user_email", None)
+        target_agent_id = str(args.get("agent_id") or "").strip()
+        if agent_registry is None:
+            target_error = OrchestrationTargetError(
+                code="delegate_target_validation_unavailable",
+                message="Delegate target validation is unavailable.",
             )
-            if target_agent is None:
+        else:
+            try:
+                target_agent = await OrchestrationTargetService(agent_registry).require(
+                    OrchestrationTargetMode.DELEGATE,
+                    target_agent_id=target_agent_id,
+                    controller_agent=agent,
+                    user_email=getattr(session, "user_email", ""),
+                )
+                target_error = None
+            except OrchestrationTargetError as exc:
+                target_error = exc
+        if target_error is not None:
+            return (
+                ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "code": target_error.code,
+                            "mode": "delegate",
+                            "call_id": tool_call.call_id,
+                            "message": str(target_error),
+                        },
+                        sort_keys=True,
+                    ),
+                    is_error=True,
+                    metadata={"orchestration": True, "mode": "delegate"},
+                ),
+                None,
+            )
+        explicit_profile_id = normalize_agent_profile_id(args.get("agent_profile_id"))
+        child_agent_profile_id = explicit_profile_id
+        if child_agent_profile_id is not None:
+            try:
+                resolve_agent_profile(
+                    target_agent,
+                    child_agent_profile_id,
+                    source="delegate_explicit",
+                )
+            except ValueError as exc:
                 return (
                     ToolResult(
                         output=json.dumps(
@@ -1398,7 +1689,7 @@ async def handle_delegate_tool_call(
                                 "status": "error",
                                 "mode": "delegate",
                                 "call_id": tool_call.call_id,
-                                "message": f"Agent '{target_agent_id}' not found.",
+                                "message": str(exc),
                             },
                             sort_keys=True,
                         ),
@@ -1407,76 +1698,6 @@ async def handle_delegate_tool_call(
                     ),
                     None,
                 )
-            if target_agent.agent_type == "secondary":
-                is_bound = await agent_registry.is_secondary_bound(
-                    getattr(agent, "agent_id", ""), target_agent_id
-                )
-                if not is_bound:
-                    return (
-                        ToolResult(
-                            output=json.dumps(
-                                {
-                                    "status": "error",
-                                    "mode": "delegate",
-                                    "call_id": tool_call.call_id,
-                                    "message": (
-                                        f"Secondary agent '{target_agent_id}' is not bound to "
-                                        f"agent '{getattr(agent, 'agent_id', '')}'. "
-                                        f"Add it to the agent's secondary bindings."
-                                    ),
-                                },
-                                sort_keys=True,
-                            ),
-                            is_error=True,
-                            metadata={"orchestration": True, "mode": "delegate"},
-                        ),
-                        None,
-                    )
-        explicit_profile_id = normalize_agent_profile_id(args.get("agent_profile_id"))
-        inherited_profile_id = None
-        parent_agent_profile_id = getattr(session, "agent_profile_id", None)
-        parent_agent_profile_id = (
-            parent_agent_profile_id.strip()
-            if isinstance(parent_agent_profile_id, str) and parent_agent_profile_id.strip()
-            else None
-        )
-        same_agent_delegate = target_agent_id == getattr(agent, "agent_id", "")
-        if explicit_profile_id is None and same_agent_delegate:
-            inherited_profile_id = parent_agent_profile_id
-        child_agent_profile_id = explicit_profile_id or inherited_profile_id
-        if target_agent is not None and child_agent_profile_id is not None:
-            try:
-                resolve_agent_profile(
-                    target_agent,
-                    child_agent_profile_id,
-                    source="delegate_inherited"
-                    if explicit_profile_id is None
-                    else "delegate_explicit",
-                )
-            except ValueError as exc:
-                if (
-                    not same_agent_delegate
-                    and explicit_profile_id is not None
-                    and explicit_profile_id == parent_agent_profile_id
-                ):
-                    child_agent_profile_id = None
-                else:
-                    return (
-                        ToolResult(
-                            output=json.dumps(
-                                {
-                                    "status": "error",
-                                    "mode": "delegate",
-                                    "call_id": tool_call.call_id,
-                                    "message": str(exc),
-                                },
-                                sort_keys=True,
-                            ),
-                            is_error=True,
-                            metadata={"orchestration": True, "mode": "delegate"},
-                        ),
-                        None,
-                    )
 
         try:
             effective_wait = bool(args.get("wait", False) if wait is None else wait)
@@ -1484,10 +1705,11 @@ async def handle_delegate_tool_call(
                 parent_session=session,
                 mode="delegate_sync" if effective_wait else "delegate_async",
                 task_description=args.get("task", ""),
-                agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
-                effective_agent_id=args.get("agent_id") or getattr(agent, "agent_id", ""),
+                agent_id=target_agent_id,
+                effective_agent_id=target_agent_id,
                 agent_profile_id=child_agent_profile_id,
                 expected_output=args.get("expected_output"),
+                delegation_metadata=tool_call.runtime_metadata.get("delegate_lineage"),
                 workspace_root=workspace_root,
                 working_directory=working_directory,
             )
@@ -1518,14 +1740,32 @@ async def handle_delegate_tool_call(
                 child_session,
             )
         except Exception as exc:
+            requested_agent_id = args.get("agent_id") or getattr(agent, "agent_id", "")
+            if isinstance(exc, ValueError) and str(exc).startswith("Unknown agent:"):
+                error_code = "delegate_agent_not_found"
+                message = f"Agent '{requested_agent_id}' not found."
+            elif isinstance(exc, ValueError):
+                error_code = "delegate_child_session_invalid"
+                message = "Delegated child session request is invalid."
+            else:
+                error_code = "delegate_child_session_creation_failed"
+                message = "Unable to create delegated child session."
+            logger.exception(
+                "Delegate child session creation failed: call_id=%s parent_session_id=%s "
+                "requested_agent_id=%s",
+                tool_call.call_id,
+                getattr(session, "session_id", None),
+                requested_agent_id,
+            )
             return (
                 ToolResult(
                     output=json.dumps(
                         {
                             "status": "error",
+                            "code": error_code,
                             "mode": "delegate",
                             "call_id": tool_call.call_id,
-                            "message": f"Delegation failed: {type(exc).__name__}",
+                            "message": message,
                         },
                         sort_keys=True,
                     ),

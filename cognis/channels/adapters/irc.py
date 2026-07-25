@@ -16,6 +16,7 @@ import asyncio
 import ssl
 from datetime import UTC, datetime
 
+from cognis.channels.markdown_rendering import markdown_to_plain_text
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import IRC_META
 from cognis.logging import get_logger
@@ -156,7 +157,7 @@ class IRCAdapter(BaseChannelAdapter):
                 note += f" {media.url}"
             self._send_raw(f"PRIVMSG {target} :{note[:max_content]}")
 
-        lines = message.content.split("\n")
+        lines = markdown_to_plain_text(message.content).split("\n")
         for line in lines:
             while line:
                 chunk = line[:max_content]

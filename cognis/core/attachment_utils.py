@@ -126,6 +126,13 @@ def strip_attachment_payload_bytes(
     return safe
 
 
+def _attachment_size_bytes(attachment: dict[str, Any], row: ArtifactRecordRow) -> int:
+    size = attachment.get("size_bytes")
+    if isinstance(size, int):
+        return size
+    return int(row.size_bytes or 0)
+
+
 async def hydrate_attachment_refs(
     session: AsyncSession,
     artifact_store: Any,
@@ -179,11 +186,7 @@ async def hydrate_attachment_refs(
             "kind": str(attachment.get("kind") or row.kind or ArtifactKind.FILE.value),
             "mime_type": str(attachment.get("mime_type") or row.mime_type),
             "filename": str(attachment.get("filename") or row.object_id or row.filename),
-            "size_bytes": int(
-                attachment.get("size_bytes")
-                if isinstance(attachment.get("size_bytes"), int)
-                else row.size_bytes or 0
-            ),
+            "size_bytes": _attachment_size_bytes(attachment, row),
         }
         try:
             hydrated_attachment["url"] = await artifact_store.async_get_public_url(
@@ -201,6 +204,98 @@ async def hydrate_attachment_refs(
     return hydrated
 
 
+async def hydrate_attachment_ref_groups(
+    session: AsyncSession,
+    artifact_store: Any,
+    attachment_groups: Iterable[Iterable[dict[str, Any] | Any]],
+    *,
+    owner_email: str | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Hydrate multiple attachment lists with one artifact-record lookup."""
+
+    normalized_groups = [normalize_attachment_refs(group) for group in attachment_groups]
+    artifact_ids = sorted(
+        {
+            str(attachment["artifact_id"])
+            for group in normalized_groups
+            for attachment in group
+            if attachment.get("artifact_id")
+        }
+    )
+    if not artifact_ids:
+        return [[] for _group in normalized_groups]
+
+    result = await session.execute(
+        sa.select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
+    )
+    rows = {row.artifact_id: row for row in result.scalars().all()}
+
+    hydrated_groups: list[list[dict[str, Any]]] = []
+    public_urls: dict[str, str] = {}
+    for normalized in normalized_groups:
+        hydrated: list[dict[str, Any]] = []
+        for attachment in normalized:
+            artifact_id = str(attachment["artifact_id"])
+            row = rows.get(artifact_id)
+            if row is None:
+                legacy = _legacy_attachment_fallback(attachment)
+                if legacy is not None:
+                    hydrated.append(legacy)
+                continue
+            if (
+                owner_email is not None
+                and row.owner_email is not None
+                and row.owner_email != owner_email
+            ):
+                continue
+            if (
+                conversation_id is not None
+                and row.conversation_id is not None
+                and row.conversation_id != conversation_id
+            ):
+                continue
+            if (
+                session_id is not None
+                and row.session_id is not None
+                and row.session_id != session_id
+            ):
+                continue
+            if row.status == "deleted":
+                legacy = _deleted_attachment_fallback(attachment, row)
+                if legacy is not None:
+                    hydrated.append(legacy)
+                continue
+
+            hydrated_attachment = {
+                **attachment,
+                "kind": str(attachment.get("kind") or row.kind or ArtifactKind.FILE.value),
+                "mime_type": str(attachment.get("mime_type") or row.mime_type),
+                "filename": str(attachment.get("filename") or row.object_id or row.filename),
+                "size_bytes": _attachment_size_bytes(attachment, row),
+            }
+            try:
+                public_url = public_urls.get(artifact_id)
+                if public_url is None:
+                    public_url = await artifact_store.async_get_public_url(
+                        row.namespace,
+                        row.object_id,
+                        row.filename,
+                    )
+                    public_urls[artifact_id] = public_url
+                hydrated_attachment["url"] = public_url
+            except Exception:
+                if (
+                    not isinstance(hydrated_attachment.get("url"), str)
+                    or not hydrated_attachment["url"]
+                ):
+                    hydrated_attachment.pop("url", None)
+            hydrated.append(hydrated_attachment)
+        hydrated_groups.append(hydrated)
+    return hydrated_groups
+
+
 def _legacy_attachment_fallback(attachment: dict[str, Any]) -> dict[str, Any] | None:
     url = attachment.get("url")
     if not isinstance(url, str) or not url:
@@ -216,11 +311,7 @@ def _deleted_attachment_fallback(
         "kind": str(attachment.get("kind") or row.kind or ArtifactKind.FILE.value),
         "mime_type": str(attachment.get("mime_type") or row.mime_type),
         "filename": str(attachment.get("filename") or row.object_id or row.filename),
-        "size_bytes": int(
-            attachment.get("size_bytes")
-            if isinstance(attachment.get("size_bytes"), int)
-            else row.size_bytes or 0
-        ),
+        "size_bytes": _attachment_size_bytes(attachment, row),
     }
     if isinstance(attachment.get("url"), str) and attachment["url"]:
         fallback["url"] = attachment["url"]

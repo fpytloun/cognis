@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 from cognis.api.app import create_app
 from cognis.store.queries import (
     create_artifact_record,
+    find_tool_artifact_record,
+    find_tool_output_artifact_record,
     list_recent_artifact_records,
     search_artifact_records,
 )
@@ -144,3 +146,63 @@ def test_artifact_query_helpers_filter_and_order(monkeypatch: object, tmp_path: 
     assert filename_ids == ["doc_new"]
     assert purpose_ids == ["doc_new"]
     assert date_ids == ["doc_new"]
+
+
+def test_tool_artifact_source_identity_is_explicit(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _exercise() -> tuple[str | None, str | None]:
+            async with app.state.session_factory() as session:  # type: ignore[attr-defined]
+                await create_artifact_record(
+                    session,
+                    artifact_id="toolout_1",
+                    namespace="tool-outputs",
+                    object_id="toolout_1",
+                    filename="renamed-output.txt",
+                    owner_email="user@example.com",
+                    purpose="tool_output",
+                    kind="file",
+                    mime_type="text/plain",
+                    size_bytes=20,
+                    status="temporary",
+                    source_tool_call_id="call-web",
+                )
+                await create_artifact_record(
+                    session,
+                    artifact_id="att_1",
+                    namespace="attachments",
+                    object_id="att_1",
+                    filename="image.jpg",
+                    owner_email="user@example.com",
+                    purpose="tool_artifact",
+                    kind="image",
+                    mime_type="image/jpeg",
+                    size_bytes=30,
+                    status="attached",
+                    content_hash="bytes-hash",
+                    source_tool_call_id="call-web",
+                    source_anchor="media:1",
+                )
+                await session.commit()
+            async with app.state.session_factory() as session:  # type: ignore[attr-defined]
+                output = await find_tool_output_artifact_record(
+                    session,
+                    owner_email="user@example.com",
+                    source_tool_call_id="call-web",
+                )
+                materialized = await find_tool_artifact_record(
+                    session,
+                    owner_email="user@example.com",
+                    source_tool_call_id="call-web",
+                    source_anchor="media:1",
+                )
+                return (
+                    output.artifact_id if output else None,
+                    materialized.artifact_id if materialized else None,
+                )
+
+        output_id, materialized_id = asyncio.run(_exercise())
+
+    assert output_id == "toolout_1"
+    assert materialized_id == "att_1"

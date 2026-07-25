@@ -42,10 +42,15 @@ def build_intaris_tool_definition(
 ) -> ToolDefinition:
     """Build a normalized Intaris MCP tool definition from aggregated metadata."""
     tool_name = sanitize_mcp_tool_name(server_name, raw_tool_name)
+    annotations = payload.get("annotations") if isinstance(payload.get("annotations"), dict) else {}
     return ToolDefinition(
         name=tool_name,
         description=str(payload.get("description", f"Intaris MCP tool {tool_name}")),
         parameters=payload.get("inputSchema") or payload.get("parameters") or {},
+        annotations=annotations,
+        output_schema=(
+            payload.get("outputSchema") if isinstance(payload.get("outputSchema"), dict) else None
+        ),
         source=ToolSource(
             type="intaris_mcp",
             server_name=server_name,

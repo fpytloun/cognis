@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from cognis.channels.markdown_rendering import markdown_to_plain_text
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import BLUEBUBBLES_META
 from cognis.logging import get_logger
@@ -135,7 +136,7 @@ class BlueBubblesAdapter(BaseChannelAdapter):
 
         payload: dict[str, Any] = {
             "chatGuid": message.chat_id,
-            "message": message.content,
+            "message": markdown_to_plain_text(message.content),
             "method": "private-api",
         }
 

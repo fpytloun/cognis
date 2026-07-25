@@ -7,7 +7,8 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.api.serializers import project_source_to_response, project_to_response
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.store.queries import (
     attach_project_workflow,
     create_project,

@@ -40,8 +40,8 @@ def recoverable_tool_output_lines(
     if len(candidates) > max_entries:
         COMPACTION_HANDLES_CAPPED.inc()
         lines.append(
-            f"[{len(candidates) - max_entries} more recoverable outputs not shown; "
-            "use list_tool_outputs to enumerate]"
+            f"[{len(candidates) - max_entries} additional recoverable outputs omitted "
+            "from this summary]"
         )
     return lines
 

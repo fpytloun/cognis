@@ -5,14 +5,24 @@ from pydantic import ValidationError
 
 from cognis.api.chat_v2.schemas import (
     ChatSyncResponse,
+    CommandV2Request,
     MessageTimelineItem,
     QueueState,
     RuntimeOverlaySnapshot,
     SendMessageV2Request,
     TimelineBackfillResponse,
+    TimelineScope,
     TimelineWindow,
     UpsertTimelineItemOp,
 )
+
+
+def test_command_request_is_strict_and_non_empty() -> None:
+    assert CommandV2Request(content="/fork new topic").content == "/fork new topic"
+    with pytest.raises(ValidationError):
+        CommandV2Request(content="")
+    with pytest.raises(ValidationError):
+        CommandV2Request(content="/fork", unsupported=True)
 
 
 def test_runtime_overlay_rejects_stable_volatile_items() -> None:
@@ -34,6 +44,19 @@ def test_runtime_overlay_rejects_stable_volatile_items() -> None:
             has_active_turn=True,
             volatile_items=[item],
         )
+
+
+def test_timeline_scope_uses_canonical_identity_key() -> None:
+    scope = TimelineScope(
+        key="session:sess-1",
+        kind="session",
+        conversation_id="conv-1",
+        session_id="sess-1",
+    )
+    assert scope.key == "session:sess-1"
+
+    with pytest.raises(ValidationError, match="does not match"):
+        TimelineScope(key="session:other", kind="session", session_id="sess-1")
 
 
 def test_runtime_overlay_rejects_active_turn_when_inactive() -> None:
@@ -73,6 +96,9 @@ def test_sync_response_requires_reset_reason_when_reset_required() -> None:
     with pytest.raises(ValidationError, match="reset_reason is required"):
         ChatSyncResponse(
             projection_version="chat-v2.1",
+            scope=TimelineScope(
+                key="conversation:conv-1", kind="conversation", conversation_id="conv-1"
+            ),
             conversation_id="conv-1",
             cursor_before="a",
             cursor_after="b",
@@ -140,6 +166,9 @@ def test_backfill_response_rejects_volatile_items() -> None:
     with pytest.raises(ValidationError, match="canonical timeline items must have stable=true"):
         TimelineBackfillResponse(
             projection_version="chat-v2.1",
+            scope=TimelineScope(
+                key="conversation:conv-1", kind="conversation", conversation_id="conv-1"
+            ),
             conversation_id="conv-1",
             items=[item],
             server_time="2026-06-29T10:00:00Z",

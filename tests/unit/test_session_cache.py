@@ -90,6 +90,10 @@ class _Guardrails:
                             "type": "context_snapshot",
                             "data": {
                                 "source": "bootstrap",
+                                "extras": {
+                                    "memory_policy_fingerprint": "policy-v1",
+                                    "memory_mode": "full_auto",
+                                },
                                 "entries": [
                                     {
                                         "role": "developer",
@@ -213,6 +217,8 @@ async def test_session_cache_cold_and_warm_paths() -> None:
         "memory_instructions",
         "core_memories",
     ]
+    assert entry.memory_policy_fingerprint == "policy-v1"
+    assert entry.memory_policy_mode == "full_auto"
 
     warm_entry = await cache.refresh(_session())
 
@@ -299,6 +305,38 @@ async def test_session_cache_appends_recorded_events_and_applies_compaction() ->
     await cache.apply_compaction(session, summary="fresh summary", compaction_seq=6)
     assert cache.get_compaction_summary(session.session_id) == "fresh summary"
     assert cache.get_events_since_compaction(session.session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_get_events_since_compaction_returns_memoized_reference_until_append() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    first = cache.get_events_since_compaction(session.session_id)
+    second = cache.get_events_since_compaction(session.session_id)
+    filtered_first = cache.get_events_since_compaction(
+        session.session_id,
+        ["user_message", "assistant_message"],
+    )
+    filtered_second = cache.get_events_since_compaction(
+        session.session_id,
+        ["user_message", "assistant_message"],
+    )
+
+    assert second is first
+    assert filtered_second is filtered_first
+    assert filtered_first is not first
+
+    await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="assistant_message", data={"content": "new"})],
+        EventAppendResult(ok=True, count=1, first_seq=13, last_seq=13),
+    )
+
+    after_append = cache.get_events_since_compaction(session.session_id)
+    assert after_append is not first
+    assert [event.seq for event in after_append][-1] == 13
 
 
 class _GapGuardrails:
@@ -489,6 +527,33 @@ async def test_session_cache_keeps_replayable_developer_context_in_history() -> 
 
 
 @pytest.mark.asyncio
+async def test_legacy_daily_brief_loaded_skill_event_preserves_v12_contract() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-daily-v12")
+
+    await cache.append_recorded_events(
+        session,
+        [
+            SessionEvent(
+                type="developer_message",
+                data={
+                    "kind": "loaded_skill",
+                    "skill_id": "skill_daily",
+                    "skill_name": "daily-brief",
+                    "content_hash": "hash-v12",
+                    "content": "<loaded_skill>Use daily_brief_v12.</loaded_skill>",
+                },
+            )
+        ],
+        EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1),
+    )
+
+    snapshot = cache.get_loaded_skill_snapshots(session.session_id)["skill_daily"]
+    assert snapshot["contract_version"] == 12
+    assert snapshot["content_hash"] == "hash-v12"
+
+
+@pytest.mark.asyncio
 async def test_session_cache_tracks_discovered_tool_handles_from_lifecycle_events() -> None:
     cache = SessionCache(_Guardrails(), max_entries=10)
     session = _session("session-discovery")
@@ -568,6 +633,8 @@ async def test_store_prefix_snapshot_replaces_active_prefix() -> None:
         ],
         snapshot_seq=22,
         snapshot_source="repair",
+        memory_policy_fingerprint="policy-v2",
+        memory_policy_mode="on_demand",
     )
 
     assert [item.content for item in cache.get_prefix_entries(session.session_id)] == [
@@ -575,6 +642,10 @@ async def test_store_prefix_snapshot_replaces_active_prefix() -> None:
         "Core v2",
     ]
     assert cache.needs_prefix_repair(session.session_id) is False
+    entry = cache.get_entry(session.session_id)
+    assert entry is not None
+    assert entry.memory_policy_fingerprint == "policy-v2"
+    assert entry.memory_policy_mode == "on_demand"
 
 
 @pytest.mark.asyncio
@@ -702,6 +773,24 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
         "cache_read_input_tokens": 900,
         "cache_creation_input_tokens": 124,
     }
+
+    cache.update_last_generation_performance(
+        session.session_id,
+        {
+            "is_local": True,
+            "model": "qwen3:8b",
+            "runtime": "Ollama",
+            "generation_tokens_per_second": 25,
+            "measured_at": "2026-07-13T12:00:00Z",
+        },
+    )
+    performance = cache.get_last_generation_performance(session.session_id)
+    assert performance is not None
+    assert performance["model"] == "qwen3:8b"
+    assert performance["generation_tokens_per_second"] == 25
+
+    cache.update_last_generation_performance(session.session_id, None)
+    assert cache.get_last_generation_performance(session.session_id) is None
 
     cache.update_context_usage(
         session,

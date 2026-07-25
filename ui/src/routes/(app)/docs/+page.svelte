@@ -1,10 +1,23 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { renderDocsMarkdown } from '$lib/markdown';
   import Card from '$lib/components/ui/Card.svelte';
-  import { docsOverview, getCategoryLabel, getDocsByCategory } from '$lib/docs';
+  import { loadDocsOverviewContent } from '$lib/docs';
+  import { getCategoryLabel, getDocsByCategoryMeta } from '$lib/docs-registry';
 
-  const groups = getDocsByCategory();
-  const overviewHtml = renderDocsMarkdown(docsOverview.content);
+  const groups = getDocsByCategoryMeta();
+  let overviewHtml = $state('');
+  let overviewLoading = $state(true);
+
+  onMount(() => {
+    void loadDocsOverviewContent()
+      .then((overview) => {
+        overviewHtml = renderDocsMarkdown(overview.content);
+      })
+      .finally(() => {
+        overviewLoading = false;
+      });
+  });
 </script>
 
 <svelte:head>
@@ -21,7 +34,11 @@
   </Card>
 
   <Card class="p-4 sm:p-6">
-    <div class="docs-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html overviewHtml}</div>
+    {#if overviewLoading}
+      <p class="text-sm text-slate-400">Loading documentation overview…</p>
+    {:else}
+      <div class="docs-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html overviewHtml}</div>
+    {/if}
   </Card>
 
   {#each groups as group}

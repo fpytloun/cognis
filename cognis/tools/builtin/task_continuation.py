@@ -6,8 +6,13 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.content_refs import continuation_scope_task_id, get_accessible_deliverable_ref
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.core.content_refs import (
+    continuation_scope_task_id,
+    get_accessible_deliverable_ref,
+    record_deliverable_access,
+)
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.store.queries import get_task, list_step_runs_for_task
 from cognis.tools.registry import ToolExecutionContext
 
@@ -15,7 +20,11 @@ _SOURCE = ToolSource(type="builtin")
 
 READ_TASK_DELIVERABLE_TOOL = ToolDefinition(
     name="read_task_deliverable",
-    description="Read a task workflow deliverable by deliverable ID. Only works for deliverables owned by the current user.",
+    description=(
+        "Read a deliverable by deliverable ID. Supports task workflow deliverables owned by "
+        "the current user and conversation deliverables created by managed descendants that "
+        "the current conversation and agent are authorized to control."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -59,18 +68,33 @@ def task_continuation_tools() -> list[ToolDefinition]:
 def _user_email(context: ToolExecutionContext) -> str | None:
     runtime_access = context.runtime_metadata.get("runtime_access")
     if isinstance(runtime_access, dict) and isinstance(runtime_access.get("user_email"), str):
-        return runtime_access["user_email"]
-    if isinstance(context.runtime_metadata.get("user_email"), str):
-        return context.runtime_metadata["user_email"]
+        return str(runtime_access["user_email"])
+    runtime_user = context.runtime_metadata.get("user_email")
+    if isinstance(runtime_user, str):
+        return runtime_user
     if isinstance(context.shared_runtime_metadata, dict) and isinstance(
         context.shared_runtime_metadata.get("user_email"), str
     ):
-        return context.shared_runtime_metadata["user_email"]
+        return str(context.shared_runtime_metadata["user_email"])
     return None
 
 
 def _continuation_task_id(context: ToolExecutionContext) -> str | None:
     return continuation_scope_task_id(context.runtime_metadata)
+
+
+def _deliverable_accessor(context: ToolExecutionContext) -> tuple[str | None, str | None]:
+    runtime_access = context.runtime_metadata.get("runtime_access")
+    if isinstance(runtime_access, dict):
+        conversation_id = runtime_access.get("conversation_id")
+        agent_id = runtime_access.get("agent_id")
+    else:
+        conversation_id = context.runtime_metadata.get("conversation_id")
+        agent_id = context.runtime_metadata.get("agent_id")
+    return (
+        conversation_id if isinstance(conversation_id, str) and conversation_id else None,
+        agent_id if isinstance(agent_id, str) and agent_id else None,
+    )
 
 
 def build_task_continuation_tool_handlers(
@@ -83,23 +107,34 @@ def build_task_continuation_tool_handlers(
     ) -> dict[str, Any]:
         user_email = _user_email(context)
         scope_task_id = _continuation_task_id(context)
+        accessor_conversation_id, accessor_agent_id = _deliverable_accessor(context)
         deliverable_id = str(arguments.get("deliverable_id") or "").strip()
         if not user_email or not deliverable_id:
             return {"ok": False, "error": "missing_user_or_deliverable_id"}
+        artifact_store = None
+        if context.shared_runtime_metadata is not None:
+            artifact_store = context.shared_runtime_metadata.get("artifact_store")
+        artifact_store = artifact_store or context.runtime_metadata.get("artifact_store")
         async with session_factory() as session:
-            ref = await get_accessible_deliverable_ref(
-                session,
-                deliverable_id,
-                user_email,
-                scope_task_id=scope_task_id,
-            )
+            try:
+                ref = await get_accessible_deliverable_ref(
+                    session,
+                    artifact_store,
+                    deliverable_id,
+                    user_email,
+                    scope_task_id=scope_task_id,
+                    accessor_conversation_id=accessor_conversation_id,
+                    accessor_agent_id=accessor_agent_id,
+                )
+            except ValueError:
+                return {"ok": False, "error": "artifact_store_unavailable"}
             if ref is None:
                 return {"ok": False, "error": "not_found"}
             deliverable = ref.deliverable
             task = ref.task
-            return {
+            result = {
                 "ok": True,
-                "task_id": task.task_id,
+                "task_id": task.task_id if task is not None else None,
                 "deliverable_id": deliverable.deliverable_id,
                 "step_run_id": deliverable.step_run_id,
                 "version": deliverable.version,
@@ -108,7 +143,23 @@ def build_task_continuation_tool_handlers(
                 "title": deliverable.title,
                 "content": deliverable.content,
                 "outputs": deliverable.outputs or {},
+                "rich_payload": getattr(deliverable, "rich_payload", None),
+                "validation_warnings": getattr(deliverable, "validation_warnings", None) or [],
+                "render_metadata": getattr(deliverable, "render_metadata", None) or {},
+                "export_metadata": getattr(deliverable, "export_metadata", None) or {},
             }
+            if task is None:
+                result.update(
+                    {
+                        "conversation_id": deliverable.conversation_id,
+                        "session_id": deliverable.session_id,
+                        "turn_id": deliverable.turn_id,
+                        "creator_agent_id": ref.creator_agent_id,
+                        "source": "managed_conversation_deliverable",
+                    }
+                )
+        await record_deliverable_access(session_factory, ref)
+        return result
 
     async def list_task_step_runs_handler(
         arguments: dict[str, Any], context: ToolExecutionContext

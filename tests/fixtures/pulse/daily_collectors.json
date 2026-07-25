@@ -1,0 +1,62 @@
+{
+  "collectors": [
+    {
+      "collector": "agenda",
+      "status": "ok",
+      "observed_at": "2026-01-15T07:00:00+00:00",
+      "items": [
+        {
+          "id": "agenda-focus",
+          "kind": "agenda",
+          "title": "Focus window",
+          "summary": "Open from 08:00 to 09:30.",
+          "value": null,
+          "unit": null,
+          "timestamp": "2026-01-15T08:00:00+00:00",
+          "source_id": "calendar",
+          "source_url": "https://calendar.example.org/day",
+          "metadata": {"end": "2026-01-15T09:30:00+00:00"}
+        }
+      ],
+      "sources": [
+        {
+          "id": "calendar",
+          "title": "Calendar",
+          "url": "https://calendar.example.org/day",
+          "publisher": "Calendar service",
+          "observed_at": "2026-01-15T07:00:00+00:00"
+        }
+      ],
+      "errors": []
+    },
+    {
+      "collector": "weather",
+      "status": "ok",
+      "observed_at": "2026-01-15T07:00:00+00:00",
+      "items": [
+        {
+          "id": "weather-temperature",
+          "kind": "weather",
+          "title": "Temperature",
+          "summary": "Cool and dry.",
+          "value": 7,
+          "unit": "°C",
+          "timestamp": "2026-01-15T07:00:00+00:00",
+          "source_id": "forecast",
+          "source_url": "https://weather.example.org/hourly",
+          "metadata": {}
+        }
+      ],
+      "sources": [
+        {
+          "id": "forecast",
+          "title": "Hourly forecast",
+          "url": "https://weather.example.org/hourly",
+          "publisher": "Weather service",
+          "observed_at": "2026-01-15T07:00:00+00:00"
+        }
+      ],
+      "errors": []
+    }
+  ]
+}

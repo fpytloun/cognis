@@ -9,8 +9,11 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-import markdown as markdown_lib
+import markdown as markdown_lib  # type: ignore[import-untyped]
 from bs4 import BeautifulSoup, Tag
+from bs4.element import NavigableString
+
+from cognis.channels.markdown_rendering import normalize_gfm
 
 _MARKDOWN_EXTENSIONS = ("fenced_code", "tables", "sane_lists", "nl2br")
 
@@ -45,39 +48,23 @@ _ALLOWED_TAGS = {
 _SAFE_LINK_SCHEMES = {"http", "https", "matrix", "mailto"}
 
 
-def markdown_to_matrix_html(value: str) -> str:
+def markdown_to_matrix_html(value: str, *, compact: bool = False) -> str:
     """Render Markdown to sanitized Matrix-compatible HTML."""
 
     if not value:
         return ""
-    normalized = _normalize_task_list_markers(value)
     rendered = markdown_lib.markdown(
-        normalized,
+        normalize_gfm(value),
         extensions=list(_MARKDOWN_EXTENSIONS),
         output_format="html",
     )
-    return _sanitize_matrix_html(rendered)
-
-
-def _normalize_task_list_markers(value: str) -> str:
-    """Translate GitHub-style task list markers to portable text markers."""
-
-    lines: list[str] = []
-    for line in value.splitlines():
-        stripped = line.lstrip()
-        prefix = line[: len(line) - len(stripped)]
-        lower = stripped.lower()
-        if lower.startswith("- [x] "):
-            lines.append(f"{prefix}- ☑ {stripped[6:]}")
-        elif lower.startswith("- [ ] "):
-            lines.append(f"{prefix}- ☐ {stripped[6:]}")
-        else:
-            lines.append(line)
-    return "\n".join(lines)
+    sanitized = _sanitize_matrix_html(rendered)
+    return _compact_matrix_html(sanitized) if compact else sanitized
 
 
 def _sanitize_matrix_html(rendered: str) -> str:
     soup = BeautifulSoup(rendered, "html.parser")
+    _linearize_tables(soup)
     while True:
         disallowed = next(
             (tag for tag in soup.find_all(True) if tag.name not in _ALLOWED_TAGS),
@@ -88,6 +75,49 @@ def _sanitize_matrix_html(rendered: str) -> str:
         disallowed.unwrap()
     for tag in soup.find_all(True):
         _sanitize_tag(tag)
+    return str(soup)
+
+
+def _linearize_tables(soup: BeautifulSoup) -> None:
+    """Prefer readable labelled rows over inconsistently rendered Matrix tables."""
+
+    for table in list(soup.find_all("table")):
+        rows = table.find_all("tr")
+        headers = (
+            [cell.get_text(" ", strip=True) for cell in rows[0].find_all(["th", "td"])]
+            if rows
+            else []
+        )
+        replacement = soup.new_tag("p")
+        for row_index, row in enumerate(rows[1:] or rows):
+            values = [cell.get_text(" ", strip=True) for cell in row.find_all(["th", "td"])]
+            if row_index:
+                replacement.append(soup.new_tag("br"))
+            replacement.append(
+                NavigableString(
+                    " · ".join(
+                        f"{header}: {value}" if header else value
+                        for header, value in zip(headers, values, strict=False)
+                        if value
+                    )
+                )
+            )
+        table.replace_with(replacement)
+
+
+def _compact_matrix_html(rendered: str) -> str:
+    """Remove client-defined paragraph/list margins from rich document messages."""
+
+    soup = BeautifulSoup(rendered, "html.parser")
+    for paragraph in list(soup.find_all("p")):
+        paragraph.append(soup.new_tag("br"))
+        paragraph.unwrap()
+    for list_item in list(soup.find_all("li")):
+        list_item.insert(0, NavigableString("• "))
+        list_item.append(soup.new_tag("br"))
+        list_item.unwrap()
+    for container in list(soup.find_all(["ul", "ol"])):
+        container.unwrap()
     return str(soup)
 
 

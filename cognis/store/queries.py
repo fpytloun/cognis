@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import secrets
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 import sqlalchemy as sa
 from sqlalchemy import case, delete, select, update
+from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from cognis.core.agent_direct import agent_direct_context_ref
+from cognis.models.deliverable import (
+    RichPayloadValidationError,
+    normalize_required_rich_payload,
+    rich_export_metadata,
+    rich_render_metadata,
+)
 from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.store.deliverable_storage import (
+    attach_deliverable_payload,
+    store_deliverable_payload,
+)
 from cognis.store.models import (
     Agent,
     AgentGrantRow,
@@ -73,9 +86,59 @@ from cognis.store.models import (
     WorkflowRow,
 )
 
+logger = logging.getLogger(__name__)
+
+_DELIVERABLE_CLEANUP_REGISTERED = "_deliverable_cleanup_registered"
+_DELIVERABLE_DELETE_AFTER_COMMIT = "_deliverable_delete_after_commit"
+_DELIVERABLE_DELETE_AFTER_ROLLBACK = "_deliverable_delete_after_rollback"
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _queue_deliverable_payload_delete(
+    session: AsyncSession,
+    artifact_store: Any,
+    *,
+    namespace: str,
+    object_id: str,
+    when: str,
+) -> None:
+    sync_session = session.sync_session
+    if not sync_session.info.get(_DELIVERABLE_CLEANUP_REGISTERED):
+
+        def _delete_objects(entries: list[tuple[Any, str, str]]) -> None:
+            for store, ns, obj_id in entries:
+                try:
+                    store.delete_object(ns, obj_id)
+                except Exception:
+                    logger.warning(
+                        "deliverable storage cleanup failed",
+                        extra={"extra_data": {"namespace": ns, "object_id": obj_id}},
+                        exc_info=True,
+                    )
+
+        def _after_commit(committed_session: Any) -> None:
+            entries = committed_session.info.pop(_DELIVERABLE_DELETE_AFTER_COMMIT, [])
+            committed_session.info.pop(_DELIVERABLE_DELETE_AFTER_ROLLBACK, None)
+            committed_session.info[_DELIVERABLE_CLEANUP_REGISTERED] = False
+            _delete_objects(entries)
+
+        def _after_rollback(rolled_back_session: Any) -> None:
+            entries = rolled_back_session.info.pop(_DELIVERABLE_DELETE_AFTER_ROLLBACK, [])
+            rolled_back_session.info.pop(_DELIVERABLE_DELETE_AFTER_COMMIT, None)
+            rolled_back_session.info[_DELIVERABLE_CLEANUP_REGISTERED] = False
+            _delete_objects(entries)
+
+        sa_event.listen(sync_session, "after_commit", _after_commit, once=True)
+        sa_event.listen(sync_session, "after_rollback", _after_rollback, once=True)
+        sync_session.info[_DELIVERABLE_CLEANUP_REGISTERED] = True
+
+    key = (
+        _DELIVERABLE_DELETE_AFTER_COMMIT if when == "commit" else _DELIVERABLE_DELETE_AFTER_ROLLBACK
+    )
+    sync_session.info.setdefault(key, []).append((artifact_store, namespace, object_id))
 
 
 class _UnsetValue:
@@ -83,6 +146,27 @@ class _UnsetValue:
 
 
 _UNSET = _UnsetValue()
+
+AuthCacheInvalidator = Callable[[str, str], None]
+_AUTH_CACHE_INVALIDATORS: list[AuthCacheInvalidator] = []
+
+
+def register_auth_cache_invalidator(callback: AuthCacheInvalidator) -> None:
+    """Register an in-process auth cache invalidation hook."""
+
+    if callback not in _AUTH_CACHE_INVALIDATORS:
+        _AUTH_CACHE_INVALIDATORS.append(callback)
+
+
+def _notify_auth_cache_invalidated(kind: str, identifier: str) -> None:
+    """Notify middleware caches about auth mutations.
+
+    This is deliberately best-effort and in-process only. External processes
+    rely on the middleware's short TTL bound for stale positive cache entries.
+    """
+
+    for callback in list(_AUTH_CACHE_INVALIDATORS):
+        callback(kind, identifier)
 
 
 def _shared_owner_clause(column: Any) -> Any:
@@ -142,6 +226,8 @@ def _conversation_list_filters(
                 Conversation.status == "active",
             ]
         )
+    elif status == "all":
+        filters.append(Conversation.status != "deleted")
     elif status != "all":
         raise ValueError(f"Unsupported conversation status filter: {status}")
     context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
@@ -159,6 +245,46 @@ def _conversation_list_filters(
     if not include_agent_direct:
         filters.append(_exclude_agent_direct_clause())
     return filters
+
+
+def _conversation_scope_filters(
+    user_email: str,
+    *,
+    context_type: str | None = None,
+    context_types: list[str] | None = None,
+    agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
+    project_id: str | None = None,
+    include_agent_direct: bool = True,
+) -> list[Any]:
+    filters: list[Any] = [Conversation.user_email == user_email]
+    context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
+    agent_values = sorted({value for value in [agent_id, *(agent_ids or [])] if value})
+    if len(context_values) == 1:
+        filters.append(Conversation.context_type == context_values[0])
+    elif len(context_values) > 1:
+        filters.append(Conversation.context_type.in_(context_values))
+    if len(agent_values) == 1:
+        filters.append(Conversation.agent_id == agent_values[0])
+    elif len(agent_values) > 1:
+        filters.append(Conversation.agent_id.in_(agent_values))
+    if project_id is not None:
+        filters.append(Conversation.project_id == project_id)
+    if not include_agent_direct:
+        filters.append(_exclude_agent_direct_clause())
+    return filters
+
+
+def _conversation_status_clause(status: str) -> sa.ColumnElement[bool]:
+    if status == "active":
+        return Conversation.status == "active"
+    if status == "archived":
+        return Conversation.status == "archived"
+    if status == "starred":
+        return sa.and_(Conversation.starred_at.is_not(None), Conversation.status == "active")
+    if status == "all":
+        return Conversation.status != "deleted"
+    raise ValueError(f"Unsupported conversation status filter: {status}")
 
 
 def tool_classification_scope(owner_email: str | None) -> str:
@@ -262,6 +388,7 @@ async def disable_user(
     user.disabled_by = disabled_by
     user.updated_at = _utcnow()
     await session.flush()
+    _notify_auth_cache_invalidated("user", email)
     return user
 
 
@@ -275,6 +402,7 @@ async def enable_user(session: AsyncSession, email: str) -> User | None:
     user.disabled_by = None
     user.updated_at = _utcnow()
     await session.flush()
+    _notify_auth_cache_invalidated("user", email)
     return user
 
 
@@ -362,6 +490,7 @@ async def delete_user_cascade(session: AsyncSession, email: str) -> bool:
     # Delete the user
     await session.execute(delete(User).where(User.email == email))
     await session.flush()
+    _notify_auth_cache_invalidated("user", email)
     return True
 
 
@@ -423,7 +552,10 @@ async def delete_api_key(session: AsyncSession, key_id: str, user_email: str) ->
         delete(ApiKey).where(ApiKey.key_id == key_id, ApiKey.user_email == user_email)
     )
     await session.flush()
-    return int(getattr(result, "rowcount", 0) or 0) > 0
+    deleted = int(getattr(result, "rowcount", 0) or 0) > 0
+    if deleted:
+        _notify_auth_cache_invalidated("api_key", key_id)
+    return deleted
 
 
 async def touch_api_key_last_used(
@@ -1012,6 +1144,28 @@ async def update_agent(
     return True
 
 
+async def update_agent_if_updated_at(
+    session: AsyncSession,
+    agent_id: str,
+    *,
+    expected_updated_at: datetime,
+    updates: dict[str, Any],
+) -> bool:
+    """Atomically update an agent only when its revision has not changed."""
+
+    values = {
+        field_name: value for field_name, value in updates.items() if hasattr(Agent, field_name)
+    }
+    values["updated_at"] = datetime.now(UTC)
+    result = await session.execute(
+        update(Agent)
+        .where(Agent.agent_id == agent_id, Agent.updated_at == expected_updated_at)
+        .values(**values)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
 async def set_agent_status(session: AsyncSession, agent_id: str, status: str) -> bool:
     """Update an agent's lifecycle status."""
     row = await get_agent(session, agent_id)
@@ -1059,6 +1213,8 @@ async def upsert_system_agent_override(
     tools_override: dict[str, Any] | None = None,
     permissions_override: dict[str, Any] | None = None,
     execution_override: dict[str, Any] | None = None,
+    agent_profiles_override: dict[str, Any] | None = None,
+    default_agent_profile_id_override: str | None = None,
 ) -> SystemAgentOverride:
     """Create or update a per-user system-agent override row."""
 
@@ -1077,6 +1233,8 @@ async def upsert_system_agent_override(
     row.tools_override = tools_override
     row.permissions_override = permissions_override
     row.execution_override = execution_override
+    row.agent_profiles_override = agent_profiles_override
+    row.default_agent_profile_id_override = default_agent_profile_id_override
     row.updated_at = _utcnow()
     await session.flush()
     return row
@@ -1471,6 +1629,7 @@ async def create_conversation(
 ) -> Conversation:
     """Create a new conversation row."""
 
+    now = _utcnow()
     conversation = Conversation(
         conversation_id=conversation_id or f"conv_{uuid.uuid4().hex}",
         user_email=user_email,
@@ -1483,6 +1642,9 @@ async def create_conversation(
         project_id=project_id,
         context_data=context_data,
         memory_labels=memory_labels,
+        last_message_at=now,
+        created_at=now,
+        updated_at=now,
     )
     session.add(conversation)
     await session.flush()
@@ -1633,6 +1795,7 @@ async def list_conversations(
     project_id: str | None = None,
     include_agent_direct: bool = True,
     cursor_id: str | None = None,
+    changed_since: datetime | None = None,
     limit: int | None = None,
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
@@ -1642,10 +1805,7 @@ async def list_conversations(
     When ``cursor_id`` and ``limit`` are provided, pagination is applied in SQL
     before hydration so callers can avoid loading the full conversation set.
     """
-    ordering_activity = sa.func.coalesce(
-        Conversation.last_message_at,
-        Conversation.created_at,
-    )
+    ordering_activity = Conversation.last_message_at
     filters = _conversation_list_filters(
         user_email,
         context_type=context_type,
@@ -1665,6 +1825,8 @@ async def list_conversations(
             Conversation.conversation_id.asc(),
         )
     )
+    if changed_since is not None:
+        query = query.where(Conversation.updated_at > changed_since)
 
     if cursor_id:
         cursor_result = await session.execute(
@@ -1697,6 +1859,41 @@ async def list_conversations(
 
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def list_sidebar_tombstone_conversation_ids(
+    session: AsyncSession,
+    user_email: str,
+    *,
+    changed_since: datetime,
+    context_type: str | None = None,
+    context_types: list[str] | None = None,
+    agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
+    status: str = "active",
+    project_id: str | None = None,
+    include_agent_direct: bool = False,
+) -> list[str]:
+    """Return conversations changed since a sidebar cursor but no longer visible."""
+
+    filters = _conversation_scope_filters(
+        user_email,
+        context_type=context_type,
+        context_types=context_types,
+        agent_id=agent_id,
+        agent_ids=agent_ids,
+        project_id=project_id,
+        include_agent_direct=include_agent_direct,
+    )
+    visible_clause = _conversation_status_clause(status)
+    result = await session.execute(
+        select(Conversation.conversation_id)
+        .where(*filters)
+        .where(Conversation.updated_at > changed_since)
+        .where(sa.not_(visible_clause))
+        .order_by(Conversation.updated_at.asc(), Conversation.conversation_id.asc())
+    )
+    return [str(conversation_id) for conversation_id in result.scalars().all()]
 
 
 async def list_conversation_context_types(
@@ -1782,10 +1979,7 @@ async def get_latest_active_conversation_for_agent(
     conversations with a matching ``context_type`` column.
     """
 
-    ordering_activity = sa.func.coalesce(
-        Conversation.last_message_at,
-        Conversation.created_at,
-    )
+    ordering_activity = Conversation.last_message_at
     query = (
         select(Conversation)
         .where(Conversation.user_email == user_email)
@@ -1837,9 +2031,67 @@ async def get_agent_direct_conversation(
     return result.scalar_one_or_none()
 
 
+async def list_agent_direct_conversations(
+    session: AsyncSession,
+    user_email: str,
+    agent_ids: list[str],
+) -> dict[str, Conversation]:
+    """Return the active sticky web direct chat for each requested agent."""
+
+    ids = sorted({agent_id for agent_id in agent_ids if agent_id})
+    if not ids:
+        return {}
+
+    has_sessions = (
+        select(sa.literal(1))
+        .where(Session.conversation_id == Conversation.conversation_id)
+        .limit(1)
+        .exists()
+    )
+    ranked = (
+        select(
+            Conversation.conversation_id.label("conversation_id"),
+            sa.func.row_number()
+            .over(
+                partition_by=Conversation.agent_id,
+                order_by=(
+                    case((has_sessions, 1), else_=0).desc(),
+                    Conversation.last_message_at.desc(),
+                    Conversation.updated_at.desc(),
+                    Conversation.created_at.desc(),
+                    Conversation.conversation_id.asc(),
+                ),
+            )
+            .label("rank"),
+        )
+        .where(Conversation.user_email == user_email)
+        .where(Conversation.agent_id.in_(ids))
+        .where(Conversation.status == "active")
+        .where(
+            sa.or_(
+                Conversation.context_ref.in_(
+                    [agent_direct_context_ref(user_email, agent_id) for agent_id in ids]
+                ),
+                sa.and_(
+                    Conversation.context_type == "web",
+                    Conversation.context_data["kind"].as_string() == "agent_direct",
+                ),
+            )
+        )
+        .subquery()
+    )
+    result = await session.execute(
+        select(Conversation)
+        .join(ranked, ranked.c.conversation_id == Conversation.conversation_id)
+        .where(ranked.c.rank == 1)
+    )
+    return {row.agent_id: row for row in result.scalars().all()}
+
+
 async def create_managed_conversation_link(
     session: AsyncSession,
     *,
+    link_id: str | None = None,
     user_email: str,
     controller_agent_id: str,
     controller_conversation_id: str,
@@ -1849,29 +2101,106 @@ async def create_managed_conversation_link(
     target_session_id: str,
     title: str,
     target_agent_profile_id: str | None = None,
+    parent_link_id: str | None = None,
+    root_link_id: str | None = None,
+    depth: int = 1,
     turn_state: str = "idle",
+    active_turn_id: str | None = None,
     notify_on_completion: bool = False,
 ) -> ManagedConversationLink:
     """Create a durable controller-to-target managed conversation link."""
 
+    if parent_link_id is not None:
+        parent = await get_managed_conversation_link(
+            session,
+            parent_link_id,
+            user_email=user_email,
+            for_update=True,
+        )
+        if parent is None or int(parent.depth or 1) >= 2:
+            raise ValueError("Maximum managed-conversation depth is 2.")
+        if (
+            controller_agent_id != parent.target_agent_id
+            or controller_conversation_id != parent.target_conversation_id
+        ):
+            raise ValueError("Nested managed-conversation controller does not own the parent link.")
+        ancestry = await get_managed_conversation_ancestry(session, parent, user_email=user_email)
+        ancestor_agent_ids = {item.target_agent_id for item in ancestry}
+        ancestor_agent_ids.add(ancestry[-1].controller_agent_id)
+        if target_agent_id in ancestor_agent_ids:
+            raise ValueError("Target agent already appears in managed ancestry.")
+        expected_root = parent.root_link_id or parent.link_id
+        if root_link_id != expected_root or depth != int(parent.depth or 1) + 1:
+            raise ValueError("Managed-conversation lineage is inconsistent.")
+    elif depth != 1 or root_link_id is not None:
+        raise ValueError("Root managed-conversation lineage is inconsistent.")
+
     row = ManagedConversationLink(
+        **({"link_id": link_id} if link_id is not None else {}),
         user_email=user_email,
         controller_agent_id=controller_agent_id,
         controller_conversation_id=controller_conversation_id,
         controller_session_id=controller_session_id,
         target_agent_id=target_agent_id,
         target_agent_profile_id=target_agent_profile_id,
+        parent_link_id=parent_link_id,
+        root_link_id=root_link_id,
+        depth=depth,
         target_conversation_id=target_conversation_id,
         target_session_id=target_session_id,
         title=title,
         conversation_state="open",
         turn_state=turn_state,
+        active_turn_id=active_turn_id,
         notify_on_completion=notify_on_completion,
     )
     session.add(row)
     await session.flush()
     await session.refresh(row)
+    if row.root_link_id is None:
+        row.root_link_id = row.link_id
+        await session.flush()
+        await session.refresh(row)
     return row
+
+
+async def get_managed_conversation_ancestry(
+    session: AsyncSession,
+    link: ManagedConversationLink,
+    *,
+    user_email: str,
+    max_hops: int = 2,
+) -> list[ManagedConversationLink]:
+    """Return the link and its parents, rejecting malformed or cross-user lineage."""
+
+    if link.depth < 1 or not link.root_link_id:
+        raise ValueError("Managed conversation lineage is invalid.")
+    ancestry = [link]
+    visited = {link.link_id}
+    current = link
+    for _ in range(max_hops):
+        if current.parent_link_id is None:
+            break
+        parent = await get_managed_conversation_link(
+            session, current.parent_link_id, user_email=user_email
+        )
+        if parent is None or parent.link_id in visited:
+            raise ValueError("Managed conversation lineage is invalid.")
+        if (
+            parent.target_conversation_id != current.controller_conversation_id
+            or parent.target_agent_id != current.controller_agent_id
+            or parent.root_link_id != current.root_link_id
+            or parent.depth != current.depth - 1
+        ):
+            raise ValueError("Managed conversation lineage is invalid.")
+        ancestry.append(parent)
+        visited.add(parent.link_id)
+        current = parent
+    if current.parent_link_id is not None:
+        raise ValueError("Managed conversation lineage exceeds the supported depth.")
+    if current.depth != 1 or current.root_link_id != current.link_id or link.depth != len(ancestry):
+        raise ValueError("Managed conversation lineage is invalid.")
+    return ancestry
 
 
 async def get_managed_conversation_link(
@@ -1879,12 +2208,15 @@ async def get_managed_conversation_link(
     link_id: str,
     *,
     user_email: str | None = None,
+    for_update: bool = False,
 ) -> ManagedConversationLink | None:
     """Return a managed conversation link by ID."""
 
     query = select(ManagedConversationLink).where(ManagedConversationLink.link_id == link_id)
     if user_email is not None:
         query = query.where(ManagedConversationLink.user_email == user_email)
+    if for_update:
+        query = query.with_for_update()
     result = await session.execute(query)
     return result.scalar_one_or_none()
 
@@ -1909,10 +2241,42 @@ async def get_managed_conversation_link_for_target(
     return result.scalar_one_or_none()
 
 
+async def list_managed_conversation_links_for_targets(
+    session: AsyncSession,
+    target_conversation_ids: list[str],
+    *,
+    user_email: str | None = None,
+) -> dict[str, ManagedConversationLink]:
+    """Return managed conversation links keyed by target conversation ID."""
+
+    ids = sorted(
+        {conversation_id for conversation_id in target_conversation_ids if conversation_id}
+    )
+    if not ids:
+        return {}
+    query = select(ManagedConversationLink).where(
+        ManagedConversationLink.target_conversation_id.in_(ids)
+    )
+    if user_email is not None:
+        query = query.where(ManagedConversationLink.user_email == user_email)
+    result = await session.execute(
+        query.order_by(
+            ManagedConversationLink.target_conversation_id.asc(),
+            ManagedConversationLink.created_at.desc(),
+            ManagedConversationLink.link_id.asc(),
+        )
+    )
+    links: dict[str, ManagedConversationLink] = {}
+    for row in result.scalars().all():
+        links.setdefault(row.target_conversation_id, row)
+    return links
+
+
 async def list_managed_conversation_links(
     session: AsyncSession,
     *,
     user_email: str,
+    controller_agent_id: str | None = None,
     controller_conversation_id: str | None = None,
     status: str | None = None,
     limit: int = 25,
@@ -1920,6 +2284,8 @@ async def list_managed_conversation_links(
     """List managed conversation links for one user."""
 
     query = select(ManagedConversationLink).where(ManagedConversationLink.user_email == user_email)
+    if controller_agent_id is not None:
+        query = query.where(ManagedConversationLink.controller_agent_id == controller_agent_id)
     if controller_conversation_id is not None:
         query = query.where(
             ManagedConversationLink.controller_conversation_id == controller_conversation_id
@@ -2024,17 +2390,65 @@ async def update_managed_conversation_link(
     *,
     conversation_state: str | None = None,
     turn_state: str | None = None,
-    target_session_id: str | None = None,
-    active_turn_id: str | None = None,
+    target_session_id: str | None | _UnsetValue = _UNSET,
+    active_turn_id: str | None | _UnsetValue = _UNSET,
     clear_active_turn_id: bool = False,
     notify_on_completion: bool | None = None,
     last_result_summary: str | None | _UnsetValue = _UNSET,
+    last_result_turn_id: str | None | _UnsetValue = _UNSET,
     last_error: str | None | _UnsetValue = _UNSET,
-    control_metadata: dict[str, Any] | None = None,
+    control_metadata: dict[str, Any] | None | _UnsetValue = _UNSET,
+    completed_at: datetime | None | _UnsetValue = _UNSET,
     completed: bool = False,
+    clear_completed: bool = False,
     closed: bool = False,
+    preserve_terminal_state: bool = False,
+    expected_active_turn_id: str | None = None,
 ) -> ManagedConversationLink | None:
     """Update managed conversation lifecycle state."""
+
+    if preserve_terminal_state:
+        now = datetime.now(UTC)
+        values: dict[str, Any] = {"updated_at": now}
+        if conversation_state is not None:
+            values["conversation_state"] = conversation_state
+        if turn_state is not None:
+            values["turn_state"] = turn_state
+        if target_session_id is not None:
+            values["target_session_id"] = target_session_id
+        if active_turn_id is not None:
+            values["active_turn_id"] = active_turn_id
+        if clear_active_turn_id:
+            values["active_turn_id"] = None
+        if notify_on_completion is not None:
+            values["notify_on_completion"] = notify_on_completion
+        if last_result_summary is not _UNSET:
+            values["last_result_summary"] = last_result_summary
+        if last_error is not _UNSET:
+            values["last_error"] = last_error
+        if control_metadata is not None:
+            values["control_metadata"] = control_metadata
+        if completed:
+            values["completed_at"] = now
+        elif clear_completed:
+            values["completed_at"] = None
+        if closed:
+            values["closed_at"] = now
+        statement = update(ManagedConversationLink).where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.conversation_state.not_in(("completed", "closed")),
+        )
+        if expected_active_turn_id is not None:
+            statement = statement.where(
+                ManagedConversationLink.active_turn_id == expected_active_turn_id
+            )
+        result = await session.execute(
+            statement.values(**values).execution_options(synchronize_session=False)
+        )
+        await session.flush()
+        if not result.rowcount:
+            return None
+        return await get_managed_conversation_link(session, link_id)
 
     row = await get_managed_conversation_link(session, link_id)
     if row is None:
@@ -2043,28 +2457,214 @@ async def update_managed_conversation_link(
         row.conversation_state = conversation_state
     if turn_state is not None:
         row.turn_state = turn_state
-    if target_session_id is not None:
-        row.target_session_id = target_session_id
+    if not isinstance(target_session_id, _UnsetValue):
+        row.target_session_id = cast(str | None, target_session_id)
     if clear_active_turn_id:
         row.active_turn_id = None
-    if active_turn_id is not None:
-        row.active_turn_id = active_turn_id
+    elif not isinstance(active_turn_id, _UnsetValue):
+        row.active_turn_id = cast(str | None, active_turn_id)
     if notify_on_completion is not None:
         row.notify_on_completion = notify_on_completion
     if not isinstance(last_result_summary, _UnsetValue):
         row.last_result_summary = cast(str | None, last_result_summary)
+    if not isinstance(last_result_turn_id, _UnsetValue):
+        row.last_result_turn_id = cast(str | None, last_result_turn_id)
     if not isinstance(last_error, _UnsetValue):
         row.last_error = cast(str | None, last_error)
-    if control_metadata is not None:
-        row.control_metadata = control_metadata
+    if not isinstance(control_metadata, _UnsetValue):
+        row.control_metadata = cast(dict[str, Any] | None, control_metadata)
+    if not isinstance(completed_at, _UnsetValue):
+        row.completed_at = cast(datetime | None, completed_at)
     if completed:
         row.completed_at = datetime.now(UTC)
+    elif clear_completed:
+        row.completed_at = None
     if closed:
         row.closed_at = datetime.now(UTC)
     row.updated_at = datetime.now(UTC)
     await session.flush()
     await session.refresh(row)
     return row
+
+
+async def arm_managed_conversation_notification_if_active(
+    session: AsyncSession,
+    link_id: str,
+) -> bool:
+    """Arm timeout handoff only while the managed turn is still active.
+
+    The conditional update closes the race where a joined wait observed a
+    running link, the child completed, and the waiter then stranded
+    ``notify_on_completion=True`` on the terminal row.
+    """
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.conversation_state == "open",
+            (
+                ManagedConversationLink.turn_state.in_(("queued", "running"))
+                | ManagedConversationLink.active_turn_id.is_not(None)
+            ),
+        )
+        .values(notify_on_completion=True, updated_at=datetime.now(UTC))
+    )
+    await session.flush()
+    return bool(result.rowcount)
+
+
+async def settle_managed_conversation_link(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    expected_active_turn_id: str,
+    conversation_state: str,
+    turn_state: str,
+    target_session_id: str,
+    last_result_summary: str | None,
+    last_error: str | None,
+    clear_active_turn_id: bool,
+    clear_notify_on_completion: bool,
+    completed: bool,
+) -> bool:
+    """Atomically settle a managed link only for its currently admitted turn."""
+
+    if not expected_active_turn_id:
+        return False
+    now = datetime.now(UTC)
+    values: dict[str, Any] = {
+        "conversation_state": conversation_state,
+        "turn_state": turn_state,
+        "target_session_id": target_session_id,
+        "active_turn_id": None if clear_active_turn_id else expected_active_turn_id,
+        "last_result_summary": last_result_summary,
+        "last_result_turn_id": expected_active_turn_id,
+        "last_error": last_error,
+        "completed_at": now if completed else None,
+        "updated_at": now,
+    }
+    if clear_notify_on_completion:
+        values["notify_on_completion"] = False
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.active_turn_id == expected_active_turn_id,
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def admit_managed_conversation_turn(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    turn_id: str,
+    turn_state: str,
+    notify_on_completion: bool,
+    control_metadata: dict[str, Any] | None,
+) -> ManagedConversationLink | None:
+    """Atomically reset lifecycle state for one managed turn admission.
+
+    A link can represent at most one queued controller admission. Re-admitting
+    the same ID is idempotent for scheduler retries, while a different queued
+    ID is rejected instead of silently orphaning the earlier turn.
+    """
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            sa.or_(
+                ManagedConversationLink.turn_state != "queued",
+                ManagedConversationLink.active_turn_id == turn_id,
+            ),
+        )
+        .values(
+            conversation_state="open",
+            turn_state=turn_state,
+            active_turn_id=turn_id,
+            notify_on_completion=notify_on_completion,
+            last_result_summary=None,
+            last_result_turn_id=None,
+            last_error=None,
+            completed_at=None,
+            control_metadata=control_metadata,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        return None
+    return await get_managed_conversation_link(session, link_id)
+
+
+async def mark_managed_conversation_turn_running(
+    session: AsyncSession,
+    target_conversation_id: str,
+    *,
+    turn_id: str,
+    target_session_id: str,
+) -> bool:
+    """Mirror scheduler launch without overwriting a newer queued admission."""
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.target_conversation_id == target_conversation_id,
+            sa.or_(
+                ManagedConversationLink.active_turn_id.is_(None),
+                ManagedConversationLink.active_turn_id == turn_id,
+                sa.and_(
+                    ManagedConversationLink.turn_state == "running",
+                    ManagedConversationLink.active_turn_id.is_not(None),
+                    ManagedConversationLink.last_result_turn_id
+                    == ManagedConversationLink.active_turn_id,
+                ),
+            ),
+        )
+        .values(
+            conversation_state="open",
+            turn_state="running",
+            target_session_id=target_session_id,
+            active_turn_id=turn_id,
+            last_result_summary=None,
+            last_result_turn_id=None,
+            last_error=None,
+            completed_at=None,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def assign_managed_conversation_recovery_turn_id(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    recovery_turn_id: str,
+) -> bool:
+    """Backfill correlation for a legacy interrupted managed notification."""
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.active_turn_id.is_(None),
+            ManagedConversationLink.turn_state == "interrupted",
+            ManagedConversationLink.notify_on_completion.is_(True),
+        )
+        .values(
+            active_turn_id=recovery_turn_id,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
 async def update_conversation(
@@ -2199,6 +2799,7 @@ async def mark_conversation_read(session: AsyncSession, conversation_id: str) ->
     if row is None:
         return False
     row.last_read_at = datetime.now(UTC)
+    row.updated_at = row.last_read_at
     await session.flush()
     return True
 
@@ -2545,6 +3146,7 @@ async def create_session(
     previous_session_id: str | None = None,
     delegation_mode: str | None = None,
     delegation_task: str | None = None,
+    delegation_metadata: dict[str, Any] | None = None,
     status: str = "active",
     intaris_session_id: str | None = None,
     mnemory_session_id: str | None = None,
@@ -2562,6 +3164,7 @@ async def create_session(
         agent_profile_id=agent_profile_id,
         delegation_mode=delegation_mode,
         delegation_task=delegation_task,
+        delegation_metadata=delegation_metadata or {},
         status=status,
         intaris_session_id=intaris_session_id,
         mnemory_session_id=mnemory_session_id,
@@ -2702,6 +3305,32 @@ async def list_conversation_todos(
         if row.priority:
             item["priority"] = row.priority
         todos.append(item)
+    return todos
+
+
+async def list_conversation_todos_by_conversation(
+    session: AsyncSession,
+    conversation_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return authoritative TODO state for many conversations in one query."""
+
+    ids = sorted({conversation_id for conversation_id in conversation_ids if conversation_id})
+    if not ids:
+        return {}
+    result = await session.execute(
+        select(ConversationTodo)
+        .where(ConversationTodo.conversation_id.in_(ids))
+        .order_by(ConversationTodo.conversation_id.asc(), ConversationTodo.position.asc())
+    )
+    todos: dict[str, list[dict[str, Any]]] = {}
+    for row in result.scalars().all():
+        item: dict[str, Any] = {
+            "content": row.content,
+            "status": row.status,
+        }
+        if row.priority:
+            item["priority"] = row.priority
+        todos.setdefault(row.conversation_id, []).append(item)
     return todos
 
 
@@ -3643,49 +4272,207 @@ async def get_dependent_tasks(
 async def create_deliverable(
     session: AsyncSession,
     *,
-    step_run_id: str,
+    step_run_id: str | None = None,
+    conversation_id: str | None = None,
+    session_id: str | None = None,
+    turn_id: str | None = None,
     content: str,
     format: str = "markdown",
     title: str | None = None,
     target: str | None = None,
     outputs: dict[str, Any] | None = None,
+    rich: dict[str, Any] | None = None,
     deliverable_id: str | None = None,
     attempt_number: int | None = None,
+    artifact_store: Any | None = None,
+    media_owner_email: str | None = None,
+    media_accessor_conversation_id: str | None = None,
+    media_accessor_agent_id: str | None = None,
 ) -> DeliverableRow:
-    """Create a new versioned deliverable for a step run."""
+    """Create a new versioned deliverable for a step or conversation scope."""
+
+    if bool(step_run_id) == bool(conversation_id):
+        raise ValueError("deliverable must have exactly one owner scope")
+    if artifact_store is None:
+        raise ValueError("deliverable storage requires an artifact store")
+    if format == "rich":
+        rich_payload, validation_warnings = normalize_required_rich_payload(rich)
+        from cognis.core.deliverable_media import authorize_rich_media, rich_payload_has_media
+
+        if rich_payload_has_media(rich_payload):
+            if conversation_id is not None:
+                creator = await get_conversation(session, conversation_id)
+                media_owner_email = media_owner_email or (
+                    creator.user_email if creator is not None else None
+                )
+                media_accessor_conversation_id = media_accessor_conversation_id or conversation_id
+                media_accessor_agent_id = media_accessor_agent_id or (
+                    creator.agent_id if creator is not None else None
+                )
+            if (
+                not media_owner_email
+                or not media_accessor_conversation_id
+                or not media_accessor_agent_id
+            ):
+                raise RichPayloadValidationError(
+                    reason="missing_rich_media_access_context",
+                    path="$.blocks[*].media.ref",
+                    expected="authenticated owner and authoring conversation/agent context",
+                )
+            rich_payload, _retained_refs = await authorize_rich_media(
+                session,
+                artifact_store,
+                rich_payload,
+                owner_email=media_owner_email,
+                accessor_conversation_id=media_accessor_conversation_id,
+                accessor_agent_id=media_accessor_agent_id,
+            )
+    else:
+        rich_payload, validation_warnings = None, []
+    render_metadata = rich_render_metadata(rich_payload, validation_warnings)
+    export_metadata = rich_export_metadata(rich_payload)
+
+    if step_run_id is not None:
+        version_where = DeliverableRow.step_run_id == step_run_id
+    else:
+        version_where = sa.and_(
+            DeliverableRow.conversation_id == conversation_id,
+            DeliverableRow.session_id == session_id,
+            DeliverableRow.turn_id == turn_id,
+        )
 
     version_result = await session.execute(
-        select(sa.func.max(DeliverableRow.version)).where(DeliverableRow.step_run_id == step_run_id)
+        select(sa.func.max(DeliverableRow.version)).where(version_where)
     )
     next_version = int(version_result.scalar_one_or_none() or 0) + 1
-    if attempt_number is None:
+    if attempt_number is None and step_run_id is not None:
         step_run = await session.get(StepRun, step_run_id)
         attempt_number = getattr(step_run, "attempt_number", 1) if step_run is not None else 1
+    if attempt_number is None:
+        attempt_number = 1
+
+    superseded_result = await session.execute(
+        select(DeliverableRow).where(
+            version_where,
+            DeliverableRow.status.in_(["buffered", "approved"]),
+        )
+    )
+    superseded_rows = list(superseded_result.scalars().all())
+
+    row_deliverable_id = deliverable_id or f"dlv_{uuid.uuid4().hex}"
+    stored = await store_deliverable_payload(
+        artifact_store,
+        deliverable_id=row_deliverable_id,
+        content=content,
+        format=format,
+        rich_payload=rich_payload,
+        outputs=outputs,
+    )
+    _queue_deliverable_payload_delete(
+        session,
+        artifact_store,
+        namespace=stored.namespace,
+        object_id=stored.object_id,
+        when="rollback",
+    )
 
     await session.execute(
         update(DeliverableRow)
         .where(
-            DeliverableRow.step_run_id == step_run_id,
+            version_where,
             DeliverableRow.status.in_(["buffered", "approved"]),
         )
         .values(status="superseded", updated_at=_utcnow())
     )
 
     row = DeliverableRow(
-        deliverable_id=deliverable_id or f"dlv_{uuid.uuid4().hex}",
+        deliverable_id=row_deliverable_id,
         step_run_id=step_run_id,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        turn_id=turn_id,
         version=next_version,
         attempt_number=attempt_number,
-        content=content,
+        storage_namespace=stored.namespace,
+        storage_object_id=stored.object_id,
+        content_key=stored.content.key,
+        content_mime=stored.content.mime,
+        content_size=stored.content.size or 0,
+        content_hash=stored.content.hash,
         format=format,
         title=title,
         target=target,
-        outputs=outputs,
+        rich_key=stored.rich.key,
+        rich_size=stored.rich.size,
+        rich_hash=stored.rich.hash,
+        outputs_key=stored.outputs.key,
+        outputs_mime=stored.outputs.mime,
+        outputs_size=stored.outputs.size,
+        outputs_hash=stored.outputs.hash,
+        validation_warnings=validation_warnings,
+        render_metadata=render_metadata,
+        export_metadata=export_metadata,
         status="buffered",
+    )
+    attach_deliverable_payload(
+        row,
+        content=content,
+        rich_payload=rich_payload,
+        outputs=outputs,
     )
     session.add(row)
     await session.flush()
+    for old_row in superseded_rows:
+        _queue_deliverable_payload_delete(
+            session,
+            artifact_store,
+            namespace=getattr(old_row, "storage_namespace", None) or "deliverables",
+            object_id=getattr(old_row, "storage_object_id", None) or old_row.deliverable_id,
+            when="commit",
+        )
     return row
+
+
+async def list_deliverables_for_conversation_scope(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    session_id: str | None = None,
+    turn_id: str | None = None,
+) -> list[DeliverableRow]:
+    """List deliverables for a conversation/session/turn scope, newest first."""
+
+    predicates: list[Any] = [DeliverableRow.conversation_id == conversation_id]
+    if session_id is not None:
+        predicates.append(DeliverableRow.session_id == session_id)
+    if turn_id is not None:
+        predicates.append(DeliverableRow.turn_id == turn_id)
+    result = await session.execute(
+        select(DeliverableRow)
+        .where(*predicates)
+        .order_by(DeliverableRow.created_at.desc(), DeliverableRow.version.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_accessible_conversation_deliverable(
+    session: AsyncSession,
+    deliverable_id: str,
+    user_email: str,
+) -> DeliverableRow | None:
+    """Return a conversation-scoped deliverable only for its conversation owner."""
+
+    result = await session.execute(
+        select(DeliverableRow)
+        .join(Conversation, Conversation.conversation_id == DeliverableRow.conversation_id)
+        .where(
+            DeliverableRow.deliverable_id == deliverable_id,
+            DeliverableRow.step_run_id.is_(None),
+            Conversation.user_email == user_email,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def get_deliverable(session: AsyncSession, deliverable_id: str) -> DeliverableRow | None:
@@ -4889,6 +5676,26 @@ async def set_current_version(session: AsyncSession, skill_id: str, version_id: 
     return result.rowcount > 0
 
 
+async def set_current_version_if_matches(
+    session: AsyncSession,
+    skill_id: str,
+    *,
+    expected_version_id: str,
+    version_id: str,
+) -> bool:
+    """Publish a version only if the observed current version is still current."""
+
+    result = await session.execute(
+        update(SkillRow)
+        .where(
+            SkillRow.skill_id == skill_id,
+            SkillRow.current_version_id == expected_version_id,
+        )
+        .values(current_version_id=version_id)
+    )
+    return result.rowcount > 0
+
+
 # --- Skill Assets ---
 
 
@@ -5164,6 +5971,27 @@ async def update_executor_runtime_state(
         row.runtime_state = runtime_state
     await session.flush()
     return row
+
+
+async def normalize_executor_desired_config_version(
+    session: AsyncSession,
+    executor_id: str,
+    *,
+    minimum_version: int = 1,
+) -> bool:
+    """Atomically raise a legacy executor desired generation to the minimum."""
+
+    result = await session.execute(
+        update(ExecutorRow)
+        .where(
+            ExecutorRow.executor_id == executor_id,
+            ExecutorRow.desired_config_version < minimum_version,
+        )
+        .values(desired_config_version=minimum_version)
+        .execution_options(synchronize_session=False)
+    )
+    await session.flush()
+    return bool(getattr(result, "rowcount", 0))
 
 
 async def bump_executor_reconfigure_generation(
@@ -5568,6 +6396,32 @@ async def get_mcp_oauth_token_for_server(
     return result.scalar_one_or_none()
 
 
+async def list_due_mcp_oauth_tokens(
+    session: AsyncSession,
+    *,
+    refresh_before: datetime,
+    now: datetime,
+    limit: int = 100,
+) -> list[MCPOAuthTokenRow]:
+    """List active OAuth tokens due for proactive refresh without locking them."""
+
+    result = await session.execute(
+        select(MCPOAuthTokenRow)
+        .where(
+            MCPOAuthTokenRow.status == "active",
+            MCPOAuthTokenRow.expires_at.is_not(None),
+            MCPOAuthTokenRow.expires_at <= refresh_before,
+            sa.or_(
+                MCPOAuthTokenRow.next_refresh_attempt_at.is_(None),
+                MCPOAuthTokenRow.next_refresh_attempt_at <= now,
+            ),
+        )
+        .order_by(MCPOAuthTokenRow.expires_at.asc())
+        .limit(max(1, min(limit, 1000)))
+    )
+    return list(result.scalars().all())
+
+
 async def upsert_mcp_oauth_token(
     session: AsyncSession,
     *,
@@ -5613,6 +6467,11 @@ async def upsert_mcp_oauth_token(
         row.status = status
         row.encrypted_payload = encrypted_payload
         row.version = int(row.version or 0) + 1
+        row.refresh_failure_count = 0
+        row.next_refresh_attempt_at = None
+        row.last_refresh_error_code = None
+        row.last_refresh_error_description = None
+        row.last_refresh_error_at = None
         row.updated_at = _utcnow()
     await session.flush()
     return row
@@ -5829,6 +6688,7 @@ async def create_channel_account(
     config: dict[str, Any] | None = None,
     credential_refs: dict[str, str] | None = None,
     default_conversation_id: str | None = None,
+    default_agent_profile_id: str | None = None,
     allow_new_conversations: bool = True,
     preferred_for_task_delivery: bool = False,
     adapter_location: str = "controller",
@@ -5855,6 +6715,7 @@ async def create_channel_account(
         config=config or {},
         credential_refs=credential_refs or {},
         default_conversation_id=default_conversation_id,
+        default_agent_profile_id=default_agent_profile_id,
         allow_new_conversations=allow_new_conversations,
         preferred_for_task_delivery=preferred_for_task_delivery,
         adapter_location=adapter_location,
@@ -5921,6 +6782,7 @@ async def get_latest_active_conversation_for_channel_account(
     user_email: str,
     agent_id: str,
     account_id: str,
+    prefer_unthreaded: bool = False,
 ) -> Conversation | None:
     """Return the latest active conversation bound to a channel account."""
 
@@ -5937,15 +6799,31 @@ async def get_latest_active_conversation_for_channel_account(
         .where(Conversation.context_type.notin_(["web", "api"]))
         .order_by(latest_activity.desc(), Conversation.updated_at.desc())
     )
+    fallback: Conversation | None = None
     for conversation in result.scalars().all():
         platform_data = conversation.context_data or {}
+        matched = False
         if str(platform_data.get("account_id") or "") == account_id:
+            matched = True
+        else:
+            context_ref = conversation.context_ref or ""
+            parts = context_ref.split(":", 3)
+            matched = len(parts) >= 3 and parts[1] == account_id
+        if not matched:
+            continue
+        if not prefer_unthreaded:
             return conversation
-        context_ref = conversation.context_ref or ""
-        parts = context_ref.split(":", 3)
-        if len(parts) >= 3 and parts[1] == account_id:
+        if fallback is None:
+            fallback = conversation
+        if "thread_id" in platform_data:
+            thread_id = platform_data.get("thread_id")
+        else:
+            context_ref = conversation.context_ref or ""
+            parts = context_ref.split(":", 3)
+            thread_id = parts[3] if len(parts) >= 4 else None
+        if not thread_id:
             return conversation
-    return None
+    return fallback
 
 
 async def delete_channel_account(
@@ -6151,6 +7029,8 @@ async def create_artifact_record(
     session_id: str | None = None,
     message_role: str | None = None,
     content_hash: str | None = None,
+    source_tool_call_id: str | None = None,
+    source_anchor: str | None = None,
 ) -> ArtifactRecordRow:
     row = ArtifactRecordRow(
         artifact_id=artifact_id,
@@ -6168,6 +7048,8 @@ async def create_artifact_record(
         status=status,
         expires_at=expires_at,
         content_hash=content_hash,
+        source_tool_call_id=source_tool_call_id,
+        source_anchor=source_anchor,
     )
     session.add(row)
     await session.flush()
@@ -6294,22 +7176,46 @@ async def find_tool_artifact_record(
     owner_email: str,
     source_tool_call_id: str,
     source_anchor: str,
-    source_hash: str,
 ) -> ArtifactRecordRow | None:
     # Tool artifact refs are lazy aliases to saved tool output anchors. We avoid
     # one DB row per discovered candidate; only first access creates a regular
     # artifact. Existing artifact columns carry the stable source identity:
-    # purpose=tool_artifact, conversation_id=source call_id,
-    # session_id=source anchor, content_hash=source fingerprint.
+    # purpose=tool_artifact with explicit source identity. content_hash is
+    # reserved for byte integrity.
     stmt = (
         select(ArtifactRecordRow)
         .where(
             ArtifactRecordRow.owner_email == owner_email,
             ArtifactRecordRow.status != "deleted",
             ArtifactRecordRow.purpose == "tool_artifact",
-            ArtifactRecordRow.content_hash == source_hash,
-            ArtifactRecordRow.conversation_id == source_tool_call_id,
-            ArtifactRecordRow.session_id == source_anchor,
+            ArtifactRecordRow.source_tool_call_id == source_tool_call_id,
+            ArtifactRecordRow.source_anchor == source_anchor,
+            sa.or_(
+                ArtifactRecordRow.expires_at.is_(None), ArtifactRecordRow.expires_at > _utcnow()
+            ),
+        )
+        .order_by(ArtifactRecordRow.created_at.desc(), ArtifactRecordRow.artifact_id.desc())
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def find_tool_output_artifact_record(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    source_tool_call_id: str,
+) -> ArtifactRecordRow | None:
+    """Find the persisted full-output artifact that authorizes a recovery call."""
+
+    stmt = (
+        select(ArtifactRecordRow)
+        .where(
+            ArtifactRecordRow.owner_email == owner_email,
+            ArtifactRecordRow.status != "deleted",
+            ArtifactRecordRow.purpose == "tool_output",
+            ArtifactRecordRow.source_tool_call_id == source_tool_call_id,
             sa.or_(
                 ArtifactRecordRow.expires_at.is_(None), ArtifactRecordRow.expires_at > _utcnow()
             ),
@@ -7089,6 +7995,8 @@ async def create_channel_delivery_outbox(
     chat_id: str,
     thread_id: str | None,
     fallback_text: str | None,
+    attachments: list[dict[str, Any]] | None = None,
+    deliverable_id: str | None = None,
     next_attempt_at: datetime | None = None,
 ) -> ChannelDeliveryOutboxRow:
     row = ChannelDeliveryOutboxRow(
@@ -7103,6 +8011,8 @@ async def create_channel_delivery_outbox(
         chat_id=chat_id,
         thread_id=thread_id,
         fallback_text=fallback_text,
+        attachments_json=attachments,
+        deliverable_id=deliverable_id,
         status="pending",
         next_attempt_at=next_attempt_at,
     )
@@ -7111,11 +8021,118 @@ async def create_channel_delivery_outbox(
     return row
 
 
+async def create_or_get_channel_delivery_outbox(
+    session: AsyncSession,
+    **kwargs: Any,
+) -> tuple[ChannelDeliveryOutboxRow, bool]:
+    """Atomically create an outbox row or return its concurrent equivalent."""
+
+    delivery_id = str(kwargs["delivery_id"])
+    try:
+        async with session.begin_nested():
+            row = await create_channel_delivery_outbox(session, **kwargs)
+        return row, True
+    except IntegrityError:
+        existing = await get_channel_delivery_outbox(session, delivery_id)
+        if existing is None:
+            raise
+        return existing, False
+
+
+async def ensure_follow_up_result_delivery(
+    session: AsyncSession,
+    *,
+    grace_delivery_id: str,
+    conversation_id: str,
+    session_id: str | None,
+    turn_id: str,
+    final_content: str | None,
+    attachments: list[dict[str, Any]] | None,
+    deliverable_id: str | None,
+) -> ChannelDeliveryOutboxRow | None:
+    """Create the durable terminal phase for a channel-bound follow-up."""
+
+    source_type = "follow_up_result"
+    stable_key = hashlib.sha256(f"{source_type}:{grace_delivery_id}".encode()).hexdigest()[:20]
+    result_delivery_id = f"cdel_{stable_key}"
+    grace_row = await get_channel_delivery_outbox(session, grace_delivery_id)
+    route: tuple[str, str, str, str | None, str] | None
+    if grace_row is not None:
+        if grace_row.conversation_id != conversation_id:
+            raise ValueError("follow-up delivery conversation mismatch")
+        route = (
+            grace_row.channel_type,
+            grace_row.account_id,
+            grace_row.chat_id,
+            grace_row.thread_id,
+            grace_row.user_email,
+        )
+    else:
+        route = await get_conversation_channel_route(session, conversation_id)
+        if route is None:
+            return None
+
+    channel_type, account_id, chat_id, thread_id, user_email = route
+    row, created = await create_or_get_channel_delivery_outbox(
+        session,
+        delivery_id=result_delivery_id,
+        user_email=user_email,
+        conversation_id=conversation_id,
+        session_id=session_id,
+        source_type=source_type,
+        source_id=turn_id,
+        channel_type=channel_type,
+        account_id=account_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        fallback_text=final_content,
+        attachments=attachments,
+        deliverable_id=deliverable_id,
+        next_attempt_at=_utcnow(),
+    )
+    if not created and (
+        row.conversation_id != conversation_id
+        or row.source_type != source_type
+        or row.source_id != turn_id
+        or row.channel_type != channel_type
+        or row.account_id != account_id
+        or row.chat_id != chat_id
+        or row.thread_id != thread_id
+    ):
+        raise ValueError("stale or conflicting follow-up result delivery")
+    if grace_row is not None:
+        await suppress_unsent_channel_delivery_outbox(
+            session,
+            delivery_id=grace_delivery_id,
+            reason="terminal follow-up result became available before grace delivery",
+        )
+    return row
+
+
 async def get_channel_delivery_outbox(
     session: AsyncSession,
     delivery_id: str,
 ) -> ChannelDeliveryOutboxRow | None:
     return await session.get(ChannelDeliveryOutboxRow, delivery_id)
+
+
+async def set_channel_delivery_attachments(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    attachments: list[dict[str, Any]],
+) -> bool:
+    """Persist attachment references before a retryable delivery attempt."""
+
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status.in_(["pending", "failed"]),
+        )
+        .values(attachments_json=attachments, updated_at=_utcnow())
+    )
+    return bool(getattr(result, "rowcount", 0))
 
 
 async def has_channel_delivery_outbox_for_source(
@@ -7136,6 +8153,27 @@ async def has_channel_delivery_outbox_for_source(
     return result.scalar_one_or_none() is not None
 
 
+async def get_channel_delivery_outbox_for_source(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    source_type: str,
+    source_id: str,
+) -> ChannelDeliveryOutboxRow | None:
+    result = await session.execute(
+        select(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.conversation_id == conversation_id,
+            ChannelDeliveryOutboxRow.source_type == source_type,
+            ChannelDeliveryOutboxRow.source_id == source_id,
+            ChannelDeliveryOutboxRow.status != "suppressed",
+        )
+        .order_by(ChannelDeliveryOutboxRow.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def claim_channel_delivery_outbox(
     session: AsyncSession,
     *,
@@ -7144,7 +8182,7 @@ async def claim_channel_delivery_outbox(
     lease_expires_at: datetime,
     ignore_next_attempt: bool = False,
 ) -> ChannelDeliveryOutboxRow | None:
-    due_clause = sa.true()
+    due_clause: sa.ColumnElement[bool] = sa.true()
     if not ignore_next_attempt:
         due_clause = sa.or_(
             ChannelDeliveryOutboxRow.next_attempt_at.is_(None),
@@ -7174,7 +8212,130 @@ async def mark_channel_delivery_sent(
     *,
     delivery_id: str,
     lease_token: str,
+    require_complete_chunks: bool = False,
 ) -> bool:
+    conditions = [
+        ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+        ChannelDeliveryOutboxRow.status == "sending",
+        ChannelDeliveryOutboxRow.lease_token == lease_token,
+    ]
+    if require_complete_chunks:
+        conditions.extend(
+            [
+                ChannelDeliveryOutboxRow.projected_chunk_count.is_not(None),
+                ChannelDeliveryOutboxRow.completed_chunk_count
+                == ChannelDeliveryOutboxRow.projected_chunk_count,
+            ]
+        )
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(*conditions)
+        .values(
+            status="sent",
+            sent_at=_utcnow(),
+            lease_token=None,
+            lease_expires_at=None,
+            inflight_chunk_index=None,
+            inflight_idempotent=None,
+            last_error=None,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def mark_channel_delivery_chunk_sent(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+    completed_chunk_count: int,
+    projected_chunk_count: int,
+    projection_digest: str,
+    lease_expires_at: datetime,
+) -> bool:
+    """Persist resumable multipart progress under the active delivery lease."""
+
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == lease_token,
+            ChannelDeliveryOutboxRow.completed_chunk_count < completed_chunk_count,
+            ChannelDeliveryOutboxRow.inflight_chunk_index == completed_chunk_count - 1,
+            sa.or_(
+                ChannelDeliveryOutboxRow.projection_digest.is_(None),
+                ChannelDeliveryOutboxRow.projection_digest == projection_digest,
+            ),
+        )
+        .values(
+            completed_chunk_count=completed_chunk_count,
+            projected_chunk_count=projected_chunk_count,
+            projection_digest=projection_digest,
+            inflight_chunk_index=None,
+            inflight_idempotent=None,
+            lease_expires_at=lease_expires_at,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def mark_channel_delivery_chunk_inflight(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+    chunk_index: int,
+    projected_chunk_count: int,
+    projection_digest: str,
+    idempotent: bool,
+    lease_expires_at: datetime,
+) -> bool:
+    """Persist the uncertain external-send boundary before invoking an adapter."""
+
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == lease_token,
+            ChannelDeliveryOutboxRow.completed_chunk_count == chunk_index,
+            sa.or_(
+                ChannelDeliveryOutboxRow.projected_chunk_count.is_(None),
+                ChannelDeliveryOutboxRow.projected_chunk_count == projected_chunk_count,
+            ),
+            sa.or_(
+                ChannelDeliveryOutboxRow.projection_digest.is_(None),
+                ChannelDeliveryOutboxRow.projection_digest == projection_digest,
+            ),
+            sa.or_(
+                ChannelDeliveryOutboxRow.inflight_chunk_index.is_(None),
+                ChannelDeliveryOutboxRow.inflight_chunk_index == chunk_index,
+            ),
+        )
+        .values(
+            projected_chunk_count=projected_chunk_count,
+            projection_digest=projection_digest,
+            inflight_chunk_index=chunk_index,
+            inflight_idempotent=idempotent,
+            lease_expires_at=lease_expires_at,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def renew_channel_delivery_lease(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+    lease_expires_at: datetime,
+) -> bool:
+    """Renew an active multipart delivery lease without changing progress."""
+
     result = await session.execute(
         update(ChannelDeliveryOutboxRow)
         .where(
@@ -7183,15 +8344,70 @@ async def mark_channel_delivery_sent(
             ChannelDeliveryOutboxRow.lease_token == lease_token,
         )
         .values(
-            status="sent",
-            sent_at=_utcnow(),
-            lease_token=None,
-            lease_expires_at=None,
-            last_error=None,
+            lease_expires_at=lease_expires_at,
             updated_at=_utcnow(),
         )
     )
     return bool(getattr(result, "rowcount", 0))
+
+
+async def recover_stale_channel_delivery(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    observed_lease_token: str,
+    observed_lease_expires_at: datetime,
+    observed_inflight_chunk_index: int | None,
+    observed_inflight_idempotent: bool | None,
+    now: datetime,
+) -> str | None:
+    """Atomically recover only the exact stale state observed by the caller."""
+
+    target_status = (
+        "uncertain"
+        if observed_inflight_chunk_index is not None and observed_inflight_idempotent is not True
+        else "failed"
+    )
+    inflight_index_clause = (
+        ChannelDeliveryOutboxRow.inflight_chunk_index.is_(None)
+        if observed_inflight_chunk_index is None
+        else ChannelDeliveryOutboxRow.inflight_chunk_index == observed_inflight_chunk_index
+    )
+    inflight_idempotent_clause = (
+        ChannelDeliveryOutboxRow.inflight_idempotent.is_(None)
+        if observed_inflight_idempotent is None
+        else ChannelDeliveryOutboxRow.inflight_idempotent.is_(observed_inflight_idempotent)
+    )
+    values: dict[str, Any] = {
+        "status": target_status,
+        "lease_token": None,
+        "lease_expires_at": None,
+        "last_error": (
+            "stale_non_idempotent_send"
+            if target_status == "uncertain"
+            else "stale_sending_recovered"
+        ),
+        "updated_at": _utcnow(),
+    }
+    if target_status == "failed":
+        values["next_attempt_at"] = now
+        values["attempt_count"] = ChannelDeliveryOutboxRow.attempt_count + 1
+
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == observed_lease_token,
+            ChannelDeliveryOutboxRow.lease_expires_at == observed_lease_expires_at,
+            ChannelDeliveryOutboxRow.lease_expires_at <= now,
+            inflight_index_clause,
+            inflight_idempotent_clause,
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return target_status if getattr(result, "rowcount", 0) else None
 
 
 async def mark_channel_delivery_failed(
@@ -7226,14 +8442,21 @@ async def mark_channel_delivery_uncertain(
     session: AsyncSession,
     *,
     delivery_id: str,
+    lease_token: str,
+    last_error: str,
 ) -> bool:
     result = await session.execute(
         update(ChannelDeliveryOutboxRow)
-        .where(ChannelDeliveryOutboxRow.delivery_id == delivery_id)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == lease_token,
+        )
         .values(
             status="uncertain",
             lease_token=None,
             lease_expires_at=None,
+            last_error=last_error,
             updated_at=_utcnow(),
         )
     )
@@ -7264,6 +8487,32 @@ async def suppress_channel_delivery_outbox(
     )
     await session.flush()
     return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def suppress_unsent_channel_delivery_outbox(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    reason: str,
+) -> bool:
+    """Suppress a grace delivery only while no external send is in flight."""
+
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status.in_(["pending", "failed"]),
+        )
+        .values(
+            status="suppressed",
+            lease_token=None,
+            lease_expires_at=None,
+            last_error=reason,
+            updated_at=_utcnow(),
+        )
+    )
+    await session.flush()
+    return bool(getattr(result, "rowcount", 0))
 
 
 async def list_channel_delivery_outbox_due(

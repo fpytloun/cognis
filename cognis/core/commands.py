@@ -20,7 +20,10 @@ from typing import Any, cast
 
 from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.agent_loop import PauseResolution
-from cognis.core.agent_profiles import requested_agent_profile_id, resolve_agent_profile
+from cognis.core.agent_profiles import (
+    resolve_agent_profile,
+    resolve_conversation_agent_profile,
+)
 from cognis.core.chat_modes import CHAT_MODE_CONTEXT_KEY, ChatMode, chat_mode_system_message
 from cognis.core.compaction import CompactionModelContext
 from cognis.core.long_lived_chat import is_channel_context_type
@@ -33,7 +36,6 @@ from cognis.models.task import TaskDelivery
 from cognis.providers.llm.reasoning import (
     normalize_reasoning_effort,
     reasoning_efforts_for_model,
-    remap_reasoning_effort_to_available,
 )
 
 logger = get_logger(__name__)
@@ -76,6 +78,7 @@ _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
         "/continue",
         "/stop",
         "/cancel",
+        "/benchmark",
     }
 )
 
@@ -186,6 +189,12 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
     _SlashCommandMetadata("/executor", "Show or switch active executor", True, True),
     _SlashCommandMetadata("/context", "Show context usage"),
     _SlashCommandMetadata("/info", "Show session details"),
+    _SlashCommandMetadata(
+        "/benchmark",
+        "Run a bounded local-runtime benchmark (quick or full)",
+        True,
+        True,
+    ),
     _SlashCommandMetadata("/lsp", "Show LSP diagnostics status"),
     _SlashCommandMetadata("/plan", "Plan/read-only mode; add text for one-shot planning", True),
     _SlashCommandMetadata("/build", "Build/implementation mode; add text for one-shot build", True),
@@ -406,6 +415,22 @@ class CommandDispatcher:
                 partial,
                 limit=bounded_limit,
             )
+        if command == "/benchmark":
+            return [
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/benchmark",
+                    value=mode,
+                    label=mode,
+                    description=description,
+                    insert_text=f"/benchmark {mode}",
+                )
+                for mode, description in (
+                    ("quick", "Short local-runtime benchmark"),
+                    ("full", "Extended local-runtime benchmark"),
+                )
+                if _matches_suggestion(partial, mode)
+            ][:bounded_limit]
         return []
 
     async def _suggest_models(
@@ -527,8 +552,7 @@ class CommandDispatcher:
         *,
         limit: int,
     ) -> list[SlashCommandSuggestion]:
-        current_id = requested_agent_profile_id(session, conversation)
-        current = resolve_agent_profile(agent, current_id, source="conversation")
+        current = resolve_conversation_agent_profile(agent, session, conversation)
         profiles: list[tuple[str, str, bool]] = []
         if agent.agent_profiles:
             for profile_id, profile in sorted(agent.agent_profiles.items()):
@@ -782,6 +806,11 @@ class CommandDispatcher:
         if stripped == "/context":
             return await self._handle_context(session)
 
+        # /benchmark [quick|full]
+        if stripped == "/benchmark" or stripped.startswith("/benchmark "):
+            mode = stripped.removeprefix("/benchmark").strip() or "quick"
+            return self._handle_benchmark(session, mode)
+
         # /plan, /build, /default persistent chat mode switches. One-shot
         # forms with trailing text are parsed by turn submission.
         if stripped in ("/plan", "/build", "/default"):
@@ -801,17 +830,23 @@ class CommandDispatcher:
         # /model [name]
         if stripped == "/model" or stripped.startswith("/model "):
             arg = stripped[6:].strip() if len(stripped) > 6 else ""
-            return await self._handle_model(session, arg, user_email=user_email)
+            return self._mark_command_result(
+                await self._handle_model(session, arg, user_email=user_email),
+                "/model",
+            )
 
         # /thinking [level]
         if stripped == "/thinking" or stripped.startswith("/thinking "):
             arg = stripped[9:].strip() if len(stripped) > 9 else ""
-            return await self._handle_thinking(session, arg)
+            return self._mark_command_result(await self._handle_thinking(session, arg), "/thinking")
 
         # /profile [agent_profile_id]
         if stripped == "/profile" or stripped.startswith("/profile "):
             arg = stripped[len("/profile") :].strip() if len(stripped) > len("/profile") else ""
-            return await self._handle_profile(conversation, session, agent, arg)
+            return self._mark_command_result(
+                await self._handle_profile(conversation, session, agent, arg),
+                "/profile",
+            )
 
         # /skill [skill name or id]
         if stripped == "/skill" or stripped.startswith("/skill "):
@@ -881,6 +916,14 @@ class CommandDispatcher:
         # Not a recognized command
         return None
 
+    @staticmethod
+    def _mark_command_result(result: CommandResult, command: str) -> CommandResult:
+        """Annotate visible command feedback with the slash command that produced it."""
+
+        if result.type == "system_message":
+            result.data.setdefault("command", command)
+        return result
+
     # ------------------------------------------------------------------
     # Command handlers
     # ------------------------------------------------------------------
@@ -891,11 +934,7 @@ class CommandDispatcher:
         agent: AgentDefinition,
         user_email: str | None,
     ) -> CompactionModelContext:
-        resolved_profile = resolve_agent_profile(
-            agent,
-            requested_agent_profile_id(session),
-            source="conversation",
-        )
+        resolved_profile = resolve_conversation_agent_profile(agent, session)
         model_override = self._session_cache.get_model_override(session.session_id)
         model_override_provider_id = self._session_cache.get_model_override_provider_id(
             session.session_id
@@ -1514,6 +1553,53 @@ class CommandDispatcher:
         self._append_context_usage_lines(lines, usage)
         return CommandResult(type="system_message", text="\n".join(lines))
 
+    def _handle_benchmark(self, session: SessionModel, mode: str) -> CommandResult:
+        """Expose the benchmark contract without bypassing normal accounting."""
+
+        if mode not in {"quick", "full"}:
+            return CommandResult(
+                type="error",
+                text="Usage: /benchmark [quick|full]",
+                data={"code": "benchmark_invalid_mode", "mode": mode},
+            )
+        performance = (
+            self._session_cache.get_last_generation_performance(session.session_id)
+            if hasattr(self._session_cache, "get_last_generation_performance")
+            else None
+        )
+        usage = self._session_cache.get_context_usage(session.session_id) or {}
+        target = performance or {}
+        model = target.get("model") or usage.get("model")
+        executor = target.get("executor_name") or target.get("executor_id")
+        context = target.get("configured_context_tokens") or usage.get("max_context_tokens")
+        target_text = ", ".join(
+            part
+            for part in (
+                f"model {model}" if model else None,
+                f"executor {executor}" if executor else None,
+                f"context {context:,} tokens" if isinstance(context, int) else None,
+            )
+            if part is not None
+        )
+        return CommandResult(
+            type="error",
+            text=(
+                f"The {mode} benchmark is not available yet"
+                f"{f' for {target_text}' if target_text else ''}. "
+                "Cognis will not call the provider outside normal generation accounting. "
+                "It requires a bounded local-runtime benchmark operation; use /info for "
+                "the latest measured generation."
+            ),
+            data={
+                "code": "benchmark_runtime_operation_unavailable",
+                "mode": mode,
+                "model": model,
+                "executor_id": target.get("executor_id"),
+                "executor_name": target.get("executor_name"),
+                "configured_context_tokens": context,
+            },
+        )
+
     async def _handle_info(
         self,
         session: SessionModel,
@@ -1576,6 +1662,63 @@ class CommandDispatcher:
                 )
                 lines.append(f"LLM diagnostics: provider reported hosted instruction drift{detail}")
             self._append_context_usage_lines(lines, usage)
+        performance = (
+            self._session_cache.get_last_generation_performance(current_session.session_id)
+            if hasattr(self._session_cache, "get_last_generation_performance")
+            else None
+        )
+        if performance:
+            lines.append("Last generation:")
+            model_detail = str(performance.get("model") or "unknown")
+            if performance.get("quantization"):
+                model_detail += f" ({performance['quantization']})"
+            lines.append(f"  Model: {model_detail}")
+            lines.append(
+                "  Runtime: "
+                + str(performance.get("runtime") or "local")
+                + (
+                    f" on {performance.get('executor_name') or performance.get('executor_id')}"
+                    if performance.get("executor_name") or performance.get("executor_id")
+                    else ""
+                )
+            )
+            if performance.get("configured_context_tokens") is not None:
+                lines.append(
+                    f"  Configured context: {performance['configured_context_tokens']:,} tokens"
+                )
+            if performance.get("prompt_tokens_per_second") is not None:
+                lines.append(
+                    f"  Prompt processing: {performance['prompt_tokens_per_second']:.1f} tok/s (pp)"
+                )
+            if performance.get("generation_tokens_per_second") is not None:
+                lines.append(
+                    f"  Generation: {performance['generation_tokens_per_second']:.1f} tok/s (tg)"
+                )
+            if performance.get("time_to_first_token_seconds") is not None:
+                lines.append(
+                    f"  First token: {performance['time_to_first_token_seconds']:.2f}s (TTFT)"
+                )
+            if performance.get("load_duration_seconds") is not None:
+                lines.append(f"  Load: {performance['load_duration_seconds']:.2f}s")
+            if performance.get("total_duration_seconds") is not None:
+                lines.append(f"  Total: {performance['total_duration_seconds']:.2f}s")
+            if performance.get("processor") or performance.get("gpu_residency"):
+                hardware = " · ".join(
+                    part
+                    for part in (
+                        f"processor {performance['processor']}"
+                        if performance.get("processor")
+                        else None,
+                        f"GPU residency {performance['gpu_residency']}"
+                        if performance.get("gpu_residency")
+                        else None,
+                    )
+                    if part is not None
+                )
+                lines.append(f"  Hardware: {hardware}")
+            if performance.get("digest"):
+                lines.append(f"  Digest: {performance['digest']}")
+            lines.append(f"  Measured: {performance['measured_at']}")
         reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
         if reasoning:
             lines.append(f"Thinking effort: {reasoning}")
@@ -1818,8 +1961,12 @@ class CommandDispatcher:
             lines.append(f"Last LLM call cache read tokens: {cache_read_tokens:,}")
             cache_lines_added = True
 
+        cache_write_tokens = usage.get("cache_write_tokens")
+        if isinstance(cache_write_tokens, int):
+            lines.append(f"Last LLM call cache write tokens: {cache_write_tokens:,}")
+            cache_lines_added = True
         cache_creation_tokens = usage.get("cache_creation_input_tokens")
-        if isinstance(cache_creation_tokens, int):
+        if not isinstance(cache_write_tokens, int) and isinstance(cache_creation_tokens, int):
             lines.append(f"Last LLM call cache write tokens: {cache_creation_tokens:,}")
             cache_lines_added = True
 
@@ -1950,16 +2097,18 @@ class CommandDispatcher:
             current_model = usage["model"] if usage else ""
 
         # Get supported effort levels
+        capability_lookup_succeeded = False
         try:
             if current_model:
                 model_info = await self._providers.llm.get_model_info(current_model)
                 available = model_info.reasoning_efforts if model_info.reasoning_efforts else []
+                capability_lookup_succeeded = True
             else:
                 available = []
         except Exception:
             available = []
 
-        if not available and current_model:
+        if not available and current_model and not capability_lookup_succeeded:
             available = _infer_reasoning_efforts(current_model)
 
         current_effort = self._session_cache.get_reasoning_effort_override(session_id)
@@ -1996,33 +2145,22 @@ class CommandDispatcher:
                 text="Thinking effort reset to default.",
             )
 
-        resolved_arg = (
-            remap_reasoning_effort_to_available(normalized_arg, available_efforts=available)
-            if available
-            else normalized_arg
-        )
-        if resolved_arg is None:
+        if current_model and capability_lookup_succeeded and not available:
             return CommandResult(
                 type="system_message",
-                text=(
-                    f"Unsupported level: {normalized_arg}\nAvailable: {', '.join(available)}"
-                    if available
-                    else "Unsupported thinking effort."
-                ),
+                text=f"Current model {current_model!r} does not support thinking effort overrides.",
             )
 
-        # Validate
-        if available and resolved_arg not in available:
+        if available and normalized_arg not in available:
             return CommandResult(
                 type="system_message",
                 text=f"Unsupported level: {normalized_arg}\nAvailable: {', '.join(available)}",
             )
 
-        self._session_cache.set_reasoning_effort_override(session_id, resolved_arg)
-        mapped_note = f" (mapped from {normalized_arg})" if resolved_arg != normalized_arg else ""
+        self._session_cache.set_reasoning_effort_override(session_id, normalized_arg)
         return CommandResult(
             type="system_message",
-            text=f"Thinking effort set to: {resolved_arg}{mapped_note}\nTakes effect on next message.",
+            text=f"Thinking effort set to: {normalized_arg}\nTakes effect on next message.",
         )
 
     async def _handle_profile(
@@ -2034,8 +2172,7 @@ class CommandDispatcher:
     ) -> CommandResult:
         """Handle /profile [id] — list or switch the current agent runtime profile."""
 
-        current_id = requested_agent_profile_id(session, conversation)
-        current = resolve_agent_profile(agent, current_id, source="conversation")
+        current = resolve_conversation_agent_profile(agent, session, conversation)
         if not arg:
             lines = [
                 f"Current agent profile: {current.profile_id} ({current.source})",
@@ -2065,32 +2202,16 @@ class CommandDispatcher:
                 type="error", text=str(exc), data={"code": "invalid_agent_profile"}
             )
 
-        async with self._session_factory() as db_session:
-            try:
-                from cognis.store.queries import (
-                    set_conversation_agent_profile_id,
-                    set_session_agent_profile_id,
-                )
+        from cognis.core.profile_switching import persist_agent_profile_switch
 
-                await set_conversation_agent_profile_id(
-                    db_session,
-                    conversation.conversation_id,
-                    resolved.profile_id,
-                )
-                await set_session_agent_profile_id(
-                    db_session,
-                    session.session_id,
-                    resolved.profile_id,
-                )
-                await db_session.commit()
-            except Exception:
-                await db_session.rollback()
-                raise
-
-        conversation.agent_profile_id = resolved.profile_id
-        session.agent_profile_id = resolved.profile_id
-        self._session_cache.set_model_override(session.session_id, None)
-        self._session_cache.set_reasoning_effort_override(session.session_id, None)
+        await persist_agent_profile_switch(
+            session_factory=self._session_factory,
+            session_cache=self._session_cache,
+            conversation=conversation,
+            session=session,
+            profile_id=resolved.profile_id,
+            persist_conversation=True,
+        )
         return CommandResult(
             type="system_message",
             text=(
@@ -2207,6 +2328,9 @@ class CommandDispatcher:
             tags=skill.tags,
             linked_tool_ids=skill.linked_tool_ids,
             attach_to_all_agents=skill.auto_load,
+            version_id=skill.version_id,
+            version_number=skill.version_number,
+            content_hash=skill.content_hash,
         )
         protected_context = str(metadata.get("protected_context") or "")
         content_hash = (
@@ -2246,7 +2370,14 @@ class CommandDispatcher:
                     "kind": "loaded_skill",
                     "skill_id": skill.skill_id,
                     "skill_name": skill.name,
+                    "version_id": skill.version_id,
+                    "version_number": skill.version_number,
                     "content_hash": content_hash,
+                    "contract_version": (
+                        metadata.get("skill_activation", {}).get("contract_version")
+                        if isinstance(metadata.get("skill_activation"), dict)
+                        else None
+                    ),
                     "activated_tool_ids": declared_tool_ids,
                 },
             )

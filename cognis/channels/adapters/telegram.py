@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from cognis.channels.markdown_rendering import markdown_to_telegram_html
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import TELEGRAM_META
 from cognis.logging import get_logger
@@ -124,8 +125,8 @@ class TelegramAdapter(BaseChannelAdapter):
 
         payload: dict[str, Any] = {
             "chat_id": message.chat_id,
-            "text": message.content,
-            "parse_mode": "Markdown",
+            "text": markdown_to_telegram_html(message.content),
+            "parse_mode": "HTML",
         }
 
         if message.reply_to_id:
@@ -133,9 +134,6 @@ class TelegramAdapter(BaseChannelAdapter):
 
         try:
             resp = await self._client.post("/sendMessage", json=payload)
-            if resp.status_code == 400:
-                payload.pop("parse_mode", None)
-                resp = await self._client.post("/sendMessage", json=payload)
             resp.raise_for_status()
             result = resp.json()
             return str(result.get("result", {}).get("message_id", ""))

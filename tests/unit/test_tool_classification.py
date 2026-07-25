@@ -10,7 +10,8 @@ import sqlalchemy as sa
 from cognis.api.serializers import tool_to_response
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.tool_classification_queue import ToolClassificationQueue
-from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource, stable_tool_id
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolCapability, ToolSource, stable_tool_id
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import ToolClassificationRow, User
 from cognis.store.queries import (

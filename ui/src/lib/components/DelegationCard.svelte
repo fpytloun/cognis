@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { DelegationTimelineItem } from '$lib/chat';
+  import type { DelegationTimelineItem } from '$lib/timeline-render-model';
   import { visibleTodos as activeVisibleTodos } from '$lib/todos';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import Button from '$lib/components/ui/Button.svelte';

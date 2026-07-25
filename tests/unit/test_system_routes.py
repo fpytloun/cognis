@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -64,3 +67,34 @@ def test_probe_routes_are_public_and_cheap(
     assert live_response.json() == {"status": "alive"}
     assert ready_response.status_code == 200
     assert ready_response.json() == {"status": "ready"}
+
+
+def test_tool_output_maintenance_does_not_block_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("COGNIS_HOST", "127.0.0.1")
+    started = threading.Event()
+    release = threading.Event()
+
+    async def _slow_cleanup(_: Any) -> int:
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return 0
+
+    monkeypatch.setattr(
+        "cognis.core.tool_output_store.ToolOutputStore.cleanup_expired",
+        _slow_cleanup,
+    )
+
+    with TestClient(create_app()) as client:
+        maintenance = client.app.state.tool_output_maintenance  # type: ignore[union-attr]
+        try:
+            assert started.wait(timeout=1.0)
+            response = client.get("/api/livez")
+            assert response.status_code == 200
+        finally:
+            release.set()
+
+    assert maintenance._task is None

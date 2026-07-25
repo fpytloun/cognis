@@ -16,6 +16,7 @@ describe('slash command helpers', () => {
     expect(isSystemSlashCommand('/skill cognis-coding')).toBe(true);
     expect(isSystemSlashCommand('/task write tests')).toBe(true);
     expect(isSystemSlashCommand('/profile fast')).toBe(true);
+    expect(isSystemSlashCommand('/benchmark full')).toBe(true);
     expect(isSystemSlashCommand('/compact')).toBe(true);
     expect(isSystemSlashCommand('/compact now')).toBe(false);
     expect(isSystemSlashCommand('/help extra')).toBe(false);
@@ -60,7 +61,8 @@ describe('slash command helpers', () => {
       '/retry',
       '/continue',
       '/stop',
-      '/cancel'
+      '/cancel',
+      '/benchmark'
     ];
 
     for (const command of exactOnlyCommands) {
@@ -109,6 +111,7 @@ describe('slash command helpers', () => {
     expect(slashParameterSuggestionCommand('/skill cog')).toBe('/skill');
     expect(slashParameterSuggestionCommand('/thinking ')).toBe('/thinking');
     expect(slashParameterSuggestionCommand('/profile ')).toBe('/profile');
+    expect(slashParameterSuggestionCommand('/benchmark ')).toBe('/benchmark');
     expect(localSlashCommandSuggestions('/profile ')).toEqual([]);
     expect(slashParameterSuggestionCommand('/task write tests')).toBeNull();
     expect(slashParameterSuggestionCommand('/fork new topic')).toBeNull();

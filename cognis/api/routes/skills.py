@@ -19,6 +19,7 @@ from cognis.api.models import (
     SkillDecompositionPreviewResponse,
     SkillExportResponse,
     SkillImportRequest,
+    SkillPatchRequest,
     SkillResponse,
     SkillUpdateRequest,
     SkillVersionResponse,
@@ -36,13 +37,17 @@ from cognis.store.queries import (
     list_skills,
     reset_skill_to_defaults,
     set_current_version,
+    set_current_version_if_matches,
     update_agent,
     update_skill,
 )
 from cognis.tools.skill_import import import_skill_from_url
 from cognis.tools.skill_parser import export_cognis_yaml, export_skill_md, parse_skill_content
 from cognis.tools.skill_service import (
+    apply_mapping_patch,
+    apply_named_list_patch,
     asset_refs_to_inputs,
+    cleanup_unpublished_skill_assets,
     compute_decomposition_source_hash,
     create_skill_version_with_assets,
     export_cognis_package,
@@ -659,6 +664,195 @@ async def update_skill_route(
         if content_changed and version_row is not None:
             await _enqueue_skill_tool_classifications(request, updated_row, version_row)
         return await _load_skill_response(request, session, updated_row)
+
+
+@router.patch("/api/v1/skills/{skill_id}", response_model=SkillResponse)
+async def patch_skill_route(
+    request: Request, skill_id: str, body: SkillPatchRequest
+) -> SkillResponse:
+    """Partially update a skill while preserving omitted fields."""
+
+    forbid_mutation_for_viewer(request)
+    user = require_current_user(request)
+    provided = body.model_dump(exclude_unset=True)
+    mutations = {
+        key: value
+        for key, value in provided.items()
+        if key not in {"expected_current_version_id", "expected_content_hash"}
+    }
+    if not mutations:
+        raise api_exception(400, "validation_error", "No patch operations provided")
+
+    async with request.app.state.session_factory() as session:
+        row = await get_skill_scoped(session, skill_id, owner_email=user.email)
+        if row is None:
+            raise api_exception(404, "not_found", "Skill not found")
+        if row.is_system:
+            raise api_exception(403, "forbidden", "Cannot modify system skills directly")
+        current = await resolve_current_skill_version(session, row)
+        if current is None:
+            raise api_exception(409, "version_conflict", "Skill has no current version")
+        if (
+            body.expected_current_version_id is not None
+            and body.expected_current_version_id != current.version_id
+        ) or (
+            body.expected_content_hash is not None
+            and body.expected_content_hash != current.content_hash
+        ):
+            raise api_exception(
+                409,
+                "version_conflict",
+                "Skill changed since it was read; reload it and retry the patch",
+            )
+
+        current_assets = await load_skill_asset_refs(session, current)
+        try:
+            instructions = (
+                body.instructions if "instructions" in mutations else current.instructions
+            )
+            tools = _coerce_tools_list(current.tools)
+            if body.tools is not None:
+                tools = normalize_skill_tools(
+                    apply_named_list_patch(tools, body.tools.model_dump(), key="name")
+                )
+            templates = current.prompt_templates or {}
+            if body.prompt_templates is not None:
+                templates = normalize_prompt_templates(
+                    apply_mapping_patch(templates, body.prompt_templates.model_dump())
+                )
+            steps = [
+                item for item in (getattr(current, "steps", None) or []) if isinstance(item, dict)
+            ]
+            if body.steps is not None:
+                steps = (
+                    normalize_skill_steps(
+                        apply_named_list_patch(steps, body.steps.model_dump(), key="name")
+                    )
+                    or []
+                )
+            linked_tool_ids = (
+                normalize_linked_tool_ids(body.linked_tool_ids)
+                if "linked_tool_ids" in mutations
+                else (getattr(current, "linked_tool_ids", None) or [])
+            )
+            placeholders = (
+                normalize_secret_placeholders(body.secret_placeholders)
+                if "secret_placeholders" in mutations
+                else current.secret_placeholders
+            )
+            asset_inputs = asset_refs_to_inputs(current_assets)
+            if body.assets is not None:
+                asset_inputs = apply_named_list_patch(
+                    asset_inputs,
+                    {
+                        "upsert": _asset_inputs_from_request(body.assets.upsert) or [],
+                        "remove": body.assets.remove,
+                    },
+                    key="filename",
+                )
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
+
+        metadata_updates: dict[str, Any] = {}
+        for field in ("name", "description", "tags"):
+            if field in mutations:
+                metadata_updates[field] = getattr(body, field)
+        if "attach_to_all_agents" in mutations:
+            metadata_updates["auto_load"] = body.attach_to_all_agents
+        if "linked_tool_ids" in mutations:
+            metadata_updates["linked_tool_ids"] = linked_tool_ids
+
+        content_changed = any(
+            [
+                instructions != current.instructions,
+                (tools or []) != (_coerce_tools_list(current.tools) or []),
+                (templates or {}) != (current.prompt_templates or {}),
+                (steps or []) != (getattr(current, "steps", None) or []),
+                (linked_tool_ids or []) != (getattr(current, "linked_tool_ids", None) or []),
+                (placeholders or []) != (current.secret_placeholders or []),
+                _canonical_asset_inputs(asset_inputs)
+                != _canonical_asset_inputs(asset_refs_to_inputs(current_assets)),
+            ]
+        )
+        metadata_changed = any(
+            getattr(row, key) != value for key, value in metadata_updates.items()
+        )
+        if not content_changed and not metadata_changed:
+            raise api_exception(400, "no_op_patch", "Patch does not change the skill")
+
+        if content_changed:
+            metadata_updates.update(
+                instructions=instructions,
+                tools=tools,
+                prompt_templates=templates,
+            )
+        try:
+            updated = await update_skill(
+                session, skill_id, owner_email=user.email, **metadata_updates
+            )
+            assert updated is not None
+            version_row = None
+            if content_changed:
+                version_row = await create_skill_version_with_assets(
+                    session,
+                    request.app.state.artifact_store,
+                    skill_id=skill_id,
+                    version_number=await get_next_version_number(session, skill_id),
+                    owner_email=user.email,
+                    instructions=instructions,
+                    tools=tools,
+                    linked_tool_ids=linked_tool_ids,
+                    prompt_templates=templates,
+                    secret_placeholders=placeholders,
+                    steps=steps,
+                    assets=asset_inputs,
+                    allow_binary_assets=True,
+                    source_url=current.source_url,
+                    resolved_url=current.resolved_url,
+                    commit_sha=current.commit_sha,
+                    import_checksum=current.import_checksum,
+                    imported_at=current.imported_at,
+                    import_format=current.import_format,
+                    decomposition_source_hash=(
+                        None if body.steps is not None else current.decomposition_source_hash
+                    ),
+                )
+                if not await set_current_version_if_matches(
+                    session,
+                    skill_id,
+                    expected_version_id=current.version_id,
+                    version_id=version_row.version_id,
+                ):
+                    await session.rollback()
+                    await cleanup_unpublished_skill_assets(
+                        request.app.state.artifact_store,
+                        version_row,
+                    )
+                    raise api_exception(
+                        409,
+                        "version_conflict",
+                        "Skill changed while the patch was being applied; reload and retry",
+                    )
+                updated.current_version_id = version_row.version_id
+            elif not await set_current_version_if_matches(
+                session,
+                skill_id,
+                expected_version_id=current.version_id,
+                version_id=current.version_id,
+            ):
+                await session.rollback()
+                raise api_exception(
+                    409,
+                    "version_conflict",
+                    "Skill changed while the patch was being applied; reload and retry",
+                )
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            raise api_exception(400, "validation_error", str(exc)) from exc
+        if version_row is not None:
+            await _enqueue_skill_tool_classifications(request, updated, version_row)
+        return await _load_skill_response(request, session, updated)
 
 
 @router.delete("/api/v1/skills/{skill_id}", status_code=204)

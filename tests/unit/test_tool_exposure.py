@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
+
 from cognis.core.tool_exposure import (
     LLMApiMode,
     ToolDiscoveryMode,
@@ -10,7 +12,8 @@ from cognis.core.tool_exposure import (
     reverse_tool_argument_aliases,
 )
 from cognis.models.config import ModelInfo
-from cognis.models.tool import ToolDefinition, ToolSource, sanitize_mcp_tool_name, stable_tool_id
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource, sanitize_mcp_tool_name, stable_tool_id
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 
@@ -53,6 +56,7 @@ def _contract(
     native_apply_patch: bool = False,
     anthropic_defer_loading: bool = True,
     anthropic_schema_compatible: bool = False,
+    anthropic_native_tool_search: bool = False,
 ) -> ToolExposureContract:
     return ToolExposureContract(
         llm_api=llm_api,
@@ -60,6 +64,7 @@ def _contract(
         native_apply_patch=native_apply_patch,
         anthropic_defer_loading=anthropic_defer_loading,
         anthropic_schema_compatible=anthropic_schema_compatible,
+        anthropic_native_tool_search=anthropic_native_tool_search,
     )
 
 
@@ -74,7 +79,150 @@ def _search_schema() -> dict[str, object]:
     }
 
 
-def test_prepare_tool_exposure_uses_anthropic_deferred_loading_with_controller_search() -> None:
+def _native_anthropic_contract() -> ToolExposureContract:
+    return _contract(
+        discovery_mode=ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH,
+        anthropic_schema_compatible=True,
+        anthropic_native_tool_search=True,
+    )
+
+
+def test_prepare_tool_exposure_uses_native_anthropic_search_with_full_deferred_inventory() -> None:
+    hidden = _mcp("github", "search/issues")
+    promoted = _mcp("slack", "search/messages")
+    result = prepare_tool_exposure(
+        inventory_tools=[
+            _tool("read", source_type="executor", category="filesystem"),
+            hidden,
+            promoted,
+        ],
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(
+            model_id="claude-sonnet-4-6",
+            supports_tool_search=True,
+            supports_native_tool_search=True,
+            supports_defer_loading=True,
+            supports_pause_turn=True,
+            max_tools=4,
+        ),
+        contract=_native_anthropic_contract(),
+        promoted_tool_ids={stable_tool_id(promoted)},
+    )
+
+    assert result.debug_metadata["strategy"] == "anthropic_native_tool_search"
+    assert result.debug_metadata["native_anthropic_search_enabled"] is True
+    assert [tool.get("name") for tool in result.tools[:1]] == ["tool_search_tool_bm25"]
+    assert result.tools[0]["type"] == "tool_search_tool_bm25_20251119"
+    functions = {tool["function"]["name"]: tool["function"] for tool in result.tools[1:]}
+    assert "search_tools" not in functions
+    assert functions[sanitize_mcp_tool_name("github", "search/issues")]["defer_loading"] is True
+    assert (
+        functions[sanitize_mcp_tool_name("slack", "search/messages")].get("defer_loading") is None
+    )
+    assert functions["read"].get("defer_loading") is None
+    assert functions[sanitize_mcp_tool_name("slack", "search/messages")]["cache_control"] == {
+        "type": "ephemeral",
+        "ttl": "5m",
+    }
+
+
+def test_prepare_tool_exposure_falls_back_before_native_payload_when_capability_or_limit_is_missing() -> (
+    None
+):
+    inventory = [_tool("read"), _mcp("github", "search/issues")]
+    for model_info, reason in (
+        (
+            ModelInfo(model_id="claude", supports_defer_loading=True),
+            "model_tool_search_unsupported",
+        ),
+        (
+            ModelInfo(
+                model_id="claude",
+                supports_tool_search=True,
+                supports_defer_loading=True,
+            ),
+            "model_native_tool_search_unsupported",
+        ),
+        (
+            ModelInfo(
+                model_id="claude",
+                supports_tool_search=True,
+                supports_native_tool_search=True,
+                supports_defer_loading=True,
+                supports_pause_turn=True,
+                max_tools=2,
+            ),
+            "provider_tool_limit",
+        ),
+        (
+            ModelInfo(
+                model_id="claude",
+                supports_tool_search=True,
+                supports_native_tool_search=True,
+                supports_defer_loading=True,
+            ),
+            "model_pause_turn_unsupported",
+        ),
+    ):
+        result = prepare_tool_exposure(
+            inventory_tools=inventory,
+            controller_tool_schemas=[_search_schema()],
+            model_info=model_info,
+            contract=_native_anthropic_contract(),
+            promoted_tool_ids=set(),
+        )
+        assert result.debug_metadata["strategy"] == "generic_search_tools"
+        assert result.debug_metadata["native_anthropic_search_reason"] == reason
+        assert any(tool.get("function", {}).get("name") == "search_tools" for tool in result.tools)
+        assert all(tool.get("type") != "tool_search_tool_bm25_20251119" for tool in result.tools)
+
+
+def test_prepare_tool_exposure_rejects_native_server_name_collision() -> None:
+    with pytest.raises(ValueError, match="collides"):
+        prepare_tool_exposure(
+            inventory_tools=[_tool("tool_search_tool_bm25")],
+            controller_tool_schemas=[],
+            model_info=ModelInfo(
+                model_id="claude",
+                supports_tool_search=True,
+                supports_native_tool_search=True,
+                supports_defer_loading=True,
+                supports_pause_turn=True,
+            ),
+            contract=_native_anthropic_contract(),
+            promoted_tool_ids=set(),
+        )
+
+
+def test_prepare_tool_exposure_counts_non_search_controller_tools_against_native_limit() -> None:
+    controller = {
+        "type": "function",
+        "function": {
+            "name": "controller_helper",
+            "description": "controller helper",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read"), _mcp("github", "search/issues")],
+        controller_tool_schemas=[_search_schema(), controller],
+        model_info=ModelInfo(
+            model_id="claude",
+            supports_tool_search=True,
+            supports_native_tool_search=True,
+            supports_defer_loading=True,
+            supports_pause_turn=True,
+            max_tools=3,
+        ),
+        contract=_native_anthropic_contract(),
+        promoted_tool_ids=set(),
+    )
+
+    assert result.debug_metadata["native_anthropic_search_reason"] == "provider_tool_limit"
+    assert result.debug_metadata["native_anthropic_tool_count"] == 4
+
+
+def test_prepare_tool_exposure_controller_search_never_uses_anthropic_deferred_loading() -> None:
     inventory = [
         _tool("read", source_type="executor", category="filesystem"),
         _mcp("github", "search/issues"),
@@ -93,15 +241,10 @@ def test_prepare_tool_exposure_uses_anthropic_deferred_loading_with_controller_s
         for tool in result.tools
         if tool.get("type") == "function"
     ]
-    assert result.debug_metadata["strategy"] == "anthropic_defer_loading"
+    assert result.debug_metadata["strategy"] == "generic_search_tools"
     assert result.debug_metadata["discovery_mode"] == "controller_search"
-    assert tool_names == ["search_tools", "read", sanitize_mcp_tool_name("github", "search/issues")]
-    assert tool_names != sorted(tool_names, key=str.casefold)
-    assert result.tools[-1]["function"]["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
-    deferred = [
-        tool for tool in result.tools if tool.get("function", {}).get("name", "").startswith("mcp_")
-    ]
-    assert deferred[0]["function"]["defer_loading"] is True
+    assert tool_names == ["read", "search_tools"]
+    assert not any(tool.get("function", {}).get("defer_loading") is True for tool in result.tools)
 
 
 def test_prepare_tool_exposure_strips_schema_metadata_recursively() -> None:
@@ -812,6 +955,203 @@ def test_anthropic_argument_aliases_follow_local_schema_refs() -> None:
     ) == {"filter": {"match[]": ["up"]}}
 
 
+def test_anthropic_argument_aliases_handle_recursive_local_schema_refs() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("recursive", "walk"),
+        description="walk a recursive tree",
+        parameters={
+            "type": "object",
+            "properties": {
+                "root": {"$ref": "#/$defs/Node"},
+            },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "child[]": {
+                            "anyOf": [
+                                {"$ref": "#/$defs/Node"},
+                                {"type": "null"},
+                            ]
+                        },
+                        "value": {"type": "string"},
+                    },
+                }
+            },
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="recursive",
+            raw_tool_name="walk",
+        ),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-opus-4-8", max_tools=128),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    schema = next(tool for tool in result.tools if tool["type"] == "function")
+    node = schema["function"]["parameters"]["$defs"]["Node"]
+    assert node["properties"].keys() == {"child", "value"}
+    assert node["properties"]["child"]["anyOf"][0] == {"$ref": "#/$defs/Node"}
+    assert result.argument_alias_map[mcp_tool.name]["root"]["properties"]["child"] == {
+        "original": "child[]",
+        "properties": {"$cognis_ref": "#/$defs/Node"},
+    }
+    assert reverse_tool_argument_aliases(
+        {
+            "root": {
+                "child": {
+                    "child": {
+                        "child": None,
+                        "value": "leaf",
+                    },
+                    "value": "middle",
+                },
+                "value": "root",
+            }
+        },
+        result.argument_alias_map[mcp_tool.name],
+    ) == {
+        "root": {
+            "child[]": {
+                "child[]": {
+                    "child[]": None,
+                    "value": "leaf",
+                },
+                "value": "middle",
+            },
+            "value": "root",
+        }
+    }
+
+
+def test_anthropic_argument_aliases_handle_mutual_and_shared_local_schema_refs() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("recursive", "mutual"),
+        description="walk mutually recursive nodes",
+        parameters={
+            "type": "object",
+            "properties": {
+                "first": {"$ref": "#/$defs/A"},
+                "second": {"$ref": "#/$defs/A"},
+            },
+            "$defs": {
+                "A": {
+                    "type": "object",
+                    "properties": {"next[]": {"$ref": "#/$defs/B"}},
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"previous[]": {"$ref": "#/$defs/A"}},
+                },
+            },
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="recursive",
+            raw_tool_name="mutual",
+        ),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-opus-4-8", max_tools=128),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    assert reverse_tool_argument_aliases(
+        {
+            "first": {"next": {"previous": {"next": None}}},
+            "second": {"next": None},
+        },
+        result.argument_alias_map[mcp_tool.name],
+    ) == {
+        "first": {"next[]": {"previous[]": {"next[]": None}}},
+        "second": {"next[]": None},
+    }
+
+
+def test_anthropic_argument_alias_refs_do_not_leak_occurrence_aliases() -> None:
+    mcp_tool = ToolDefinition(
+        name=sanitize_mcp_tool_name("recursive", "occurrences"),
+        description="reuse a ref with occurrence-specific aliases",
+        parameters={
+            "type": "object",
+            "properties": {
+                "left": {
+                    "$ref": "#/$defs/Base",
+                    "properties": {
+                        "nested": {
+                            "type": "object",
+                            "properties": {"left[]": {"type": "string"}},
+                        }
+                    },
+                },
+                "right": {
+                    "$ref": "#/$defs/Base",
+                    "properties": {
+                        "nested": {
+                            "type": "object",
+                            "properties": {"right[]": {"type": "string"}},
+                        }
+                    },
+                },
+            },
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": {
+                        "nested": {
+                            "type": "object",
+                            "properties": {"base[]": {"type": "string"}},
+                        }
+                    },
+                }
+            },
+        },
+        source=ToolSource(
+            type="intaris_mcp",
+            server_name="recursive",
+            raw_tool_name="occurrences",
+        ),
+        category="mcp",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[mcp_tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="claude-opus-4-8", max_tools=128),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(mcp_tool)},
+        allow_tool_search=False,
+    )
+
+    assert reverse_tool_argument_aliases(
+        {
+            "left": {"nested": {"base": "b", "left": "l", "right": "literal"}},
+            "right": {"nested": {"base": "b", "left": "literal", "right": "r"}},
+        },
+        result.argument_alias_map[mcp_tool.name],
+    ) == {
+        "left": {"nested": {"base[]": "b", "left[]": "l", "right": "literal"}},
+        "right": {"nested": {"base[]": "b", "left": "literal", "right[]": "r"}},
+    }
+
+
 def test_reverse_tool_argument_aliases_handles_additional_property_values() -> None:
     alias_tree = {
         "*": {
@@ -959,7 +1299,7 @@ def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> 
     assert {"edit", "write"} <= set(function_names)
 
 
-def test_deferred_loading_still_uses_single_edit_surface() -> None:
+def test_controller_search_preserves_currently_visible_edit_surface() -> None:
     read = _tool("read", source_type="executor", category="filesystem")
     edit = _write_tool("edit")
     patch = _write_tool("apply_patch")
@@ -979,8 +1319,8 @@ def test_deferred_loading_still_uses_single_edit_surface() -> None:
     )
 
     function_names = [tool["function"]["name"] for tool in result.tools]
-    assert "edit" in function_names
-    assert "apply_patch" not in function_names
+    assert "apply_patch" in function_names
+    assert "edit" not in function_names
 
 
 def test_responses_native_apply_patch_replaces_function_schema() -> None:

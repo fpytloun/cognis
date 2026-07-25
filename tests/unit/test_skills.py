@@ -670,7 +670,7 @@ def test_skill_management_tool_count() -> None:
     from cognis.tools.builtin.skill_management import skill_management_tools
 
     tools = skill_management_tools()
-    assert len(tools) == 11
+    assert len(tools) == 12
 
 
 def test_skill_load_runtime_summaries_include_callable_names() -> None:

@@ -53,6 +53,44 @@ class ToolArgumentError:
         }
 
 
+def _narrow_oneof_branch(
+    schema: dict[str, Any],
+    raw_arguments: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Select the ``oneOf`` branch matching the arguments' ``action`` discriminator.
+
+    Multi-operation native tools (e.g. ``write_deliverable`` with a generic
+    write branch and a ``rich:pulse`` branch) are exposed as a top-level
+    ``oneOf`` schema, per branch requiring ``properties.action.const``. When
+    validation fails against the full ``oneOf``, ``jsonschema`` reports errors
+    from *every* branch's context, producing confusing doubled messages (e.g.
+    a generic call missing ``content`` also reports the unrelated pulse
+    branch's ``format``/``rich`` as "required"). Narrowing to the single
+    branch selected by the discriminator keeps the reported errors relevant
+    to what the caller actually attempted. Returns ``None`` when the schema
+    isn't a multi-branch ``oneOf`` or the discriminator doesn't match any
+    branch (falls back to validating the full schema).
+    """
+
+    one_of = schema.get("oneOf")
+    if not isinstance(one_of, list) or len(one_of) < 2:
+        return None
+    action_value = raw_arguments.get("action")
+    if action_value is None:
+        return None
+    for branch in one_of:
+        if not isinstance(branch, dict):
+            continue
+        action_schema = (branch.get("properties") or {}).get("action")
+        if isinstance(action_schema, dict) and action_schema.get("const") == action_value:
+            narrowed = dict(branch)
+            definitions = schema.get("definitions")
+            if isinstance(definitions, dict) and "definitions" not in narrowed:
+                narrowed["definitions"] = definitions
+            return narrowed
+    return None
+
+
 def validate_tool_arguments(
     tool_name: str,
     raw_arguments: Any,
@@ -93,8 +131,10 @@ def validate_tool_arguments(
     if schema is None:
         return None
 
+    effective_schema = _narrow_oneof_branch(schema, raw_arguments) or schema
+
     try:
-        validator = Draft7Validator(schema)
+        validator = Draft7Validator(effective_schema)
     except SchemaError:
         # Fail open on a bad schema — this is a controller programming
         # error; we should not break production tool calls for it.
@@ -111,8 +151,17 @@ def validate_tool_arguments(
     if not errors:
         return None
 
+    detailed_errors: list[ValidationError] = []
+    pending = list(errors)
+    while pending:
+        err = pending.pop(0)
+        if err.context:
+            pending[0:0] = sorted(err.context, key=lambda child: list(child.absolute_path))
+        else:
+            detailed_errors.append(err)
+
     rendered_errors: list[str] = []
-    for err in errors[:5]:
+    for err in detailed_errors[:5]:
         path = ".".join(str(part) for part in err.absolute_path) or "<root>"
         rendered_errors.append(f"{path}: {err.message}")
 

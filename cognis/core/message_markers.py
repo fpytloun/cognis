@@ -92,6 +92,12 @@ ANCHORS_AVAILABLE = "_anchors_available"
 # Number of anchors in the anchored output.
 ANCHOR_COUNT = "_anchor_count"
 
+# Concrete persisted anchor names available for tool-output recovery.
+ANCHOR_NAMES = "_anchor_names"
+
+# Safe lazy artifact refs derived from persisted artifact-candidate anchors.
+LAZY_ARTIFACT_REFS = "_lazy_artifact_refs"
+
 # True when the result was already pruned to a compact view.
 PRUNED_VIEW = "_pruned_view"
 
@@ -146,6 +152,8 @@ ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
         TOOL_OUTPUT_PRESENTATION,
         ANCHORS_AVAILABLE,
         ANCHOR_COUNT,
+        ANCHOR_NAMES,
+        LAZY_ARTIFACT_REFS,
         PRUNED_VIEW,
         TOOL_ATTACHMENT_CONTEXT,
         TOOL_CALL_ID,

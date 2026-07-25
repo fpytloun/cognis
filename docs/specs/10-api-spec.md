@@ -84,7 +84,6 @@ PATCH  /api/v1/conversations/:id/queue/:queue_id          → Edit pending queue
 DELETE /api/v1/conversations/:id/queue/:queue_id          → Cancel pending queued message
 GET    /api/v1/conversations/:id/sessions                 → List sessions
 GET    /api/v1/conversations/:id/delegations              → Active delegations
-GET    /api/v1/conversations/:id/sessions/:sid/events     → Session event stream
 ```
 
 #### Resolve Conversation (find-or-create)
@@ -250,6 +249,7 @@ queue mutation attempts.
 
 ```
 GET    /api/v1/agents                         → List owned agents + agents shared with caller
+GET    /api/v1/agents/memory-backends         → Authoritative memory backend/mode descriptors
 POST   /api/v1/agents                         → Create agent
 GET    /api/v1/agents/:id                     → Get details (owner: full; grantee: read-only)
 PUT    /api/v1/agents/:id                     → Update (owner only)
@@ -314,7 +314,6 @@ against the agent with reason `access_revoked`.
 
 ```
 GET    /api/v1/sessions/:id                   → Session details
-GET    /api/v1/sessions/:id/events            → Events (proxied from Intaris)
 POST   /api/v1/sessions/:id/cancel            → Cancel
 ```
 
@@ -376,6 +375,12 @@ operator fields such as the provider verification URI, optional complete
 verification URI, user code, expiry, and polling interval; they must not expose
 the device code, access tokens, refresh tokens, client secrets, or raw credential
 headers.
+
+The OAuth status response keeps the existing ``connected`` field but now defines
+it as a currently usable access token. Additive fields distinguish
+``authorized``/``authorization_required``, ``runtime_connected``, ``invalid``,
+``outcome_unknown``, ``refresh_state``, bounded retry timing, sanitized last
+refresh diagnostics, and per-executor desired/applied runtime convergence.
 
 ### Secrets
 
@@ -515,10 +520,20 @@ through these endpoints. Infrastructure config (URLs, keys) uses env vars.
 GET    /api/v1/settings                       → List all settings (grouped by category)
 GET    /api/v1/settings/:key                  → Get single setting
 PUT    /api/v1/settings/:key                  → Update setting (admin only)
+DELETE /api/v1/settings/:key                  → Reset to the registry default (admin only)
 ```
 
 Unknown setting keys are rejected. Known settings validate value types against
-the seeded application schema.
+the typed application registry. List/detail/update/reset responses include
+`default_value`, `is_overridden`, `label`, `description`, `section`,
+`value_type`, options/bounds/unit, and `apply_scope`.
+`is_overridden` is a value comparison against the current registry default;
+it does not track historical administrator intent.
+
+Exposed settings are restartless: updates are either hot-applied in the current
+worker or read at the next safe operation/runtime boundary. Legacy stored keys
+without sound runtime semantics remain bootstrapped for compatibility but are
+not exposed by these endpoints.
 
 ### LLM Providers
 
@@ -530,6 +545,49 @@ PUT    /api/v1/llm-providers/:id              → Update provider
 DELETE /api/v1/llm-providers/:id              → Remove provider
 POST   /api/v1/llm-providers/:id/test        → Test provider connectivity (resolved model, latency, sanitized errors)
 ```
+
+### Local Models
+
+```
+GET    /api/v1/local-model-catalog                         → Search catalog with per-source availability
+GET    /api/v1/local-model-catalog/detail                  → Resolve one bounded HF repository detail view
+GET    /api/v1/local-model-catalog/resolve                 → Normalize one direct WS2A model reference
+POST   /api/v1/local-model-fit-plans                       → Build an advisory per-executor capacity plan
+GET    /api/v1/local-model-deployments                     → List visible desired-state deployments
+POST   /api/v1/local-model-deployments                     → Create a desired-state deployment
+GET    /api/v1/local-model-deployments/:id                 → Get one visible deployment
+PATCH  /api/v1/local-model-deployments/:id                 → Update managed desired state
+DELETE /api/v1/local-model-deployments/:id                 → Delete desired state when dependencies allow
+GET    /api/v1/local-model-deployments/:id/targets         → List materialized executor targets
+GET    /api/v1/local-model-deployments/:id/operations      → List durable runtime operations
+GET    /api/v1/local-model-deployments/:id/status          → Generation-aware rollout summary
+POST   /api/v1/local-model-deployments/:id/reconciliation-requests
+                                                            → Request declarative reconciliation
+GET    /api/v1/executors/:id/local-model-runtime           → Probe managed Ollama status
+POST   /api/v1/executors/:id/local-model-runtime/operations
+                                                            → Create exact-target pull/delete operation
+POST   /api/v1/executors/:id/local-model-runtime/operations/:operation_id/cancellation-requests
+                                                            → Request durable cancellation
+POST   /api/v1/llm-providers/:id/local-models:upsert       → Atomically add/merge a configured model
+```
+
+Catalog and fit endpoints are authenticated and advisory only. Hugging Face access is public and
+credential-free. Search is a fast bounded page and never fans out to repository APIs. Optional
+`parameter_range`, `download_size_range`, `quantization`, `min_context`, and `include_unknown`
+filters apply only to metadata in that upstream page; `next_cursor` still advances the upstream HF
+page, so a filtered page may contain fewer than `limit` items. The search cache key includes source,
+normalized query, upstream cursor, limit, and every filter.
+
+`/detail` accepts only a validated `owner/repository` and optional 40-character revision SHA. It uses
+only fixed `https://huggingface.co` model-info and revision-pinned README endpoints, refuses redirects,
+and bounds concurrency, deadlines, response bodies, README bytes, cache entries, and normalized
+fields. Detail work is coalesced and cached by repository plus SHA. A detail failure is diagnostic for
+that item and does not retroactively mark a successful search source unavailable.
+
+Fit plans accept any positive context without clamping and never mutate runtime state; deployment
+creation remains the only write in the planning flow. See
+`36-local-model-declarative-foundation.md` for selector authorization, reference integrity, capacity
+math, and override semantics.
 
 ### Model Routing
 
@@ -666,8 +724,11 @@ read-only viewers receive `forbidden` and cannot change pending messages.
 {type: "conversation_created", conversation_id, old_conversation_id}
 {type: "session_recovered", conversation_id, session_id, reason}
 
-// System messages (slash command feedback, cancel notifications, etc.)
-{type: "system_message", conversation_id, text}
+// System messages (slash command feedback, cancel notifications, etc.).
+// Visible /profile, /model, and /thinking command feedback is persisted as
+// lifecycle event="system_notice" and echoed with notice_id; Chat v2 clients
+// use item id system:{notice_id} for local/canonical reconciliation.
+{type: "system_message", conversation_id, text, notice_id?, kind?, scope?, command_result?}
 
 // Queue status
 {type: "queued", conversation_id, queued_count}

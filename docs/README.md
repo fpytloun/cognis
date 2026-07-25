@@ -25,6 +25,11 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | [Schedules](guide/schedules.md) | Recurring task creation and scheduled workflow execution |
 | [Workflows](guide/workflows.md) | Build reusable workflows and understand step behavior |
 | [Tools and Skills](guide/tools-and-skills.md) | Inspect tools, MCP-backed capabilities, reusable skills, and skill-loaded tools |
+| [Content and Temporary Sharing](guide/content-and-sharing.md) | Artifacts, documents, temporary signed links, HTML viewing, and recovery |
+| [Rich Deliverables](guide/rich-deliverables.md) | Structured durable outputs and their renderer targets |
+| [Rich Deliverable Composition](guide/rich-deliverable-composition.md) | Compose blocks, assets, evidence, and accessible fallbacks |
+| [Rich Deliverable Layout Blocks](guide/rich-deliverable-blocks-layout.md) | Layout, narrative, status, and action block reference |
+| [Rich Deliverable Data Blocks](guide/rich-deliverable-blocks-data.md) | Data, evidence, media, and utility block reference |
 
 ## Operations
 
@@ -53,6 +58,11 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 - `/docs/schedules`
 - `/docs/workflows`
 - `/docs/tools-and-skills`
+- `/docs/content-and-sharing`
+- `/docs/rich-deliverables`
+- `/docs/rich-deliverable-composition`
+- `/docs/rich-deliverable-blocks-layout`
+- `/docs/rich-deliverable-blocks-data`
 - `/docs/settings`
 - `/docs/executors`
 - `/docs/channels`

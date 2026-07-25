@@ -4,6 +4,7 @@
   import type { Snippet } from 'svelte';
   import { onMount } from 'svelte';
   import Bot from 'lucide-svelte/icons/bot';
+import Box from 'lucide-svelte/icons/box';
 import BookOpen from 'lucide-svelte/icons/book-open';
 import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
 import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
@@ -56,6 +57,7 @@ import X from 'lucide-svelte/icons/x';
     { href: '/docs', label: 'Docs', icon: BookOpen },
     { href: '/tools', label: 'Tools', icon: Wrench },
     { href: '/channels', label: 'Channels', icon: Radio },
+    { href: '/local-models', label: 'Local Models', icon: Box },
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 
@@ -65,6 +67,9 @@ import X from 'lucide-svelte/icons/x';
   let sidebarCollapsed = $state(false);
   let mobileHeaderEl = $state<HTMLElement | null>(null);
   let workspaceRunning = false;
+  let diagnosticsLoadedForUser: string | null = null;
+  let workspaceLoadingSlow = $state(false);
+  let workspaceLoadingSlowTimer: number | null = null;
 
   function openMobileNav(): void {
     mobileNavOpen = true;
@@ -133,7 +138,7 @@ import X from 'lucide-svelte/icons/x';
     return tagName === 'input' || tagName === 'textarea' || target.isContentEditable;
   }
 
-  function outageBanners() {
+  let outageBanners = $derived.by(() => {
     const health = $workspaceHealth.health;
     if (!health) {
       return [];
@@ -181,7 +186,7 @@ import X from 'lucide-svelte/icons/x';
     }
 
     return banners;
-  }
+  });
 
   function handleGlobalShortcuts(event: KeyboardEvent): void {
     if ($blockingOverlayActive) {
@@ -219,12 +224,19 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function loadDiagnosticsIfNeeded(): Promise<void> {
-    if (auth.getSnapshot().user?.role !== 'admin') {
+    const user = auth.getSnapshot().user;
+    if (user?.role !== 'admin') {
       diagnostics = null;
+      diagnosticsLoadedForUser = null;
+      return;
+    }
+    const userKey = user.email;
+    if (diagnosticsLoadedForUser === userKey) {
       return;
     }
     try {
       diagnostics = await api.system.diagnostics();
+      diagnosticsLoadedForUser = userKey;
     } catch {
       diagnostics = null;
     }
@@ -257,7 +269,7 @@ import X from 'lucide-svelte/icons/x';
   let isChatWindowMode = $derived(isChatDetailRoute && $page.url.searchParams.get('window') === '1');
   let showMobileHeader = $derived(!isChatDetailRoute);
   let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute && !isChatWindowMode);
-  let hasStatusBanners = $derived(outageBanners().length > 0 || shouldShowGettingStarted());
+  let hasStatusBanners = $derived(outageBanners.length > 0 || shouldShowGettingStarted());
   let contentShellClass = $derived.by(() => {
     if (isChatWindowMode) {
       return 'min-h-0 min-w-0 flex-1 overflow-hidden';
@@ -302,6 +314,26 @@ import X from 'lucide-svelte/icons/x';
     workspaceHealth.stop();
   }
 
+  function clearWorkspaceLoadingSlowTimer(): void {
+    if (workspaceLoadingSlowTimer !== null) {
+      window.clearTimeout(workspaceLoadingSlowTimer);
+      workspaceLoadingSlowTimer = null;
+    }
+  }
+
+  function startAuthBootstrap(): void {
+    bootstrapped = false;
+    workspaceLoadingSlow = false;
+    clearWorkspaceLoadingSlowTimer();
+    void auth.bootstrap().finally(() => {
+      bootstrapped = true;
+    });
+  }
+
+  function retryWorkspaceLoad(): void {
+    startAuthBootstrap();
+  }
+
   function websocketStatusLabel(): string {
     if ($wsState.status === 'connected') return 'Connected';
     if ($wsState.status === 'stalled') return 'Disconnected';
@@ -318,9 +350,7 @@ import X from 'lucide-svelte/icons/x';
 
   onMount(() => {
     restoreSidebarState();
-    void auth.bootstrap().finally(() => {
-      bootstrapped = true;
-    });
+    startAuthBootstrap();
 
     window.addEventListener('keydown', handleGlobalShortcuts);
     window.addEventListener('resize', syncMobileHeaderOffset);
@@ -342,8 +372,24 @@ import X from 'lucide-svelte/icons/x';
       window.removeEventListener('resize', syncMobileHeaderOffset);
       setShellOffsetVariable('--app-shell-top-offset', 0);
       unsubscribeMobileNav();
+      clearWorkspaceLoadingSlowTimer();
       stopWorkspace();
     };
+  });
+
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    const loadingWorkspace = !bootstrapped || $auth.status === 'loading';
+    if (!loadingWorkspace) {
+      workspaceLoadingSlow = false;
+      clearWorkspaceLoadingSlowTimer();
+      return;
+    }
+    if (workspaceLoadingSlowTimer !== null) return;
+    workspaceLoadingSlowTimer = window.setTimeout(() => {
+      workspaceLoadingSlowTimer = null;
+      workspaceLoadingSlow = true;
+    }, 10_000);
   });
 
   $effect(() => {
@@ -375,7 +421,17 @@ import X from 'lucide-svelte/icons/x';
 
 {#if !bootstrapped || $auth.status === 'loading'}
   <div class="app-fullscreen-safe mx-auto flex max-w-5xl items-center justify-center">
-    <LoadingState label="Loading workspace" description="Restoring your Cognis session and preparing the UI shell." />
+    {#if workspaceLoadingSlow}
+      <section class="mx-4 max-w-md rounded-3xl border border-sky-500/30 bg-sky-500/10 px-6 py-8 text-center text-sm text-sky-100 shadow-card">
+        <p class="font-medium">Workspace is still loading.</p>
+        <p class="mt-2 text-sky-50/80">The app shell is taking longer than expected to restore your session.</p>
+        <div class="mt-5 flex justify-center">
+          <Button variant="secondary" onclick={retryWorkspaceLoad}>Retry</Button>
+        </div>
+      </section>
+    {:else}
+      <LoadingState label="Loading workspace" description="Restoring your Cognis session and preparing the UI shell." />
+    {/if}
   </div>
 {:else}
   <a class="skip-link" href="#main-content">Skip to content</a>
@@ -386,7 +442,7 @@ import X from 'lucide-svelte/icons/x';
     <div class="mx-auto flex h-full max-w-[1600px] overflow-hidden lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
       {#if !isChatWindowMode}
       <aside
-        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900/80 shadow-card backdrop-blur transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
+        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
@@ -548,7 +604,7 @@ import X from 'lucide-svelte/icons/x';
           top by `env(safe-area-inset-top)` so the hamburger + title sit
           below the camera cutout instead of being obscured by it.
         -->
-        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950/95 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 backdrop-blur sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
+        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
             <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
@@ -592,8 +648,8 @@ import X from 'lucide-svelte/icons/x';
 
         {#if hasStatusBanners}
           <div class="space-y-3 px-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 lg:px-0 lg:pt-0">
-            {#if outageBanners().length > 0}
-              {#each outageBanners() as banner (banner.id)}
+            {#if outageBanners.length > 0}
+              {#each outageBanners as banner (banner.id)}
                 <div class={`rounded-2xl border px-4 py-4 text-sm ${banner.variant === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
                   <div class="flex flex-wrap items-center justify-between gap-3">
                     <div class="flex min-w-0 items-start gap-3">

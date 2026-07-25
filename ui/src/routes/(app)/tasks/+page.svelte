@@ -56,6 +56,7 @@
   let visibilityHandler: (() => void) | null = null;
   let loadTimeoutTimer: number | null = null;
   let boardReplaceRequestId = 0;
+  let boardRefreshRequestId = 0;
   let boardStateVersion = 0;
   let workflowFilterLoadKey = 0;
   let filterReloadTimer: number | null = null;
@@ -419,14 +420,26 @@
   });
 
   async function refreshTasksOnly(): Promise<void> {
-    if (document.hidden) return;
+    if (document.hidden || loading) return;
     const requestFilterKey = boardFilterKey();
-    const requestId = ++boardReplaceRequestId;
+    const replaceRequestId = boardReplaceRequestId;
+    const requestId = ++boardRefreshRequestId;
     try {
       const nextBoard = await api.tasks.board(boardQueryParams());
-      if (requestId !== boardReplaceRequestId || requestFilterKey !== boardFilterKey()) return;
+      if (
+        requestId !== boardRefreshRequestId ||
+        replaceRequestId !== boardReplaceRequestId ||
+        requestFilterKey !== boardFilterKey() ||
+        loading
+      ) return;
       applyBoardResponse(nextBoard.columns);
     } catch (caughtError) {
+      if (
+        requestId !== boardRefreshRequestId ||
+        replaceRequestId !== boardReplaceRequestId ||
+        requestFilterKey !== boardFilterKey() ||
+        loading
+      ) return;
       error = asApiError(caughtError).message;
     }
   }

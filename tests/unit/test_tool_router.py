@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import socket
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -9,24 +10,60 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from cognis.core import tool_router as tool_router_module
 from cognis.core.chat_modes import is_plan_hidden_tool
-from cognis.core.tool_router import ToolRoute, ToolRouter, _extract_output_anchor_names
+from cognis.core.tool_router import (
+    ToolRoute,
+    ToolRouter,
+    _extract_output_anchor_names,
+    caller_assignable_tools,
+)
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError, CredentialRecord
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
+    NativeToolDefinition as ToolDefinition,
+)
+from cognis.models.tool import (
     Permission,
     ToolCall,
-    ToolDefinition,
     ToolResult,
     ToolSource,
     sanitize_mcp_tool_name,
 )
+from cognis.store.models import ArtifactRecordRow, AuditLog
+from cognis.tools.builtin.schedule import MANAGE_SCHEDULES_TOOL
+from cognis.tools.builtin.skill_management import SKILL_PATCH_TOOL
+from cognis.tools.mcp import MCPClientError
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 pytest_plugins = ("tests.unit.test_task_continuation_tools",)
+
+
+def test_caller_assignable_tools_excludes_permission_denied_registry_tools() -> None:
+    registry = ToolRegistry()
+    for name in ("allowed_tool", "denied_tool"):
+        registry.register(
+            RegisteredTool(
+                definition=ToolDefinition(
+                    name=name,
+                    description=f"{name}.",
+                    parameters={"type": "object", "properties": {}},
+                    source=ToolSource(type="builtin"),
+                    read_only=True,
+                )
+            )
+        )
+    agent = AgentDefinition(
+        agent_id="restricted",
+        owner_email="owner@example.com",
+        name="Restricted",
+        permissions=AgentPermissions(denied_tools=["denied_tool"]),
+    )
+
+    assert [tool.name for tool in caller_assignable_tools(registry, agent)] == ["allowed_tool"]
 
 
 class _Guardrails:
@@ -127,6 +164,198 @@ class _RemoteExecutor(_Executor):
         super().__init__(result=result)
         self.executor_id = "remote-exec"
         self.executor_type = "websocket"
+
+
+@pytest.mark.asyncio
+async def test_remote_mcp_401_refreshes_reconfigures_and_retries_once() -> None:
+    router = object.__new__(ToolRouter)
+    oauth_service = SimpleNamespace(
+        refresh_token_for_server_id=AsyncMock(return_value=True),
+        mark_token_invalid_for_server=AsyncMock(return_value=True),
+        require_reauthorization_for_server=AsyncMock(return_value=None),
+    )
+    router._mcp_oauth_service = oauth_service
+    router._session_factory = None
+    router._wait_for_executor_reconfigure = AsyncMock(return_value=True)
+    executor = _RemoteExecutor(result=ToolResult(output="recovered"))
+    registered_tool = SimpleNamespace(
+        definition=SimpleNamespace(
+            source=SimpleNamespace(server_id="mcp-1"),
+            read_only=True,
+        )
+    )
+    first = ToolResult(
+        output="Unauthorized",
+        is_error=True,
+        metadata={
+            "mcp_auth_error": True,
+            "authorization_required": True,
+            "status_code": 401,
+        },
+    )
+    tool_call = ToolCall(call_id="call-1", name="mcp_tool", arguments={})
+
+    result = await router._recover_remote_mcp_oauth_once(
+        result=first,
+        tool_call=tool_call,
+        registered_tool=registered_tool,
+        session=SimpleNamespace(user_email="alice@example.com"),
+        executor=executor,
+        timeout_seconds=30,
+        outer_timeout=31,
+        output_chunk_callback=None,
+    )
+
+    assert result.output == "recovered"
+    assert result.metadata["mcp_oauth_retry_attempted"] is True
+    assert executor.calls == 1
+    oauth_service.refresh_token_for_server_id.assert_awaited_once_with(
+        user_email="alice@example.com",
+        server_id="mcp-1",
+        force=True,
+        reason="mcp_tool_401",
+    )
+    router._wait_for_executor_reconfigure.assert_awaited_once_with("remote-exec")
+    oauth_service.mark_token_invalid_for_server.assert_not_awaited()
+    oauth_service.require_reauthorization_for_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remote_mcp_401_does_not_auto_replay_mutating_tool() -> None:
+    router = object.__new__(ToolRouter)
+    oauth_service = SimpleNamespace(
+        refresh_token_for_server_id=AsyncMock(return_value=True),
+    )
+    router._mcp_oauth_service = oauth_service
+    router._session_factory = None
+    router._wait_for_executor_reconfigure = AsyncMock(return_value=True)
+    executor = _RemoteExecutor(result=ToolResult(output="must not execute"))
+    registered_tool = SimpleNamespace(
+        definition=SimpleNamespace(
+            source=SimpleNamespace(server_id="mcp-1"),
+            read_only=False,
+        )
+    )
+
+    result = await router._recover_remote_mcp_oauth_once(
+        result=ToolResult(
+            output="Unauthorized",
+            is_error=True,
+            metadata={"mcp_auth_error": True, "status_code": 401},
+        ),
+        tool_call=ToolCall(call_id="call-1", name="mcp_mutate", arguments={}),
+        registered_tool=registered_tool,
+        session=SimpleNamespace(user_email="alice@example.com"),
+        executor=executor,
+        timeout_seconds=30,
+        outer_timeout=31,
+        output_chunk_callback=None,
+    )
+
+    assert result.metadata["code"] == "mcp_oauth_refreshed_retry_required"
+    assert result.metadata["retryable"] is True
+    assert executor.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_remote_mcp_insufficient_scope_preserves_rfc9728_challenge() -> None:
+    router = object.__new__(ToolRouter)
+    oauth_service = SimpleNamespace(
+        refresh_token_for_server_id=AsyncMock(return_value=True),
+        require_reauthorization_for_server=AsyncMock(return_value=None),
+    )
+    router._mcp_oauth_service = oauth_service
+    router._session_factory = None
+    executor = _RemoteExecutor(result=ToolResult(output="must not execute"))
+    registered_tool = SimpleNamespace(
+        definition=SimpleNamespace(
+            source=SimpleNamespace(server_id="mcp-1"),
+            read_only=True,
+        )
+    )
+    challenge = {
+        "resource_metadata": "https://mcp.example/.well-known/oauth-protected-resource",
+        "scope": "tools.write",
+    }
+
+    result = await router._recover_remote_mcp_oauth_once(
+        result=ToolResult(
+            output="Forbidden",
+            is_error=True,
+            metadata={
+                "mcp_auth_error": True,
+                "status_code": 403,
+                "auth_error": "insufficient_scope",
+                "authorization_challenge": challenge,
+            },
+        ),
+        tool_call=ToolCall(call_id="call-1", name="mcp_tool", arguments={}),
+        registered_tool=registered_tool,
+        session=SimpleNamespace(
+            user_email="alice@example.com",
+            conversation_id="conv-1",
+            session_id="sess-1",
+        ),
+        executor=executor,
+        timeout_seconds=30,
+        outer_timeout=31,
+        output_chunk_callback=None,
+    )
+
+    assert result.metadata["reason"] == "insufficient_scope"
+    oauth_service.require_reauthorization_for_server.assert_awaited_once_with(
+        user_email="alice@example.com",
+        server_id="mcp-1",
+        reason="insufficient_scope",
+        authorization_challenge=challenge,
+        conversation_id="conv-1",
+        session_id="sess-1",
+    )
+    oauth_service.refresh_token_for_server_id.assert_not_awaited()
+    assert executor.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_remote_generic_403_does_not_refresh_or_reauthorize() -> None:
+    router = object.__new__(ToolRouter)
+    oauth_service = SimpleNamespace(
+        refresh_token_for_server_id=AsyncMock(return_value=True),
+        require_reauthorization_for_server=AsyncMock(return_value=None),
+    )
+    router._mcp_oauth_service = oauth_service
+    router._session_factory = None
+    executor = _RemoteExecutor(result=ToolResult(output="must not execute"))
+    registered_tool = SimpleNamespace(
+        definition=SimpleNamespace(
+            source=SimpleNamespace(server_id="mcp-1"),
+            read_only=True,
+        )
+    )
+    original = ToolResult(
+        output="Forbidden",
+        is_error=True,
+        metadata={
+            "mcp_auth_error": True,
+            "authorization_required": True,
+            "status_code": 403,
+        },
+    )
+
+    result = await router._recover_remote_mcp_oauth_once(
+        result=original,
+        tool_call=ToolCall(call_id="call-1", name="mcp_tool", arguments={}),
+        registered_tool=registered_tool,
+        session=SimpleNamespace(user_email="alice@example.com"),
+        executor=executor,
+        timeout_seconds=30,
+        outer_timeout=31,
+        output_chunk_callback=None,
+    )
+
+    assert result is original
+    oauth_service.refresh_token_for_server_id.assert_not_awaited()
+    oauth_service.require_reauthorization_for_server.assert_not_awaited()
+    assert executor.calls == 0
 
 
 class _FakeMCPRow(SimpleNamespace):
@@ -397,6 +626,159 @@ def _session_factory() -> object:
         yield _Session()
 
     return factory
+
+
+async def _execute_controller_auth_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status_code: int,
+    auth_error: str | None,
+    read_only: bool,
+) -> tuple[ToolResult, SimpleNamespace, list[str]]:
+    mcp_row = _FakeMCPRow(
+        server_id="mcp_1",
+        name="mfg-portal",
+        status="active",
+        transport="streamable_http",
+        command=None,
+        url="https://mfg.example/mcp",
+        args=[],
+        env={},
+        headers={},
+        auth_config={"type": "oauth2"},
+        timeout_seconds=30,
+    )
+
+    async def fake_get_mcp_server(*_args: object, **_kwargs: object) -> object:
+        return mcp_row
+
+    async def fake_get_setting_value(_session: object, key: str, default: object) -> object:
+        return 300 if key == "mcp.tool_timeout_seconds" else 15
+
+    oauth_service = SimpleNamespace(
+        inject_authorization_header=AsyncMock(
+            return_value=SimpleNamespace(
+                authorization_required=False,
+                headers={"Authorization": "Bearer access"},
+            )
+        ),
+        refresh_token_for_server_id=AsyncMock(return_value=True),
+        require_reauthorization_for_server=AsyncMock(return_value=None),
+    )
+    tool_calls: list[str] = []
+
+    class _Client:
+        async def connect(self) -> None:
+            return None
+
+        async def call_tool(self, raw_name: str, _arguments: dict[str, object]) -> object:
+            tool_calls.append(raw_name)
+            raise MCPClientError(
+                "mfg-portal",
+                "call_tool",
+                "authorization rejected",
+                error_class="http_status",
+                status_code=status_code,
+                auth_error=auth_error,
+                authorization_challenge=(
+                    {"scope": "tools.write"} if auth_error == "insufficient_scope" else None
+                ),
+            )
+
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            return None
+
+    monkeypatch.setattr(tool_router_module, "get_mcp_server", fake_get_mcp_server)
+    monkeypatch.setattr(tool_router_module, "get_setting_value", fake_get_setting_value)
+    monkeypatch.setattr(
+        tool_router_module,
+        "build_mcp_client",
+        lambda _config, secrets: _Client(),
+    )
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+        mcp_oauth_service=oauth_service,
+    )
+    registered_tool = RegisteredTool(
+        definition=ToolDefinition(
+            name="mcp_mfg_portal__tool",
+            description="tool",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(
+                type="local_mcp",
+                server_id="mcp_1",
+                server_name="mfg-portal",
+                raw_tool_name="tool",
+            ),
+            read_only=read_only,
+        )
+    )
+    result = await router._execute_controller_oauth_mcp_if_applicable(
+        ToolCall(call_id="call_1", name="mcp_mfg_portal__tool", arguments={}),
+        registered_tool=registered_tool,
+        session=_session(),
+    )
+    assert result is not None
+    return result, oauth_service, tool_calls
+
+
+@pytest.mark.asyncio
+async def test_controller_generic_403_does_not_refresh_or_reauthorize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, oauth_service, tool_calls = await _execute_controller_auth_failure(
+        monkeypatch,
+        status_code=403,
+        auth_error=None,
+        read_only=True,
+    )
+
+    assert result.metadata["code"] == "mcp_tool_call_failed"
+    assert result.metadata["authorization_required"] is False
+    assert tool_calls == ["tool"]
+    oauth_service.refresh_token_for_server_id.assert_not_awaited()
+    oauth_service.require_reauthorization_for_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_controller_mutating_401_refreshes_without_auto_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, oauth_service, tool_calls = await _execute_controller_auth_failure(
+        monkeypatch,
+        status_code=401,
+        auth_error="invalid_token",
+        read_only=False,
+    )
+
+    assert result.metadata["code"] == "mcp_oauth_refreshed_retry_required"
+    assert tool_calls == ["tool"]
+    oauth_service.refresh_token_for_server_id.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_controller_insufficient_scope_preserves_challenge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, oauth_service, tool_calls = await _execute_controller_auth_failure(
+        monkeypatch,
+        status_code=403,
+        auth_error="insufficient_scope",
+        read_only=True,
+    )
+
+    assert result.metadata["reason"] == "insufficient_scope"
+    assert tool_calls == ["tool"]
+    oauth_service.require_reauthorization_for_server.assert_awaited_once_with(
+        user_email="user@example.com",
+        server_id="mcp_1",
+        reason="insufficient_scope",
+        authorization_challenge={"scope": "tools.write"},
+        conversation_id="conv-a",
+        session_id="session-a",
+    )
+    oauth_service.refresh_token_for_server_id.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -881,6 +1263,174 @@ async def test_plan_mode_denies_routed_schedule_write_before_execution() -> None
     assert result.is_error is True
     assert "Plan mode is active" in result.output
     assert result.metadata and result.metadata["code"] == "plan_mode_mutation_denied"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_action"),
+    [
+        ({"action": "list"}, "list"),
+        ({"action": "trigger", "schedule_id": "schedule-1"}, "trigger"),
+    ],
+)
+async def test_schedule_dispatch_validates_domain_without_agent_management(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict[str, str],
+    expected_action: str,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_SCHEDULES_TOOL))
+    validated_contexts: list[object] = []
+
+    async def validate_domain(
+        definitions: list[ToolDefinition],
+        tool_name: str,
+        call_arguments: dict[str, str],
+        context: object,
+    ) -> dict[str, object]:
+        assert definitions == [MANAGE_SCHEDULES_TOOL]
+        assert tool_name == "manage_schedules"
+        assert call_arguments == arguments
+        validated_contexts.append(context)
+        return {"valid": True}
+
+    async def handle_schedule(**kwargs: object) -> ToolResult:
+        assert kwargs["arguments"] == arguments
+        return ToolResult(output=expected_action)
+
+    monkeypatch.setattr(
+        tool_router_module,
+        "validate_available_tool_call_with_context",
+        validate_domain,
+    )
+    monkeypatch.setattr(tool_router_module, "handle_schedule_tool", handle_schedule)
+
+    result = await ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+    ).execute(
+        ToolCall(
+            call_id=f"schedule-{expected_action}", name="manage_schedules", arguments=arguments
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _Executor(),
+    )
+
+    assert result.is_error is False
+    assert expected_action in result.output
+    assert len(validated_contexts) == 1
+
+
+@pytest.mark.asyncio
+async def test_schedule_dispatch_rejects_invalid_domain_without_agent_management(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_SCHEDULES_TOOL))
+    handler = AsyncMock(return_value=ToolResult(output="should not run"))
+
+    async def reject_domain(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"valid": False, "error": "schedule_not_found"}
+
+    monkeypatch.setattr(
+        tool_router_module,
+        "validate_available_tool_call_with_context",
+        reject_domain,
+    )
+    monkeypatch.setattr(tool_router_module, "handle_schedule_tool", handler)
+
+    result = await ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+    ).execute(
+        ToolCall(
+            call_id="schedule-invalid-domain",
+            name="manage_schedules",
+            arguments={"action": "trigger", "schedule_id": "schedule-1"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _Executor(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata and result.metadata["code"] == "invalid_tool_arguments"
+    handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_successful_skill_patch_marks_skill_epoch_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=SKILL_PATCH_TOOL))
+
+    async def handle_skill_patch(**_kwargs: object) -> ToolResult:
+        return ToolResult(output="patched", metadata={"version": 2})
+
+    monkeypatch.setattr(tool_router_module, "handle_skill_management_tool", handle_skill_patch)
+
+    result = await ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+    ).execute(
+        ToolCall(
+            call_id="skill-patch",
+            name="skill_patch",
+            arguments={"skill_id": "skill-1", "instructions": "Updated"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _Executor(),
+    )
+
+    assert result.is_error is False
+    assert result.metadata and result.metadata["skill_epoch_stale"] is True
+    assert result.metadata["version"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Skill 'skill-1' not found",
+        "no_op_patch: patch does not change the skill",
+    ],
+)
+async def test_failed_or_no_op_skill_patch_does_not_mark_skill_epoch_stale(
+    monkeypatch: pytest.MonkeyPatch,
+    output: str,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=SKILL_PATCH_TOOL))
+
+    async def handle_skill_patch(**_kwargs: object) -> ToolResult:
+        return ToolResult(output=output, is_error=True)
+
+    monkeypatch.setattr(tool_router_module, "handle_skill_management_tool", handle_skill_patch)
+
+    result = await ToolRouter(
+        guardrails=_Guardrails(),
+        session_factory=_session_factory(),
+    ).execute(
+        ToolCall(
+            call_id="skill-patch-no-op",
+            name="skill_patch",
+            arguments={"skill_id": "skill-1", "instructions": "Unchanged"},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        _Executor(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata is not None
+    assert "skill_epoch_stale" not in result.metadata
 
 
 @pytest.mark.asyncio
@@ -2063,17 +2613,8 @@ async def test_tool_router_enriches_inline_attachment_output_with_artifact_guida
     assert 'artifact_read with artifact_id="att_1"' in raw_output
     assert 'artifact_get_url with artifact_id="att_1"' in raw_output
     anchors = result.metadata["output_anchors"]
-    assert any(
-        anchor["anchor"] == "binary"
-        and anchor["artifact_candidate"]
-        == {
-            "source_type": "artifact_id",
-            "artifact_id": "att_1",
-            "mime_hint": "image/png",
-            "filename_hint": "a.png",
-        }
-        for anchor in anchors
-    )
+    assert {anchor["anchor"] for anchor in anchors} == {"binary", "attachment:1"}
+    assert all("artifact_candidate" not in anchor for anchor in anchors)
 
 
 @pytest.mark.asyncio
@@ -2389,6 +2930,7 @@ async def test_artifact_read_materializes_tool_artifact_ref(
             "url": "https://cdn.example.com/product.svg",
             "mime_hint": "image/svg+xml",
             "filename_hint": "product.svg",
+            "metadata": {"source_page_url": "https://news.example.com/article"},
         }
 
     class _ToolOutputStore:
@@ -2426,13 +2968,18 @@ async def test_artifact_read_materializes_tool_artifact_ref(
         "cognis.tools.builtin.artifact_tools.find_tool_artifact_record",
         AsyncMock(return_value=None),
     )
+    create_record = AsyncMock(return_value=row)
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools.create_artifact_record",
-        AsyncMock(return_value=row),
+        create_record,
     )
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools.get_artifact_record",
         AsyncMock(return_value=row),
+    )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.find_tool_output_artifact_record",
+        AsyncMock(return_value=SimpleNamespace(conversation_id="conv-a")),
     )
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools._fetch_remote_artifact_candidate",
@@ -2457,13 +3004,83 @@ async def test_artifact_read_materializes_tool_artifact_ref(
         user_email="user@example.com",
         current_model=None,
         current_provider_id=None,
-        runtime_metadata={"tool_output_store": _ToolOutputStore()},
+        runtime_metadata={
+            "tool_output_store": _ToolOutputStore(),
+            "authorized_lazy_artifact_refs": ["tool_artifact:call-web:media:1"],
+            "runtime_access": {
+                "conversation_id": "conv-a",
+                "session_id": "session-a",
+            },
+        },
     )
 
     assert result.is_error is False
     assert "Materialized tool_artifact:call-web:media:1 as artifact att_1" in result.output
     assert result.metadata is not None
     assert result.metadata["materialized_artifact_id"] == "att_1"
+    assert result.metadata["source_url"] == "https://news.example.com/article"
+    assert result.metadata["asset_url"] == "https://cdn.example.com/product.svg"
+    create_kwargs = create_record.await_args.kwargs
+    assert create_kwargs["source_tool_call_id"] == "call-web"
+    assert create_kwargs["source_anchor"] == "media:1"
+    assert create_kwargs["content_hash"] == hashlib.sha256(b"<svg></svg>").hexdigest()
+    assert create_kwargs["conversation_id"] == "conv-a"
+    assert create_kwargs["session_id"] == "session-a"
+
+
+@pytest.mark.asyncio
+async def test_artifact_read_blocks_unpromoted_lazy_ref_before_store_lookup() -> None:
+    from cognis.tools.builtin.artifact_tools import handle_artifact_tool
+
+    class _ToolOutputStore:
+        async def list_anchors(self, call_id: str) -> list[object]:
+            raise AssertionError(f"unauthorized store lookup for {call_id}")
+
+    result = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "tool_artifact:call-web:media:1"},
+        llm=None,
+        artifact_store=object(),
+        session_factory=object(),
+        user_email="user@example.com",
+        current_model=None,
+        current_provider_id=None,
+        runtime_metadata={
+            "tool_output_store": _ToolOutputStore(),
+            "authorized_lazy_artifact_refs": [],
+        },
+    )
+
+    assert result.is_error is True
+    assert result.output == "Tool artifact access denied: tool_artifact:call-web:media:1"
+
+
+@pytest.mark.asyncio
+async def test_pinned_remote_backend_connects_to_validated_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpcore
+
+    from cognis.tools.builtin.artifact_tools import _PinnedNetworkBackend
+
+    stream = object()
+    connect = AsyncMock(return_value=stream)
+    monkeypatch.setattr(httpcore.AnyIOBackend, "connect_tcp", connect)
+    backend = _PinnedNetworkBackend(
+        host="cdn.example.com",
+        ip_address="203.0.113.10",
+    )
+
+    result = await backend.connect_tcp("cdn.example.com", 443, timeout=10)
+
+    assert result is stream
+    connect.assert_awaited_once_with(
+        "203.0.113.10",
+        443,
+        timeout=10,
+        local_address=None,
+        socket_options=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -2538,6 +3155,10 @@ async def test_artifact_read_resolves_binary_tool_artifact_to_persisted_attachme
         "cognis.tools.builtin.artifact_tools.get_artifact_record",
         AsyncMock(return_value=row),
     )
+    monkeypatch.setattr(
+        "cognis.tools.builtin.artifact_tools.find_tool_output_artifact_record",
+        AsyncMock(return_value=SimpleNamespace(conversation_id="conv-a")),
+    )
 
     result = await handle_artifact_tool(
         "artifact_read",
@@ -2548,7 +3169,11 @@ async def test_artifact_read_resolves_binary_tool_artifact_to_persisted_attachme
         user_email="user@example.com",
         current_model="gpt-4o-mini",
         current_provider_id=None,
-        runtime_metadata={"tool_output_store": _ToolOutputStore()},
+        runtime_metadata={
+            "tool_output_store": _ToolOutputStore(),
+            "authorized_lazy_artifact_refs": [],
+            "runtime_access": {"conversation_id": "conv-a", "session_id": "session-a"},
+        },
     )
 
     assert result.is_error is False
@@ -4230,7 +4855,7 @@ async def test_tool_router_resolves_deliverable_artifact_save_content_for_execut
     executor = _CapturingExecutor()
     router = ToolRouter(
         guardrails=guardrails,
-        artifact_store=_ArtifactStore(),
+        artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
     )
 
@@ -4263,6 +4888,160 @@ async def test_tool_router_resolves_deliverable_artifact_save_content_for_execut
         base64.b64decode(executor.seen_call.arguments["source_artifact_content_b64"])
         == b"# Full report\n\nComplete deliverable body."
     )
+
+
+@pytest.mark.asyncio
+async def test_tool_router_exports_and_publishes_managed_descendant_deliverable(
+    task_continuation_db,
+) -> None:
+    from tests.unit.test_artifact_virtual_deliverable_refs import _seed_managed_deliverables
+
+    await _seed_managed_deliverables(task_continuation_db)
+
+    class _CapturingDocumentExecutor(_RemoteExecutor):
+        def __init__(self) -> None:
+            super().__init__(
+                ToolResult(
+                    output="generated",
+                    attachments=[
+                        {
+                            "filename": "nested-result.pdf",
+                            "mime_type": "application/pdf",
+                            "content_b64": base64.b64encode(b"%PDF-managed-export").decode("ascii"),
+                            "kind": "pdf",
+                            "purpose": "document_output",
+                        }
+                    ],
+                )
+            )
+            self.seen_call: ToolCall | None = None
+
+        async def tool_execute(
+            self,
+            tool_call: ToolCall,
+            timeout_seconds: int | None = None,
+            output_chunk_callback: object | None = None,
+        ) -> ToolResult:
+            del timeout_seconds, output_chunk_callback
+            self.seen_call = tool_call
+            return self.result
+
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="document_generate",
+                description="generate document",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _CapturingDocumentExecutor()
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+    )
+    controller_session = _session().model_copy(
+        update={
+            "user_email": "owner@example.com",
+            "conversation_id": "conv-controller",
+            "agent_id": "agent-owner",
+        }
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="document-generate-managed-dlv",
+            name="document_generate",
+            arguments={
+                "source_artifact_id": "dlv_grandchild",
+                "filename": "nested-result.pdf",
+            },
+        ),
+        controller_session,
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert executor.seen_call is not None
+    assert executor.seen_call.arguments["source_artifact_content"] == "Nested deliverable"
+    assert result.attachments
+    published_artifact_id = result.attachments[0]["artifact_id"]
+    async with task_continuation_db() as session:
+        artifact = (
+            await session.execute(
+                select(ArtifactRecordRow).where(
+                    ArtifactRecordRow.artifact_id == published_artifact_id
+                )
+            )
+        ).scalar_one()
+        audit = (
+            await session.execute(
+                select(AuditLog).where(AuditLog.event_type == "managed_deliverable_access")
+            )
+        ).scalar_one()
+    assert artifact.owner_email == "owner@example.com"
+    assert artifact.conversation_id == "conv-controller"
+    assert artifact.session_id == controller_session.session_id
+    assert artifact.filename == "nested-result.pdf"
+    assert artifact.mime_type == "application/pdf"
+    assert audit.agent_id == "agent-owner"
+    assert audit.details["creator_agent_id"] == "agent-grandchild"
+    assert audit.details["creator_conversation_id"] == "conv-grandchild"
+
+
+@pytest.mark.asyncio
+async def test_tool_router_denies_managed_descendant_export_to_unrelated_agent(
+    task_continuation_db,
+) -> None:
+    from tests.unit.test_artifact_virtual_deliverable_refs import _seed_managed_deliverables
+
+    await _seed_managed_deliverables(task_continuation_db)
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="document_generate",
+                description="generate document",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _RemoteExecutor(ToolResult(output="must not execute"))
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+    )
+
+    result = await router.execute(
+        ToolCall(
+            call_id="document-generate-denied-managed-dlv",
+            name="document_generate",
+            arguments={"source_artifact_id": "dlv_grandchild"},
+        ),
+        _session().model_copy(
+            update={
+                "user_email": "owner@example.com",
+                "conversation_id": "conv-unrelated",
+                "agent_id": "agent-unrelated",
+            }
+        ),
+        _agent({"*": Permission.EVALUATE}),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is True
+    assert "Artifact not found: dlv_grandchild" in result.output
+    assert executor.calls == 0
 
 
 @pytest.mark.asyncio
@@ -4344,7 +5123,7 @@ async def test_tool_router_resolves_deliverable_browser_upload_guardrails_and_pa
     executor = _CapturingExecutor()
     router = ToolRouter(
         guardrails=guardrails,
-        artifact_store=_ArtifactStore(),
+        artifact_store=task_continuation_db.artifact_store,
         session_factory=task_continuation_db,
     )
 

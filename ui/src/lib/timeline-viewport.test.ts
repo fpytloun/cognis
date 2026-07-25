@@ -70,7 +70,7 @@ describe('observeTimelineResizeAutoScroll', () => {
 
     ResizeObserverMock.instances[0]?.callback([], ResizeObserverMock.instances[0] as unknown as ResizeObserver);
 
-    expect(requestAnimationFrame).toHaveBeenCalledTimes(4);
-    expect(scrollToBottom).toHaveBeenCalledTimes(4);
+    expect(requestAnimationFrame).toHaveBeenCalledTimes(2);
+    expect(scrollToBottom).toHaveBeenCalledTimes(2);
   });
 });

@@ -14,9 +14,7 @@ from cognis.models.tool import Permission
 
 logger = get_logger(__name__)
 
-# Known backend ids — validated at parse time.  New backends register themselves
-# in cognis/providers/backends/ and must be added here for validation.
-_KNOWN_MEMORY_BACKENDS = {"mnemory", "none"}
+# Guardrails backends do not yet expose provider-owned options.
 _KNOWN_GUARDRAILS_BACKENDS = {"intaris", "none"}
 
 
@@ -37,22 +35,40 @@ class AgentCapabilities(BaseModel):
                    session/event store regardless of this setting.
 
     Both fields are open strings (not Literal) so new backends can be added
-    without schema changes.  Unknown values raise a validation error.
+    without schema changes. Unavailable memory backends are preserved for
+    forward-compatible reads and fail closed at runtime.
     """
 
     memory_backend: str = "mnemory"
+    memory_backend_options: dict[str, Any] = Field(default_factory=dict)
     guardrails_backend: str = "intaris"
 
     @field_validator("memory_backend")
     @classmethod
     def _validate_memory_backend(cls, value: str) -> str:
-        if value not in _KNOWN_MEMORY_BACKENDS:
-            raise ValueError(
-                f"Unknown memory_backend {value!r}. "
-                f"Known: {sorted(_KNOWN_MEMORY_BACKENDS)}. "
-                "Add a new backend in cognis/providers/backends/memory/."
-            )
+        if not value.strip() or value != value.strip():
+            raise ValueError("memory_backend must be a non-empty trimmed backend id")
         return value
+
+    @model_validator(mode="after")
+    def _validate_memory_options(self) -> AgentCapabilities:
+        from cognis.providers.backends import get_backend
+
+        try:
+            descriptor = get_backend("memory", self.memory_backend)
+        except ValueError:
+            # Preserve unavailable future/provider plugin configurations. The
+            # runtime resolver treats them as disabled until the provider is
+            # installed; API mutation paths reject newly selected unknown ids.
+            return self
+        if descriptor.memory_options is None:
+            if self.memory_backend_options:
+                raise ValueError(f"Memory backend {self.memory_backend!r} does not accept options")
+            return self
+        self.memory_backend_options = descriptor.memory_options.validate_options(
+            self.memory_backend_options
+        )
+        return self
 
     @field_validator("guardrails_backend")
     @classmethod
@@ -67,7 +83,15 @@ class AgentCapabilities(BaseModel):
 
     @property
     def memory_enabled(self) -> bool:
-        return self.memory_backend != "none"
+        if self.memory_backend == "none":
+            return False
+        from cognis.providers.backends import get_backend
+
+        try:
+            get_backend("memory", self.memory_backend)
+        except ValueError:
+            return False
+        return True
 
     @property
     def guardrails_enabled(self) -> bool:
@@ -97,6 +121,7 @@ class AgentDefinition(BaseModel):
         if value is None:
             return AgentCapabilities()
         return value
+
     agent_profiles: dict[str, AgentRuntimeProfile] = Field(default_factory=dict)
     default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
@@ -138,6 +163,47 @@ class AgentDefinition(BaseModel):
                     normalized[profile_id] = profile
             return normalized
         return value
+
+    @field_validator("agent_profiles")
+    @classmethod
+    def _validate_agent_profile_keys(
+        cls, value: dict[str, AgentRuntimeProfile]
+    ) -> dict[str, AgentRuntimeProfile]:
+        for profile_id, profile in value.items():
+            if not profile_id.strip() or profile_id != profile_id.strip() or "/" in profile_id:
+                raise ValueError(
+                    "runtime profile keys must be non-empty, trimmed, and must not contain '/'"
+                )
+            if profile.profile_id is not None and profile.profile_id != profile_id:
+                raise ValueError(
+                    f"runtime profile key '{profile_id}' does not match embedded "
+                    f"profile_id '{profile.profile_id}'"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_profile_memory_options(self) -> AgentDefinition:
+        from cognis.providers.backends import get_backend
+
+        try:
+            descriptor = get_backend("memory", self.capabilities.memory_backend)
+        except ValueError:
+            return self
+        options_provider = descriptor.memory_options
+        for profile_id, profile in self.agent_profiles.items():
+            if profile.memory_backend_options and options_provider is None:
+                raise ValueError(
+                    f"Runtime profile {profile_id!r} configures memory options, "
+                    f"but backend {self.capabilities.memory_backend!r} does not accept them"
+                )
+            if options_provider is not None:
+                # Validate the effective shallow merge, while preserving only
+                # the explicit profile fields in persisted configuration.
+                merged = dict(options_provider.defaults)
+                merged.update(self.capabilities.memory_backend_options)
+                merged.update(profile.memory_backend_options)
+                options_provider.validate_options(merged)
+        return self
 
     def compose_personality(self) -> str | None:
         """Compose structured personality fields into a text block.
@@ -250,7 +316,10 @@ class AgentRuntimeProfile(BaseModel):
         validation_alias=AliasChoices("reasoning_effort", "thinking_effort"),
     )
     system_prompt_extra: str | None = None
+    memory_enabled: bool | None = None
+    memory_backend_options: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
+    agent_switchable: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -296,6 +365,14 @@ class AgentRuntimeProfile(BaseModel):
             allowed = ", ".join(NORMALIZED_REASONING_LEVELS)
             raise ValueError(f"reasoning_effort must be one of {allowed}; got {value!r}")
         return normalized
+
+    @model_validator(mode="after")
+    def _require_switchable_profile_description(self) -> AgentRuntimeProfile:
+        if self.agent_switchable and not self.description:
+            raise ValueError(
+                "agent-switchable runtime profiles require description routing guidance"
+            )
+        return self
 
 
 def _matches_any(tool_name: str, patterns: list[str] | None) -> bool:

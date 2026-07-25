@@ -29,6 +29,7 @@ from cognis.core.content_refs import (
     continuation_scope_task_id,
     get_accessible_deliverable_ref,
     is_deliverable_ref,
+    record_deliverable_access,
 )
 from cognis.core.credential_grants import (
     grant_credential_to_agent,
@@ -55,11 +56,18 @@ from cognis.models.tool import (
     mcp_headers_have_authorization,
     stable_tool_id,
     tool_capabilities,
+    tool_input_schema,
 )
-from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_context
+from cognis.runtime_context import (
+    RuntimeAccessContext,
+    current_agent_id,
+    current_runtime_access_context,
+    current_user_email,
+)
 from cognis.store.queries import (
     create_artifact_record,
     get_artifact_record,
+    get_executor_row,
     get_mcp_server,
     get_setting_value,
 )
@@ -75,6 +83,10 @@ from cognis.tools.builtin.artifact_tools import (
     is_artifact_tool,
 )
 from cognis.tools.builtin.image import handle_image_tool, is_image_tool
+from cognis.tools.builtin.mcp_management import (
+    handle_mcp_management_tool,
+    is_mcp_management_tool,
+)
 from cognis.tools.builtin.memory import handle_memory_tool, is_memory_tool
 from cognis.tools.builtin.orchestration import handle_delegate_tool_call, is_orchestration_tool
 from cognis.tools.builtin.schedule import handle_schedule_tool, is_schedule_tool
@@ -83,12 +95,14 @@ from cognis.tools.builtin.skill_management import (
     is_skill_management_tool,
 )
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
+from cognis.tools.introspection import validate_available_tool_call_with_context
 from cognis.tools.mcp import (
     HTTP_MCP_TRANSPORTS,
     MCPClientError,
     _normalize_call_result,
     build_mcp_client,
 )
+from cognis.tools.native_validation import NativeValidationContext
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 TOOL_ROUTE_DECISIONS = Counter(
@@ -256,6 +270,7 @@ class ToolRoute(StrEnum):
     ARTIFACT = "artifact"
     IMAGE = "image"
     AGENT_MANAGEMENT = "agent_management"
+    MCP_MANAGEMENT = "mcp_management"
     SKILL_MANAGEMENT = "skill_management"
     SCHEDULE = "schedule"
     INTARIS_MCP = "intaris_mcp"
@@ -274,6 +289,28 @@ class PermissionDecision:
     path: str | None = None
     latency_ms: int = 0
     call_id: str | None = None  # Intaris evaluation call_id (for escalation tracking)
+
+
+def caller_assignable_tools(
+    registry: ToolRegistry,
+    agent: AgentDefinition,
+) -> list[ToolDefinition]:
+    """Return persistable tools inside the caller agent's effective authority."""
+
+    return [
+        tool
+        for tool in registry.list_tools()
+        if tool.configurable
+        and tool.source.type in {"builtin", "executor"}
+        and (
+            agent.permissions is None
+            or agent.permissions.resolve_permission(
+                tool.name,
+                tool_id=stable_tool_id(tool),
+            )
+            is not Permission.DENY
+        )
+    ]
 
 
 def _guardrails_context_value(value: Any) -> Any:
@@ -430,6 +467,11 @@ class ToolRouter:
             registered_tool = registry.get(tool_name)
             if registered_tool is not None and registered_tool.definition.source.type == "builtin":
                 return ToolRoute.AGENT_MANAGEMENT
+            return ToolRoute.UNKNOWN
+        if is_mcp_management_tool(tool_name):
+            registered_tool = registry.get(tool_name)
+            if registered_tool is not None and registered_tool.definition.source.type == "builtin":
+                return ToolRoute.MCP_MANAGEMENT
             return ToolRoute.UNKNOWN
         if is_skill_management_tool(tool_name):
             return ToolRoute.SKILL_MANAGEMENT
@@ -817,16 +859,20 @@ class ToolRouter:
             )
         if route is ToolRoute.MEMORY:
             capabilities = getattr(agent, "capabilities", None)
+            policy_enabled = tool_call.runtime_metadata.get("memory_policy_enabled")
             if capabilities is not None and not capabilities.memory_enabled:
                 result = ToolResult(
                     output="Memory backend is disabled for this agent.",
                     is_error=True,
                 )
+            elif policy_enabled is not True:
+                result = ToolResult(
+                    output="Memory tools are disabled by the effective turn policy.",
+                    is_error=True,
+                )
             elif self.memory is None:
                 result = ToolResult(output="Memory provider not available.", is_error=True)
             else:
-                from cognis.runtime_context import current_user_email
-
                 result = await handle_memory_tool(
                     tool_name=tool_call.name,
                     arguments=dict(tool_call.arguments),
@@ -851,6 +897,7 @@ class ToolRouter:
                     tool_name=tool_call.name,
                     arguments=dict(tool_call.arguments),
                     store=self.tool_output_store,
+                    pressure_mode=tool_call.runtime_metadata.get("context_pressure_mode"),
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -862,9 +909,9 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.ARTIFACT:
-            from cognis.runtime_context import current_user_email
-
             artifact_runtime_metadata = dict(tool_call.runtime_metadata)
+            artifact_runtime_metadata.setdefault("conversation_id", session.conversation_id)
+            artifact_runtime_metadata.setdefault("agent_id", agent.agent_id)
             if self.tool_output_store is not None:
                 artifact_runtime_metadata["tool_output_store"] = self.tool_output_store
             result = await handle_artifact_tool(
@@ -951,7 +998,7 @@ class ToolRouter:
             validation_error = validate_tool_arguments(
                 tool_call.name,
                 tool_call.arguments,
-                schema=registered_tool.definition.parameters if registered_tool else None,
+                schema=tool_input_schema(registered_tool.definition) if registered_tool else None,
             )
             if validation_error is not None:
                 TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
@@ -991,32 +1038,129 @@ class ToolRouter:
                     runtime_metadata=tool_call.runtime_metadata,
                 )
             from cognis.core.agent_management import AgentManagementDependencies
-            from cognis.runtime_context import current_agent_id, current_user_email
 
             if self._session_factory is None:
                 result = ToolResult(output="Agent management not available.", is_error=True)
             else:
-                result = await handle_agent_management_tool(
-                    tool_name=tool_call.name,
-                    arguments=dict(tool_call.arguments),
-                    deps=AgentManagementDependencies(
-                        session_factory=self._session_factory,
-                        memory=self.memory,
-                        event_bus=getattr(self, "event_bus", None),
-                        artifact_store=self.artifact_store,
-                        image_generation_provider=self.image_generation_provider,
-                        llm=self.llm,
-                        task_queue=getattr(self, "_task_queue", None),
-                        guardrails=self.guardrails,
+                actor_email = current_user_email.get() or session.user_email
+                current_id = current_agent_id.get() or agent.agent_id
+                deps = AgentManagementDependencies(
+                    session_factory=self._session_factory,
+                    memory=self.memory,
+                    event_bus=getattr(self, "event_bus", None),
+                    artifact_store=self.artifact_store,
+                    image_generation_provider=self.image_generation_provider,
+                    llm=self.llm,
+                    task_queue=getattr(self, "_task_queue", None),
+                    guardrails=self.guardrails,
+                    assignable_tools=caller_assignable_tools(registry, agent),
+                    assignable_knowledgebase_ids=(
+                        set(agent.permissions.allowed_knowledgebases)
+                        if agent.permissions is not None
+                        else None
                     ),
-                    user_email=current_user_email.get() or session.user_email,
-                    current_agent_id=current_agent_id.get() or agent.agent_id,
-                    runtime_access=self._runtime_access_from_tool_call(tool_call),
                 )
+                domain_validation = await validate_available_tool_call_with_context(
+                    [registered_tool.definition],
+                    tool_call.name,
+                    dict(tool_call.arguments),
+                    NativeValidationContext(
+                        actor_email=actor_email,
+                        current_agent_id=current_id,
+                        agent_management_deps=deps,
+                    ),
+                )
+                if not domain_validation["valid"]:
+                    result = ToolResult(
+                        output=json.dumps(domain_validation),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    )
+                else:
+                    result = await handle_agent_management_tool(
+                        tool_name=tool_call.name,
+                        arguments=dict(tool_call.arguments),
+                        deps=deps,
+                        user_email=actor_email,
+                        current_agent_id=current_id,
+                        runtime_access=self._runtime_access_from_tool_call(tool_call),
+                    )
             combined_meta: dict[str, Any] = {"evaluation": eval_meta}
             if result.metadata is not None:
                 combined_meta.update(result.metadata)
             result = result.model_copy(update={"metadata": combined_meta})
+            outcome = "success" if not result.is_error else "failure"
+            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                100_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
+        if route is ToolRoute.MCP_MANAGEMENT:
+            agent_tools = agent.tools if isinstance(agent.tools, dict) else {}
+            opted_in = agent_tools.get("opt_in_builtin_tools")
+            explicit_allow = agent_tools.get("allow_tools")
+            enabled = (isinstance(opted_in, list) and tool_call.name in opted_in) or (
+                isinstance(explicit_allow, list)
+                and (
+                    tool_call.name in explicit_allow
+                    or f"builtin:{tool_call.name}" in explicit_allow
+                )
+            )
+            if not enabled:
+                result = ToolResult(
+                    output="MCP management is not explicitly enabled for this agent.",
+                    is_error=True,
+                    metadata={"code": "mcp_management_not_enabled"},
+                )
+            else:
+                registered_tool = registry.get(tool_call.name)
+                validation_error = validate_tool_arguments(
+                    tool_call.name,
+                    tool_call.arguments,
+                    schema=tool_input_schema(registered_tool.definition)
+                    if registered_tool
+                    else None,
+                )
+                if validation_error is not None:
+                    result = ToolResult(
+                        output=json.dumps(validation_error.as_tool_result()),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    )
+                else:
+                    decision = await self.evaluate_tool_call(tool_call, agent, session, registry)
+                    if decision.decision in {"deny", "escalate"}:
+                        result = ToolResult(
+                            output=decision.reasoning
+                            or "MCP management requires explicit approval.",
+                            is_error=True,
+                            metadata={"decision": decision.decision},
+                        )
+                    elif self._session_factory is None:
+                        result = ToolResult(
+                            output="MCP management is not available.", is_error=True
+                        )
+                    else:
+                        from cognis.core.mcp_management import MCPManagementDependencies
+
+                        result = await handle_mcp_management_tool(
+                            arguments=dict(tool_call.arguments),
+                            deps=MCPManagementDependencies(
+                                session_factory=self._session_factory,
+                                oauth_service=self._mcp_oauth_service,
+                                reconfigure_server=getattr(self, "_mcp_reconfigure_server", None),
+                                reconfigure_executor=getattr(
+                                    self, "_mcp_reconfigure_executor", None
+                                ),
+                                oauth_status=getattr(self, "_mcp_oauth_status", None),
+                                oauth_disconnect=getattr(self, "_mcp_oauth_disconnect", None),
+                            ),
+                            user_email=current_user_email.get() or session.user_email,
+                            runtime_access=self._runtime_access_from_tool_call(tool_call),
+                        )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(
@@ -1068,8 +1212,6 @@ class ToolRouter:
             if self._session_factory is None:
                 result = ToolResult(output="Skill management not available.", is_error=True)
             else:
-                from cognis.runtime_context import current_agent_id, current_user_email
-
                 result = await handle_skill_management_tool(
                     tool_name=tool_call.name,
                     arguments=dict(tool_call.arguments),
@@ -1083,6 +1225,7 @@ class ToolRouter:
             # can re-resolve skills before the next model call.
             _SKILL_MUTATION_TOOLS = {
                 "skill_write",
+                "skill_patch",
                 "skill_delete",
                 "skill_import_url",
                 "skill_restore_version",
@@ -1109,16 +1252,31 @@ class ToolRouter:
             if self._session_factory is None:
                 result = ToolResult(output="Schedule management not available.", is_error=True)
             else:
-                from cognis.runtime_context import current_user_email
-
-                result = await handle_schedule_tool(
-                    tool_name=tool_call.name,
-                    arguments=dict(tool_call.arguments),
-                    session_factory=self._session_factory,
-                    scheduler=self._scheduler,
-                    user_email=current_user_email.get() or session.user_email,
-                    agent_id=agent.agent_id if agent else None,
+                domain_validation = await validate_available_tool_call_with_context(
+                    [registered_tool.definition],
+                    tool_call.name,
+                    dict(tool_call.arguments),
+                    NativeValidationContext(
+                        actor_email=current_user_email.get() or session.user_email,
+                        current_agent_id=agent.agent_id if agent else None,
+                        session_factory=self._session_factory,
+                    ),
                 )
+                if not domain_validation["valid"]:
+                    result = ToolResult(
+                        output=json.dumps(domain_validation),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    )
+                else:
+                    result = await handle_schedule_tool(
+                        tool_name=tool_call.name,
+                        arguments=dict(tool_call.arguments),
+                        session_factory=self._session_factory,
+                        scheduler=self._scheduler,
+                        user_email=current_user_email.get() or session.user_email,
+                        agent_id=agent.agent_id if agent else None,
+                    )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
             return self._sanitize_result(
@@ -1200,7 +1358,7 @@ class ToolRouter:
             validation_error = validate_tool_arguments(
                 guardrails_tool_call.name,
                 guardrails_tool_call.arguments,
-                schema=registered_tool.definition.parameters,
+                schema=tool_input_schema(registered_tool.definition),
             )
             if validation_error is not None:
                 TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
@@ -1280,7 +1438,7 @@ class ToolRouter:
             validation_error = validate_tool_arguments(
                 tool_call.name,
                 tool_call.arguments,
-                schema=registered_tool.definition.parameters,
+                schema=tool_input_schema(registered_tool.definition),
             )
             if validation_error is not None:
                 TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
@@ -1304,7 +1462,17 @@ class ToolRouter:
                 50_000,
                 runtime_metadata=tool_call.runtime_metadata,
             )
-        scoped_tool_call = tool_call.model_copy(update={"execution_scope_id": session.session_id})
+        scoped_tool_call = tool_call.model_copy(
+            update={
+                "execution_scope_id": session.session_id,
+                "runtime_metadata": {
+                    **tool_call.runtime_metadata,
+                    "tool_contract_hash": registered_tool.definition.descriptor.schema_hash
+                    if registered_tool.definition.descriptor
+                    else None,
+                },
+            }
+        )
 
         if registered_tool.handler is not None:
             try:
@@ -1355,6 +1523,16 @@ class ToolRouter:
                     ),
                     timeout=outer_timeout,
                 )
+                result = await self._recover_remote_mcp_oauth_once(
+                    result=result,
+                    tool_call=scoped_tool_call,
+                    registered_tool=registered_tool,
+                    session=session,
+                    executor=executor,
+                    timeout_seconds=inner_timeout,
+                    outer_timeout=outer_timeout,
+                    output_chunk_callback=output_chunk_callback,
+                )
                 result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(result, session, tool_call.name)
             result = await self._postprocess_tool_result(result, scoped_tool_call, session)
@@ -1398,6 +1576,169 @@ class ToolRouter:
             runtime_metadata=tool_call.runtime_metadata,
             content_trust=_effective_content_trust(registered_tool, result),
         )
+
+    async def _recover_remote_mcp_oauth_once(
+        self,
+        *,
+        result: ToolResult,
+        tool_call: ToolCall,
+        registered_tool: Any,
+        session: SessionModel,
+        executor: Any,
+        timeout_seconds: int,
+        outer_timeout: int,
+        output_chunk_callback: Any | None,
+    ) -> ToolResult:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        source = registered_tool.definition.source
+        server_id = source.server_id
+        auth_failed = bool(
+            result.is_error
+            and server_id
+            and (
+                metadata.get("status_code") == 401
+                or metadata.get("auth_error") in {"invalid_token", "insufficient_scope"}
+            )
+        )
+        if not auth_failed or self._mcp_oauth_service is None:
+            return result
+        raw_challenge = metadata.get("authorization_challenge")
+        challenge = (
+            {str(key): str(value) for key, value in raw_challenge.items()}
+            if isinstance(raw_challenge, dict)
+            else None
+        )
+        insufficient_scope = metadata.get("auth_error") == "insufficient_scope"
+        if insufficient_scope:
+            authorization = await self._mcp_oauth_service.require_reauthorization_for_server(
+                user_email=session.user_email,
+                server_id=server_id,
+                reason="insufficient_scope",
+                authorization_challenge=challenge,
+                conversation_id=getattr(session, "conversation_id", None),
+                session_id=getattr(session, "session_id", None),
+            )
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **metadata,
+                        "code": "mcp_authorization_required",
+                        "reason": "insufficient_scope",
+                        "authorization_required": True,
+                        "authorization_url": getattr(authorization, "authorization_url", None),
+                        "transaction_id": getattr(authorization, "transaction_id", None),
+                    }
+                }
+            )
+        try:
+            await self._mcp_oauth_service.refresh_token_for_server_id(
+                user_email=session.user_email,
+                server_id=server_id,
+                force=True,
+                reason="mcp_tool_401",
+            )
+        except MCPOAuthError as exc:
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **metadata,
+                        "code": "mcp_authorization_required"
+                        if exc.authorization_required
+                        else "mcp_oauth_refresh_failed",
+                        "reason": exc.reason or "refresh_failed",
+                        "retryable": exc.retryable,
+                        "outcome_unknown": exc.outcome_unknown,
+                        "authorization_required": exc.authorization_required,
+                    }
+                }
+            )
+        executor_id = str(getattr(executor, "executor_id", "") or "")
+        if executor_id and not await self._wait_for_executor_reconfigure(executor_id):
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **metadata,
+                        "code": "mcp_oauth_reconfigure_pending",
+                        "retryable": True,
+                    }
+                }
+            )
+        if not registered_tool.definition.read_only:
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **metadata,
+                        "code": "mcp_oauth_refreshed_retry_required",
+                        "reason": "automatic_replay_not_safe",
+                        "retryable": True,
+                        "mcp_oauth_refresh_succeeded": True,
+                    }
+                }
+            )
+        retried = await asyncio.wait_for(
+            executor.tool_execute(
+                tool_call,
+                timeout_seconds=timeout_seconds,
+                output_chunk_callback=output_chunk_callback,
+            ),
+            timeout=outer_timeout,
+        )
+        retry_metadata = retried.metadata if isinstance(retried.metadata, dict) else {}
+        second_auth_failure = bool(
+            retried.is_error
+            and (
+                retry_metadata.get("mcp_auth_error") is True
+                or retry_metadata.get("authorization_required") is True
+                or retry_metadata.get("status_code") == 401
+                or retry_metadata.get("auth_error") == "invalid_token"
+            )
+        )
+        if second_auth_failure:
+            retry_challenge_raw = retry_metadata.get("authorization_challenge")
+            retry_challenge = (
+                {str(key): str(value) for key, value in retry_challenge_raw.items()}
+                if isinstance(retry_challenge_raw, dict)
+                else challenge
+            )
+            await self._mcp_oauth_service.require_reauthorization_for_server(
+                user_email=session.user_email,
+                server_id=server_id,
+                reason="mcp_resource_authorization_failed_after_refresh",
+                authorization_challenge=retry_challenge,
+                conversation_id=getattr(session, "conversation_id", None),
+                session_id=getattr(session, "session_id", None),
+            )
+        return retried.model_copy(
+            update={
+                "metadata": {
+                    **retry_metadata,
+                    "mcp_oauth_retry_attempted": True,
+                    "authorization_required": second_auth_failure,
+                }
+            }
+        )
+
+    async def _wait_for_executor_reconfigure(
+        self,
+        executor_id: str,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> bool:
+        if self._session_factory is None:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while loop.time() < deadline:
+            async with self._session_factory() as store_session:
+                row = await get_executor_row(store_session, executor_id)
+            if row is None:
+                return False
+            if int(getattr(row, "desired_config_version", 0) or 0) == int(
+                getattr(row, "applied_config_version", 0) or 0
+            ) and getattr(row, "runtime_state", None) in {"active", "degraded"}:
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
     async def _execute_controller_oauth_mcp_if_applicable(
         self,
@@ -1523,6 +1864,153 @@ class ToolRouter:
             )
             return result.model_copy(update={"metadata": metadata})
         except MCPClientError as exc:
+            if exc.authorization_required:
+                challenge = (
+                    {str(key): str(value) for key, value in exc.authorization_challenge.items()}
+                    if isinstance(exc.authorization_challenge, dict)
+                    else None
+                )
+                if exc.auth_error == "insufficient_scope":
+                    authorization = (
+                        await self._mcp_oauth_service.require_reauthorization_for_server(
+                            user_email=session.user_email,
+                            server_id=mcp_row.server_id,
+                            reason="insufficient_scope",
+                            authorization_challenge=challenge,
+                            conversation_id=session.conversation_id,
+                            session_id=session.session_id,
+                        )
+                    )
+                    return ToolResult(
+                        output="MCP authorization has insufficient scope; reauthorization is required.",
+                        is_error=True,
+                        metadata={
+                            "code": "mcp_authorization_required",
+                            "server_id": source.server_id,
+                            "server_name": mcp_row.name,
+                            "reason": "insufficient_scope",
+                            "authorization_required": True,
+                            "authorization_url": getattr(authorization, "authorization_url", None),
+                            "transaction_id": getattr(authorization, "transaction_id", None),
+                        },
+                    )
+                if exc.status_code != 401 and exc.auth_error != "invalid_token":
+                    return ToolResult(
+                        output=f"MCP tool call failed: {str(exc)[:500]}",
+                        is_error=True,
+                        metadata={
+                            "code": "mcp_tool_call_failed",
+                            "server_id": source.server_id,
+                            "server_name": exc.server_name,
+                            "phase": exc.phase,
+                            "error_class": exc.error_class,
+                            "status_code": exc.status_code,
+                            "auth_error": exc.auth_error,
+                            "authorization_required": False,
+                            "www_authenticate": exc.www_authenticate,
+                            "authorization_challenge": exc.authorization_challenge,
+                            "retryable": False,
+                        },
+                    )
+                try:
+                    await self._mcp_oauth_service.refresh_token_for_server_id(
+                        user_email=session.user_email,
+                        server_id=mcp_row.server_id,
+                        force=True,
+                        reason="mcp_tool_401",
+                    )
+                    if not registered_tool.definition.read_only:
+                        return ToolResult(
+                            output=(
+                                "MCP authorization was refreshed. Retry the tool explicitly; "
+                                "automatic replay is disabled for mutating tools."
+                            ),
+                            is_error=True,
+                            metadata={
+                                "code": "mcp_oauth_refreshed_retry_required",
+                                "server_id": source.server_id,
+                                "server_name": mcp_row.name,
+                                "reason": "automatic_replay_not_safe",
+                                "retryable": True,
+                                "mcp_oauth_refresh_succeeded": True,
+                            },
+                        )
+                    retry_token = await self._mcp_oauth_service.inject_authorization_header(
+                        user_email=session.user_email,
+                        server=mcp_row,
+                        headers={
+                            key: value
+                            for key, value in base_headers.items()
+                            if key.lower() != "authorization"
+                        },
+                        conversation_id=session.conversation_id,
+                        session_id=session.session_id,
+                        delivery_mode="same_conversation",
+                    )
+                    if not retry_token.authorization_required:
+                        retry_config = config.model_copy(update={"headers": retry_token.headers})
+                        retry_client = build_mcp_client(retry_config, secrets={})
+                        try:
+                            await retry_client.connect()
+                            retried_raw = await retry_client.call_tool(
+                                source.raw_tool_name or tool_call.name,
+                                tool_call.arguments,
+                            )
+                            retried = (
+                                retried_raw
+                                if isinstance(retried_raw, ToolResult)
+                                else _normalize_call_result(retried_raw)
+                            )
+                            retry_metadata = dict(retried.metadata or {})
+                            retry_metadata.update(
+                                {
+                                    "executed_by": "controller_oauth_mcp",
+                                    "server_id": source.server_id,
+                                    "server_name": mcp_row.name,
+                                    "raw_tool_name": source.raw_tool_name or tool_call.name,
+                                    "mcp_oauth_retry_attempted": True,
+                                }
+                            )
+                            return retried.model_copy(update={"metadata": retry_metadata})
+                        except MCPClientError as retry_exc:
+                            if retry_exc.authorization_required:
+                                retry_challenge = (
+                                    {
+                                        str(key): str(value)
+                                        for key, value in retry_exc.authorization_challenge.items()
+                                    }
+                                    if isinstance(retry_exc.authorization_challenge, dict)
+                                    else challenge
+                                )
+                                await self._mcp_oauth_service.require_reauthorization_for_server(
+                                    user_email=session.user_email,
+                                    server_id=mcp_row.server_id,
+                                    reason="mcp_resource_authorization_failed_after_refresh",
+                                    authorization_challenge=retry_challenge,
+                                    conversation_id=session.conversation_id,
+                                    session_id=session.session_id,
+                                )
+                        finally:
+                            await retry_client.close(suppress_cancelled=True)
+                except MCPOAuthError as refresh_exc:
+                    return ToolResult(
+                        output=(
+                            "MCP authorization recovery failed"
+                            f" ({refresh_exc.reason or 'refresh_failed'})."
+                        ),
+                        is_error=True,
+                        metadata={
+                            "code": "mcp_authorization_required"
+                            if refresh_exc.authorization_required
+                            else "mcp_oauth_refresh_failed",
+                            "server_id": source.server_id,
+                            "server_name": mcp_row.name,
+                            "reason": refresh_exc.reason,
+                            "retryable": refresh_exc.retryable,
+                            "outcome_unknown": refresh_exc.outcome_unknown,
+                            "authorization_required": refresh_exc.authorization_required,
+                        },
+                    )
             return ToolResult(
                 output=f"MCP tool call failed: {str(exc)[:500]}",
                 is_error=True,
@@ -1536,6 +2024,8 @@ class ToolRouter:
                     "status_code": exc.status_code,
                     "auth_error": exc.auth_error,
                     "authorization_required": exc.authorization_required,
+                    "www_authenticate": exc.www_authenticate,
+                    "authorization_challenge": exc.authorization_challenge,
                     "retryable": exc.timed_out,
                 },
             )
@@ -1691,7 +2181,7 @@ class ToolRouter:
         )
         normalized_arguments = strip_empty_optional_values(
             tool_call.arguments,
-            registered_tool.definition.parameters,
+            tool_input_schema(registered_tool.definition),
         )
         raw = await handler(normalized_arguments, context)
         duration_ms = int((perf_counter() - start) * 1000)
@@ -1727,6 +2217,8 @@ class ToolRouter:
                     str(artifact_id),
                     session.user_email,
                     scope_task_id=self._content_ref_scope_task_id(tool_call),
+                    accessor_conversation_id=session.conversation_id,
+                    accessor_agent_id=session.agent_id,
                 )
                 arguments.setdefault("source_artifact_filename", metadata["filename"])
                 arguments.setdefault("source_artifact_mime_type", metadata["mime_type"])
@@ -1738,6 +2230,8 @@ class ToolRouter:
                     str(artifact_id),
                     session.user_email,
                     scope_task_id=self._content_ref_scope_task_id(tool_call),
+                    accessor_conversation_id=session.conversation_id,
+                    accessor_agent_id=session.agent_id,
                 )
                 arguments.setdefault("source_artifact_filename", metadata["filename"])
                 arguments.setdefault("source_artifact_mime_type", metadata["mime_type"])
@@ -1759,6 +2253,8 @@ class ToolRouter:
                         artifact_id,
                         session.user_email,
                         scope_task_id=self._content_ref_scope_task_id(tool_call),
+                        accessor_conversation_id=session.conversation_id,
+                        accessor_agent_id=session.agent_id,
                     )
                     total_bytes += int(metadata["size_bytes"] or 0)
                     if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
@@ -1788,6 +2284,8 @@ class ToolRouter:
                         str(artifact_id),
                         session.user_email,
                         scope_task_id=self._content_ref_scope_task_id(tool_call),
+                        accessor_conversation_id=session.conversation_id,
+                        accessor_agent_id=session.agent_id,
                     )
                     item.setdefault("filename", metadata["filename"])
                     item.setdefault("mime_type", metadata["mime_type"])
@@ -1811,6 +2309,8 @@ class ToolRouter:
                 str(artifact_id),
                 session.user_email,
                 scope_task_id=self._content_ref_scope_task_id(tool_call),
+                accessor_conversation_id=session.conversation_id,
+                accessor_agent_id=session.agent_id,
             )
             arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
             arguments.setdefault("source_artifact_filename", filename)
@@ -1822,6 +2322,8 @@ class ToolRouter:
                 str(artifact_id),
                 session.user_email,
                 scope_task_id=self._content_ref_scope_task_id(tool_call),
+                accessor_conversation_id=session.conversation_id,
+                accessor_agent_id=session.agent_id,
             )
             arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
             arguments.setdefault("source_artifact_filename", filename)
@@ -1834,6 +2336,8 @@ class ToolRouter:
                 str(artifact_id),
                 session.user_email,
                 scope_task_id=self._content_ref_scope_task_id(tool_call),
+                accessor_conversation_id=session.conversation_id,
+                accessor_agent_id=session.agent_id,
             )
         if tool_call.name == "browser_upload":
             arguments.pop("source_artifacts", None)
@@ -1852,6 +2356,8 @@ class ToolRouter:
                         artifact_id,
                         session.user_email,
                         scope_task_id=self._content_ref_scope_task_id(tool_call),
+                        accessor_conversation_id=session.conversation_id,
+                        accessor_agent_id=session.agent_id,
                     )
                     total_bytes += len(content)
                     if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
@@ -1880,6 +2386,8 @@ class ToolRouter:
                         str(artifact_id),
                         session.user_email,
                         scope_task_id=self._content_ref_scope_task_id(tool_call),
+                        accessor_conversation_id=session.conversation_id,
+                        accessor_agent_id=session.agent_id,
                     )
                     item.setdefault("content_b64", base64.b64encode(content).decode("ascii"))
                     item.setdefault("mime_type", mime_type)
@@ -1953,6 +2461,8 @@ class ToolRouter:
             content_ref,
             session.user_email,
             scope_task_id=self._content_ref_scope_task_id(tool_call),
+            accessor_conversation_id=session.conversation_id,
+            accessor_agent_id=session.agent_id,
         )
         if field == "filename":
             return metadata["filename"]
@@ -1996,6 +2506,8 @@ class ToolRouter:
                 content_ref,
                 session.user_email,
                 scope_task_id=scope_task_id,
+                accessor_conversation_id=session.conversation_id,
+                accessor_agent_id=session.agent_id,
             )
             if len(content) > _MAX_ARTIFACT_VALUE_REF_BYTES:
                 raise ValueError(
@@ -2008,6 +2520,8 @@ class ToolRouter:
                 content_ref,
                 session.user_email,
                 scope_task_id=scope_task_id,
+                accessor_conversation_id=session.conversation_id,
+                accessor_agent_id=session.agent_id,
             )
             return metadata[field]
         if field in {"signed_url", "public_url"}:
@@ -2015,6 +2529,8 @@ class ToolRouter:
                 content_ref,
                 session.user_email,
                 scope_task_id=scope_task_id,
+                accessor_conversation_id=session.conversation_id,
+                accessor_agent_id=session.agent_id,
             )
         raise ValueError(f"Unsupported artifact value ref field: {field}")
 
@@ -2411,16 +2927,25 @@ class ToolRouter:
         user_email: str,
         *,
         scope_task_id: str | None = None,
+        accessor_conversation_id: str | None = None,
+        accessor_agent_id: str | None = None,
     ) -> str:
         if is_deliverable_ref(artifact_id):
-            if self._session_factory is None:
+            if self._session_factory is None or self.artifact_store is None:
                 raise ValueError("Artifact support not available")
             async with self._session_factory() as db_session:
                 ref = await get_accessible_deliverable_ref(
-                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                    db_session,
+                    self.artifact_store,
+                    artifact_id,
+                    user_email,
+                    scope_task_id=scope_task_id,
+                    accessor_conversation_id=accessor_conversation_id,
+                    accessor_agent_id=accessor_agent_id,
                 )
             if ref is None:
                 raise ValueError(f"Artifact not found: {artifact_id}")
+            await record_deliverable_access(self._session_factory, ref)
             return ref.deliverable.content
         return await self._load_text_artifact(artifact_id, user_email)
 
@@ -2430,16 +2955,25 @@ class ToolRouter:
         user_email: str,
         *,
         scope_task_id: str | None = None,
+        accessor_conversation_id: str | None = None,
+        accessor_agent_id: str | None = None,
     ) -> tuple[bytes, str, str]:
         if is_deliverable_ref(artifact_id):
-            if self._session_factory is None:
+            if self._session_factory is None or self.artifact_store is None:
                 raise ValueError("Artifact support not available")
             async with self._session_factory() as db_session:
                 ref = await get_accessible_deliverable_ref(
-                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                    db_session,
+                    self.artifact_store,
+                    artifact_id,
+                    user_email,
+                    scope_task_id=scope_task_id,
+                    accessor_conversation_id=accessor_conversation_id,
+                    accessor_agent_id=accessor_agent_id,
                 )
             if ref is None:
                 raise ValueError(f"Artifact not found: {artifact_id}")
+            await record_deliverable_access(self._session_factory, ref)
             return ref.content_bytes, ref.mime_type, ref.filename
         return await self._load_binary_artifact(artifact_id, user_email)
 
@@ -2449,16 +2983,25 @@ class ToolRouter:
         user_email: str,
         *,
         scope_task_id: str | None = None,
+        accessor_conversation_id: str | None = None,
+        accessor_agent_id: str | None = None,
     ) -> dict[str, Any]:
         if is_deliverable_ref(artifact_id):
-            if self._session_factory is None:
+            if self._session_factory is None or self.artifact_store is None:
                 raise ValueError("Artifact support not available")
             async with self._session_factory() as db_session:
                 ref = await get_accessible_deliverable_ref(
-                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                    db_session,
+                    self.artifact_store,
+                    artifact_id,
+                    user_email,
+                    scope_task_id=scope_task_id,
+                    accessor_conversation_id=accessor_conversation_id,
+                    accessor_agent_id=accessor_agent_id,
                 )
             if ref is None:
                 raise ValueError(f"Artifact not found: {artifact_id}")
+            await record_deliverable_access(self._session_factory, ref)
             return {
                 "filename": ref.filename,
                 "mime_type": ref.mime_type,
@@ -2477,6 +3020,8 @@ class ToolRouter:
         user_email: str,
         *,
         scope_task_id: str | None = None,
+        accessor_conversation_id: str | None = None,
+        accessor_agent_id: str | None = None,
         ttl_seconds: int = 3600,
     ) -> str:
         if self.artifact_store is None:
@@ -2487,10 +3032,17 @@ class ToolRouter:
                 raise ValueError("Artifact support not available")
             async with self._session_factory() as db_session:
                 ref = await get_accessible_deliverable_ref(
-                    db_session, artifact_id, user_email, scope_task_id=scope_task_id
+                    db_session,
+                    self.artifact_store,
+                    artifact_id,
+                    user_email,
+                    scope_task_id=scope_task_id,
+                    accessor_conversation_id=accessor_conversation_id,
+                    accessor_agent_id=accessor_agent_id,
                 )
             if ref is None:
                 raise ValueError(f"Artifact not found: {artifact_id}")
+            await record_deliverable_access(self._session_factory, ref)
             return build_deliverable_public_url(
                 self.artifact_store,
                 ref,
@@ -2715,12 +3267,10 @@ class ToolRouter:
             artifact_id = item.get("artifact_id")
             if not isinstance(artifact_id, str) or not artifact_id:
                 continue
-            candidate = {
-                "source_type": "artifact_id",
-                "artifact_id": artifact_id,
-                "mime_hint": item.get("mime_type"),
-                "filename_hint": item.get("filename"),
-            }
+            # Persisted attachment IDs are already valid inputs for artifact
+            # tools. Anchoring their metadata supports recovery/navigation,
+            # but adding an artifact candidate manufactures a redundant
+            # tool_artifact:* alias for the exact same content.
             if index == 1:
                 anchors.append(
                     {
@@ -2729,7 +3279,6 @@ class ToolRouter:
                         "label": str(item.get("filename") or artifact_id),
                         "start_line": start_line,
                         "end_line": end_line,
-                        "artifact_candidate": candidate,
                     }
                 )
             anchors.append(
@@ -2739,7 +3288,6 @@ class ToolRouter:
                     "label": str(item.get("filename") or artifact_id),
                     "start_line": start_line,
                     "end_line": end_line,
-                    "artifact_candidate": candidate,
                 }
             )
         return anchors

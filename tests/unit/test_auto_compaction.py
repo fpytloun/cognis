@@ -129,6 +129,7 @@ class _FakeSessionManager:
         intention: str,
         completion_reason: str = "compacted",
         compaction_summary: str | None = None,
+        compaction_summary_event_data: dict[str, Any] | None = None,
         tail_events: list[Any] | None = None,
     ) -> SessionModel:
         del compaction_summary, tail_events
@@ -138,6 +139,7 @@ class _FakeSessionManager:
                 "old_session_id": current_session.session_id,
                 "intention": intention,
                 "completion_reason": completion_reason,
+                "compaction_summary_event_data": compaction_summary_event_data,
             }
         )
         if self._fail:
@@ -344,6 +346,13 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
     assert len(session_mgr.rotations) == 1
     assert session_mgr.rotations[0]["old_session_id"] == "session-1"
     assert session_mgr.rotations[0]["completion_reason"] == "compacted"
+    marker_data = session_mgr.rotations[0]["compaction_summary_event_data"]
+    assert marker_data["timeline_visible"] is True
+    assert marker_data["marker_role"] == "context_seed"
+    assert marker_data["method"] == "llm"
+    assert marker_data["trigger"] == "automatic"
+    assert marker_data["status"] == "compacted"
+    assert marker_data["turns_compacted"] == 5
 
     # Cache was refreshed for the new session; the durable summary event is
     # recorded by SessionManager during rotation.

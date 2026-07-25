@@ -8,6 +8,7 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   chat: {
     show_thinking_blocks: false,
     group_tool_calls: true,
+    keep_assistant_messages_separate: false,
     show_internal_tool_calls: false
   }
 };
@@ -40,6 +41,9 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
       group_tool_calls: typeof chat.group_tool_calls === 'boolean'
         ? chat.group_tool_calls
         : DEFAULT_USER_PREFERENCES.chat.group_tool_calls,
+      keep_assistant_messages_separate: typeof chat.keep_assistant_messages_separate === 'boolean'
+        ? chat.keep_assistant_messages_separate
+        : DEFAULT_USER_PREFERENCES.chat.keep_assistant_messages_separate,
       show_internal_tool_calls: typeof chat.show_internal_tool_calls === 'boolean'
         ? chat.show_internal_tool_calls
         : DEFAULT_USER_PREFERENCES.chat.show_internal_tool_calls

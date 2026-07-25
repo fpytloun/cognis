@@ -14,6 +14,7 @@ export type ToolGroupKind =
   | 'delegate'
   | 'web'
   | 'browser'
+  | 'image'
   | 'memory'
   | 'knowledgebase'
   | 'mixed';
@@ -25,6 +26,7 @@ export type ActivityGroupIcon =
   | 'delegate'
   | 'globe'
   | 'browser'
+  | 'image'
   | 'database'
   | 'wrench'
   | 'brain';
@@ -95,19 +97,29 @@ export interface ActivitySegmentRow {
 export type TimelineRow = TimelineItemRow | ToolGroupRow | ThinkingGroupRow | ActivitySegmentRow;
 
 type FileActivityRole = 'none' | 'file_read' | 'file_edit';
-type ActivityRunKey = ToolGroupKind | 'file_work';
+type ActivityRunKey = ToolGroupKind;
 type CycleStateLookup = Map<string, TurnCycleState>;
+type DiffLineCounts = { additions: number; deletions: number };
 
 const INTERNAL_TOOL_NAMES = new Set([
   'search_tools',
+  'describe_tool',
+  'validate_tool_call',
   'skill_load',
   'skill_asset_materialize',
   'todo_write',
   'step_todo_write',
+  'todo_list',
+  'step_todo_list',
+  'switch_agent_profile',
+  'switch_executor',
+  'request_user_input',
+  'step_request_questions',
   'read_tool_output',
   'search_tool_output',
   'list_tool_output_anchors',
-  'read_tool_output_anchor'
+  'read_tool_output_anchor',
+  'attach_artifact'
 ]);
 
 const UNGROUPED_TOOL_NAMES = new Set([
@@ -116,6 +128,11 @@ const UNGROUPED_TOOL_NAMES = new Set([
   'request_user_input',
   'step_request_questions'
 ]);
+
+const diffLineCountCache = new Map<string, DiffLineCounts>();
+const toolGroupSummaryCache = new Map<string, ToolGroupSummary>();
+const activitySegmentSummaryCache = new Map<string, ToolGroupSummary>();
+const timestampCache = new WeakMap<ToolCallTimelineItem, { value: string | null | undefined; time: number | null }>();
 
 const EXPLORATION_TOOLS = new Set([
   'read',
@@ -150,9 +167,6 @@ const EXPLORATION_TOOLS = new Set([
   'read_conversation_messages',
   'search_conversations',
   'summarize_conversation',
-  'agent_conversation_get',
-  'agent_conversation_list',
-  'agent_conversation_wait',
   'list_credentials',
   'skill_export',
   'skill_get',
@@ -182,6 +196,11 @@ const WEB_TOOLS = new Set([
   'web_research'
 ]);
 
+const IMAGE_TOOLS = new Set([
+  'image_generate',
+  'image_edit'
+]);
+
 const EDIT_TOOLS = new Set([
   'apply_patch',
   'write',
@@ -194,6 +213,10 @@ const EDIT_TOOLS = new Set([
 const DELEGATION_TOOLS = new Set([
   'delegate',
   'cancel_subsession',
+  'retry_subsession',
+  'follow_up_subsession',
+  'fork_subsession',
+  'fork',
   'create_task',
   'update_task',
   'cancel_task',
@@ -204,6 +227,9 @@ const DELEGATION_TOOLS = new Set([
   'agent_conversation_create',
   'agent_conversation_send',
   'agent_conversation_fork',
+  'agent_conversation_get',
+  'agent_conversation_list',
+  'agent_conversation_wait',
   'agent_conversation_retry',
   'agent_conversation_interrupt',
   'agent_conversation_close'
@@ -228,6 +254,7 @@ function classifyTool(item: ToolCallTimelineItem): ToolGroupKind {
   if (fileRole === 'file_edit') return 'edit';
   if (WEB_TOOLS.has(name)) return 'web';
   if (name.startsWith('browser_')) return 'browser';
+  if (IMAGE_TOOLS.has(name)) return 'image';
   if (name.startsWith('memory_')) return 'memory';
   if (name.startsWith('knowledgebase_')) return 'knowledgebase';
   if (EXPLORATION_TOOLS.has(name)) return 'explore';
@@ -236,8 +263,16 @@ function classifyTool(item: ToolCallTimelineItem): ToolGroupKind {
 }
 
 function fileActivityRole(item: ToolCallTimelineItem): FileActivityRole {
+  // NAME-BASED ONLY. Grouping/classification must depend solely on immutable
+  // signals so streaming and reload produce identical groups. file_diffs is
+  // live-mutable (it arrives on the tool RESULT, absent while the call is still
+  // running) and can appear on non-edit tools such as `bash`; keying file-work
+  // classification on it would let a shell command masquerade as a file edit
+  // after reload and absorb following reads into an editing run. file_diffs
+  // still drives the edit STATS/label in summarizeEditStats, which does not
+  // affect identity or run continuation.
   const name = normalizedToolName(item);
-  if (EDIT_TOOLS.has(name) || (item.file_diffs?.length ?? 0) > 0) return 'file_edit';
+  if (EDIT_TOOLS.has(name)) return 'file_edit';
   if (FILE_READ_TOOLS.has(name)) return 'file_read';
   return 'none';
 }
@@ -255,15 +290,58 @@ function groupFileActivityRole(group: ToolGroupRow): FileActivityRole {
   return hasRead ? 'file_read' : 'none';
 }
 
-function groupRunKey(group: ToolGroupRow): ActivityRunKey {
-  return groupFileActivityRole(group) === 'none' ? group.summary.kind : 'file_work';
+// A group is "file work" when EVERY member is a file read or file edit
+// (groupFileActivityRole returns 'none' the moment a non-file tool is present,
+// e.g. artifact_read / web / bash). File-edit groups have role 'file_edit';
+// file-read-only groups have role 'file_read'.
+function groupIsFileEdit(group: ToolGroupRow): boolean {
+  return groupFileActivityRole(group) === 'file_edit';
+}
+
+function groupIsFileRead(group: ToolGroupRow): boolean {
+  return groupFileActivityRole(group) === 'file_read';
+}
+
+// The run key tracks whether the CURRENT run has entered edit mode. Once a run
+// contains a file edit, subsequent file reads fold into it ("reads during
+// editing"); before any edit, file reads form their own "Exploring…" run.
+type NormalizedRunKey = ActivityRunKey | 'file_work_read' | 'file_work_edit';
+
+function initialRunKey(group: ToolGroupRow): NormalizedRunKey {
+  if (groupIsFileEdit(group)) return 'file_work_edit';
+  if (groupIsFileRead(group)) return 'file_work_read';
+  return group.summary.kind;
+}
+
+// Directional continuation: given the current run key and the next candidate
+// group, decide whether the group extends the run and what the run key becomes.
+// The forward-escalation rule (Option A — never fold backward):
+//   file reads  -> file reads : continue as read run
+//   file reads  -> file edit  : BREAK (the edit starts a new "Editing…" run;
+//                               pre-edit reads stay their own Exploring segment)
+//   file edit   -> file edit  : continue as edit run
+//   file edit   -> file reads : continue as edit run (reads-during-editing)
+//   anything else             : continue only when the plain kind matches
+// Returns the run key to adopt if the group continues, or null to break.
+function continueRunKey(runKey: NormalizedRunKey, group: ToolGroupRow): NormalizedRunKey | null {
+  const isEdit = groupIsFileEdit(group);
+  const isRead = groupIsFileRead(group);
+  if (runKey === 'file_work_edit') {
+    return isEdit || isRead ? 'file_work_edit' : null;
+  }
+  if (runKey === 'file_work_read') {
+    if (isRead) return 'file_work_read';
+    // Reads followed by an edit: do NOT extend — the edit begins a fresh run.
+    return null;
+  }
+  return group.summary.kind === runKey ? runKey : null;
 }
 
 function defaultDetailLabel(toolCount: number): string {
   return `${toolCount} ${toolCount === 1 ? 'tool' : 'tools'}`;
 }
 
-function countDiffLines(diff: string): { additions: number; deletions: number } {
+function countDiffLines(diff: string): DiffLineCounts {
   let additions = 0;
   let deletions = 0;
   for (const line of diff.split('\n')) {
@@ -274,6 +352,32 @@ function countDiffLines(diff: string): { additions: number; deletions: number } 
   return { additions, deletions };
 }
 
+function diffLineCountCacheKey(item: ToolCallTimelineItem): string | null {
+  return item.updated_at ? `${item.id}:${item.updated_at}` : null;
+}
+
+function countItemDiffLines(item: ToolCallTimelineItem): DiffLineCounts {
+  const cacheKey = diffLineCountCacheKey(item);
+  if (cacheKey) {
+    const cached = diffLineCountCache.get(cacheKey);
+    if (cached) return cached;
+  }
+
+  let additions = 0;
+  let deletions = 0;
+  for (const fileDiff of item.file_diffs ?? []) {
+    const diffStats = countDiffLines(fileDiff.diff ?? '');
+    additions += diffStats.additions;
+    deletions += diffStats.deletions;
+  }
+
+  const counts = { additions, deletions };
+  if (cacheKey) {
+    diffLineCountCache.set(cacheKey, counts);
+  }
+  return counts;
+}
+
 function summarizeEditStats(items: ToolCallTimelineItem[]): ToolGroupSummary['editStats'] | null {
   const paths = new Set<string>();
   let additions = 0;
@@ -282,10 +386,10 @@ function summarizeEditStats(items: ToolCallTimelineItem[]): ToolGroupSummary['ed
   for (const item of items) {
     for (const fileDiff of item.file_diffs ?? []) {
       if (fileDiff.path) paths.add(fileDiff.path);
-      const diffStats = countDiffLines(fileDiff.diff ?? '');
-      additions += diffStats.additions;
-      deletions += diffStats.deletions;
     }
+    const diffStats = countItemDiffLines(item);
+    additions += diffStats.additions;
+    deletions += diffStats.deletions;
   }
 
   if (paths.size === 0) {
@@ -323,8 +427,8 @@ function earliestTimestamp(items: ToolCallTimelineItem[]): string | null {
   let earliest: { value: string; time: number } | null = null;
   for (const item of items) {
     if (!item.created_at) continue;
-    const time = new Date(item.created_at).getTime();
-    if (Number.isNaN(time)) continue;
+    const time = itemTimestampMs(item);
+    if (time === null) continue;
     if (!earliest || time < earliest.time) {
       earliest = { value: item.created_at, time };
     }
@@ -332,7 +436,35 @@ function earliestTimestamp(items: ToolCallTimelineItem[]): string | null {
   return earliest?.value ?? null;
 }
 
+function itemTimestampMs(item: ToolCallTimelineItem): number | null {
+  const cached = timestampCache.get(item);
+  if (cached && cached.value === item.created_at) return cached.time;
+  if (!item.created_at) {
+    timestampCache.set(item, { value: item.created_at, time: null });
+    return null;
+  }
+  const time = new Date(item.created_at).getTime();
+  const normalized = Number.isNaN(time) ? null : time;
+  timestampCache.set(item, { value: item.created_at, time: normalized });
+  return normalized;
+}
+
+function summaryCacheKey(items: ToolCallTimelineItem[]): string | null {
+  const parts: string[] = [];
+  for (const item of items) {
+    if (!item.updated_at) return null;
+    parts.push(item.id, item.status ?? '', item.updated_at);
+  }
+  return parts.join('\u001f');
+}
+
 function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
+  const cacheKey = summaryCacheKey(items);
+  if (cacheKey) {
+    const cached = toolGroupSummaryCache.get(cacheKey);
+    if (cached) return cached;
+  }
+
   const fileRoles = items.map(fileActivityRole);
   const hasFileEdit = fileRoles.includes('file_edit');
   const hasOnlyFileReads = fileRoles.length > 0 && fileRoles.every((role) => role === 'file_read');
@@ -363,26 +495,43 @@ function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
     failedCount,
     status: failed ? 'failed' as const : running ? 'running' as const : 'complete' as const
   };
+  let summary: ToolGroupSummary;
   switch (kind) {
     case 'explore':
-      return { ...common, label: 'Exploring…', icon: 'search', accentClass: 'border-sky-400/30 text-sky-200' };
+      summary = { ...common, label: 'Exploring…', icon: 'search', accentClass: 'border-sky-400/30 text-sky-200' };
+      break;
     case 'command':
-      return { ...common, label: 'Running commands…', icon: 'terminal', accentClass: 'border-violet-400/30 text-violet-200' };
+      summary = { ...common, label: 'Running commands…', icon: 'terminal', accentClass: 'border-violet-400/30 text-violet-200' };
+      break;
     case 'edit':
-      return { ...common, label: 'Editing files…', icon: 'edit', accentClass: 'border-emerald-400/30 text-emerald-200' };
+      summary = { ...common, label: 'Editing files…', icon: 'edit', accentClass: 'border-emerald-400/30 text-emerald-200' };
+      break;
     case 'delegate':
-      return { ...common, label: 'Delegating work…', icon: 'delegate', accentClass: 'border-amber-400/30 text-amber-200' };
+      summary = { ...common, label: 'Delegating work…', icon: 'delegate', accentClass: 'border-amber-400/30 text-amber-200' };
+      break;
     case 'web':
-      return { ...common, label: 'Searching web…', icon: 'globe', accentClass: 'border-cyan-400/30 text-cyan-200' };
+      summary = { ...common, label: 'Searching web…', icon: 'globe', accentClass: 'border-cyan-400/30 text-cyan-200' };
+      break;
     case 'browser':
-      return { ...common, label: 'Using browser…', icon: 'browser', accentClass: 'border-indigo-400/30 text-indigo-200' };
+      summary = { ...common, label: 'Using browser…', icon: 'browser', accentClass: 'border-indigo-400/30 text-indigo-200' };
+      break;
+    case 'image':
+      summary = { ...common, label: 'Generating images…', icon: 'image', accentClass: 'border-pink-400/30 text-pink-200' };
+      break;
     case 'memory':
-      return { ...common, label: 'Accessing memory…', icon: 'brain', accentClass: 'border-fuchsia-400/30 text-fuchsia-200' };
+      summary = { ...common, label: 'Accessing memory…', icon: 'brain', accentClass: 'border-fuchsia-400/30 text-fuchsia-200' };
+      break;
     case 'knowledgebase':
-      return { ...common, label: 'Querying knowledgebase…', icon: 'database', accentClass: 'border-teal-400/30 text-teal-200' };
+      summary = { ...common, label: 'Querying knowledgebase…', icon: 'database', accentClass: 'border-teal-400/30 text-teal-200' };
+      break;
     default:
-      return { ...common, label: 'Using tools…', icon: 'wrench', accentClass: 'border-slate-500/40 text-slate-200' };
+      summary = { ...common, label: 'Using tools…', icon: 'wrench', accentClass: 'border-slate-500/40 text-slate-200' };
   }
+
+  if (cacheKey) {
+    toolGroupSummaryCache.set(cacheKey, summary);
+  }
+  return summary;
 }
 
 function summarizeThinkingGroup(items: ThinkingTimelineItem[]): ThinkingGroupSummary {
@@ -415,11 +564,8 @@ function canJoinToolGroup(previous: ToolCallTimelineItem, next: ToolCallTimeline
   const nextFileRole = fileActivityRole(next);
   const compatibleKind = previousKind === nextKind
     || (previousFileRole !== 'none' && nextFileRole !== 'none');
-  const previousHasCycle = typeof previous.turn_cycle_index === 'number';
-  const nextHasCycle = typeof next.turn_cycle_index === 'number';
-  const compatibleCycle = previousHasCycle && nextHasCycle
-    ? previous.turn_cycle_index === next.turn_cycle_index
-    : !previousHasCycle && !nextHasCycle;
+  const compatibleCycle = typeof previous.turn_cycle_index === 'number'
+    && previous.turn_cycle_index === next.turn_cycle_index;
   // assistant_phase_index is deliberately NOT a join key: phases are assigned
   // PER TOOL CALL (each call bumps the turn's phase counter), so two adjacent
   // tools in one cycle carry different phases by design — the phase orders
@@ -464,19 +610,72 @@ function thinkingGroupId(items: ThinkingTimelineItem[]): string {
   ].join(':');
 }
 
-function activitySegmentId(entries: ActivitySegmentEntry[]): string {
-  const firstEntry = entries[0];
-  const firstGroup = firstEntry?.kind === 'tool_group'
-    ? firstEntry.group
-    : entries.find((entry) => entry.kind === 'tool_group')?.group;
-  const firstAssistant = firstEntry?.kind === 'assistant'
-    ? firstEntry.item
-    : entries.find((entry) => entry.kind === 'assistant')?.item;
+// The stable within-cycle disambiguator for a segment: the first tool call_id
+// in the run, falling back to the first assistant message id. Tool call_ids are
+// content identities that never change once emitted — unlike the run's first
+// ROW (which flips when an assistant folds at the front) or its classification
+// (which flips when a tool result arrives with file_diffs). Deriving the key
+// from this instead of a positional ordinal keeps it stable even when an
+// earlier same-cycle segment appears or disappears between frames.
+function segmentStableDisambiguator(entries: ActivitySegmentEntry[]): string | null {
+  for (const entry of entries) {
+    if (entry.kind !== 'tool_group') continue;
+    for (const item of entry.group.items) {
+      if (item.call_id) return `t:${item.call_id}`;
+      if (item.id) return `t:${item.id}`;
+    }
+  }
+  for (const entry of entries) {
+    if (entry.kind === 'assistant' && entry.item.id) return `a:${entry.item.id}`;
+  }
+  return null;
+}
+
+function activitySegmentId(entries: ActivitySegmentEntry[], runKey: NormalizedRunKey): string {
+  const firstItemId = entries.find((entry) => {
+    if (entry.kind === 'assistant') return !!entry.item.id;
+    return entry.group.items.some((item) => !!item.id);
+  });
+  const itemId = firstItemId?.kind === 'assistant'
+    ? firstItemId.item.id
+    : firstItemId?.group.items.find((item) => !!item.id)?.id;
+  const firstTurnId = entries.find((entry) => {
+    if (entry.kind === 'assistant') return !!entry.item.turn_id;
+    return entry.group.items.some((item) => !!item.turn_id);
+  });
+  const turnId = firstTurnId?.kind === 'assistant'
+    ? firstTurnId.item.turn_id
+    : firstTurnId?.group.items.find((item) => !!item.turn_id)?.turn_id;
+  const firstCycleIndex = entries.find((entry) => {
+    if (entry.kind === 'assistant') return typeof entry.item.turn_cycle_index === 'number';
+    return entry.group.items.some((item) => typeof item.turn_cycle_index === 'number');
+  });
+  const cycleIndex = firstCycleIndex?.kind === 'assistant'
+    ? firstCycleIndex.item.turn_cycle_index
+    : firstCycleIndex?.group.items.find((item) => typeof item.turn_cycle_index === 'number')?.turn_cycle_index;
+  // When the segment has a stable (turn, cycle) identity — which every stamped
+  // turn now does — key on `{turn}:{cycle}:{stableDisambiguator}`. The
+  // disambiguator is the run's first tool call_id (or first assistant id),
+  // which is a fixed content identity. This id is immutable across every
+  // transition that used to remount the block and reset expansion:
+  //   - an assistant message folding at the FRONT of a run (first-row flip),
+  //   - a tool result arriving with file_diffs that reclassifies the run
+  //     (command/explore -> edit, runKey flip),
+  //   - an earlier same-cycle segment appearing/disappearing between frames
+  //     (a positional ordinal would shift; a content id does not).
+  // It also guarantees uniqueness: two segments cannot contain the same first
+  // tool call. The first-item id + runKey are retained only for the legacy
+  // `no-cycle` fallback, where no stable grouping key exists.
+  if (typeof cycleIndex === 'number' && turnId) {
+    const disambiguator = segmentStableDisambiguator(entries) ?? `row:${itemId ?? 'unknown'}`;
+    return `activity-segment:${turnId}:${cycleIndex}:${disambiguator}`;
+  }
   return [
     'activity-segment',
-    firstAssistant?.turn_id ?? firstGroup?.items[0]?.turn_id ?? 'no-turn',
-    firstAssistant?.id ?? firstGroup?.items[0]?.id ?? 'unknown',
-    firstGroup?.id ?? 'no-tools'
+    turnId ?? 'no-turn',
+    'no-cycle',
+    itemId ?? 'unknown',
+    runKey
   ].join(':');
 }
 
@@ -499,29 +698,28 @@ function buildCycleStateLookup(cycleStates: readonly TurnCycleState[]): CycleSta
   return lookup;
 }
 
-function itemCycleState(
-  cycleStates: CycleStateLookup,
-  item: MessageTimelineItem | ToolCallTimelineItem
-): TurnCycleState | undefined {
-  if (!item.turn_id || typeof item.turn_cycle_index !== 'number') {
-    return undefined;
-  }
-  return cycleStates.get(cycleStateKey(item.turn_id, item.turn_cycle_index));
+function assistantIsLive(item: MessageTimelineItem): boolean {
+  return item.partial || item.status === 'running' || item.status === 'pending';
 }
 
-function activityRunHasBackendToolCycle(
-  entries: ActivitySegmentEntry[],
-  cycleStates: CycleStateLookup
+function assistantCycleHasBackendToolActivity(
+  cycleStates: CycleStateLookup,
+  item: MessageTimelineItem
 ): boolean {
-  if (cycleStates.size === 0) {
+  if (!item.turn_id) {
     return false;
   }
-  return entries.some((entry) => {
-    if (entry.kind === 'assistant') {
-      return itemCycleState(cycleStates, entry.item)?.has_tool_activity === true;
-    }
-    return entry.group.items.some((item) => itemCycleState(cycleStates, item)?.has_tool_activity === true);
-  });
+  if (typeof item.turn_cycle_index !== 'number') {
+    return false;
+  }
+  return cycleStates.get(cycleStateKey(item.turn_id, item.turn_cycle_index))?.has_tool_activity === true;
+}
+
+function canFoldAssistantIntoActivity(
+  cycleStates: CycleStateLookup,
+  item: MessageTimelineItem
+): boolean {
+  return !assistantIsLive(item) || assistantCycleHasBackendToolActivity(cycleStates, item);
 }
 
 function toolGroupMatchesAssistantCycle(group: ToolGroupRow, assistant: MessageTimelineItem): boolean {
@@ -540,53 +738,6 @@ function toolGroupMatchesAssistantCycle(group: ToolGroupRow, assistant: MessageT
   return group.items.every((item) => item.turn_cycle_index === assistant.turn_cycle_index);
 }
 
-function toolGroupCycleIndex(group: ToolGroupRow): number | null | undefined {
-  let cycleIndex: number | null | undefined;
-  for (const item of group.items) {
-    const itemCycleIndex = typeof item.turn_cycle_index === 'number'
-      ? item.turn_cycle_index
-      : null;
-    if (cycleIndex === undefined) {
-      cycleIndex = itemCycleIndex;
-      continue;
-    }
-    if (cycleIndex !== itemCycleIndex) {
-      return undefined;
-    }
-  }
-  return cycleIndex;
-}
-
-function inferMissingAssistantCycle(group: ToolGroupRow, assistant: MessageTimelineItem): number | null | undefined {
-  if (typeof assistant.turn_cycle_index === 'number') {
-    return undefined;
-  }
-  if (group.items.length === 0) {
-    return undefined;
-  }
-  if (!group.items.every((item) => item.turn_id === assistant.turn_id)) {
-    return undefined;
-  }
-  return toolGroupCycleIndex(group);
-}
-
-function toolGroupMatchesAssistantCycleOrInferred(
-  group: ToolGroupRow,
-  assistant: MessageTimelineItem,
-  inferredCycleIndex: number | null | undefined
-): boolean {
-  if (toolGroupMatchesAssistantCycle(group, assistant)) {
-    return true;
-  }
-  if (inferredCycleIndex === undefined || typeof assistant.turn_cycle_index === 'number') {
-    return false;
-  }
-  if (!group.items.every((item) => item.turn_id === assistant.turn_id)) {
-    return false;
-  }
-  return toolGroupCycleIndex(group) === inferredCycleIndex;
-}
-
 function segmentToolGroups(entries: ActivitySegmentEntry[]): ToolGroupRow[] {
   return entries
     .filter((entry): entry is { kind: 'tool_group'; group: ToolGroupRow } => entry.kind === 'tool_group')
@@ -597,12 +748,51 @@ function groupTurnId(group: ToolGroupRow): string | null | undefined {
   return group.items[0]?.turn_id;
 }
 
-function groupMatchesRunTurn(group: ToolGroupRow, turnId: string | null | undefined): boolean {
+function groupMatchesRunTurn(
+  group: ToolGroupRow,
+  turnId: string | null | undefined
+): boolean {
   return group.items.every((item) => item.turn_id === turnId);
 }
 
+function mergeAdjacentToolGroupsAcrossCycles(rows: TimelineRow[]): TimelineRow[] {
+  const merged: TimelineRow[] = [];
+
+  for (const row of rows) {
+    const previous = merged[merged.length - 1];
+    if (
+      previous?.kind === 'tool_group'
+      && row.kind === 'tool_group'
+      && groupMatchesRunTurn(row, groupTurnId(previous))
+      && continueRunKey(initialRunKey(previous), row) !== null
+    ) {
+      const items = [...previous.items, ...row.items];
+      merged[merged.length - 1] = {
+        ...previous,
+        items,
+        summary: summarizeToolGroup(items),
+        defaultExpanded: previous.defaultExpanded || row.defaultExpanded
+      };
+      continue;
+    }
+    merged.push(row);
+  }
+
+  return merged;
+}
+
 function summarizeActivitySegment(toolGroups: ToolGroupRow[]): ToolGroupSummary {
-  return summarizeToolGroup(toolGroups.flatMap((group) => group.items));
+  const items = toolGroups.flatMap((group) => group.items);
+  const cacheKey = summaryCacheKey(items);
+  if (cacheKey) {
+    const cached = activitySegmentSummaryCache.get(cacheKey);
+    if (cached) return cached;
+  }
+  const summary = summarizeToolGroup(items);
+  if (cacheKey) {
+    activitySegmentSummaryCache.set(cacheKey, summary);
+  }
+  return summary;
 }
 
 function assistantPreviewText(entry: ActivitySegmentEntry): string | null {
@@ -637,9 +827,9 @@ function activityRunHasActiveAssistant(entries: ActivitySegmentEntry[]): boolean
   );
 }
 
-function activityRunShouldRender(entries: ActivitySegmentEntry[], runKey: ActivityRunKey): boolean {
+function activityRunShouldRender(entries: ActivitySegmentEntry[], runKey: NormalizedRunKey): boolean {
+  void runKey;
   if (activityRunHasAssistant(entries)) return true;
-  if (runKey !== 'file_work' && runKey !== 'command') return false;
   return segmentToolGroups(entries).length > 1;
 }
 
@@ -653,40 +843,41 @@ function activityRunHasMatchingToolGroup(entries: ActivitySegmentEntry[], assist
 function appendMatchingToolGroupsForAssistant(
   rows: TimelineRow[],
   index: number,
-  runKey: ActivityRunKey,
+  runKey: NormalizedRunKey,
   assistant: MessageTimelineItem,
-  inferredCycleIndex: number | null | undefined,
   entries: ActivitySegmentEntry[]
-): number {
+): { nextIndex: number; runKey: NormalizedRunKey } {
   let nextIndex = index;
+  let currentRunKey = runKey;
   while (nextIndex < rows.length) {
     const candidate = rows[nextIndex];
-    if (
-      candidate.kind !== 'tool_group'
-      || groupRunKey(candidate) !== runKey
-      || !toolGroupMatchesAssistantCycleOrInferred(candidate, assistant, inferredCycleIndex)
-    ) {
+    if (candidate.kind !== 'tool_group' || !toolGroupMatchesAssistantCycle(candidate, assistant)) {
+      break;
+    }
+    const advanced = continueRunKey(currentRunKey, candidate);
+    if (advanced === null) {
       break;
     }
     entries.push({ kind: 'tool_group', group: candidate });
+    currentRunKey = advanced;
     nextIndex += 1;
   }
-  return nextIndex;
+  return { nextIndex, runKey: currentRunKey };
 }
 
 function collectActivityRun(
   rows: TimelineRow[],
   index: number,
   cycleStates: CycleStateLookup
-): { entries: ActivitySegmentEntry[]; runKey: ActivityRunKey; nextIndex: number } | null {
+): { entries: ActivitySegmentEntry[]; runKey: NormalizedRunKey; nextIndex: number } | null {
   const row = rows[index];
   const entries: ActivitySegmentEntry[] = [];
-  let runKey: ActivityRunKey;
+  let runKey: NormalizedRunKey;
   let runTurnId: string | null | undefined;
   let nextIndex: number;
 
   if (row.kind === 'tool_group') {
-    runKey = groupRunKey(row);
+    runKey = initialRunKey(row);
     runTurnId = groupTurnId(row);
     entries.push({ kind: 'tool_group', group: row });
     nextIndex = index + 1;
@@ -698,14 +889,18 @@ function collectActivityRun(
     ) {
       return null;
     }
-    const inferredCycleIndex = inferMissingAssistantCycle(nextRow, row.item);
-    if (!toolGroupMatchesAssistantCycleOrInferred(nextRow, row.item, inferredCycleIndex)) {
+    if (!toolGroupMatchesAssistantCycle(nextRow, row.item)) {
       return null;
     }
-    runKey = groupRunKey(nextRow);
+    if (!canFoldAssistantIntoActivity(cycleStates, row.item)) {
+      return null;
+    }
+    runKey = initialRunKey(nextRow);
     runTurnId = row.item.turn_id;
     entries.push({ kind: 'assistant', item: row.item });
-    nextIndex = appendMatchingToolGroupsForAssistant(rows, index + 1, runKey, row.item, inferredCycleIndex, entries);
+    const appended = appendMatchingToolGroupsForAssistant(rows, index + 1, runKey, row.item, entries);
+    nextIndex = appended.nextIndex;
+    runKey = appended.runKey;
   } else {
     return null;
   }
@@ -713,13 +908,12 @@ function collectActivityRun(
   while (nextIndex < rows.length) {
     const candidate = rows[nextIndex];
     if (candidate.kind === 'tool_group') {
-      if (
-        groupRunKey(candidate) !== runKey
-        || !groupMatchesRunTurn(candidate, runTurnId)
-      ) {
+      const advanced = continueRunKey(runKey, candidate);
+      if (advanced === null || !groupMatchesRunTurn(candidate, runTurnId)) {
         break;
       }
       entries.push({ kind: 'tool_group', group: candidate });
+      runKey = advanced;
       nextIndex += 1;
       continue;
     }
@@ -732,21 +926,40 @@ function collectActivityRun(
     }
 
     const nextToolGroup = rows[nextIndex + 1];
-    const inferredCycleIndex = nextToolGroup?.kind === 'tool_group'
-      ? inferMissingAssistantCycle(nextToolGroup, candidate.item)
-      : undefined;
     if (
       nextToolGroup
       && nextToolGroup.kind === 'tool_group'
-      && groupRunKey(nextToolGroup) === runKey
-      && toolGroupMatchesAssistantCycleOrInferred(nextToolGroup, candidate.item, inferredCycleIndex)
+      && continueRunKey(runKey, nextToolGroup) !== null
+      && candidate.item.turn_id === runTurnId
+      && toolGroupMatchesAssistantCycle(nextToolGroup, candidate.item)
     ) {
+      if (!canFoldAssistantIntoActivity(cycleStates, candidate.item)) {
+        break;
+      }
       entries.push({ kind: 'assistant', item: candidate.item });
-      nextIndex = appendMatchingToolGroupsForAssistant(rows, nextIndex + 1, runKey, candidate.item, inferredCycleIndex, entries);
+      const appended = appendMatchingToolGroupsForAssistant(rows, nextIndex + 1, runKey, candidate.item, entries);
+      nextIndex = appended.nextIndex;
+      runKey = appended.runKey;
       continue;
     }
 
     if (activityRunHasMatchingToolGroup(entries, candidate.item)) {
+      // Trailing fold: an assistant with NO following tool group, matching a
+      // tool group already in the run. This is the turn's final answer folding
+      // into the activity it produced. A LIVE (partial/running) assistant must
+      // NEVER fold here: while streaming it is the visible answer, and folding
+      // it would make the just-streamed message vanish into the collapsed
+      // segment (only to re-appear when a later frame corrects its cycle). The
+      // backend cycle can transiently collide during streaming (phase-vs-cycle
+      // skew, completion-frame clobber); the mid-fold branch above already
+      // handles a live assistant that has a genuine following same-cycle group.
+      // A trailing live assistant stays standalone until it settles.
+      if (assistantIsLive(candidate.item)) {
+        break;
+      }
+      if (!canFoldAssistantIntoActivity(cycleStates, candidate.item)) {
+        break;
+      }
       entries.push({ kind: 'assistant', item: candidate.item });
       nextIndex += 1;
       continue;
@@ -893,6 +1106,12 @@ export function prepareTimelineRows(
   }
   flushPendingTools();
   flushPendingThinking();
+  if (preferences.chat.keep_assistant_messages_separate) {
+    // Assistant folding is optional, but adjacent cross-cycle tool batching is
+    // not. The raw-row pass splits every cycle before this point, even when no
+    // visible assistant item separates compatible tool activity.
+    return mergeAdjacentToolGroupsAcrossCycles(rows);
+  }
   return foldActivitySegments(rows, buildCycleStateLookup(cycleStates));
 }
 
@@ -913,16 +1132,21 @@ function foldActivitySegments(rows: TimelineRow[], cycleStates: CycleStateLookup
 
     folded.push({
       kind: 'activity_segment',
-      id: activitySegmentId(run.entries),
+      id: activitySegmentId(run.entries, run.runKey),
       entries: run.entries,
       toolGroups,
       summary,
       assistantPreview: activitySegmentAssistantPreview(run.entries, summary.status),
+      // Decouple folding from collapsing. A segment stays EXPANDED while its
+      // assistant text is still live (streaming), so the just-streamed content
+      // remains visible through the fold transition instead of being hidden
+      // behind the one-line preview the instant the first tool call confirms
+      // backend activity. It collapses on its own once the assistant message
+      // completes (the next cycle begins or the turn settles) — the tidy-up
+      // follows the agent's progress rather than yanking text mid-stream.
+      // Failed tool groups still force-expand so errors stay visible.
       defaultExpanded: toolGroups.some((group) => group.defaultExpanded)
-        || (
-          activityRunHasActiveAssistant(run.entries)
-          && !activityRunHasBackendToolCycle(run.entries, cycleStates)
-        )
+        || activityRunHasActiveAssistant(run.entries)
     });
     index = run.nextIndex;
   }

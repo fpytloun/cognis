@@ -13,7 +13,8 @@ from cognis.core.long_lived_chat import is_long_lived_chat_context
 from cognis.core.session_cache import CachedEvent
 from cognis.models.search import SearchRequestFilters, SearchSessionsRequest
 from cognis.models.session import ConversationContext, SessionModel
-from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolCapability, ToolSource
 from cognis.store.queries import (
     get_conversation,
     get_session_row,

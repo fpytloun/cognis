@@ -6,6 +6,7 @@ KIND_RANK: dict[str, int] = {
     "user_message": 0,
     "thinking": 1,
     "assistant_message": 2,
+    "assistant_deliverable": 3,
     "tool_call": 3,
     "tool_result": 3,
     "evaluation": 3,
@@ -28,9 +29,11 @@ KIND_RANK: dict[str, int] = {
 ORDER_KEY_NO_LINEAGE = 9999
 ORDER_KEY_NO_SEQ = 10**15 - 1
 ORDER_KEY_ACTIVE_LINEAGE = 9998
+ORDER_KEY_PRE_TURN_LINEAGE = 9997
 
-assert 0 <= ORDER_KEY_ACTIVE_LINEAGE < ORDER_KEY_NO_LINEAGE <= 9999, (
+assert 0 <= ORDER_KEY_PRE_TURN_LINEAGE < ORDER_KEY_ACTIVE_LINEAGE < ORDER_KEY_NO_LINEAGE <= 9999, (
     "Lineage sentinel ordering invariant violated: "
+    f"pre_turn={ORDER_KEY_PRE_TURN_LINEAGE}, "
     f"active={ORDER_KEY_ACTIVE_LINEAGE}, no_lineage={ORDER_KEY_NO_LINEAGE}"
 )
 
@@ -63,6 +66,18 @@ def runtime_timeline_sort_key(
         lineage=ORDER_KEY_ACTIVE_LINEAGE,
         seq=None,
         phase=phase,
+        kind_rank=kind_rank,
+        local=local,
+    )
+
+
+def pre_turn_runtime_timeline_sort_key(*, kind_rank: int, local: int) -> str:
+    """Sort a pre-turn runtime item before the admitted optimistic user message."""
+
+    return encode_timeline_sort_key(
+        lineage=ORDER_KEY_PRE_TURN_LINEAGE,
+        seq=None,
+        phase=None,
         kind_rank=kind_rank,
         local=local,
     )

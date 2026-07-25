@@ -6,6 +6,7 @@ export type ChannelEditorMode = 'closed' | 'create' | 'edit';
 export interface ChannelEditorDraft {
   display_name: string;
   agent_id: string;
+  default_agent_profile_id: string;
   adapter_location: string;
   executor_id: string;
   dm_policy: string;
@@ -220,6 +221,7 @@ export function createChannelDraft(meta: ChannelMeta, agents: Agent[], account?:
   return {
     display_name: account?.display_name ?? `${meta.label} Account`,
     agent_id: account?.agent_id ?? primaryAgents[0]?.agent_id ?? '',
+    default_agent_profile_id: account?.default_agent_profile_id ?? '',
     adapter_location: account?.adapter_location ?? 'controller',
     executor_id: account?.executor_id ?? '',
     dm_policy: account?.dm_policy ?? 'pairing',

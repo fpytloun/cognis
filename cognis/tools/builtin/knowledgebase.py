@@ -16,7 +16,8 @@ from cognis.models.knowledgebase import (
     KnowledgebaseSourceContextRequest,
     KnowledgebaseUpdateRequest,
 )
-from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolCapability, ToolSource
 from cognis.tools.registry import ToolExecutionContext
 
 _SOURCE = ToolSource(type="builtin")

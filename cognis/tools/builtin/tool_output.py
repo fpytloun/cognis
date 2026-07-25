@@ -7,12 +7,29 @@ disk by the :class:`~cognis.core.tool_output_store.ToolOutputStore`.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from cognis.core.tool_output_store import ToolOutputStore
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from prometheus_client import Counter
 
+from cognis.core.tool_output_store import ToolOutputStore
+from cognis.logging import get_logger
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolResult, ToolSource
+
+logger = get_logger(__name__)
 _SOURCE = ToolSource(type="builtin")
+_NORMAL_RECOVERY_OUTPUT_CAP = 50_000
+_RECOVERY_OUTPUT_CAPS = {
+    "normal": _NORMAL_RECOVERY_OUTPUT_CAP,
+    "pressure": 25_000,
+    "critical": 12_000,
+}
+TOOL_OUTPUT_RECOVERY_CLAMPS_TOTAL = Counter(
+    "cognis_tool_output_recovery_clamps_total",
+    "Tool-output recovery result slices clamped because of context pressure.",
+    labelnames=("mode", "tool"),
+)
 
 TOOL_OUTPUT_TOOL_NAMES = frozenset(
     {
@@ -206,21 +223,67 @@ async def handle_tool_output_tool(
     tool_name: str,
     arguments: dict[str, Any],
     store: ToolOutputStore,
+    *,
+    pressure_mode: Any = None,
 ) -> ToolResult:
     """Dispatch a tool output exploration call."""
 
     if tool_name == "read_tool_output":
-        return await _handle_read(arguments, store)
+        return await _handle_read(arguments, store, pressure_mode=pressure_mode)
     if tool_name == "search_tool_output":
-        return await _handle_search(arguments, store)
+        return await _handle_search(arguments, store, pressure_mode=pressure_mode)
     if tool_name == "list_tool_output_anchors":
         return await _handle_list_anchors(arguments, store)
     if tool_name == "read_tool_output_anchor":
-        return await _handle_read_anchor(arguments, store)
+        return await _handle_read_anchor(arguments, store, pressure_mode=pressure_mode)
     return ToolResult(output=f"Unknown tool output tool: {tool_name}", is_error=True)
 
 
-async def _handle_read(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
+def _normalize_pressure_mode(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    if isinstance(raw, str) and raw in _RECOVERY_OUTPUT_CAPS:
+        return raw
+    return "normal"
+
+
+def _apply_pressure_recovery_clamp(
+    output: str,
+    *,
+    pressure_mode: Any,
+    tool_name: str,
+    guidance: str,
+) -> str:
+    mode = _normalize_pressure_mode(pressure_mode)
+    cap = _RECOVERY_OUTPUT_CAPS[mode]
+    if cap >= _NORMAL_RECOVERY_OUTPUT_CAP or len(output) <= cap:
+        return output
+
+    notice = (
+        f"\n\n[Tool output recovery truncated under {mode} context pressure. "
+        f"Returned at most {cap} characters. {guidance}]"
+    )
+    content_cap = max(0, cap - len(notice))
+    TOOL_OUTPUT_RECOVERY_CLAMPS_TOTAL.labels(mode=mode, tool=tool_name).inc()
+    logger.info(
+        "tool_output: pressure-aware recovery clamp applied",
+        extra={
+            "extra_data": {
+                "tool_name": tool_name,
+                "pressure_mode": mode,
+                "cap_chars": cap,
+                "output_chars": len(output),
+            }
+        },
+    )
+    return output[:content_cap].rstrip() + notice
+
+
+async def _handle_read(
+    arguments: dict[str, Any],
+    store: ToolOutputStore,
+    *,
+    pressure_mode: Any = None,
+) -> ToolResult:
     call_id = arguments.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         return ToolResult(output="call_id is required.", is_error=True)
@@ -246,11 +309,21 @@ async def _handle_read(arguments: dict[str, Any], store: ToolOutputStore) -> Too
     else:
         lines.append(f"\n(Total: {result.total_lines} lines)")
 
-    output = "\n".join(lines)
+    output = _apply_pressure_recovery_clamp(
+        "\n".join(lines),
+        pressure_mode=pressure_mode,
+        tool_name="read_tool_output",
+        guidance="Use offset/limit to request a smaller slice, or list_tool_output_anchors/read_tool_output_anchor for structured sections.",
+    )
     return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
 
-async def _handle_search(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
+async def _handle_search(
+    arguments: dict[str, Any],
+    store: ToolOutputStore,
+    *,
+    pressure_mode: Any = None,
+) -> ToolResult:
     call_id = arguments.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         return ToolResult(output="call_id is required.", is_error=True)
@@ -287,7 +360,12 @@ async def _handle_search(arguments: dict[str, Any], store: ToolOutputStore) -> T
         header += f" (showing first {len(result.matches)})"
     header += ":"
 
-    output = header + "\n\n" + "\n---\n".join(parts)
+    output = _apply_pressure_recovery_clamp(
+        header + "\n\n" + "\n---\n".join(parts),
+        pressure_mode=pressure_mode,
+        tool_name="search_tool_output",
+        guidance="Use a narrower pattern, smaller context_lines, or anchors for more focused recovery.",
+    )
     return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
 
@@ -309,14 +387,23 @@ async def _handle_list_anchors(arguments: dict[str, Any], store: ToolOutputStore
     lines = [f"Found {len(anchors)} anchor(s) for '{call_id}':", ""]
     for item in anchors:
         label_suffix = f" - {item.label}" if item.label else ""
-        lines.append(
-            f"- {item.anchor} ({item.kind}, lines {item.start_line}-{item.end_line}){label_suffix}"
+        locator = item.locator or {}
+        location = (
+            f"lines {item.start_line}-{item.end_line}"
+            if item.start_line is not None and item.end_line is not None
+            else json.dumps(locator, ensure_ascii=False, sort_keys=True)
         )
+        lines.append(f"- {item.anchor} ({item.format}/{item.kind}, {location}){label_suffix}")
     output = "\n".join(lines)
     return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))
 
 
-async def _handle_read_anchor(arguments: dict[str, Any], store: ToolOutputStore) -> ToolResult:
+async def _handle_read_anchor(
+    arguments: dict[str, Any],
+    store: ToolOutputStore,
+    *,
+    pressure_mode: Any = None,
+) -> ToolResult:
     call_id = arguments.get("call_id")
     if not isinstance(call_id, str) or not call_id:
         return ToolResult(output="call_id is required.", is_error=True)
@@ -346,11 +433,21 @@ async def _handle_read_anchor(arguments: dict[str, Any], store: ToolOutputStore)
             message += f" Available anchors: {available}."
         return ToolResult(output=message, is_error=True)
 
+    locator = result.anchor.locator or {}
+    location = (
+        f"lines {result.anchor.start_line}-{result.anchor.end_line}"
+        if result.anchor.start_line is not None and result.anchor.end_line is not None
+        else json.dumps(locator, ensure_ascii=False, sort_keys=True)
+    )
     header = (
-        f"Anchor '{result.anchor.anchor}' ({result.anchor.kind}, "
-        f"lines {result.anchor.start_line}-{result.anchor.end_line})"
+        f"Anchor '{result.anchor.anchor}' ({result.anchor.format}/{result.anchor.kind}, {location})"
     )
     if result.anchor.label:
         header += f" - {result.anchor.label}"
-    output = header + "\n\n" + result.content
+    output = _apply_pressure_recovery_clamp(
+        header + "\n\n" + result.content,
+        pressure_mode=pressure_mode,
+        tool_name="read_tool_output_anchor",
+        guidance="Use before_lines/after_lines to request less surrounding context, or read neighboring anchors separately.",
+    )
     return ToolResult(output=output, metadata=_recovery_metadata(call_id, output))

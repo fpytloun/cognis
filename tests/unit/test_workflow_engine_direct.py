@@ -14,6 +14,7 @@ from cognis.core.followups import (
     FollowUpStatus,
     TaskResultFollowUp,
 )
+from cognis.core.harness_guards import SameTurnToolCallLedger
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.models.agent import AgentDefinition
@@ -61,6 +62,7 @@ async def test_run_direct_turn_enables_questions() -> None:
         step_runtime_factory=_runtime_factory,
     )
 
+    ledger = SameTurnToolCallLedger()
     await engine.run_direct_turn(
         conversation=SimpleNamespace(
             conversation_id="conv-1",
@@ -69,12 +71,18 @@ async def test_run_direct_turn_enables_questions() -> None:
         session=SimpleNamespace(user_email="user@example.com"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         user_message="Need help",
+        user_message_already_recorded=True,
+        user_message_event_seq=42,
+        same_turn_tool_call_ledger=ledger,
     )
 
     ctx = captured["ctx"]
     assert ctx.interaction_mode == "step_requests"
     assert ctx.step_definition.allow_questions is True
     assert ctx.step_definition.step_profile_id == "system:direct-default"
+    assert ctx.user_message_already_recorded is True
+    assert ctx.remember_user_event_seq == 42
+    assert ctx.same_turn_tool_call_ledger is ledger
 
 
 @pytest.mark.asyncio

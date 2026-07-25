@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from cognis.models.tool import ToolCapability, ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolCapability, ToolSource
 
 _SOURCE = ToolSource(type="executor")
 _OFFICE_FORMATS = ["docx", "xlsx", "pptx"]

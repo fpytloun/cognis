@@ -607,7 +607,7 @@ def test_session_manager_repairs_intaris_titled_agent_direct_chat(tmp_path: Path
 
 
 def test_session_manager_recover_stale_sessions_publishes_event(tmp_path: Path) -> None:
-    async def _run() -> list[EventType]:
+    async def _run() -> list[object]:
         engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -635,11 +635,11 @@ def test_session_manager_recover_stale_sessions_publishes_event(tmp_path: Path) 
             session_row.updated_at = datetime.now(UTC) - timedelta(minutes=10)
             await session.commit()
 
-        events: list[EventType] = []
+        events: list[object] = []
         event_bus = EventBus()
 
         async def _capture(event: object) -> None:
-            events.append(event.type)
+            events.append(event)
 
         event_bus.subscribe_all(_capture)
 
@@ -654,7 +654,14 @@ def test_session_manager_recover_stale_sessions_publishes_event(tmp_path: Path) 
         await engine.dispose()
         return events
 
-    assert EventType.SESSION_RECOVERED in asyncio.run(_run())
+    events = asyncio.run(_run())
+    recovered_event = next(event for event in events if event.type == EventType.SESSION_RECOVERED)
+    assert recovered_event.data["reason"] == "controller_restart"
+    assert recovered_event.data["title"] == "Controller restarted"
+    assert recovered_event.data["message"] == (
+        "The controller restarted while this session was active. "
+        "Saved work is preserved; resume the session if needed."
+    )
 
 
 async def _seed_user(app: object, email: str) -> None:

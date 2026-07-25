@@ -1,10 +1,12 @@
 import { apiUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
+import { fetchWithTimeout, isFetchTimeoutError } from '$lib/api/fetch';
 import { auth } from '$lib/stores/auth';
 import type {
   ApiKeyCreateResponse,
   Agent,
   AgentGrant,
+  MemoryBackendDescriptor,
   AttachmentRef,
   ChannelAccount,
   ChannelAccountStatus,
@@ -22,6 +24,8 @@ import type {
   ConversationSearchResponse,
   ConversationTitleSuggestion,
   CursorPage,
+  Deliverable,
+  DeliverableShareLink,
   Escalation,
   ExecutorConfig,
   ExecutorCreateRequest,
@@ -38,6 +42,21 @@ import type {
   IntarisMCPServer,
   IntarisSessionDetail,
   KnowledgebaseModel,
+  LocalModelCatalogItem,
+  LocalModelCatalogResponse,
+  LocalModelCatalogSource,
+  LocalModelDeployment,
+  LocalModelDeploymentCreate,
+  LocalModelDeploymentUpdate,
+  LocalModelFitPlan,
+  LocalModelFitPlanRequest,
+  LocalModelManagedDeploymentCreate,
+  LocalModelManagedDeploymentCreateResponse,
+  LocalModelOperation,
+  LocalModelProviderFindOrCreateResponse,
+  LocalModelProviderRecommendation,
+  LocalModelSelector,
+  LocalModelTargetStatus,
   LLMProvider,
   LLMProviderOAuthStatus,
   CodexUsage,
@@ -66,7 +85,6 @@ import type {
   ScheduleRun,
     SecretMetadata,
   Session,
-  SessionEventsResponse,
   SidebarProjection,
   Setting,
   SettingsCategory,
@@ -90,7 +108,6 @@ import type {
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
-  ToolOutputPageResponse,
   ToolDefinitionSummary,
   TtsSynthesizeRequest,
   TtsSynthesizeResponse,
@@ -100,6 +117,7 @@ import type {
   UserSummary,
   UserUpdatePayload,
   VapidPublicKeyResponse,
+  WebBackendUpdatePayload,
   WebConfigStatus,
   Workflow,
   WorkflowRun
@@ -122,7 +140,11 @@ export class ApiError extends Error {
 
 type RequestOptions = RequestInit & {
   auth?: boolean;
+  timeoutMs?: number;
 };
+
+const UI_LOAD_REQUEST_TIMEOUT_MS = 30_000;
+const DISABLE_API_REQUEST_TIMEOUT_MS = 0;
 
 async function readError(response: Response): Promise<ApiError> {
   let payload: ApiErrorResponse | null = null;
@@ -157,19 +179,27 @@ async function readError(response: Response): Promise<ApiError> {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { auth: requiresAuth = true, headers, body, ...rest } = options;
+  const { auth: requiresAuth = true, headers, body, timeoutMs, ...rest } = options;
   const nextHeaders = new Headers(headers ?? {});
 
   if (body && !nextHeaders.has('Content-Type') && !(body instanceof FormData)) {
     nextHeaders.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(apiUrl(path), {
-    ...rest,
-    credentials: 'include',
-    headers: nextHeaders,
-    body
-  });
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(apiUrl(path), {
+      ...rest,
+      credentials: 'include',
+      headers: nextHeaders,
+      body
+    }, { timeoutMs });
+  } catch (error) {
+    if (isFetchTimeoutError(error)) {
+      throw new ApiError(error.message, { code: 'request_timeout', status: 0 });
+    }
+    throw error;
+  }
 
   if (response.status === 401 && requiresAuth) {
     const message = 'Your session has expired. Please log in again.';
@@ -228,6 +258,13 @@ function encodeQuery(params: Record<string, string | number | boolean | string[]
 
   const serialized = query.toString();
   return serialized ? `?${serialized}` : '';
+}
+
+const executorConfigVersions = new Map<string, number>();
+
+function rememberExecutorConfigVersion(executor: ExecutorConfig): ExecutorConfig {
+  executorConfigVersions.set(executor.executor_id, executor.desired_config_version);
+  return executor;
 }
 
 export const api = {
@@ -380,7 +417,9 @@ export const api = {
 
   conversations: {
     getQueue(conversationId: string): Promise<QueuedMessagesResponse> {
-      return request<QueuedMessagesResponse>(`/api/v1/conversations/${conversationId}/queue`);
+      return request<QueuedMessagesResponse>(`/api/v1/conversations/${conversationId}/queue`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     list(
@@ -397,7 +436,8 @@ export const api = {
           agent_ids: filters.agentIds ?? undefined,
           status: filters.status,
           include_agent_direct: filters.includeAgentDirect
-        })}`
+        })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
       );
     },
 
@@ -409,18 +449,21 @@ export const api = {
 
     sidebar(
       cursor: string | null = null,
-      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null } = {}
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null } = {},
+      options: { changedSince?: string | null } = {}
     ): Promise<SidebarProjection> {
       return request<SidebarProjection>(
         `/api/v1/conversations/sidebar${encodeQuery({
           cursor,
           limit: 50,
+          changed_since: options.changedSince,
           context_type: filters.contextType,
           context_types: filters.contextTypes ?? undefined,
           agent_id: filters.agentId,
           agent_ids: filters.agentIds ?? undefined,
           status: filters.status
-        })}`
+        })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
       );
     },
 
@@ -428,7 +471,8 @@ export const api = {
       return request<string[]>(
         `/api/v1/conversations/context-types${encodeQuery({
           status: params.status
-        })}`
+        })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
       );
     },
 
@@ -438,7 +482,8 @@ export const api = {
           agent_id: params.agentId,
           agent_ids: params.agentIds ?? undefined,
           status: params.status
-        })}`
+        })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
       );
     },
 
@@ -454,8 +499,12 @@ export const api = {
       });
     },
 
-    detail(conversationId: string): Promise<Conversation> {
-      return request<Conversation>(`/api/v1/conversations/${conversationId}`);
+    detail(conversationId: string, options: { includeState?: boolean } = {}): Promise<Conversation> {
+      return request<Conversation>(`/api/v1/conversations/${conversationId}${encodeQuery({
+        include_state: options.includeState
+      })}`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     rememberOpened(conversationId: string): Promise<Conversation> {
@@ -465,7 +514,9 @@ export const api = {
     },
 
     titleSuggestion(conversationId: string): Promise<ConversationTitleSuggestion> {
-      return request<ConversationTitleSuggestion>(`/api/v1/conversations/${conversationId}/title-suggestion`);
+      return request<ConversationTitleSuggestion>(`/api/v1/conversations/${conversationId}/title-suggestion`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     slashCommandSuggestions(conversationId: string, input: string, limit = 12): Promise<SlashCommandSuggestionsResponse> {
@@ -492,21 +543,6 @@ export const api = {
       );
     },
 
-    toolOutputPage(
-      conversationId: string,
-      callId: string,
-      params: { sessionId?: string | null; offset?: number; limit?: number; latest?: boolean } = {}
-    ): Promise<ToolOutputPageResponse> {
-      return request<ToolOutputPageResponse>(
-        `/api/v1/conversations/${conversationId}/tool-outputs/${encodeURIComponent(callId)}${encodeQuery({
-          session_id: params.sessionId,
-          offset: params.offset,
-          limit: params.limit,
-          latest: params.latest
-        })}`
-      );
-    },
-
     sessions(
       conversationId: string,
       params: { rootOnly?: boolean; activeOnly?: boolean; limit?: number; order?: 'asc' | 'desc' } = {}
@@ -516,11 +552,13 @@ export const api = {
         active_only: params.activeOnly,
         limit: params.limit,
         order: params.order
-      })}`);
+      })}`, { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS });
     },
 
     delegations(conversationId: string): Promise<Session[]> {
-      return request<Session[]>(`/api/v1/conversations/${conversationId}/delegations`);
+      return request<Session[]>(`/api/v1/conversations/${conversationId}/delegations`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     resolve(payload: {
@@ -538,14 +576,9 @@ export const api = {
     open(payload: ConversationOpenRequest): Promise<Conversation> {
       return request<Conversation>('/api/v1/conversations/open', {
         method: 'POST',
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
       });
-    },
-
-    sessionEvents(conversationId: string, sessionId: string, afterSeq = 0, limit = 50): Promise<SessionEventsResponse> {
-      return request<SessionEventsResponse>(
-        `/api/v1/conversations/${conversationId}/sessions/${sessionId}/events${encodeQuery({ after_seq: afterSeq, limit })}`
-      );
     },
 
     markRead(conversationId: string): Promise<{ ok: boolean }> {
@@ -567,12 +600,17 @@ export const api = {
   },
 
   agents: {
+    memoryBackends(): Promise<{ items: MemoryBackendDescriptor[] }> {
+      return request<{ items: MemoryBackendDescriptor[] }>('/api/v1/agents/memory-backends');
+    },
+
     list(
       cursor: string | null = null,
       params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean }
     ): Promise<CursorPage<Agent>> {
       return request<CursorPage<Agent>>(
-        `/api/v1/agents${encodeQuery({ cursor, limit: 100, ...params })}`
+        `/api/v1/agents${encodeQuery({ cursor, limit: 100, ...params })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
       );
     },
 
@@ -712,14 +750,16 @@ export const api = {
       formData.append('file', file);
       return request<{ image_id: string; url: string }>('/api/v1/images/upload', {
         method: 'POST',
-        body: formData
+        body: formData,
+        timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS
       });
     },
 
     generate(prompt: string, options?: { size?: string; quality?: string }): Promise<{ image_id: string; url: string; prompt_used: string }> {
       return request<{ image_id: string; url: string; prompt_used: string }>('/api/v1/images/generate', {
         method: 'POST',
-        body: JSON.stringify({ prompt, ...options })
+        body: JSON.stringify({ prompt, ...options }),
+        timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS
       });
     },
 
@@ -738,12 +778,35 @@ export const api = {
       form.set('purpose', purpose);
       return request<AttachmentRef>('/api/v1/artifacts/upload', {
         method: 'POST',
-        body: form
+        body: form,
+        timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS
       });
     },
 
     signedUrl(artifactId: string, ttlSeconds = 3600, mode: 'download' | 'view' = 'download'): Promise<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }> {
       return request<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds, mode: mode === 'download' ? undefined : mode })}`);
+    }
+  },
+
+  deliverables: {
+    get(deliverableId: string, options: { accessorConversationId?: string } = {}): Promise<Deliverable> {
+      const query = options.accessorConversationId
+        ? `?accessor_conversation_id=${encodeURIComponent(options.accessorConversationId)}`
+        : '';
+      return request<Deliverable>(`/api/v1/deliverables/${encodeURIComponent(deliverableId)}${query}`);
+    },
+
+    getForStepRun(stepRunId: string, deliverableId: string): Promise<Deliverable> {
+      return request<Deliverable>(
+        `/api/v1/step-runs/${encodeURIComponent(stepRunId)}/deliverables/${encodeURIComponent(deliverableId)}`
+      );
+    },
+
+    shareLink(deliverableId: string): Promise<DeliverableShareLink> {
+      return request<DeliverableShareLink>(
+        `/api/v1/deliverables/${encodeURIComponent(deliverableId)}/share-link`,
+        { method: 'POST' }
+      );
     }
   },
 
@@ -830,6 +893,10 @@ export const api = {
 
     deleteMcpServer(serverId: string): Promise<void> {
       return request<void>(`/api/v1/mcp-servers/${serverId}`, { method: 'DELETE' });
+    },
+
+    getDeliverable(deliverableId: string): Promise<Deliverable> {
+      return request<Deliverable>(`/api/v1/deliverables/${encodeURIComponent(deliverableId)}`);
     },
 
     startMcpOAuth(serverId: string): Promise<{
@@ -963,20 +1030,40 @@ export const api = {
       return request<ExecutorStatus>('/api/v1/executor/status');
     },
 
-    list(): Promise<ExecutorConfig[]> {
-      return request<ExecutorConfig[]>('/api/v1/executors');
+    async list(): Promise<ExecutorConfig[]> {
+      const executors = await request<ExecutorConfig[]>('/api/v1/executors');
+      executors.forEach(rememberExecutorConfigVersion);
+      return executors;
     },
 
-    get(executorId: string): Promise<ExecutorConfig> {
-      return request<ExecutorConfig>(`/api/v1/executors/${executorId}`);
+    async get(executorId: string): Promise<ExecutorConfig> {
+      return rememberExecutorConfigVersion(
+        await request<ExecutorConfig>(`/api/v1/executors/${executorId}`)
+      );
     },
 
-    create(data: ExecutorCreateRequest): Promise<ExecutorConfig> {
-      return request<ExecutorConfig>('/api/v1/executors', { method: 'POST', body: JSON.stringify(data) });
+    async create(data: ExecutorCreateRequest): Promise<ExecutorConfig> {
+      return rememberExecutorConfigVersion(
+        await request<ExecutorConfig>('/api/v1/executors', {
+          method: 'POST',
+          body: JSON.stringify(data)
+        })
+      );
     },
 
-    update(executorId: string, data: ExecutorUpdateRequest): Promise<ExecutorConfig> {
-      return request<ExecutorConfig>(`/api/v1/executors/${executorId}`, { method: 'PUT', body: JSON.stringify(data) });
+    async update(executorId: string, data: ExecutorUpdateRequest): Promise<ExecutorConfig> {
+      const expectedConfigVersion =
+        data.expected_config_version ??
+        (data.config === undefined ? undefined : executorConfigVersions.get(executorId));
+      return rememberExecutorConfigVersion(
+        await request<ExecutorConfig>(`/api/v1/executors/${executorId}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            ...data,
+            expected_config_version: expectedConfigVersion
+          })
+        })
+      );
     },
 
     delete(executorId: string): Promise<void> {
@@ -990,9 +1077,139 @@ export const api = {
     }
   },
 
+  localModels: {
+    catalog(options: {
+      source?: LocalModelCatalogSource;
+      query?: string;
+      cursor?: string;
+      limit?: number;
+      parameterRange?: string;
+      downloadSizeRange?: string;
+      quantization?: string;
+      minContext?: number;
+      includeUnknown?: boolean;
+    } = {}): Promise<LocalModelCatalogResponse> {
+      const params = new URLSearchParams();
+      if (options.source) params.set('source', options.source);
+      if (options.query) params.set('query', options.query);
+      if (options.cursor) params.set('cursor', options.cursor);
+      if (options.limit) params.set('limit', String(options.limit));
+      if (options.parameterRange) params.set('parameter_range', options.parameterRange);
+      if (options.downloadSizeRange) params.set('download_size_range', options.downloadSizeRange);
+      if (options.quantization) params.set('quantization', options.quantization);
+      if (options.minContext) params.set('min_context', String(options.minContext));
+      if (options.includeUnknown != null) params.set('include_unknown', String(options.includeUnknown));
+      const suffix = params.size ? `?${params.toString()}` : '';
+      return request<LocalModelCatalogResponse>(`/api/v1/local-model-catalog${suffix}`);
+    },
+
+    resolve(reference: string): Promise<LocalModelCatalogItem> {
+      return request<LocalModelCatalogItem>(
+        `/api/v1/local-model-catalog/resolve?ref=${encodeURIComponent(reference)}`
+      );
+    },
+
+    detail(repository: string, revisionSha?: string | null): Promise<LocalModelCatalogItem> {
+      const params = new URLSearchParams({ repo: repository });
+      if (revisionSha) params.set('revision_sha', revisionSha);
+      return request<LocalModelCatalogItem>(
+        `/api/v1/local-model-catalog/detail?${params.toString()}`
+      );
+    },
+
+    plan(payload: LocalModelFitPlanRequest): Promise<LocalModelFitPlan> {
+      return request<LocalModelFitPlan>('/api/v1/local-model-fit-plans', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    deployments(): Promise<LocalModelDeployment[]> {
+      return request<LocalModelDeployment[]>('/api/v1/local-model-deployments');
+    },
+
+    createDeployment(payload: LocalModelDeploymentCreate): Promise<LocalModelDeployment> {
+      return request<LocalModelDeployment>('/api/v1/local-model-deployments', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    createManagedDeployment(
+      payload: LocalModelManagedDeploymentCreate
+    ): Promise<LocalModelManagedDeploymentCreateResponse> {
+      return request<LocalModelManagedDeploymentCreateResponse>(
+        '/api/v1/local-model-deployments:managed',
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
+    },
+
+    recommendProvider(payload: {
+      requested_ref: string;
+      selector?: LocalModelSelector;
+      shared?: boolean;
+    }): Promise<LocalModelProviderRecommendation> {
+      return request<LocalModelProviderRecommendation>(
+        '/api/v1/local-model-providers/recommendations',
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
+    },
+
+    findOrCreateProvider(payload: {
+      requested_ref: string;
+      selector: LocalModelSelector;
+      shared?: boolean;
+      force_create?: boolean;
+    }): Promise<LocalModelProviderFindOrCreateResponse> {
+      return request<LocalModelProviderFindOrCreateResponse>(
+        '/api/v1/local-model-providers:find-or-create',
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
+    },
+
+    updateDeployment(
+      deploymentId: string,
+      payload: LocalModelDeploymentUpdate
+    ): Promise<LocalModelDeployment> {
+      return request<LocalModelDeployment>(
+        `/api/v1/local-model-deployments/${encodeURIComponent(deploymentId)}`,
+        { method: 'PATCH', body: JSON.stringify(payload) }
+      );
+    },
+
+    attachManagedProvider(
+      deploymentId: string,
+      payload: { force_create_provider?: boolean }
+    ): Promise<LocalModelManagedDeploymentCreateResponse> {
+      return request<LocalModelManagedDeploymentCreateResponse>(
+        `/api/v1/local-model-deployments/${encodeURIComponent(deploymentId)}:attach-managed-provider`,
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
+    },
+
+    targets(deploymentId: string): Promise<LocalModelTargetStatus[]> {
+      return request<LocalModelTargetStatus[]>(
+        `/api/v1/local-model-deployments/${encodeURIComponent(deploymentId)}/targets`
+      );
+    },
+
+    operations(deploymentId: string): Promise<LocalModelOperation[]> {
+      return request<LocalModelOperation[]>(
+        `/api/v1/local-model-deployments/${encodeURIComponent(deploymentId)}/operations`
+      );
+    },
+
+    reconcile(deploymentId: string): Promise<LocalModelDeployment> {
+      return request<LocalModelDeployment>(
+        `/api/v1/local-model-deployments/${encodeURIComponent(deploymentId)}/reconciliation-requests`,
+        { method: 'POST' }
+      );
+    }
+  },
+
   skills: {
     list(): Promise<Skill[]> {
-      return request<Skill[]>('/api/v1/skills');
+      return request<Skill[]>('/api/v1/skills', { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS });
     },
 
     get(skillId: string): Promise<Skill> {
@@ -1042,7 +1259,9 @@ export const api = {
 
   tasks: {
     list(params: Record<string, string | number | null | undefined> = {}): Promise<CursorPage<Task>> {
-      return request<CursorPage<Task>>(`/api/v1/tasks${encodeQuery({ limit: 100, ...params })}`);
+      return request<CursorPage<Task>>(`/api/v1/tasks${encodeQuery({ limit: 100, ...params })}`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     async listAll(): Promise<Task[]> {
@@ -1050,23 +1269,30 @@ export const api = {
     },
 
     board(params: Record<string, string | number | null | undefined> = {}): Promise<TaskBoard> {
-      return request<TaskBoard>(`/api/v1/tasks/board${encodeQuery({ limit: 20, ...params })}`);
+      return request<TaskBoard>(`/api/v1/tasks/board${encodeQuery({ limit: 20, ...params })}`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     boardColumn(columnId: string, params: Record<string, string | number | null | undefined> = {}): Promise<TaskBoardColumn> {
-      return request<TaskBoardColumn>(`/api/v1/tasks/board/${columnId}${encodeQuery({ limit: 20, ...params })}`);
+      return request<TaskBoardColumn>(`/api/v1/tasks/board/${columnId}${encodeQuery({ limit: 20, ...params })}`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     doneGroupTasks(groupKey: string, params: Record<string, string | number | null | undefined> = {}): Promise<CursorPage<TaskBoardItem>> {
-      return request<CursorPage<TaskBoardItem>>(`/api/v1/tasks/board/done/groups/${encodeURIComponent(groupKey)}/tasks${encodeQuery({ limit: 20, ...params })}`);
+      return request<CursorPage<TaskBoardItem>>(
+        `/api/v1/tasks/board/done/groups/${encodeURIComponent(groupKey)}/tasks${encodeQuery({ limit: 20, ...params })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
+      );
     },
 
     detail(taskId: string): Promise<TaskDetail> {
-      return request<TaskDetail>(`/api/v1/tasks/${taskId}`);
+      return request<TaskDetail>(`/api/v1/tasks/${taskId}`, { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS });
     },
 
     summary(taskId: string): Promise<TaskDetail> {
-      return request<TaskDetail>(`/api/v1/tasks/${taskId}/summary`);
+      return request<TaskDetail>(`/api/v1/tasks/${taskId}/summary`, { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS });
     },
 
     create(payload: Record<string, unknown>): Promise<Task> {
@@ -1173,6 +1399,12 @@ export const api = {
       return request<StepRun>(`/api/v1/step-runs/${encodeURIComponent(stepRunId)}`);
     },
 
+    stepRunDeliverable(stepRunId: string, deliverableId: string): Promise<Deliverable> {
+      return request<Deliverable>(
+        `/api/v1/step-runs/${encodeURIComponent(stepRunId)}/deliverables/${encodeURIComponent(deliverableId)}`
+      );
+    },
+
     comments(taskId: string): Promise<TaskComment[]> {
       return request<TaskComment[]>(`/api/v1/tasks/${taskId}/comments`);
     },
@@ -1202,7 +1434,9 @@ export const api = {
 
   projects: {
     list(params: { status?: string; q?: string } = {}): Promise<Project[]> {
-      return request<Project[]>(`/api/v1/projects${encodeQuery(params)}`);
+      return request<Project[]>(`/api/v1/projects${encodeQuery(params)}`, {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
     },
 
     detail(projectId: string): Promise<Project> {
@@ -1272,7 +1506,10 @@ export const api = {
 
   workflows: {
     list(cursor: string | null = null, params?: { include_disabled?: boolean; include_ephemeral?: boolean; project_id?: string | null }): Promise<CursorPage<Workflow>> {
-      return request<CursorPage<Workflow>>(`/api/v1/workflows${encodeQuery({ cursor, limit: 100, ...params })}`);
+      return request<CursorPage<Workflow>>(
+        `/api/v1/workflows${encodeQuery({ cursor, limit: 100, ...params })}`,
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
+      );
     },
 
     async listAll(params?: { include_disabled?: boolean; include_ephemeral?: boolean; project_id?: string | null }): Promise<Workflow[]> {
@@ -1382,6 +1619,12 @@ export const api = {
       });
     },
 
+    reset(key: string): Promise<Setting> {
+      return request<Setting>(`/api/v1/settings/${key}`, {
+        method: 'DELETE'
+      });
+    },
+
     stepProfiles(): Promise<StepProfileDefinition[]> {
       return request<StepProfileDefinition[]>('/api/v1/settings/step-profiles');
     },
@@ -1464,11 +1707,15 @@ export const api = {
     },
 
     discoverModelsPreview(payload: {
+      provider_id?: string;
       preset: string;
       base_url: string;
       api_key?: string;
       secret_name?: string;
       env_var?: string;
+      location?: string;
+      executor_id?: string;
+      executor_labels?: Record<string, string>;
     }): Promise<{ models: ModelEntry[] }> {
       return request<{ models: ModelEntry[] }>('/api/v1/llm-providers/discover-models-preview', {
         method: 'POST',
@@ -1560,7 +1807,8 @@ export const api = {
       return request<TtsSynthesizeResponse>('/api/v1/tts/synthesize', {
         method: 'POST',
         body: JSON.stringify(payload),
-        signal: opts.signal
+        signal: opts.signal,
+        timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS
       });
     }
   },
@@ -1571,12 +1819,12 @@ export const api = {
       form.append('file', file, opts.filename ?? 'voice-input.webm');
       if (opts.language) form.append('language', opts.language);
       if (opts.prompt) form.append('prompt', opts.prompt);
-      const response = await fetch('/api/v1/stt/transcribe', {
+      const response = await fetchWithTimeout('/api/v1/stt/transcribe', {
         method: 'POST',
         body: form,
         credentials: 'include',
         signal: opts.signal
-      });
+      }, { timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS });
       if (!response.ok) {
         let detail = 'Transcription failed';
         try {
@@ -1595,11 +1843,11 @@ export const api = {
       form.append('artifact_id', artifactId);
       if (opts.language) form.append('language', opts.language);
       if (opts.prompt) form.append('prompt', opts.prompt);
-      const response = await fetch('/api/v1/stt/transcribe', {
+      const response = await fetchWithTimeout('/api/v1/stt/transcribe', {
         method: 'POST',
         body: form,
         credentials: 'include'
-      });
+      }, { timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS });
       if (!response.ok) {
         let detail = 'Transcription failed';
         try {
@@ -1617,6 +1865,13 @@ export const api = {
   webConfig: {
     status(): Promise<WebConfigStatus> {
       return request<WebConfigStatus>('/api/v1/web-config/status');
+    },
+
+    updateBackend(backend: string, payload: WebBackendUpdatePayload): Promise<WebConfigStatus> {
+      return request<WebConfigStatus>(`/api/v1/web-config/backends/${encodeURIComponent(backend)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
     }
   },
 
@@ -1667,10 +1922,6 @@ export const api = {
   sessions: {
     detail(sessionId: string): Promise<Session> {
       return request<Session>(`/api/v1/sessions/${sessionId}`);
-    },
-
-    events(sessionId: string, afterSeq = 0, limit = 50): Promise<SessionEventsResponse> {
-      return request<SessionEventsResponse>(`/api/v1/sessions/${sessionId}/events${encodeQuery({ after_seq: afterSeq, limit })}`);
     },
 
     cancel(sessionId: string): Promise<{ ok: boolean; session_id: string }> {

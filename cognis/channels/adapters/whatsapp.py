@@ -21,6 +21,7 @@ from typing import Any
 
 import httpx
 
+from cognis.channels.markdown_rendering import markdown_to_chat_text
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import WHATSAPP_META
 from cognis.logging import get_logger
@@ -102,7 +103,7 @@ class WhatsAppAdapter(BaseChannelAdapter):
             "messaging_product": "whatsapp",
             "to": message.chat_id,
             "type": "text",
-            "text": {"body": message.content},
+            "text": {"body": markdown_to_chat_text(message.content)},
         }
 
         if message.reply_to_id:

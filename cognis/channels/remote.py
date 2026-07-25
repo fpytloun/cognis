@@ -9,6 +9,7 @@ JSON-RPC call over the executor WebSocket.
 from __future__ import annotations
 
 import base64
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,6 +28,7 @@ from cognis.models.channel import (
     OutboundMessage,
 )
 from cognis.models.config import ProviderHealth
+from cognis.providers.executor.websocket import ExecutorDisconnectedError
 
 logger = get_logger(__name__)
 
@@ -45,11 +47,13 @@ class RemoteChannelAdapterProxy:
         channel_type: str,
         capabilities: ChannelCapabilities,
         account_id: str,
+        reconnect_connection: Callable[[], Awaitable[Any | None]] | None = None,
     ) -> None:
         self._connection = connection
         self.channel_type = channel_type
         self.capabilities = capabilities
         self._account_id = account_id
+        self._reconnect_connection = reconnect_connection
         self._status = ChannelStatus.DISCONNECTED
         self._connected_at: datetime | None = None
         self._last_error: str | None = None
@@ -57,6 +61,11 @@ class RemoteChannelAdapterProxy:
     @property
     def account_id(self) -> str:
         return self._account_id
+
+    def _connection_for_retry(self) -> Any:
+        """Return the live connection to a superseded proxy retry waiter."""
+
+        return self._connection
 
     async def start(
         self,
@@ -75,6 +84,7 @@ class RemoteChannelAdapterProxy:
                     "config": {
                         "display_name": config.display_name,
                         "agent_id": config.agent_id,
+                        "default_agent_profile_id": config.default_agent_profile_id,
                         "user_email": config.user_email,
                         "settings": config.settings,
                         "default_conversation_id": config.default_conversation_id,
@@ -245,17 +255,43 @@ class RemoteChannelAdapterProxy:
         stt_supported_mime_types: list[str] | None,
         raise_errors: bool,
     ) -> tuple[bytes, str, str] | None:
-        try:
+        params = {
+            "account_id": self._account_id,
+            "message": message.model_dump(mode="json"),
+            "attachment": attachment.model_dump(mode="json"),
+            "stt_supported_mime_types": stt_supported_mime_types,
+        }
+
+        async def fetch() -> dict[str, Any]:
             result = await self._connection.rpc_call(
                 "channel.fetch_media",
-                {
-                    "account_id": self._account_id,
-                    "message": message.model_dump(mode="json"),
-                    "attachment": attachment.model_dump(mode="json"),
-                    "stt_supported_mime_types": stt_supported_mime_types,
-                },
+                params,
                 timeout=60.0,
             )
+            if not isinstance(result, dict):
+                raise RuntimeError("Executor returned an invalid channel.fetch_media response")
+            return result
+
+        try:
+            try:
+                result = await fetch()
+            except ExecutorDisconnectedError:
+                if self._reconnect_connection is None:
+                    raise
+                replacement = await self._reconnect_connection()
+                if replacement is None:
+                    raise
+                self._connection = replacement
+                logger.info(
+                    "remote channel proxy: retrying fetch_media after executor reconnect",
+                    extra={
+                        "extra_data": {
+                            "account_id": self._account_id,
+                            "executor_id": replacement.executor_id,
+                        }
+                    },
+                )
+                result = await fetch()
             error = result.get("error")
             if isinstance(error, str) and error:
                 raise RuntimeError(error)

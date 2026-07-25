@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { createMarkdownStreamer, renderDocsMarkdown, renderMarkdown, stripMarkdown } from '$lib/markdown';
+import {
+  createMarkdownStreamer,
+  extractMarkdownHeadings,
+  renderDocsMarkdown,
+  renderInlineMarkdown,
+  renderInlineMarkdownNoLinks,
+  renderMarkdown,
+  renderMarkdownDocument,
+  stripMarkdown,
+} from '$lib/markdown';
 
 describe('renderMarkdown', () => {
   const preCount = (html: string) => html.match(/<pre\b/g)?.length ?? 0;
@@ -29,14 +38,16 @@ describe('renderMarkdown', () => {
     expect(html).toContain('href="https://example.com/docs"');
   });
 
-  it('strips dangerous html and event handlers', () => {
+  it('renders raw html literally without creating active elements', () => {
     const html = renderMarkdown(
       '<script>alert(1)</script><a href="javascript:alert(1)">bad</a><img src="x" onerror="alert(1)" />'
     );
 
     expect(html).not.toContain('<script');
-    expect(html).not.toContain('onerror');
-    expect(html).not.toContain('javascript:');
+    expect(html).not.toContain('<img');
+    expect(html).not.toContain('<a href=');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).toContain('&lt;img src=&quot;x&quot;');
   });
 
   it('opens outgoing markdown links in a new tab', () => {
@@ -196,6 +207,125 @@ describe('renderMarkdown', () => {
     expect(html).toContain('markdown-table-wrap');
     expect(html).toContain('<pre><code');
     expect(html).toContain('<table>');
+  });
+
+  it('renders malformed LLM-style tables when the separator row is missing trailing cells', () => {
+    const html = renderMarkdown([
+      '| Phase | Work | Branch/worktree | Parallel? |',
+      '|---|---|--|',
+      '| A | WS1 + WS2 (same files, one coherent change set) | fix/projection-critical-pressure | no — foundation |',
+      '| B1 | WS3 (prefix stability) | feat/projection-prefix-stability on top of A | parallel with B2 |',
+    ].join('\n'));
+
+    expect(html).toContain('<table>');
+    expect(html).toContain('<th>Parallel?</th>');
+    expect(html).toContain('<td>parallel with B2</td>');
+    expect(html).toContain('markdown-table-wrap');
+    expect(html).not.toContain('<p>| Phase | Work');
+  });
+
+  it('renders markdown documents with stable heading anchors', () => {
+    const document = renderMarkdownDocument([
+      '# Final report',
+      '',
+      '```md',
+      '## Ignored fenced heading',
+      '```',
+      '',
+      '## Stage scope',
+      '',
+      '## Stage scope',
+    ].join('\n'), 'deliverable-dlv-1');
+
+    expect(document.headings).toEqual([
+      { id: 'deliverable-dlv-1-final-report', level: 1, text: 'Final report' },
+      { id: 'deliverable-dlv-1-stage-scope', level: 2, text: 'Stage scope' },
+      { id: 'deliverable-dlv-1-stage-scope-2', level: 2, text: 'Stage scope' },
+    ]);
+    expect(document.html).toContain('<h1 id="deliverable-dlv-1-final-report"');
+    expect(document.html).toContain('<h2 id="deliverable-dlv-1-stage-scope"');
+    expect(document.html).not.toContain('<h2 id="deliverable-dlv-1-ignored-fenced-heading"');
+  });
+
+  it('extracts markdown headings without including fenced code', () => {
+    expect(extractMarkdownHeadings('## Visible\n\n```\n# Hidden\n```', 'doc')).toEqual([
+      { id: 'doc-visible', level: 2, text: 'Visible' },
+    ]);
+  });
+});
+
+describe('renderInlineMarkdown', () => {
+  it('renders an inline link without wrapping it in a <p>', () => {
+    const html = renderInlineMarkdown('See [ČTK](https://example.com/ctk) for details.');
+
+    expect(html).toContain('href="https://example.com/ctk"');
+    expect(html).toContain('target="_blank"');
+    expect(html).toContain('rel="noopener noreferrer"');
+    expect(html).not.toContain('<p>');
+  });
+
+  it('renders inline bold/italic/code without block wrapping', () => {
+    const html = renderInlineMarkdown('**bold** and _italic_ and `code`');
+
+    expect(html).toBe('<strong>bold</strong> and <em>italic</em> and <code>code</code>');
+  });
+
+  it('escapes plain text with no markdown syntax unchanged (aside from HTML escaping)', () => {
+    expect(renderInlineMarkdown('Plain text, no markup.')).toBe('Plain text, no markup.');
+  });
+
+  it('returns an empty string for empty input without throwing', () => {
+    expect(renderInlineMarkdown('')).toBe('');
+  });
+
+  it('sanitizes unsafe raw HTML the same way renderMarkdown does (escaped, not executable)', () => {
+    const html = renderInlineMarkdown('<img src=x onerror="alert(1)">Text');
+
+    // Raw HTML embedded in markdown source is escaped to visible text by
+    // the shared renderer (same as renderMarkdown), never parsed as a live
+    // element -- there must be no actual `<img` element in the output.
+    expect(html).not.toContain('<img');
+    expect(html).toContain('Text');
+  });
+
+  it('linkifies bare URLs like renderMarkdown', () => {
+    const html = renderInlineMarkdown('Visit https://example.com now.');
+
+    expect(html).toContain('href="https://example.com"');
+    expect(html).toContain('>https://example.com</a>');
+  });
+});
+
+describe('renderInlineMarkdownNoLinks', () => {
+  it('renders a markdown link as its label only, dropping the anchor', () => {
+    const html = renderInlineMarkdownNoLinks('See [ČTK](https://example.com/ctk) for details.');
+
+    expect(html).not.toContain('<a');
+    expect(html).not.toContain('href');
+    expect(html).toContain('ČTK');
+  });
+
+  it('preserves nested inline formatting inside the dropped link label', () => {
+    const html = renderInlineMarkdownNoLinks('[**bold label**](https://example.com)');
+
+    expect(html).toBe('<strong>bold label</strong>');
+  });
+
+  it('still renders bold/italic/code when there is no link', () => {
+    expect(renderInlineMarkdownNoLinks('**bold** and `code`')).toBe(
+      '<strong>bold</strong> and <code>code</code>',
+    );
+  });
+
+  it('does not linkify bare URLs either', () => {
+    const html = renderInlineMarkdownNoLinks('Visit https://example.com now.');
+
+    expect(html).not.toContain('<a');
+    expect(html).toContain('https://example.com');
+  });
+
+  it('returns an empty string for empty input without throwing', () => {
+    expect(renderInlineMarkdownNoLinks('')).toBe('');
   });
 });
 

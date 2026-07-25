@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from cognis.tools.executor.browser.install import (
 logger = get_logger(__name__)
 
 BROWSER_MANAGER_KEY = "browser_manager"
+BROWSER_CLEANUP_RETAINER_KEY = "browser_cleanup_retainer"
 BROWSER_DEFAULT_IDLE_TIMEOUT_SECONDS = 1800
 BROWSER_DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECONDS = 60
 BROWSER_DEFAULT_MAX_SESSIONS = 8
@@ -41,13 +43,6 @@ BROWSER_DEFAULT_VIEWPORT_WIDTH = 1365
 BROWSER_DEFAULT_VIEWPORT_HEIGHT = 900
 BROWSER_DIAGNOSTIC_EVENT_LIMIT = 200
 
-# Pinned recent Chrome desktop UA used as the realistic-UA fallback when we
-# cannot probe the running Chromium build at startup. Update periodically.
-BROWSER_DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/127.0.0.0 Safari/537.36"
-)
 BROWSER_DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 BROWSER_DEFAULT_TIMEZONE_ID = "UTC"
 
@@ -56,6 +51,71 @@ BROWSER_DEFAULT_AUTO_CONSENT_DELAY_MS = 800
 BROWSER_DEFAULT_HUMANIZE_INTENSITY = "low"
 SUPPORTED_HUMANIZE_INTENSITIES: tuple[str, ...] = ("off", "low", "medium", "high")
 SUPPORTED_AUTO_CONSENT_ACTIONS: tuple[str, ...] = ("accept", "reject", "off")
+
+
+def _coherent_chromium_user_agent(version: str) -> str | None:
+    """Build a desktop UA matching the running Chromium version and host OS."""
+    match = re.search(r"\d+(?:\.\d+){0,3}", version)
+    if match is None:
+        return None
+    chromium_version = match.group(0)
+    if sys.platform == "darwin":
+        platform_token = "Macintosh; Intel Mac OS X 10_15_7"
+    elif sys.platform == "win32":
+        platform_token = "Windows NT 10.0; Win64; x64"
+    else:
+        platform_token = "X11; Linux x86_64"
+    return (
+        f"Mozilla/5.0 ({platform_token}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{chromium_version} Safari/537.36"
+    )
+
+
+class BrowserLifecycleError(RuntimeError):
+    """Structured browser lifecycle failure safe to expose to tool callers."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"[{code}] {message}")
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class BrowserSessionOwner:
+    execution_scope_id: str
+    session_id: str | None = None
+    conversation_id: str | None = None
+    user_email: str | None = None
+    agent_id: str | None = None
+    parent_session_id: str | None = None
+    delegation_mode: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> BrowserSessionOwner:
+        return cls(
+            execution_scope_id=str(value.get("execution_scope_id") or ""),
+            session_id=str(value.get("session_id") or "") or None,
+            conversation_id=str(value.get("conversation_id") or "") or None,
+            user_email=str(value.get("user_email") or "") or None,
+            agent_id=str(value.get("agent_id") or "") or None,
+            parent_session_id=str(value.get("parent_session_id") or "") or None,
+            delegation_mode=str(value.get("delegation_mode") or "") or None,
+        )
+
+    def safe_dict(self, *, caller_scope_id: str | None = None) -> dict[str, Any]:
+        return {
+            "scope_id": self.execution_scope_id,
+            "session_id": self.session_id,
+            "conversation_id": self.conversation_id,
+            "agent_id": self.agent_id,
+            "relationship": (
+                "self"
+                if caller_scope_id == self.execution_scope_id
+                else "managed_descendant"
+                if caller_scope_id == self.parent_session_id
+                else "other"
+            ),
+        }
+
 
 # Asset filenames (kept here so tests can monkey-patch the loader).
 _AUTOCONSENT_ASSET = "autoconsent.bundle.js"
@@ -110,6 +170,10 @@ class BrowserSession:
     idle_timeout_seconds: float | None = None
     runtime_generation: int = 0
     browser_settings: BrowserSessionSettings | None = None
+    owner: BrowserSessionOwner | None = None
+    navigation_url: str | None = None
+    navigation_status: int | None = None
+    navigation_ok: bool | None = None
 
 
 class BrowserManager:
@@ -236,6 +300,7 @@ class BrowserManager:
         # concurrently.  True=headless browser, False=headed browser.
         self._browsers: dict[bool, Any] = {}  # headless -> Browser object
         self._browser_generations: dict[bool, int] = {}  # headless -> generation
+        self._browser_user_agents: dict[bool, str] = {}
         # Back-compat alias kept for external readers (e.g. status/diagnostics).
         # Points at the most recently launched browser regardless of mode.
         self._browser: Any | None = None  # last-touched browser, for diagnostics
@@ -243,16 +308,23 @@ class BrowserManager:
         self._playwright_displays: dict[bool, str | None] = {}  # headless -> display
         self._playwright: Any | None = None  # last-touched runtime, for diagnostics/tests
         self._sessions: dict[str, BrowserSession] = {}
+        self._closing_sessions: dict[str, BrowserSession] = {}
+        self._session_close_tasks: dict[str, asyncio.Task[bool]] = {}
+        self._expired_session_ids: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._xvfb_process: asyncio.subprocess.Process | None = None
         self._xvfb_display: str | None = None
         self._claimed_displays: set[str] = set()
-        self._reserved_profile_ids: set[str] = set()
+        self._reserved_profile_ids: dict[str, BrowserSessionOwner | None] = {}
+        self._terminal_owners: dict[str, BrowserSessionOwner] = {}
+        self._disposing = False
         self._runtime_generation = 0
         self._playwright_display: str | None = None  # last-touched display, for diagnostics/tests
         self._headed_open_in_flight = 0
         self._open_in_flight = 0
         self._open_in_flight_by_mode: dict[bool, int] = {True: 0, False: 0}
+        self._open_in_flight_owners: dict[str, int] = {}
+        self._opening_session_ids: set[str] = set()
         self._patchright_persistent_warning_emitted = False
         self._idle_reaper_task: asyncio.Task[None] | None = None
         self._reap_orphan_profile_locks()
@@ -261,52 +333,243 @@ class BrowserManager:
     def active_session_count(self) -> int:
         return len(self._sessions)
 
-    async def list_sessions(self) -> list[dict[str, Any]]:
+    async def list_sessions(
+        self, *, owner: BrowserSessionOwner | None = None
+    ) -> list[dict[str, Any]]:
+        if owner is None:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Browser lifecycle ownership is unavailable for this execution.",
+            )
+        await self._cleanup_idle_sessions()
         sessions: list[dict[str, Any]] = []
-        for session in self._sessions.values():
-            if self._session_is_idle(session):
+        for session in [*self._sessions.values(), *self._closing_sessions.values()]:
+            if not self._can_inspect(session, owner):
                 continue
-            session_settings = getattr(session, "browser_settings", None)
             sessions.append(
-                {
-                    "session_id": session.session_id,
-                    "url": getattr(session.page, "url", ""),
-                    "profile_mode": session.profile_mode,
-                    "profile_id": session.profile_id,
-                    "headless": session.headless,
-                    "display": session.display,
-                    "last_used_at": session.last_used_at.isoformat(),
-                    "lifecycle": getattr(session, "lifecycle", "explicit"),
-                    "idle_deadline_at": self._session_idle_deadline_at(session),
-                    "auth_origin": session.auth_origin,
-                    "console_event_count": len(getattr(session, "console_events", [])),
-                    "network_event_count": len(getattr(session, "network_events", [])),
-                    "browser_settings": session_settings.as_dict()
-                    if session_settings is not None
-                    else None,
-                }
+                self._safe_session_metadata(
+                    session,
+                    caller=owner,
+                    state=(
+                        "terminal_cleanup_pending"
+                        if session.session_id in self._closing_sessions
+                        else "active"
+                    ),
+                )
             )
         return sessions
 
-    async def list_profiles(self) -> list[dict[str, Any]]:
-        active_profile_ids = {
+    async def inspect_session(
+        self,
+        session_id: str,
+        *,
+        owner: BrowserSessionOwner | None = None,
+    ) -> dict[str, Any]:
+        if owner is None:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Browser lifecycle ownership is unavailable for this execution.",
+            )
+        await self._cleanup_idle_sessions()
+        session = self._sessions.get(session_id) or self._closing_sessions.get(session_id)
+        if session is None or not self._can_inspect(session, owner):
+            raise BrowserLifecycleError(
+                "browser_session_missing",
+                "Browser session does not exist.",
+            )
+        return self._safe_session_metadata(
+            session,
+            caller=owner,
+            state=(
+                "terminal_cleanup_pending" if session_id in self._closing_sessions else "active"
+            ),
+        )
+
+    async def list_profiles(
+        self,
+        *,
+        owner: BrowserSessionOwner | None = None,
+        reclaim_stale: bool = False,
+        include_unclaimed: bool = False,
+        executor_owner_email: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if owner is None:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Browser lifecycle ownership is unavailable for this execution.",
+            )
+        if reclaim_stale:
+            self._reap_orphan_profile_locks()
+        if include_unclaimed and executor_owner_email != owner.user_email:
+            raise BrowserLifecycleError(
+                "browser_unauthorized",
+                "Legacy unclaimed profiles are visible only on an executor privately owned "
+                "by the current user.",
+            )
+        visible_profile_ids = {
             session.profile_id
-            for session in self._sessions.values()
-            if session.profile_id and not self._session_is_idle(session)
+            for session in [*self._sessions.values(), *self._closing_sessions.values()]
+            if session.profile_id
+            and self._profile_session_is_in_use(session)
+            and self._can_inspect(session, owner)
+        }
+        hidden_active_profile_ids = {
+            session.profile_id
+            for session in [*self._sessions.values(), *self._closing_sessions.values()]
+            if session.profile_id
+            and self._profile_session_is_in_use(session)
+            and not self._can_inspect(session, owner)
         }
         profiles: list[dict[str, Any]] = []
         for entry in sorted(self.profile_base_dir.iterdir(), key=lambda item: item.name):
-            if not entry.is_dir():
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if entry.name in hidden_active_profile_ids:
+                continue
+            owned = self._profile_is_owned_by(entry, owner)
+            owner_path = entry / ".cognis-owner.json"
+            legacy_unclaimed = (
+                include_unclaimed and not owner_path.exists() and any(entry.iterdir())
+            )
+            if not owned and not legacy_unclaimed:
                 continue
             stat = entry.stat()
             profiles.append(
                 {
                     "profile_id": entry.name,
-                    "currently_in_use": entry.name in active_profile_ids,
+                    "currently_in_use": entry.name in visible_profile_ids,
                     "last_used_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+                    "ownership_status": "owned" if owned else "legacy_unclaimed",
+                    "claimable": (
+                        legacy_unclaimed
+                        and entry.name not in self._reserved_profile_ids
+                        and not self._profile_lock_exists(entry)
+                    ),
                 }
             )
         return profiles
+
+    async def claim_legacy_profile(
+        self,
+        profile_id: str,
+        *,
+        owner: BrowserSessionOwner | None,
+        confirm_profile_id: str,
+        reclaim_stale: bool = False,
+        executor_owner_email: str | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly bind one unclaimed legacy profile to an authenticated user."""
+        if owner is None or not owner.user_email:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Claiming a persistent browser profile requires an authenticated user.",
+            )
+        if executor_owner_email != owner.user_email:
+            raise BrowserLifecycleError(
+                "browser_unauthorized",
+                "Legacy profiles can be claimed only when the selected executor is privately "
+                "owned by the current user.",
+            )
+        normalized_profile_id = profile_id.strip()
+        if (
+            not normalized_profile_id
+            or normalized_profile_id != Path(normalized_profile_id).name
+            or normalized_profile_id in {".", ".."}
+        ):
+            raise ValueError("browser_claim_profile requires a valid profile_id")
+        if confirm_profile_id != normalized_profile_id:
+            raise ValueError(
+                "confirm_profile_id must exactly match profile_id to claim a legacy profile"
+            )
+
+        async with self._lock:
+            if reclaim_stale:
+                self._reap_orphan_profile_locks()
+            profile_dir = self.profile_base_dir / normalized_profile_id
+            if (
+                not profile_dir.is_dir()
+                or profile_dir.is_symlink()
+                or profile_dir.resolve().parent != self.profile_base_dir.resolve()
+            ):
+                raise BrowserLifecycleError(
+                    "browser_profile_missing",
+                    "Legacy persistent browser profile does not exist.",
+                )
+            if normalized_profile_id in self._reserved_profile_ids or any(
+                session.profile_id == normalized_profile_id
+                for session in [*self._sessions.values(), *self._closing_sessions.values()]
+            ):
+                raise BrowserLifecycleError(
+                    "browser_profile_locked",
+                    "Browser profile is already in use by an active session.",
+                )
+            if self._profile_lock_exists(profile_dir):
+                raise BrowserLifecycleError(
+                    "browser_profile_locked",
+                    "Browser profile is locked by a browser process. Stop Chromium or retry "
+                    "with reclaim_stale=true only for a confirmed crash leftover.",
+                )
+
+            owner_path = profile_dir / ".cognis-owner.json"
+            if owner_path.exists():
+                if self._profile_is_owned_by(profile_dir, owner):
+                    return {
+                        "profile_id": normalized_profile_id,
+                        "ownership_status": "owned",
+                        "claimed": False,
+                    }
+                raise BrowserLifecycleError(
+                    "browser_unauthorized",
+                    "Persistent browser profile belongs to another user or has unreadable "
+                    "ownership metadata.",
+                )
+            if not any(profile_dir.iterdir()):
+                raise BrowserLifecycleError(
+                    "browser_profile_missing",
+                    "Profile is empty and is not an existing legacy profile.",
+                )
+
+            payload = json.dumps(
+                {
+                    "user_email": owner.user_email,
+                    "claimed_at": datetime.now(UTC).isoformat(),
+                    "claim_source": "browser_claim_profile",
+                }
+            )
+            try:
+                with owner_path.open("x") as owner_file:
+                    owner_file.write(payload)
+            except FileExistsError:
+                if not self._profile_is_owned_by(profile_dir, owner):
+                    raise BrowserLifecycleError(
+                        "browser_unauthorized",
+                        "Persistent browser profile was claimed by another user.",
+                    ) from None
+                return {
+                    "profile_id": normalized_profile_id,
+                    "ownership_status": "owned",
+                    "claimed": False,
+                }
+            except OSError as exc:
+                raise BrowserLifecycleError(
+                    "browser_profile_locked",
+                    "Persistent browser profile ownership could not be claimed.",
+                ) from exc
+            return {
+                "profile_id": normalized_profile_id,
+                "ownership_status": "owned",
+                "claimed": True,
+            }
+
+    @staticmethod
+    def _profile_lock_exists(profile_dir: Path) -> bool:
+        lock_path = profile_dir / "SingletonLock"
+        return lock_path.exists() or lock_path.is_symlink()
+
+    def _profile_session_is_in_use(self, session: BrowserSession) -> bool:
+        return any(
+            closing is session for closing in self._closing_sessions.values()
+        ) or not self._session_is_idle(session)
 
     async def ensure_runtime(self, *, headless: bool = True) -> None:
         if not self.enabled:
@@ -335,13 +598,21 @@ class BrowserManager:
         wait_until: str | None = None,
         network_idle_after_dom_seconds: float | None = None,
         browser_settings: dict[str, Any] | None = None,
+        owner: BrowserSessionOwner | None = None,
     ) -> BrowserSession:
         self._ensure_idle_reaper()
         await self._cleanup_idle_sessions()
         resolved_settings = self._resolve_session_settings(browser_settings)
+        self._expired_session_ids.pop(session_id, None)
         async with self._lock:
+            if owner is not None and self._owner_is_terminal(owner):
+                raise BrowserLifecycleError(
+                    "browser_session_terminal",
+                    "Browser session owner has already reached a terminal state.",
+                )
             session = self._sessions.get(session_id)
             if session is not None and not self._session_is_idle(session):
+                self._require_owner(session, owner)
                 session.last_used_at = datetime.now(UTC)
         if session is not None and not self._session_is_idle(session):
             self._ensure_session_settings_compatible(
@@ -349,13 +620,14 @@ class BrowserManager:
                 requested=browser_settings,
                 resolved=resolved_settings,
             )
-            await self._goto(
+            response = await self._goto(
                 session.page,
                 url,
                 navigation_timeout_seconds=navigation_timeout_seconds,
                 wait_until=wait_until,
                 network_idle_after_dom_seconds=network_idle_after_dom_seconds,
             )
+            self.record_navigation_response(session, response, requested_url=url)
             return session
         resolved_mode, resolved_profile_id = self._resolve_profile_settings(
             profile_mode=profile_mode,
@@ -364,13 +636,22 @@ class BrowserManager:
         )
         self._maybe_emit_patchright_persistent_warning(profile_mode=resolved_mode)
         await self._reserve_open_slot(
+            session_id=session_id,
             headless=headless,
             wait_for_slot=wait_for_slot,
             wait_timeout_seconds=wait_timeout_seconds,
+            owner=owner,
         )
+        profile_reserved = False
         try:
             if resolved_mode == "persistent_local":
-                await self._reserve_profile_id(str(resolved_profile_id))
+                if owner is None:
+                    await self._reserve_profile_id(str(resolved_profile_id))
+                else:
+                    await self._reserve_profile_id(str(resolved_profile_id), owner=owner)
+                    profile_reserved = True
+                    self._ensure_profile_owner(str(resolved_profile_id), owner)
+                profile_reserved = True
                 (
                     context,
                     page,
@@ -398,13 +679,15 @@ class BrowserManager:
                     idle_timeout_seconds=session_idle_seconds,
                     runtime_generation=runtime_generation,
                     browser_settings=resolved_settings,
+                    owner=owner,
                 )
                 try:
                     async with self._lock:
                         self._register_session_locked(session)
-                        self._reserved_profile_ids.discard(str(resolved_profile_id))
+                        self._reserved_profile_ids.pop(str(resolved_profile_id), None)
+                        profile_reserved = False
                 except Exception:
-                    await context.close()
+                    await self._close_unregistered_context(session)
                     raise
                 self._log_lifecycle(
                     "browser_session_open",
@@ -413,13 +696,14 @@ class BrowserManager:
                 )
                 try:
                     await self._attach_session_observers(session)
-                    await self._goto(
+                    response = await self._goto(
                         page,
                         url,
                         navigation_timeout_seconds=navigation_timeout_seconds,
                         wait_until=wait_until,
                         network_idle_after_dom_seconds=network_idle_after_dom_seconds,
                     )
+                    self.record_navigation_response(session, response, requested_url=url)
                 except Exception:
                     await self.close_session(session_id)
                     raise
@@ -431,7 +715,11 @@ class BrowserManager:
                 )
                 display = self._active_display(headless=headless)
                 context = await browser.new_context(
-                    **self._context_kwargs(auth_state=auth_state, settings=resolved_settings)
+                    **self._context_kwargs(
+                        auth_state=auth_state,
+                        settings=resolved_settings,
+                        headless=headless,
+                    )
                 )
                 await self._apply_context_defaults(context, settings=resolved_settings)
                 page = await context.new_page()
@@ -448,6 +736,7 @@ class BrowserManager:
                     idle_timeout_seconds=session_idle_seconds,
                     runtime_generation=runtime_generation,
                     browser_settings=resolved_settings,
+                    owner=owner,
                 )
                 try:
                     async with self._lock:
@@ -458,29 +747,37 @@ class BrowserManager:
                         session=session,
                     )
                 except Exception:
-                    await context.close()
+                    await self._close_unregistered_context(session)
                     raise
                 try:
                     await self._attach_session_observers(session)
-                    await self._goto(
+                    response = await self._goto(
                         page,
                         url,
                         navigation_timeout_seconds=navigation_timeout_seconds,
                         wait_until=wait_until,
                         network_idle_after_dom_seconds=network_idle_after_dom_seconds,
                     )
+                    self.record_navigation_response(session, response, requested_url=url)
                 except Exception:
                     await self.close_session(session_id)
                     raise
         finally:
             try:
                 async with self._lock:
-                    if resolved_mode == "persistent_local":
-                        self._reserved_profile_ids.discard(str(resolved_profile_id))
+                    if resolved_mode == "persistent_local" and profile_reserved:
+                        self._reserved_profile_ids.pop(str(resolved_profile_id), None)
                     self._open_in_flight -= 1
                     self._open_in_flight_by_mode[headless] = max(
                         0, self._open_in_flight_by_mode.get(headless, 0) - 1
                     )
+                    self._opening_session_ids.discard(session_id)
+                    if owner is not None:
+                        remaining = self._open_in_flight_owners.get(owner.execution_scope_id, 1) - 1
+                        if remaining > 0:
+                            self._open_in_flight_owners[owner.execution_scope_id] = remaining
+                        else:
+                            self._open_in_flight_owners.pop(owner.execution_scope_id, None)
                     if not headless:
                         self._headed_open_in_flight -= 1
                     # Tear down the per-mode runtime if no sessions of that
@@ -508,28 +805,144 @@ class BrowserManager:
     def get_session(self, session_id: str) -> BrowserSession:
         session = self._sessions.get(session_id)
         if session is None:
-            raise KeyError(f"Unknown browser session: {session_id}")
+            code = (
+                "browser_session_expired"
+                if session_id in self._expired_session_ids
+                else "browser_session_missing"
+            )
+            message = (
+                "Browser session expired due to idleness."
+                if code == "browser_session_expired"
+                else "Browser session does not exist."
+            )
+            raise BrowserLifecycleError(code, message)
         if self._session_is_idle(session):
-            raise KeyError(f"Browser session expired due to idleness: {session_id}")
+            self._record_expired_session(session_id)
+            raise BrowserLifecycleError(
+                "browser_session_expired", "Browser session expired due to idleness."
+            )
         session.last_used_at = datetime.now(UTC)
         return session
 
-    async def get_live_session(self, session_id: str) -> BrowserSession:
+    async def get_live_session(
+        self,
+        session_id: str,
+        *,
+        owner: BrowserSessionOwner | None = None,
+        allow_inspect: bool = False,
+    ) -> BrowserSession:
         await self._cleanup_idle_sessions()
-        return self.get_session(session_id)
+        session = self._sessions.get(session_id)
+        if session is None:
+            code = (
+                "browser_session_expired"
+                if session_id in self._expired_session_ids
+                else "browser_session_missing"
+            )
+            message = (
+                "Browser session expired due to idleness."
+                if code == "browser_session_expired"
+                else "Browser session does not exist."
+            )
+            raise BrowserLifecycleError(code, message)
+        if not allow_inspect or owner is None or not self._can_inspect(session, owner):
+            self._require_owner(session, owner)
+        session.last_used_at = datetime.now(UTC)
+        return session
 
-    async def close_session(self, session_id: str) -> None:
+    async def close_session(
+        self,
+        session_id: str,
+        *,
+        owner: BrowserSessionOwner | None = None,
+        allow_managed_descendant: bool = False,
+        wait_for_in_progress: bool = True,
+    ) -> bool:
         async with self._lock:
-            session = self._sessions.pop(session_id, None)
+            session = self._sessions.get(session_id) or self._closing_sessions.get(session_id)
             if session is None:
-                return
-        await session.context.close()
+                return False
+            if owner is not None:
+                self._require_owner(
+                    session,
+                    owner,
+                    allow_managed_descendant=allow_managed_descendant,
+                )
+            task = self._session_close_tasks.get(session_id)
+            if task is not None and task.done():
+                self._session_close_tasks.pop(session_id, None)
+                task = None
+            elif task is not None and not wait_for_in_progress:
+                raise BrowserLifecycleError(
+                    "browser_session_close_failed",
+                    "Browser session close is still in progress and will be retried.",
+                )
+            if task is None:
+                task = self._retain_session_for_cleanup_locked(session)
+        return await asyncio.shield(task)
+
+    def _retain_session_for_cleanup_locked(
+        self,
+        session: BrowserSession,
+    ) -> asyncio.Task[bool]:
+        self._sessions.pop(session.session_id, None)
+        self._closing_sessions[session.session_id] = session
+        task = asyncio.create_task(
+            self._close_session_once(session),
+            name=f"browser-close-{session.session_id}",
+        )
+        self._session_close_tasks[session.session_id] = task
+        task.add_done_callback(
+            lambda done, sid=session.session_id: asyncio.create_task(
+                self._forget_close_task(sid, done)
+            )
+        )
+        return task
+
+    async def _close_unregistered_context(self, session: BrowserSession) -> None:
+        async with self._lock:
+            retained = self._closing_sessions.get(session.session_id) is session
+            task = self._session_close_tasks.get(session.session_id) if retained else None
+        if task is not None:
+            with contextlib.suppress(BrowserLifecycleError):
+                await asyncio.shield(task)
+            return
+        try:
+            await asyncio.wait_for(session.context.close(), timeout=15.0)
+        except Exception as exc:
+            async with self._lock:
+                if session.session_id not in self._closing_sessions:
+                    task = self._retain_session_for_cleanup_locked(session)
+                else:
+                    task = self._session_close_tasks[session.session_id]
+            with contextlib.suppress(BrowserLifecycleError):
+                await asyncio.shield(task)
+            raise BrowserLifecycleError(
+                "browser_session_close_failed",
+                "Rejected browser context cleanup failed and remains retained.",
+            ) from exc
+
+    async def _close_session_once(self, session: BrowserSession) -> bool:
+        try:
+            await asyncio.wait_for(session.context.close(), timeout=15.0)
+        except Exception as exc:
+            logger.warning(
+                "browser: session close failed; retaining for retry",
+                extra={"extra_data": {"session_id": session.session_id}},
+                exc_info=True,
+            )
+            raise BrowserLifecycleError(
+                "browser_session_close_failed",
+                "Browser session close failed and remains pending for retry.",
+            ) from exc
+        async with self._lock:
+            self._closing_sessions.pop(session.session_id, None)
         self._log_lifecycle("browser_session_close", outcome="success", session=session)
         async with self._lock:
             # Tear down the per-mode browser once all sessions of that mode
             # are gone and no open is in flight for that mode.
             was_headless = session.headless
-            live_same_mode = any(s.headless == was_headless for s in self._sessions.values())
+            live_same_mode = self._has_live_sessions_for_mode_locked(was_headless)
             in_flight_same_mode = self._open_in_flight_by_mode.get(was_headless, 0) > 0
             if not live_same_mode and not in_flight_same_mode:
                 await self._stop_playwright_locked(headless=was_headless)
@@ -539,29 +952,152 @@ class BrowserManager:
                 and not self._has_live_headed_runtime_locked()
             ):
                 await self._stop_virtual_display_locked()
+        return True
+
+    async def _forget_close_task(
+        self,
+        session_id: str,
+        task: asyncio.Task[bool],
+    ) -> None:
+        if not task.cancelled():
+            task.exception()
+        async with self._lock:
+            if self._session_close_tasks.get(session_id) is task:
+                self._session_close_tasks.pop(session_id, None)
+
+    async def mark_owner_terminal(self, owner: BrowserSessionOwner) -> int:
+        """Record a trusted terminal scope and close all sessions it owns."""
+        if not owner.execution_scope_id or not owner.user_email:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Terminal browser cleanup requires an authenticated execution owner.",
+            )
+        async with self._lock:
+            self._terminal_owners[owner.execution_scope_id] = owner
+            owner_open_in_flight = self._open_in_flight_owners.get(owner.execution_scope_id, 0) > 0
+            session_ids = [
+                session.session_id
+                for session in [*self._sessions.values(), *self._closing_sessions.values()]
+                if self._owners_match(session.owner, owner)
+            ]
+        results = await asyncio.gather(
+            *(
+                self.close_session(
+                    session_id,
+                    owner=owner,
+                    wait_for_in_progress=False,
+                )
+                for session_id in session_ids
+            ),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures or owner_open_in_flight:
+            raise BrowserLifecycleError(
+                "browser_session_close_failed",
+                "Terminal browser cleanup is incomplete and will be retried.",
+            ) from (failures[0] if failures else None)
+        return sum(result is True for result in results)
 
     async def cleanup(self) -> None:
+        self._disposing = True
         if self._idle_reaper_task is not None:
             self._idle_reaper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._idle_reaper_task
             self._idle_reaper_task = None
-        for session_id in list(self._sessions):
-            await self.close_session(session_id)
+        opens_finished = await self._wait_for_open_operations(timeout_seconds=1.0)
+        if not opens_finished:
+            teardown_failures = await self._force_runtime_teardown()
+            if teardown_failures:
+                raise BrowserLifecycleError(
+                    "browser_cleanup_failed",
+                    "Browser manager could not interrupt in-progress opens.",
+                ) from teardown_failures[0]
+            if not await self._wait_for_open_operations(timeout_seconds=15.0):
+                raise BrowserLifecycleError(
+                    "browser_cleanup_failed",
+                    "Browser manager cleanup could not stop in-progress opens.",
+                )
         async with self._lock:
-            await self._close_all_browsers_locked()
-            await self._stop_all_playwright_locked()
-            await self._stop_virtual_display_locked()
+            session_ids = list(dict.fromkeys([*self._sessions, *self._closing_sessions]))
+        close_results = await asyncio.gather(
+            *(self.close_session(session_id) for session_id in session_ids),
+            return_exceptions=True,
+        )
+        close_failures = [result for result in close_results if isinstance(result, BaseException)]
+        if close_failures:
+            async with self._lock:
+                retry_session_ids = list(self._closing_sessions)
+            retry_results = await asyncio.gather(
+                *(self.close_session(session_id) for session_id in retry_session_ids),
+                return_exceptions=True,
+            )
+            close_failures = [
+                result for result in retry_results if isinstance(result, BaseException)
+            ]
 
-    async def storage_state(self, session_id: str) -> dict[str, Any]:
-        session = await self.get_live_session(session_id)
+        teardown_failures = await self._force_runtime_teardown()
+        if teardown_failures:
+            raise BrowserLifecycleError(
+                "browser_cleanup_failed",
+                "Browser manager forced teardown is incomplete; resources remain retained.",
+            ) from teardown_failures[0]
+
+        async with self._lock:
+            self._sessions.clear()
+            self._closing_sessions.clear()
+            self._reserved_profile_ids.clear()
+        if close_failures:
+            logger.warning(
+                "browser: session close failed before successful forced runtime teardown",
+                extra={"extra_data": {"failed_session_count": len(close_failures)}},
+            )
+
+    async def _force_runtime_teardown(self) -> list[BaseException]:
+        teardown_failures: list[BaseException] = []
+        async with self._lock:
+            modes = list(
+                dict.fromkeys(
+                    [
+                        *self._playwrights,
+                        *self._browsers,
+                        *(session.headless for session in self._closing_sessions.values()),
+                    ]
+                )
+            )
+        for mode in modes:
+            try:
+                async with self._lock:
+                    await asyncio.wait_for(
+                        self._stop_playwright_locked(headless=mode),
+                        timeout=15.0,
+                    )
+            except Exception as exc:
+                teardown_failures.append(exc)
+        try:
+            async with self._lock:
+                await asyncio.wait_for(self._stop_virtual_display_locked(), timeout=15.0)
+        except Exception as exc:
+            teardown_failures.append(exc)
+        return teardown_failures
+
+    async def storage_state(
+        self, session_id: str, *, owner: BrowserSessionOwner | None = None
+    ) -> dict[str, Any]:
+        session = await self.get_live_session(session_id, owner=owner)
         state: dict[str, Any] = await session.context.storage_state()
         return state
 
     async def get_console_events(
-        self, session_id: str, *, level: str = "all", limit: int = 100
+        self,
+        session_id: str,
+        *,
+        level: str = "all",
+        limit: int = 100,
+        owner: BrowserSessionOwner | None = None,
     ) -> list[dict[str, Any]]:
-        session = await self.get_live_session(session_id)
+        session = await self.get_live_session(session_id, owner=owner)
         events = session.console_events
         if level != "all":
             normalized = level.lower()
@@ -576,8 +1112,9 @@ class BrowserManager:
         *,
         limit: int = 100,
         resource_types: list[str] | None = None,
+        owner: BrowserSessionOwner | None = None,
     ) -> list[dict[str, Any]]:
-        session = await self.get_live_session(session_id)
+        session = await self.get_live_session(session_id, owner=owner)
         events = session.network_events
         if resource_types:
             allowed = {item.lower() for item in resource_types}
@@ -587,22 +1124,47 @@ class BrowserManager:
         return events[-max(1, limit) :]
 
     async def _cleanup_idle_sessions(self) -> None:
-        if self.idle_timeout_seconds <= 0:
-            return
-        stale = [
-            session_id
-            for session_id, session in self._sessions.items()
-            if self._session_is_idle(session)
-        ]
-        for session_id in stale:
-            await self.close_session(session_id)
+        async with self._lock:
+            stale = [
+                session for session in self._sessions.values() if self._session_is_idle(session)
+            ]
+        await asyncio.sleep(0)
+        for session in stale:
+            async with self._lock:
+                if self._sessions.get(session.session_id) is not session:
+                    continue
+                self._sessions.pop(session.session_id)
+                self._record_expired_session(session.session_id)
+            await session.context.close()
+            self._log_lifecycle("browser_session_close", outcome="success", session=session)
+            async with self._lock:
+                was_headless = session.headless
+                live_same_mode = any(
+                    item.headless == was_headless for item in self._sessions.values()
+                )
+                in_flight_same_mode = self._open_in_flight_by_mode.get(was_headless, 0) > 0
+                if not live_same_mode and not in_flight_same_mode:
+                    await self._stop_playwright_locked(headless=was_headless)
+                if (
+                    self._headed_open_in_flight == 0
+                    and not self._has_live_headed_sessions_locked()
+                    and not self._has_live_headed_runtime_locked()
+                ):
+                    await self._stop_virtual_display_locked()
+
+    def _record_expired_session(self, session_id: str) -> None:
+        self._expired_session_ids[session_id] = time.monotonic()
+        while len(self._expired_session_ids) > 256:
+            self._expired_session_ids.pop(next(iter(self._expired_session_ids)), None)
 
     async def _reserve_open_slot(
         self,
         *,
+        session_id: str | None = None,
         headless: bool,
         wait_for_slot: bool,
         wait_timeout_seconds: float,
+        owner: BrowserSessionOwner | None = None,
     ) -> None:
         """Reserve a session slot, optionally waiting until one is free.
 
@@ -614,12 +1176,17 @@ class BrowserManager:
         """
         if not wait_for_slot:
             async with self._lock:
-                if len(self._sessions) + self._open_in_flight >= self.max_sessions:
+                self._validate_open_reservation_locked(session_id, owner)
+                if (
+                    len(self._sessions) + len(self._closing_sessions) + self._open_in_flight
+                    >= self.max_sessions
+                ):
                     raise RuntimeError("Browser session limit exceeded")
                 self._open_in_flight += 1
                 self._open_in_flight_by_mode[headless] = (
                     self._open_in_flight_by_mode.get(headless, 0) + 1
                 )
+                self._record_open_reservation_locked(session_id, owner)
                 if not headless:
                     self._headed_open_in_flight += 1
             return
@@ -627,11 +1194,16 @@ class BrowserManager:
         deadline = asyncio.get_running_loop().time() + max(0.0, wait_timeout_seconds)
         while True:
             async with self._lock:
-                if len(self._sessions) + self._open_in_flight < self.max_sessions:
+                self._validate_open_reservation_locked(session_id, owner)
+                if (
+                    len(self._sessions) + len(self._closing_sessions) + self._open_in_flight
+                    < self.max_sessions
+                ):
                     self._open_in_flight += 1
                     self._open_in_flight_by_mode[headless] = (
                         self._open_in_flight_by_mode.get(headless, 0) + 1
                     )
+                    self._record_open_reservation_locked(session_id, owner)
                     if not headless:
                         self._headed_open_in_flight += 1
                     return
@@ -644,14 +1216,57 @@ class BrowserManager:
             # other tasks releasing slots via ``close_session``.
             await asyncio.sleep(min(0.2, max(0.05, deadline - now)))
 
-    async def _reserve_profile_id(self, profile_id: str) -> None:
+    def _validate_open_reservation_locked(
+        self,
+        session_id: str | None,
+        owner: BrowserSessionOwner | None,
+    ) -> None:
+        if self._disposing or (owner is not None and self._owner_is_terminal(owner)):
+            raise BrowserLifecycleError(
+                "browser_session_terminal",
+                "Browser session owner or manager has reached a terminal state.",
+            )
+        if session_id is not None and (
+            session_id in self._opening_session_ids
+            or session_id in self._sessions
+            or session_id in self._closing_sessions
+        ):
+            raise RuntimeError(f"Browser session already exists: {session_id}")
+
+    def _record_open_reservation_locked(
+        self,
+        session_id: str | None,
+        owner: BrowserSessionOwner | None,
+    ) -> None:
+        if session_id is not None:
+            self._opening_session_ids.add(session_id)
+        if owner is not None:
+            scope_id = owner.execution_scope_id
+            self._open_in_flight_owners[scope_id] = self._open_in_flight_owners.get(scope_id, 0) + 1
+
+    async def _wait_for_open_operations(self, *, timeout_seconds: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while True:
+            async with self._lock:
+                if self._open_in_flight == 0:
+                    return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+    async def _reserve_profile_id(
+        self, profile_id: str, *, owner: BrowserSessionOwner | None = None
+    ) -> None:
         async with self._lock:
             if profile_id in self._reserved_profile_ids or any(
                 session.profile_mode == "persistent_local" and session.profile_id == profile_id
-                for session in self._sessions.values()
+                for session in [*self._sessions.values(), *self._closing_sessions.values()]
             ):
-                raise RuntimeError(f"Browser profile already in use: {profile_id}")
-            self._reserved_profile_ids.add(profile_id)
+                raise BrowserLifecycleError(
+                    "browser_profile_locked",
+                    "Browser profile is locked and already in use by another active session.",
+                )
+            self._reserved_profile_ids[profile_id] = owner
 
     def _session_is_idle(self, session: BrowserSession | Any) -> bool:
         timeout_seconds = self._session_idle_timeout_seconds(session)
@@ -667,7 +1282,101 @@ class BrowserManager:
         configured = getattr(session, "idle_timeout_seconds", None)
         if isinstance(configured, int | float) and configured > 0:
             return float(configured)
+        if getattr(session, "lifecycle", "explicit") == "ephemeral":
+            return float(BROWSER_DEFAULT_EPHEMERAL_IDLE_TIMEOUT_SECONDS)
         return float(self.idle_timeout_seconds)
+
+    def _can_inspect(self, session: BrowserSession, owner: BrowserSessionOwner) -> bool:
+        session_owner = session.owner
+        if session_owner is None:
+            return False
+        return session_owner.execution_scope_id == owner.execution_scope_id or (
+            session_owner.parent_session_id == owner.execution_scope_id
+            and session_owner.user_email == owner.user_email
+        )
+
+    @staticmethod
+    def _owners_match(
+        left: BrowserSessionOwner | None,
+        right: BrowserSessionOwner,
+    ) -> bool:
+        return bool(
+            left is not None
+            and left.execution_scope_id == right.execution_scope_id
+            and left.user_email == right.user_email
+        )
+
+    def _owner_is_terminal(self, owner: BrowserSessionOwner) -> bool:
+        terminal = self._terminal_owners.get(owner.execution_scope_id)
+        return bool(terminal is not None and terminal.user_email == owner.user_email)
+
+    def _require_owner(
+        self,
+        session: BrowserSession,
+        owner: BrowserSessionOwner | None,
+        *,
+        allow_managed_descendant: bool = False,
+    ) -> None:
+        if owner is None:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Browser lifecycle ownership is unavailable for this execution.",
+            )
+        session_owner = session.owner
+        if session_owner is None:
+            raise BrowserLifecycleError(
+                "browser_unauthorized",
+                "This legacy browser session is not owned by the current execution.",
+            )
+        if session_owner.execution_scope_id == owner.execution_scope_id:
+            return
+        if (
+            allow_managed_descendant
+            and session_owner.parent_session_id == owner.execution_scope_id
+            and session_owner.user_email == owner.user_email
+        ):
+            if self._owner_is_terminal(session_owner):
+                return
+            raise BrowserLifecycleError(
+                "browser_session_active",
+                "Managed descendant browser session is still active and cannot be released.",
+            )
+        raise BrowserLifecycleError(
+            "browser_unauthorized",
+            "Browser session belongs to another active execution.",
+        )
+
+    def _safe_session_metadata(
+        self,
+        session: BrowserSession,
+        *,
+        caller: BrowserSessionOwner,
+        state: str = "active",
+    ) -> dict[str, Any]:
+        session_settings = getattr(session, "browser_settings", None)
+        return {
+            "session_id": session.session_id,
+            "url": getattr(session.page, "url", ""),
+            "profile_mode": session.profile_mode,
+            "profile_id": session.profile_id,
+            "headless": session.headless,
+            "display": session.display,
+            "last_used_at": session.last_used_at.isoformat(),
+            "lifecycle": getattr(session, "lifecycle", "explicit"),
+            "idle_deadline_at": self._session_idle_deadline_at(session),
+            "auth_origin": session.auth_origin,
+            "console_event_count": len(getattr(session, "console_events", [])),
+            "network_event_count": len(getattr(session, "network_events", [])),
+            "browser_settings": (
+                session_settings.as_dict() if session_settings is not None else None
+            ),
+            "owner": (
+                session.owner.safe_dict(caller_scope_id=caller.execution_scope_id)
+                if session.owner is not None
+                else None
+            ),
+            "state": state,
+        }
 
     def _session_idle_deadline_at(self, session: BrowserSession | Any) -> str | None:
         timeout_seconds = self._session_idle_timeout_seconds(session)
@@ -747,7 +1456,7 @@ class BrowserManager:
         navigation_timeout_seconds: float | None = None,
         wait_until: str | None = None,
         network_idle_after_dom_seconds: float | None = None,
-    ) -> None:
+    ) -> Any | None:
         timeout_seconds = (
             float(navigation_timeout_seconds)
             if navigation_timeout_seconds is not None and navigation_timeout_seconds > 0
@@ -758,7 +1467,11 @@ class BrowserManager:
         )
         if wait_until_value not in {"commit", "domcontentloaded", "load", "networkidle"}:
             wait_until_value = BROWSER_DEFAULT_WAIT_UNTIL
-        await page.goto(url, timeout=int(timeout_seconds * 1000), wait_until=wait_until_value)
+        response = await page.goto(
+            url,
+            timeout=int(timeout_seconds * 1000),
+            wait_until=wait_until_value,
+        )
         soft_wait = (
             float(network_idle_after_dom_seconds)
             if network_idle_after_dom_seconds is not None
@@ -767,6 +1480,20 @@ class BrowserManager:
         if soft_wait > 0 and wait_until_value != "networkidle":
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("networkidle", timeout=int(soft_wait * 1000))
+        return response
+
+    @staticmethod
+    def record_navigation_response(
+        session: BrowserSession,
+        response: Any | None,
+        *,
+        requested_url: str,
+    ) -> None:
+        session.navigation_url = str(getattr(response, "url", "") or requested_url)
+        status = getattr(response, "status", None)
+        session.navigation_status = int(status) if isinstance(status, int) else None
+        ok = getattr(response, "ok", None)
+        session.navigation_ok = bool(ok) if isinstance(ok, bool) else None
 
     def _bump_session_activity(self, session: BrowserSession) -> None:
         now = time.monotonic()
@@ -779,34 +1506,87 @@ class BrowserManager:
         if not self.profile_base_dir.exists():
             return
         for lock_path in self.profile_base_dir.glob("**/SingletonLock"):
-            if not self._profile_lock_looks_orphaned(lock_path):
+            identity = self._orphaned_profile_lock_identity(lock_path)
+            if identity is None:
                 continue
             try:
-                lock_path.unlink()
-                logger.warning(
-                    "browser: removed orphaned profile lock",
-                    extra={"extra_data": {"path": str(lock_path)}},
-                )
+                if self._remove_profile_lock_if_same(lock_path, identity):
+                    logger.warning(
+                        "browser: removed orphaned profile lock",
+                        extra={"extra_data": {"path": str(lock_path)}},
+                    )
             except OSError:
                 logger.debug("browser: failed to remove orphaned profile lock", exc_info=True)
 
+    def _remove_profile_lock_if_same(
+        self,
+        lock_path: Path,
+        expected_identity: tuple[int, int, int, int, str | None],
+    ) -> bool:
+        quarantine = lock_path.with_name(f".{lock_path.name}.stale-{uuid.uuid4().hex}")
+        lock_path.rename(quarantine)
+        if self._profile_lock_identity(quarantine) == expected_identity:
+            quarantine.unlink()
+            return True
+        if not lock_path.exists() and not lock_path.is_symlink():
+            try:
+                os.link(quarantine, lock_path, follow_symlinks=False)
+                quarantine.unlink()
+            except (FileExistsError, NotImplementedError, OSError):
+                logger.warning(
+                    "browser: preserved replaced profile lock in quarantine",
+                    extra={
+                        "extra_data": {
+                            "path": str(lock_path),
+                            "quarantine": str(quarantine),
+                        }
+                    },
+                )
+        return False
+
     def _profile_lock_looks_orphaned(self, lock_path: Path) -> bool:
+        return self._orphaned_profile_lock_identity(lock_path) is not None
+
+    def _orphaned_profile_lock_identity(
+        self,
+        lock_path: Path,
+    ) -> tuple[int, int, int, int, str | None] | None:
         try:
-            if lock_path.is_symlink():
-                target = os.readlink(lock_path)
-                pid_match = re.search(r"(?:^|[^0-9])(\d{2,})(?:[^0-9]|$)", target)
-                if pid_match:
-                    return not self._pid_is_alive(int(pid_match.group(1)))
-                return True
-            if not lock_path.exists():
-                return False
+            identity = self._profile_lock_identity(lock_path)
+            if identity is None:
+                return None
+            target = identity[4]
+            if target is not None:
+                pid_match = re.search(r"(\d+)\s*$", target)
+                orphaned = not self._pid_is_alive(int(pid_match.group(1))) if pid_match else True
+                return (
+                    identity
+                    if orphaned and self._profile_lock_identity(lock_path) == identity
+                    else None
+                )
             if time.time() - lock_path.stat().st_mtime < 24 * 60 * 60:
-                return False
+                return None
             content = lock_path.read_text(errors="ignore")[:200]
             pid_match = re.search(r"\b(\d{2,})\b", content)
-            return not (pid_match and self._pid_is_alive(int(pid_match.group(1))))
+            orphaned = not (pid_match and self._pid_is_alive(int(pid_match.group(1))))
+            return (
+                identity
+                if orphaned and self._profile_lock_identity(lock_path) == identity
+                else None
+            )
         except OSError:
-            return False
+            return None
+
+    @staticmethod
+    def _profile_lock_identity(
+        lock_path: Path,
+    ) -> tuple[int, int, int, int, str | None] | None:
+        try:
+            stat = lock_path.lstat()
+            target = os.readlink(lock_path) if lock_path.is_symlink() else None
+            return (stat.st_dev, stat.st_ino, stat.st_mode, stat.st_ctime_ns, target)
+        except OSError:
+            return None
 
     def _pid_is_alive(self, pid: int) -> bool:
         if pid <= 0:
@@ -818,6 +1598,69 @@ class BrowserManager:
             return False
         except PermissionError:
             return True
+
+    def _ensure_profile_owner(self, profile_id: str, owner: BrowserSessionOwner) -> None:
+        if not owner.user_email:
+            raise BrowserLifecycleError(
+                "browser_unauthenticated",
+                "Persistent browser profiles require an authenticated user owner.",
+            )
+        profile_dir = self.profile_base_dir / profile_id
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        owner_path = profile_dir / ".cognis-owner.json"
+        if owner_path.exists():
+            try:
+                stored = json.loads(owner_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise BrowserLifecycleError(
+                    "browser_profile_locked",
+                    "Persistent browser profile ownership metadata is unreadable.",
+                ) from exc
+            if stored.get("user_email") != owner.user_email:
+                raise BrowserLifecycleError(
+                    "browser_unauthorized",
+                    "Persistent browser profile belongs to another user.",
+                ) from None
+            return
+        if any(profile_dir.iterdir()):
+            raise BrowserLifecycleError(
+                "browser_profile_locked",
+                "Legacy persistent browser profile has no ownership metadata; "
+                "inspect it with browser_list_profiles(include_unclaimed=true), then use "
+                "browser_claim_profile after the user or operator verifies ownership.",
+            )
+        payload = json.dumps(
+            {"user_email": owner.user_email, "claimed_at": datetime.now(UTC).isoformat()}
+        )
+        try:
+            with owner_path.open("x") as owner_file:
+                owner_file.write(payload)
+        except FileExistsError:
+            try:
+                stored = json.loads(owner_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise BrowserLifecycleError(
+                    "browser_profile_locked",
+                    "Persistent browser profile ownership metadata is unreadable.",
+                ) from exc
+            if stored.get("user_email") != owner.user_email:
+                raise BrowserLifecycleError(
+                    "browser_unauthorized",
+                    "Persistent browser profile belongs to another user.",
+                ) from None
+        except OSError as exc:
+            raise BrowserLifecycleError(
+                "browser_profile_locked",
+                "Persistent browser profile ownership could not be reserved.",
+            ) from exc
+
+    def _profile_is_owned_by(self, profile_dir: Path, owner: BrowserSessionOwner) -> bool:
+        owner_path = profile_dir / ".cognis-owner.json"
+        try:
+            stored = json.loads(owner_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        return bool(owner.user_email and stored.get("user_email") == owner.user_email)
 
     def _resolve_profile_base_dir(self, configured: str | None) -> Path:
         if configured:
@@ -1028,6 +1871,7 @@ class BrowserManager:
         *,
         auth_state: dict[str, Any] | None = None,
         settings: BrowserSessionSettings | None = None,
+        headless: bool | None = None,
     ) -> dict[str, Any]:
         settings = settings or self._resolve_session_settings()
         kwargs: dict[str, Any] = {
@@ -1040,8 +1884,10 @@ class BrowserManager:
         if timezone_id:
             kwargs["timezone_id"] = timezone_id
         if settings.stealth_enabled:
-            if self.realistic_user_agent:
-                kwargs["user_agent"] = BROWSER_DEFAULT_USER_AGENT
+            if self.realistic_user_agent and headless is not None:
+                user_agent = self._browser_user_agents.get(headless)
+                if user_agent:
+                    kwargs["user_agent"] = user_agent
             if self.default_accept_language:
                 kwargs["extra_http_headers"] = {
                     "Accept-Language": self.default_accept_language,
@@ -1216,14 +2062,36 @@ class BrowserManager:
                 runtime_generation = self._runtime_generation
                 browser_launcher = getattr(self._playwrights[headless], self.engine)
                 launch_kwargs = self._launch_kwargs(headless=headless, display=display)
+            if (
+                self.channel is None
+                and settings.stealth_enabled
+                and self.realistic_user_agent
+                and headless not in self._browser_user_agents
+            ):
+                user_agent = await self._probe_browser_user_agent(
+                    str(getattr(browser_launcher, "executable_path", "") or "")
+                )
+                if user_agent:
+                    self._browser_user_agents[headless] = user_agent
             try:
                 context = await browser_launcher.launch_persistent_context(
                     str(user_data_dir),
                     **launch_kwargs,
-                    **self._context_kwargs(settings=settings),
+                    **self._context_kwargs(
+                        settings=settings,
+                        # A configured browser channel may select a different executable
+                        # than Playwright's bundled path. Preserve that browser's native,
+                        # internally coherent UA instead of guessing its identity.
+                        headless=headless if self.channel is None else None,
+                    ),
                 )
                 break
             except Exception as exc:
+                if self._persistent_profile_is_locked(exc):
+                    raise BrowserLifecycleError(
+                        "browser_profile_locked",
+                        "Browser profile is locked by another browser process.",
+                    ) from exc
                 failure_category = self._classify_launch_failure(exc, phase="persistent_launch")
                 if retry_count >= 1 or failure_category is None:
                     self._log_lifecycle(
@@ -1253,6 +2121,41 @@ class BrowserManager:
         )
         return context, page, user_data_dir, display, runtime_generation
 
+    @staticmethod
+    def _persistent_profile_is_locked(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "processsingleton",
+                "singletonlock",
+                "profile appears to be in use",
+                "user data directory is already in use",
+                "failed to create a process singleton",
+            )
+        )
+
+    @staticmethod
+    async def _probe_browser_user_agent(executable_path: str) -> str | None:
+        if not executable_path:
+            return None
+        process: asyncio.subprocess.Process | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                executable_path,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except Exception:
+            if process is not None and process.returncode is None:
+                process.kill()
+                with contextlib.suppress(Exception):
+                    await process.wait()
+            return None
+        return _coherent_chromium_user_agent(stdout.decode(errors="replace"))
+
     def _launch_env(self, display: str | None) -> dict[str, str]:
         env = dict(os.environ)
         if display is None:
@@ -1262,29 +2165,48 @@ class BrowserManager:
         return env
 
     def _register_session_locked(self, session: BrowserSession) -> None:
-        if session.session_id in self._sessions:
+        if self._disposing or (
+            session.owner is not None and self._owner_is_terminal(session.owner)
+        ):
+            if session.session_id not in self._closing_sessions:
+                self._retain_session_for_cleanup_locked(session)
+            raise BrowserLifecycleError(
+                "browser_session_terminal",
+                "Browser session owner or manager reached a terminal state during startup.",
+            )
+        if session.session_id in self._sessions or session.session_id in self._closing_sessions:
             raise RuntimeError(f"Browser session already exists: {session.session_id}")
-        if len(self._sessions) >= self.max_sessions:
+        if len(self._sessions) + len(self._closing_sessions) >= self.max_sessions:
             raise RuntimeError("Browser session limit exceeded")
         self._sessions[session.session_id] = session
 
     def _has_live_headed_sessions_locked(self) -> bool:
-        return any(not session.headless for session in self._sessions.values())
+        return any(
+            not session.headless
+            for session in [*self._sessions.values(), *self._closing_sessions.values()]
+        )
 
     def _has_live_headed_runtime_locked(self) -> bool:
         return self._browsers.get(False) is not None or self._playwrights.get(False) is not None
 
     def _has_live_sessions_for_generation_locked(self, generation: int) -> bool:
-        return any(session.runtime_generation == generation for session in self._sessions.values())
+        return any(
+            session.runtime_generation == generation
+            for session in [*self._sessions.values(), *self._closing_sessions.values()]
+        )
 
     def _has_live_sessions_for_mode_locked(self, headless: bool) -> bool:
-        return any(session.headless == headless for session in self._sessions.values())
+        return any(
+            session.headless == headless
+            for session in [*self._sessions.values(), *self._closing_sessions.values()]
+        )
 
     async def _close_shared_browser_locked(self, headless: bool | None = None) -> None:
         """Close the per-mode browser, or both if headless is None."""
         modes = [True, False] if headless is None else [headless]
         for mode in modes:
             browser = self._browsers.pop(mode, None)
+            self._browser_user_agents.pop(mode, None)
             if browser is not None:
                 with contextlib.suppress(Exception):
                     await browser.close()
@@ -1332,6 +2254,7 @@ class BrowserManager:
                     **self._launch_kwargs(headless=headless, display=display)
                 )
                 self._browsers[headless] = browser
+                self._cache_browser_user_agent(headless=headless, browser=browser)
                 self._browser = browser  # diagnostic alias
                 self._runtime_generation += 1
                 self._browser_generations[headless] = self._runtime_generation
@@ -1361,6 +2284,14 @@ class BrowserManager:
                     headless=headless,
                     retry_count=retry_count,
                 )
+
+    def _cache_browser_user_agent(self, *, headless: bool, browser: Any) -> None:
+        self._browser_user_agents.pop(headless, None)
+        if self.channel is not None:
+            return
+        user_agent = _coherent_chromium_user_agent(str(getattr(browser, "version", "") or ""))
+        if user_agent:
+            self._browser_user_agents[headless] = user_agent
 
     async def _recover_retryable_launch_failure_locked(
         self,
@@ -1540,3 +2471,91 @@ class BrowserManager:
         _attach_page_observers(page)
         if hasattr(session.context, "on"):
             session.context.on("page", _attach_page_observers)
+
+
+class BrowserManagerCleanupRetainer:
+    """Own managers whose forced cleanup has not succeeded yet."""
+
+    def __init__(self) -> None:
+        self._managers: set[BrowserManager] = set()
+        self._tasks: dict[BrowserManager, asyncio.Task[None]] = {}
+
+    @property
+    def managers(self) -> tuple[BrowserManager, ...]:
+        return tuple(self._managers)
+
+    def retain(self, manager: BrowserManager) -> None:
+        if manager in self._managers:
+            return
+        self._managers.add(manager)
+        task = asyncio.create_task(
+            self._retry_cleanup(manager),
+            name=f"browser-manager-cleanup-{id(manager)}",
+        )
+        self._tasks[manager] = task
+
+    async def cleanup_now(self, manager: BrowserManager) -> bool:
+        try:
+            await manager.cleanup()
+        except asyncio.CancelledError:
+            self.retain(manager)
+            return False
+        except Exception:
+            self.retain(manager)
+            return False
+        self._managers.discard(manager)
+        task = self._tasks.pop(manager, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        return True
+
+    async def _retry_cleanup(self, manager: BrowserManager) -> None:
+        delay = 0.25
+        while manager in self._managers:
+            try:
+                await manager.cleanup()
+            except asyncio.CancelledError:
+                if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                    raise
+                logger.warning(
+                    "browser: retained manager cleanup was interrupted",
+                    extra={"extra_data": {"manager_id": id(manager)}},
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5.0)
+            except Exception:
+                logger.warning(
+                    "browser: retained manager cleanup remains pending",
+                    extra={"extra_data": {"manager_id": id(manager)}},
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 5.0)
+            else:
+                self._managers.discard(manager)
+                break
+        self._tasks.pop(manager, None)
+
+    async def mark_owner_terminal(self, owner: BrowserSessionOwner) -> int:
+        results = await asyncio.gather(
+            *(manager.mark_owner_terminal(owner) for manager in self.managers),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BrowserLifecycleError(
+                "browser_session_close_failed",
+                "Retained browser manager cleanup remains incomplete.",
+            ) from failures[0]
+        return sum(int(result) for result in results)
+
+    async def wait_until_empty(self) -> None:
+        """Keep the outer runtime alive until every retained manager is cleaned."""
+        while self._managers:
+            tasks = list(self._tasks.values())
+            if not tasks:
+                for manager in self.managers:
+                    self._managers.discard(manager)
+                    self.retain(manager)
+                tasks = list(self._tasks.values())
+            await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))

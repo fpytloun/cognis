@@ -398,8 +398,19 @@ describe('provider presets', () => {
       supports_tool_search: true,
       supports_openai_namespace_tools: true,
       supports_openai_allowed_tools: true,
+      supports_openai_apply_patch: true,
+      supported_image_mime_types: ['image/png'],
+      supported_audio_mime_types: ['audio/wav'],
       input_cost_per_mtok: 2.5,
-      output_cost_per_mtok: 10.0
+      output_cost_per_mtok: 10.0,
+      provider_metadata: {
+        provider: 'ollama',
+        details: { parameter_size: '7B', quantization_level: 'Q4_K_M' }
+      },
+      runtime_metadata: {
+        provider: 'ollama',
+        num_ctx: 32768
+      }
     };
     const richProvider: LLMProvider = {
       provider_id: 'rich',
@@ -425,7 +436,18 @@ describe('provider presets', () => {
     expect(form.models[0].supports_vision).toBe(true);
     expect(form.models[0].supports_openai_namespace_tools).toBe(true);
     expect(form.models[0].supports_openai_allowed_tools).toBe(true);
+    expect(form.models[0].supports_openai_apply_patch).toBe(true);
+    expect(form.models[0].supported_image_mime_types).toEqual(['image/png']);
+    expect(form.models[0].supported_audio_mime_types).toEqual(['audio/wav']);
     expect(form.models[0].input_cost_per_mtok).toBe(2.5);
+    expect(form.models[0].provider_metadata).toEqual({
+      provider: 'ollama',
+      details: { parameter_size: '7B', quantization_level: 'Q4_K_M' }
+    });
+    expect(form.models[0].runtime_metadata).toEqual({
+      provider: 'ollama',
+      num_ctx: 32768
+    });
 
     // Save and verify properties are preserved
     const payload = providerFormToPayload(form);
@@ -439,7 +461,18 @@ describe('provider presets', () => {
     expect(models[0].supports_tool_search).toBe(true);
     expect(models[0].supports_openai_namespace_tools).toBe(true);
     expect(models[0].supports_openai_allowed_tools).toBe(true);
+    expect(models[0].supports_openai_apply_patch).toBe(true);
+    expect(models[0].supported_image_mime_types).toEqual(['image/png']);
+    expect(models[0].supported_audio_mime_types).toEqual(['audio/wav']);
     expect(models[0].input_cost_per_mtok).toBe(2.5);
+    expect(models[0].provider_metadata).toEqual({
+      provider: 'ollama',
+      details: { parameter_size: '7B', quantization_level: 'Q4_K_M' }
+    });
+    expect(models[0].runtime_metadata).toEqual({
+      provider: 'ollama',
+      num_ctx: 32768
+    });
   });
 
   it('advanced settings are merged into config on save', () => {

@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import threading
+import time
+from pathlib import Path
+
 import pytest
 
 from cognis.core.tool_output_store import FilesystemToolOutputBackend, ToolOutputStore
@@ -74,6 +80,80 @@ async def test_search_with_context_lines(store: ToolOutputStore) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content", "record", "expected"),
+    [
+        (
+            '{"data":{"items":[1,2]}}',
+            {
+                "anchor_id": "anc_json",
+                "anchor": "json:data",
+                "kind": "json.array",
+                "format": "json",
+                "label": "Items",
+                "locator": {"type": "stored_json", "pointer": "/data/items"},
+                "recovery_op": "read_json",
+                "priority": 80,
+                "promote": True,
+            },
+            "[\n  1,\n  2\n]",
+        ),
+        (
+            "name,value\na,1\nb,2\nc,3",
+            {
+                "anchor_id": "anc_rows",
+                "anchor": "rows:1",
+                "kind": "table.rows",
+                "format": "table",
+                "label": "Rows",
+                "locator": {"type": "stored_rows", "start_row": 2, "end_row": 3},
+                "recovery_op": "read_rows",
+                "priority": 50,
+                "promote": False,
+            },
+            "a,1\nb,2",
+        ),
+        (
+            "binary attachment",
+            {
+                "anchor_id": "anc_page",
+                "anchor": "page:2",
+                "kind": "artifact.page",
+                "format": "pdf",
+                "label": "Page 2",
+                "locator": {"type": "artifact_part", "page": 2},
+                "recovery_op": "read_artifact_part",
+                "priority": 50,
+                "promote": False,
+            },
+            '"page": 2',
+        ),
+    ],
+)
+async def test_format_aware_manifest_round_trip_and_recovery(
+    store: ToolOutputStore,
+    content: str,
+    record: dict[str, object],
+    expected: str,
+) -> None:
+    manifest = {"schema_version": 1, "adapter_id": "test-v1", "anchors": [record]}
+    persisted = await store.save(
+        "call_format",
+        content,
+        anchors=[record],
+        anchor_manifest=manifest,
+    )
+
+    assert persisted == [record]
+    anchors = await store.list_anchors("call_format")
+    assert anchors is not None
+    assert anchors[0].anchor_id == record["anchor_id"]
+    recovered = await store.read_anchor("call_format", str(record["anchor"]))
+    assert recovered is not None
+    assert expected in recovered.content
+
+
+@pytest.mark.asyncio
 async def test_search_nonexistent_returns_none(store: ToolOutputStore) -> None:
     result = await store.search("nonexistent", "pattern")
     assert result is None
@@ -106,6 +186,53 @@ async def test_cleanup_session(store: ToolOutputStore) -> None:
     assert await store.exists("call_a") is False
     assert await store.exists("call_b") is True
     assert await store.exists("call_c") is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_expired_removes_only_stale_outputs(tmp_path: Path) -> None:
+    backend = FilesystemToolOutputBackend(tmp_path)
+    store = ToolOutputStore(backend, ttl_hours=1, max_size_mb=1)
+    await store.save("stale_call", "stale")
+    await store.save("fresh_call", "fresh")
+    stale_time = time.time() - 7200
+    os.utime(tmp_path / "tool-outputs" / "stale_call.txt", (stale_time, stale_time))
+
+    deleted = await store.cleanup_expired()
+
+    assert deleted == 1
+    assert await store.exists("stale_call") is False
+    assert await store.exists("fresh_call") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "sync_method_name", "argument"),
+    [
+        ("cleanup_expired", "_sync_cleanup_expired", 3600),
+        ("enforce_size_cap", "_sync_enforce_size_cap", 1024),
+    ],
+)
+async def test_filesystem_bulk_maintenance_does_not_block_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    method_name: str,
+    sync_method_name: str,
+    argument: int,
+) -> None:
+    backend = FilesystemToolOutputBackend(tmp_path)
+    release = threading.Event()
+
+    def _slow_operation(_: int) -> int:
+        release.wait(timeout=1.0)
+        return 0
+
+    monkeypatch.setattr(backend, sync_method_name, _slow_operation)
+    operation = asyncio.create_task(getattr(backend, method_name)(argument))
+    await asyncio.sleep(0.01)
+
+    assert operation.done() is False
+    release.set()
+    assert await operation == 0
 
 
 @pytest.mark.asyncio

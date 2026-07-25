@@ -1,21 +1,20 @@
 <script lang="ts">
-  import { api } from '$lib/api/client';
+  import { chatV2Api } from '$lib/chat-v2/api';
+  import type { TimelineScope } from '$lib/chat-v2/types';
   import { renderTerminalOutput } from '$lib/syntax/terminal-output';
   import { displayToolName } from '$lib/tools-display';
   import type { ToolOutputPageResponse } from '$lib/types/api';
 
   let {
     open,
-    conversationId,
-    sessionId = null,
+    scope,
     callId,
     toolName,
     isTerminal = false,
     onClose,
   } = $props<{
     open: boolean;
-    conversationId?: string | null;
-    sessionId?: string | null;
+    scope?: TimelineScope;
     callId: string;
     toolName: string;
     isTerminal?: boolean;
@@ -28,18 +27,17 @@
   let content = $state('');
 
   $effect(() => {
-    if (open && conversationId && callId) {
+    if (open && scope && callId) {
       void load({ latest: true, replace: true });
     }
   });
 
   async function load(opts: { offset?: number | null; latest?: boolean; prepend?: boolean; replace?: boolean } = {}): Promise<void> {
-    if (!conversationId) return;
+    if (!scope) return;
     loading = true;
     error = null;
     try {
-      const next = await api.conversations.toolOutputPage(conversationId, callId, {
-        sessionId,
+      const next = await chatV2Api.toolOutputPage(scope, callId, {
         offset: opts.offset ?? undefined,
         limit: 200,
         latest: opts.latest,

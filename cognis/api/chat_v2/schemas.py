@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from cognis.models.artifact import AttachmentRef
+from cognis.models.config import GenerationPerformanceSnapshot
 
 SchemaVersion = Literal[2]
 ChatMode = Literal["default", "plan", "build"]
+TimelineScopeKind = Literal["conversation", "session", "task_step"]
 TimelineItemStatus = Literal[
     "pending",
     "running",
@@ -54,6 +56,41 @@ class SourceRef(StrictModel):
     seq: int = Field(ge=0)
     event_id: str | None = None
     event_type: str
+
+
+class TimelineScope(StrictModel):
+    """Verified identity of one independently synchronized timeline view."""
+
+    key: str
+    kind: TimelineScopeKind
+    conversation_id: str | None = None
+    session_id: str | None = None
+    task_id: str | None = None
+    step_run_id: str | None = None
+    parent_session_id: str | None = None
+    label: str | None = None
+    status: str | None = None
+    missing_stream: bool = False
+    _server_authoritative: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def _validate_identity(self) -> TimelineScope:
+        expected_key: str
+        if self.kind == "conversation":
+            if not self.conversation_id:
+                raise ValueError("conversation scope requires conversation_id")
+            expected_key = f"conversation:{self.conversation_id}"
+        elif self.kind == "session":
+            if not self.session_id:
+                raise ValueError("session scope requires session_id")
+            expected_key = f"session:{self.session_id}"
+        else:
+            if not self.task_id or not self.step_run_id:
+                raise ValueError("task_step scope requires task_id and step_run_id")
+            expected_key = f"task_step:{self.step_run_id}"
+        if self.key != expected_key:
+            raise ValueError("timeline scope key does not match scope identity")
+        return self
 
 
 class FileDiffRef(StrictModel):
@@ -113,6 +150,18 @@ class MessageTimelineItem(TimelineItemBase):
     notice_id: str | None = None
     notice_kind: str | None = None
     notice_scope: str | None = None
+    reason_class: str | None = None
+    provider_id: str | None = None
+    model: str | None = None
+    retry_after_seconds: float | None = Field(default=None, ge=0)
+    provider_retry_after_seconds: float | None = Field(default=None, ge=0)
+    retry_at: str | None = None
+    attempt: int | None = Field(default=None, ge=0)
+    max_attempts: int | None = Field(default=None, ge=0)
+    attempts: int | None = Field(default=None, ge=0)
+    attempts_per_cycle: int | None = Field(default=None, ge=0)
+    continuation_attempts: int | None = Field(default=None, ge=0)
+    recoverable: bool | None = None
     follow_up_conversation_id: str | None = None
     follow_up_session_id: str | None = None
     attachments: list[AttachmentRef] = Field(default_factory=list)
@@ -161,6 +210,7 @@ class ToolCallTimelineItem(TimelineItemBase):
     progress_input_chars: int | None = Field(default=None, ge=0)
     progress_input_lines: int | None = Field(default=None, ge=0)
     progress_complete: bool | None = None
+    managed_conversation: dict[str, Any] | None = None
     # Delegation details folded onto the delegate tool call so it renders as a
     # single rich, auto-expanding tool call (title/progress/todos) rather than a
     # separate delegation card. Populated only for delegate/fork tool calls.
@@ -250,6 +300,16 @@ class ArtifactTimelineItem(TimelineItemBase):
     title: str | None = None
 
 
+class AssistantDeliverableTimelineItem(TimelineItemBase):
+    kind: Literal["assistant_deliverable"] = "assistant_deliverable"
+    deliverable_id: str
+    format: str
+    title: str | None = None
+    content: str | None = None
+    render_metadata: dict[str, Any] | None = None
+    export_metadata: dict[str, Any] | None = None
+
+
 class FileDiffTimelineItem(TimelineItemBase):
     kind: Literal["file_diff"] = "file_diff"
     file_diffs: list[FileDiffRef] = Field(default_factory=list)
@@ -301,6 +361,7 @@ TimelineItem = Annotated[
     | CredentialRequestTimelineItem
     | TodoStateTimelineItem
     | ArtifactTimelineItem
+    | AssistantDeliverableTimelineItem
     | FileDiffTimelineItem
     | NoticeTimelineItem
     | CompactionTimelineItem
@@ -347,6 +408,7 @@ class RuntimeOverlaySnapshot(StrictModel):
     volatile_items: list[TimelineItem] = Field(default_factory=list)
     cycle_states: list[TurnCycleState] = Field(default_factory=list)
     context_usage: dict[str, Any] | None = None
+    last_generation: GenerationPerformanceSnapshot | None = None
 
     @model_validator(mode="after")
     def _validate_active_turn_consistency(self) -> RuntimeOverlaySnapshot:
@@ -405,7 +467,8 @@ class ConversationStateView(StrictModel):
 class ChatSnapshot(StrictModel):
     schema_version: SchemaVersion = 2
     projection_version: str
-    conversation: ConversationSummary
+    scope: TimelineScope
+    conversation: ConversationSummary | None = None
     timeline: TimelineWindow
     state: ConversationStateView
     queue: QueueState
@@ -464,7 +527,8 @@ ChatViewOp = Annotated[
 class ChatSyncResponse(StrictModel):
     schema_version: SchemaVersion = 2
     projection_version: str
-    conversation_id: str
+    scope: TimelineScope
+    conversation_id: str | None = None
     cursor_before: str
     cursor_after: str
     ops: list[ChatViewOp] = Field(default_factory=list)
@@ -486,7 +550,8 @@ class ChatRealtimeFrame(StrictModel):
     type: Literal["chat_v2_frame"] = "chat_v2_frame"
     schema_version: SchemaVersion = 2
     projection_version: str
-    conversation_id: str
+    scope: TimelineScope
+    conversation_id: str | None = None
     cursor_before: str
     cursor_after: str
     ops: list[ChatViewOp] = Field(default_factory=list)
@@ -506,6 +571,20 @@ class SendMessageV2Request(StrictModel):
         if not self.content.strip() and not self.attachments:
             raise ValueError("content or attachments are required")
         return self
+
+
+class CommandV2Request(StrictModel):
+    content: str = Field(min_length=1, max_length=100_000)
+
+
+class CommandV2Response(StrictModel):
+    conversation_id: str
+    client_txn_id: str
+    status: Literal["completed", "duplicate"]
+    result_type: str
+    text: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    server_time: str
 
 
 class SendMessageV2Response(StrictModel):
@@ -546,10 +625,20 @@ class CancelTurnV2Response(StrictModel):
     server_time: str
 
 
+class RetryTurnV2Response(StrictModel):
+    conversation_id: str
+    client_txn_id: str
+    turn_id: str
+    status: Literal["accepted", "duplicate"]
+    runtime: RuntimeOverlaySnapshot | None = None
+    server_time: str
+
+
 class TimelineBackfillResponse(StrictModel):
     schema_version: SchemaVersion = 2
     projection_version: str
-    conversation_id: str
+    scope: TimelineScope
+    conversation_id: str | None = None
     items: list[TimelineItem] = Field(default_factory=list)
     cycle_states: list[TurnCycleState] = Field(default_factory=list)
     has_more_before: bool = False

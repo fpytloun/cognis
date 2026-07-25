@@ -15,7 +15,7 @@
   import { installBeforeUnloadGuard, blockNavigationIfDirty } from '$lib/navigation/unsaved';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
-  import type { Agent, AgentGrant, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, SecretMetadata, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, AgentGrant, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, SecretMetadata, Skill, Workflow } from '$lib/types/api';
 
   let loading = $state(true);
   let saving = $state(false);
@@ -24,6 +24,7 @@
   let tools = $state<EffectiveToolItem[]>([]);
   let workflows = $state<Workflow[]>([]);
   let providers = $state<LLMProvider[]>([]);
+  let memoryBackends = $state<MemoryBackendDescriptor[]>([]);
   let executors = $state<ExecutorConfig[]>([]);
   let secrets = $state<SecretMetadata[]>([]);
   let credentials = $state<CredentialMetadata[]>([]);
@@ -200,6 +201,11 @@
         providers = (await api.llmProviders.list()).items;
       } catch {
         providers = [];
+      }
+      try {
+        memoryBackends = (await api.agents.memoryBackends()).items;
+      } catch {
+        memoryBackends = [];
       }
       Object.assign(form, agentToFormState(agent));
       await loadMyShare();
@@ -603,6 +609,7 @@
       {tools}
       {workflows}
       {providers}
+      {memoryBackends}
       {executors}
       {secrets}
       {credentials}

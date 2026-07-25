@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.tools.executor.browser.definitions import browser_tool_definitions
 from cognis.tools.executor.browser.handlers import (
+    handle_browser_claim_profile,
     handle_browser_click,
     handle_browser_close,
     handle_browser_download_wait,
@@ -19,6 +21,7 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_get_network,
     handle_browser_get_text,
     handle_browser_hover,
+    handle_browser_inspect_session,
     handle_browser_list_profiles,
     handle_browser_list_sessions,
     handle_browser_open,
@@ -140,8 +143,9 @@ WRITE_TOOL = ToolDefinition(
 ARTIFACT_SAVE_TOOL = ToolDefinition(
     name="artifact_save",
     description=(
-        "Save an artifact-compatible content ref, including saved artifact IDs and task "
-        "deliverable IDs (dlv_*), to a local executor file path. Use this when you need "
+        "Save an artifact-compatible content ref, including saved artifact IDs and authorized "
+        "task or managed-descendant deliverable IDs (dlv_*), to a local executor file path. "
+        "Use this when you need "
         "a saved image, PDF, deliverable, or other artifact-like source as a real "
         "filesystem file for subsequent tools."
     ),
@@ -218,8 +222,17 @@ EDIT_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Absolute path to the file. Use ~ for home directory.",
             },
-            "old_string": {"type": "string", "description": "Exact text to find and replace"},
-            "new_string": {"type": "string", "description": "Replacement text"},
+            "old_string": {
+                "type": "string",
+                "description": (
+                    "Exact text to find. Copy from read output after the line-number "
+                    "prefix; do not include the leading 'N:'."
+                ),
+            },
+            "new_string": {
+                "type": "string",
+                "description": "Replacement text; must differ from old_string.",
+            },
             "replace_all": {
                 "type": "boolean",
                 "description": "Replace all occurrences (default false)",
@@ -263,7 +276,11 @@ APPLY_PATCH_TOOL = ToolDefinition(
 
 MULTIEDIT_TOOL = ToolDefinition(
     name="multiedit",
-    description="Apply multiple sequential text replacements to a single file.",
+    description=(
+        "Apply multiple sequential text replacements to a single file. You must call "
+        "read first and copy old_string from the file content without read-tool "
+        "line-number prefixes such as '12:'. Each edit is applied in order."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -276,8 +293,17 @@ MULTIEDIT_TOOL = ToolDefinition(
                 "items": {
                     "type": "object",
                     "properties": {
-                        "old_string": {"type": "string", "description": "Text to find"},
-                        "new_string": {"type": "string", "description": "Replacement text"},
+                        "old_string": {
+                            "type": "string",
+                            "description": (
+                                "Exact text to find. Copy from read output after the "
+                                "line-number prefix; do not include the leading 'N:'."
+                            ),
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement text; must differ from old_string.",
+                        },
                         "replace_all": {"type": "boolean"},
                     },
                     "required": ["old_string", "new_string"],
@@ -805,7 +831,9 @@ _HANDLER_MAP: dict[
     "browser_open": handle_browser_open,
     "browser_snapshot": handle_browser_snapshot,
     "browser_list_sessions": handle_browser_list_sessions,
+    "browser_inspect_session": handle_browser_inspect_session,
     "browser_list_profiles": handle_browser_list_profiles,
+    "browser_claim_profile": handle_browser_claim_profile,
     "browser_query": handle_browser_query,
     "browser_eval": handle_browser_eval,
     "browser_get_console": handle_browser_get_console,

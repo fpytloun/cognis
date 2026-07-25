@@ -15,7 +15,7 @@ from collections.abc import Iterable, Sequence
 from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
 from typing import Any, Protocol, TextIO, cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import httpx
 from mcp.client.session import ClientSession
@@ -35,6 +35,8 @@ from cognis.models.tool import (
     sanitize_mcp_tool_name,
     sanitize_mcp_tool_name_with_suffix,
     stable_tool_id,
+    tool_input_schema,
+    tool_with_input_schema,
 )
 from cognis.tools.argument_normalization import strip_empty_optional_values
 
@@ -68,6 +70,7 @@ class MCPClientError(RuntimeError):
         status_code: int | None = None,
         auth_error: str | None = None,
         www_authenticate: str | None = None,
+        authorization_challenge: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.server_name = server_name
@@ -78,6 +81,7 @@ class MCPClientError(RuntimeError):
         self.status_code = status_code
         self.auth_error = auth_error
         self.www_authenticate = www_authenticate
+        self.authorization_challenge = authorization_challenge
         self.authorization_required = status_code in {401, 403} or auth_error is not None
 
 
@@ -234,16 +238,25 @@ class _SessionMCPClient:
             raise RuntimeError("MCP client is not started")
         logger.debug("MCP: %s requesting tools/list", self.config.name)
         result = await self._submit("list_tools")
-        tools = [
-            {
-                "name": t.name,
-                "description": t.description or "",
-                "inputSchema": t.inputSchema.model_dump()
-                if hasattr(t.inputSchema, "model_dump")
-                else dict(t.inputSchema),
-            }
-            for t in result.tools
-        ]
+        tools = []
+        for tool in result.tools:
+            payload = (
+                tool.model_dump(mode="json", exclude_none=True)
+                if hasattr(tool, "model_dump")
+                else {}
+            )
+            payload.update(
+                {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "inputSchema": (
+                        tool.inputSchema.model_dump(mode="json")
+                        if hasattr(tool.inputSchema, "model_dump")
+                        else dict(tool.inputSchema)
+                    ),
+                }
+            )
+            tools.append(payload)
         for t in tools:
             name = t["name"]
             input_schema = t.get("inputSchema", {})
@@ -624,6 +637,7 @@ def mcp_tools_to_definitions(
             parameters = {"type": "object", "properties": {}}
         else:
             parameters = _strip_json_schema_metadata(parameters)
+        annotations = dict(tool["annotations"]) if isinstance(tool.get("annotations"), dict) else {}
         definitions.append(
             ToolDefinition(
                 name=sanitize_mcp_tool_name(server_name, name),
@@ -631,6 +645,12 @@ def mcp_tools_to_definitions(
                     str(tool.get("description") or f"MCP tool {name}")
                 ),
                 parameters=parameters,
+                annotations=annotations,
+                output_schema=(
+                    dict(tool["outputSchema"])
+                    if isinstance(tool.get("outputSchema"), dict)
+                    else None
+                ),
                 source=ToolSource(
                     type="local_mcp",
                     server_name=server_name,
@@ -697,8 +717,10 @@ def disambiguate_mcp_tool_name_collisions(
             resolved.append(definition)
             continue
         resolved.append(
-            definition.model_copy(
-                update={"name": sanitize_mcp_tool_name_with_suffix(server_name, raw_tool_name)}
+            tool_with_input_schema(
+                definition,
+                tool_input_schema(definition),
+                name=sanitize_mcp_tool_name_with_suffix(server_name, raw_tool_name),
             )
         )
     return resolved
@@ -956,6 +978,27 @@ def _safe_message(message: str, *, limit: int = _MAX_SAFE_STDERR_LENGTH) -> str:
     return redacted[:limit]
 
 
+def _safe_authorization_challenge(value: str | None) -> dict[str, str] | None:
+    if not value:
+        return None
+    challenge = value.strip()
+    if challenge.lower().startswith("bearer "):
+        challenge = challenge[7:]
+    parsed = {
+        key.strip().lower(): item.strip().strip('"')
+        for key, item in parse_qsl(challenge.replace(",", "&"), keep_blank_values=True)
+    }
+    limits = {
+        "error": 120,
+        "scope": 2048,
+        "resource_metadata": 2048,
+        "authorization_uri": 2048,
+        "issuer": 2048,
+    }
+    safe = {key: parsed[key][:limit] for key, limit in limits.items() if key in parsed}
+    return safe or None
+
+
 def _redact_match(match: re.Match[str]) -> str:
     groups = match.groups()
     if len(groups) == 2:
@@ -1002,10 +1045,23 @@ def _coerce_client_error(server_name: str, phase: str, exc: BaseException) -> MC
         if status_code is not None and www_authenticate is not None:
             break
     auth_error = None
+    challenge_error = None
+    if isinstance(www_authenticate, str):
+        match = re.search(
+            r'(?:^|[,\s])error\s*=\s*"?([^",\s]+)',
+            www_authenticate,
+            flags=re.IGNORECASE,
+        )
+        if match is not None:
+            challenge_error = match.group(1).lower()
     if status_code == 401:
-        auth_error = "authorization_required"
+        auth_error = (
+            "invalid_token" if challenge_error == "invalid_token" else "authorization_required"
+        )
     elif status_code == 403:
-        auth_error = "insufficient_scope" if www_authenticate else "forbidden"
+        auth_error = (
+            "insufficient_scope" if challenge_error == "insufficient_scope" else "forbidden"
+        )
     return MCPClientError(
         server_name,
         phase,
@@ -1015,6 +1071,7 @@ def _coerce_client_error(server_name: str, phase: str, exc: BaseException) -> MC
         status_code=status_code if isinstance(status_code, int) else None,
         auth_error=auth_error,
         www_authenticate=_safe_message(www_authenticate) if www_authenticate else None,
+        authorization_challenge=_safe_authorization_challenge(www_authenticate),
     )
 
 

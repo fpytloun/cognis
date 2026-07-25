@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ThinkingTimelineItem } from '$lib/chat';
+  import type { ThinkingTimelineItem } from '$lib/timeline-render-model';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronUp from 'lucide-svelte/icons/chevron-up';

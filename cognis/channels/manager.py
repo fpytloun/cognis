@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from time import monotonic
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -392,11 +393,44 @@ class ChannelManager:
         meta = get_channel_meta(config.channel_type)
         capabilities = meta.capabilities if meta else ChannelCapabilities()
 
+        proxy: RemoteChannelAdapterProxy | None = None
+
+        async def _reconnect_connection() -> Any | None:
+            if self._ws_provider is None:
+                return None
+            from cognis.providers.executor.websocket import (
+                executor_reconnect_retry_budget_seconds,
+            )
+
+            budget = executor_reconnect_retry_budget_seconds()
+            deadline = monotonic() + budget
+            replacement = await self._ws_provider.wait_for_connection(
+                conn.executor_id,
+                timeout=budget,
+            )
+            if replacement is None:
+                return None
+
+            deadline = max(deadline, monotonic() + min(10.0, budget))
+            while monotonic() < deadline:
+                current = self._adapters.get(config.account_id)
+                if isinstance(current, RemoteChannelAdapterProxy) and current is not proxy:
+                    status = await current.get_status()
+                    current_connection = current._connection_for_retry()  # noqa: SLF001
+                    if (
+                        status.status == ChannelStatus.CONNECTED
+                        and current_connection.executor_id == conn.executor_id
+                    ):
+                        return current_connection
+                await asyncio.sleep(0.1)
+            return None
+
         proxy = RemoteChannelAdapterProxy(
             connection=conn,
             channel_type=config.channel_type,
             capabilities=capabilities,
             account_id=config.account_id,
+            reconnect_connection=_reconnect_connection,
         )
 
         # Register notification callbacks so inbound messages from the
@@ -676,6 +710,7 @@ def _row_to_config(row: Any) -> ChannelAccountConfig:
         enabled=row.enabled,
         credential_refs=row.credential_refs or {},
         agent_id=row.agent_id,
+        default_agent_profile_id=getattr(row, "default_agent_profile_id", None),
         user_email=row.user_email,
         settings=row.config or {},
         default_conversation_id=row.default_conversation_id,

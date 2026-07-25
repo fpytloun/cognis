@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from cognis.core.tool_retrieval import retrieve_relevant_skills, retrieve_relevant_tools
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
 
 

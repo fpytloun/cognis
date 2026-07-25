@@ -21,6 +21,7 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+from cognis.channels.markdown_rendering import markdown_to_plain_text
 from cognis.channels.matrix_formatting import markdown_to_matrix_html
 from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import MATRIX_META
@@ -97,10 +98,10 @@ def _contains_localpart_mention(haystack: str, localpart: str) -> bool:
     return re.search(pattern, haystack, flags=re.IGNORECASE) is not None
 
 
-def _markdown_to_matrix_html(value: str) -> str:
+def _markdown_to_matrix_html(value: str, *, compact: bool = False) -> str:
     """Convert Markdown to Matrix-compatible HTML."""
 
-    return markdown_to_matrix_html(value)
+    return markdown_to_matrix_html(value, compact=compact)
 
 
 def _matrix_msgtype_for_mime(mime: str) -> str:
@@ -312,19 +313,31 @@ class MatrixAdapter(BaseChannelAdapter):
         if self._client is None:
             return None
 
-        # Send media attachments first
+        # Explicit attachments remain separate Matrix events. Rich deliverable
+        # illustrations use the inline disposition and are embedded in the text event.
         for media in message.media:
-            await self._send_media(message.chat_id, media, thread_id=message.thread_id)
+            if media.disposition == "attachment":
+                await self._send_media(message.chat_id, media, thread_id=message.thread_id)
 
-        if not message.content.strip() and message.media:
+        inline_media = [media for media in message.media if media.disposition == "inline"]
+        if not message.content.strip() and message.media and not inline_media:
             return None
 
-        txn_id = uuid.uuid4().hex
+        idempotency_key = message.platform_data.get("idempotency_key")
+        txn_id = (
+            quote(str(idempotency_key), safe="")
+            if isinstance(idempotency_key, str) and idempotency_key.strip()
+            else uuid.uuid4().hex
+        )
 
-        formatted = _markdown_to_matrix_html(message.content)
+        compact = message.platform_data.get("canonical_rich_markdown") is True
+        formatted = _markdown_to_matrix_html(message.content, compact=compact)
+        inline_images = await self._inline_media_html(inline_media)
+        if inline_images:
+            formatted = f"{formatted}<br><br>{''.join(inline_images)}"
         content: dict[str, Any] = {
             "msgtype": "m.text",
-            "body": message.content,
+            "body": markdown_to_plain_text(message.content),
             "format": _MATRIX_HTML_FORMAT,
             "formatted_body": formatted,
         }
@@ -344,6 +357,37 @@ class MatrixAdapter(BaseChannelAdapter):
         self._raise_for_status(resp, "Matrix message send failed")
         result = resp.json()
         return result.get("event_id")
+
+    async def _inline_media_html(self, media: list[MediaAttachment]) -> list[str]:
+        """Upload inline images and return safe Matrix HTML image elements."""
+
+        if self._client is None:
+            return []
+        images: list[str] = []
+        for item in media:
+            if not (item.mime_type or "").startswith("image/"):
+                continue
+            file_content = await self._load_outbound_media(item)
+            if file_content is None:
+                msg = "Matrix inline media could not be loaded"
+                raise RuntimeError(msg)
+            filename = item.filename or "image"
+            upload_resp = await self._client.post(
+                "/_matrix/media/v3/upload",
+                content=file_content,
+                headers={"Content-Type": item.mime_type},
+                params={"filename": filename},
+            )
+            self._raise_for_status(upload_resp, "Matrix inline media upload failed")
+            mxc_url = upload_resp.json().get("content_uri")
+            if not isinstance(mxc_url, str) or not mxc_url:
+                msg = "Matrix inline media upload returned no MXC URL"
+                raise RuntimeError(msg)
+            images.append(
+                f'<img src="{html.escape(mxc_url, quote=True)}" '
+                f'alt="{html.escape(filename, quote=True)}">'
+            )
+        return images
 
     async def _send_media(
         self, room_id: str, media: MediaAttachment, *, thread_id: str | None = None
@@ -619,13 +663,9 @@ class MatrixAdapter(BaseChannelAdapter):
             return None
         # Prefer the authenticated media endpoint (MSC3916 / Synapse ≥1.95).
         # Fall back to the legacy unauthenticated path for older homeservers.
-        resp = await self._client.get(
-            f"/_matrix/client/v1/media/download/{server_name}/{media_id}"
-        )
+        resp = await self._client.get(f"/_matrix/client/v1/media/download/{server_name}/{media_id}")
         if resp.status_code == 404:
-            resp = await self._client.get(
-                f"/_matrix/media/v3/download/{server_name}/{media_id}"
-            )
+            resp = await self._client.get(f"/_matrix/media/v3/download/{server_name}/{media_id}")
         self._raise_for_status(resp, "Matrix attachment download failed")
         return (
             resp.content,

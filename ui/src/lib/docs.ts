@@ -1,21 +1,15 @@
 /**
- * Docs content loader (lazy).
+ * Docs content loader.
  *
- * This module re-exports metadata-only helpers from `docs-registry` and adds
- * lazy loaders for the actual markdown. The heavy eager imports of
- * 13 `?raw` markdown files live exclusively in this file and are loaded
- * on demand via `import.meta.glob(..., { eager: true })` so that callers
- * who only need metadata (e.g. `/getting-started` page) can import from
- * `docs-registry` and avoid pulling the docs bundle.
- *
- * Legacy shape `embeddedDocs: EmbeddedDoc[]` is preserved for existing tests.
+ * Metadata lives in `docs-registry.ts`; markdown content is loaded with
+ * per-document dynamic imports so docs content does not become one large
+ * inlined JavaScript chunk.
  */
 
 import {
   type DocCategory,
   type DocMeta,
   DOC_CATEGORIES,
-  ONBOARDING_DOC_SLUGS,
   embeddedDocsMeta,
   getCategoryLabel,
   getDocHref,
@@ -25,29 +19,24 @@ import {
   getRelatedDocsMeta
 } from './docs-registry';
 
-// Eager glob of the guide markdown. Vite will ship these as one shared chunk
-// that is loaded by the `/docs` routes only. Pages that merely need DocMeta
-// can import from `docs-registry.ts` and avoid this module.
+type RawMarkdownLoader = () => Promise<string>;
+
 const markdownModules = import.meta.glob('../../../docs/guide/*.md', {
   query: '?raw',
-  import: 'default',
-  eager: true
-}) as Record<string, string>;
+  import: 'default'
+}) as Record<string, RawMarkdownLoader>;
 
 const overviewModules = import.meta.glob('../../../docs/README.md', {
   query: '?raw',
-  import: 'default',
-  eager: true
-}) as Record<string, string>;
+  import: 'default'
+}) as Record<string, RawMarkdownLoader>;
 
-// Asset urls (diagrams and screenshots referenced from guides).
 const assetUrlModules = import.meta.glob('../../../docs/assets/**/*.{svg,png,jpg,jpeg}', {
   query: '?url',
   import: 'default',
   eager: true
 }) as Record<string, string>;
 
-// Re-exports from the registry for convenience.
 export {
   DOC_CATEGORIES,
   type DocCategory,
@@ -86,6 +75,11 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/schedules.md': '/docs/schedules',
   'docs/guide/workflows.md': '/docs/workflows',
   'docs/guide/tools-and-skills.md': '/docs/tools-and-skills',
+  'docs/guide/content-and-sharing.md': '/docs/content-and-sharing',
+  'docs/guide/rich-deliverables.md': '/docs/rich-deliverables',
+  'docs/guide/rich-deliverable-composition.md': '/docs/rich-deliverable-composition',
+  'docs/guide/rich-deliverable-blocks-layout.md': '/docs/rich-deliverable-blocks-layout',
+  'docs/guide/rich-deliverable-blocks-data.md': '/docs/rich-deliverable-blocks-data',
   'docs/guide/channels.md': '/docs/channels',
   'docs/guide/executors.md': '/docs/executors',
   'docs/guide/deployment.md': '/docs/deployment',
@@ -127,7 +121,6 @@ function getGitHubRepoUrl(path: string): string {
 }
 
 function lookupAssetUrl(repoPath: string): string | null {
-  // Glob keys look like "../../../docs/assets/images/xyz.svg"; map to repo-relative paths.
   for (const [globKey, url] of Object.entries(assetUrlModules)) {
     const rel = globKey.replace(/^(\.\.\/)+/, '');
     if (rel === repoPath) return url;
@@ -135,14 +128,14 @@ function lookupAssetUrl(repoPath: string): string | null {
   return null;
 }
 
-function getMarkdownForSourcePath(sourcePath: string): string {
+async function getMarkdownForSourcePath(sourcePath: string): Promise<string> {
   if (sourcePath === 'docs/README.md') {
     const key = Object.keys(overviewModules)[0];
-    return overviewModules[key] ?? '';
+    return key ? await overviewModules[key]() : '';
   }
-  for (const [globKey, content] of Object.entries(markdownModules)) {
+  for (const [globKey, load] of Object.entries(markdownModules)) {
     const rel = globKey.replace(/^(\.\.\/)+/, '');
-    if (rel === sourcePath) return content;
+    if (rel === sourcePath) return load();
   }
   return '';
 }
@@ -178,51 +171,53 @@ function rewriteMarkdownTargets(sourcePath: string, markdown: string): string {
   });
 }
 
-export const docsOverview: DocsOverview = (() => {
+export async function loadDocsOverviewContent(): Promise<DocsOverview> {
   const sourcePath = 'docs/README.md';
-  const raw = getMarkdownForSourcePath(sourcePath);
+  const raw = await getMarkdownForSourcePath(sourcePath);
   return {
     title: 'Documentation',
     sourcePath,
     rawContent: raw,
     content: rewriteMarkdownTargets(sourcePath, raw)
   };
-})();
+}
 
-export const embeddedDocs: EmbeddedDoc[] = embeddedDocsMeta.map((meta) => {
-  const raw = getMarkdownForSourcePath(meta.sourcePath);
+export async function loadEmbeddedDoc(slug: string): Promise<EmbeddedDoc | null> {
+  const meta = getDocMeta(slug);
+  if (!meta) return null;
+  const raw = await getMarkdownForSourcePath(meta.sourcePath);
   return {
     ...meta,
     rawContent: raw,
     content: rewriteMarkdownTargets(meta.sourcePath, raw)
   };
-});
-
-export function getEmbeddedDocs(): EmbeddedDoc[] {
-  return embeddedDocs;
 }
 
-export function getEmbeddedDoc(slug: string): EmbeddedDoc | null {
-  return embeddedDocs.find((doc) => doc.slug === slug) ?? null;
+export async function loadEmbeddedDocs(): Promise<EmbeddedDoc[]> {
+  const docs = await Promise.all(embeddedDocsMeta.map((meta) => loadEmbeddedDoc(meta.slug)));
+  return docs.filter((doc): doc is EmbeddedDoc => doc !== null);
 }
 
-export function getOnboardingDocs(): EmbeddedDoc[] {
-  return getOnboardingDocsMeta()
-    .map((meta) => getEmbeddedDoc(meta.slug))
-    .filter((d): d is EmbeddedDoc => d !== null);
+export async function getEmbeddedDoc(slug: string): Promise<EmbeddedDoc | null> {
+  return loadEmbeddedDoc(slug);
 }
 
-export function getRelatedDocs(doc: EmbeddedDoc | DocMeta): EmbeddedDoc[] {
-  return getRelatedDocsMeta(doc)
-    .map((meta) => getEmbeddedDoc(meta.slug))
-    .filter((d): d is EmbeddedDoc => d !== null);
+export async function getEmbeddedDocs(): Promise<EmbeddedDoc[]> {
+  return loadEmbeddedDocs();
 }
 
-export function getDocsByCategory(): Array<{ category: DocCategory; docs: EmbeddedDoc[] }> {
-  return getDocsByCategoryMeta().map(({ category, docs }) => ({
-    category,
-    docs: docs.map((meta) => getEmbeddedDoc(meta.slug)).filter((d): d is EmbeddedDoc => d !== null)
-  }));
+export async function getOnboardingDocs(): Promise<EmbeddedDoc[]> {
+  const docs = await Promise.all(getOnboardingDocsMeta().map((meta) => loadEmbeddedDoc(meta.slug)));
+  return docs.filter((d): d is EmbeddedDoc => d !== null);
+}
+
+export async function getRelatedDocs(doc: EmbeddedDoc | DocMeta): Promise<EmbeddedDoc[]> {
+  const docs = await Promise.all(getRelatedDocsMeta(doc).map((meta) => loadEmbeddedDoc(meta.slug)));
+  return docs.filter((d): d is EmbeddedDoc => d !== null);
+}
+
+export function getDocsByCategory(): Array<{ category: DocCategory; docs: DocMeta[] }> {
+  return getDocsByCategoryMeta();
 }
 
 export function extractMarkdownTitle(markdown: string): string | null {
@@ -239,13 +234,9 @@ export function validateEmbeddedDocs(): string[] {
   const errors: string[] = [];
   const slugSet = new Set<string>();
   const sourcePathSet = new Set<string>();
-  const allowedSlugs = new Set(embeddedDocs.map((doc) => doc.slug));
-  const allMarkdownSources: Array<{ title: string; sourcePath: string; content: string }> = [
-    { title: docsOverview.title, sourcePath: docsOverview.sourcePath, content: docsOverview.rawContent ?? docsOverview.content },
-    ...embeddedDocs.map((doc) => ({ title: doc.title, sourcePath: doc.sourcePath, content: doc.rawContent ?? doc.content }))
-  ];
+  const allowedSlugs = new Set(embeddedDocsMeta.map((doc) => doc.slug));
 
-  for (const doc of embeddedDocs) {
+  for (const doc of embeddedDocsMeta) {
     if (slugSet.has(doc.slug)) errors.push(`Duplicate doc slug: ${doc.slug}`);
     slugSet.add(doc.slug);
 
@@ -258,17 +249,33 @@ export function validateEmbeddedDocs(): string[] {
     if (doc.sourcePath.includes('docs/specs/')) {
       errors.push(`Forbidden docs/specs source path: ${doc.sourcePath}`);
     }
+    for (const relatedSlug of doc.relatedSlugs ?? []) {
+      if (!allowedSlugs.has(relatedSlug)) {
+        errors.push(`Doc ${doc.slug} references missing related slug: ${relatedSlug}`);
+      }
+    }
+  }
+
+  return errors;
+}
+
+export async function validateEmbeddedDocsContent(): Promise<string[]> {
+  const errors = validateEmbeddedDocs();
+  const overview = await loadDocsOverviewContent();
+  const docs = await loadEmbeddedDocs();
+  const allowedSlugs = new Set(docs.map((doc) => doc.slug));
+  const allMarkdownSources: Array<{ title: string; sourcePath: string; content: string }> = [
+    { title: overview.title, sourcePath: overview.sourcePath, content: overview.rawContent ?? overview.content },
+    ...docs.map((doc) => ({ title: doc.title, sourcePath: doc.sourcePath, content: doc.rawContent ?? doc.content }))
+  ];
+
+  for (const doc of docs) {
     if (!doc.content.trim()) {
       errors.push(`Doc content is empty: ${doc.slug}`);
     }
     const markdownTitle = extractMarkdownTitle(doc.content);
     if (markdownTitle !== doc.title) {
       errors.push(`Doc title mismatch for ${doc.slug}: expected "${doc.title}" but found "${markdownTitle ?? 'missing'}"`);
-    }
-    for (const relatedSlug of doc.relatedSlugs ?? []) {
-      if (!allowedSlugs.has(relatedSlug)) {
-        errors.push(`Doc ${doc.slug} references missing related slug: ${relatedSlug}`);
-      }
     }
   }
 

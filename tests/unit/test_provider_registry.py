@@ -59,6 +59,7 @@ def _test_config(tmp_path: Path, database_url: str) -> CognisConfig:
         log_format="json",
         serve_ui=False,
         cors_origins=["http://localhost:5173"],
+        trusted_proxy_cidrs=(),
         browser_session_ttl_seconds=3600,
         session_cookie_domain="",
         session_cookie_samesite="lax",
@@ -77,6 +78,7 @@ def _test_config(tmp_path: Path, database_url: str) -> CognisConfig:
         artifact_max_size_bytes=50 * 1024 * 1024,
         artifact_signed_url_ttl_seconds=3600,
         artifact_signing_secret="test",
+        deliverable_share_link_ttl_seconds=3600,
         knowledgebase_vector_backend="disabled",
         knowledgebase_qdrant_url="http://localhost:6333",
         knowledgebase_qdrant_api_key="",
@@ -105,6 +107,7 @@ def _test_config(tmp_path: Path, database_url: str) -> CognisConfig:
         initial_admin_password=None,
         default_memory_backend="mnemory",
         default_guardrails_backend="intaris",
+        mcp_oauth_refresh_timeout_seconds=30.0,
     )
 
 

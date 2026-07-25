@@ -27,7 +27,7 @@ export function observeTimelineResizeAutoScroll({
   });
   let pending = false;
   let disposed = false;
-  const burstFrames = 4;
+  const burstFrames = 2;
 
   function scheduleScroll(remainingFrames: number): void {
     scheduleFrame(() => {

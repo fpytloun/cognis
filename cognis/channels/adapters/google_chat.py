@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from cognis.channels.markdown_rendering import markdown_to_chat_text
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import GOOGLE_CHAT_META
 from cognis.logging import get_logger
@@ -82,7 +83,7 @@ class GoogleChatAdapter(BaseChannelAdapter):
             return None
 
         payload: dict[str, Any] = {
-            "text": message.content,
+            "text": markdown_to_chat_text(message.content),
         }
 
         # Add image cards for media attachments
@@ -108,7 +109,7 @@ class GoogleChatAdapter(BaseChannelAdapter):
                     )
                 elif media.url:
                     payload["text"] = (
-                        f"{payload.get('text', '')}\n[{media.filename or 'attachment'}]({media.url})"
+                        f"{payload.get('text', '')}\n{media.filename or 'attachment'}: {media.url}"
                     )
             if cards:
                 payload["cards"] = cards

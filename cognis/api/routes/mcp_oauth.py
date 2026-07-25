@@ -19,6 +19,7 @@ from cognis.store.queries import (
     get_mcp_oauth_transaction,
     get_mcp_server,
     list_pending_mcp_oauth_transactions,
+    list_websocket_executors_for_mcp_server,
     mcp_oauth_resource_key,
 )
 
@@ -50,6 +51,7 @@ async def start_mcp_oauth(request: Request, server_id: str) -> dict[str, Any]:
         "issuer": started.issuer,
         "authorization_server": started.authorization_server,
         "scopes": started.scopes,
+        "resource": started.resource,
         "flow": started.flow,
         "verification_uri": started.verification_uri,
         "verification_uri_complete": started.verification_uri_complete,
@@ -138,6 +140,69 @@ async def _mcp_oauth_status_payload_for_user(
                 exc_info=True,
             )
     payload = oauth_status_payload(row, token_payload)
+    async with app.state.session_factory() as session:
+        executor_rows = await list_websocket_executors_for_mcp_server(
+            session,
+            server.server_id,
+        )
+    executors: list[dict[str, Any]] = []
+    for executor in executor_rows:
+        runtime_metadata = (
+            executor.runtime_metadata if isinstance(executor.runtime_metadata, dict) else {}
+        )
+        server_status = next(
+            (
+                item
+                for item in runtime_metadata.get("mcp_servers", [])
+                if isinstance(item, dict) and item.get("server_id") == server.server_id
+            ),
+            None,
+        )
+        converged = int(executor.desired_config_version or 0) == int(
+            executor.applied_config_version or 0
+        )
+        websocket_provider = getattr(
+            getattr(getattr(app.state, "providers", None), "executor", None),
+            "websocket",
+            None,
+        )
+        connection = (
+            websocket_provider.get_connection(executor.executor_id)
+            if websocket_provider is not None
+            else None
+        )
+        ready = bool(
+            converged
+            and executor.status == "active"
+            and executor.runtime_state in {"active", "degraded"}
+            and connection is not None
+            and isinstance(server_status, dict)
+            and server_status.get("status") == "ready"
+        )
+        executors.append(
+            {
+                "executor_id": executor.executor_id,
+                "runtime_state": executor.runtime_state,
+                "desired_config_version": int(executor.desired_config_version or 0),
+                "applied_config_version": int(executor.applied_config_version or 0),
+                "converged": converged,
+                "mcp_status": server_status.get("status")
+                if isinstance(server_status, dict)
+                else None,
+                "ready": ready,
+            }
+        )
+    runtime_connected = bool(
+        payload.get("connected")
+        and (any(item["ready"] for item in executors) if executors else True)
+    )
+    payload["runtime_connected"] = runtime_connected
+    payload["runtime"] = {
+        "state": (
+            "connected" if runtime_connected else "not_assigned" if not executors else "degraded"
+        ),
+        "executors": executors,
+    }
     pending_authorization = None
     svc = getattr(app.state, "mcp_oauth_service", None)
     if svc is not None:
@@ -195,13 +260,40 @@ async def _emit_mcp_oauth_status_changed(
     )
 
 
+async def emit_mcp_oauth_status_changed_for_app(
+    app: Any,
+    *,
+    user_email: str,
+    server_id: str,
+) -> None:
+    """Emit the additive OAuth status event from controller lifecycle callbacks."""
+
+    await _emit_mcp_oauth_status_changed(
+        app,
+        user_email=user_email,
+        server_id=server_id,
+    )
+
+
 @router.post("/api/v1/mcp-servers/{server_id}/oauth/disconnect")
 async def disconnect_mcp_oauth(request: Request, server_id: str) -> dict[str, Any]:
     user = require_current_user(request)
+    return await disconnect_mcp_oauth_for_user(
+        request.app, user_email=user.email, server_id=server_id
+    )
+
+
+async def disconnect_mcp_oauth_for_user(
+    app: Any,
+    *,
+    user_email: str,
+    server_id: str,
+) -> dict[str, Any]:
+    """Disconnect one user's MCP OAuth token and publish runtime status changes."""
     should_reconfigure = False
-    async with request.app.state.session_factory() as session:
+    async with app.state.session_factory() as session:
         server = await get_mcp_server(
-            session, server_id, owner_email=user.email, include_shared=True
+            session, server_id, owner_email=user_email, include_shared=True
         )
         if server is None:
             raise api_exception(404, "not_found", "MCP server not found")
@@ -211,7 +303,7 @@ async def disconnect_mcp_oauth(request: Request, server_id: str) -> dict[str, An
         if issuer:
             row = await get_mcp_oauth_token(
                 session,
-                user_email=user.email,
+                user_email=user_email,
                 mcp_server_id=server.server_id,
                 issuer=issuer,
                 resource=auth_config.resource or server.url,
@@ -219,7 +311,7 @@ async def disconnect_mcp_oauth(request: Request, server_id: str) -> dict[str, An
         else:
             row = await get_mcp_oauth_token_for_server(
                 session,
-                user_email=user.email,
+                user_email=user_email,
                 mcp_server_id=server.server_id,
             )
         if row is not None:
@@ -229,13 +321,11 @@ async def disconnect_mcp_oauth(request: Request, server_id: str) -> dict[str, An
             should_reconfigure = True
     if should_reconfigure:
         await schedule_mcp_server_executor_reconfigure_for_app(
-            request.app,
+            app,
             server_id=server_id,
             reason="mcp_oauth_disconnect",
         )
-    await _emit_mcp_oauth_status_changed(
-        app=request.app, user_email=user.email, server_id=server_id
-    )
+    await _emit_mcp_oauth_status_changed(app=app, user_email=user_email, server_id=server_id)
     return {"status": "disconnected"}
 
 

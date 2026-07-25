@@ -107,7 +107,15 @@ def _canonical_args(arguments: dict[str, Any] | None) -> str:
 
 def _args_hash(tool_name: str, arguments: dict[str, Any] | None) -> str:
     canonical = _canonical_args(arguments)
-    return hashlib.sha1(f"{tool_name}::{canonical}".encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{tool_name}::{canonical}".encode()).hexdigest()[:32]
+
+
+def tool_call_argument_fingerprint(
+    tool_name: str, arguments: dict[str, Any] | None
+) -> str:
+    """Return a content-safe stable identity for one canonical tool request."""
+
+    return _args_hash(tool_name, arguments)
 
 
 def check_loop_guard(
@@ -171,6 +179,74 @@ def record_tool_result(
     state.last_key = key
     state.last_result_hash = result_hash
     state.identical_result_streak = 1
+
+
+@dataclass(slots=True)
+class SameTurnToolCallLedger:
+    """Records tool calls that already executed successfully in a turn lineage.
+
+    This is a provider-neutral defense against a class of duplicate tool
+    execution that the same-cycle guard and the executor's per-turn dedup
+    cannot catch:
+
+    * A provider (observed on the OpenAI/Codex Responses path) re-emits an
+      identical non-idempotent call in a *later* cycle of the same turn.
+    * A failed/cancelled turn is retried or automatically continued under a
+      *new* turn id, and the model re-plans and re-issues the same
+      non-idempotent calls it already executed. Seeding a retry/continuation
+      turn's ledger from its source turn's executed calls closes this gap
+      because the executor's dedup is strictly turn-id scoped.
+
+    Only successful (non-error) executions are recorded, so a genuine retry
+    after a tool failure is never suppressed. Read-only tools are never
+    recorded: repeating a read is idempotent and sometimes intentional.
+    """
+
+    executed: set[tuple[str, str]] = field(default_factory=set)
+
+    def record(self, tool_name: str, arguments: dict[str, Any] | None) -> None:
+        self.record_fingerprint(
+            tool_name,
+            tool_call_argument_fingerprint(tool_name, arguments),
+        )
+
+    def record_fingerprint(self, tool_name: str, fingerprint: str) -> None:
+        """Record a precomputed canonical fingerprint from a persisted event."""
+
+        self.executed.add((tool_name, fingerprint))
+
+    def already_executed(self, tool_name: str, arguments: dict[str, Any] | None) -> bool:
+        return (
+            tool_name,
+            tool_call_argument_fingerprint(tool_name, arguments),
+        ) in self.executed
+
+    def seed_from(self, other: SameTurnToolCallLedger | None) -> None:
+        """Seed this ledger from a source turn's executed calls (retry lineage)."""
+        if other is not None:
+            self.executed.update(other.executed)
+
+
+def same_turn_duplicate_rejection_payload(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> str:
+    """Build the tool-result payload for a suppressed same-turn duplicate."""
+
+    _ = arguments
+    return json.dumps(
+        {
+            "status": "skipped",
+            "reason": "duplicate_tool_call_same_turn_lineage",
+            "message": (
+                f"This exact '{tool_name}' call already executed successfully "
+                "earlier in this turn (or a turn it was retried/continued from) "
+                "and was NOT executed again to avoid a duplicate side effect. "
+                "Use the earlier result, or make a different concrete call."
+            ),
+            "tool": tool_name,
+        }
+    )
 
 
 def loop_guard_rejection_payload(
@@ -381,9 +457,13 @@ def argument_sanity_rejection_payload(
 __all__ = [
     "ArgumentSanityViolation",
     "LoopGuardState",
+    "SameTurnToolCallLedger",
     "argument_sanity_rejection_payload",
     "check_argument_sanity",
     "check_loop_guard",
     "loop_guard_rejection_payload",
     "record_tool_call",
+    "record_tool_result",
+    "same_turn_duplicate_rejection_payload",
+    "tool_call_argument_fingerprint",
 ]

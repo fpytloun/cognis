@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.core.events import EventBus, EventType
 from cognis.core.session import SessionManager
 from cognis.core.workflow_engine import WorkflowEngine
@@ -55,9 +56,26 @@ class _ChannelDelivery:
         conversation_id: str,
         content: str,
         attachments: list[dict[str, object]] | None = None,
+        deliverable_id: str | None = None,
     ) -> bool:
+        del deliverable_id
         self.calls.append((conversation_id, content, attachments))
         return self.sent
+
+    async def deliver_task_to_conversation(
+        self,
+        conversation_id: str,
+        *,
+        task_id: str,
+        content: str,
+        attachments: list[dict[str, object]] | None = None,
+        deliverable_id: str | None = None,
+    ) -> object:
+        from cognis.channels.delivery import ChannelDeliveryStatus
+
+        del task_id, deliverable_id
+        self.calls.append((conversation_id, content, attachments))
+        return ChannelDeliveryStatus.SENT if self.sent else ChannelDeliveryStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -299,10 +317,17 @@ async def test_deliver_task_result_direct_sends_channel_message_without_follow_u
         seen.append(event.type)
 
     event_bus.subscribe_all(_capture)
+    artifact_store = ArtifactStore(
+        ArtifactStoreConfig(
+            path=str(tmp_path / "artifacts-direct-duplicate"),
+            base_url="http://testserver",
+            signing_secret="test-secret",
+        )
+    )
     workflow_engine = WorkflowEngine(
         session_factory=session_factory,
         providers=SimpleNamespace(guardrails=guardrails),
-        agent_loop=SimpleNamespace(),
+        agent_loop=SimpleNamespace(artifact_store=artifact_store),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
         session_manager=SimpleNamespace(),
@@ -370,6 +395,90 @@ async def test_deliver_task_result_direct_sends_channel_message_without_follow_u
 
 
 @pytest.mark.asyncio
+async def test_direct_workflow_partial_delivery_stays_on_durable_path_without_fallback(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    channel_delivery = _ChannelDelivery(sent=False)
+    event_bus = EventBus()
+    events: list[object] = []
+
+    async def capture(event: object) -> None:
+        events.append(event)
+
+    event_bus.subscribe_all(capture)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=event_bus,
+        pause_waiter=SimpleNamespace(),
+        channel_delivery=channel_delivery,
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session,
+            email="user@example.com",
+            name="User",
+            password_hash="hash",
+            role="user",
+        )
+        await create_agent(
+            session,
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="matrix",
+            context_ref="matrix:acct-1:room-1",
+            context_data={
+                "channel_type": "matrix",
+                "account_id": "acct-1",
+                "chat_id": "room-1",
+            },
+            title="Matrix",
+        )
+        await session.commit()
+
+    task = TaskModel(
+        task_id="task-direct-partial",
+        title="Background task",
+        description="",
+        status=TaskStatus.COMPLETED,
+        priority=0,
+        created_by="user@example.com",
+        agent_id="agent-1",
+        source_type="chat",
+        source_ref=conversation.conversation_id,
+        delivery=TaskDelivery(mode="same_conversation"),
+        completion_delivery=CompletionDeliveryPolicy(completion_mode_family="direct"),
+        workflow_id=None,
+        result_summary="Done",
+        result_data={"final_content": "Multipart result"},
+        applied_completion_mode="direct",
+    )
+    await workflow_engine._deliver_task_result(task)
+
+    assert channel_delivery.calls == [(conversation.conversation_id, "Multipart result", [])]
+    assert guardrails.recorded == []
+    assert task.applied_completion_mode == "direct"
+    assert task.applied_completion_reason == "Direct channel delivery is pending durable retry."
+    assert any(
+        getattr(event, "data", {}).get("channel_delivery_status") == "failed" for event in events
+    )
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_deliver_task_result_direct_publishes_terminal_event_when_deliverable_already_sent(
     tmp_path: object,
 ) -> None:
@@ -383,10 +492,17 @@ async def test_deliver_task_result_direct_publishes_terminal_event_when_delivera
         seen.append(event.type)
 
     event_bus.subscribe_all(_capture)
+    artifact_store = ArtifactStore(
+        ArtifactStoreConfig(
+            path=str(tmp_path / "artifacts-direct-duplicate"),
+            base_url="http://testserver",
+            signing_secret="test-secret",
+        )
+    )
     workflow_engine = WorkflowEngine(
         session_factory=session_factory,
         providers=SimpleNamespace(guardrails=guardrails),
-        agent_loop=SimpleNamespace(),
+        agent_loop=SimpleNamespace(artifact_store=artifact_store),
         step_evaluator=SimpleNamespace(),
         workflow_registry=SimpleNamespace(),
         session_manager=SimpleNamespace(),
@@ -436,6 +552,7 @@ async def test_deliver_task_result_direct_publishes_terminal_event_when_delivera
             deliverable_id="dlv_direct_duplicate",
             content="Already delivered content",
             format="markdown",
+            artifact_store=artifact_store,
         )
         deliverable.status = "delivered"
         await session.commit()
@@ -1020,6 +1137,99 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
 
 
 @pytest.mark.asyncio
+async def test_deliverable_channel_outbox_ignores_legacy_full_channel_content(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    event_bus = EventBus()
+    captured: list[object] = []
+
+    async def _capture(event: object) -> None:
+        captured.append(event)
+
+    event_bus.subscribe_all(_capture)
+
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=event_bus,
+        pause_waiter=SimpleNamespace(),
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="signal",
+            context_ref="signal:acct-1:chat-1",
+            context_data={
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+            },
+            title="Signal",
+        )
+        root_session = await create_session(
+            session,
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await set_session_intaris_session_id(session, root_session.session_id, "intaris-signal")
+        await update_conversation_active_session(
+            session, conversation.conversation_id, root_session.session_id
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-chan-deliverable",
+            title="Background task",
+            description="",
+            status=TaskStatus.COMPLETED,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="chat",
+            source_ref=conversation.conversation_id,
+            delivery=TaskDelivery(mode="same_conversation"),
+            workflow_id=None,
+            result_summary="Done",
+            result_data={
+                "final_deliverable_id": "dlv_legacy",
+                "final_content": "Bounded deliverable summary",
+                "final_channel_content": "FULL DELIVERABLE CONTENT MUST NOT BE STORED IN OUTBOX",
+                "final_format": "html",
+            },
+        )
+    )
+
+    turn_completed = next(event for event in captured if event.type == EventType.TURN_COMPLETED)
+    delivery_id = turn_completed.data.get("delivery_id")
+    assert isinstance(delivery_id, str)
+
+    async with session_factory() as session:
+        row = await get_channel_delivery_outbox(session, delivery_id)
+        assert row is not None
+        assert row.fallback_text == "Bounded deliverable summary"
+        assert "FULL DELIVERABLE CONTENT" not in row.fallback_text
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_deliver_failed_task_channel_fallback_identifies_task(tmp_path: object) -> None:
     engine, session_factory = await _runtime(tmp_path)
     guardrails = _Guardrails()
@@ -1206,6 +1416,100 @@ async def test_preferred_channel_delivery_uses_preferred_account_conversation(
     )
 
     assert guardrails.recorded[0][0] == "intaris-signal"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_preferred_channel_direct_delivery_uses_matrix_main_conversation_not_thread(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    channel_delivery = _ChannelDelivery()
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=_Guardrails()),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=EventBus(),
+        pause_waiter=SimpleNamespace(),
+        channel_delivery=channel_delivery,
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        main_conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="matrix",
+            context_ref="matrix:acct-preferred:!room:example.com",
+            context_data={
+                "channel_type": "matrix",
+                "account_id": "acct-preferred",
+                "chat_id": "!room:example.com",
+                "thread_id": None,
+            },
+            title="Matrix room",
+        )
+        thread_conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="matrix",
+            context_ref="matrix:acct-preferred:!room:example.com:$thread",
+            context_data={
+                "channel_type": "matrix",
+                "account_id": "acct-preferred",
+                "chat_id": "!room:example.com",
+                "thread_id": "$thread",
+            },
+            title="Matrix thread",
+        )
+        main_conversation.updated_at = datetime(2026, 1, 1, tzinfo=UTC)
+        main_conversation.last_message_at = datetime(2026, 1, 1, tzinfo=UTC)
+        thread_conversation.updated_at = datetime(2026, 1, 2, tzinfo=UTC)
+        thread_conversation.last_message_at = datetime(2026, 1, 2, tzinfo=UTC)
+        await create_channel_account(
+            session,
+            account_id="acct-preferred",
+            channel_type="matrix",
+            display_name="Matrix",
+            agent_id="agent-1",
+            user_email="user@example.com",
+            preferred_for_task_delivery=True,
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id="task-matrix-main",
+            title="Background task",
+            description="",
+            status=TaskStatus.COMPLETED,
+            priority=0,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="scheduler",
+            source_ref=None,
+            delivery=TaskDelivery(mode="preferred_channel"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family="direct"),
+            workflow_id=None,
+            result_summary="Done",
+            result_data={"final_content": "Matrix direct result"},
+            applied_completion_mode="direct",
+        )
+    )
+
+    assert channel_delivery.calls == [
+        (main_conversation.conversation_id, "Matrix direct result", [])
+    ]
     await engine.dispose()
 
 

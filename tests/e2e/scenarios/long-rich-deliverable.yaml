@@ -1,0 +1,57 @@
+id: long-rich-deliverable
+description: |
+  Creates a long Rich Deliverable through the real write_deliverable tool so
+  browser E2E can exercise contextual active-message TOC navigation.
+trigger: "scenario:long-rich-deliverable"
+turns:
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_write_long_deliverable
+        name: write_deliverable
+        arguments:
+          action: "write_deliverable"
+          title: "Long navigation report"
+          content: "Long navigation report fallback"
+          format: "rich"
+          target: "channel"
+          rich:
+            metadata:
+              toc: true
+            blocks:
+              - type: markdown
+                title: "Section 1"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 2"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 3"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 4"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 5"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 6"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 7"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 8"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 9"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+              - type: markdown
+                title: "Section 10"
+                content: "Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis. Evidence and detailed analysis."
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["The ", "long ", "deliverable ", "is ", "ready."]
+        delay_ms: 20

@@ -1,4 +1,4 @@
-"""Claude subscription OAuth and direct Anthropic Messages transport.
+"""Claude subscription OAuth and native Anthropic Messages compatibility helpers.
 
 This module mirrors the controller-managed Codex subscription model: Cognis
 stores refreshable OAuth records in encrypted secrets and sends inference
@@ -13,7 +13,6 @@ import hashlib
 import json
 import secrets
 import time
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -49,7 +48,6 @@ CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 CCH_SALT = "59cf53e54c78"
 CCH_POSITIONS = (4, 7, 20)
-TOOL_PREFIX = "mcp_"
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,62 +217,6 @@ async def refresh_authorized_record(auth_record: dict[str, str]) -> dict[str, An
     return refreshed
 
 
-class AnthropicSubscriptionTransport:
-    """Direct controller-side Anthropic Messages transport using Claude OAuth."""
-
-    def __init__(
-        self,
-        auth: AnthropicSubscriptionAuth,
-        *,
-        timeout: float | None = None,
-    ) -> None:
-        self._auth = auth
-        self._base_url = ANTHROPIC_MESSAGES_URL
-        self._timeout = timeout or 600.0
-
-    async def completion(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, Any]],
-        stream: bool,
-        **kwargs: Any,
-    ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
-        payload = _build_anthropic_payload(
-            model=model, messages=messages, stream=stream, kwargs=kwargs
-        )
-        headers = _oauth_headers(
-            self._auth.access_token,
-            extra_headers=kwargs.get("extra_headers")
-            if isinstance(kwargs.get("extra_headers"), dict)
-            else None,
-        )
-        if _payload_uses_extended_cache_ttl(payload):
-            headers["anthropic-beta"] = _with_extended_cache_ttl_beta(headers["anthropic-beta"])
-        url = self._base_url
-        if "?" not in url:
-            url = f"{url}?beta=true"
-        elif "beta=" not in url:
-            url = f"{url}&beta=true"
-        client = httpx.AsyncClient(timeout=self._timeout)
-        if not stream:
-            try:
-                response = await client.post(url, headers=headers, json=payload)
-                await _raise_for_anthropic_error(response)
-                return _anthropic_response_to_chat(response.json(), model=model)
-            finally:
-                await client.aclose()
-        request = client.build_request("POST", url, headers=headers, json=payload)
-        response = await client.send(request, stream=True)
-        try:
-            await _raise_for_anthropic_error(response)
-        except Exception:
-            await response.aclose()
-            await client.aclose()
-            raise
-        return _stream_chat_chunks(response, client, model=model)
-
-
 def bundled_anthropic_model_entries() -> list[dict[str, Any]]:
     """Return current Claude model metadata used when remote discovery is unavailable.
 
@@ -290,8 +232,12 @@ def bundled_anthropic_model_entries() -> list[dict[str, Any]]:
         "supports_file_input": True,
         "supports_reasoning": True,
         "supports_prompt_caching": True,
+        "supports_tool_search": True,
+        "supports_native_tool_search": True,
         "supports_defer_loading": True,
         "supports_extended_thinking": True,
+        "supports_strict_tools": True,
+        "supports_pause_turn": True,
         "max_tools": 128,
     }
     return [
@@ -468,11 +414,17 @@ def _oauth_headers(
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": CLAUDE_CODE_USER_AGENT,
+        "anthropic-version": "2023-06-01",
         "anthropic-beta": ",".join(ANTHROPIC_REQUIRED_BETAS),
     }
     if extra_headers:
         for key, value in extra_headers.items():
-            if str(key).lower() in {"authorization", "x-api-key", "user-agent"}:
+            if str(key).lower() in {
+                "authorization",
+                "anthropic-version",
+                "x-api-key",
+                "user-agent",
+            }:
                 continue
             if str(key).lower() == "anthropic-beta":
                 headers["anthropic-beta"] = _merge_beta_headers(str(value))
@@ -485,74 +437,6 @@ def _merge_beta_headers(incoming: str) -> str:
     values = [*ANTHROPIC_REQUIRED_BETAS]
     values.extend(item.strip() for item in incoming.split(",") if item.strip())
     return ",".join(dict.fromkeys(values))
-
-
-def _with_extended_cache_ttl_beta(beta_header: str) -> str:
-    values = [item.strip() for item in beta_header.split(",") if item.strip()]
-    values.append(ANTHROPIC_EXTENDED_CACHE_TTL_BETA)
-    return ",".join(dict.fromkeys(values))
-
-
-def _default_max_tokens_for_model(model: str) -> int:
-    normalized = model.lower()
-    if "opus-4" in normalized or "sonnet-4" in normalized or "haiku-4" in normalized:
-        return 64_000
-    if "claude-3-7" in normalized or "claude-3.7" in normalized:
-        return 64_000
-    if "claude-3-5" in normalized or "claude-3.5" in normalized:
-        return 8_192
-    return 8_192
-
-
-def _payload_uses_extended_cache_ttl(value: Any) -> bool:
-    if isinstance(value, dict):
-        cache_control = value.get("cache_control")
-        if (
-            isinstance(cache_control, dict)
-            and str(cache_control.get("ttl") or "").strip().lower() == "1h"
-        ):
-            return True
-        return any(_payload_uses_extended_cache_ttl(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_payload_uses_extended_cache_ttl(item) for item in value)
-    return False
-
-
-def _build_anthropic_payload(
-    *,
-    model: str,
-    messages: list[dict[str, Any]],
-    stream: bool,
-    kwargs: dict[str, Any],
-) -> dict[str, Any]:
-    system_blocks, anthropic_messages = _convert_messages(messages)
-    first_user_text = _first_user_text(anthropic_messages)
-    system = [
-        {"type": "text", "text": _billing_header(first_user_text)},
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY_BRIDGE},
-        *system_blocks,
-    ]
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": anthropic_messages,
-        "system": system,
-        "stream": stream,
-        "max_tokens": int(
-            kwargs.get("max_tokens")
-            or kwargs.get("max_completion_tokens")
-            or _default_max_tokens_for_model(model)
-        ),
-    }
-    for key in ("temperature", "top_p", "top_k", "stop_sequences", "metadata", "thinking"):
-        value = kwargs.get(key)
-        if value is not None:
-            payload[key] = value
-    tools = _convert_tools(kwargs.get("tools"))
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = {"type": "auto"}
-    return payload
 
 
 def _convert_messages(
@@ -586,27 +470,35 @@ def _convert_messages(
             continue
         blocks = _content_to_blocks(message.get("content"))
         if role == "assistant":
-            blocks = [
-                *_content_to_anthropic_thinking_blocks(message.get("_anthropic_thinking_blocks")),
-                *blocks,
-            ]
-            for tool_call in message.get("tool_calls") or []:
-                if not isinstance(tool_call, dict):
-                    continue
-                function = tool_call.get("function")
-                if not isinstance(function, dict):
-                    continue
-                name = function.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                blocks.append(
-                    {
-                        "type": "tool_use",
-                        "id": str(tool_call.get("id") or ""),
-                        "name": _prefix_tool_name(name),
-                        "input": _parse_tool_arguments(function.get("arguments")),
-                    }
-                )
+            native_blocks = message.get("_anthropic_native_blocks")
+            if isinstance(native_blocks, list) and all(
+                isinstance(block, dict) for block in native_blocks
+            ):
+                blocks = [dict(block) for block in native_blocks]
+            else:
+                blocks = [
+                    *_content_to_anthropic_thinking_blocks(
+                        message.get("_anthropic_thinking_blocks")
+                    ),
+                    *blocks,
+                ]
+                for tool_call in message.get("tool_calls") or []:
+                    if not isinstance(tool_call, dict):
+                        continue
+                    function = tool_call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    name = function.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": str(tool_call.get("id") or ""),
+                            "name": name,
+                            "input": _parse_tool_arguments(function.get("arguments")),
+                        }
+                    )
         if blocks:
             _append_anthropic_message(output, role, blocks)
     if not output:
@@ -729,48 +621,6 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def _convert_tools(raw_tools: Any) -> list[dict[str, Any]]:
-    tools: list[dict[str, Any]] = []
-    if not isinstance(raw_tools, list):
-        return tools
-    for raw_tool in raw_tools:
-        if not isinstance(raw_tool, dict):
-            continue
-        function = raw_tool.get("function")
-        if not isinstance(function, dict):
-            continue
-        name = function.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        tool = {
-            "name": _prefix_tool_name(name),
-            "description": str(function.get("description") or ""),
-            "input_schema": function.get("parameters")
-            if isinstance(function.get("parameters"), dict)
-            else {"type": "object", "properties": {}},
-        }
-        for key in ("cache_control", "defer_loading"):
-            if key in function:
-                tool[key] = function[key]
-        tools.append(tool)
-    return tools
-
-
-def _prefix_tool_name(name: str) -> str:
-    if name.startswith(TOOL_PREFIX):
-        return name
-    return f"{TOOL_PREFIX}{name[:1].upper()}{name[1:]}"
-
-
-def _unprefix_tool_name(name: str) -> str:
-    if not name.startswith(TOOL_PREFIX):
-        return name
-    raw = name[len(TOOL_PREFIX) :]
-    if raw == "StructuredOutput":
-        return raw
-    return f"{raw[:1].lower()}{raw[1:]}"
-
-
 def _parse_tool_arguments(raw: Any) -> Any:
     if isinstance(raw, dict):
         return raw
@@ -819,223 +669,28 @@ def _sanitize_system_text(text: str) -> str:
 
 
 class AnthropicSubscriptionError(RuntimeError):
-    def __init__(self, status_code: int, detail: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        response: httpx.Response | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> None:
         self.status_code = status_code
+        self.response = response
+        self.body = body
         super().__init__(f"Anthropic subscription request failed ({status_code}): {detail}")
 
 
 async def _raise_for_anthropic_error(response: httpx.Response) -> None:
     if response.status_code < 400:
         return
+    await response.aread()
     detail = response.text[:500]
-    raise AnthropicSubscriptionError(response.status_code, detail)
-
-
-def _anthropic_response_to_chat(response: dict[str, Any], *, model: str) -> dict[str, Any]:
-    message = _anthropic_content_to_chat_message(response.get("content"))
-    return {
-        "id": response.get("id"),
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": response.get("model") or model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": _map_stop_reason(response.get("stop_reason")),
-            }
-        ],
-        "usage": _normalize_usage(response.get("usage")),
-    }
-
-
-def _anthropic_content_to_chat_message(content: Any) -> dict[str, Any]:
-    text_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
-    thinking_blocks: list[dict[str, Any]] = []
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                text_parts.append(block["text"])
-            elif block.get("type") in {"thinking", "redacted_thinking"}:
-                thinking_blocks.extend(_content_to_anthropic_thinking_blocks([block]))
-            elif block.get("type") == "tool_use":
-                tool_calls.append(
-                    {
-                        "id": str(block.get("id") or ""),
-                        "type": "function",
-                        "function": {
-                            "name": _unprefix_tool_name(str(block.get("name") or "")),
-                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
-                        },
-                    }
-                )
-    message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-    if thinking_blocks:
-        message["thinking_blocks"] = thinking_blocks
-    return message
-
-
-def _normalize_usage(usage: Any) -> dict[str, int]:
-    if not isinstance(usage, dict):
-        return {}
-    input_tokens = int(usage.get("input_tokens") or 0)
-    output_tokens = int(usage.get("output_tokens") or 0)
-    return {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens,
-        "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
-        "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-    }
-
-
-def _map_stop_reason(reason: Any) -> str:
-    if reason == "tool_use":
-        return "tool_calls"
-    if reason == "max_tokens":
-        return "length"
-    return "stop"
-
-
-async def _stream_chat_chunks(
-    response: httpx.Response,
-    client: httpx.AsyncClient,
-    *,
-    model: str,
-) -> AsyncIterator[dict[str, Any]]:
-    usage: dict[str, int] = {}
-    tool_indices: dict[int, int] = {}
-    thinking_blocks: dict[int, dict[str, Any]] = {}
     try:
-        async for line in response.aiter_lines():
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if not data or data == "[DONE]":
-                continue
-            event = json.loads(data)
-            event_type = event.get("type")
-            if event_type == "message_start":
-                usage.update(_normalize_usage((event.get("message") or {}).get("usage")))
-                continue
-            if event_type == "content_block_start":
-                index = int(event.get("index") or 0)
-                block = event.get("content_block") or {}
-                if isinstance(block, dict) and block.get("type") in {
-                    "thinking",
-                    "redacted_thinking",
-                }:
-                    normalized_blocks = _content_to_anthropic_thinking_blocks([block])
-                    thinking_blocks[index] = (
-                        normalized_blocks[0]
-                        if normalized_blocks
-                        else {"type": str(block.get("type") or ""), "thinking": ""}
-                    )
-                elif isinstance(block, dict) and block.get("type") == "tool_use":
-                    tool_indices[index] = len(tool_indices)
-                    yield {
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": tool_indices[index],
-                                            "id": str(block.get("id") or ""),
-                                            "type": "function",
-                                            "function": {
-                                                "name": _unprefix_tool_name(
-                                                    str(block.get("name") or "")
-                                                ),
-                                                "arguments": "",
-                                            },
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    }
-                continue
-            if event_type == "content_block_delta":
-                index = int(event.get("index") or 0)
-                delta = event.get("delta") or {}
-                if not isinstance(delta, dict):
-                    continue
-                if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-                    yield {"choices": [{"index": 0, "delta": {"content": delta["text"]}}]}
-                elif delta.get("type") == "thinking_delta" and isinstance(
-                    delta.get("thinking"), str
-                ):
-                    block = thinking_blocks.setdefault(index, {"type": "thinking", "thinking": ""})
-                    block["thinking"] = str(block.get("thinking") or "") + delta["thinking"]
-                    yield {
-                        "choices": [{"index": 0, "delta": {"reasoning_content": delta["thinking"]}}]
-                    }
-                elif delta.get("type") == "signature_delta" and isinstance(
-                    delta.get("signature"), str
-                ):
-                    block = thinking_blocks.setdefault(index, {"type": "thinking", "thinking": ""})
-                    block["signature"] = delta["signature"]
-                elif delta.get("type") == "redacted_thinking_delta" and isinstance(
-                    delta.get("data"), str
-                ):
-                    block = thinking_blocks.setdefault(
-                        index, {"type": "redacted_thinking", "data": ""}
-                    )
-                    block["data"] = str(block.get("data") or "") + delta["data"]
-                elif delta.get("type") == "input_json_delta":
-                    partial = str(delta.get("partial_json") or "")
-                    yield {
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": tool_indices.get(index, index),
-                                            "function": {"arguments": partial},
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    }
-                continue
-            if event_type == "content_block_stop":
-                index = int(event.get("index") or 0)
-                block = thinking_blocks.pop(index, None)
-                normalized_blocks = _content_to_anthropic_thinking_blocks([block])
-                if normalized_blocks:
-                    yield {
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"provider_thinking_blocks": normalized_blocks},
-                            }
-                        ],
-                    }
-                continue
-            if event_type == "message_delta":
-                delta = event.get("delta") or {}
-                if isinstance(event.get("usage"), dict):
-                    usage.update(_normalize_usage(event["usage"]))
-                if isinstance(delta, dict) and delta.get("stop_reason"):
-                    yield {
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": _map_stop_reason(delta.get("stop_reason")),
-                            }
-                        ]
-                    }
-            elif event_type == "message_stop" and usage:
-                yield {"usage": usage}
-    finally:
-        await response.aclose()
-        await client.aclose()
+        parsed_body = response.json()
+    except json.JSONDecodeError:
+        parsed_body = None
+    body = parsed_body if isinstance(parsed_body, dict) else None
+    raise AnthropicSubscriptionError(response.status_code, detail, response=response, body=body)

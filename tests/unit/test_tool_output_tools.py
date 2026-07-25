@@ -42,6 +42,66 @@ async def test_list_tool_output_anchors_returns_saved_anchors(store: ToolOutputS
 
 
 @pytest.mark.asyncio
+async def test_read_tool_output_critical_pressure_clamps_large_default_slice(
+    store: ToolOutputStore,
+) -> None:
+    content = "\n".join(f"line {index} {'x' * 120}" for index in range(1, 260))
+    await store.save("call_large", content)
+
+    result = await handle_tool_output_tool(
+        "read_tool_output",
+        {"call_id": "call_large"},
+        store,
+        pressure_mode="critical",
+    )
+
+    assert not result.is_error
+    assert len(result.output) <= 12_000
+    assert "Tool output recovery truncated under critical context pressure" in result.output
+    assert "Use offset/limit" in result.output
+
+
+@pytest.mark.asyncio
+async def test_read_tool_output_critical_pressure_honors_explicit_small_limit(
+    store: ToolOutputStore,
+) -> None:
+    content = "\n".join(f"line {index} {'x' * 120}" for index in range(1, 260))
+    await store.save("call_small", content)
+
+    result = await handle_tool_output_tool(
+        "read_tool_output",
+        {"call_id": "call_small", "limit": 5},
+        store,
+        pressure_mode="critical",
+    )
+
+    assert not result.is_error
+    assert "Tool output recovery truncated under critical context pressure" not in result.output
+    assert "1: line 1" in result.output
+    assert "5: line 5" in result.output
+    assert "6: line 6" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_read_tool_output_normal_pressure_keeps_existing_large_slice(
+    store: ToolOutputStore,
+) -> None:
+    content = "\n".join(f"line {index} {'x' * 120}" for index in range(1, 260))
+    await store.save("call_normal", content)
+
+    result = await handle_tool_output_tool(
+        "read_tool_output",
+        {"call_id": "call_normal"},
+        store,
+        pressure_mode="normal",
+    )
+
+    assert not result.is_error
+    assert len(result.output) > 12_000
+    assert "Tool output recovery truncated under" not in result.output
+
+
+@pytest.mark.asyncio
 async def test_list_tool_output_anchors_does_not_duplicate_saved_markdown_anchors(
     store: ToolOutputStore,
 ) -> None:

@@ -5,14 +5,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import getpass
+import hashlib
 import json
 import logging
 import os
 import platform
+import threading
 import uuid
+from builtins import BaseExceptionGroup
+from collections import OrderedDict
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -20,6 +25,14 @@ from websockets.exceptions import ConnectionClosed
 
 from cognis.core.executor_resolution import filter_tools_by_executor
 from cognis.executor.inference_types import json_safe_inference_payload
+from cognis.executor.resources import ExecutorResourceCollector
+from cognis.models.executor_inference import resolve_executor_local_inference_config
+from cognis.models.executor_resources import ExecutorRuntimeResourceSnapshot
+from cognis.models.local_models import (
+    OLLAMA_MANAGED_ENDPOINT,
+    OllamaRuntimeModelRequest,
+    OllamaRuntimeStartRequest,
+)
 from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
@@ -29,7 +42,13 @@ from cognis.models.tool import (
     ToolSource,
 )
 from cognis.tools.executor.browser.handlers import build_manager_from_config
-from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
+from cognis.tools.executor.browser.manager import (
+    BROWSER_MANAGER_KEY,
+    BrowserLifecycleError,
+    BrowserManager,
+    BrowserManagerCleanupRetainer,
+    BrowserSessionOwner,
+)
 from cognis.tools.executor.definitions import (
     executor_tool_definitions,
     executor_tool_handlers,
@@ -81,6 +100,15 @@ _RUNTIME_METADATA_SCHEMA_VERSION = 1
 _OAUTH_LOOPBACK_DEFAULT_TTL_SECONDS = 600
 _OAUTH_LOOPBACK_MAX_TTL_SECONDS = 900
 _OAUTH_LOOPBACK_CALLBACK_PATH = "/oauth/callback"
+_LOCAL_INFERENCE_START_METHODS = {
+    "llm.complete",
+    "llm.discover_models",
+    "llm.image_generate",
+    "llm.transcribe",
+    "llm.synthesize",
+    "local_model.show",
+    "local_model.operation.start",
+}
 
 
 def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
@@ -121,6 +149,86 @@ _WS_PING_TIMEOUT_SECONDS = _env_float(
     90.0,
     minimum=1.0,
 )
+_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS = _env_float(
+    "COGNIS_EXECUTOR_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS",
+    5.0,
+    minimum=1.0,
+)
+_EVENT_LOOP_WATCHDOG_TIMEOUT_SECONDS = _env_float(
+    "COGNIS_EXECUTOR_EVENT_LOOP_WATCHDOG_TIMEOUT_SECONDS",
+    45.0,
+    minimum=5.0,
+)
+_RESOURCE_SNAPSHOT_INTERVAL_SECONDS = _env_float(
+    "COGNIS_EXECUTOR_RESOURCE_SNAPSHOT_INTERVAL_SECONDS",
+    60.0,
+    minimum=15.0,
+)
+
+
+class _EventLoopWatchdog:
+    """Force process recovery when the executor event loop stops scheduling."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        *,
+        interval_seconds: float,
+        timeout_seconds: float,
+        exit_process: Callable[[int], object] = os._exit,
+        clock: Callable[[], float] = monotonic,
+    ) -> None:
+        self._loop = loop
+        self._interval_seconds = interval_seconds
+        self._timeout_seconds = timeout_seconds
+        self._exit_process = exit_process
+        self._clock = clock
+        self._last_ack = clock()
+        self._ack_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cognis-executor-event-loop-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self._interval_seconds + 1.0)
+
+    def acknowledge(self) -> None:
+        with self._ack_lock:
+            self._last_ack = self._clock()
+
+    def poll_once(self) -> bool:
+        """Schedule an acknowledgement; return false after fatal timeout."""
+        with self._ack_lock:
+            elapsed = self._clock() - self._last_ack
+        if elapsed > self._timeout_seconds:
+            logger.critical(
+                "Executor event loop unresponsive for %.1fs; forcing process restart",
+                elapsed,
+            )
+            self._exit_process(70)
+            return False
+        try:
+            self._loop.call_soon_threadsafe(self.acknowledge)
+        except RuntimeError:
+            return False
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            if not self.poll_once():
+                return
 
 
 def _contains_process_exit_exception(exc: BaseException) -> bool:
@@ -162,6 +270,22 @@ def _safe_base_exception_message(exc: BaseException, *, limit: int = 500) -> str
     return _safe_message(str(exc), limit=limit)
 
 
+def _websocket_close_metadata(ws: Any, exc: BaseException | None = None) -> dict[str, Any]:
+    """Return bounded transport close details without exposing payload data."""
+
+    close = getattr(exc, "rcvd", None) if exc is not None else None
+    code = getattr(close, "code", None)
+    reason = getattr(close, "reason", None)
+    if code is None:
+        code = getattr(ws, "close_code", None)
+    if reason is None:
+        reason = getattr(ws, "close_reason", None)
+    return {
+        "close_code": code if isinstance(code, int) else None,
+        "close_reason": _safe_message(reason, limit=200) if isinstance(reason, str) else None,
+    }
+
+
 def _build_browser_manager(browser_config: dict[str, Any]) -> BrowserManager | None:
     """Build a BrowserManager from the browser config block.
 
@@ -194,12 +318,87 @@ def _build_environment_payload() -> dict[str, str]:
     }
 
 
+def _build_platform_payload() -> dict[str, str]:
+    """Capture stable executor platform metadata."""
+
+    return {
+        "os": platform.system().lower(),
+        "arch": platform.machine().lower(),
+        "python": platform.python_version(),
+    }
+
+
+def _same_turn_tool_call_identity(params: dict[str, Any]) -> tuple[tuple[str, str], str] | None:
+    """Return provider-neutral turn scope and exact-call key."""
+
+    runtime_metadata = params.get("runtime_metadata")
+    if not isinstance(runtime_metadata, dict):
+        return None
+    turn_id = runtime_metadata.get("turn_id")
+    execution_scope_id = params.get("execution_scope_id")
+    tool_name = params.get("tool_name")
+    if not all(
+        isinstance(value, str) and value for value in (turn_id, execution_scope_id, tool_name)
+    ):
+        return None
+    turn_scope = (execution_scope_id, turn_id)
+    return turn_scope, json.dumps(
+        {
+            "execution_scope_id": execution_scope_id,
+            "turn_id": turn_id,
+            "tool_name": tool_name,
+            "arguments": params.get("arguments", {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _same_turn_tool_call_key(params: dict[str, Any]) -> str | None:
+    """Return only the exact-call portion of a same-turn duplicate identity."""
+
+    identity = _same_turn_tool_call_identity(params)
+    return identity[1] if identity is not None else None
+
+
+class _SameTurnToolCallDeduplicator:
+    """Reject later exact calls within one execution scope and turn."""
+
+    def __init__(self) -> None:
+        self._seen_keys: OrderedDict[tuple[str, str], dict[str, str]] = OrderedDict()
+        self._digest_key = os.urandom(32)
+        self._max_turn_scopes = 4096
+
+    def original_call_id(self, params: dict[str, Any]) -> str | None:
+        identity = _same_turn_tool_call_identity(params)
+        if identity is None:
+            return None
+        turn_scope, canonical_identity = identity
+        duplicate_key = hashlib.blake2b(
+            canonical_identity.encode("utf-8"),
+            key=self._digest_key,
+            digest_size=16,
+        ).hexdigest()
+        seen_calls = self._seen_keys.setdefault(turn_scope, {})
+        self._seen_keys.move_to_end(turn_scope)
+        while len(self._seen_keys) > self._max_turn_scopes:
+            self._seen_keys.popitem(last=False)
+        call_id = str(params.get("call_id", "unknown"))
+        original_call_id = seen_calls.get(duplicate_key)
+        if original_call_id is None:
+            seen_calls[duplicate_key] = call_id
+        return original_call_id
+
+
 class ExecutorRunner:
     """Thin remote hand for tool execution and inference proxying."""
 
     def __init__(self, config: ExecutorConfig) -> None:
         self.config = config
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
+        self._same_turn_tool_call_deduplicator = _SameTurnToolCallDeduplicator()
+        self._connection_handler_tasks: set[asyncio.Task[Any]] = set()
         self._running = True
         self._configured = False
         self._runtime_state = "offline"
@@ -208,15 +407,27 @@ class ExecutorRunner:
         self._configured_tool_definitions: list[ToolDefinition] = []
         self._mcp_clients: dict[str, MCPClient] = {}
         self._inference_handler: Any | None = None
+        self._local_inference_enabled = True
+        self._ollama_runtime_handler: Any | None = None
         self._channel_handler: Any | None = None
         self._runtime_metadata: dict[str, Any] = {}
+        self._resource_collector = ExecutorResourceCollector()
+        self._resource_snapshot: dict[str, Any] | None = None
+        self._resource_snapshot_collected_at: float | None = None
         self._background_shell_completion_callback: BackgroundShellCompletionCallback | None = None
         self._started_at = perf_counter()
         self._ws_send_lock = asyncio.Lock()
         self._oauth_loopback_listeners: dict[str, dict[str, Any]] = {}
+        self._browser_cleanup_retainer = BrowserManagerCleanupRetainer()
 
     async def run(self) -> None:
         reconnect_delay = _RECONNECT_BASE
+        watchdog = _EventLoopWatchdog(
+            asyncio.get_running_loop(),
+            interval_seconds=_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS,
+            timeout_seconds=_EVENT_LOOP_WATCHDOG_TIMEOUT_SECONDS,
+        )
+        watchdog.start()
         try:
             while self._running:
                 try:
@@ -236,9 +447,12 @@ class ExecutorRunner:
         finally:
             logger.info("Executor shutting down, cleaning up resources")
             browser_manager = self._runtime_metadata.get("browser_manager")
-            if browser_manager is not None:
+            if isinstance(browser_manager, BrowserManager):
+                self._browser_cleanup_retainer.retain(browser_manager)
+            elif browser_manager is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await browser_manager.cleanup()
+            await self._browser_cleanup_retainer.wait_until_empty()
             lsp_manager = self._runtime_metadata.get(LSP_MANAGER_KEY)
             if lsp_manager is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -255,6 +469,10 @@ class ExecutorRunner:
             if self._inference_handler is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._inference_handler.close()
+            if self._ollama_runtime_handler is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._ollama_runtime_handler.close()
+            watchdog.stop()
             logger.info("Executor shutdown complete")
 
     async def _connect_and_serve(self) -> None:
@@ -286,6 +504,7 @@ class ExecutorRunner:
             ping_timeout=_WS_PING_TIMEOUT_SECONDS,
         ) as ws:
             logger.info("WebSocket connected, sending executor.ready")
+            resource_snapshot = await self._refresh_resource_snapshot(force=True)
             ready_id = uuid.uuid4().hex
             await self._send_ws(
                 ws,
@@ -296,11 +515,8 @@ class ExecutorRunner:
                         "params": {
                             "token": self.config.controller_token,
                             "environment": _build_environment_payload(),
-                            "platform": {
-                                "os": platform.system().lower(),
-                                "arch": platform.machine().lower(),
-                                "python": platform.python_version(),
-                            },
+                            "platform": _build_platform_payload(),
+                            "resource_snapshot": resource_snapshot,
                         },
                         "id": ready_id,
                     }
@@ -343,17 +559,93 @@ class ExecutorRunner:
             )
             await notify_pending_background_shell_completions(self._runtime_metadata)
 
-            heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
             try:
-                await self._message_loop(ws)
+                await self._run_connection_loops(ws)
             finally:
                 self._background_shell_completion_callback = None
                 set_background_shell_completion_callback(self._runtime_metadata, None)
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._close_oauth_loopback_listeners()
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
+
+    async def _run_connection_loops(self, ws: Any) -> None:
+        """Supervise receive and heartbeat loops as one connection lifetime."""
+
+        message_task = asyncio.create_task(
+            self._message_loop(ws),
+            name=f"executor-message-loop-{self.config.executor_id}",
+        )
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(ws),
+            name=f"executor-heartbeat-{self.config.executor_id}",
+        )
+        tasks = {message_task, heartbeat_task}
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            heartbeat_error = (
+                heartbeat_task.exception()
+                if heartbeat_task in done and not heartbeat_task.cancelled()
+                else None
+            )
+            if heartbeat_error is not None:
+                metadata = _websocket_close_metadata(ws, heartbeat_error)
+                logger.warning(
+                    "Executor heartbeat failed; closing controller connection: %s: %s",
+                    type(heartbeat_error).__name__,
+                    _safe_base_exception_message(heartbeat_error),
+                    extra={
+                        "extra_data": {
+                            "executor_id": self.config.executor_id,
+                            "error_type": type(heartbeat_error).__name__,
+                            **metadata,
+                        }
+                    },
+                )
+                with contextlib.suppress(Exception):
+                    await ws.close(code=1011, reason="executor heartbeat failure")
+                raise heartbeat_error
+            if message_task in done:
+                message_error = message_task.exception()
+                if message_error is not None:
+                    raise message_error
+                logger.info(
+                    "Controller connection closed",
+                    extra={
+                        "extra_data": {
+                            "executor_id": self.config.executor_id,
+                            **_websocket_close_metadata(ws),
+                        }
+                    },
+                )
+                return
+
+            if heartbeat_error is None and not self._running:
+                with contextlib.suppress(Exception):
+                    await ws.close(code=1000, reason="executor shutdown")
+                return
+            if heartbeat_error is None:
+                heartbeat_error = RuntimeError("executor heartbeat stopped unexpectedly")
+            metadata = _websocket_close_metadata(ws, heartbeat_error)
+            logger.warning(
+                "Executor heartbeat failed; closing controller connection: %s: %s",
+                type(heartbeat_error).__name__,
+                _safe_base_exception_message(heartbeat_error),
+                extra={
+                    "extra_data": {
+                        "executor_id": self.config.executor_id,
+                        "error_type": type(heartbeat_error).__name__,
+                        **metadata,
+                    }
+                },
+            )
+            with contextlib.suppress(Exception):
+                await ws.close(code=1011, reason="executor heartbeat failure")
+            raise heartbeat_error
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._cancel_connection_handler_tasks()
 
     async def _message_loop(self, ws: Any) -> None:
         logger.info("Entering message loop, waiting for controller commands")
@@ -366,6 +658,14 @@ class ExecutorRunner:
             method = msg.get("method")
             msg_id = msg.get("id")
             params = msg.get("params", {})
+            if method in _LOCAL_INFERENCE_START_METHODS and not self._local_inference_enabled:
+                await self._send_rpc_error(
+                    ws,
+                    msg_id,
+                    -32045,
+                    "Local inference is disabled on this executor",
+                )
+                continue
 
             if method == "executor.configure":
                 await self._handle_configure(ws, msg_id, params)
@@ -375,6 +675,39 @@ class ExecutorRunner:
             elif method == "tool.execute":
                 tool_name = params.get("tool_name", params.get("name", "?"))
                 logger.debug("Received tool.execute: %s", tool_name)
+                call_id = str(params.get("call_id", msg_id or "unknown"))
+                original_call_id = self._same_turn_tool_call_deduplicator.original_call_id(params)
+                if original_call_id is not None:
+                    logger.warning(
+                        "Rejected duplicate same-turn tool call",
+                        extra={
+                            "extra_data": {
+                                "executor_id": self.config.executor_id,
+                                "call_id": call_id,
+                                "original_call_id": original_call_id,
+                                "tool_name": tool_name,
+                                "reason": "duplicate_tool_call_same_turn",
+                            }
+                        },
+                    )
+                    await self._send_rpc_result(
+                        ws,
+                        msg_id,
+                        {
+                            "call_id": call_id,
+                            "output": json.dumps(
+                                {
+                                    "status": "rejected",
+                                    "reason": "duplicate_tool_call_same_turn",
+                                    "original_call_id": original_call_id,
+                                },
+                                separators=(",", ":"),
+                            ),
+                            "is_error": True,
+                            "duration_ms": 0,
+                        },
+                    )
+                    continue
                 task = self._create_background_handler_task(
                     self._handle_tool_execute(ws, msg_id, params),
                     "tool.execute",
@@ -386,10 +719,53 @@ class ExecutorRunner:
                 logger.debug("Received tool.cancel: %s", call_id)
                 if call_id and call_id in self._active_calls:
                     self._active_calls[call_id].cancel()
+            elif method == "browser.session_terminal":
+                self._create_background_handler_task(
+                    self._handle_browser_session_terminal(ws, msg_id, params),
+                    method,
+                    msg_id=msg_id,
+                )
             elif method == "llm.complete":
                 logger.debug("Received llm.complete")
                 self._create_background_handler_task(
                     self._handle_llm_complete(ws, msg_id, params), "llm.complete", msg_id=msg_id
+                )
+            elif method == "llm.discover_models":
+                logger.debug("Received llm.discover_models")
+                self._create_background_handler_task(
+                    self._handle_llm_discover_models(ws, msg_id, params),
+                    "llm.discover_models",
+                    msg_id=msg_id,
+                )
+            elif method == "local_model.status":
+                self._create_background_handler_task(
+                    self._handle_local_model_status(ws, msg_id),
+                    "local_model.status",
+                    msg_id=msg_id,
+                )
+            elif method == "local_model.show":
+                self._create_background_handler_task(
+                    self._handle_local_model_show(ws, msg_id, params),
+                    "local_model.show",
+                    msg_id=msg_id,
+                )
+            elif method == "local_model.operation.start":
+                self._create_background_handler_task(
+                    self._handle_local_model_operation_start(ws, msg_id, params),
+                    "local_model.operation.start",
+                    msg_id=msg_id,
+                )
+            elif method == "local_model.operation.status":
+                self._create_background_handler_task(
+                    self._handle_local_model_operation_status(ws, msg_id, params),
+                    "local_model.operation.status",
+                    msg_id=msg_id,
+                )
+            elif method == "local_model.operation.cancel":
+                self._create_background_handler_task(
+                    self._handle_local_model_operation_cancel(ws, msg_id, params),
+                    "local_model.operation.cancel",
+                    msg_id=msg_id,
                 )
             elif method == "llm.image_generate":
                 logger.debug("Received llm.image_generate")
@@ -496,8 +872,10 @@ class ExecutorRunner:
         msg_id: str | None,
     ) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
+        self._connection_handler_tasks.add(task)
 
         def _consume_result(done: asyncio.Task[Any]) -> None:
+            self._connection_handler_tasks.discard(done)
             try:
                 done.result()
             except asyncio.CancelledError:
@@ -518,6 +896,20 @@ class ExecutorRunner:
 
         task.add_done_callback(_consume_result)
         return task
+
+    async def _cancel_connection_handler_tasks(self) -> None:
+        """Cancel and drain RPC handlers owned by the closing connection."""
+
+        tasks = tuple(self._connection_handler_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._connection_handler_tasks.difference_update(tasks)
+        for call_id, task in tuple(self._active_calls.items()):
+            if task in tasks or task.done():
+                self._active_calls.pop(call_id, None)
 
     async def _handle_configure(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
         requested_version = int(params.get("config_version") or (self._config_version + 1))
@@ -552,8 +944,19 @@ class ExecutorRunner:
         previous_runtime_metadata = dict(self._runtime_metadata)
         previous_lsp_manager = previous_runtime_metadata.get(LSP_MANAGER_KEY)
         previous_shell_manager = previous_runtime_metadata.get(SHELL_MANAGER_KEY)
+        previous_ollama_handler = self._ollama_runtime_handler
+        previous_local_inference_enabled = self._local_inference_enabled
+        previous_ollama_config = (
+            previous_ollama_handler.config if previous_ollama_handler is not None else None
+        )
 
         try:
+            inference_config = resolve_executor_local_inference_config(
+                config if isinstance(config, dict) else {}
+            )
+            ollama_config = inference_config.ollama_runtime.model_copy(
+                update={"management_enabled": inference_config.ollama_management_enabled}
+            )
             mcp_servers = [MCPServerConfig.model_validate(item) for item in mcp_servers_raw]
             validate_unique_server_names(mcp_servers)
             async with asyncio.timeout(_MCP_PREPARE_TOTAL_TIMEOUT_SECONDS):
@@ -571,6 +974,7 @@ class ExecutorRunner:
             self._tool_handlers = previous_tool_handlers
             self._configured_tool_definitions = previous_tool_definitions
             self._runtime_metadata = previous_runtime_metadata
+            self._local_inference_enabled = previous_local_inference_enabled
             self._configured = previous_configured
             self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
             await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
@@ -589,6 +993,7 @@ class ExecutorRunner:
             self._tool_handlers = previous_tool_handlers
             self._configured_tool_definitions = previous_tool_definitions
             self._runtime_metadata = previous_runtime_metadata
+            self._local_inference_enabled = previous_local_inference_enabled
             self._configured = previous_configured
             self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
             await self._send_rpc_error(
@@ -665,7 +1070,7 @@ class ExecutorRunner:
                     "web_browser_fetch_network_idle_after_dom_seconds", 3
                 ),
                 "web_browser_fetch_headed_fallback_enabled": web_config_raw.get(
-                    "web_browser_fetch_headed_fallback_enabled", False
+                    "web_browser_fetch_headed_fallback_enabled", True
                 ),
                 "web_concurrency": web_config_raw.get("web_concurrency", {}),
                 "web_available_backends": web_backends,
@@ -681,8 +1086,10 @@ class ExecutorRunner:
                 "controller_url": self.config.controller_url,
                 "browser": browser_config_dict,
                 "environment": _build_environment_payload(),
+                "platform": _build_platform_payload(),
                 "mcp_servers": mcp_statuses,
                 "warnings": mcp_warnings,
+                "local_inference_enabled": inference_config.local_inference_enabled,
             }
             if previous_shell_manager is not None:
                 self._runtime_metadata[SHELL_MANAGER_KEY] = previous_shell_manager
@@ -755,6 +1162,14 @@ class ExecutorRunner:
                 from cognis.executor.inference import InferenceHandler
 
                 self._inference_handler = InferenceHandler()
+            if self._ollama_runtime_handler is None:
+                from cognis.executor.ollama_runtime import OllamaRuntimeHandler
+
+                self._ollama_runtime_handler = OllamaRuntimeHandler(ollama_config)
+            else:
+                await self._ollama_runtime_handler.reconfigure(ollama_config)
+            self._runtime_metadata["ollama_runtime"] = self._ollama_runtime_handler.capability()
+            self._local_inference_enabled = inference_config.local_inference_enabled
             if self._channel_handler is None:
                 from cognis.executor.channel_handler import ChannelHandler
 
@@ -771,35 +1186,71 @@ class ExecutorRunner:
                 # closing from a background task leaves async generators for
                 # loop shutdown and triggers anyio cross-task scope errors.
                 await self._close_clients(previous_clients, suppress_cancelled=True)
-            old_browser_manager = previous_runtime_metadata.get(BROWSER_MANAGER_KEY)
-            if (
-                old_browser_manager is not None
-                and old_browser_manager is not self._runtime_metadata.get(BROWSER_MANAGER_KEY)
-            ):
-                with contextlib.suppress(Exception):
-                    await old_browser_manager.cleanup()
             if previous_lsp_manager is not self._runtime_metadata.get(LSP_MANAGER_KEY):
                 await cleanup_lsp_manager(previous_lsp_manager, executor_id=self.config.executor_id)
-        except Exception as exc:
+        except BaseException as exc:
             logger.warning(
                 "Configure v%d failed during tool/handler setup: %s", requested_version, exc
             )
             current_lsp_manager = self._runtime_metadata.get(LSP_MANAGER_KEY)
-            await self._close_clients(staged_mcp_clients, suppress_cancelled=True)
+            current_browser_manager = self._runtime_metadata.get(BROWSER_MANAGER_KEY)
             self._mcp_clients = previous_clients
             self._tool_handlers = previous_tool_handlers
             self._configured_tool_definitions = previous_tool_definitions
             self._runtime_metadata = previous_runtime_metadata
+            self._local_inference_enabled = previous_local_inference_enabled
             self._configured = previous_configured
             self._runtime_state = "blocked" if not previous_configured else previous_runtime_state
+            if isinstance(
+                current_browser_manager, BrowserManager
+            ) and current_browser_manager is not previous_runtime_metadata.get(BROWSER_MANAGER_KEY):
+                self._browser_cleanup_retainer.retain(current_browser_manager)
+            if self._ollama_runtime_handler is not previous_ollama_handler:
+                if self._ollama_runtime_handler is not None:
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await self._ollama_runtime_handler.close()
+                self._ollama_runtime_handler = previous_ollama_handler
+            elif previous_ollama_config is not None and self._ollama_runtime_handler is not None:
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await self._ollama_runtime_handler.reconfigure(previous_ollama_config)
+            if not isinstance(exc, Exception):
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await self._close_clients(staged_mcp_clients, suppress_cancelled=True)
+                if current_lsp_manager is not previous_lsp_manager:
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await cleanup_lsp_manager(
+                            current_lsp_manager,
+                            executor_id=self.config.executor_id,
+                        )
+                raise
+            await self._close_clients(staged_mcp_clients, suppress_cancelled=True)
             if current_lsp_manager is not previous_lsp_manager:
                 await cleanup_lsp_manager(current_lsp_manager, executor_id=self.config.executor_id)
             await self._send_rpc_error(ws, msg_id, -32021, f"Executor configure failed: {exc}")
             return
 
+        old_browser_manager = previous_runtime_metadata.get(BROWSER_MANAGER_KEY)
+        if isinstance(
+            old_browser_manager, BrowserManager
+        ) and old_browser_manager is not self._runtime_metadata.get(BROWSER_MANAGER_KEY):
+            self._browser_cleanup_retainer.retain(old_browser_manager)
         self._config_version = requested_version
         self._configured = True
         self._runtime_state = runtime_state
+        previous_probe_endpoint = (
+            previous_ollama_config.endpoint
+            if previous_ollama_config is not None
+            else OLLAMA_MANAGED_ENDPOINT
+        )
+        previous_model_store_path = (
+            previous_ollama_config.model_store_path if previous_ollama_config is not None else None
+        )
+        if (
+            ollama_config.endpoint != previous_probe_endpoint
+            or ollama_config.model_store_path != previous_model_store_path
+        ):
+            self._resource_snapshot_collected_at = None
+        await self._refresh_resource_snapshot(force=False, return_cached=True)
         logger.info(
             "Configure v%d complete: state=%s, %d tool(s), %d MCP client(s)%s",
             requested_version,
@@ -820,10 +1271,15 @@ class ExecutorRunner:
                     "observed_at": datetime.now(UTC).isoformat(),
                     "capabilities": {
                         "tools": [tool.name for tool in self._configured_tool_definitions],
-                        "inference": True,
+                        "inference": self._local_inference_enabled,
+                        "local_inference": self._local_inference_enabled,
                         "inference_models": [],
                         "inference_type": "litellm_proxy",
                         "channels": True,
+                        "local_model_runtime": self._ollama_runtime_handler.capability()
+                        if self._ollama_runtime_handler is not None
+                        and self._local_inference_enabled
+                        else None,
                     },
                     "observed_tools": [
                         tool.model_dump(mode="json") for tool in self._configured_tool_definitions
@@ -1045,6 +1501,19 @@ class ExecutorRunner:
         request_runtime_metadata = params.get("runtime_metadata")
         if not isinstance(request_runtime_metadata, dict):
             request_runtime_metadata = {}
+        tool_definition = next(
+            (
+                definition
+                for definition in self._configured_tool_definitions
+                if definition.name == tool_name
+            ),
+            None,
+        )
+        tool_server_id = (
+            getattr(getattr(tool_definition, "source", None), "server_id", None)
+            if tool_definition is not None
+            else None
+        )
         try:
             handler = self._tool_handlers.get(tool_name)
             if handler is None:
@@ -1052,6 +1521,58 @@ class ExecutorRunner:
                     output=f"Tool '{tool_name}' not available on this executor.", is_error=True
                 )
             else:
+                from cognis.core.tool_arguments import validate_tool_arguments
+                from cognis.models.tool import tool_input_schema
+
+                definition = next(
+                    (tool for tool in self._configured_tool_definitions if tool.name == tool_name),
+                    None,
+                )
+                expected_hash = request_runtime_metadata.get("tool_contract_hash")
+                local_hash = (
+                    definition.descriptor.schema_hash
+                    if definition is not None and definition.descriptor is not None
+                    else None
+                )
+                if local_hash is not None and expected_hash != local_hash:
+                    result = ToolResult(
+                        output="Controller and executor tool contracts do not match.",
+                        is_error=True,
+                        metadata={
+                            "code": "tool_contract_mismatch",
+                            "expected_hash": expected_hash,
+                            "local_hash": local_hash,
+                        },
+                    )
+                    await self._send_rpc_result(
+                        ws,
+                        msg_id,
+                        {
+                            "call_id": call_id,
+                            **result.model_dump(mode="json"),
+                        },
+                    )
+                    return
+                validation_error = validate_tool_arguments(
+                    tool_name,
+                    arguments,
+                    schema=tool_input_schema(definition) if definition is not None else None,
+                )
+                if validation_error is not None:
+                    result = ToolResult(
+                        output=json.dumps(validation_error.as_tool_result()),
+                        is_error=True,
+                        metadata={"code": "invalid_tool_arguments"},
+                    )
+                    await self._send_rpc_result(
+                        ws,
+                        msg_id,
+                        {
+                            "call_id": call_id,
+                            **result.model_dump(mode="json"),
+                        },
+                    )
+                    return
                 tool_call = ToolCall(call_id=call_id, name=tool_name, arguments=arguments)
                 from cognis.models.tool import ExecutorHandle
                 from cognis.tools.registry import ToolExecutionContext
@@ -1112,12 +1633,22 @@ class ExecutorRunner:
                 duration_ms=int((perf_counter() - start) * 1000),
                 metadata={
                     "mcp_auth_error": True,
+                    "server_id": tool_server_id,
                     "server_name": exc.server_name,
                     "phase": exc.phase,
                     "status_code": exc.status_code,
                     "auth_error": exc.auth_error,
                     "authorization_required": exc.authorization_required,
+                    "www_authenticate": exc.www_authenticate,
+                    "authorization_challenge": exc.authorization_challenge,
                 },
+            )
+        except BrowserLifecycleError as exc:
+            result = ToolResult(
+                output=str(exc),
+                is_error=True,
+                duration_ms=int((perf_counter() - start) * 1000),
+                metadata={"browser_lifecycle_error": exc.code},
             )
         except Exception as exc:
             result = ToolResult(
@@ -1141,6 +1672,46 @@ class ExecutorRunner:
                     "attachments": result.attachments,
                 },
             )
+
+    async def _handle_browser_session_terminal(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        manager = self._runtime_metadata.get(BROWSER_MANAGER_KEY)
+        retainer = self._browser_cleanup_retainer
+        raw_owner = params.get("owner")
+        if not isinstance(manager, BrowserManager) and not isinstance(
+            retainer, BrowserManagerCleanupRetainer
+        ):
+            await self._send_rpc_result(ws, msg_id, {"closed": 0, "complete": True})
+            return
+        if not isinstance(raw_owner, dict):
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32602,
+                "browser.session_terminal requires owner metadata",
+            )
+            return
+        try:
+            owner = BrowserSessionOwner.from_dict(raw_owner)
+            closed = 0
+            if isinstance(manager, BrowserManager):
+                closed += await manager.mark_owner_terminal(owner)
+            if isinstance(retainer, BrowserManagerCleanupRetainer):
+                closed += await retainer.mark_owner_terminal(owner)
+        except BrowserLifecycleError as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32020,
+                str(exc),
+                data={"code": exc.code, "retryable": True},
+            )
+            return
+        await self._send_rpc_result(ws, msg_id, {"closed": closed, "complete": True})
 
     async def _handle_llm_complete(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -1207,6 +1778,7 @@ class ExecutorRunner:
                 # markers) — required for executor-routed inference to match
                 # controller-direct behavior.
                 for extra_key in (
+                    "anthropic_native_events",
                     "reasoning_part_boundary",
                     "tool_progress",
                     "responses_output_item",
@@ -1214,6 +1786,7 @@ class ExecutorRunner:
                     "response_item_id",
                     "content_source",
                     "response_message_phase",
+                    "provider_thinking_blocks",
                 ):
                     if safe_chunk.get(extra_key) is not None:
                         chunk_params[extra_key] = safe_chunk[extra_key]
@@ -1227,6 +1800,172 @@ class ExecutorRunner:
                         }
                     ),
                 )
+
+    async def _handle_llm_discover_models(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._inference_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
+            return
+
+        try:
+            models = await self._inference_handler.discover_models(
+                preset=str(params.get("preset", "")),
+                base_url=str(params.get("base_url", "")),
+                api_key=str(params.get("api_key") or ""),
+            )
+            safe_models = json_safe_inference_payload(models)
+            await self._send_rpc_result(
+                ws,
+                msg_id,
+                {"models": safe_models if isinstance(safe_models, list) else []},
+            )
+        except Exception as exc:
+            await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_local_model_status(self, ws: Any, msg_id: str | None) -> None:
+        if self._ollama_runtime_handler is None:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32601,
+                "Managed Ollama runtime unavailable",
+            )
+            return
+        status = await self._ollama_runtime_handler.inspect()
+        await self._send_rpc_result(ws, msg_id, status.model_dump(mode="json"))
+
+    async def _handle_local_model_show(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        if self._ollama_runtime_handler is None:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32601,
+                "Managed Ollama runtime unavailable",
+            )
+            return
+        try:
+            request = OllamaRuntimeModelRequest.model_validate(params)
+            result = await self._ollama_runtime_handler.inspect_model(request.runtime_name)
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32040,
+                _safe_message(str(exc), limit=500),
+            )
+
+    async def _handle_local_model_operation_start(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        if self._ollama_runtime_handler is None:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32601,
+                "Managed Ollama runtime unavailable",
+            )
+            return
+        try:
+            operation = OllamaRuntimeStartRequest.model_validate(params)
+
+            async def _progress(payload: dict[str, Any]) -> None:
+                await self._send_ws(
+                    ws,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "local_model.progress",
+                            "params": payload,
+                        }
+                    ),
+                )
+
+            async def _complete(payload: dict[str, Any]) -> None:
+                await self._send_ws(
+                    ws,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "local_model.completed",
+                            "params": payload,
+                        }
+                    ),
+                )
+
+            status = await self._ollama_runtime_handler.start(
+                operation,
+                on_progress=_progress,
+                on_complete=_complete,
+            )
+            await self._send_rpc_result(ws, msg_id, status.model_dump(mode="json"))
+        except Exception as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32040,
+                _safe_message(str(exc), limit=500),
+            )
+
+    async def _handle_local_model_operation_status(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        if self._ollama_runtime_handler is None:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32601,
+                "Managed Ollama runtime unavailable",
+            )
+            return
+        operation_id = str(params.get("operation_id") or "")
+        status = self._ollama_runtime_handler.operation_status(operation_id)
+        if status is None:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32044,
+                "Managed Ollama operation not found",
+            )
+            return
+        await self._send_rpc_result(ws, msg_id, status.model_dump(mode="json"))
+
+    async def _handle_local_model_operation_cancel(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+    ) -> None:
+        if self._ollama_runtime_handler is None:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32601,
+                "Managed Ollama runtime unavailable",
+            )
+            return
+        operation_id = str(params.get("operation_id") or "")
+        cancelled = await self._ollama_runtime_handler.cancel(operation_id)
+        await self._send_rpc_result(
+            ws,
+            msg_id,
+            {
+                "acknowledged": cancelled,
+                "rollback_guaranteed": False,
+            },
+        )
 
     async def _handle_llm_transcribe(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -1416,26 +2155,82 @@ class ExecutorRunner:
 
     async def _heartbeat_loop(self, ws: Any) -> None:
         while self._running:
-            try:
-                await self._send_ws(
-                    ws,
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "method": "executor.heartbeat",
-                            "params": {
-                                "uptime_seconds": int(perf_counter() - self._started_at),
-                                "active_calls": len(self._active_calls),
-                                "configured": self._configured,
-                                "runtime_state": self._runtime_state,
-                                "config_version": self._config_version,
-                            },
-                        }
-                    ),
-                )
-            except Exception:
-                break
+            resource_snapshot = await self._refresh_resource_snapshot(force=False)
+            params: dict[str, Any] = {
+                "uptime_seconds": int(perf_counter() - self._started_at),
+                "active_calls": len(self._active_calls),
+                "configured": self._configured,
+                "runtime_state": self._runtime_state,
+                "config_version": self._config_version,
+            }
+            if resource_snapshot is not None:
+                params["resource_snapshot"] = resource_snapshot
+            await self._send_ws(
+                ws,
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "executor.heartbeat",
+                        "params": params,
+                    }
+                ),
+            )
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
+
+    async def _refresh_resource_snapshot(
+        self,
+        *,
+        force: bool,
+        return_cached: bool = False,
+    ) -> dict[str, Any] | None:
+        now = perf_counter()
+        runtime = ExecutorRuntimeResourceSnapshot(
+            uptime_seconds=max(0, int(now - self._started_at)),
+            active_calls=len(self._active_calls),
+            configured=self._configured,
+            state=self._runtime_state,
+        )
+        if (
+            not force
+            and self._resource_snapshot_collected_at is not None
+            and now - self._resource_snapshot_collected_at < _RESOURCE_SNAPSHOT_INTERVAL_SECONDS
+        ):
+            if return_cached and self._resource_snapshot is not None:
+                cached_snapshot = {
+                    **self._resource_snapshot,
+                    "runtime": runtime.model_dump(mode="json"),
+                }
+                self._resource_snapshot = cached_snapshot
+                if self._runtime_metadata:
+                    self._runtime_metadata["resource_snapshot"] = cached_snapshot
+                    self._runtime_metadata["platform"] = _build_platform_payload()
+                return cached_snapshot
+            return None
+        try:
+            ollama_config = (
+                self._ollama_runtime_handler.config
+                if self._ollama_runtime_handler is not None
+                else None
+            )
+            snapshot = await self._resource_collector.collect(
+                runtime=runtime,
+                ollama_endpoint=(
+                    ollama_config.endpoint if ollama_config is not None else OLLAMA_MANAGED_ENDPOINT
+                ),
+                ollama_model_store_path=(
+                    ollama_config.model_store_path if ollama_config is not None else None
+                ),
+            )
+        except Exception:
+            logger.debug("Failed to collect executor resource snapshot", exc_info=True)
+            return None
+        payload = snapshot.model_dump(mode="json", exclude={"freshness"})
+        self._resource_snapshot = payload
+        self._resource_snapshot_collected_at = now
+        if self._runtime_metadata:
+            self._runtime_metadata["resource_snapshot"] = payload
+            self._runtime_metadata["platform"] = _build_platform_payload()
+        return payload
 
     async def _start_mcp_clients(
         self, servers: list[MCPServerConfig], secrets: dict[str, str]
@@ -1498,6 +2293,7 @@ class ExecutorRunner:
                         "authorization_required": exc.authorization_required,
                         "status_code": exc.status_code,
                         "www_authenticate": exc.www_authenticate,
+                        "authorization_challenge": exc.authorization_challenge,
                     }
                 )
                 if exc.authorization_required:
@@ -1672,7 +2468,7 @@ class ExecutorRunner:
             )
             return
 
-        sockets = server.sockets or []
+        sockets: list[Any] = list(server.sockets or [])
         if not sockets:
             server.close()
             await server.wait_closed()
@@ -1828,14 +2624,23 @@ class ExecutorRunner:
             return
         await self._send_ws(ws, json.dumps({"jsonrpc": "2.0", "result": result, "id": msg_id}))
 
-    async def _send_rpc_error(self, ws: Any, msg_id: str | None, code: int, message: str) -> None:
+    async def _send_rpc_error(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        code: int,
+        message: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> None:
         if msg_id is None:
             return
+        error: dict[str, Any] = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
         await self._send_ws(
             ws,
-            json.dumps(
-                {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": msg_id}
-            ),
+            json.dumps({"jsonrpc": "2.0", "error": error, "id": msg_id}),
         )
 
     async def _send_ws(self, ws: Any, payload: str) -> None:

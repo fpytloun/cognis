@@ -38,6 +38,7 @@ from cognis.core.project_context import (
     project_metadata_from_event_data,
 )
 from cognis.logging import get_logger
+from cognis.models.config import GenerationPerformanceSnapshot
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
 
 logger = get_logger(__name__)
@@ -123,6 +124,9 @@ class CachedSessionState:
     session_id: str
     intaris_session_id: str
     events: list[CachedEvent] = field(default_factory=list)
+    events_since_compaction_memo: dict[
+        tuple[int, int, int, tuple[str, ...] | None], list[CachedEvent]
+    ] = field(default_factory=dict)
     last_event_seq: int = 0
     last_compaction_seq: int = 0
     last_compaction_summary: str | None = None
@@ -135,6 +139,8 @@ class CachedSessionState:
     prefix_entries: list[ImmutablePrefixEntry] = field(default_factory=list)
     context_snapshot_seq: int = 0
     context_snapshot_source: str | None = None
+    memory_policy_fingerprint: str | None = None
+    memory_policy_mode: str | None = None
     prefix_repair_needed: bool = False
     last_repair_attempt_at: float | None = None
     # Context usage from last context assembly
@@ -147,6 +153,7 @@ class CachedSessionState:
     reserve_output_tokens: int = 0
     effective_reserve_output_tokens: int = 0
     last_llm_usage: dict[str, int] = field(default_factory=dict)
+    last_generation_performance: dict[str, Any] | None = None
     context_metadata: dict[str, Any] = field(default_factory=dict)
     context_reserve_clamp_warned: bool = False
     # Per-session overrides (ephemeral, set via /model and /thinking commands)
@@ -156,6 +163,7 @@ class CachedSessionState:
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
     loaded_skill_ids: set[str] = field(default_factory=set)
     loaded_skill_context_hashes: dict[str, str] = field(default_factory=dict)
+    loaded_skill_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     activated_skill_ids: set[str] = field(default_factory=set)
     activated_skill_tool_ids_by_skill: dict[str, set[str]] = field(default_factory=dict)
     activated_skill_tool_ids: set[str] = field(default_factory=set)
@@ -217,6 +225,8 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             ],
             "context_snapshot_seq": entry.context_snapshot_seq,
             "context_snapshot_source": entry.context_snapshot_source,
+            "memory_policy_fingerprint": entry.memory_policy_fingerprint,
+            "memory_policy_mode": entry.memory_policy_mode,
             "prefix_repair_needed": entry.prefix_repair_needed,
             "last_repair_attempt_at": entry.last_repair_attempt_at,
             "last_prompt_tokens": entry.last_prompt_tokens,
@@ -228,6 +238,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "reserve_output_tokens": entry.reserve_output_tokens,
             "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
             "last_llm_usage": entry.last_llm_usage,
+            "last_generation_performance": entry.last_generation_performance,
             "context_metadata": entry.context_metadata,
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
@@ -235,6 +246,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "reasoning_effort_override": entry.reasoning_effort_override,
             "loaded_skill_ids": sorted(entry.loaded_skill_ids),
             "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
+            "loaded_skill_snapshots": dict(entry.loaded_skill_snapshots),
             "activated_skill_ids": sorted(entry.activated_skill_ids),
             "activated_skill_tool_ids_by_skill": {
                 skill_id: sorted(tool_ids)
@@ -307,6 +319,8 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
         ],
         context_snapshot_seq=data.get("context_snapshot_seq", 0),
         context_snapshot_source=data.get("context_snapshot_source"),
+        memory_policy_fingerprint=data.get("memory_policy_fingerprint"),
+        memory_policy_mode=data.get("memory_policy_mode"),
         prefix_repair_needed=bool(data.get("prefix_repair_needed", False)),
         last_repair_attempt_at=data.get("last_repair_attempt_at"),
         last_prompt_tokens=data.get("last_prompt_tokens", 0),
@@ -322,6 +336,11 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             for key, value in data.get("last_llm_usage", {}).items()
             if isinstance(key, str) and isinstance(value, int | float)
         },
+        last_generation_performance=(
+            dict(data["last_generation_performance"])
+            if isinstance(data.get("last_generation_performance"), dict)
+            else None
+        ),
         context_metadata=(
             dict(data.get("context_metadata", {}))
             if isinstance(data.get("context_metadata"), dict)
@@ -340,6 +359,11 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             str(key): str(value)
             for key, value in data.get("loaded_skill_context_hashes", {}).items()
             if isinstance(key, str) and isinstance(value, str)
+        },
+        loaded_skill_snapshots={
+            str(key): dict(value)
+            for key, value in data.get("loaded_skill_snapshots", {}).items()
+            if isinstance(key, str) and isinstance(value, dict)
         },
         activated_skill_ids={
             str(item)
@@ -507,6 +531,7 @@ class SessionCache:
         self.max_entries = max_entries
         self._entries: dict[str, CachedSessionState] = {}
         self._entries_lock = asyncio.Lock()
+        self._conversation_owner_by_id: dict[str, str] = {}
         self._active_thinking: dict[str, ActiveThinkingState] = {}
         # Tracks (session_id, turn_id) pairs that have been torn down via
         # clear_active_thinking so that a late thinking delta cannot re-create
@@ -516,7 +541,7 @@ class SessionCache:
         self._redis_ttl = redis_ttl_seconds
         if redis_url:
             try:
-                import redis.asyncio as aioredis
+                import redis.asyncio as aioredis  # type: ignore[import-not-found]
 
                 self._redis = aioredis.from_url(
                     redis_url,
@@ -531,6 +556,31 @@ class SessionCache:
             except Exception:
                 logger.warning("session_cache: failed to connect to Redis L2", exc_info=True)
                 self._redis = None
+
+    def get_conversation_owner(self, conversation_id: str) -> str | None:
+        """Return the immutable in-memory owner for a conversation, if known."""
+
+        return self._conversation_owner_by_id.get(conversation_id)
+
+    def remember_conversation_owner(self, conversation_id: str, owner_email: str) -> str:
+        """Cache a conversation owner without mutating an existing owner mapping."""
+
+        existing = self._conversation_owner_by_id.get(conversation_id)
+        if existing is not None:
+            if existing != owner_email:
+                logger.warning(
+                    "session_cache: conversation owner cache mismatch",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "cached_owner": existing,
+                            "resolved_owner": owner_email,
+                        }
+                    },
+                )
+            return existing
+        self._conversation_owner_by_id[conversation_id] = owner_email
+        return owner_email
 
     async def aclose(self) -> None:
         """Close Redis connection if active."""
@@ -715,6 +765,7 @@ class SessionCache:
             "message_id": state.message_id,
             "turn_id": state.turn_id,
             "assistant_phase_index": state.assistant_phase_index,
+            "assistant_phase_authoritative": True,
             # Stable anchor: the first block_id ever added to this segment.
             # The runtime projector uses this to form the thinking item id so
             # it stays stable even after completed blocks are popped.
@@ -994,6 +1045,7 @@ class SessionCache:
             entry.last_compaction_summary = summary
             entry.last_compaction_seq = compaction_seq
             entry.events = [event for event in entry.events if event.seq > compaction_seq]
+            entry.events_since_compaction_memo.clear()
             entry.last_event_seq = max(entry.last_event_seq, compaction_seq)
             entry.touched_at = monotonic()
         await self._redis_set(entry)
@@ -1162,6 +1214,27 @@ class SessionCache:
             return
         entry.last_llm_usage = dict(usage or {})
 
+    def update_last_generation_performance(
+        self, session_id: str, performance: dict[str, Any] | None
+    ) -> None:
+        """Replace the latest local-generation observation for a session."""
+
+        entry = self._entries.get(session_id)
+        if entry is None:
+            return
+        if performance is None:
+            entry.last_generation_performance = None
+            return
+        entry.last_generation_performance = GenerationPerformanceSnapshot.model_validate(
+            performance
+        ).model_dump(mode="json")
+
+    def get_last_generation_performance(self, session_id: str) -> dict[str, Any] | None:
+        entry = self.get_entry(session_id)
+        if entry is None or entry.last_generation_performance is None:
+            return None
+        return dict(entry.last_generation_performance)
+
     def update_tool_runtime_info(self, session_id: str, info: dict[str, Any] | None) -> None:
         """Store the latest tool-exposure runtime metadata for a session."""
 
@@ -1201,6 +1274,14 @@ class SessionCache:
         if entry is None:
             return None
         return entry.loaded_skill_context_hashes.get(skill_id)
+
+    def get_loaded_skill_snapshots(self, session_id: str) -> dict[str, dict[str, Any]]:
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return {}
+        return {
+            skill_id: dict(snapshot) for skill_id, snapshot in entry.loaded_skill_snapshots.items()
+        }
 
     def get_discovered_tool_ids(self, session_id: str) -> set[str]:
         """Return stable tool ids discovered by ``search_tools`` in this session."""
@@ -1279,6 +1360,22 @@ class SessionCache:
             entry.activated_skill_ids.discard(skill_id)
             entry.activated_skill_tool_ids_by_skill.pop(skill_id, None)
         self._rebuild_activated_skill_tool_union(entry)
+
+    def store_loaded_skill_snapshot(
+        self,
+        session_id: str,
+        skill_id: str,
+        snapshot: dict[str, Any],
+    ) -> None:
+        entry = self.get_entry(session_id)
+        if entry is None or not skill_id:
+            return
+        entry.loaded_skill_ids.add(skill_id)
+        entry.loaded_skill_snapshots[skill_id] = dict(snapshot)
+        content_hash = snapshot.get("content_hash")
+        if isinstance(content_hash, str):
+            entry.loaded_skill_context_hashes[skill_id] = content_hash
+        entry.touched_at = monotonic()
 
     def get_skill_tool_classification(self, session_id: str, cache_key: str) -> list[str] | None:
         entry = self.get_entry(session_id)
@@ -1540,6 +1637,8 @@ class SessionCache:
         *,
         snapshot_seq: int,
         snapshot_source: str,
+        memory_policy_fingerprint: str | None = None,
+        memory_policy_mode: str | None = None,
     ) -> None:
         """Persist the active immutable-prefix snapshot in the cache."""
 
@@ -1550,6 +1649,8 @@ class SessionCache:
             entry.prefix_entries = sort_prefix_entries(list(entries))
             entry.context_snapshot_seq = snapshot_seq
             entry.context_snapshot_source = snapshot_source
+            entry.memory_policy_fingerprint = memory_policy_fingerprint
+            entry.memory_policy_mode = memory_policy_mode
             entry.prefix_repair_needed = False
             compaction_summary = entry.last_compaction_summary
             for prefix_entry in entry.prefix_entries:
@@ -1574,16 +1675,33 @@ class SessionCache:
     def get_events_since_compaction(
         self, session_id: str, types: list[str] | None = None
     ) -> list[CachedEvent]:
-        """Return buffered events after the latest compaction."""
+        """Return buffered events after the latest compaction.
+
+        The returned list may be a memoized reference shared with later calls.
+        Callers must treat it as read-only and never mutate it in place.
+        """
 
         entry = self.get_entry(session_id)
         if entry is None:
             return []
-        events = entry.events
+        types_key = tuple(types) if types is not None else None
+        memo_key = (
+            entry.last_compaction_seq,
+            entry.last_event_seq,
+            len(entry.events),
+            types_key,
+        )
+        memoized = entry.events_since_compaction_memo.get(memo_key)
+        if memoized is not None:
+            return memoized
+        events: list[CachedEvent] = entry.events
         if types is not None:
             allowed = set(types)
             events = [event for event in events if event.type in allowed]
-        return list(events)
+        else:
+            events = list(events)
+        entry.events_since_compaction_memo = {memo_key: events}
+        return events
 
     # ------------------------------------------------------------------
     # Internal
@@ -1667,12 +1785,15 @@ class SessionCache:
         """Replace event-derived cache state from a full Intaris stream read."""
 
         entry.events = []
+        entry.events_since_compaction_memo.clear()
         entry.last_event_seq = 0
         entry.last_compaction_seq = 0
         entry.last_compaction_summary = None
         entry.prefix_entries = []
         entry.context_snapshot_seq = 0
         entry.context_snapshot_source = None
+        entry.memory_policy_fingerprint = None
+        entry.memory_policy_mode = None
         entry.prefix_repair_needed = False
         entry.discovered_tool_handles = {}
         entry.project_contexts = {}
@@ -1746,6 +1867,9 @@ class SessionCache:
                     )
 
         snapshot_data = latest_snapshot.data
+        snapshot_extras = snapshot_data.get("extras", {})
+        if not isinstance(snapshot_extras, dict):
+            snapshot_extras = {}
         rebuilt_entries: list[ImmutablePrefixEntry] = []
         for item in snapshot_data.get("entries", []):
             if not isinstance(item, dict):
@@ -1769,6 +1893,10 @@ class SessionCache:
         entry.context_snapshot_source = (
             snapshot_source if isinstance(snapshot_source, str) else None
         )
+        fingerprint = snapshot_extras.get("memory_policy_fingerprint")
+        entry.memory_policy_fingerprint = fingerprint if isinstance(fingerprint, str) else None
+        mode = snapshot_extras.get("memory_mode")
+        entry.memory_policy_mode = mode if isinstance(mode, str) else None
         entry.prefix_repair_needed = False
         compaction_summary = entry.last_compaction_summary
         for prefix_entry in entry.prefix_entries:
@@ -1836,6 +1964,9 @@ class SessionCache:
                     )
 
         snapshot_data = latest_snapshot.get("data", {})
+        snapshot_extras = snapshot_data.get("extras", {})
+        if not isinstance(snapshot_extras, dict):
+            snapshot_extras = {}
         rebuilt_entries: list[ImmutablePrefixEntry] = []
         missing_refs: list[int] = []
         for item in snapshot_data.get("entries", []):
@@ -1878,6 +2009,10 @@ class SessionCache:
         entry.context_snapshot_source = (
             snapshot_source if isinstance(snapshot_source, str) else None
         )
+        fingerprint = snapshot_extras.get("memory_policy_fingerprint")
+        entry.memory_policy_fingerprint = fingerprint if isinstance(fingerprint, str) else None
+        mode = snapshot_extras.get("memory_mode")
+        entry.memory_policy_mode = mode if isinstance(mode, str) else None
         entry.prefix_repair_needed = False
         compaction_summary = entry.last_compaction_summary
         for prefix_entry in entry.prefix_entries:
@@ -1934,6 +2069,7 @@ class SessionCache:
                 for existing in entry.events
                 if self._loaded_skill_id_from_event(existing) != loaded_skill_id
             ]
+            entry.events_since_compaction_memo.clear()
             if superseded_event_seqs:
                 entry.prefix_entries = [
                     item for item in entry.prefix_entries if item.seq not in superseded_event_seqs
@@ -1963,12 +2099,14 @@ class SessionCache:
             ):
                 entry.events.append(event)
             entry.last_event_seq = max(entry.last_event_seq, event.seq)
+            entry.events_since_compaction_memo.clear()
             return
         if event.type == "compaction_summary":
             summary = event.data.get("summary")
             entry.last_compaction_summary = summary if isinstance(summary, str) else None
             entry.last_compaction_seq = event.seq
             entry.events = [existing for existing in entry.events if existing.seq > event.seq]
+            entry.events_since_compaction_memo.clear()
         elif event.type == "tool_discovery" or (
             event.type == "lifecycle" and event.data.get("event") == "tool_discovery"
         ):
@@ -1982,9 +2120,9 @@ class SessionCache:
                         continue
                     if handle.discovered_at is None:
                         handle.discovered_at = event.ts
-                    existing = entry.discovered_tool_handles.get(handle.tool_id)
-                    if handle.last_used_at is None and existing is not None:
-                        handle.last_used_at = existing.last_used_at
+                    existing_handle = entry.discovered_tool_handles.get(handle.tool_id)
+                    if handle.last_used_at is None and existing_handle is not None:
+                        handle.last_used_at = existing_handle.last_used_at
                     entry.discovered_tool_handles[handle.tool_id] = handle
             if event.seq > entry.last_compaction_seq:
                 entry.events.append(event)
@@ -2001,13 +2139,15 @@ class SessionCache:
         elif event.seq > entry.last_compaction_seq:
             entry.events.append(event)
         entry.last_event_seq = max(entry.last_event_seq, event.seq)
+        entry.events_since_compaction_memo.clear()
 
     @staticmethod
     def _loaded_skill_id_from_event(event: CachedEvent) -> str | None:
-        if event.type != "developer_message":
-            return None
         data = event.data
-        if data.get("kind") != "loaded_skill":
+        if not (
+            (event.type == "developer_message" and data.get("kind") == "loaded_skill")
+            or (event.type == "lifecycle" and data.get("event") == "loaded_skill_snapshot")
+        ):
             return None
         skill_id = data.get("skill_id")
         if not isinstance(skill_id, str) or not skill_id.strip():
@@ -2027,6 +2167,37 @@ class SessionCache:
         content_hash = data.get("content_hash")
         if isinstance(content_hash, str):
             entry.loaded_skill_context_hashes[skill_id] = content_hash
+        snapshot = {
+            key: data.get(key)
+            for key in (
+                "skill_id",
+                "skill_name",
+                "name",
+                "version_id",
+                "version_number",
+                "content_hash",
+                "contract_version",
+            )
+        }
+        name = snapshot.pop("name") or snapshot.get("skill_name")
+        snapshot.pop("skill_name", None)
+        snapshot["name"] = name
+        if snapshot.get("contract_version") is None and snapshot.get("name") == "daily-brief":
+            from cognis.core.daily_brief_contract import daily_brief_contract_version
+
+            legacy_content = data.get("content")
+            inferred = daily_brief_contract_version(
+                name="daily-brief",
+                prompt_templates={
+                    "legacy_loaded_skill": (
+                        legacy_content if isinstance(legacy_content, str) else ""
+                    )
+                },
+            )
+            # Metadata-free loaded_skill events predate the v13 activation
+            # contract. Preserve v12 rather than silently upgrading them.
+            snapshot["contract_version"] = inferred or 12
+        entry.loaded_skill_snapshots[skill_id] = snapshot
         raw_tool_ids = data.get("activated_tool_ids")
         if isinstance(raw_tool_ids, list):
             tool_ids = {item for item in raw_tool_ids if isinstance(item, str) and item.strip()}
@@ -2046,13 +2217,34 @@ class SessionCache:
             for tool_id in tool_ids
         }
 
+    async def resize(self, max_entries: int) -> None:
+        """Apply a new L1 bound and evict unlocked excess entries immediately."""
+
+        async with self._entries_lock:
+            self.max_entries = max(1, int(max_entries))
+            while len(self._entries) > self.max_entries:
+                if not self._evict_one_unlocked():
+                    break
+
+    async def mark_all_prefix_repairs_needed(self) -> None:
+        """Schedule immutable-prefix regeneration for cached sessions."""
+
+        async with self._entries_lock:
+            session_ids = list(self._entries)
+        for session_id in session_ids:
+            await self.mark_prefix_repair_needed(session_id)
+
     async def _evict_oldest_unlocked(self) -> None:
-        if self.max_entries <= 0 or len(self._entries) < self.max_entries:
-            return
+        while self.max_entries > 0 and len(self._entries) >= self.max_entries:
+            if not self._evict_one_unlocked():
+                return
+
+    def _evict_one_unlocked(self) -> bool:
         eviction_candidates = [entry for entry in self._entries.values() if not entry.lock.locked()]
         if not eviction_candidates:
-            return
+            return False
         oldest_entry = min(eviction_candidates, key=lambda entry: entry.touched_at)
         self._entries.pop(oldest_entry.session_id, None)
         CACHE_EVICTIONS.inc()
         CACHE_SIZE.set(len(self._entries))
+        return True

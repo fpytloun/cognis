@@ -7,10 +7,12 @@ from typing import Any
 import pytest
 
 from cognis.api.chat_v2.event_store import RawSessionEvent
+from cognis.api.chat_v2.item_keys import assistant_message_item_id
 from cognis.api.chat_v2.normalizer import normalize_session_events
 from cognis.api.chat_v2.projector import project_timeline
 from cognis.api.chat_v2.schemas import (
     ArtifactTimelineItem,
+    AssistantDeliverableTimelineItem,
     AuthChallengeTimelineItem,
     CompactionTimelineItem,
     CredentialRequestTimelineItem,
@@ -93,6 +95,63 @@ def test_audit_only_prompt_visibility_is_hidden() -> None:
     assert normalization.skipped_count == 1
     assert normalization.skipped_event_types == {"user_message": 1}
     assert projection.timeline.items == []
+
+
+def test_turn_error_lifecycle_projects_as_error() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_failed",
+            seq=2,
+            type="lifecycle",
+            data={
+                "event": "turn_error",
+                "turn_id": "turn_failed",
+                "message": "Executor unavailable",
+                "code": "executor_unavailable",
+                "recoverable": True,
+            },
+        )
+    ]
+
+    normalization = normalize_session_events(raw_events)
+    projection = project_timeline(normalization.events)
+
+    assert normalization.skipped_count == 0
+    assert len(projection.timeline.items) == 1
+    assert projection.timeline.items[0].kind == "error"
+    assert projection.timeline.items[0].error_code == "executor_unavailable"
+    assert projection.timeline.items[0].recoverable is True
+
+
+def test_cancelled_turn_lifecycle_projects_as_system_message() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_cancelled",
+            seq=2,
+            type="lifecycle",
+            data={
+                "event": "turn_error",
+                "turn_id": "turn_cancelled",
+                "message": "The turn was cancelled.",
+                "error_code": "turn_cancelled",
+                "recoverable": True,
+            },
+        )
+    ]
+
+    normalization = normalize_session_events(raw_events)
+    projection = project_timeline(normalization.events)
+
+    assert normalization.skipped_count == 0
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, MessageTimelineItem)
+    assert item.kind == "message"
+    assert item.role == "system"
+    assert item.content == "The turn was cancelled."
+    assert item.turn_id == "turn_cancelled"
 
 
 def test_lifecycle_and_system_events_are_hidden_from_chat_timeline() -> None:
@@ -224,6 +283,19 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
                 "turn_id": "turn_1",
                 "notice_id": "model_error:turn_1",
                 "kind": "model_error",
+                "scope": "failed_turn",
+                "reason_class": "rate_limit",
+                "provider_id": "anthropic-lumilens",
+                "model": "claude-fable-5",
+                "retry_after_seconds": 23,
+                "provider_retry_after_seconds": 23,
+                "retry_at": "2026-07-09T13:28:00+00:00",
+                "attempt": 1,
+                "max_attempts": 3,
+                "attempts": 3,
+                "attempts_per_cycle": 1,
+                "continuation_attempts": 2,
+                "recoverable": True,
             },
         ),
     ]
@@ -245,6 +317,19 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
     assert item.turn_id == "turn_1"
     assert item.notice_id == "model_error:turn_1"
     assert item.notice_kind == "model_error"
+    assert item.notice_scope == "failed_turn"
+    assert item.reason_class == "rate_limit"
+    assert item.provider_id == "anthropic-lumilens"
+    assert item.model == "claude-fable-5"
+    assert item.retry_after_seconds == 23
+    assert item.provider_retry_after_seconds == 23
+    assert item.retry_at == "2026-07-09T13:28:00+00:00"
+    assert item.attempt == 1
+    assert item.max_attempts == 3
+    assert item.attempts == 3
+    assert item.attempts_per_cycle == 1
+    assert item.continuation_attempts == 2
+    assert item.recoverable is True
 
 
 def test_lifecycle_system_notice_dedupes_by_notice_id() -> None:
@@ -355,7 +440,7 @@ def test_compaction_summary_projects_to_compaction_card() -> None:
     item = projection.timeline.items[0]
     assert isinstance(item, CompactionTimelineItem)
     assert item.kind == "compaction"
-    assert item.id == "compaction:sess_old:sess_new"
+    assert item.id == "compaction:sess_old"
     assert item.status == "compacted"
     assert item.session_id == "sess_new"
     assert item.previous_session_id == "sess_old"
@@ -365,6 +450,69 @@ def test_compaction_summary_projects_to_compaction_card() -> None:
     assert item.previous_usage_percentage == 86.1
     assert item.effective_usage_percentage == 72.5
     assert item.hard_pressure_exceeded is True
+
+
+def test_legacy_and_rotated_compaction_markers_fold_to_one_card() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_old",
+            seq=11,
+            type="compaction_summary",
+            data={
+                "summary": "Legacy source-session checkpoint",
+                "method": "llm",
+                "turns_compacted": 7,
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_new",
+            seq=2,
+            type="compaction_summary",
+            data={
+                "session_id": "sess_new",
+                "source_session_id": "sess_old",
+                "summary": "Rotated-session marker",
+                "method": "rotation",
+                "turns_compacted": 7,
+                "timeline_visible": True,
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, CompactionTimelineItem)
+    assert item.id == "compaction:sess_old"
+    assert item.session_id == "sess_new"
+    assert item.summary == "Rotated-session marker"
+    assert len(item.source_refs) == 2
+
+
+def test_source_compaction_checkpoint_uses_runtime_stable_id() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_old",
+            seq=11,
+            type="compaction_summary",
+            data={
+                "summary": "Internal checkpoint",
+                "timeline_visible": True,
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, CompactionTimelineItem)
+    assert item.id == "compaction:sess_old"
+    assert item.session_id == "sess_old"
 
 
 def test_evaluation_events_attach_to_tool_call_cards() -> None:
@@ -539,6 +687,217 @@ def test_tool_result_preserves_cycle_from_tool_call_event() -> None:
     assert tool_call.turn_cycle_index == 2
 
 
+def test_tool_result_backfills_cycle_when_tool_call_event_lacks_stamp() -> None:
+    """The primary regular-tool path historically recorded tool_call events
+    without cycle/phase while the paired tool_result carried them. The
+    projector must backfill from the tool_result rather than freezing the
+    tool_call's null, otherwise the grouping key is lost after reload."""
+
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_cycle",
+            seq=1,
+            type="tool_call",
+            data={
+                "call_id": "call_1",
+                "name": "web_fetch",
+                "arguments": {"url": "https://example.com"},
+                "turn_id": "turn_1",
+                # No assistant_phase_index / turn_cycle_index (legacy batch path).
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_cycle",
+            seq=2,
+            type="tool_result",
+            data={
+                "call_id": "call_1",
+                "name": "web_fetch",
+                "result": "contents",
+                "is_error": False,
+                "turn_id": "turn_1",
+                "assistant_phase_index": 2,
+                "turn_cycle_index": 1,
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+    tool_call = next(item for item in projection.timeline.items if item.kind == "tool_call")
+
+    assert tool_call.turn_cycle_index == 1
+    assert tool_call.assistant_phase_index == 2
+
+
+def test_production_snapshot_shape_tools_missing_cycle_are_repaired() -> None:
+    """Reproduces the 2026-07-08 production snapshot: thinking events carry an
+    int cycle, but tool_call/tool_result events for the same turn were persisted
+    without one. The positional repair must stamp the tool items with the
+    surrounding cycle so they fold with the thinking segment instead of
+    fragmenting into standalone cards."""
+
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_prod",
+            seq=1,
+            type="user_message",
+            data={"content": "Explain this.", "client_message_id": "cmsg_1", "turn_id": "turn_1"},
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_prod",
+            seq=2,
+            type="tool_call",
+            data={
+                "call_id": "call_a",
+                "name": "web_fetch",
+                "arguments": {"url": "https://example.com/1"},
+                "turn_id": "turn_1",
+                # Batch path: no cycle/phase.
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_prod",
+            seq=3,
+            type="tool_result",
+            data={
+                "call_id": "call_a",
+                "name": "web_fetch",
+                "result": "first",
+                "is_error": False,
+                "turn_id": "turn_1",
+                # Result recorded before result-side stamping existed either.
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_prod",
+            seq=4,
+            type="assistant_thinking",
+            data={
+                "message_id": "turn_1",
+                "block_id": "think_1",
+                "content": "Considering options",
+                "turn_id": "turn_1",
+                "assistant_phase_index": 4,
+                "turn_cycle_index": 2,
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_prod",
+            seq=5,
+            type="tool_call",
+            data={
+                "call_id": "call_b",
+                "name": "bash",
+                "arguments": {"command": "curl -s https://example.com/2"},
+                "turn_id": "turn_1",
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_prod",
+            seq=6,
+            type="tool_result",
+            data={
+                "call_id": "call_b",
+                "name": "bash",
+                "result": "second",
+                "is_error": False,
+                "turn_id": "turn_1",
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+    tool_calls = [item for item in projection.timeline.items if item.kind == "tool_call"]
+
+    # Both tools inherit a same-turn cycle so they carry the grouping key. The
+    # first tool precedes the thinking cycle (2) and inherits it via the forward
+    # scan; the bash tool follows the thinking event and also resolves to 2.
+    assert all(isinstance(tc.turn_cycle_index, int) for tc in tool_calls)
+    assert {tc.turn_cycle_index for tc in tool_calls} == {2}
+
+
+def test_final_answer_after_tool_cycle_stays_standalone_while_tools_repaired() -> None:
+    """A trailing assistant answer with no following tools must NOT inherit the
+    prior cycle (it is the final answer and renders standalone), even though the
+    preceding unstamped tools DO inherit it via the backward fallback."""
+
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_final",
+            seq=1,
+            type="assistant_thinking",
+            data={
+                "message_id": "turn_1",
+                "block_id": "think_1",
+                "content": "Planning",
+                "turn_id": "turn_1",
+                "assistant_phase_index": 0,
+                "turn_cycle_index": 0,
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_final",
+            seq=2,
+            type="tool_call",
+            data={
+                "call_id": "call_a",
+                "name": "bash",
+                "arguments": {"command": "ls"},
+                "turn_id": "turn_1",
+                # Unstamped batch path; must inherit cycle 0 backward.
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_final",
+            seq=3,
+            type="tool_result",
+            data={
+                "call_id": "call_a",
+                "name": "bash",
+                "result": "files",
+                "is_error": False,
+                "turn_id": "turn_1",
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_final",
+            seq=4,
+            type="assistant_message",
+            data={
+                "message_id": "turn_1",
+                "content": "Here is the answer.",
+                "turn_id": "turn_1",
+                "assistant_phase_index": 1,
+                # No cycle: this is the final answer, no following tools.
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    tool_call = next(item for item in projection.timeline.items if item.kind == "tool_call")
+    answer = next(
+        item
+        for item in projection.timeline.items
+        if item.kind == "message" and item.role == "assistant"
+    )
+
+    assert tool_call.turn_cycle_index == 0
+    assert answer.turn_cycle_index is None
+
+
 def test_assistant_missing_cycle_is_repaired_from_following_same_turn_tool_cycle() -> None:
     raw_events = [
         RawSessionEvent(
@@ -668,6 +1027,7 @@ def test_folded_delegation_payload_preserves_turn_metadata() -> None:
                 "turn_id": "turn_1",
                 "assistant_phase_index": 3,
                 "turn_cycle_index": 2,
+                "error_code": "delegate_agent_not_found",
             },
         ),
     ]
@@ -682,6 +1042,7 @@ def test_folded_delegation_payload_preserves_turn_metadata() -> None:
     assert item.delegation["turn_id"] == "turn_1"
     assert item.delegation["assistant_phase_index"] == 3
     assert item.delegation["turn_cycle_index"] == 2
+    assert item.delegation["error_code"] == "delegate_agent_not_found"
 
 
 def test_evaluation_events_use_tool_call_id_as_sidecar_target() -> None:
@@ -838,14 +1199,9 @@ def test_assistant_message_without_phase_uses_unphased_id() -> None:
     assert items[0].id == "message:turn_1"
 
 
-def test_canonical_assistant_id_matches_runtime_and_legacy_id() -> None:
-    """The canonical projector, the runtime overlay, and the legacy/completion
-    builder must produce byte-identical assistant ids for the same (message_id,
-    phase) so live and canonical items merge 1:1. Guards against regressing to
-    the divergent `message:{id}` (canonical) vs `message:{id}:phase:{p}`
-    (runtime) shapes that dropped mid-turn assistant messages."""
+def test_canonical_assistant_id_matches_runtime_id() -> None:
+    """The projector and runtime overlay share the canonical assistant id."""
     from cognis.api.chat_v2.realtime import assistant_stream_runtime_item
-    from cognis.api.routes.conversations import _stable_assistant_timeline_id
 
     for phase in (0, 1, 7):
         raw_events = [
@@ -876,10 +1232,10 @@ def test_canonical_assistant_id_matches_runtime_and_legacy_id() -> None:
             },
             local=0,
         )
-        legacy_id = _stable_assistant_timeline_id("turn_x", phase, "turn_x")
-        assert canonical_item.id == legacy_id
+        canonical_id = assistant_message_item_id(message_id="turn_x", phase=phase)
+        assert canonical_item.id == canonical_id
         assert runtime_item is not None
-        assert runtime_item.id == legacy_id
+        assert runtime_item.id == canonical_id
 
 
 def test_multiple_thinking_blocks_remain_separate_timeline_items() -> None:
@@ -1004,7 +1360,11 @@ def test_thinking_block_projects_timing() -> None:
     assert block.duration_ms == 2000
 
 
-def test_delegation_folds_onto_delegate_tool_call() -> None:
+@pytest.mark.parametrize(
+    "tool_name",
+    ["delegate", "retry_subsession", "follow_up_subsession", "fork_subsession", "fork"],
+)
+def test_delegation_folds_onto_delegated_subsession_tool_call(tool_name: str) -> None:
     raw_events = [
         RawSessionEvent(
             store_id="intaris",
@@ -1013,7 +1373,7 @@ def test_delegation_folds_onto_delegate_tool_call() -> None:
             type="tool_call",
             data={
                 "call_id": "call_d",
-                "name": "delegate",
+                "name": tool_name,
                 "arguments": {"title": "Investigate X", "agent_id": "laforge"},
             },
         ),
@@ -1036,11 +1396,11 @@ def test_delegation_folds_onto_delegate_tool_call() -> None:
         ),
     ]
     projection = project_timeline(normalize_session_events(raw_events).events)
-    # Only the delegate tool call remains; no separate delegation card.
+    # Only the delegated sub-session tool call remains; no standalone card.
     assert [item.kind for item in projection.timeline.items] == ["tool_call"]
     item = projection.timeline.items[0]
     assert isinstance(item, ToolCallTimelineItem)
-    assert item.tool_name == "delegate"
+    assert item.tool_name == tool_name
     assert item.delegation is not None
     assert item.delegation["title"] == "Investigate X"
     assert item.delegation["used_agent_id"] == "laforge"
@@ -1141,7 +1501,13 @@ def test_delegation_without_matching_tool_call_emits_standalone_card() -> None:
     assert [item.kind for item in projection.timeline.items] == ["delegation"]
 
 
-def test_delegation_projected_before_tool_call_folds_and_suppresses_card() -> None:
+@pytest.mark.parametrize(
+    "tool_name",
+    ["delegate", "retry_subsession", "follow_up_subsession", "fork_subsession", "fork"],
+)
+def test_delegation_projected_before_tool_call_folds_and_suppresses_card(
+    tool_name: str,
+) -> None:
     """A delegation event ordered BEFORE its tool_call in the same window folds.
 
     Concurrent writers can invert seq order (the delegation completion lands
@@ -1167,7 +1533,7 @@ def test_delegation_projected_before_tool_call_folds_and_suppresses_card() -> No
             session_id="sess_deleg",
             seq=2,
             type="tool_call",
-            data={"call_id": "call_d", "name": "delegate", "arguments": {"title": "X"}},
+            data={"call_id": "call_d", "name": tool_name, "arguments": {"title": "X"}},
         ),
     ]
     projection = project_timeline(normalize_session_events(raw_events).events)
@@ -1238,6 +1604,103 @@ def _load_fixture(fixture_name: str) -> dict[str, Any]:
     loaded = json.loads((FIXTURES_DIR / fixture_name).read_text())
     assert isinstance(loaded, dict)
     return loaded
+
+
+def test_assistant_deliverable_event_projects_reference_only_item() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_1",
+            seq=1,
+            event_id="evt-deliverable",
+            type="lifecycle",
+            data={
+                "event": "assistant_deliverable",
+                "deliverable_id": "dlv_rich",
+                "format": "rich",
+                "title": "Rich report",
+                "render_metadata": {"presentation": "rich"},
+            },
+        )
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, AssistantDeliverableTimelineItem)
+    assert item.deliverable_id == "dlv_rich"
+    assert item.format == "rich"
+    assert item.title == "Rich report"
+    assert item.render_metadata == {"presentation": "rich"}
+    assert not hasattr(item, "rich_payload")
+
+
+def test_deferred_assistant_deliverable_projects_after_final_assistant_message() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_1",
+            seq=1,
+            event_id="evt-user",
+            type="user_message",
+            data={"content": "Build report", "client_message_id": "client-1"},
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_1",
+            seq=2,
+            event_id="evt-tool",
+            type="tool_call",
+            data={
+                "call_id": "call_write",
+                "tool_name": "write_deliverable",
+                "arguments": {"content": "# Draft"},
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_1",
+            seq=3,
+            event_id="evt-final",
+            type="assistant_message",
+            data={
+                "content": "Completed validation. The final deliverable follows.",
+                "message_id": "turn-1",
+                "turn_id": "turn-1",
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_1",
+            seq=4,
+            event_id="evt-deliverable",
+            type="lifecycle",
+            data={
+                "event": "assistant_deliverable",
+                "deliverable_id": "dlv_final",
+                "format": "markdown",
+                "title": "Final report",
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assistant_index = next(
+        index
+        for index, item in enumerate(projection.timeline.items)
+        if isinstance(item, MessageTimelineItem) and item.role == "assistant"
+    )
+    deliverable_index = next(
+        index
+        for index, item in enumerate(projection.timeline.items)
+        if item.id == "assistant-deliverable:dlv_final"
+    )
+    assert assistant_index < deliverable_index
+    deliverable_item = projection.timeline.items[deliverable_index]
+    assert isinstance(deliverable_item, AssistantDeliverableTimelineItem)
+    assert deliverable_item.sort_key > projection.timeline.items[assistant_index].sort_key
 
 
 def _item_summary(item: TimelineItem) -> dict[str, Any]:

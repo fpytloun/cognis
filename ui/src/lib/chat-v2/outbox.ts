@@ -29,6 +29,7 @@ const DB_NAME = 'cognis-chat-v2';
 const DB_VERSION = 1;
 const STORE_NAME = 'outbox';
 const CONVERSATION_INDEX = 'conversation_id';
+const IDB_OPERATION_TIMEOUT_MS = 3_000;
 
 export class ChatV2OutboxUnavailableError extends Error {
   constructor(message = 'IndexedDB is not available for Chat v2 outbox persistence') {
@@ -40,17 +41,84 @@ export class ChatV2OutboxUnavailableError extends Error {
 export class IndexedDbChatV2Outbox implements ChatV2Outbox {
   private readonly indexedDB: IDBFactory;
   private dbPromise: Promise<IDBDatabase> | null = null;
+  private memoryFallback: MemoryChatV2Outbox | null = null;
 
   constructor(indexedDBFactory: IDBFactory = indexedDB) {
     this.indexedDB = indexedDBFactory;
   }
 
   async put(entry: OutboxEntry): Promise<void> {
+    await this.withFallback(
+      () => this.putDb(entry),
+      (outbox) => outbox.put(entry)
+    );
+  }
+
+  async get(clientTxnId: string): Promise<OutboxEntry | null> {
+    return this.withFallback(
+      () => this.getDb(clientTxnId),
+      (outbox) => outbox.get(clientTxnId)
+    );
+  }
+
+  async list(conversationId?: string): Promise<OutboxEntry[]> {
+    return this.withFallback(
+      () => this.listDb(conversationId),
+      (outbox) => outbox.list(conversationId)
+    );
+  }
+
+  async update(
+    clientTxnId: string,
+    patch: Partial<Omit<OutboxEntry, 'client_txn_id' | 'created_at'>>
+  ): Promise<void> {
+    await this.withFallback(
+      async () => {
+        const existing = await this.getDb(clientTxnId);
+        if (!existing) return;
+        await this.putDb({
+          ...existing,
+          ...patch,
+          client_txn_id: existing.client_txn_id,
+          created_at: existing.created_at,
+          updated_at: new Date().toISOString()
+        });
+      },
+      (outbox) => outbox.update(clientTxnId, patch)
+    );
+  }
+
+  async delete(clientTxnId: string): Promise<void> {
+    await this.withFallback(
+      () => this.deleteDb(clientTxnId),
+      (outbox) => outbox.delete(clientTxnId)
+    );
+  }
+
+  async clearAcked(): Promise<void> {
+    await this.withFallback(
+      async () => {
+        const entries = await this.listDb();
+        await Promise.all(entries.filter((entry) => entry.status === 'acked').map((entry) => this.deleteDb(entry.client_txn_id)));
+      },
+      (outbox) => outbox.clearAcked()
+    );
+  }
+
+  private db(): Promise<IDBDatabase> {
+    this.dbPromise ??= openDatabase(this.indexedDB).catch((error) => {
+      this.dbPromise = null;
+      throw error;
+    });
+    return this.dbPromise;
+  }
+
+  private async putDb(entry: OutboxEntry): Promise<void> {
     const db = await this.db();
     await requestToPromise(transactionStore(db, 'readwrite').put(entry));
   }
 
-  async get(clientTxnId: string): Promise<OutboxEntry | null> {
+  private async getDb(clientTxnId: string): Promise<OutboxEntry | null> {
     const db = await this.db();
     const value = await requestToPromise<OutboxEntry | undefined>(
       transactionStore(db, 'readonly').get(clientTxnId)
@@ -58,7 +126,7 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
     return value ?? null;
   }
 
-  async list(conversationId?: string): Promise<OutboxEntry[]> {
+  private async listDb(conversationId?: string): Promise<OutboxEntry[]> {
     const db = await this.db();
     const store = transactionStore(db, 'readonly');
     const source: IDBObjectStore | IDBIndex = conversationId
@@ -68,34 +136,30 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
     return requestToPromise<OutboxEntry[]>(request);
   }
 
-  async update(
-    clientTxnId: string,
-    patch: Partial<Omit<OutboxEntry, 'client_txn_id' | 'created_at'>>
-  ): Promise<void> {
-    const existing = await this.get(clientTxnId);
-    if (!existing) return;
-    await this.put({
-      ...existing,
-      ...patch,
-      client_txn_id: existing.client_txn_id,
-      created_at: existing.created_at,
-      updated_at: new Date().toISOString()
-    });
-  }
-
-  async delete(clientTxnId: string): Promise<void> {
+  private async deleteDb(clientTxnId: string): Promise<void> {
     const db = await this.db();
     await requestToPromise(transactionStore(db, 'readwrite').delete(clientTxnId));
   }
 
-  async clearAcked(): Promise<void> {
-    const entries = await this.list();
-    await Promise.all(entries.filter((entry) => entry.status === 'acked').map((entry) => this.delete(entry.client_txn_id)));
+  private fallback(): MemoryChatV2Outbox {
+    this.dbPromise = null;
+    this.memoryFallback ??= new MemoryChatV2Outbox();
+    return this.memoryFallback;
   }
 
-  private db(): Promise<IDBDatabase> {
-    this.dbPromise ??= openDatabase(this.indexedDB);
-    return this.dbPromise;
+  private async withFallback<T>(
+    operation: () => Promise<T>,
+    fallbackOperation: (outbox: MemoryChatV2Outbox) => Promise<T>
+  ): Promise<T> {
+    if (this.memoryFallback) {
+      return fallbackOperation(this.memoryFallback);
+    }
+    try {
+      return await operation();
+    } catch (error) {
+      console.warn('Chat v2 IndexedDB outbox unavailable; using in-memory outbox', error);
+      return fallbackOperation(this.fallback());
+    }
   }
 }
 
@@ -152,7 +216,7 @@ export function createIndexedDbChatV2Outbox(): IndexedDbChatV2Outbox {
 }
 
 function openDatabase(indexedDBFactory: IDBFactory): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  return withIdbTimeout(new Promise((resolve, reject) => {
     const request = indexedDBFactory.open(DB_NAME, DB_VERSION);
     request.onerror = () => reject(request.error ?? new Error('Failed to open Chat v2 IndexedDB outbox'));
     request.onsuccess = () => resolve(request.result);
@@ -165,7 +229,7 @@ function openDatabase(indexedDBFactory: IDBFactory): Promise<IDBDatabase> {
         store.createIndex(CONVERSATION_INDEX, CONVERSATION_INDEX, { unique: false });
       }
     };
-  });
+  }), 'Opening Chat v2 IndexedDB outbox');
 }
 
 function transactionStore(db: IDBDatabase, mode: IDBTransactionMode): IDBObjectStore {
@@ -173,8 +237,20 @@ function transactionStore(db: IDBDatabase, mode: IDBTransactionMode): IDBObjectS
 }
 
 function requestToPromise<T = unknown>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
+  return withIdbTimeout(new Promise((resolve, reject) => {
     request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'));
     request.onsuccess = () => resolve(request.result);
+  }), 'Chat v2 IndexedDB request');
+}
+
+function withIdbTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new ChatV2OutboxUnavailableError(`${label} timed out after ${Math.round(IDB_OPERATION_TIMEOUT_MS / 1000)} seconds`));
+    }, IDB_OPERATION_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
   });
 }

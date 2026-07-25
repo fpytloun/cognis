@@ -15,7 +15,9 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     TIMESTAMP,
+    BigInteger,
     Boolean,
+    CheckConstraint,
     Float,
     ForeignKey,
     Index,
@@ -342,6 +344,8 @@ class SystemAgentOverride(Base):
     tools_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     permissions_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     execution_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    agent_profiles_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    default_agent_profile_id_override: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -354,6 +358,22 @@ class Conversation(Base):
     """Conversation metadata. Session content is in Intaris."""
 
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index(
+            "ix_conversations_owner_activity",
+            "user_email",
+            "status",
+            "last_message_at",
+            "created_at",
+        ),
+        Index(
+            "ix_conversations_owner_agent_context",
+            "user_email",
+            "status",
+            "agent_id",
+            "context_type",
+        ),
+    )
 
     conversation_id: Mapped[str] = mapped_column(String, primary_key=True)
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
@@ -463,6 +483,7 @@ class Session(Base):
     agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     delegation_mode: Mapped[str | None] = mapped_column(String, nullable=True)
     delegation_task: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delegation_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     completion_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     intaris_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -555,6 +576,8 @@ class ManagedConversationLink(Base):
         ),
         Index("ix_managed_conversation_links_user_state", "user_email", "conversation_state"),
         Index("ix_managed_conversation_links_target_agent", "target_agent_id"),
+        Index("ix_managed_conversation_links_parent_link", "parent_link_id"),
+        Index("ix_managed_conversation_links_root_depth", "root_link_id", "depth"),
     )
 
     link_id: Mapped[str] = mapped_column(
@@ -570,6 +593,13 @@ class ManagedConversationLink(Base):
         String, ForeignKey("conversations.conversation_id"), nullable=False
     )
     controller_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    parent_link_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("managed_conversation_links.link_id"), nullable=True
+    )
+    root_link_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("managed_conversation_links.link_id"), nullable=True
+    )
+    depth: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     target_agent_id: Mapped[str] = mapped_column(
         String, ForeignKey("agents.agent_id"), nullable=False
     )
@@ -590,6 +620,7 @@ class ManagedConversationLink(Base):
         Boolean, nullable=False, default=False, server_default="0"
     )
     last_result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_result_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     control_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -623,6 +654,10 @@ class LLMProvider(Base):
     __table_args__ = (
         Index("ix_llm_providers_owner_provider", "owner_email", "provider_id"),
         Index("ix_llm_providers_owner_default", "owner_email", "is_default"),
+        UniqueConstraint(
+            "managed_local_key",
+            name="uq_llm_providers_managed_local_key",
+        ),
     )
 
     provider_id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -633,6 +668,7 @@ class LLMProvider(Base):
         String, nullable=False, default="system@cognis.local", server_default="system@cognis.local"
     )
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    managed_local_key: Mapped[str | None] = mapped_column(String, nullable=True)
     is_default: Mapped[bool] = mapped_column(default=False, nullable=False, server_default="0")
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
@@ -942,27 +978,69 @@ class DeliverableRow(Base):
     """Typed user-facing artifact written by a workflow step."""
 
     __tablename__ = "deliverables"
+    __allow_unmapped__ = True
     __table_args__ = (
         UniqueConstraint("step_run_id", "version", name="uq_deliverables_step_run_version"),
+        UniqueConstraint(
+            "conversation_id",
+            "session_id",
+            "turn_id",
+            "version",
+            name="uq_deliverables_conversation_scope_version",
+        ),
         Index("ix_deliverables_step_run", "step_run_id"),
+        Index("ix_deliverables_conversation_scope", "conversation_id", "session_id", "turn_id"),
         Index("ix_deliverables_status", "status"),
     )
 
     deliverable_id: Mapped[str] = mapped_column(String, primary_key=True)
-    step_run_id: Mapped[str] = mapped_column(
+    step_run_id: Mapped[str | None] = mapped_column(
         String,
         ForeignKey("step_runs.step_run_id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
+    conversation_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("sessions.session_id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     attempt_number: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    storage_namespace: Mapped[str] = mapped_column(
+        String, nullable=False, default="deliverables", server_default="deliverables"
+    )
+    storage_object_id: Mapped[str] = mapped_column(String, nullable=False)
+    content_key: Mapped[str] = mapped_column(
+        String, nullable=False, default="content.md", server_default="content.md"
+    )
+    content_mime: Mapped[str] = mapped_column(String, nullable=False)
+    content_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    content_hash: Mapped[str] = mapped_column(String, nullable=False)
     format: Mapped[str] = mapped_column(String, nullable=False, default="markdown")
     title: Mapped[str | None] = mapped_column(String, nullable=True)
     target: Mapped[str | None] = mapped_column(String, nullable=True)
-    outputs: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    rich_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    rich_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rich_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    outputs_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    outputs_mime: Mapped[str | None] = mapped_column(String, nullable=True)
+    outputs_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    outputs_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    validation_warnings: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    render_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    export_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    html_cache_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    pdf_cache_key: Mapped[str | None] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="buffered")
     evaluator_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -971,6 +1049,34 @@ class DeliverableRow(Base):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
+
+    _content_cache: str | None = None
+    _outputs_cache: dict[str, Any] | None = None
+    _rich_payload_cache: dict[str, Any] | None = None
+
+    @property
+    def content(self) -> str:
+        return self._content_cache or ""
+
+    @content.setter
+    def content(self, value: str | None) -> None:
+        self._content_cache = value or ""
+
+    @property
+    def outputs(self) -> dict[str, Any] | None:
+        return self._outputs_cache
+
+    @outputs.setter
+    def outputs(self, value: dict[str, Any] | None) -> None:
+        self._outputs_cache = value or {}
+
+    @property
+    def rich_payload(self) -> dict[str, Any] | None:
+        return self._rich_payload_cache
+
+    @rich_payload.setter
+    def rich_payload(self, value: dict[str, Any] | None) -> None:
+        self._rich_payload_cache = value
 
 
 class Schedule(Base):
@@ -1093,6 +1199,256 @@ class ExecutorRow(Base):
     )
 
 
+class LocalModelDeployment(Base):
+    """Declarative desired state for one local model across concrete executors."""
+
+    __tablename__ = "local_model_deployments"
+    __table_args__ = (
+        CheckConstraint("runtime_type = 'ollama'", name="ck_local_model_deployment_runtime"),
+        CheckConstraint(
+            "source IN ('ollama', 'huggingface')",
+            name="ck_local_model_deployment_source",
+        ),
+        CheckConstraint(
+            "desired_state IN ('present', 'absent')",
+            name="ck_local_model_deployment_desired_state",
+        ),
+        CheckConstraint(
+            "update_policy IN ('if_changed', 'always', 'manual')",
+            name="ck_local_model_deployment_update_policy",
+        ),
+        CheckConstraint(
+            "prune_policy IN ('retain', 'delete')",
+            name="ck_local_model_deployment_prune_policy",
+        ),
+        CheckConstraint("max_parallel > 0", name="ck_local_model_deployment_max_parallel"),
+        CheckConstraint("generation > 0", name="ck_local_model_deployment_generation"),
+        CheckConstraint(
+            "capacity_assessment_generation IS NULL OR capacity_assessment_generation >= 0",
+            name="ck_local_model_deployment_capacity_generation",
+        ),
+        Index(
+            "ix_local_model_deployments_owner_updated",
+            "owner_email",
+            "updated_at",
+        ),
+        Index(
+            "ix_local_model_deployments_provider",
+            "provider_id",
+        ),
+        Index(
+            "ix_local_model_deployments_reconcile_requested",
+            "reconcile_requested_at",
+        ),
+    )
+
+    deployment_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("users.email", ondelete="CASCADE"),
+        nullable=False,
+    )
+    runtime_type: Mapped[str] = mapped_column(
+        String, nullable=False, default="ollama", server_default="ollama"
+    )
+    requested_ref: Mapped[str] = mapped_column(String, nullable=False)
+    canonical_name: Mapped[str] = mapped_column(String, nullable=False)
+    runtime_name: Mapped[str] = mapped_column(String, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    revision: Mapped[str | None] = mapped_column(String, nullable=True)
+    selector: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    desired_state: Mapped[str] = mapped_column(
+        String, nullable=False, default="present", server_default="present"
+    )
+    update_policy: Mapped[str] = mapped_column(
+        String, nullable=False, default="if_changed", server_default="if_changed"
+    )
+    prune_policy: Mapped[str] = mapped_column(
+        String, nullable=False, default="retain", server_default="retain"
+    )
+    max_parallel: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    provider_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("llm_providers.provider_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    capacity_override_acknowledged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    capacity_assessment_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    reconcile_requested_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class LocalModelOperation(Base):
+    """Durable future executor operation for a local-model target."""
+
+    __tablename__ = "local_model_operations"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('pull', 'delete')",
+            name="ck_local_model_operation_action",
+        ),
+        CheckConstraint(
+            "state IN "
+            "('queued', 'running', 'cancel_requested', 'succeeded', 'failed', "
+            "'cancelled', 'interrupted')",
+            name="ck_local_model_operation_state",
+        ),
+        CheckConstraint("generation > 0", name="ck_local_model_operation_generation"),
+        CheckConstraint("progress_seq >= 0", name="ck_local_model_operation_progress_seq"),
+        CheckConstraint(
+            "progress_bytes >= 0",
+            name="ck_local_model_operation_progress_bytes",
+        ),
+        UniqueConstraint(
+            "deployment_id",
+            "idempotency_key",
+            name="uq_local_model_operation_idempotency",
+        ),
+        Index(
+            "ix_local_model_operations_deployment_state",
+            "deployment_id",
+            "state",
+            "created_at",
+        ),
+        Index(
+            "ix_local_model_operations_executor_state",
+            "executor_id",
+            "state",
+            "created_at",
+        ),
+    )
+
+    operation_id: Mapped[str] = mapped_column(String, primary_key=True)
+    deployment_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("local_model_deployments.deployment_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    executor_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("executors.executor_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, default="queued", server_default="queued"
+    )
+    progress_seq: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    progress_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    phase: Mapped[str | None] = mapped_column(String, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False)
+    request_hash: Mapped[str] = mapped_column(String, nullable=False)
+    post_pull_provider_upsert: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    sanitized_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
+class LocalModelTargetStatus(Base):
+    """Observed reconciliation state for one deployment/executor pair."""
+
+    __tablename__ = "local_model_target_statuses"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'reconciling', 'ready', 'absent', 'blocked', 'error')",
+            name="ck_local_model_target_state",
+        ),
+        CheckConstraint("generation > 0", name="ck_local_model_target_generation"),
+        CheckConstraint(
+            "observed_generation >= 0",
+            name="ck_local_model_target_observed_generation",
+        ),
+        CheckConstraint(
+            "observed_size_bytes IS NULL OR observed_size_bytes >= 0",
+            name="ck_local_model_target_observed_size",
+        ),
+        UniqueConstraint(
+            "deployment_id",
+            "executor_id",
+            name="uq_local_model_target_deployment_executor",
+        ),
+        Index(
+            "ix_local_model_targets_deployment_state",
+            "deployment_id",
+            "state",
+        ),
+        Index(
+            "ix_local_model_targets_executor_state",
+            "executor_id",
+            "state",
+        ),
+    )
+
+    target_id: Mapped[str] = mapped_column(String, primary_key=True)
+    deployment_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("local_model_deployments.deployment_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    executor_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("executors.executor_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    observed_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    observed_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    observed_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_operation_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("local_model_operations.operation_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reconcile_requested_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    reconcile_started_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    reconciled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class MCPServerRow(Base):
     """Global MCP server definitions assigned to executors."""
 
@@ -1148,6 +1504,15 @@ class MCPOAuthTokenRow(Base):
     )
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    refresh_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_refresh_attempt_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_refresh_error_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_refresh_error_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_refresh_error_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     encrypted_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -1165,6 +1530,12 @@ class MCPOAuthTokenRow(Base):
             name="uq_mcp_oauth_token_scope",
         ),
         Index("ix_mcp_oauth_tokens_user_server", "user_email", "mcp_server_id"),
+        Index(
+            "ix_mcp_oauth_tokens_refresh_due",
+            "status",
+            "next_refresh_attempt_at",
+            "expires_at",
+        ),
     )
 
 
@@ -1521,6 +1892,10 @@ class FollowUpDedupeRow(Base):
     follow_up_id: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -1531,15 +1906,50 @@ class FollowUpDedupeRow(Base):
     __table_args__ = (
         UniqueConstraint("conversation_id", "follow_up_id", name="uq_follow_up_dedupe_pair"),
         Index("ix_follow_up_dedupe_expires", "expires_at"),
+        Index("ix_follow_up_dedupe_lease", "status", "lease_expires_at"),
         Index("ix_follow_up_dedupe_conversation", "conversation_id"),
+    )
+
+
+class FollowUpIntentRow(Base):
+    """Durable idempotent intent for a follow-up turn."""
+
+    __tablename__ = "follow_up_intents"
+
+    intent_id: Mapped[str] = mapped_column(String, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String, nullable=False)
+    follow_up_id: Mapped[str] = mapped_column(String, nullable=False)
+    event_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "follow_up_id",
+            name="uq_follow_up_intents_pair",
+        ),
+        Index("ix_follow_up_intents_status_updated", "status", "updated_at"),
+        Index("ix_follow_up_intents_lease", "status", "lease_expires_at"),
     )
 
 
 class ChannelDeliveryOutboxRow(Base):
     """Durable outbox for background/system channel follow-up sends.
 
-    Stores only metadata and deterministic fallback text. Assistant/user
-    content is never persisted here.
+    Stores delivery metadata and retry-safe channel payloads. User-authored
+    conversation input is never persisted here.
     """
 
     __tablename__ = "channel_delivery_outbox"
@@ -1557,6 +1967,15 @@ class ChannelDeliveryOutboxRow(Base):
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     fallback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_chunk_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    projected_chunk_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    projection_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    inflight_chunk_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inflight_idempotent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    attachments_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    deliverable_id: Mapped[str | None] = mapped_column(String, nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
@@ -1610,6 +2029,7 @@ class ChannelAccountRow(Base):
     display_name: Mapped[str] = mapped_column(String, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
+    default_agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     credential_refs: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
@@ -1727,6 +2147,8 @@ class ArtifactRecordRow(Base):
     size_bytes: Mapped[int] = mapped_column(nullable=False, default=0)
     status: Mapped[str] = mapped_column(String, nullable=False, default="temporary")
     content_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_tool_call_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_anchor: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -1740,6 +2162,7 @@ class ArtifactRecordRow(Base):
         Index("ix_artifacts_owner_status", "owner_email", "status"),
         Index("ix_artifacts_conversation", "conversation_id"),
         Index("ix_artifacts_expiry", "expires_at"),
+        Index("ix_artifacts_tool_source", "owner_email", "source_tool_call_id", "source_anchor"),
     )
 
 

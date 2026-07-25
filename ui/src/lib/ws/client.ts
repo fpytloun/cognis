@@ -3,13 +3,14 @@ import { writable, get } from 'svelte/store';
 import { getWebSocketUrl } from '$lib/config';
 import { reportError } from '$lib/errors';
 import { auth } from '$lib/stores/auth';
-import type { ChatRealtimeFrame } from '$lib/chat-v2/types';
-import type { AttachmentRef, CognisWebSocketEvent, QuestionSetReply } from '$lib/types/api';
+import { conversationTimelineScope, type ChatRealtimeFrame, type TimelineScope } from '$lib/chat-v2/types';
+import type { CognisWebSocketEvent } from '$lib/types/api';
 import { clamp } from '$lib/utils';
 
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'stalled';
 type CognisWebSocketClientEvent = CognisWebSocketEvent | ChatRealtimeFrame;
 type EventListener = (event: CognisWebSocketClientEvent) => void;
+type WebSocketAuth = Pick<typeof auth, 'getSnapshot' | 'clear'>;
 
 interface WebSocketState {
   status: ConnectionStatus;
@@ -20,7 +21,13 @@ interface WebSocketState {
 interface ConversationSubscription {
   lastSeq: number;
   sessionId: string | null;
-  chatV2Cursor: string | null;
+}
+
+interface ChatV2Subscription {
+  scope: TimelineScope;
+  cursor: string | null;
+  refCount: number;
+  wireRegistered: boolean;
 }
 
 interface SubscribeConversationOptions {
@@ -32,11 +39,15 @@ const initialState: WebSocketState = {
   attempts: 0,
   lastError: null
 };
+const CONVERSATION_SUBSCRIPTION_LIMIT = 12;
 
-class CognisWebSocketClient {
+export class CognisWebSocketClient {
+  constructor(private readonly authProvider: WebSocketAuth = auth) {}
+
   private socket: WebSocket | null = null;
   private listeners = new Set<EventListener>();
   private subscriptions = new Map<string, ConversationSubscription>();
+  private chatV2Subscriptions = new Map<string, ChatV2Subscription>();
   private queuedMessages: string[] = [];
   private reconnectTimer: number | null = null;
   private heartbeatTimer: number | null = null;
@@ -65,7 +76,7 @@ class CognisWebSocketClient {
       return;
     }
 
-    const authState = auth.getSnapshot();
+    const authState = this.authProvider.getSnapshot();
     if (authState.status !== 'authenticated') {
       this.state.set({ status: 'stalled', attempts: this.reconnectAttempts, lastError: 'Authentication required' });
       return;
@@ -86,23 +97,30 @@ class CognisWebSocketClient {
       lastError: null
     }));
 
-    this.socket = new WebSocket(getWebSocketUrl());
-    this.socket.onopen = () => {};
-    this.socket.onmessage = (event) => {
+    const socket = new WebSocket(getWebSocketUrl());
+    this.socket = socket;
+    socket.onopen = () => {
+      if (this.socket !== socket) return;
+    };
+    socket.onmessage = (event) => {
+      if (this.socket !== socket) return;
       this.handleMessage(event.data);
     };
-    this.socket.onerror = () => {
+    socket.onerror = () => {
+      if (this.socket !== socket) return;
       this.state.update((state) => ({ ...state, lastError: 'WebSocket connection error' }));
     };
-    this.socket.onclose = (event) => {
+    socket.onclose = (event) => {
+      if (this.socket !== socket) return;
       this.socket = null;
       this.authenticated = false;
+      this.markChatV2WireDisconnected();
       if (this.manualDisconnect) {
         this.state.set({ status: 'idle', attempts: 0, lastError: null });
         return;
       }
       if (event.code === 4401) {
-        auth.clear('Session expired. Please log in again.');
+        this.authProvider.clear('Session expired. Please log in again.');
         this.state.set({
           status: 'stalled',
           attempts: this.reconnectAttempts,
@@ -126,7 +144,13 @@ class CognisWebSocketClient {
     this.socket?.close();
     this.socket = null;
     this.authenticated = false;
+    this.markChatV2WireDisconnected();
     this.state.set(initialState);
+  }
+
+  reAuthenticate(): void {
+    this.disconnect();
+    this.connect();
   }
 
   subscribeConversation(
@@ -140,16 +164,18 @@ class CognisWebSocketClient {
     const shouldReplaceCursor = options.replaceCursor === true;
     const next: ConversationSubscription = previous && previous.sessionId === normalizedSessionId && !shouldReplaceCursor
       ? { ...previous, lastSeq: Math.max(previous.lastSeq, lastSeq), sessionId: normalizedSessionId }
-      : { lastSeq, sessionId: normalizedSessionId, chatV2Cursor: previous?.chatV2Cursor ?? null };
-    this.subscriptions.set(conversationId, next);
+      : { lastSeq, sessionId: normalizedSessionId };
+    this.rememberSubscription(conversationId, next);
     if (this.authenticated) {
-      this.sendRaw({
-        type: 'reconnect',
-        conversation_id: conversationId,
-        last_seq: next.lastSeq,
-        session_id: next.sessionId,
-        chat_v2_cursor: next.chatV2Cursor,
-      });
+      const scopeKey = `conversation:${conversationId}`;
+      const chatV2 = this.chatV2Subscriptions.get(scopeKey);
+      if (chatV2?.cursor && !chatV2.wireRegistered) {
+        this.sendRaw({ type: 'chat_v2_subscribe', scope: chatV2.scope, cursor: chatV2.cursor });
+        this.chatV2Subscriptions.set(scopeKey, {
+          ...chatV2,
+          wireRegistered: true
+        });
+      }
       return;
     }
 
@@ -157,99 +183,125 @@ class CognisWebSocketClient {
   }
 
   unsubscribeConversation(conversationId: string): void {
-    const previous = this.subscriptions.get(conversationId);
-    if (this.authenticated && previous?.chatV2Cursor) {
-      this.sendRaw({ type: 'chat_v2_unsubscribe', conversation_id: conversationId });
+    const scopeKey = `conversation:${conversationId}`;
+    if (this.authenticated && this.chatV2Subscriptions.get(scopeKey)?.wireRegistered) {
+      this.sendRaw({ type: 'chat_v2_unsubscribe', scope_key: scopeKey });
     }
+    this.chatV2Subscriptions.delete(scopeKey);
     this.subscriptions.delete(conversationId);
+    this.discardPendingChatV2FramesForConversation(conversationId);
   }
 
-  subscribeChatV2Conversation(conversationId: string, cursor: string): void {
+  acquireChatV2(scopeOrConversation: TimelineScope | string, cursor: string): void {
+    const scope = typeof scopeOrConversation === 'string'
+      ? conversationTimelineScope(scopeOrConversation)
+      : scopeOrConversation;
+    const scopeKey = scope.key;
+    const conversationId = scope.conversation_id ?? '';
     const previous = this.subscriptions.get(conversationId);
-    const next: ConversationSubscription = {
-      lastSeq: previous?.lastSeq ?? 0,
-      sessionId: previous?.sessionId ?? null,
-      chatV2Cursor: cursor
-    };
-    this.subscriptions.set(conversationId, next);
+    const previousChatV2 = this.chatV2Subscriptions.get(scopeKey);
+    if (scope.kind === 'conversation') {
+      this.rememberSubscription(conversationId, {
+        lastSeq: previous?.lastSeq ?? 0,
+        sessionId: previous?.sessionId ?? null
+      });
+    }
+    this.chatV2Subscriptions.set(scopeKey, {
+      scope,
+      cursor,
+      refCount: (previousChatV2?.refCount ?? 0) + 1,
+      wireRegistered: previousChatV2?.wireRegistered ?? false
+    });
+    if (previousChatV2) {
+      if (this.authenticated && cursor && !previousChatV2.wireRegistered) {
+        this.sendRaw({ type: 'chat_v2_subscribe', scope, cursor });
+        this.chatV2Subscriptions.set(scopeKey, {
+          ...this.chatV2Subscriptions.get(scopeKey)!,
+          wireRegistered: true
+        });
+      }
+      return;
+    }
     if (this.authenticated) {
-      this.sendRaw({
-        type: 'chat_v2_subscribe',
-        conversation_id: conversationId,
-        cursor
+      this.sendRaw({ type: 'chat_v2_subscribe', scope, cursor });
+      this.chatV2Subscriptions.set(scopeKey, {
+        ...this.chatV2Subscriptions.get(scopeKey)!,
+        wireRegistered: true
       });
       return;
     }
     this.connect();
   }
 
-  updateChatV2Cursor(conversationId: string, cursor: string): void {
-    const previous = this.subscriptions.get(conversationId);
-    if (!previous) {
-      this.subscriptions.set(conversationId, {
-        lastSeq: 0,
-        sessionId: null,
-        chatV2Cursor: cursor
+  /** @deprecated Use acquireChatV2 once for a mounted view. */
+  subscribeChatV2Conversation(scopeOrConversation: TimelineScope | string, cursor: string): void {
+    this.acquireChatV2(scopeOrConversation, cursor);
+  }
+
+  updateChatV2Cursor(scopeOrConversation: TimelineScope | string, cursor: string): void {
+    const scope = typeof scopeOrConversation === 'string'
+      ? conversationTimelineScope(scopeOrConversation)
+      : scopeOrConversation;
+    const previous = this.chatV2Subscriptions.get(scope.key);
+    if (!previous) return;
+    this.chatV2Subscriptions.set(scope.key, { ...previous, scope, cursor });
+    if (cursor && !previous.wireRegistered && this.authenticated) {
+      this.sendRaw({ type: 'chat_v2_subscribe', scope, cursor });
+      this.chatV2Subscriptions.set(scope.key, {
+        ...this.chatV2Subscriptions.get(scope.key)!,
+        wireRegistered: true
+      });
+    }
+  }
+
+  clearChatV2Cursor(scopeOrConversation: TimelineScope | string): void {
+    const scope = typeof scopeOrConversation === 'string'
+      ? conversationTimelineScope(scopeOrConversation)
+      : scopeOrConversation;
+    const previous = this.chatV2Subscriptions.get(scope.key);
+    if (!previous) return;
+    // Cursor validity and current-socket registration are independent. The
+    // server still owns this wire subscription until the socket is replaced
+    // or the final owner releases it.
+    this.chatV2Subscriptions.set(scope.key, { ...previous, cursor: null });
+  }
+
+  releaseChatV2(scopeKey: string): void {
+    const subscription = this.chatV2Subscriptions.get(scopeKey);
+    if (!subscription) return;
+    if (subscription.refCount > 1) {
+      this.chatV2Subscriptions.set(scopeKey, {
+        ...subscription,
+        refCount: subscription.refCount - 1
       });
       return;
     }
-    this.subscriptions.set(conversationId, { ...previous, chatV2Cursor: cursor });
+    if (this.authenticated && subscription.wireRegistered) {
+      this.sendRaw({ type: 'chat_v2_unsubscribe', scope_key: scopeKey });
+    }
+    this.chatV2Subscriptions.delete(scopeKey);
+    this.discardPendingChatV2FramesForScope(scopeKey);
   }
 
-  clearChatV2Cursor(conversationId: string): void {
-    const previous = this.subscriptions.get(conversationId);
-    if (!previous) return;
-    this.subscriptions.set(conversationId, { ...previous, chatV2Cursor: null });
-    this.sendRaw({ type: 'chat_v2_unsubscribe', conversation_id: conversationId });
+  /** @deprecated Use releaseChatV2 when a mounted view is destroyed. */
+  unsubscribeChatV2(scopeKey: string): void {
+    this.releaseChatV2(scopeKey);
   }
 
   updateConversationSeq(conversationId: string, lastSeq: number, sessionId: string | null = null): void {
     const previous = this.subscriptions.get(conversationId);
     const normalizedSessionId = typeof sessionId === 'string' && sessionId.trim() ? sessionId : null;
     if (!previous || previous.sessionId !== normalizedSessionId) {
-      this.subscriptions.set(conversationId, {
+      this.rememberSubscription(conversationId, {
         lastSeq,
         sessionId: normalizedSessionId,
-        chatV2Cursor: previous?.chatV2Cursor ?? null
       });
       return;
     }
-    this.subscriptions.set(conversationId, {
+    this.rememberSubscription(conversationId, {
       lastSeq: Math.max(previous.lastSeq, lastSeq),
       sessionId: previous.sessionId,
-      chatV2Cursor: previous.chatV2Cursor
     });
-  }
-
-  sendMessage(conversationId: string, content: string, attachments: AttachmentRef[] = [], clientMessageId: string | null = null): string {
-    const resolvedClientMessageId = clientMessageId ?? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
-    // Only subscribe if not already subscribed — avoids sending a redundant
-    // reconnect frame before every message which triggers session_recovered.
-    if (!this.subscriptions.has(conversationId)) {
-      this.subscribeConversation(conversationId, 0);
-    }
-    this.sendRaw({ type: 'message', conversation_id: conversationId, content, attachments, client_message_id: resolvedClientMessageId });
-    return resolvedClientMessageId;
-  }
-
-  resolveEscalation(callId: string, decision: string, note?: string): void {
-    this.sendRaw({ type: 'resolve_escalation', call_id: callId, decision, note });
-  }
-
-  respondGate(taskId: string, action: string, stepName?: string, feedback?: string): void {
-    this.sendRaw({ type: 'gate_response', task_id: taskId, action, step_name: stepName, feedback });
-  }
-
-  respondStep(taskId: string, reply: QuestionSetReply, stepName?: string): void {
-    this.sendRaw({ type: 'step_response', task_id: taskId, ...reply, step_name: stepName });
-  }
-
-  respondStepQuestion(notificationId: string, reply: QuestionSetReply, stepName?: string): void {
-    this.sendRaw({ type: 'step_response', notification_id: notificationId, ...reply, step_name: stepName });
-  }
-
-  respondAuthChallenge(notificationId: string, response: string, stepName?: string): void {
-    this.sendRaw({ type: 'step_response', notification_id: notificationId, response, step_name: stepName });
   }
 
   ping(): void {
@@ -283,6 +335,38 @@ class CognisWebSocketClient {
     this.socket.send(serialized);
   }
 
+  private rememberSubscription(conversationId: string, subscription: ConversationSubscription): void {
+    if (this.subscriptions.has(conversationId)) {
+      this.subscriptions.delete(conversationId);
+    }
+    this.subscriptions.set(conversationId, subscription);
+    this.evictOldConversationSubscriptions();
+  }
+
+  private markChatV2WireDisconnected(): void {
+    for (const [scopeKey, subscription] of this.chatV2Subscriptions.entries()) {
+      if (subscription.wireRegistered) {
+        this.chatV2Subscriptions.set(scopeKey, { ...subscription, wireRegistered: false });
+      }
+    }
+  }
+
+  private evictOldConversationSubscriptions(): void {
+    while (this.subscriptions.size > CONVERSATION_SUBSCRIPTION_LIMIT) {
+      const oldestConversationId = this.subscriptions.keys().next().value as string | undefined;
+      if (!oldestConversationId) return;
+      if (this.authenticated && this.chatV2Subscriptions.has(`conversation:${oldestConversationId}`)) {
+        const subscription = this.chatV2Subscriptions.get(`conversation:${oldestConversationId}`);
+        if (subscription?.wireRegistered) {
+          this.sendRaw({ type: 'chat_v2_unsubscribe', scope_key: `conversation:${oldestConversationId}` });
+        }
+      }
+      this.chatV2Subscriptions.delete(`conversation:${oldestConversationId}`);
+      this.subscriptions.delete(oldestConversationId);
+      this.discardPendingChatV2FramesForConversation(oldestConversationId);
+    }
+  }
+
   private flushQueue(): void {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.authenticated) {
       return;
@@ -304,14 +388,12 @@ class CognisWebSocketClient {
         this.clearPongTimeout();
         this.state.set({ status: 'connected', attempts: 0, lastError: null });
         this.startHeartbeat();
-        for (const [conversationId, subscription] of this.subscriptions.entries()) {
-          this.sendRaw({
-            type: 'reconnect',
-            conversation_id: conversationId,
-            last_seq: subscription.lastSeq,
-            session_id: subscription.sessionId,
-            chat_v2_cursor: subscription.chatV2Cursor,
-          });
+        for (const [scopeKey, subscription] of this.chatV2Subscriptions.entries()) {
+          const { scope, cursor } = subscription;
+          if (cursor) {
+            this.sendRaw({ type: 'chat_v2_subscribe', scope, cursor });
+            this.chatV2Subscriptions.set(scopeKey, { ...subscription, wireRegistered: true });
+          }
         }
         this.flushQueue();
         return;
@@ -394,6 +476,25 @@ class CognisWebSocketClient {
     }
     this.chatV2FrameFlushHandle = null;
     this.pendingChatV2Frames = [];
+  }
+
+  private discardPendingChatV2FramesForConversation(conversationId: string): void {
+    this.discardPendingChatV2Frames((frame) => frame.conversation_id !== conversationId);
+  }
+
+  private discardPendingChatV2FramesForScope(scopeKey: string): void {
+    this.discardPendingChatV2Frames(
+      (frame) => (frame.scope?.key ?? `conversation:${frame.conversation_id}`) !== scopeKey
+    );
+  }
+
+  private discardPendingChatV2Frames(keep: (frame: ChatRealtimeFrame) => boolean): void {
+    if (this.pendingChatV2Frames.length === 0) return;
+    this.pendingChatV2Frames = this.pendingChatV2Frames.filter(keep);
+    if (this.pendingChatV2Frames.length === 0 && this.chatV2FrameFlushHandle !== null && typeof window !== 'undefined') {
+      window.cancelAnimationFrame(this.chatV2FrameFlushHandle);
+      this.chatV2FrameFlushHandle = null;
+    }
   }
 
   private scheduleReconnect(): void {

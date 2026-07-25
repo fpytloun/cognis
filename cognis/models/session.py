@@ -79,8 +79,10 @@ class SessionModel(BaseModel):
     user_email: str
     agent_id: str
     agent_profile_id: str | None = None
+    channel_default_agent_profile_id: str | None = Field(default=None, exclude=True)
     delegation_mode: str | None = None
     delegation_task: str | None = None
+    delegation_metadata: dict[str, Any] = Field(default_factory=dict)
     status: str = SessionStatus.ACTIVE
     completion_reason: str | None = None
     intaris_session_id: str | None = None

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { formatStepQuestionResponse, normalizeStepQuestionAnswers, normalizeStepQuestions } from '$lib/tool-call-question-set';
-import type { ToolCallTimelineItem } from '$lib/chat';
+import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
 
 function questionToolItem(overrides: Partial<ToolCallTimelineItem> = {}): ToolCallTimelineItem {
   return {

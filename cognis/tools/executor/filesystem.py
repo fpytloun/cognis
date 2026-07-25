@@ -151,6 +151,20 @@ class _EditMatchResult:
     count: int
     matched_old: str = ""
     note: str | None = None
+    candidates: tuple[_EditCandidate, ...] = ()
+    decode_replacement_escapes: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _EditCandidate:
+    text: str
+    start_index: int
+    end_index: int
+    start_line: int
+    old_base_indent: str = ""
+    content_base_indent: str = ""
+    line_indent_pairs: tuple[tuple[str, str], ...] = ()
+    preserve_trailing_newline: bool = False
 
 
 async def _collect_lsp_diagnostics(
@@ -1097,37 +1111,296 @@ def _validate_skill_asset_url(url: str, context: ToolExecutionContext) -> None:
 
 
 def _find_edit_match(content: str, old_string: str) -> _EditMatchResult:
+    if not old_string:
+        return _EditMatchResult(count=0)
+
     count = content.count(old_string)
     if count:
         return _EditMatchResult(count=count, matched_old=old_string)
 
-    rstrip_matches = _find_rstrip_normalized_matches(content, old_string)
-    if len(rstrip_matches) == 1:
-        return _EditMatchResult(
-            count=1,
-            matched_old=rstrip_matches[0],
-            note="used rstrip-normalized fallback match",
+    decoded_old = _decode_escaped_edit_text(old_string)
+    if decoded_old != old_string:
+        count = content.count(decoded_old)
+        if count:
+            return _EditMatchResult(
+                count=count,
+                matched_old=decoded_old,
+                note="used escaped-character fallback match",
+                decode_replacement_escapes=True,
+            )
+
+    strategies: tuple[tuple[str, Callable[[list[str]], tuple[str, ...]]], ...] = (
+        ("rstrip-normalized fallback match", _normalize_block_rstrip),
+        ("horizontal-whitespace fallback match", _normalize_block_horizontal_whitespace),
+        ("smart-punctuation fallback match", _normalize_block_patch_equivalent),
+    )
+    old_variants = [(old_string, False)]
+    if decoded_old != old_string:
+        old_variants.append((decoded_old, True))
+    for candidate_old, decode_replacement in old_variants:
+        rstrip_matches = _find_normalized_line_window_matches(
+            content,
+            candidate_old,
+            normalizer=_normalize_block_rstrip,
         )
-    if len(rstrip_matches) > 1:
-        return _EditMatchResult(count=len(rstrip_matches))
+        if rstrip_matches:
+            return _edit_match_result_from_candidates(
+                rstrip_matches,
+                note="rstrip-normalized fallback match",
+                decode_replacement_escapes=decode_replacement,
+            )
+
+        matches = _find_dedent_line_window_matches(content, candidate_old)
+        if matches:
+            return _edit_match_result_from_candidates(
+                matches,
+                note="indentation-flexible fallback match",
+                decode_replacement_escapes=decode_replacement,
+            )
+
+        matches = _find_line_trimmed_window_matches(content, candidate_old)
+        if matches:
+            return _edit_match_result_from_candidates(
+                matches,
+                note="line-trimmed fallback match",
+                decode_replacement_escapes=decode_replacement,
+            )
+
+        for note, normalizer in strategies[1:]:
+            matches = _find_normalized_line_window_matches(
+                content,
+                candidate_old,
+                normalizer=normalizer,
+            )
+            if matches:
+                return _edit_match_result_from_candidates(
+                    matches,
+                    note=note,
+                    decode_replacement_escapes=decode_replacement,
+                )
+
     return _EditMatchResult(count=0)
 
 
+def _edit_match_result_from_candidates(
+    matches: list[_EditCandidate],
+    *,
+    note: str,
+    decode_replacement_escapes: bool = False,
+) -> _EditMatchResult:
+    suffix = " after escaped-character normalization" if decode_replacement_escapes else ""
+    if len(matches) == 1:
+        return _EditMatchResult(
+            count=1,
+            matched_old=matches[0].text,
+            note=f"used {note}{suffix}",
+            candidates=tuple(matches),
+            decode_replacement_escapes=decode_replacement_escapes,
+        )
+    return _EditMatchResult(
+        count=len(matches),
+        note=f"found {len(matches)} {note} candidates{suffix}",
+        candidates=tuple(matches),
+        decode_replacement_escapes=decode_replacement_escapes,
+    )
+
+
 def _find_rstrip_normalized_matches(content: str, old_string: str) -> list[str]:
+    return [
+        candidate.text
+        for candidate in _find_normalized_line_window_matches(
+            content,
+            old_string,
+            normalizer=_normalize_block_rstrip,
+        )
+    ]
+
+
+def _find_normalized_line_window_matches(
+    content: str,
+    old_string: str,
+    *,
+    normalizer: Callable[[list[str]], tuple[str, ...]],
+) -> list[_EditCandidate]:
     pattern_lines = old_string.splitlines(keepends=True)
     content_lines = content.splitlines(keepends=True)
     if not pattern_lines or len(pattern_lines) > len(content_lines):
         return []
 
-    normalized_pattern = [_line_stripped(line).rstrip() for line in pattern_lines]
-    matches: list[str] = []
+    normalized_pattern = normalizer(pattern_lines)
+    matches: list[_EditCandidate] = []
     width = len(pattern_lines)
+    line_offsets = _line_start_offsets(content_lines)
     for index in range(0, len(content_lines) - width + 1):
         candidate_lines = content_lines[index : index + width]
-        normalized_candidate = [_line_stripped(line).rstrip() for line in candidate_lines]
+        normalized_candidate = normalizer(candidate_lines)
         if normalized_candidate == normalized_pattern:
-            matches.append("".join(candidate_lines))
+            start_index = line_offsets[index]
+            text = "".join(candidate_lines)
+            matches.append(
+                _EditCandidate(
+                    text=text,
+                    start_index=start_index,
+                    end_index=start_index + len(text),
+                    start_line=index + 1,
+                    preserve_trailing_newline=_should_preserve_candidate_trailing_newline(
+                        old_string,
+                        text,
+                    ),
+                )
+            )
     return matches
+
+
+def _find_dedent_line_window_matches(content: str, old_string: str) -> list[_EditCandidate]:
+    pattern_lines = old_string.splitlines(keepends=True)
+    content_lines = content.splitlines(keepends=True)
+    if not pattern_lines or len(pattern_lines) > len(content_lines):
+        return []
+
+    normalized_pattern, old_base_indent = _normalize_block_dedent(pattern_lines)
+    matches: list[_EditCandidate] = []
+    width = len(pattern_lines)
+    line_offsets = _line_start_offsets(content_lines)
+    for index in range(0, len(content_lines) - width + 1):
+        candidate_lines = content_lines[index : index + width]
+        normalized_candidate, content_base_indent = _normalize_block_dedent(candidate_lines)
+        if normalized_candidate == normalized_pattern:
+            start_index = line_offsets[index]
+            text = "".join(candidate_lines)
+            matches.append(
+                _EditCandidate(
+                    text=text,
+                    start_index=start_index,
+                    end_index=start_index + len(text),
+                    start_line=index + 1,
+                    old_base_indent=old_base_indent,
+                    content_base_indent=content_base_indent,
+                    preserve_trailing_newline=_should_preserve_candidate_trailing_newline(
+                        old_string,
+                        text,
+                    ),
+                )
+            )
+    return matches
+
+
+def _find_line_trimmed_window_matches(content: str, old_string: str) -> list[_EditCandidate]:
+    pattern_lines = old_string.splitlines(keepends=True)
+    content_lines = content.splitlines(keepends=True)
+    if not pattern_lines or len(pattern_lines) > len(content_lines):
+        return []
+
+    normalized_pattern = _normalize_block_trimmed(pattern_lines)
+    matches: list[_EditCandidate] = []
+    width = len(pattern_lines)
+    line_offsets = _line_start_offsets(content_lines)
+    for index in range(0, len(content_lines) - width + 1):
+        candidate_lines = content_lines[index : index + width]
+        normalized_candidate = _normalize_block_trimmed(candidate_lines)
+        if normalized_candidate == normalized_pattern:
+            start_index = line_offsets[index]
+            text = "".join(candidate_lines)
+            matches.append(
+                _EditCandidate(
+                    text=text,
+                    start_index=start_index,
+                    end_index=start_index + len(text),
+                    start_line=index + 1,
+                    preserve_trailing_newline=_should_preserve_candidate_trailing_newline(
+                        old_string,
+                        text,
+                    ),
+                    line_indent_pairs=tuple(
+                        (
+                            _leading_indent(pattern_line),
+                            _leading_indent(candidate_line),
+                        )
+                        for pattern_line, candidate_line in zip(
+                            pattern_lines,
+                            candidate_lines,
+                            strict=True,
+                        )
+                    ),
+                )
+            )
+    return matches
+
+
+def _line_start_offsets(lines: list[str]) -> list[int]:
+    offsets: list[int] = []
+    position = 0
+    for line in lines:
+        offsets.append(position)
+        position += len(line)
+    return offsets
+
+
+def _normalize_block_rstrip(lines: list[str]) -> tuple[str, ...]:
+    return tuple(_line_stripped(line).rstrip() for line in lines)
+
+
+def _normalize_block_trimmed(lines: list[str]) -> tuple[str, ...]:
+    return tuple(_line_stripped(line).strip() for line in lines)
+
+
+def _normalize_block_horizontal_whitespace(lines: list[str]) -> tuple[str, ...]:
+    return tuple(_normalize_horizontal_whitespace(_line_stripped(line)).rstrip() for line in lines)
+
+
+def _normalize_block_patch_equivalent(lines: list[str]) -> tuple[str, ...]:
+    return tuple(_normalize_patch_line_for_match(line) for line in lines)
+
+
+def _normalize_block_dedent(lines: list[str]) -> tuple[tuple[str, ...], str]:
+    base_indent = _common_leading_indent(lines)
+    normalized = []
+    for line in lines:
+        stripped_line = _line_stripped(line)
+        if stripped_line.strip() and stripped_line.startswith(base_indent):
+            stripped_line = stripped_line[len(base_indent) :]
+        normalized.append(stripped_line.rstrip())
+    return tuple(normalized), base_indent
+
+
+def _common_leading_indent(lines: list[str]) -> str:
+    prefixes = []
+    for line in lines:
+        stripped_line = _line_stripped(line)
+        if not stripped_line.strip():
+            continue
+        match = re.match(r"^[ \t]*", stripped_line)
+        prefixes.append(match.group(0) if match else "")
+    if not prefixes:
+        return ""
+    common = prefixes[0]
+    for prefix in prefixes[1:]:
+        while common and not prefix.startswith(common):
+            common = common[:-1]
+        if not common:
+            break
+    return common
+
+
+def _leading_indent(line: str) -> str:
+    match = re.match(r"^[ \t]*", _line_stripped(line))
+    return match.group(0) if match else ""
+
+
+def _should_preserve_candidate_trailing_newline(old_string: str, candidate_text: str) -> bool:
+    return _has_trailing_newline(candidate_text) and not _has_trailing_newline(old_string)
+
+
+def _has_trailing_newline(text: str) -> bool:
+    return text.endswith(("\n", "\r"))
+
+
+def _decode_escaped_edit_text(text: str) -> str:
+    if not any(sequence in text for sequence in ("\\n", "\\r", "\\t")):
+        return text
+    return (
+        text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
+    )
 
 
 def _old_string_not_found_message(content: str, old_string: str, *, prefix: str = "") -> str:
@@ -1179,6 +1452,9 @@ def _edit_failure_hints(content: str, old_string: str) -> list[str]:
         hints.append("The text appears to differ only by tabs versus spaces.")
     if _normalize_patch_line_for_match(old_string) in _normalize_patch_line_for_match(content):
         hints.append("The text appears to contain smart quotes/dashes or non-breaking spaces.")
+    decoded_old = _decode_escaped_edit_text(old_string)
+    if decoded_old != old_string and decoded_old in content:
+        hints.append("The text appears to contain literal escaped newline/tab sequences.")
     return hints
 
 
@@ -1188,6 +1464,182 @@ def _looks_like_line_number_prefixed(text: str) -> bool:
 
 def _normalize_horizontal_whitespace(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text)
+
+
+def _ambiguous_edit_match_message(match: _EditMatchResult, *, prefix: str = "") -> str:
+    lines = [
+        f"{prefix}Found {match.count} matches for old_string. "
+        "Use replace_all=true or provide more context to make the match unique."
+    ]
+    if match.candidates:
+        line_numbers = ", ".join(str(candidate.start_line) for candidate in match.candidates[:5])
+        if len(match.candidates) > 5:
+            line_numbers += ", ..."
+        lines.append(f"Candidate match start lines: {line_numbers}.")
+    if match.note:
+        lines.append(f"Match note: {match.note}.")
+    return "\n".join(lines)
+
+
+def _edit_match_has_overlapping_candidates(match: _EditMatchResult) -> bool:
+    if len(match.candidates) < 2:
+        return False
+    previous_end = -1
+    for candidate in sorted(match.candidates, key=lambda item: item.start_index):
+        if candidate.start_index < previous_end:
+            return True
+        previous_end = candidate.end_index
+    return False
+
+
+def _replacement_text_for_match(
+    match: _EditMatchResult,
+    normalized_new: str,
+    newline: str,
+) -> str:
+    if not match.decode_replacement_escapes:
+        return normalized_new
+    return _normalize_text_for_newline(_decode_escaped_edit_text(normalized_new), newline)
+
+
+def _edit_match_replacement_error(
+    match: _EditMatchResult,
+    normalized_new: str,
+    *,
+    replace_all: bool,
+    newline: str,
+) -> str | None:
+    replacement = _replacement_text_for_match(match, normalized_new, newline)
+    selected = match.candidates if replace_all else match.candidates[:1]
+    replacement_line_count = len(replacement.splitlines(keepends=True))
+    for candidate in selected:
+        if candidate.line_indent_pairs and replacement_line_count != len(
+            candidate.line_indent_pairs
+        ):
+            return (
+                "line-trimmed fallback match requires new_string to have the same "
+                "number of lines as old_string so indentation can be preserved safely."
+            )
+    return None
+
+
+def _apply_edit_match(
+    content: str,
+    match: _EditMatchResult,
+    normalized_new: str,
+    *,
+    replace_all: bool,
+    newline: str,
+) -> str:
+    replacement = _replacement_text_for_match(match, normalized_new, newline)
+    if not match.candidates:
+        return (
+            content.replace(match.matched_old, replacement)
+            if replace_all
+            else content.replace(match.matched_old, replacement, 1)
+        )
+
+    selected = match.candidates if replace_all else match.candidates[:1]
+    new_content = content
+    for candidate in sorted(selected, key=lambda item: item.start_index, reverse=True):
+        candidate_replacement = _replacement_text_for_candidate(candidate, replacement)
+        new_content = (
+            new_content[: candidate.start_index]
+            + candidate_replacement
+            + new_content[candidate.end_index :]
+        )
+    return new_content
+
+
+def _replacement_text_for_candidate(candidate: _EditCandidate, replacement: str) -> str:
+    if candidate.line_indent_pairs:
+        return _preserve_candidate_trailing_newline(
+            candidate,
+            _apply_line_indent_pairs(replacement, candidate.line_indent_pairs),
+        )
+    if candidate.old_base_indent == candidate.content_base_indent:
+        return _preserve_candidate_trailing_newline(candidate, replacement)
+    if _replacement_already_has_base_indent(replacement, candidate.content_base_indent):
+        return _preserve_candidate_trailing_newline(candidate, replacement)
+
+    lines = replacement.splitlines(keepends=True)
+    adjusted = []
+    for line in lines:
+        line_body = line
+        stripped_line = _line_stripped(line)
+        if stripped_line.strip():
+            if candidate.old_base_indent and line_body.startswith(candidate.old_base_indent):
+                line_body = line_body[len(candidate.old_base_indent) :]
+            line_body = candidate.content_base_indent + line_body
+        adjusted.append(line_body)
+    if not lines and replacement:
+        return _preserve_candidate_trailing_newline(
+            candidate,
+            candidate.content_base_indent + replacement,
+        )
+    return _preserve_candidate_trailing_newline(candidate, "".join(adjusted))
+
+
+def _preserve_candidate_trailing_newline(candidate: _EditCandidate, replacement: str) -> str:
+    if not candidate.preserve_trailing_newline or _has_trailing_newline(replacement):
+        return replacement
+    if candidate.text.endswith("\r\n"):
+        return replacement + "\r\n"
+    if candidate.text.endswith("\n"):
+        return replacement + "\n"
+    return replacement + "\r"
+
+
+def _apply_line_indent_pairs(
+    replacement: str,
+    line_indent_pairs: tuple[tuple[str, str], ...],
+) -> str:
+    lines = replacement.splitlines(keepends=True)
+    if len(lines) != len(line_indent_pairs):
+        return replacement
+    adjusted = []
+    for line, (old_indent, content_indent) in zip(lines, line_indent_pairs, strict=True):
+        if not _line_stripped(line).strip():
+            adjusted.append(line)
+            continue
+        if _leading_indent(line) == content_indent:
+            adjusted.append(line)
+            continue
+        if old_indent and line.startswith(old_indent):
+            body = line[len(old_indent) :]
+        else:
+            body = line.lstrip(" \t")
+        adjusted.append(content_indent + body)
+    return "".join(adjusted)
+
+
+def _replacement_already_has_base_indent(replacement: str, base_indent: str) -> bool:
+    if not base_indent:
+        return True
+    nonblank_lines = [line for line in replacement.splitlines() if line.strip()]
+    return bool(nonblank_lines) and all(line.startswith(base_indent) for line in nonblank_lines)
+
+
+def _validate_multiedit_sequence(edits: list[Any]) -> str | None:
+    previous_new_strings: list[tuple[int, str]] = []
+    for index, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            return f"Edit {index + 1}: edit must be an object."
+        old_string = edit.get("old_string", "")
+        new_string = edit.get("new_string", "")
+        if not isinstance(old_string, str) or not isinstance(new_string, str):
+            return f"Edit {index + 1}: old_string and new_string must be strings."
+        if old_string:
+            for previous_index, previous_new_string in previous_new_strings:
+                if old_string in previous_new_string:
+                    return (
+                        f"Edit {index + 1}: old_string is contained in new_string from edit "
+                        f"{previous_index}; split or reorder the edits to avoid replacing text "
+                        "created by an earlier edit."
+                    )
+        if old_string != new_string:
+            previous_new_strings.append((index + 1, new_string))
+    return None
 
 
 async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -1230,14 +1682,32 @@ async def handle_edit(arguments: dict[str, Any], context: ToolExecutionContext) 
             )
         if match.count > 1 and not replace_all:
             return ToolResult(
-                output=f"Found {match.count} matches for old_string. Use replace_all=true or provide more context to make the match unique.",
+                output=_ambiguous_edit_match_message(match),
                 is_error=True,
             )
+        if replace_all and _edit_match_has_overlapping_candidates(match):
+            return ToolResult(
+                output=(
+                    "replace_all=true would replace overlapping fallback matches. "
+                    "Provide a larger old_string or split the edit into unambiguous operations."
+                ),
+                is_error=True,
+            )
+        replacement_error = _edit_match_replacement_error(
+            match,
+            normalized_new,
+            replace_all=replace_all,
+            newline=newline,
+        )
+        if replacement_error is not None:
+            return ToolResult(output=replacement_error, is_error=True)
 
-        new_content = (
-            content.replace(match.matched_old, normalized_new)
-            if replace_all
-            else content.replace(match.matched_old, normalized_new, 1)
+        new_content = _apply_edit_match(
+            content,
+            match,
+            normalized_new,
+            replace_all=replace_all,
+            newline=newline,
         )
         try:
             path.write_text(new_content, encoding="utf-8", newline="")
@@ -1337,6 +1807,9 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
 
     if not isinstance(edits, list) or not edits:
         return ToolResult(output="No edits provided.", is_error=True)
+    sequence_error = _validate_multiedit_sequence(edits)
+    if sequence_error is not None:
+        return ToolResult(output=sequence_error, is_error=True)
 
     try:
         path = _resolve_path(file_path, context)
@@ -1379,15 +1852,34 @@ async def handle_multiedit(arguments: dict[str, Any], context: ToolExecutionCont
                 )
             if match.count > 1 and not replace_all:
                 return ToolResult(
-                    output=f"Edit {i + 1}: Found {match.count} matches for old_string. Use replace_all or provide more context.",
+                    output=_ambiguous_edit_match_message(match, prefix=f"Edit {i + 1}: "),
                     is_error=True,
                 )
+            if replace_all and _edit_match_has_overlapping_candidates(match):
+                return ToolResult(
+                    output=(
+                        f"Edit {i + 1}: replace_all=true would replace overlapping "
+                        "fallback matches. Provide a larger old_string or split the edit "
+                        "into unambiguous operations."
+                    ),
+                    is_error=True,
+                )
+            replacement_error = _edit_match_replacement_error(
+                match,
+                normalized_new,
+                replace_all=replace_all,
+                newline=newline,
+            )
+            if replacement_error is not None:
+                return ToolResult(output=f"Edit {i + 1}: {replacement_error}", is_error=True)
             if match.note:
                 fallback_notes.append(f"edit {i + 1}: {match.note}")
-            content = (
-                content.replace(match.matched_old, normalized_new)
-                if replace_all
-                else content.replace(match.matched_old, normalized_new, 1)
+            content = _apply_edit_match(
+                content,
+                match,
+                normalized_new,
+                replace_all=replace_all,
+                newline=newline,
             )
             applied += 1
 

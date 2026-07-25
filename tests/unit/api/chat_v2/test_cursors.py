@@ -21,6 +21,7 @@ from cognis.api.chat_v2.cursors import (
 
 def _payload(**overrides: object) -> InternalChatCursorPayload:
     values: dict[str, object] = {
+        "scope_key": "conversation:conv-1",
         "conversation_id": "conv-1",
         "projection_version": "chat-v2.1",
         "session_watermarks": [
@@ -85,6 +86,7 @@ def test_cursor_rejects_unsupported_version_with_specific_code() -> None:
     token = _signed_raw_cursor(
         {
             "version": 2,
+            "scope_key": "conversation:conv-1",
             "conversation_id": "conv-1",
             "projection_version": "chat-v2.1",
             "session_watermarks": [],
@@ -108,7 +110,7 @@ def test_validate_cursor_rejects_wrong_conversation() -> None:
         validate_cursor(
             token,
             "secret",
-            conversation_id="conv-2",
+            scope_key="conversation:conv-2",
             projection_version="chat-v2.1",
         )
 
@@ -122,7 +124,7 @@ def test_validate_cursor_rejects_projection_version_change() -> None:
         validate_cursor(
             token,
             "secret",
-            conversation_id="conv-1",
+            scope_key="conversation:conv-1",
             projection_version="chat-v2.2",
         )
 
@@ -140,7 +142,7 @@ def test_validate_cursor_rejects_expired_cursor() -> None:
         validate_cursor(
             token,
             "secret",
-            conversation_id="conv-1",
+            scope_key="conversation:conv-1",
             projection_version="chat-v2.1",
             now=now,
         )

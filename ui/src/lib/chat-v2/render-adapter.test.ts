@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { isRenderableChatV2Item, toRenderItem, toRenderItems } from './render-adapter';
 import type {
+  AssistantDeliverableTimelineItem,
   AuthChallengeTimelineItem,
   CompactionTimelineItem,
   MessageTimelineItem,
@@ -62,9 +63,27 @@ function toolCall(overrides: Partial<ToolCallTimelineItem> = {}): ToolCallTimeli
   };
 }
 
+function assistantDeliverable(
+  overrides: Partial<AssistantDeliverableTimelineItem> = {}
+): AssistantDeliverableTimelineItem {
+  return {
+    id: 'assistant-deliverable:dlv-rich',
+    kind: 'assistant_deliverable',
+    sort_key: '0000:000000000000004:000000:03:000000000',
+    source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 4, event_type: 'assistant_deliverable' }],
+    stable: true,
+    deliverable_id: 'dlv-rich',
+    format: 'rich',
+    title: 'Rich report',
+    render_metadata: { presentation: 'rich' },
+    export_metadata: null,
+    ...overrides
+  };
+}
+
 function compaction(overrides: Partial<CompactionTimelineItem> = {}): CompactionTimelineItem {
   return {
-    id: 'compaction:sess-old:sess-new',
+    id: 'compaction:sess-old',
     kind: 'compaction',
     sort_key: '0000:000000000000004:000000:10:000000000',
     source_refs: baseRefs(4),
@@ -107,6 +126,15 @@ describe('render-adapter', () => {
       expect(partial?.kind === 'message' && partial.streaming).toBe(true);
     });
 
+    it('does not reuse markdown output for the same canonical id', () => {
+      const first = toRenderItem(message({ id: 'shared-id', content: '**conversation**', stable: false, status: 'running' }));
+      const second = toRenderItem(message({ id: 'shared-id', content: '**task step**', stable: false, status: 'running' }));
+
+      expect(first?.kind === 'message' && first.html).toContain('<strong>conversation</strong>');
+      expect(second?.kind === 'message' && second.html).toContain('<strong>task step</strong>');
+      expect(second?.kind === 'message' && second.html).not.toContain('conversation');
+    });
+
     it('passes through chat mode metadata', () => {
       const rendered = toRenderItem(message({ chat_mode: 'plan', chat_mode_source: 'directive' }));
       expect(rendered?.kind === 'message' && rendered.chatMode).toBe('plan');
@@ -127,7 +155,7 @@ describe('render-adapter', () => {
           created_at: '2026-01-01T00:00:00Z'
         })
       );
-      expect(rendered).toEqual({
+      expect(rendered).toMatchObject({
         id: 'system:notice-1',
         kind: 'system_message',
         text: 'visible system notice',
@@ -150,6 +178,16 @@ describe('render-adapter', () => {
             'A model error occurred while generating the response. Your tool results have been saved. Please try sending your message again.',
           notice_id: 'model_error:turn-1',
           notice_kind: 'model_error',
+          notice_scope: 'failed_turn',
+          reason_class: 'rate_limit',
+          provider_id: 'anthropic-lumilens',
+          model: 'claude-fable-5',
+          retry_after_seconds: 23,
+          provider_retry_after_seconds: 23,
+          retry_at: '2026-07-09T13:28:00+00:00',
+          attempt: 1,
+          max_attempts: 3,
+          recoverable: true,
           created_at: '2026-01-01T00:00:00Z'
         })
       );
@@ -160,7 +198,17 @@ describe('render-adapter', () => {
         text:
           'A model error occurred while generating the response. Your tool results have been saved. Please try sending your message again.',
         noticeId: 'model_error:turn-1',
-        noticeKind: 'model_error'
+        noticeKind: 'model_error',
+        noticeScope: 'failed_turn',
+        reasonClass: 'rate_limit',
+        providerId: 'anthropic-lumilens',
+        model: 'claude-fable-5',
+        retryAfterSeconds: 23,
+        providerRetryAfterSeconds: 23,
+        retryAt: '2026-07-09T13:28:00+00:00',
+        attempt: 1,
+        maxAttempts: 3,
+        recoverable: true
       });
     });
   });
@@ -300,6 +348,50 @@ describe('render-adapter', () => {
       expect(rendered?.delegation?.resultTruncated).toBe(false);
       expect(rendered?.delegation?.todos).toHaveLength(1);
     });
+
+    it('safely normalizes malformed delegation and evaluation payloads', () => {
+      const rendered = toRenderItem(
+        toolCall({
+          evaluation: { decision: 42, reasoning: ['invalid'] } as never,
+          delegation: {
+            child_session_id: 42,
+            status: ['running'],
+            duration_ms: 'slow',
+            result_truncated: 'false',
+            result_anchors: ['invalid'],
+            tool_call_count: Number.NaN
+          } as never
+        })
+      );
+
+      expect(rendered?.kind).toBe('tool_call');
+      expect(rendered?.kind === 'tool_call' && rendered.evaluation).toBeUndefined();
+      expect(rendered?.kind === 'tool_call' && rendered.delegation).toMatchObject({
+        childSessionId: null,
+        status: null,
+        durationMs: null,
+        resultTruncated: null,
+        toolCallCount: null
+      });
+      expect(rendered?.kind === 'tool_call' && rendered.delegation?.resultAnchors).toBeUndefined();
+    });
+  });
+
+  describe('assistant_deliverable', () => {
+    it('is renderable and maps to a first-class deliverable item', () => {
+      const item = assistantDeliverable();
+
+      expect(isRenderableChatV2Item(item)).toBe(true);
+      expect(toRenderItem(item)).toMatchObject({
+        id: 'assistant-deliverable:dlv-rich',
+        kind: 'assistant_deliverable',
+        deliverableId: 'dlv-rich',
+        format: 'rich',
+        title: 'Rich report',
+        orderKey: '0000:000000000000004:000000:03:000000000',
+        sourceRefs: ['intaris:sess-1:4']
+      });
+    });
   });
 
   describe('compaction', () => {
@@ -315,7 +407,7 @@ describe('render-adapter', () => {
       );
 
       expect(rendered).toMatchObject({
-        id: 'compaction:sess-old:sess-new',
+        id: 'compaction:sess-old',
         kind: 'compaction',
         status: 'compacted',
         sessionId: 'sess-new',

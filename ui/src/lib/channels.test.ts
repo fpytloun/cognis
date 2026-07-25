@@ -49,15 +49,18 @@ describe('channels helpers', () => {
     const created = createChannelDraft(meta, [agent]);
     expect(created.display_name).toBe('Signal Account');
     expect(created.agent_id).toBe('agent-1');
+    expect(created.default_agent_profile_id).toBe('');
     expect(created.credentialValues.token).toBe('');
 
     const account = {
       account_id: 'acc', channel_type: 'signal', display_name: 'My Signal', enabled: true, agent_id: 'agent-1',
+      default_agent_profile_id: 'chat',
       config: { use_tls: false }, credential_refs: {}, allowed_senders: ['@filip:fpy.cz'], dm_policy: 'pairing', group_policy: 'pairing',
       created_at: null, updated_at: null,
     } satisfies ChannelAccount;
     const edited = createChannelDraft(meta, [agent], account);
     expect(edited.display_name).toBe('My Signal');
+    expect(edited.default_agent_profile_id).toBe('chat');
     expect(edited.allowed_senders).toBe('@filip:fpy.cz');
     expect(edited.settingValues.use_tls).toBe('false');
   });

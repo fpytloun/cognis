@@ -6,8 +6,15 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.api.runtime_support import select_static_tools
 from cognis.bootstrap import run_schema_bootstrap
-from cognis.core.agent_management import AgentManagementDependencies, handle_agent_management_action
+from cognis.core.agent_management import (
+    AgentManagementDependencies,
+    AgentManagementError,
+    handle_agent_management_action,
+)
+from cognis.models.agent import AgentDefinition
+from cognis.models.tool import stable_tool_id
 from cognis.runtime_context import RuntimeAccessContext
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.queries import (
@@ -16,11 +23,19 @@ from cognis.store.queries import (
     create_conversation,
     create_executor,
     create_knowledgebase,
-    create_skill,
+    create_llm_provider,
+    create_schedule,
     create_user,
     create_workflow,
+    update_schedule,
 )
-from cognis.tools.builtin.agent_management import handle_agent_management_tool
+from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL, handle_agent_management_tool
+from cognis.tools.builtin.schedule import MANAGE_SCHEDULES_TOOL, handle_schedule_tool
+from cognis.tools.introspection import (
+    audit_native_tool_domains,
+    validate_available_tool_call_with_context,
+)
+from cognis.tools.native_validation import NativeValidationContext
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -35,9 +50,14 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
 
 
 async def _agent_management_test_deps(tmp_path: Path) -> AgentManagementDependencies:
+    from cognis.api.runtime_support import static_tool_definitions
+
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/agent-management.db")
     await run_schema_bootstrap(engine)
-    return AgentManagementDependencies(session_factory=create_session_factory(engine))
+    return AgentManagementDependencies(
+        session_factory=create_session_factory(engine),
+        assignable_tools=static_tool_definitions(knowledgebase_enabled=True),
+    )
 
 
 def test_grantee_can_list_and_view_shared_agent(monkeypatch: object, tmp_path: Path) -> None:
@@ -577,28 +597,8 @@ def test_agent_management_settings_get_schema_and_update(
                 name="Software Development",
                 definition={"steps": []},
             )
-            await create_skill(
-                session,
-                skill_id="test-cognis-coding",
-                owner_email="owner@example.com",
-                name="Cognis Coding",
-                instructions="Coding discipline",
-            )
-            await create_executor(
-                session,
-                executor_id="dev-executor",
-                owner_email="owner@example.com",
-                name="Dev Executor",
-                executor_type="websocket",
-            )
             await session.commit()
 
-        schema = await handle_agent_management_action(
-            deps=deps,
-            actor_email="owner@example.com",
-            current_agent_id="controller-agent",
-            arguments={"action": "settings_schema", "agent_id": "managed-agent"},
-        )
         initial = await handle_agent_management_action(
             deps=deps,
             actor_email="owner@example.com",
@@ -616,10 +616,6 @@ def test_agent_management_settings_get_schema_and_update(
                     "available_workflow_ids": ["software-development"],
                     "default_workflow_id": "software-development",
                     "workflow_selection_mode": "use_default",
-                    "executor_id": "dev-executor",
-                    "enabled_skills": ["test-cognis-coding"],
-                    "opt_in_builtin_tools": ["builtin:manage_agents"],
-                    "disabled_categories": ["browser"],
                 },
             },
         )
@@ -629,25 +625,78 @@ def test_agent_management_settings_get_schema_and_update(
             current_agent_id="controller-agent",
             arguments={"action": "settings_get", "agent_id": "managed-agent"},
         )
-        assert schema["fields"]["default_workflow_id"]["options"] == [
-            {"id": "software-development", "label": "Software Development", "is_system": False}
-        ]
-        assert {
-            "id": "test-cognis-coding",
-            "label": "Cognis Coding",
-            "is_system": False,
-            "attach_to_all_agents": False,
-        } in schema["fields"]["enabled_skills"]["options"]
         assert initial["settings"]["tools"] is None
         assert initial["settings"]["tools_state"]["config_state"] == "default_inherited"
         settings = updated["settings"]
         assert settings["workflow"]["default_workflow_id"] == "software-development"
         assert settings["workflow"]["workflow_selection_mode"] == "use_default"
-        assert settings["executor"]["executor_id"] == "dev-executor"
-        assert settings["enabled_skills"] == ["test-cognis-coding"]
-        assert settings["tools_state"]["config_state"] == "explicit_config"
-        assert settings["tools_state"]["opt_in_builtin_tools"] == ["manage_agents"]
+        assert settings["executor"]["executor_id"] is None
+        assert settings["enabled_skills"] == []
+        assert settings["tools_state"]["config_state"] == "default_inherited"
         assert reread["settings"] == updated["settings"]
+
+    asyncio.run(_run())
+
+
+def test_agent_management_list_includes_available_profiles(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                agent_profiles={
+                    "quality": {
+                        "profile_id": "quality",
+                        "description": "Maximum implementation quality.",
+                    },
+                    "fast": {
+                        "profile_id": "fast",
+                        "description": "Low-latency routine work.",
+                    },
+                },
+                default_agent_profile_id="quality",
+                status="active",
+            )
+            await session.commit()
+
+        result = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={"action": "list"},
+        )
+
+        assert result["agents"] == [
+            {
+                "agent_id": "managed-agent",
+                "name": "Managed Agent",
+                "description": None,
+                "agent_type": "primary",
+                "status": "active",
+                "manageable": True,
+                "default_agent_profile_id": "quality",
+                "agent_profiles": [
+                    {
+                        "profile_id": "fast",
+                        "description": "Low-latency routine work.",
+                        "is_default": False,
+                        "synthetic": False,
+                    },
+                    {
+                        "profile_id": "quality",
+                        "description": "Maximum implementation quality.",
+                        "is_default": True,
+                        "synthetic": False,
+                    },
+                ],
+            }
+        ]
 
     asyncio.run(_run())
 
@@ -714,26 +763,17 @@ def test_agent_management_tool_assignment_crud_and_validation(tmp_path: Path) ->
             )
             await session.commit()
 
-        available = await handle_agent_management_action(
-            deps=deps,
-            actor_email="owner@example.com",
-            current_agent_id="controller-agent",
-            arguments={"action": "tools_list_available"},
-        )
-        assert "knowledgebase_read" in {group["id"] for group in available["tool_groups"]}
-        assert "builtin:knowledgebase_search" in {tool["id"] for tool in available["tools"]}
-
         invalid = await handle_agent_management_action(
             deps=deps,
             actor_email="owner@example.com",
             current_agent_id="controller-agent",
             arguments={
-                "action": "tools_validate",
+                "action": "tools_set",
                 "agent_id": "managed-agent",
                 "tool_groups": ["missing"],
             },
         )
-        assert invalid["valid"] is False
+        assert invalid["status"] == "invalid"
         assert invalid["errors"][0]["reason"] == "Unknown tool group"
 
         updated = await handle_agent_management_action(
@@ -771,5 +811,438 @@ def test_agent_management_tool_assignment_crud_and_validation(tmp_path: Path) ->
             arguments={"action": "knowledgebases_get", "agent_id": "managed-agent"},
         )
         assert reread["assigned_knowledgebases"] == [kb.knowledgebase_id]
+
+        created_with_kb = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "create",
+                "name": "Knowledge agent",
+                "assigned_knowledgebases": [kb.knowledgebase_id],
+            },
+        )
+        assert created_with_kb["agent"]["permissions"]["allowed_knowledgebases"] == [
+            kb.knowledgebase_id
+        ]
+        created_kb_state = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "knowledgebases_get",
+                "agent_id": created_with_kb["agent"]["agent_id"],
+            },
+        )
+        assert created_kb_state["assigned_knowledgebases"] == [kb.knowledgebase_id]
+
+    asyncio.run(_run())
+
+
+def test_restricted_primary_cannot_expand_tool_assignment(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        deps.assignable_tools = [
+            tool
+            for tool in deps.assignable_tools or []
+            if tool.name in {"list_agents", "manage_agents"}
+        ]
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                display_name="Managed Agent",
+                status="active",
+            )
+            allowed_kb = await create_knowledgebase(
+                session,
+                owner_email="owner@example.com",
+                name="Allowed KB",
+            )
+            denied_kb = await create_knowledgebase(
+                session,
+                owner_email="owner@example.com",
+                name="Denied KB",
+            )
+            await session.commit()
+        deps.assignable_knowledgebase_ids = {allowed_kb.knowledgebase_id}
+
+        direct = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "tools_set",
+                "agent_id": "managed-agent",
+                "allow_tools": ["builtin:write_deliverable"],
+            },
+        )
+        grouped = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={
+                "action": "tools_set",
+                "agent_id": "managed-agent",
+                "tool_groups": ["knowledgebase_read"],
+            },
+        )
+
+        assert direct["status"] == "invalid"
+        assert direct["errors"][0]["reason"] == "Unknown tool"
+        assert grouped["status"] == "invalid"
+        assert "exceeds caller-effective" in grouped["errors"][0]["reason"]
+
+        created = await handle_agent_management_action(
+            deps=deps,
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            arguments={"action": "create", "name": "Restricted child"},
+        )
+        assert set(created["agent"]["tools"]["allow_tools"]) == {
+            stable_tool_id(tool) for tool in deps.assignable_tools or []
+        }
+        assert created["agent"]["permissions"] is None
+        assert created["agent"]["execution"] is None
+        created_definition = AgentDefinition.model_validate(created["agent"])
+        assert {
+            stable_tool_id(tool)
+            for tool in select_static_tools(
+                created_definition,
+                knowledgebase_enabled=True,
+            )
+        } <= {stable_tool_id(tool) for tool in deps.assignable_tools or []}
+
+        try:
+            await handle_agent_management_action(
+                deps=deps,
+                actor_email="owner@example.com",
+                current_agent_id="controller-agent",
+                arguments={
+                    "action": "knowledgebases_add",
+                    "agent_id": "managed-agent",
+                    "knowledgebase_ids": [denied_kb.knowledgebase_id],
+                },
+            )
+        except AgentManagementError as exc:
+            assert "Invalid knowledgebase_ids" in str(exc)
+        else:
+            raise AssertionError("caller-denied knowledgebase assignment should fail")
+
+    asyncio.run(_run())
+
+
+def test_settings_preflight_validates_provider_model_and_workflow_domains(
+    tmp_path: Path,
+) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                display_name="Managed Agent",
+                status="active",
+            )
+            workflow = await create_workflow(
+                session,
+                workflow_id="allowed-workflow",
+                owner_email="owner@example.com",
+                name="Allowed workflow",
+                definition={"steps": []},
+            )
+            await create_llm_provider(
+                session,
+                provider_id="provider-a",
+                display_name="Provider A",
+                location="local",
+                backend="litellm",
+                owner_email="owner@example.com",
+                config={"models": [{"model_id": "model-a"}]},
+            )
+            await session.commit()
+
+        context = NativeValidationContext(
+            actor_email="owner@example.com",
+            current_agent_id="controller-agent",
+            agent_management_deps=deps,
+        )
+        valid = await validate_available_tool_call_with_context(
+            [MANAGE_AGENTS_TOOL],
+            "manage_agents",
+            {
+                "action": "settings_update",
+                "agent_id": "managed-agent",
+                "settings": {
+                    "provider_id": "provider-a",
+                    "model": "model-a",
+                    "default_workflow_id": workflow.workflow_id,
+                },
+            },
+            context,
+        )
+        invalid_model = await validate_available_tool_call_with_context(
+            [MANAGE_AGENTS_TOOL],
+            "manage_agents",
+            {
+                "action": "settings_update",
+                "agent_id": "managed-agent",
+                "settings": {
+                    "provider_id": "provider-a",
+                    "model": "model-b",
+                },
+            },
+            context,
+        )
+        invalid_workflow = await validate_available_tool_call_with_context(
+            [MANAGE_AGENTS_TOOL],
+            "manage_agents",
+            {
+                "action": "settings_update",
+                "agent_id": "managed-agent",
+                "settings": {"default_workflow_id": "missing-workflow"},
+            },
+            context,
+        )
+
+        assert valid["valid"] is True
+        assert invalid_model["valid"] is False
+        assert "Invalid model" in invalid_model["errors"][0]["message"]
+        assert invalid_workflow["valid"] is False
+        assert "Invalid default_workflow_id" in invalid_workflow["errors"][0]["message"]
+
+    asyncio.run(_run())
+
+
+def test_complex_native_examples_pass_handler_domain_validation(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                display_name="Managed Agent",
+                status="active",
+            )
+            await create_schedule(
+                session,
+                schedule_id="schedule-id",
+                name="Existing schedule",
+                schedule_type="cron",
+                cron_expr="0 8 * * *",
+                agent_id="managed-agent",
+                task_template={"input": "Run"},
+                created_by="owner@example.com",
+            )
+            await session.commit()
+
+        failures = await audit_native_tool_domains(
+            [MANAGE_AGENTS_TOOL],
+            NativeValidationContext(
+                actor_email="owner@example.com",
+                current_agent_id="controller-agent",
+                agent_management_deps=deps,
+                session_factory=deps.session_factory,
+            ),
+        )
+        failures.extend(
+            await audit_native_tool_domains(
+                [MANAGE_SCHEDULES_TOOL],
+                NativeValidationContext(
+                    actor_email="owner@example.com",
+                    current_agent_id="managed-agent",
+                    session_factory=deps.session_factory,
+                ),
+            )
+        )
+
+        assert failures == []
+        assert MANAGE_AGENTS_TOOL.native_operations is not None
+        settings_example = next(
+            operation.examples[0]
+            for operation in MANAGE_AGENTS_TOOL.native_operations
+            if operation.operation == "settings_update"
+        )
+        settings_result = await handle_agent_management_tool(
+            tool_name="manage_agents",
+            arguments=settings_example,
+            deps=deps,
+            user_email="owner@example.com",
+            current_agent_id="controller-agent",
+            runtime_access=RuntimeAccessContext(
+                user_email="owner@example.com",
+                agent_id="controller-agent",
+                agent_owner_email="owner@example.com",
+                agent_type="primary",
+            ),
+        )
+        assert settings_result.is_error is False
+
+        assert MANAGE_SCHEDULES_TOOL.native_operations is not None
+        schedule_example = next(
+            operation.examples[0]
+            for operation in MANAGE_SCHEDULES_TOOL.native_operations
+            if operation.operation == "create"
+        )
+        schedule_result = await handle_schedule_tool(
+            tool_name="manage_schedules",
+            arguments=schedule_example,
+            session_factory=deps.session_factory,
+            scheduler=None,
+            user_email="owner@example.com",
+            agent_id="managed-agent",
+        )
+        assert schedule_result.is_error is False
+
+    asyncio.run(_run())
+
+
+def test_schedule_preflight_matches_handler_authorization_domains(tmp_path: Path) -> None:
+    async def _run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session,
+                email="owner@example.com",
+                name="Owner",
+                password_hash="hashed",
+            )
+            await create_user(
+                session,
+                email="other@example.com",
+                name="Other",
+                password_hash="hashed",
+            )
+            await create_agent(
+                session,
+                agent_id="managed-agent",
+                owner_email="owner@example.com",
+                name="Managed Agent",
+                status="active",
+                agent_profiles={
+                    "fast": {
+                        "profile_id": "fast",
+                        "description": "Fast responses",
+                        "enabled": True,
+                    }
+                },
+            )
+            await create_workflow(
+                session,
+                workflow_id="allowed-workflow",
+                owner_email="owner@example.com",
+                name="Allowed workflow",
+                definition={"steps": []},
+            )
+            await create_conversation(
+                session,
+                user_email="other@example.com",
+                agent_id="managed-agent",
+                context_type="direct",
+                conversation_id="foreign-conversation",
+            )
+            await create_schedule(
+                session,
+                schedule_id="schedule-domain",
+                name="Existing schedule",
+                schedule_type="cron",
+                cron_expr="0 8 * * *",
+                agent_id="managed-agent",
+                workflow_id="allowed-workflow",
+                task_template={"delivery": {"mode": "preferred_channel"}},
+                created_by="owner@example.com",
+            )
+            await update_schedule(
+                session,
+                "schedule-domain",
+                workflow_id="stale-workflow",
+            )
+            await session.commit()
+
+        context = NativeValidationContext(
+            actor_email="owner@example.com",
+            current_agent_id="managed-agent",
+            session_factory=deps.session_factory,
+        )
+        accepted_update = {
+            "action": "update",
+            "schedule_id": "schedule-domain",
+            "name": "Renamed despite stale workflow",
+        }
+        accepted_preflight = await validate_available_tool_call_with_context(
+            [MANAGE_SCHEDULES_TOOL],
+            "manage_schedules",
+            accepted_update,
+            context,
+        )
+        accepted_handler = await handle_schedule_tool(
+            tool_name="manage_schedules",
+            arguments=accepted_update,
+            session_factory=deps.session_factory,
+            scheduler=None,
+            user_email="owner@example.com",
+            agent_id="managed-agent",
+        )
+        assert accepted_preflight["valid"] is True
+        assert accepted_handler.is_error is False
+
+        invalid_fields = [
+            {"agent_id": "missing-agent"},
+            {"workflow_id": "missing-workflow"},
+            {"agent_profile_id": "missing-profile"},
+            {
+                "delivery_mode": "specific_conversation",
+                "delivery_target": "foreign-conversation",
+            },
+        ]
+        for fields in invalid_fields:
+            for action in ("create", "update"):
+                arguments: dict[str, object] = {
+                    "action": action,
+                    **fields,
+                }
+                if action == "create":
+                    arguments.update(
+                        {
+                            "name": "Invalid schedule",
+                            "cron_expr": "0 8 * * *",
+                            "agent_id": fields.get("agent_id", "managed-agent"),
+                        }
+                    )
+                else:
+                    arguments["schedule_id"] = "schedule-domain"
+
+                preflight = await validate_available_tool_call_with_context(
+                    [MANAGE_SCHEDULES_TOOL],
+                    "manage_schedules",
+                    arguments,
+                    context,
+                )
+                handler_result = await handle_schedule_tool(
+                    tool_name="manage_schedules",
+                    arguments=arguments,
+                    session_factory=deps.session_factory,
+                    scheduler=None,
+                    user_email="owner@example.com",
+                    agent_id="managed-agent",
+                )
+
+                assert preflight["valid"] is False, (action, fields, preflight)
+                assert handler_result.is_error is True, (action, fields, handler_result)
 
     asyncio.run(_run())

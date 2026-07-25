@@ -1,31 +1,54 @@
 <script lang="ts">
   import { page } from '$app/stores';
-
-  import { getEmbeddedDoc, getRelatedDocs } from '$lib/docs';
+  import { loadEmbeddedDoc } from '$lib/docs';
+  import { getDocMeta, getRelatedDocsMeta } from '$lib/docs-registry';
   import { renderDocsMarkdown } from '$lib/markdown';
   import Card from '$lib/components/ui/Card.svelte';
+  import type { EmbeddedDoc } from '$lib/docs';
 
   let slug = $derived($page.params.slug ?? '');
-  let doc = $derived(getEmbeddedDoc(slug));
-  let relatedDocs = $derived(doc ? getRelatedDocs(doc) : []);
-  let html = $derived(doc ? renderDocsMarkdown(doc.content) : '');
+  let docMeta = $derived(getDocMeta(slug));
+  let doc = $state<EmbeddedDoc | null>(null);
+  let loading = $state(true);
+  let html = $state('');
+  let relatedDocs = $derived(docMeta ? getRelatedDocsMeta(docMeta) : []);
+  let loadSeq = 0;
+
+  async function loadCurrentDoc(): Promise<void> {
+    const currentSeq = ++loadSeq;
+    loading = true;
+    const loaded = await loadEmbeddedDoc(slug);
+    if (currentSeq !== loadSeq) return;
+    doc = loaded;
+    html = loaded ? renderDocsMarkdown(loaded.content) : '';
+    loading = false;
+  }
+
+  $effect(() => {
+    void slug;
+    void loadCurrentDoc();
+  });
 </script>
 
 <svelte:head>
-  <title>{doc ? `${doc.title} · Docs · Cognis` : 'Doc Not Found · Docs · Cognis'}</title>
+  <title>{docMeta ? `${docMeta.title} · Docs · Cognis` : 'Doc Not Found · Docs · Cognis'}</title>
 </svelte:head>
 
-{#if doc}
+{#if docMeta}
   <section class="space-y-6">
     <Card class="p-4 sm:p-6">
       <a class="text-sm text-sky-300" href="/docs">Back to docs</a>
       <p class="mt-4 text-sm uppercase tracking-[0.25em] text-slate-400">Docs</p>
-      <h1 class="mt-2 text-2xl font-semibold text-white">{doc.title}</h1>
-      <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-400">{doc.description}</p>
+      <h1 class="mt-2 text-2xl font-semibold text-white">{docMeta.title}</h1>
+      <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-400">{docMeta.description}</p>
     </Card>
 
     <Card class="p-4 sm:p-6">
-      <div class="docs-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html html}</div>
+      {#if loading}
+        <p class="text-sm text-slate-400">Loading guide…</p>
+      {:else}
+        <div class="docs-markdown min-w-0 max-w-full overflow-x-hidden break-words prose prose-invert max-w-none prose-headings:text-white prose-p:text-slate-300 prose-strong:text-white prose-li:text-slate-300 prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950/80 prose-table:text-slate-200">{@html html}</div>
+      {/if}
     </Card>
 
     {#if relatedDocs.length > 0}

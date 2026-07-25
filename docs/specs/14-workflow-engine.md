@@ -730,14 +730,16 @@ Inside a step, the agent also has access to step-scoped task/todo tools:
 ```json
 {
   "name": "step_todo_write",
-  "description": "Track your progress within this step. Use todos for complex multi-step work, break substantial tasks into concrete actionable items instead of a few broad buckets, keep exactly one item in progress, and mark items completed or cancelled immediately as status changes. These todos help you stay organized, especially during long execution with compaction. They are advisory — the workflow advances based on step_complete, not todo status."
+  "description": "Track required progress for genuine multistep work within this step. Do not create a todo list for work that can be completed in a single response. Keep created todos current across turns and mark every item completed or cancelled before terminal completion. Multiple in_progress items are allowed for genuinely parallel workstreams. Architect todos track durable workstreams or milestones; developer todos track granular implementation, test, and acceptance steps. Stable labels or hierarchy are optional when useful. Pending todos block premature step completion."
 }
 ```
 
-These survive compaction for task/delegation steps (stored in step metadata,
-re-injected into context). In direct chat, todos are turn-local and should be
-used only for concrete execution work that the agent is actively continuing in
-the current turn.
+Todos are reserved for genuine multistep work. Simple questions, short answers,
+and clarification that fit in one response do not require todo bookkeeping.
+Created todos survive compaction for task/delegation steps (stored in step
+metadata and re-injected into context). In direct chat, created todos are
+conversation-scoped and persist across turns until the work reaches a terminal
+state.
 
 The controller never infers workflow advancement from todo state alone. Only
 `step_complete` may advance a run step, and task/delegation steps reject

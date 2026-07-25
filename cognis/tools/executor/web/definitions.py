@@ -8,7 +8,8 @@ parameters.
 
 from __future__ import annotations
 
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 
 _EXECUTOR_SOURCE = ToolSource(type="executor")
 
@@ -205,6 +206,19 @@ def _build_web_search(
             "type": "integer",
             "description": "Number of results (default: 8, max varies by backend)",
         },
+        "include_images": {
+            "type": "boolean",
+            "description": (
+                "Include image references usable as lazy artifacts in rich deliverables. "
+                "Direct uses DuckDuckGo Image Search; Tavily returns query-related images."
+            ),
+        },
+        "image_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 50,
+            "description": "Maximum image references to return when include_images is enabled (default: 10, max 50)",
+        },
     }
 
     if has_multiple:
@@ -243,10 +257,6 @@ def _build_web_search(
                 {"type": "string", "enum": ["markdown", "text"]},
             ],
             "description": "Tavily: include cleaned raw page content",
-        }
-        properties["include_images"] = {
-            "type": "boolean",
-            "description": "Tavily: include query-related and per-result images",
         }
         properties["include_image_descriptions"] = {
             "type": "boolean",

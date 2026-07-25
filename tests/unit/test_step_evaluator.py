@@ -256,6 +256,67 @@ async def test_evaluator_prompt_uses_plain_deliverable_text_exactly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_evaluator_rejects_structural_only_pulse_v2_before_llm() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+    output = _step_output()
+    output.metadata = {
+        "deliverable_render_metadata": {
+            "pulse_version": 2,
+            "pulse_quality": {
+                "quality_gate_passed": False,
+                "visual_count": 0,
+                "uncited_story_count": 2,
+            },
+        }
+    }
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Create a Pulse v2 daily brief."),
+        step_output=output,
+        step_inputs={},
+    )
+
+    assert result.decision == "revise"
+    assert "structural-only" in str(result.feedback)
+    assert capture.messages is None
+
+
+@pytest.mark.asyncio
+async def test_evaluator_prompt_consumes_passing_pulse_v2_quality_metadata() -> None:
+    capture = _CaptureLLM()
+    evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)
+    output = _step_output()
+    output.metadata = {
+        "deliverable_render_metadata": {
+            "pulse_version": 2,
+            "pulse_quality": {
+                "quality_gate_passed": True,
+                "visual_count": 1,
+                "meaningful_chart_count": 1,
+                "cited_story_count": 4,
+                "uncited_story_count": 0,
+                "collapsible_count": 2,
+                "unavailable_count": 1,
+            },
+        }
+    }
+
+    result = await evaluator.evaluate(
+        step_definition=_step_def("Create a Pulse v2 daily brief."),
+        step_output=output,
+        step_inputs={},
+    )
+
+    assert result.decision == "approved"
+    assert capture.messages is not None
+    prompt = str(capture.messages[1]["content"])
+    assert '"quality_gate_passed": true' in prompt
+    assert '"meaningful_chart_count": 1' in prompt
+    assert "Structural composition alone is not success" in prompt
+
+
+@pytest.mark.asyncio
 async def test_evaluator_uses_step_inputs() -> None:
     capture = _CaptureLLM()
     evaluator = StepEvaluator(llm=capture, evaluator_timeout_seconds=5.0)

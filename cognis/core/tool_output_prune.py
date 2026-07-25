@@ -9,10 +9,9 @@ intact, accumulate tool-result tokens, and once the tail exceeds
 ``PRUNE_PROTECT`` tokens mark older tool result call ids as pruned.
 
 Pruning is purely a controller-side context-assembly view. The Intaris
-event store is unchanged. The tool output store also retains the
-original payload, so the model can always recover via ``read_tool_output``
-or ``read_tool_output_anchor`` — Cognis ends up strictly better than
-OpenCode here, where pruned content is unrecoverable.
+event store is unchanged. Only results whose event metadata confirms a
+saved recovery handle are eligible, so every clearance marker can direct
+the model back to the original output.
 """
 
 from __future__ import annotations
@@ -54,6 +53,30 @@ class PruneCandidate:
     tool_name: str
     output: str
     is_user_turn: bool = False  # Sentinel for user-message events.
+
+
+def prune_candidate_from_event_data(data: dict[str, object]) -> PruneCandidate | None:
+    """Build a candidate only when its full output is explicitly recoverable."""
+
+    if data.get("has_full_output") is not True:
+        return None
+    recovery_call_id = data.get("recovery_call_id")
+    if not isinstance(recovery_call_id, str) or not recovery_call_id.strip():
+        return None
+    call_id = data.get("call_id")
+    if not isinstance(call_id, str) or not call_id.strip():
+        return None
+    output = data.get("result")
+    if not isinstance(output, str):
+        output = data.get("output")
+    if not isinstance(output, str) or not output:
+        return None
+    tool_name = data.get("name")
+    return PruneCandidate(
+        call_id=call_id,
+        tool_name=tool_name if isinstance(tool_name, str) else "",
+        output=output,
+    )
 
 
 def select_prune_call_ids(

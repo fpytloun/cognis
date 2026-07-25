@@ -17,7 +17,8 @@ from typing import Any
 
 import httpx
 
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolResult, ToolSource
 from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
 
@@ -56,7 +57,11 @@ DOCUMENT_GENERATE_TOOL = ToolDefinition(
             },
             "source_artifact_id": {
                 "type": "string",
-                "description": "Existing Cognis artifact id for the source document.",
+                "description": (
+                    "Artifact-compatible source document ref, including a saved Cognis "
+                    "artifact ID or an authorized task or managed-descendant deliverable ID "
+                    "(dlv_*)."
+                ),
             },
             "title": {"type": "string", "description": "Document title."},
             "filename": {"type": "string", "description": "Output PDF filename."},

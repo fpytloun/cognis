@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from cognis.core.tool_output_presentation import (
+    artifact_anchor_names,
+    present_tool_output,
+    safe_output_anchors,
+)
 from cognis.tools.executor.web.backends.formatting import build_fetch_tool_result
 from cognis.tools.executor.web.extraction import extract_document
 
@@ -47,6 +52,37 @@ ARTICLE_HTML = """
 </body>
 </html>
 """
+
+
+def test_long_fetch_promotes_media_ref_without_reordering_tool_output() -> None:
+    result = build_fetch_tool_result(
+        url="https://example.com/article",
+        content="article body " * 2_000,
+        metadata={
+            "extracted_document": {
+                "url": "https://example.com/article",
+                "images": [
+                    {
+                        "url": "https://cdn.example.com/article.jpg",
+                        "alt": "Source photograph",
+                    }
+                ],
+            }
+        },
+    )
+    anchors = safe_output_anchors((result.metadata or {}).get("output_anchors"))
+    names = [anchor["anchor"] for anchor in anchors]
+    presentation = present_tool_output(
+        result.output,
+        900,
+        recovery_call_id="call_web_media",
+        has_full_output=True,
+        anchors=names,
+        lazy_artifact_anchors=artifact_anchor_names(anchors),
+    )
+
+    assert result.output.index("[[page:1]]") < result.output.index("[[media:1]]")
+    assert presentation.lazy_artifact_refs == ("tool_artifact:call_web_media:media:1",)
 
 
 def test_extract_document_merges_jsonld_opengraph_and_media() -> None:

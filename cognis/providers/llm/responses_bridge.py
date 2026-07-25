@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from prometheus_client import Counter
+
 from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
 from cognis.models.config import ModelInfo
@@ -26,6 +28,15 @@ OUTPUT_TEXT_DELTA_DEDUPE_MIN_OVERLAP = 80
 OUTPUT_TEXT_DELTA_DEDUPE_MAX_SCAN = 4096
 
 logger = get_logger(__name__)
+
+RESPONSES_REPLAY_UNPAIRED_TOOL_CALLS_TOTAL = Counter(
+    "cognis_responses_replay_unpaired_tool_calls_total",
+    (
+        "Prior-turn Responses tool calls with no paired output during history "
+        "replay, grouped by how the bridge resolved them."
+    ),
+    labelnames=("resolution",),
+)
 
 _NATIVE_APPLY_PATCH_OPERATION_TYPES = {"create_file", "update_file", "delete_file"}
 APPLY_PATCH_FREEFORM_LARK_GRAMMAR = """start: begin_patch hunk+ end_patch
@@ -197,16 +208,130 @@ def _extract_text_content(content: Any) -> str:
     return ""
 
 
+def _assistant_message_call_id_groups(
+    index: int, message: dict[str, Any]
+) -> list[set[str]]:
+    """Return id aliases grouped by logical tool call in one assistant message.
+
+    Both the raw ``_responses_output_items`` call ids and the normalized
+    ``tool_calls[].id`` are collected. A ``function_call`` recorded under a
+    raw ``call_...`` id may have its paired output recorded under the item's
+    ``fc_...`` id (or vice versa). Grouping aliases per call lets pairing on
+    either id preserve all aliases without incorrectly completing a different
+    parallel call in the same assistant message.
+    """
+
+    groups: list[set[str]] = []
+    raw_items = message.get("_responses_output_items")
+    if isinstance(raw_items, list):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            if str(raw_item.get("type") or "") not in RESPONSES_TOOL_CALL_TYPES:
+                continue
+            raw_aliases: set[str] = set()
+            for id_field in ("call_id", "id"):
+                raw_id = raw_item.get(id_field)
+                if isinstance(raw_id, str) and raw_id:
+                    raw_aliases.add(raw_id)
+            if raw_aliases:
+                groups.append(raw_aliases)
+    for tool_index, tool_call in enumerate(message.get("tool_calls") or []):
+        if not isinstance(tool_call, dict):
+            continue
+        tool_aliases: set[str] = set()
+        raw_id = tool_call.get("id")
+        if isinstance(raw_id, str) and raw_id:
+            tool_aliases.add(raw_id)
+        tool_aliases.add(
+            normalize_tool_call_id(
+                tool_call.get("id"),
+                tool_call.get("id"),
+                f"{index}:{tool_index}",
+            )
+        )
+        matching_group = next((group for group in groups if group & tool_aliases), None)
+        if matching_group is None:
+            groups.append(tool_aliases)
+        else:
+            matching_group.update(tool_aliases)
+    return groups
+
+
+def _paired_tool_call_ids_by_message(
+    messages: list[dict[str, Any]],
+) -> dict[int, set[str]]:
+    """Match each reusable call id to one later tool output in transcript order."""
+
+    available_output_ids: set[str] = set()
+    consumed_output_ids: set[str] = set()
+    paired_by_message: dict[int, set[str]] = {}
+    unpaired_group_count = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        role = str(message.get("role", "user"))
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id and call_id not in consumed_output_ids:
+                available_output_ids.add(call_id)
+            continue
+        if role != "assistant":
+            continue
+
+        completed_aliases: set[str] = set()
+        for alias_group in _assistant_message_call_id_groups(index, message):
+            matched_output_ids = (
+                alias_group & available_output_ids
+            ) - consumed_output_ids
+            if not matched_output_ids:
+                unpaired_group_count += 1
+                continue
+            completed_aliases.update(alias_group)
+            available_output_ids.difference_update(matched_output_ids)
+            consumed_output_ids.update(matched_output_ids)
+        if completed_aliases:
+            paired_by_message[index] = completed_aliases
+
+    _record_unpaired_tool_calls(unpaired_group_count)
+    return paired_by_message
+
+
+def _record_unpaired_tool_calls(unpaired_call_count: int) -> None:
+    """Emit diagnostics for prior tool calls that will be dropped from replay.
+
+    Dropping a prior tool call from the replayed Responses input is silent to
+    the model: it can no longer see it already made that call, so it may
+    re-issue an identical (non-idempotent) call. Surface the drops with a log
+    and a metric so the upstream cause (id mismatch, interrupted turn) is
+    observable in production instead of manifesting only as duplicate tool
+    execution.
+    """
+
+    if unpaired_call_count <= 0:
+        return
+    RESPONSES_REPLAY_UNPAIRED_TOOL_CALLS_TOTAL.labels(resolution="dropped").inc(
+        unpaired_call_count
+    )
+    logger.warning(
+        "Dropping unpaired prior tool calls from Responses input replay",
+        extra={"extra_data": {"unpaired_tool_call_count": unpaired_call_count}},
+    )
+
+
 def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Translate canonical Cognis/OpenAI-chat messages into Responses input."""
 
     items: list[dict[str, Any]] = []
+    paired_tool_call_ids = _paired_tool_call_ids_by_message(messages)
     native_apply_patch_call_ids: set[str] = set()
     custom_tool_call_ids: set[str] = set()
     function_call_ids: set[str] = set()
+    emitted_tool_output_ids: set[str] = set()
+    tool_call_id_aliases: dict[str, str] = {}
     for index, message in enumerate(messages):
         role = str(message.get("role", "user"))
         content = message.get("content")
+        completed_tool_call_ids = paired_tool_call_ids.get(index, set())
         raw_responses_output_items = message.get("_responses_output_items")
         if role == "assistant" and isinstance(raw_responses_output_items, list):
             normalized_content = _normalize_message_content(
@@ -231,6 +356,21 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                     ):
                         items.append({"role": "assistant", "content": normalized_content})
                         reconstructed_content_emitted = True
+                    if raw_type in RESPONSES_TOOL_CALL_TYPES:
+                        raw_call_id = raw_item.get("call_id")
+                        raw_item_id = raw_item.get("id")
+                        if isinstance(raw_call_id, str) and raw_call_id:
+                            tool_call_id_aliases[raw_call_id] = raw_call_id
+                            if isinstance(raw_item_id, str) and raw_item_id:
+                                tool_call_id_aliases[raw_item_id] = raw_call_id
+                        if (
+                            not isinstance(raw_call_id, str)
+                            or raw_call_id not in completed_tool_call_ids
+                            or raw_call_id in function_call_ids
+                            or raw_call_id in custom_tool_call_ids
+                            or raw_call_id in native_apply_patch_call_ids
+                        ):
+                            continue
                     if raw_type == "function_call":
                         call_id = raw_item.get("call_id")
                         if isinstance(call_id, str) and call_id:
@@ -256,6 +396,9 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 call_id = normalize_tool_call_id(
                     tool_call.get("id"), tool_call.get("id"), f"{index}:{tool_index}"
                 )
+                tool_call_id_aliases.setdefault(call_id, call_id)
+                if call_id not in completed_tool_call_ids:
+                    continue
                 if (
                     call_id in function_call_ids
                     or call_id in custom_tool_call_ids
@@ -309,6 +452,15 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 call_id = normalize_tool_call_id(
                     tool_call.get("id"), tool_call.get("id"), f"{index}:{tool_index}"
                 )
+                tool_call_id_aliases.setdefault(call_id, call_id)
+                if call_id not in completed_tool_call_ids:
+                    continue
+                if (
+                    call_id in function_call_ids
+                    or call_id in custom_tool_call_ids
+                    or call_id in native_apply_patch_call_ids
+                ):
+                    continue
                 function_name = str(function.get("name", "unknown_tool"))
                 arguments = str(function.get("arguments", "{}"))
                 native_operation = _extract_native_apply_patch_operation(function_name, arguments)
@@ -342,6 +494,20 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 )
                 continue
             normalized_call_id = normalize_tool_call_id(call_id, call_id, str(index))
+            normalized_call_id = tool_call_id_aliases.get(
+                normalized_call_id, normalized_call_id
+            )
+            if normalized_call_id in emitted_tool_output_ids:
+                logger.warning(
+                    "Dropping duplicate tool output for Responses API",
+                    extra={
+                        "extra_data": {
+                            "message_index": index,
+                            "tool_call_id": normalized_call_id,
+                        }
+                    },
+                )
+                continue
             output = content if isinstance(content, str) else json.dumps(content)
             if normalized_call_id in native_apply_patch_call_ids:
                 items.append(
@@ -352,6 +518,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "output": output,
                     }
                 )
+                emitted_tool_output_ids.add(normalized_call_id)
             elif normalized_call_id in function_call_ids:
                 items.append(
                     {
@@ -360,6 +527,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "output": output,
                     }
                 )
+                emitted_tool_output_ids.add(normalized_call_id)
             elif normalized_call_id in custom_tool_call_ids:
                 items.append(
                     {
@@ -368,6 +536,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                         "output": output,
                     }
                 )
+                emitted_tool_output_ids.add(normalized_call_id)
             else:
                 logger.warning(
                     "Dropping orphan tool output for Responses API",
@@ -1731,6 +1900,7 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
     reasoning_parts: list[str] = []
     summary_parts: list[str] = []
     refusal_parts: list[str] = []
+    output_tool_call_ids: set[str] = set()
 
     for index, item in enumerate(payload.get("output") or []):
         if not isinstance(item, dict):
@@ -1756,9 +1926,10 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
                 refusal_parts.append(refusal_text)
             continue
         if item_type in {"function_call", "apply_patch_call", "custom_tool_call"}:
+            call_id = normalize_tool_call_id(item.get("call_id"), item.get("id"), index)
             envelope.tool_calls.append(
                 {
-                    "id": normalize_tool_call_id(item.get("call_id"), item.get("id"), index),
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": _tool_call_item_name(item),
@@ -1766,6 +1937,7 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
                     },
                 }
             )
+            output_tool_call_ids.add(call_id)
 
     for choice in payload.get("choices") or []:
         if not isinstance(choice, dict):
@@ -1780,6 +1952,8 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
             if not isinstance(function, dict):
                 function = {}
             fallback_id = normalize_tool_call_id(tool_call.get("id"), None, index)
+            if fallback_id in output_tool_call_ids:
+                continue
             envelope.tool_calls.append(
                 {
                     "id": fallback_id,
@@ -1852,6 +2026,10 @@ def _extract_usage(payload: dict[str, Any]) -> dict[str, Any]:
         input_details.get("cached_tokens"), int | float
     ):
         normalized["cached_tokens"] = int(input_details["cached_tokens"])
+    if isinstance(input_details, dict) and isinstance(
+        input_details.get("cache_write_tokens"), int | float
+    ):
+        normalized["cache_write_tokens"] = int(input_details["cache_write_tokens"])
     output_details = usage.get("output_tokens_details")
     if isinstance(output_details, dict) and isinstance(
         output_details.get("reasoning_tokens"), int | float

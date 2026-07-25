@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, TypedDict
 
@@ -110,6 +113,10 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
     if callable(to_payload):
         payload = to_payload()
         if isinstance(payload, dict):
+            if payload.get("category") == MidStreamErrorCategory.OTHER.value:
+                payload_message = str(payload.get("message") or exc)
+                if _looks_like_artifact_fetch_error(payload_message.lower(), None):
+                    payload = {**payload, "category": MidStreamErrorCategory.ARTIFACT_FETCH.value}
             return payload
 
     message = str(exc) or type(exc).__name__
@@ -124,12 +131,7 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
     headers = getattr(getattr(exc, "response", None), "headers", None)
-    if headers is not None:
-        retry_after_raw = headers.get("retry-after") if hasattr(headers, "get") else None
-        try:
-            retry_after = float(retry_after_raw) if retry_after_raw is not None else None
-        except (TypeError, ValueError):
-            retry_after = None
+    retry_after = retry_after_seconds_from_headers(headers)
 
     body = getattr(exc, "body", None)
     if isinstance(body, dict):
@@ -178,6 +180,36 @@ def classify_llm_exception(exc: BaseException) -> MidStreamErrorPayload:
     if ids:
         payload["artifact_ids"] = ids
     return payload
+
+
+def retry_after_seconds_from_headers(headers: Any) -> float | None:
+    """Parse Retry-After header values as seconds or HTTP dates."""
+
+    if headers is None or not hasattr(headers, "get"):
+        return None
+    retry_after_raw = headers.get("retry-after")
+    if retry_after_raw is None:
+        retry_after_raw = headers.get("Retry-After")
+    if retry_after_raw is None:
+        return None
+    value = str(retry_after_raw).strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        seconds = (retry_at.astimezone(UTC) - datetime.now(UTC)).total_seconds()
+    if not math.isfinite(seconds):
+        return None
+    if seconds < 0:
+        return 0.0
+    return seconds
 
 
 def classify_response_failure(details: dict[str, Any]) -> MidStreamErrorPayload:
@@ -243,10 +275,16 @@ def reasoning_summary_rejected(payload: dict[str, Any] | None) -> bool:
 
 
 def _looks_like_artifact_fetch_error(message: str, param: str | None) -> bool:
+    url_fetch_timeout_markers = (
+        "timeout while downloading",
+        "unable to download content from the provided url",
+        "unable to download the content from the provided url",
+        "could not download content from the provided url",
+    )
     return bool(
         param in {"url", "image_url", "file_url"}
         and any(marker in message for marker in ("download", "fetch", "timeout", "timed out"))
-    ) or bool("timeout while downloading" in message and "url" in message)
+    ) or any(marker in message for marker in url_fetch_timeout_markers)
 
 
 def _looks_like_attachment_input_error(message: str, param: str | None) -> bool:

@@ -934,6 +934,176 @@ class TestEditTool:
         assert result.is_error
         assert "Use the read tool first" in result.output
 
+    @pytest.mark.asyncio()
+    async def test_edit_uses_line_trimmed_fallback(self, tmp_path: Path) -> None:
+        target = tmp_path / "trimmed.txt"
+        target.write_text("alpha\n  beta  \nomega\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "alpha\nbeta\nomega\n",
+                "new_string": "alpha\nBETA\nomega\n",
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "line-trimmed fallback" in result.output
+        assert target.read_text() == "alpha\n  BETA\nomega\n"
+
+    @pytest.mark.asyncio()
+    async def test_edit_rejects_line_trimmed_fallback_with_replacement_line_count_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "trimmed-mismatch.txt"
+        target.write_text("alpha\n  beta  \nomega\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "alpha\nbeta\nomega\n",
+                "new_string": "alpha\nBETA\nextra\nomega\n",
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "same number of lines" in result.output
+        assert target.read_text() == "alpha\n  beta  \nomega\n"
+
+    @pytest.mark.asyncio()
+    async def test_edit_uses_indentation_flexible_fallback_and_preserves_base_indent(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "indent.py"
+        target.write_text("def f():\n    if ready:\n        return True\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "if ready:\n    return True\n",
+                "new_string": "if ready:\n    return False\n",
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "indentation-flexible fallback" in result.output
+        assert target.read_text() == "def f():\n    if ready:\n        return False\n"
+
+    @pytest.mark.asyncio()
+    async def test_edit_fallback_preserves_line_ending_when_old_string_omits_it(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "indent-no-terminal-old.py"
+        target.write_text("def f():\n    if ready:\n        return True\n    return None\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "if ready:\n    return True",
+                "new_string": "if ready:\n    return False",
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert (
+            target.read_text() == "def f():\n    if ready:\n        return False\n    return None\n"
+        )
+
+    @pytest.mark.asyncio()
+    async def test_edit_uses_escaped_newline_fallback(self, tmp_path: Path) -> None:
+        target = tmp_path / "escaped.txt"
+        target.write_text("alpha\nbeta\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "alpha\\nbeta\\n",
+                "new_string": "alpha\\ngamma\\n",
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "escaped-character fallback" in result.output
+        assert target.read_text() == "alpha\ngamma\n"
+
+    @pytest.mark.asyncio()
+    async def test_edit_uses_escaped_newline_fallback_preserving_crlf(self, tmp_path: Path) -> None:
+        target = tmp_path / "escaped-crlf.txt"
+        target.write_bytes(b"alpha\r\nbeta\r\n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "alpha\\nbeta\\n",
+                "new_string": "alpha\\ngamma\\n",
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "escaped-character normalization" in result.output
+        assert target.read_bytes() == b"alpha\r\ngamma\r\n"
+
+    @pytest.mark.asyncio()
+    async def test_edit_rejects_ambiguous_fallback_without_replace_all(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "ambiguous.txt"
+        target.write_text("  beta  \n  beta  \n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "beta\n",
+                "new_string": "gamma\n",
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "Found 2 matches" in result.output
+        assert "Candidate match start lines: 1, 2." in result.output
+
+    @pytest.mark.asyncio()
+    async def test_edit_replace_all_handles_ambiguous_fallback(self, tmp_path: Path) -> None:
+        target = tmp_path / "replace-all-fallback.txt"
+        target.write_text("value   \nvalue   \n")
+        context = _context()
+        await handle_read({"file_path": str(target)}, context)
+
+        result = await handle_edit(
+            {
+                "file_path": str(target),
+                "old_string": "value\n",
+                "new_string": "done\n",
+                "replace_all": True,
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "rstrip-normalized fallback" in result.output
+        assert target.read_text() == "done\ndone\n"
+
 
 class TestMultieditTool:
     """Test the multiedit filesystem tool."""
@@ -998,6 +1168,74 @@ class TestMultieditTool:
 
         assert result.is_error
         assert "modified since it was last read" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_multiedit_rejects_old_string_inside_previous_new_string(
+        self, tmp_path: Path
+    ) -> None:
+        f = tmp_path / "multi-overlap.txt"
+        f.write_text("alpha\nbeta\n")
+        context = _context()
+        await handle_read({"file_path": str(f)}, context)
+
+        result = await handle_multiedit(
+            {
+                "file_path": str(f),
+                "edits": [
+                    {"old_string": "alpha", "new_string": "alpha beta"},
+                    {"old_string": "beta", "new_string": "gamma"},
+                ],
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "old_string is contained in new_string from edit 1" in result.output
+        assert f.read_text() == "alpha\nbeta\n"
+
+    @pytest.mark.asyncio()
+    async def test_multiedit_uses_indentation_flexible_fallback(self, tmp_path: Path) -> None:
+        f = tmp_path / "multi-indent.py"
+        f.write_text("def f():\n    if ready:\n        return True\n")
+        context = _context()
+        await handle_read({"file_path": str(f)}, context)
+
+        result = await handle_multiedit(
+            {
+                "file_path": str(f),
+                "edits": [
+                    {
+                        "old_string": "if ready:\n    return True\n",
+                        "new_string": "if ready:\n    return False\n",
+                    }
+                ],
+            },
+            context,
+        )
+
+        assert not result.is_error
+        assert "indentation-flexible fallback" in result.output
+        assert f.read_text() == "def f():\n    if ready:\n        return False\n"
+
+    @pytest.mark.asyncio()
+    async def test_multiedit_rejects_ambiguous_fallback(self, tmp_path: Path) -> None:
+        f = tmp_path / "multi-ambiguous.txt"
+        f.write_text("  beta  \n  beta  \n")
+        context = _context()
+        await handle_read({"file_path": str(f)}, context)
+
+        result = await handle_multiedit(
+            {
+                "file_path": str(f),
+                "edits": [{"old_string": "beta\n", "new_string": "gamma\n"}],
+            },
+            context,
+        )
+
+        assert result.is_error
+        assert "Edit 1: Found 2 matches" in result.output
+        assert "Candidate match start lines: 1, 2." in result.output
+        assert f.read_text() == "  beta  \n  beta  \n"
 
     @pytest.mark.asyncio()
     async def test_freshness_is_scope_local(self, tmp_path: Path) -> None:

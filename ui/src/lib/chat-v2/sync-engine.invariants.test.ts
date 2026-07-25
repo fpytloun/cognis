@@ -16,13 +16,16 @@
  *   state (the "message disappears" bug class).
  * - INV-REFRESH-NO-DROP: a canonical sync/snapshot does not evict an
  *   unconfirmed live item that was visible just before it.
+ * - INV-NO-REMOUNT-ON-FOLD: the first same-cycle tool frame does not re-home
+ *   a live streaming assistant message before backend cycle metadata confirms
+ *   tool activity.
  *
- * The legacy golden suite (chat-timeline.golden.test.ts) exercises a store
- * that no longer renders production chat; this suite covers the live path.
+ * This suite covers the canonical production path.
  */
 import { describe, expect, it } from 'vitest';
 
 import {
+  addLocalSystemMessage,
   addOptimisticUserMessage,
   applyRealtimeFrame,
   applySnapshot,
@@ -31,6 +34,8 @@ import {
   visibleTimelineItems,
   type ChatV2ClientState
 } from './sync-engine';
+import { prepareTimelineRows } from './tool-groups';
+import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
 import type {
   ChatRealtimeFrame,
   ChatSnapshot,
@@ -272,6 +277,25 @@ function toolCanonicalItem(turnId: string, phase: number, callId: string, seq: n
   } as TimelineItem;
 }
 
+function systemNoticeItem(noticeId: string, seq: number, content: string): TimelineItem {
+  return {
+    id: `system:${noticeId}`,
+    kind: 'message',
+    sort_key: `0000:${String(seq).padStart(15, '0')}:000000:09:000000000`,
+    source_refs: [{ store: 'intaris', session_id: 'sess-1', seq, event_type: 'lifecycle' }],
+    stable: true,
+    status: 'complete',
+    role: 'system',
+    content,
+    message_id: noticeId,
+    notice_id: noticeId,
+    notice_kind: 'command_result',
+    notice_scope: 'session',
+    attachments: [],
+    partial: false
+  } as TimelineItem;
+}
+
 // ---------------------------------------------------------------------------
 // Invariant checkers
 // ---------------------------------------------------------------------------
@@ -365,6 +389,46 @@ function checkRefreshNoDrop(before: StepRecord, after: StepRecord): void {
   }
 }
 
+function assistantRendererKeys(state: ChatV2ClientState): string[] {
+  return prepareTimelineRows(visibleTimelineItems(state), DEFAULT_USER_PREFERENCES, state.cycleStates)
+    .flatMap((row) => {
+      if (row.kind === 'item') {
+        const item = row.item;
+        return item.kind === 'message' && item.role === 'assistant'
+          ? [`message:assistant:${item.id}`]
+          : [];
+      }
+      if (row.kind === 'activity_segment') {
+        return row.entries.flatMap((entry) =>
+          entry.kind === 'assistant' ? [`message:assistant:${entry.item.id}`] : []
+        );
+      }
+      return [];
+    });
+}
+
+function timelineRowKeys(state: ChatV2ClientState): string[] {
+  return prepareTimelineRows(visibleTimelineItems(state), DEFAULT_USER_PREFERENCES, state.cycleStates)
+    .map((row) => {
+      if (row.kind === 'item') {
+        const item = row.item;
+        return item.kind === 'message' ? `${item.kind}:${item.role}:${item.id}` : `${item.kind}:${item.id}`;
+      }
+      return row.id;
+    });
+}
+
+function checkNoDuplicateTimelineRowKeys(label: string, state: ChatV2ClientState): void {
+  const seen = new Set<string>();
+  for (const key of timelineRowKeys(state)) {
+    expect(
+      seen.has(key),
+      `INV-NO-ROW-DUP violated at "${label}": duplicate timeline row key ${key}`
+    ).toBe(false);
+    seen.add(key);
+  }
+}
+
 class InvariantScenario {
   state: ChatV2ClientState;
   history: StepRecord[] = [];
@@ -379,6 +443,7 @@ class InvariantScenario {
     const record = { label, items: visibleTimelineItems(this.state) };
     checkNoDuplicates(record);
     checkNoHang(record, this.settledTurnIds);
+    checkNoDuplicateTimelineRowKeys(label, this.state);
     this.history.push(record);
     return record;
   }
@@ -539,6 +604,74 @@ describe('Chat v2 invariant scenarios', () => {
     scenario.finish();
   });
 
+  it('INV-NO-REMOUNT-ON-FOLD: mid-stream tool arrival does not re-home the assistant row', () => {
+    const scenario = new InvariantScenario(
+      applySnapshot(snapshot([userItem('user:c1', 1, 'c1', 'inspect the repo')], overlay(0), 'cur-0'))
+    );
+    const activeTurn = { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' as const };
+
+    const assistantOnly = applyRealtimeFrame(
+      scenario.state,
+      frame('cur-0', overlay(1, {
+        has_active_turn: true,
+        active_turn: activeTurn,
+        volatile_items: [
+          assistantStreamItem('turn-1', 0, 'I will inspect this.', { turn_cycle_index: 0 })
+        ]
+      }))
+    );
+    scenario.step('assistant stream before tool', assistantOnly.state);
+    expect(timelineRowKeys(scenario.state)).toEqual(['message:user:user:c1', 'message:assistant:message:turn-1:phase:0']);
+    expect(assistantRendererKeys(scenario.state)).toEqual(['message:assistant:message:turn-1:phase:0']);
+
+    const toolArrivedBeforeCycleConfirmation = applyRealtimeFrame(
+      scenario.state,
+      frame('cur-0', overlay(2, {
+        has_active_turn: true,
+        active_turn: activeTurn,
+        volatile_items: [
+          assistantStreamItem('turn-1', 0, 'I will inspect this.', { turn_cycle_index: 0 }),
+          toolRuntimeItem('turn-1', 0, 'call-1', 'running')
+        ],
+        cycle_states: [
+          { turn_id: 'turn-1', turn_cycle_index: 0, lifecycle_status: 'open', has_tool_activity: false }
+        ]
+      }))
+    );
+    scenario.step('tool arrived before cycle confirmation', toolArrivedBeforeCycleConfirmation.state);
+    expect(
+      timelineRowKeys(scenario.state),
+      'INV-NO-REMOUNT-ON-FOLD: assistant row must keep its standalone key when the first tool frame arrives'
+    ).toEqual([
+      'message:user:user:c1',
+      'message:assistant:message:turn-1:phase:0',
+      'tool-group:turn-1:tool:call-1'
+    ]);
+    expect(assistantRendererKeys(scenario.state)).toEqual(['message:assistant:message:turn-1:phase:0']);
+
+    const confirmedToolActivity = applyRealtimeFrame(
+      scenario.state,
+      frame('cur-0', overlay(3, {
+        has_active_turn: true,
+        active_turn: activeTurn,
+        volatile_items: [
+          assistantStreamItem('turn-1', 0, 'I will inspect this.', { turn_cycle_index: 0 }),
+          toolRuntimeItem('turn-1', 0, 'call-1', 'running')
+        ],
+        cycle_states: [
+          { turn_id: 'turn-1', turn_cycle_index: 0, lifecycle_status: 'open', has_tool_activity: true }
+        ]
+      }))
+    );
+    scenario.step('confirmed tool activity fold', confirmedToolActivity.state);
+    expect(timelineRowKeys(scenario.state)).toEqual([
+      'message:user:user:c1',
+      'activity-segment:turn-1:0:t:call-1'
+    ]);
+    expect(assistantRendererKeys(scenario.state)).toEqual(['message:assistant:message:turn-1:phase:0']);
+    scenario.finish();
+  });
+
   it('queued message cross-turn: turn 2 starts before turn 1 is confirmed', () => {
     const scenario = new InvariantScenario(
       applySnapshot(snapshot([userItem('user:c1', 1, 'c1', 'first question')], overlay(0), 'cur-0'))
@@ -652,12 +785,112 @@ describe('Chat v2 invariant scenarios', () => {
     scenario.finish();
   });
 
+  it('INV-NO-PERMANENT-TAIL: command system notice is canonical-id anchored mid-turn', () => {
+    const scenario = new InvariantScenario(
+      applySnapshot(snapshot([userItem('user:c1', 1, 'c1', 'use fast profile')], overlay(0), 'cur-0'))
+    );
+
+    const active = applyRealtimeFrame(
+      scenario.state,
+      frame('cur-0', overlay(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [assistantStreamItem('turn-1', 0, 'working…')]
+      }))
+    );
+    scenario.step('mid-turn stream', active.state);
+
+    const noticeId = 'command:profile:abc123';
+    scenario.step(
+      'profile switch notice',
+      addLocalSystemMessage(scenario.state, {
+        id: `system:${noticeId}`,
+        noticeId,
+        content: 'Agent profile switched to: fast'
+      })
+    );
+
+    const localNotice = scenario.lastRecord().items.find((item) => item.id === `system:${noticeId}`);
+    expect(localNotice).toBeDefined();
+    expect(localNotice?.sort_key.startsWith('9998:999999999999999:')).toBe(false);
+    expect((localNotice?.sort_key ?? '') > '0000:000000000000001:000000:00:000000000').toBe(true);
+
+    const sync = applySyncResponse(
+      scenario.state,
+      syncWith('cur-0', 'cur-1', [systemNoticeItem(noticeId, 2, 'Agent profile switched to: fast')])
+    );
+    scenario.step('canonical notice sync', sync.state);
+
+    const matching = scenario.lastRecord().items.filter((item) => item.id === `system:${noticeId}`);
+    expect(matching).toHaveLength(1);
+    expect(matching[0].stable).toBe(true);
+    expect(scenario.state.localItems.some((item) => item.id === `system:${noticeId}`)).toBe(false);
+    scenario.finish();
+  });
+
   it('empty state bootstrap preserves invariants', () => {
     const scenario = new InvariantScenario(emptyChatV2State());
     scenario.step(
       'first snapshot',
       applySnapshot(snapshot([userItem('user:c1', 1, 'c1', 'hi')], overlay(0), 'cur-0'))
     );
+    scenario.finish();
+  });
+
+  it('INV-RETRY-NO-DUP: retrying a failed turn does not duplicate the user message', () => {
+    const scenario = new InvariantScenario(
+      applySnapshot(
+        snapshot(
+          [
+            userItem('user:c1', 1, 'c1', 'retry me'),
+            {
+              ...assistantCanonicalItem('turn-1', 0, 2, 'The model failed before answering.'),
+              status: 'failed',
+              partial: false
+            } as TimelineItem
+          ],
+          overlay(0),
+          'cur-0'
+        )
+      )
+    );
+
+    const assertSingleUserMessage = (label: string) => {
+      const userMessages = visibleTimelineItems(scenario.state).filter(
+        (item) => item.kind === 'message' && item.role === 'user' && item.content === 'retry me'
+      );
+      expect(userMessages, `INV-RETRY-NO-DUP violated at "${label}"`).toHaveLength(1);
+      expect((userMessages[0] as { client_message_id?: string } | undefined)?.client_message_id).toBe('c1');
+    };
+
+    assertSingleUserMessage('failed baseline');
+
+    const retryRuntime = applyRealtimeFrame(
+      scenario.state,
+      frame('cur-0', overlay(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-2', session_id: 'sess-1', status: 'running' },
+        volatile_items: [assistantStreamItem('turn-2', 0, 'Retry answer')]
+      }))
+    );
+    scenario.step('retry runtime without optimistic user', retryRuntime.state);
+    assertSingleUserMessage('retry runtime without optimistic user');
+
+    const retrySettle = applyRealtimeFrame(scenario.state, frame('cur-0', overlay(2)));
+    scenario.settleTurn('turn-2');
+    scenario.step('retry settle', retrySettle.state);
+    assertSingleUserMessage('retry settle');
+
+    const retrySync = applySyncResponse(
+      scenario.state,
+      syncWith('cur-0', 'cur-1', [
+        systemNoticeItem('retry:turn-1:turn-2', 3, 'Retrying turn…'),
+        assistantCanonicalItem('turn-2', 0, 4, 'Retry answer')
+      ])
+    );
+    scenario.step('retry canonical sync', retrySync.state);
+    assertSingleUserMessage('retry canonical sync');
+
     scenario.finish();
   });
 });

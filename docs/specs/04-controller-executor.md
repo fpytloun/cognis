@@ -201,19 +201,61 @@ Bidirectional JSON-RPC 2.0 over WebSocket between controller and executor.
 2. Admin generates a JWT token (POST /api/v1/executors/{id}/token)
 3. Executor process starts: cognis-executor --controller-url wss://... --token <jwt>
 4. Executor connects to WS /api/executor/ws (permessage-deflate)
-5. Executor sends executor.ready with JWT token + platform info + optional environment snapshot
+5. Executor sends executor.ready with JWT token + platform info + optional environment and current resource snapshots
 6. Controller validates JWT (aud=cognis-executor, sub=executor_id)
 7. Controller looks up executor config from DB
 8. Controller increments desired config version and sends executor.configure with enabled tools/groups, executor-assigned MCP servers, scoped secrets, and executor runtime config (including LSP/browser settings)
-9. Executor applies the config, starts/refreshes MCP clients, refreshes executor-local runtime helpers such as LSP managers, and ACKs with applied version + observed tool manifest + refreshed environment snapshot
+9. Executor applies the config, starts/refreshes MCP clients, refreshes executor-local runtime helpers such as LSP managers, and ACKs with applied version + observed tool manifest + refreshed environment, platform, and resource snapshots
 10. Controller persists the observed manifest and marks executor as ready
 11. Controller dispatches tool.execute / llm.complete as needed
-12. Executor sends executor.heartbeat every 15 seconds
+12. Executor sends executor.heartbeat every 15 seconds; a current resource snapshot is attached on a bounded 60-second cadence by default
 13. On shutdown: executor.cancel or graceful disconnect
 ```
 
 For subprocess executors, steps 1-3 are automated: the controller spawns
 ``python -m cognis.executor`` with a short-lived JWT (5 min) piped via stdin.
+
+### Current resource snapshots
+
+WebSocket executors report one typed current snapshot. The controller stores
+only the latest snapshot in the existing executor runtime metadata and computes
+its age when serializing the executor API. Cognis does not create resource
+history, charts, a time-series table, or a TSDB feed.
+
+The snapshot may include:
+
+- OS, architecture, CPU model/core counts/current utilization, and current RAM
+  totals
+- a unified-memory flag only when Apple Silicon is positively identified
+- Metal or NVIDIA accelerator name, memory, and utilization when the local
+  platform can report them
+- current Ollama reachability, version, installed/running model counts, active
+  model names, and model-store filesystem capacity
+- current executor uptime, active calls, configuration state, and runtime state
+
+Every unavailable measurement remains `null`; collectors do not infer hardware
+from labels or substitute nominal values. `psutil` is a runtime dependency for
+portable CPU, RAM, and filesystem counters because the Python standard library
+does not provide consistent current utilization and available-memory semantics
+across Linux, macOS, and Windows. Platform enrichments use only fixed,
+read-only commands (`sysctl`, `system_profiler`, and optional `nvidia-smi`) with
+hard timeouts. Ollama is queried through its bounded HTTP status APIs. Model
+store filesystem probing runs off the event loop with a hard wait bound, so a
+stalled NFS/FUSE mount cannot stall executor heartbeats or configuration.
+Timed-out filesystem probes are reused rather than resubmitted, keeping at most
+one outstanding blocking probe per executor.
+
+The ready snapshot is reused by an immediate configure instead of repeating
+startup probes. Snapshot notifications are cadence-limited at the executor,
+cardinality-bounded and coalesced to one pending update per connection, then
+write-throttled again at the controller before a database update. Configure
+metadata is allowlisted and snapshots are normalized before persistence; the
+snapshot receipt timestamp remains controller-owned. The controller records
+its own receipt time so clock skew on an executor cannot create false stale or
+fresh health. The executor API returns controller-computed
+`freshness.age_seconds` and `freshness.stale`; the default stale threshold is
+120 seconds. Snapshot payloads contain no model-store path, device serial,
+process list, command output, or credential material.
 
 ### Controller → Executor
 

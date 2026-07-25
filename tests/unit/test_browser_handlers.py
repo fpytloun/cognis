@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,7 +12,9 @@ from cognis.models.credential import CredentialAccessError, CredentialRecord, Cr
 from cognis.models.tool import ExecutorHandle, ToolCall
 from cognis.tools.executor.browser import handlers as browser_handlers
 from cognis.tools.executor.browser.handlers import (
+    handle_browser_claim_profile,
     handle_browser_click,
+    handle_browser_close,
     handle_browser_download_wait,
     handle_browser_drag_drop,
     handle_browser_eval,
@@ -21,6 +24,7 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_get_focus,
     handle_browser_get_network,
     handle_browser_hover,
+    handle_browser_inspect_session,
     handle_browser_list_profiles,
     handle_browser_list_sessions,
     handle_browser_open,
@@ -35,7 +39,7 @@ from cognis.tools.executor.browser.handlers import (
     handle_browser_upload,
     handle_browser_wait_for,
 )
-from cognis.tools.executor.browser.manager import BrowserSessionSettings
+from cognis.tools.executor.browser.manager import BrowserManager, BrowserSessionSettings
 from cognis.tools.registry import ToolExecutionContext
 
 
@@ -188,6 +192,7 @@ class _FakePage:
         self.active_element: dict[str, Any] | None = None
         self.file_chooser = _FakeFileChooser()
         self.download = _FakeDownload()
+        self.content_text = ""
 
     def locator(self, selector: str) -> _FakeLocator:
         self.locator_calls.append(selector)
@@ -353,6 +358,9 @@ class _FakePage:
     async def title(self) -> str:
         return "Settings"
 
+    async def content(self) -> str:
+        return self.content_text
+
     async def wait_for_selector(
         self, selector: str, timeout: int, state: str | None = None
     ) -> None:
@@ -393,23 +401,28 @@ class _FakeManager:
         # passes through to the locator API when intensity is "off").
         self.humanize_input = False
         self.humanize_intensity = "off"
+        self.close_calls: list[dict[str, Any]] = []
 
     async def open_session(self, **kwargs: Any) -> Any:
         self.open_calls.append(kwargs)
         return self.session
 
+    async def close_session(self, session_id: str, **kwargs: Any) -> bool:
+        self.close_calls.append({"session_id": session_id, **kwargs})
+        return True
+
     def get_session(self, session_id: str) -> Any:
         assert session_id == "sess-1"
         return self.session
 
-    async def get_live_session(self, session_id: str) -> Any:
+    async def get_live_session(self, session_id: str, **_kwargs: Any) -> Any:
         return self.get_session(session_id)
 
-    async def storage_state(self, session_id: str) -> dict[str, Any]:
+    async def storage_state(self, session_id: str, **_kwargs: Any) -> dict[str, Any]:
         assert session_id == "sess-1"
         return {"cookies": [{"name": "sid"}], "origins": []}
 
-    async def list_sessions(self) -> list[dict[str, Any]]:
+    async def list_sessions(self, **_kwargs: Any) -> list[dict[str, Any]]:
         return [
             {
                 "session_id": "sess-1",
@@ -423,7 +436,11 @@ class _FakeManager:
             }
         ]
 
-    async def list_profiles(self) -> list[dict[str, Any]]:
+    async def inspect_session(self, session_id: str, **_kwargs: Any) -> dict[str, Any]:
+        assert session_id == "sess-1"
+        return (await self.list_sessions())[0]
+
+    async def list_profiles(self, **_kwargs: Any) -> list[dict[str, Any]]:
         return [
             {
                 "profile_id": "github-com",
@@ -432,8 +449,15 @@ class _FakeManager:
             }
         ]
 
+    async def claim_legacy_profile(self, profile_id: str, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "profile_id": profile_id,
+            "ownership_status": "owned",
+            "claimed": True,
+        }
+
     async def get_console_events(
-        self, session_id: str, *, level: str = "all", limit: int = 100
+        self, session_id: str, *, level: str = "all", limit: int = 100, **_kwargs: Any
     ) -> list[dict[str, Any]]:
         assert session_id == "sess-1"
         return self.session.console_events[:limit]
@@ -444,6 +468,7 @@ class _FakeManager:
         *,
         limit: int = 100,
         resource_types: list[str] | None = None,
+        **_kwargs: Any,
     ) -> list[dict[str, Any]]:
         assert session_id == "sess-1"
         return self.session.network_events[:limit]
@@ -452,7 +477,15 @@ class _FakeManager:
 def _context() -> ToolExecutionContext:
     return ToolExecutionContext(
         executor_handle=ExecutorHandle(executor_id="exec-1", executor_type="in_process"),
-        runtime_metadata={},
+        runtime_metadata={
+            "runtime_access": {
+                "session_id": "scope-1",
+                "conversation_id": "conversation-1",
+                "user_email": "user@example.com",
+                "agent_id": "agent-1",
+            }
+        },
+        execution_scope_id="scope-1",
     )
 
 
@@ -619,6 +652,8 @@ async def test_browser_open_uses_default_profile_mode_and_reports_profile(
     assert manager.open_calls[0]["profile_mode"] == "default"
     assert manager.open_calls[0]["profile_id"] is None
     assert manager.open_calls[0]["browser_settings"] is None
+    assert manager.open_calls[0]["owner"].execution_scope_id == "scope-1"
+    assert manager.open_calls[0]["owner"].conversation_id == "conversation-1"
     assert '"profile_mode": "persistent_local"' in result.output
     assert '"profile_id": "www-reddit-com"' in result.output
     assert '"auto_consent": "accept"' in result.output
@@ -638,6 +673,7 @@ async def test_browser_open_passes_browser_settings(monkeypatch: pytest.MonkeyPa
                 "fingerprint_hardening": False,
                 "humanize_input": True,
             },
+            "selected_executor_owner_email": "user@example.com",
         },
         _context(),
     )
@@ -647,6 +683,114 @@ async def test_browser_open_passes_browser_settings(monkeypatch: pytest.MonkeyPa
         "fingerprint_hardening": False,
         "humanize_input": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_browser_open_reports_site_attributed_headless_waf_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    manager.session.navigation_status = 500
+    manager.session.navigation_url = "https://patchright-init-script-inject.internal/script.js"
+    manager.session.page.url = "https://www.cocky-kontaktni.cz/"
+    manager.session.page.content_text = "<h1>Request rejected</h1><p>Attack ID: 20000051</p>"
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_open(
+        {
+            "session_id": "lens",
+            "url": "https://www.cocky-kontaktni.cz/",
+            "headless": True,
+        },
+        _context(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["category"] == "vendor_waf_block"
+    assert result.metadata["final_url"] == "https://www.cocky-kontaktni.cz/"
+    assert result.metadata["headed_retry_recommended"] is True
+    assert "patchright-init-script-inject.internal" not in result.output
+    assert "headless=false" in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_open_sanitizes_internal_init_url_on_navigation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+
+    async def _fail_open(**_kwargs: Any) -> Any:
+        raise RuntimeError(
+            "navigation failed at https://patchright-init-script-inject.internal/bootstrap"
+        )
+
+    manager.open_session = _fail_open  # type: ignore[method-assign]
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_open(
+        {
+            "session_id": "lens",
+            "url": "https://www.cocky-kontaktni.cz/",
+            "headless": True,
+        },
+        _context(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["requested_url"] == "https://www.cocky-kontaktni.cz/"
+    assert result.metadata["final_url"] == "https://www.cocky-kontaktni.cz/"
+    assert result.metadata["attribution"] == "requested_site"
+    assert "patchright-init-script-inject.internal" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_open_does_not_attribute_runtime_failure_to_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+
+    async def _fail_open(**_kwargs: Any) -> Any:
+        raise RuntimeError("Headed browser mode is not enabled on this executor")
+
+    manager.open_session = _fail_open  # type: ignore[method-assign]
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_open(
+        {
+            "session_id": "lens",
+            "url": "https://www.cocky-kontaktni.cz/",
+            "headless": False,
+        },
+        _context(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["browser_runtime_error"] is True
+    assert result.metadata["attribution"] == "executor_runtime"
+    assert "requested_site" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_open_does_not_treat_plain_access_denied_as_waf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    manager.session.navigation_status = 403
+    manager.session.page.content_text = "<h1>Access denied</h1>"
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_open(
+        {
+            "session_id": "account",
+            "url": "https://example.com/private",
+            "headless": True,
+        },
+        _context(),
+    )
+
+    assert result.is_error is False
+    assert result.metadata == {}
+    assert '"diagnostic": null' in result.output
 
 
 @pytest.mark.asyncio
@@ -685,11 +829,103 @@ async def test_browser_list_sessions_returns_metadata(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+async def test_browser_inspect_session_returns_safe_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_inspect_session({"session_id": "sess-1"}, _context())
+    assert '"session_id": "sess-1"' in result.output
+    assert '"user_email"' not in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_list_sessions_rejects_missing_execution_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    context = _context()
+    context.execution_scope_id = None
+    result = await handle_browser_list_sessions({}, context)
+    assert result.is_error is True
+    assert result.metadata["browser_lifecycle_error"] == "browser_unauthenticated"
+
+
+@pytest.mark.asyncio
+async def test_browser_close_forwards_verified_owner_and_descendant_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    result = await handle_browser_close(
+        {"session_id": "sess-1", "release_managed_descendant": True},
+        _context(),
+    )
+    assert result.metadata == {"closed": True, "idempotent": False}
+    assert manager.close_calls[0]["owner"].execution_scope_id == "scope-1"
+    assert manager.close_calls[0]["allow_managed_descendant"] is True
+
+
+@pytest.mark.asyncio
 async def test_browser_list_profiles_returns_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     manager = _FakeManager()
     monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
     result = await handle_browser_list_profiles({}, _context())
     assert '"profile_id": "github-com"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_claim_profile_returns_claim_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_claim_profile(
+        {
+            "profile_id": "www-cocky-kontaktni-cz",
+            "confirm_profile_id": "www-cocky-kontaktni-cz",
+        },
+        _context(),
+    )
+
+    assert result.is_error is False
+    assert result.metadata == {"browser_profile_claimed": True}
+    assert '"ownership_status": "owned"' in result.output
+
+
+@pytest.mark.asyncio
+async def test_browser_claim_profile_rejects_shared_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "account"
+    profile_dir.mkdir()
+    (profile_dir / "Default").mkdir()
+    manager = BrowserManager(profile_base_dir=str(tmp_path))
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+    context = _context()
+    context.runtime_metadata["selected_executor_owner_email"] = "system@cognis.local"
+
+    result = await handle_browser_claim_profile(
+        {"profile_id": "account", "confirm_profile_id": "account"},
+        context,
+    )
+
+    assert result.is_error is True
+    assert result.metadata["browser_lifecycle_error"] == "browser_unauthorized"
+    assert not (profile_dir / ".cognis-owner.json").exists()
+
+
+def test_browser_profile_claim_schema_requires_explicit_non_bypassable_confirmation() -> None:
+    from cognis.tools.executor.browser.definitions import browser_tool_definitions
+
+    definitions = {tool.name: tool for tool in browser_tool_definitions()}
+    claim = definitions["browser_claim_profile"]
+    assert claim.read_only is False
+    assert claim.non_bypassable is True
+    assert claim.parameters["required"] == ["profile_id", "confirm_profile_id"]
 
 
 @pytest.mark.asyncio

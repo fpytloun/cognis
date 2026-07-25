@@ -1,10 +1,10 @@
 <script lang="ts">
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
-  import ChevronUp from 'lucide-svelte/icons/chevron-up';
 
   import ActivityGroupIcon from '$lib/components/chat-v2/ActivityGroupIcon.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
-  import type { ToolCallTimelineItem as LegacyToolCallTimelineItem } from '$lib/chat';
+  import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
+  import type { TimelineScope } from '$lib/chat-v2/types';
   import type { ToolGroupRow } from '$lib/chat-v2/tool-groups';
   import type { Agent } from '$lib/types/api';
 
@@ -15,8 +15,9 @@
     searchQuery = '',
     searchMatchedIds = new Set<string>(),
     searchSelectedId = null,
-    toolCallsByCallId = new Map<string, LegacyToolCallTimelineItem>(),
-    onViewSession
+    getToolCall = () => null,
+    onViewSession,
+    scope
   } = $props<{
     row: ToolGroupRow;
     agent?: Agent | null;
@@ -24,8 +25,9 @@
     searchQuery?: string;
     searchMatchedIds?: Set<string>;
     searchSelectedId?: string | null;
-    toolCallsByCallId?: Map<string, LegacyToolCallTimelineItem>;
+    getToolCall?: (callId: string) => ToolCallTimelineItem | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    scope?: TimelineScope | undefined;
   }>();
 
   let expanded = $state(false);
@@ -115,11 +117,9 @@
     {#if durationLabel}
       <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
     {/if}
-    {#if expanded}
-      <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-    {:else}
-      <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-    {/if}
+    <ChevronDown
+      class="h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform duration-150 ease-out {expanded ? 'rotate-180' : ''}"
+    />
   </button>
 
   {#if expanded}
@@ -133,8 +133,9 @@
           {searchQuery}
           {searchMatched}
           searchSelected={searchMatched && searchSelectedId === item.id}
-          {toolCallsByCallId}
+          {getToolCall}
           {onViewSession}
+          {scope}
         />
       {/each}
     </div>

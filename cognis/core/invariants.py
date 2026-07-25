@@ -32,7 +32,13 @@ from sqlalchemy import exists, select, update
 from sqlalchemy.orm import aliased
 
 from cognis.logging import get_logger
-from cognis.store.models import Conversation, StepRun, Task, TaskDependency
+from cognis.store.models import (
+    Conversation,
+    ManagedConversationLink,
+    StepRun,
+    Task,
+    TaskDependency,
+)
 from cognis.store.models import Session as SessionRow
 
 # Avoid a circular import: context_projection imports nothing from invariants.
@@ -92,6 +98,10 @@ INVARIANTS: tuple[tuple[str, str], ...] = (
         "conversations_with_missing_active_session",
         "Conversations whose active_session_id points at no session row.",
     ),
+    (
+        "managed_conversation_terminal_state",
+        "Managed links with impossible terminal or restart-stale runtime state.",
+    ),
 )
 
 
@@ -112,25 +122,39 @@ async def check_invariants(session: Any) -> list[InvariantReport]:
     return reports
 
 
-async def reconcile_invariants(session: Any) -> list[InvariantReport]:
+async def reconcile_invariants(
+    session: Any,
+    *,
+    recover_restart_stale_managed_turns: bool = False,
+) -> list[InvariantReport]:
     """Repair every invariant violation in a single pass.
 
     Returns per-category reports with the number of rows reconciled.
-    Intended for startup and for the admin reconcile command; the
-    implementation is idempotent, so repeated runs converge to zero.
+    Runtime/admin reconciliation preserves live managed turns. Startup callers
+    may opt into repairing queued/running turns whose in-process owner was lost
+    with the previous controller process.
     """
 
     now = datetime.now(UTC)
     reports: list[InvariantReport] = []
     for category, description in INVARIANTS:
-        reconciled = await _reconcile_category(session, category, now=now)
+        reconciled = await _reconcile_category(
+            session,
+            category,
+            now=now,
+            recover_restart_stale_managed_turns=recover_restart_stale_managed_turns,
+        )
         if reconciled:
             INVARIANT_RECONCILED_TOTAL.labels(category=category).inc(reconciled)
             logger.warning(
                 "invariants: reconciled violations",
                 extra={"extra_data": {"category": category, "count": reconciled}},
             )
-        remaining = await _count_violations(session, category)
+        remaining = await _count_violations(
+            session,
+            category,
+            include_restart_stale_managed_turns=recover_restart_stale_managed_turns,
+        )
         INVARIANT_CURRENT_GAUGE.labels(category=category).set(remaining)
         reports.append(
             InvariantReport(
@@ -143,7 +167,12 @@ async def reconcile_invariants(session: Any) -> list[InvariantReport]:
     return reports
 
 
-async def _count_violations(session: Any, category: str) -> int:
+async def _count_violations(
+    session: Any,
+    category: str,
+    *,
+    include_restart_stale_managed_turns: bool = False,
+) -> int:
     if category == "non_terminal_step_runs_under_terminal_task":
         return await _count_orphaned_step_runs(session)
     if category == "queued_tasks_ready_to_run":
@@ -152,10 +181,21 @@ async def _count_violations(session: Any, category: str) -> int:
         return await _count_conversations_with_terminal_active_session(session)
     if category == "conversations_with_missing_active_session":
         return await _count_conversations_with_missing_active_session(session)
+    if category == "managed_conversation_terminal_state":
+        return await _count_managed_conversation_terminal_state(
+            session,
+            include_restart_stale=include_restart_stale_managed_turns,
+        )
     return 0
 
 
-async def _reconcile_category(session: Any, category: str, *, now: datetime) -> int:
+async def _reconcile_category(
+    session: Any,
+    category: str,
+    *,
+    now: datetime,
+    recover_restart_stale_managed_turns: bool,
+) -> int:
     if category == "non_terminal_step_runs_under_terminal_task":
         return await _reconcile_orphaned_step_runs(session, now=now)
     if category == "queued_tasks_ready_to_run":
@@ -164,7 +204,104 @@ async def _reconcile_category(session: Any, category: str, *, now: datetime) -> 
         return await _reconcile_conversations_with_terminal_active_session(session)
     if category == "conversations_with_missing_active_session":
         return await _reconcile_conversations_with_missing_active_session(session)
+    if category == "managed_conversation_terminal_state":
+        return await _reconcile_managed_conversation_terminal_state(
+            session,
+            now=now,
+            recover_restart_stale_managed_turns=recover_restart_stale_managed_turns,
+        )
     return 0
+
+
+async def _count_managed_conversation_terminal_state(
+    session: Any,
+    *,
+    include_restart_stale: bool,
+) -> int:
+    violation = (
+        (ManagedConversationLink.conversation_state == "closed")
+        & (
+            (ManagedConversationLink.turn_state != "idle")
+            | ManagedConversationLink.active_turn_id.is_not(None)
+            | ManagedConversationLink.notify_on_completion.is_(True)
+        )
+    ) | (
+        (ManagedConversationLink.conversation_state == "completed")
+        & (
+            (ManagedConversationLink.turn_state != "completed")
+            | ManagedConversationLink.active_turn_id.is_not(None)
+            | ManagedConversationLink.notify_on_completion.is_(True)
+        )
+    )
+    if include_restart_stale:
+        violation |= (ManagedConversationLink.conversation_state == "open") & (
+            ManagedConversationLink.turn_state.in_(("queued", "running"))
+        )
+    stmt = select(ManagedConversationLink.link_id).where(violation)
+    result = await session.execute(stmt)
+    return len(result.scalars().all())
+
+
+async def _reconcile_managed_conversation_terminal_state(
+    session: Any,
+    *,
+    now: datetime,
+    recover_restart_stale_managed_turns: bool,
+) -> int:
+    closed = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.conversation_state == "closed",
+            (ManagedConversationLink.turn_state != "idle")
+            | ManagedConversationLink.active_turn_id.is_not(None)
+            | ManagedConversationLink.notify_on_completion.is_(True),
+        )
+        .values(
+            turn_state="idle",
+            active_turn_id=None,
+            notify_on_completion=False,
+            updated_at=now,
+        )
+    )
+    completed = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.conversation_state == "completed",
+            (ManagedConversationLink.turn_state != "completed")
+            | ManagedConversationLink.active_turn_id.is_not(None)
+            | ManagedConversationLink.notify_on_completion.is_(True),
+        )
+        .values(
+            turn_state="completed",
+            active_turn_id=None,
+            notify_on_completion=False,
+            updated_at=now,
+        )
+    )
+    stale_count = 0
+    if recover_restart_stale_managed_turns:
+        stale = await session.execute(
+            update(ManagedConversationLink)
+            .where(
+                ManagedConversationLink.conversation_state == "open",
+                ManagedConversationLink.turn_state.in_(("queued", "running")),
+            )
+            .values(
+                turn_state="interrupted",
+                notify_on_completion=True,
+                last_error="Controller restarted before the managed turn settled.",
+                updated_at=now,
+            )
+        )
+        stale_count = int(getattr(stale, "rowcount", 0) or 0)
+    count = (
+        int(getattr(closed, "rowcount", 0) or 0)
+        + int(getattr(completed, "rowcount", 0) or 0)
+        + stale_count
+    )
+    if count:
+        await session.commit()
+    return count
 
 
 # ---------------------------------------------------------------------------

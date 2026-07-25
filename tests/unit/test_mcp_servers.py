@@ -12,6 +12,7 @@ from cognis.api.runtime_support import select_static_tools
 from cognis.models.tool import (
     MCP_SERVER_IDS_KEY,
     MCPServerConfig,
+    NativeToolDefinition,
     ToolSource,
     sanitize_mcp_tool_name,
 )
@@ -403,16 +404,16 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
         class _Conn:
             async def list_tools(self) -> list[dict[str, object]]:
                 return [
-                    {
-                        "name": "read",
-                        "description": "Read file",
-                        "parameters": {},
-                        "source": ToolSource(type="executor").model_dump(mode="json"),
-                        "category": "filesystem",
-                        "read_only": True,
-                        "timeout_seconds": 30,
-                        "non_bypassable": False,
-                    }
+                    NativeToolDefinition(
+                        name="read",
+                        description="Read file",
+                        parameters={},
+                        source=ToolSource(type="executor"),
+                        category="filesystem",
+                        read_only=True,
+                        timeout_seconds=30,
+                        non_bypassable=False,
+                    ).model_dump(mode="json")
                 ]
 
         client.app.state.providers.executor.websocket.get_connection = lambda executor_id: (  # type: ignore[method-assign]
@@ -439,7 +440,7 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
                 "tools": {"intaris_mcp_servers": ["github"]},
             },
         )
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         payload = response.json()
         live_names = {tool["name"] for tool in payload["live_state"]["tools"]}
         assert "read" in live_names

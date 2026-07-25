@@ -24,6 +24,49 @@
     return parts.join(' \u00b7 ');
   });
 
+  function metadataString(record: Record<string, unknown> | undefined, key: string): string | null {
+    const value = record?.[key];
+    return typeof value === 'string' && value.trim() ? value : null;
+  }
+
+  function metadataPositiveNumber(record: Record<string, unknown> | undefined, key: string): number | null {
+    const value = record?.[key];
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  let providerMetaLine = $derived.by(() => {
+    const providerMetadata = model.provider_metadata ?? {};
+    if (providerMetadata.provider !== 'ollama') {
+      return '';
+    }
+    const runtimeMetadata = model.runtime_metadata ?? {};
+    const details =
+      typeof providerMetadata.details === 'object' && providerMetadata.details !== null && !Array.isArray(providerMetadata.details)
+        ? (providerMetadata.details as Record<string, unknown>)
+        : {};
+    const parts = [
+      metadataString(details, 'parameter_size'),
+      metadataString(details, 'quantization_level'),
+      metadataString(details, 'family')
+    ].filter((value): value is string => Boolean(value));
+    const runtimeNumCtx = metadataPositiveNumber(runtimeMetadata, 'num_ctx');
+    const maxContextWindow =
+      typeof model.max_context_window === 'number' && Number.isFinite(model.max_context_window) && model.max_context_window > 0
+        ? model.max_context_window
+        : null;
+    const contextWindow =
+      typeof model.context_window === 'number' && Number.isFinite(model.context_window) && model.context_window > 0
+        ? model.context_window
+        : null;
+    const runtimeContextWindow = runtimeNumCtx ?? (
+      contextWindow !== null && maxContextWindow !== null ? Math.min(contextWindow, maxContextWindow) : contextWindow
+    );
+    if (runtimeContextWindow !== null) {
+      parts.push(`runtime num_ctx ${formatTokenCount(runtimeContextWindow)}`);
+    }
+    return parts.join(' \u00b7 ');
+  });
+
   const capabilityBadges: { key: keyof ModelEntry; label: string }[] = [
     { key: 'supports_tools', label: 'tools' },
     { key: 'supports_vision', label: 'vision' },
@@ -57,6 +100,9 @@
 
       <!-- Metadata line -->
       <p class="text-xs text-slate-400">{metaLine}</p>
+      {#if providerMetaLine}
+        <p class="text-xs text-slate-500">Ollama: {providerMetaLine}</p>
+      {/if}
 
       <!-- Capability badges -->
       {#if activeBadges.length > 0}

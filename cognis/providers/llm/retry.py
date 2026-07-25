@@ -9,12 +9,14 @@ backoff with jitter for retryable errors.
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
 
 from cognis.logging import get_logger
+from cognis.providers.llm.errors import retry_after_seconds_from_headers
 from cognis.providers.retry import compute_delay
 
 logger = get_logger(__name__)
@@ -45,6 +47,15 @@ def compute_retry_delay(policy: RetryPolicy, attempt: int) -> float:
     """Compute the delay for a retry attempt using the shared retry formula."""
 
     return compute_delay(attempt, policy.base_delay, policy.max_delay, policy.jitter)
+
+
+def _retry_after_seconds_from_exception(exc: BaseException) -> float | None:
+    retry_after = retry_after_seconds_from_headers(
+        getattr(getattr(exc, "response", None), "headers", None)
+    )
+    if retry_after is None or retry_after < 0 or not math.isfinite(retry_after):
+        return None
+    return retry_after
 
 
 _CONTEXT_OVERFLOW_SIGNATURES: tuple[tuple[str, str], ...] = (
@@ -177,7 +188,7 @@ def is_retryable_error(exc: Exception) -> bool:
     if status is None:
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
-    if status in {429, 500, 502, 503, 504}:
+    if status == 429 or (isinstance(status, int) and 500 <= status < 600):
         return True
     if status in {400, 401, 403, 404, 422}:
         return False
@@ -305,7 +316,27 @@ async def with_llm_retry[T](
                 )
                 raise
 
-            delay = compute_delay(attempt, base_delay, max_delay, jitter)
+            provider_retry_after = _retry_after_seconds_from_exception(exc)
+            if provider_retry_after is not None and provider_retry_after > max_delay:
+                logger.warning(
+                    "%s failed with provider Retry-After %.1fs beyond inline retry cap %.1fs",
+                    operation,
+                    provider_retry_after,
+                    max_delay,
+                    extra={
+                        "extra_data": {
+                            "error_type": type(exc).__name__,
+                            "provider_retry_after_seconds": provider_retry_after,
+                            "max_delay": max_delay,
+                        }
+                    },
+                )
+                raise
+            delay = (
+                provider_retry_after
+                if provider_retry_after is not None
+                else compute_delay(attempt, base_delay, max_delay, jitter)
+            )
             logger.warning(
                 "%s failed (attempt %d/%d), retrying in %.1fs",
                 operation,
@@ -316,6 +347,7 @@ async def with_llm_retry[T](
                     "extra_data": {
                         "error_type": type(exc).__name__,
                         "delay": delay,
+                        "provider_retry_after_seconds": provider_retry_after,
                     }
                 },
             )

@@ -8,7 +8,7 @@ import pytest
 
 from cognis.core.invariants import check_invariants, reconcile_invariants
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Agent, Base, User
+from cognis.store.models import Agent, Base, Conversation, ManagedConversationLink, User
 from cognis.store.queries import (
     add_task_dependency,
     create_step_run,
@@ -84,6 +84,175 @@ async def test_reconcile_invariants_is_idempotent(tmp_path: object) -> None:
         # Idempotent — second pass reconciles nothing and reports zero remaining.
         assert all(r.reconciled_count == 0 for r in reports_second)
         assert all(r.current_count == 0 for r in reports_second)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_invariants_interrupts_restart_stale_managed_turn(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            session.add_all(
+                [
+                    Conversation(
+                        conversation_id="controller",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    ),
+                    Conversation(
+                        conversation_id="target",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="agent_work",
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add(
+                ManagedConversationLink(
+                    link_id="mconv_restart",
+                    user_email="user@test.com",
+                    controller_agent_id="agent-1",
+                    controller_conversation_id="controller",
+                    target_agent_id="agent-1",
+                    target_conversation_id="target",
+                    conversation_state="open",
+                    turn_state="running",
+                    active_turn_id="turn_lost",
+                    notify_on_completion=True,
+                )
+            )
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(
+                session,
+                recover_restart_stale_managed_turns=True,
+            )
+            row = await session.get(ManagedConversationLink, "mconv_restart")
+        report = next(
+            item for item in reports if item.category == "managed_conversation_terminal_state"
+        )
+        assert report.reconciled_count == 1
+        assert row is not None
+        assert row.turn_state == "interrupted"
+        assert row.active_turn_id == "turn_lost"
+        assert row.notify_on_completion is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_reconcile_preserves_active_managed_turn(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            session.add_all(
+                [
+                    Conversation(
+                        conversation_id="controller-active",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    ),
+                    Conversation(
+                        conversation_id="target-active",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="agent_work",
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add(
+                ManagedConversationLink(
+                    link_id="mconv_active",
+                    user_email="user@test.com",
+                    controller_agent_id="agent-1",
+                    controller_conversation_id="controller-active",
+                    target_agent_id="agent-1",
+                    target_conversation_id="target-active",
+                    conversation_state="open",
+                    turn_state="running",
+                    active_turn_id="turn_active",
+                    notify_on_completion=True,
+                )
+            )
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(session)
+            row = await session.get(ManagedConversationLink, "mconv_active")
+        report = next(
+            item for item in reports if item.category == "managed_conversation_terminal_state"
+        )
+        assert report.reconciled_count == 0
+        assert report.current_count == 0
+        assert row is not None
+        assert row.turn_state == "running"
+        assert row.active_turn_id == "turn_active"
+        assert row.notify_on_completion is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_repairs_completed_managed_link_with_running_state(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            session.add_all(
+                [
+                    Conversation(
+                        conversation_id="controller-completed",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    ),
+                    Conversation(
+                        conversation_id="target-completed",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="agent_work",
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add(
+                ManagedConversationLink(
+                    link_id="mconv_completed_running",
+                    user_email="user@test.com",
+                    controller_agent_id="agent-1",
+                    controller_conversation_id="controller-completed",
+                    target_agent_id="agent-1",
+                    target_conversation_id="target-completed",
+                    conversation_state="completed",
+                    turn_state="running",
+                    active_turn_id="turn_stale",
+                    notify_on_completion=True,
+                    completed_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(session)
+            row = await session.get(ManagedConversationLink, "mconv_completed_running")
+        report = next(
+            item for item in reports if item.category == "managed_conversation_terminal_state"
+        )
+        assert report.reconciled_count == 1
+        assert report.current_count == 0
+        assert row is not None
+        assert row.turn_state == "completed"
+        assert row.active_turn_id is None
+        assert row.notify_on_completion is False
     finally:
         await engine.dispose()
 

@@ -15,5 +15,6 @@ dist
 dist-executor
 ui/.svelte-kit
 ui/build
+ui/standalone-build
 ui/coverage
 ui/node_modules

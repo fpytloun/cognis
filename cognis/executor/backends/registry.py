@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from cognis.executor.backends.anthropic import AnthropicMessagesExecutorBackend
 from cognis.executor.backends.base import ExecutorInferenceBackend
 from cognis.executor.backends.litellm import LiteLLMExecutorBackend
 from cognis.executor.inference_types import CognisInferenceRequest
@@ -17,6 +18,7 @@ class ExecutorBackendRegistry:
     def __init__(self) -> None:
         self._factories: dict[str, BackendFactory] = {
             "litellm": LiteLLMExecutorBackend,
+            "anthropic_messages": AnthropicMessagesExecutorBackend,
         }
         self._instances: dict[str, ExecutorInferenceBackend] = {}
 

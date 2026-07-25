@@ -75,6 +75,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, SessionEvent
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
+from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.models import DeliverableRow, StepRun, Task
 from cognis.store.queries import (
     add_task_dependency,
@@ -1093,7 +1094,7 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
             )
             for deliverable_row in deliverable_rows:
                 deliverables_by_step_run.setdefault(deliverable_row.step_run_id, []).append(
-                    deliverable_to_response(deliverable_row)
+                    deliverable_to_response(deliverable_row, include_rich_payload=False)
                 )
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
@@ -1754,7 +1755,7 @@ async def task_steps(request: Request, task_id: str) -> list[StepRunResponse]:
         rows = await list_step_runs_for_task(session, task_id)
         deliverables_by_step_run = {
             row.step_run_id: [
-                deliverable_to_response(item)
+                deliverable_to_response(item, include_rich_payload=False)
                 for item in await list_deliverables_for_step_run(session, row.step_run_id)
             ]
             for row in rows
@@ -1776,7 +1777,7 @@ async def task_step_history(
         rows = await list_step_run_history(session, task_id, step_name)
         deliverables_by_step_run = {
             row.step_run_id: [
-                deliverable_to_response(item)
+                deliverable_to_response(item, include_rich_payload=False)
                 for item in await list_deliverables_for_step_run(session, row.step_run_id)
             ]
             for row in rows
@@ -1796,7 +1797,7 @@ async def step_run_detail(request: Request, step_run_id: str) -> StepRunResponse
             raise api_exception(404, "not_found", "Step run not found")
         task_row = await get_task(session, row.task_id)
         deliverables = [
-            deliverable_to_response(item)
+            deliverable_to_response(item, include_rich_payload=False)
             for item in await list_deliverables_for_step_run(session, row.step_run_id)
         ]
     if task_row is None or task_row.created_by != user.email:
@@ -1818,7 +1819,31 @@ async def step_run_deliverables(request: Request, step_run_id: str) -> list[Deli
         if task_row is None or task_row.created_by != user.email:
             raise api_exception(404, "not_found", "Step run not found")
         rows = await list_deliverables_for_step_run(session, step_run_id)
-    return [deliverable_to_response(row) for row in rows]
+    return [deliverable_to_response(row, include_rich_payload=False) for row in rows]
+
+
+@router.get(
+    "/api/v1/step-runs/{step_run_id}/deliverables/{deliverable_id}",
+    response_model=DeliverableResponse,
+)
+async def step_run_deliverable_detail(
+    request: Request,
+    step_run_id: str,
+    deliverable_id: str,
+) -> DeliverableResponse:
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        step_run = await get_step_run(session, step_run_id)
+        if step_run is None:
+            raise api_exception(404, "not_found", "Step run not found")
+        task_row = await get_task(session, step_run.task_id)
+        if task_row is None or task_row.created_by != user.email:
+            raise api_exception(404, "not_found", "Step run not found")
+        row = await get_deliverable(session, deliverable_id)
+        if row is None or row.step_run_id != step_run_id:
+            raise api_exception(404, "not_found", "Deliverable not found")
+        await hydrate_deliverable_payload(row, request.app.state.artifact_store)
+    return deliverable_to_response(row)
 
 
 @router.get("/api/v1/tasks/{task_id}/workflow-run", response_model=WorkflowRunResponse)
@@ -1940,16 +1965,21 @@ async def _task_final_deliverable_content(
     if isinstance(final_deliverable_id, str) and final_deliverable_id:
         row = await get_deliverable(session, final_deliverable_id)
         if row is not None:
-            return row.content or "", row.deliverable_id
+            summary = result_data.get("final_content_summary")
+            if not isinstance(summary, str):
+                summary = result_data.get("final_channel_content")
+            return _recoverable_snippet(summary or "", limit=2000), row.deliverable_id
     final_content = result_data.get("final_content")
     if isinstance(final_content, str) and final_content:
-        return final_content, final_deliverable_id if isinstance(
+        return _recoverable_snippet(final_content, limit=2000), final_deliverable_id if isinstance(
             final_deliverable_id, str
         ) else None
     for deliverables in reversed(list(deliverables_by_step_run.values())):
         if deliverables:
             row = deliverables[0]
-            return row.content or "", row.deliverable_id
+            return _recoverable_snippet(
+                getattr(row, "title", "") or "", limit=2000
+            ), row.deliverable_id
     return "", None
 
 
@@ -2010,8 +2040,9 @@ def _build_task_chat_briefing(
             "\n".join(comment_lines) if comment_lines else "(none)",
             "",
             f"Final deliverable ID: {final_deliverable_id or '(none)'}",
-            "Final deliverable content follows in full and must be treated as authoritative:",
-            final_content or "(no final deliverable content recorded)",
+            "Final deliverable summary/reference:",
+            final_content
+            or "(no final deliverable summary recorded; use read_task_deliverable for full content)",
             "</task_context>",
             "",
             "To dig deeper, inspect the forked session history above first. If the user asks for details that are not in context, use read_task_deliverable(deliverable_id=...) for full deliverable content, list_task_step_runs(task_id=...) for step/session references, and tool-output anchor tools for stored tool outputs before answering.",

@@ -8,7 +8,8 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.security import generate_api_key_material
 from cognis.store.queries import create_agent, create_api_key, create_llm_provider, create_user
 

@@ -55,7 +55,8 @@ class InternalChatCursorPayload(StrictModel):
     """
 
     version: Literal[1] = 1
-    conversation_id: str
+    scope_key: str
+    conversation_id: str | None = None
     projection_version: str
     session_watermarks: list[CursorSessionWatermark] = Field(default_factory=list)
     lineage: list[CursorLineageEntry] = Field(default_factory=list)
@@ -111,15 +112,15 @@ def validate_cursor(
     token: str,
     secret: str | bytes,
     *,
-    conversation_id: str,
+    scope_key: str,
     projection_version: str,
     now: datetime | None = None,
 ) -> InternalChatCursorPayload:
     """Decode a cursor and validate conversation, projection, and expiry."""
 
     payload = decode_cursor(token, secret)
-    if payload.conversation_id != conversation_id:
-        raise ChatCursorError("cursor_invalid", "Chat cursor belongs to a different conversation")
+    if payload.scope_key != scope_key:
+        raise ChatCursorError("cursor_invalid", "Chat cursor belongs to a different timeline scope")
     if payload.projection_version != projection_version:
         raise ChatCursorError(
             "projection_version_changed",

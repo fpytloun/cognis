@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
 from cognis.models.config import ModelInfo
-from cognis.models.tool import ToolDefinition, stable_tool_id, tool_profile_group
+from cognis.models.tool import (
+    ToolDefinition,
+    stable_tool_id,
+    tool_input_schema,
+    tool_profile_group,
+)
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 
 _VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -19,6 +25,8 @@ _ANTHROPIC_PROPERTY_NAME_UNSAFE_PATTERN = re.compile(r"[^a-zA-Z0-9_.-]+")
 _MAX_ANTHROPIC_PROPERTY_NAME_LENGTH = 64
 _JSON_SCHEMA_METADATA_KEYS = frozenset({"$schema", "$id", "$comment"})
 _ARGUMENT_ALIAS_ANY_PROPERTY = "*"
+_ARGUMENT_ALIAS_REF = "$cognis_ref"
+_ARGUMENT_ALIAS_REF_DEFINITIONS = "$cognis_refs"
 _JSON_SCHEMA_SAME_INSTANCE_SCHEMA_KEYS = frozenset(
     {
         "allOf",
@@ -46,6 +54,8 @@ _CRITICAL_GENERIC_TOOL_NAMES = frozenset(
         "search_tool_output",
         "list_tool_output_anchors",
         "read_tool_output_anchor",
+        "describe_tool",
+        "validate_tool_call",
     }
 )
 
@@ -70,6 +80,7 @@ class LLMApiMode(StrEnum):
 
 class ToolDiscoveryMode(StrEnum):
     CONTROLLER_SEARCH = "controller_search"
+    ANTHROPIC_NATIVE_SEARCH = "anthropic_native_search"
     NONE = "none"
 
 
@@ -120,6 +131,11 @@ class ToolExposureContract:
     native_apply_patch_tool_type: str | None = None
     anthropic_defer_loading: bool = True
     anthropic_schema_compatible: bool = False
+    anthropic_native_tool_search: bool = False
+
+
+_ANTHROPIC_TOOL_SEARCH_TYPE = "tool_search_tool_bm25_20251119"
+_ANTHROPIC_TOOL_SEARCH_NAME = "tool_search_tool_bm25"
 
 
 def detect_edit_tool_family(model_id: str | None) -> EditToolFamily:
@@ -262,19 +278,52 @@ def prepare_tool_exposure(
     discovery_enabled = (
         allow_tool_search and contract.discovery_mode == ToolDiscoveryMode.CONTROLLER_SEARCH
     )
+    native_anthropic_search_requested = (
+        allow_tool_search
+        and contract.discovery_mode == ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH
+        and contract.anthropic_native_tool_search
+    )
     has_hidden = bool(hidden_searchable_tools)
 
-    use_anthropic_defer = bool(
-        not use_responses_api
-        and discovery_enabled
-        and contract.anthropic_defer_loading
-        and model_info.supports_defer_loading
-        and has_hidden
+    # Controller ``search_tools`` is a Cognis-level discovery protocol. It
+    # must never emit Anthropic's native defer_loading extension.
+    native_anthropic_tool_count = (
+        len(_unique_tools(policy_visible_tools + hidden_searchable_tools))
+        + len(controller_tool_schemas_without_search)
+        + 1
     )
+    native_anthropic_search_reason: str | None = None
+    if native_anthropic_search_requested:
+        if not model_info.supports_tool_search:
+            native_anthropic_search_reason = "model_tool_search_unsupported"
+        elif not model_info.supports_native_tool_search:
+            native_anthropic_search_reason = "model_native_tool_search_unsupported"
+        elif not model_info.supports_defer_loading:
+            native_anthropic_search_reason = "model_defer_loading_unsupported"
+        elif not model_info.supports_pause_turn:
+            native_anthropic_search_reason = "model_pause_turn_unsupported"
+        elif not contract.anthropic_defer_loading:
+            native_anthropic_search_reason = "runtime_policy_disabled"
+        elif not contract.anthropic_schema_compatible:
+            native_anthropic_search_reason = "provider_schema_incompatible"
+        elif max_tools is not None and native_anthropic_tool_count > max_tools:
+            native_anthropic_search_reason = "provider_tool_limit"
+        elif any(tool.name == _ANTHROPIC_TOOL_SEARCH_NAME for tool in sorted_inventory):
+            raise ValueError(
+                f"Custom tool name collides with Anthropic server tool "
+                f"{_ANTHROPIC_TOOL_SEARCH_NAME!r}"
+            )
+    use_anthropic_defer = (
+        native_anthropic_search_requested and native_anthropic_search_reason is None
+    )
+    if native_anthropic_search_requested and not use_anthropic_defer:
+        # Native search is all-or-nothing: an incomplete catalog would make
+        # deferred tool references invalid. Fall back before building payloads.
+        discovery_enabled = allow_tool_search
     use_openai_controller_search_fallback = bool(
         use_responses_api and discovery_enabled and search_tool_schema_present and has_hidden
     )
-    if not allow_tool_search:
+    if use_anthropic_defer or not allow_tool_search:
         filtered_controller_tool_schemas = controller_tool_schemas_without_search
     elif not use_responses_api or use_openai_controller_search_fallback:
         filtered_controller_tool_schemas = controller_tool_schemas_with_search
@@ -296,7 +345,7 @@ def prepare_tool_exposure(
         # We place them between policy-visible and the remaining hidden tools so the
         # Anthropic cache breakpoint (placed at the last policy-visible tool) still
         # covers the stable prefix correctly.
-        strategy = "anthropic_defer_loading"
+        strategy = "anthropic_native_tool_search"
         deferred_tool_ids = {stable_tool_id(tool) for tool in hidden_searchable_tools}
         deferred_tool_ids -= promoted_tool_ids
         promoted_non_policy = [
@@ -314,10 +363,7 @@ def prepare_tool_exposure(
             alias_map,
             deferred_tool_ids=deferred_tool_ids,
         )
-        request_kwargs = {
-            "extra_headers": {"anthropic-beta": "tool-search-tool-2025-10-19"},
-            "disable_parallel_tool_use": False,
-        }
+        request_kwargs = {"disable_parallel_tool_use": False}
 
     elif use_openai_controller_search_fallback:
         # OpenAI Responses fallback: controller search_tools is the discovery
@@ -390,7 +436,16 @@ def prepare_tool_exposure(
     }
     promoted_inventory_ids = {stable_tool_id(tool) for tool in promoted_visible}
     promoted_visible_ids = visible_tool_ids & promoted_inventory_ids
-    final_tool_schema_sources = [*filtered_controller_tool_schemas, *tool_schemas]
+    native_server_tool_schemas: list[dict[str, Any]] = []
+    if use_anthropic_defer:
+        native_server_tool_schemas = [
+            {"type": _ANTHROPIC_TOOL_SEARCH_TYPE, "name": _ANTHROPIC_TOOL_SEARCH_NAME}
+        ]
+    final_tool_schema_sources = [
+        *native_server_tool_schemas,
+        *filtered_controller_tool_schemas,
+        *tool_schemas,
+    ]
     if not use_anthropic_defer:
         final_tool_schema_sources = _sort_model_facing_tool_schemas(
             final_tool_schema_sources,
@@ -437,6 +492,10 @@ def prepare_tool_exposure(
             "native_apply_patch_exposed": native_apply_patch_exposed,
             "native_apply_patch_reason": contract.native_apply_patch_reason,
             "argument_alias_tool_count": len(argument_alias_map),
+            "native_anthropic_search_requested": native_anthropic_search_requested,
+            "native_anthropic_search_enabled": use_anthropic_defer,
+            "native_anthropic_search_reason": native_anthropic_search_reason,
+            "native_anthropic_tool_count": native_anthropic_tool_count,
         },
     )
 
@@ -521,7 +580,7 @@ def _build_inventory_schemas(
         function_schema: dict[str, Any] = {
             "name": visible_name,
             "description": tool.description,
-            "parameters": _strip_schema_metadata(tool.parameters),
+            "parameters": _strip_schema_metadata(tool_input_schema(tool)),
             "x-stable-tool-id": stable_tool_id(tool),
         }
         if stable_tool_id(tool) in deferred_tool_ids:
@@ -545,15 +604,27 @@ def _mark_anthropic_cache_breakpoint(
     if not tool_schemas:
         return
 
-    anchor_index = len(tool_schemas) - 1
+    anchor_index: int | None = None
     for index in range(len(tool_schemas) - 1, -1, -1):
         function = tool_schemas[index].get("function")
         if not isinstance(function, dict):
+            continue
+        if function.get("defer_loading") is True:
             continue
         tool_id = function.get("x-stable-tool-id")
         if isinstance(tool_id, str) and tool_id in stable_anchor_tool_ids:
             anchor_index = index
             break
+
+    if anchor_index is None:
+        for index in range(len(tool_schemas) - 1, -1, -1):
+            function = tool_schemas[index].get("function")
+            if isinstance(function, dict) and function.get("defer_loading") is not True:
+                anchor_index = index
+                break
+
+    if anchor_index is None:
+        return
 
     function = tool_schemas[anchor_index].get("function")
     if isinstance(function, dict):
@@ -609,10 +680,14 @@ def _normalize_anthropic_tool_schema_arguments(
         parameters = function.get("parameters")
         if isinstance(parameters, dict):
             schema_refs = _collect_local_schema_refs(parameters)
+            ref_alias_trees: dict[str, dict[str, Any]] = {}
             normalized_parameters, alias_tree = _normalize_anthropic_schema_node(
                 parameters,
                 schema_refs=schema_refs,
+                ref_alias_trees=ref_alias_trees,
             )
+            if ref_alias_trees:
+                alias_tree[_ARGUMENT_ALIAS_REF_DEFINITIONS] = ref_alias_trees
             function = dict(function)
             function["parameters"] = normalized_parameters
             normalized_schema["function"] = function
@@ -654,7 +729,9 @@ def _normalize_anthropic_schema_node(
     *,
     schema_refs: dict[str, Any],
     resolving_refs: set[str] | None = None,
+    ref_alias_trees: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
+    ref_alias_trees = ref_alias_trees if ref_alias_trees is not None else {}
     if isinstance(value, list):
         normalized_items: list[Any] = []
         merged_alias_tree: dict[str, Any] = {}
@@ -663,6 +740,7 @@ def _normalize_anthropic_schema_node(
                 item,
                 schema_refs=schema_refs,
                 resolving_refs=resolving_refs,
+                ref_alias_trees=ref_alias_trees,
             )
             normalized_items.append(normalized_item)
             _merge_argument_alias_tree(merged_alias_tree, item_alias_tree)
@@ -682,7 +760,12 @@ def _normalize_anthropic_schema_node(
 
         if key == "properties" and isinstance(child, dict):
             normalized_properties, property_alias_tree, property_aliases = (
-                _normalize_anthropic_properties(child, schema_refs=schema_refs)
+                _normalize_anthropic_properties(
+                    child,
+                    schema_refs=schema_refs,
+                    resolving_refs=resolving_refs,
+                    ref_alias_trees=ref_alias_trees,
+                )
             )
             normalized["properties"] = normalized_properties
             _merge_argument_alias_tree(current_alias_tree, property_alias_tree)
@@ -693,17 +776,23 @@ def _normalize_anthropic_schema_node(
             child,
             schema_refs=schema_refs,
             resolving_refs=resolving_refs,
+            ref_alias_trees=ref_alias_trees,
         )
         normalized[key] = normalized_child
-        if key == "$ref" and isinstance(child, str) and child not in resolving_refs:
-            ref_schema = schema_refs.get(child)
-            if ref_schema is not None:
-                _, ref_alias_tree = _normalize_anthropic_schema_node(
-                    ref_schema,
-                    schema_refs=schema_refs,
-                    resolving_refs={*resolving_refs, child},
-                )
-                _merge_argument_alias_tree(current_alias_tree, ref_alias_tree)
+        if key == "$ref" and isinstance(child, str):
+            current_alias_tree[_ARGUMENT_ALIAS_REF] = child
+            if child not in resolving_refs:
+                ref_schema = schema_refs.get(child)
+                if ref_schema is not None:
+                    _, ref_alias_tree = _normalize_anthropic_schema_node(
+                        ref_schema,
+                        schema_refs=schema_refs,
+                        resolving_refs={*resolving_refs, child},
+                        ref_alias_trees=ref_alias_trees,
+                    )
+                    stored_ref_alias_tree = ref_alias_trees.setdefault(child, {})
+                    _merge_argument_alias_tree(stored_ref_alias_tree, ref_alias_tree)
+                    _merge_argument_alias_tree(current_alias_tree, ref_alias_tree)
         if key in _JSON_SCHEMA_SAME_INSTANCE_SCHEMA_KEYS:
             _merge_argument_alias_tree(current_alias_tree, child_alias_tree)
         elif key == "additionalProperties" and child_alias_tree:
@@ -726,6 +815,8 @@ def _normalize_anthropic_properties(
     properties: dict[str, Any],
     *,
     schema_refs: dict[str, Any],
+    resolving_refs: set[str] | None = None,
+    ref_alias_trees: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
     normalized_properties: dict[str, Any] = {}
     alias_tree: dict[str, Any] = {}
@@ -742,6 +833,8 @@ def _normalize_anthropic_properties(
         normalized_property_schema, child_alias_tree = _normalize_anthropic_schema_node(
             property_schema,
             schema_refs=schema_refs,
+            resolving_refs=resolving_refs,
+            ref_alias_trees=ref_alias_trees,
         )
         if safe_name != original_name:
             normalized_property_schema = _annotate_aliased_property_schema(
@@ -805,49 +898,109 @@ def _annotate_aliased_property_schema(value: Any, *, original_name: str) -> Any:
     return annotated
 
 
-def _merge_argument_alias_tree(target: dict[str, Any], source: dict[str, Any]) -> None:
+def _merge_argument_alias_tree(target: dict[str, Any], source: Mapping[str, Any]) -> None:
     for key, source_node in source.items():
         if key not in target:
-            target[key] = source_node
+            target[key] = (
+                _copy_argument_alias_tree(source_node)
+                if isinstance(source_node, Mapping)
+                else source_node
+            )
             continue
         target_node = target[key]
-        if not isinstance(target_node, dict) or not isinstance(source_node, dict):
+        if not isinstance(target_node, dict) or not isinstance(source_node, Mapping):
             continue
         target_children = target_node.setdefault("properties", {})
         source_children = source_node.get("properties", {})
-        if isinstance(target_children, dict) and isinstance(source_children, dict):
+        if isinstance(target_children, dict) and isinstance(source_children, Mapping):
             _merge_argument_alias_tree(target_children, source_children)
 
 
-def reverse_tool_argument_aliases(arguments: Any, alias_tree: dict[str, Any]) -> Any:
+def reverse_tool_argument_aliases(
+    arguments: Any,
+    alias_tree: Mapping[str, Any],
+    *,
+    _ref_alias_trees: Mapping[str, Mapping[str, Any]] | None = None,
+) -> Any:
     """Translate provider-facing aliased argument keys back to canonical names."""
 
-    if not alias_tree:
-        return arguments
-    if isinstance(arguments, list):
-        return [reverse_tool_argument_aliases(item, alias_tree) for item in arguments]
-    if not isinstance(arguments, dict):
+    if _ref_alias_trees is None:
+        stored_ref_alias_trees = alias_tree.get(_ARGUMENT_ALIAS_REF_DEFINITIONS)
+        _ref_alias_trees = (
+            stored_ref_alias_trees if isinstance(stored_ref_alias_trees, Mapping) else {}
+        )
+    ref_name = alias_tree.get(_ARGUMENT_ALIAS_REF)
+    if isinstance(ref_name, str):
+        ref_alias_tree = _ref_alias_trees.get(ref_name)
+        if isinstance(ref_alias_tree, Mapping):
+            effective_alias_tree = _copy_argument_alias_tree(ref_alias_tree)
+            _merge_argument_alias_tree(effective_alias_tree, alias_tree)
+            alias_tree = effective_alias_tree
+    if isinstance(arguments, (list, tuple)):
+        return [
+            reverse_tool_argument_aliases(
+                item,
+                alias_tree,
+                _ref_alias_trees=_ref_alias_trees,
+            )
+            for item in arguments
+        ]
+    if not isinstance(arguments, Mapping):
         return arguments
 
     translated: dict[str, Any] = {}
     wildcard_node = alias_tree.get(_ARGUMENT_ALIAS_ANY_PROPERTY)
     wildcard_children = (
-        wildcard_node.get("properties", {}) if isinstance(wildcard_node, dict) else {}
+        wildcard_node.get("properties", {}) if isinstance(wildcard_node, Mapping) else {}
     )
     for key, value in arguments.items():
         alias_node = alias_tree.get(key)
-        if isinstance(alias_node, dict):
+        if isinstance(alias_node, str):
+            if alias_node in translated:
+                raise ValueError("Tool argument aliases are ambiguous")
+            translated[alias_node] = reverse_tool_argument_aliases(
+                value,
+                {},
+                _ref_alias_trees=_ref_alias_trees,
+            )
+            continue
+        if isinstance(alias_node, Mapping):
             original_key = alias_node.get("original", key)
             child_alias_tree = alias_node.get("properties", {})
-            if isinstance(child_alias_tree, dict) and child_alias_tree:
-                value = reverse_tool_argument_aliases(value, child_alias_tree)
+            if isinstance(child_alias_tree, Mapping):
+                value = reverse_tool_argument_aliases(
+                    value,
+                    child_alias_tree,
+                    _ref_alias_trees=_ref_alias_trees,
+                )
             if isinstance(original_key, str):
+                if original_key in translated:
+                    raise ValueError("Tool argument aliases are ambiguous")
                 translated[original_key] = value
                 continue
-        if isinstance(wildcard_children, dict) and wildcard_children:
-            value = reverse_tool_argument_aliases(value, wildcard_children)
+        if isinstance(wildcard_children, Mapping) and wildcard_children:
+            value = reverse_tool_argument_aliases(
+                value,
+                wildcard_children,
+                _ref_alias_trees=_ref_alias_trees,
+            )
+        else:
+            value = reverse_tool_argument_aliases(
+                value,
+                {},
+                _ref_alias_trees=_ref_alias_trees,
+            )
+        if key in translated:
+            raise ValueError("Tool argument aliases are ambiguous")
         translated[key] = value
     return translated
+
+
+def _copy_argument_alias_tree(alias_tree: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: _copy_argument_alias_tree(value) if isinstance(value, Mapping) else value
+        for key, value in alias_tree.items()
+    }
 
 
 def _sort_model_facing_tool_schemas(
@@ -936,7 +1089,7 @@ def _build_openai_deferred_namespaces(
                     "type": "function",
                     "name": visible_name,
                     "description": tool.description,
-                    "parameters": _strip_schema_metadata(tool.parameters),
+                    "parameters": _strip_schema_metadata(tool_input_schema(tool)),
                     "defer_loading": True,
                 }
             )

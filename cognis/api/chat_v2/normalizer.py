@@ -35,6 +35,7 @@ NormalizedEventKind = Literal[
     "credential_request",
     "todo_state",
     "artifact",
+    "assistant_deliverable",
     "file_diff",
     "evaluation",
     "notice",
@@ -75,7 +76,12 @@ VISIBLE_LIFECYCLE_EVENTS: frozenset[str] = frozenset(
         "task_failed",
         "task_cancelled",
         "workflow_composed",
+        "assistant_deliverable",
+        "turn_error",
     }
+)
+_CANCELLED_TURN_ERROR_CODES: frozenset[str] = frozenset(
+    {"cancelled", "queued_turn_cancelled", "turn_cancelled"}
 )
 
 
@@ -206,6 +212,7 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
         "credential_request",
         "todo_state",
         "artifact",
+        "assistant_deliverable",
         "file_diff",
         "error",
         "history_gap",
@@ -221,8 +228,15 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
         lifecycle_event = str(data.get("event") or data.get("type") or "")
         if lifecycle_event in {"task_result", "task_failed", "task_cancelled", "workflow_composed"}:
             return "task"
+        if lifecycle_event == "assistant_deliverable":
+            return "assistant_deliverable"
         if lifecycle_event == "system_notice":
             return "system_message"
+        if lifecycle_event == "turn_error":
+            error_code = str(data.get("error_code") or data.get("code") or "").lower()
+            if error_code in _CANCELLED_TURN_ERROR_CODES:
+                return "system_message"
+            return "error"
         return "unknown"
 
     if event_type == "evaluation":

@@ -27,6 +27,9 @@ jobs:
           python -m pip install build
           pyproject-build
 
+      - name: Verify controller runtime assets
+        run: python scripts/verify_controller_dist_assets.py dist
+
       - name: Upload controller distributions
         uses: actions/upload-artifact@v4
         with:

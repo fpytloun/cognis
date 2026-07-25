@@ -10,7 +10,9 @@ from typing import Any
 
 from cognis.logging import get_logger
 from cognis.models.tool import (
-    ToolDefinition,
+    NativeToolDefinition as ToolDefinition,
+)
+from cognis.models.tool import (
     ToolSource,
     stable_tool_id,
     tool_capabilities,
@@ -55,6 +57,61 @@ SEARCH_TOOLS_TOOL = ToolDefinition(
             },
         },
         "required": ["query"],
+    },
+    source=ToolSource(type="builtin"),
+    category="system",
+    read_only=True,
+)
+
+DESCRIBE_TOOL_TOOL = ToolDefinition(
+    name="describe_tool",
+    description=(
+        "Describe one currently authorized tool from the live session inventory. Use this before "
+        "calling an unfamiliar tool or a complex mutation to inspect authoritative operations, "
+        "mutation kind, omitted/null/array/concurrency semantics, dynamic options, examples, side "
+        "effects, and schema version/hash. Accepts callable names and stable tool IDs returned by "
+        "search_tools. It never reveals tools outside the caller's effective authorization scope."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Callable name or stable tool ID from the current session inventory.",
+            }
+        },
+        "required": ["tool"],
+        "additionalProperties": False,
+    },
+    source=ToolSource(type="builtin"),
+    category="system",
+    read_only=True,
+)
+
+VALIDATE_TOOL_CALL_TOOL = ToolDefinition(
+    name="validate_tool_call",
+    description=(
+        "Validate proposed arguments for one currently authorized tool without executing it. Use "
+        "this before unfamiliar or high-impact mutations when omitted/null/array semantics or "
+        "operation-specific fields are uncertain. Validation uses the exact authoritative "
+        "descriptor that generates the model-facing schema and never bypasses authorization."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Callable name or stable tool ID from the current session inventory.",
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Complete proposed argument object for the target tool.",
+            },
+        },
+        "required": ["tool", "arguments"],
+        "additionalProperties": False,
     },
     source=ToolSource(type="builtin"),
     category="system",

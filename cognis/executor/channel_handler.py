@@ -81,6 +81,7 @@ class ChannelHandler:
             display_name=config.get("display_name", ""),
             credential_refs={},
             agent_id=config.get("agent_id", ""),
+            default_agent_profile_id=config.get("default_agent_profile_id"),
             user_email=config.get("user_email", ""),
             settings=settings,
             default_conversation_id=config.get("default_conversation_id"),

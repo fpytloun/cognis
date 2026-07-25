@@ -362,6 +362,80 @@ textarea:focus-visible,
 }
 
 /*
+ * Chat micro-animations.
+ *
+ * Deliberately CSS-only (keyframes + transitions), transform/opacity only,
+ * short and subtle. This keeps them:
+ *   - automatically neutralized by the prefers-reduced-motion reset above
+ *     (no separate JS gate needed),
+ *   - off the keyed timeline {#each} (no Svelte transition:/animate:flip),
+ *     so they cannot reintroduce fold/settle remount blinks,
+ *   - free of any layout-height change, so scrollHeight stays stable and the
+ *     tail-pin ResizeObserver is not perturbed.
+ *
+ * A CSS `animation` plays once when the element is created, i.e. when a new
+ * timeline row mounts — exactly the "message appeared" moment.
+ */
+@keyframes chat-message-in-assistant {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes chat-message-in-user {
+  from {
+    opacity: 0;
+    transform: translate3d(8px, 2px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+/*
+ * Entry animation applies only to UNSETTLED messages (data-stable="false"):
+ * an actively streaming assistant row or an optimistic client-local user
+ * bubble. Canonical rows painted on history load — and the canonical echo that
+ * replaces an optimistic bubble under a new key — are data-stable="true" and do
+ * not animate, so scrolling through history and the optimistic->canonical swap
+ * stay flash-free.
+ */
+[data-kind='message'][data-role='assistant'][data-stable='false'] {
+  animation: chat-message-in-assistant 160ms ease-out both;
+}
+
+[data-kind='message'][data-role='user'][data-stable='false'] {
+  animation: chat-message-in-user 150ms ease-out both;
+}
+
+/* Soft emphasis while an assistant message is actively streaming. */
+[data-kind='message'][data-streaming='true'] {
+  transition: opacity 120ms ease-out;
+}
+
+/* Queued-message banner entry (outside the timeline scroll container). */
+@keyframes chat-queue-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.chat-queue-item-enter {
+  animation: chat-queue-in 150ms ease-out both;
+}
+
+/*
  * App overlays live inside the same viewport shell as the mobile header
  * and bottom tab bar. Reserve that chrome via shared CSS variables so
  * dialogs, drawers, and sheets size against the actually visible area

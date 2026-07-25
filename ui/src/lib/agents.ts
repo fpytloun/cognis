@@ -21,7 +21,11 @@ export interface AgentRuntimeProfileFormState {
   model: string;
   reasoningEffort: string;
   systemPromptExtra: string;
+  memoryAvailability: 'inherit' | 'enabled' | 'disabled';
+  memoryMode: string;
+  memoryBackendOptions: Record<string, unknown>;
   enabled: boolean;
+  agentSwitchable: boolean;
 }
 
 /**
@@ -60,7 +64,9 @@ export interface AgentFormState {
   maxTokens: string;
   reasoningEffort: string;
   voice: string;
-  memoryBackend: 'mnemory' | 'none';
+  memoryBackend: string;
+  memoryMode: string;
+  memoryBackendOptions: Record<string, unknown>;
   guardrailsBackend: 'intaris' | 'none';
   agentProfiles: AgentRuntimeProfileFormState[];
   defaultAgentProfileId: string;
@@ -200,7 +206,20 @@ function profileFormStateFromAgentProfiles(
       reasoningEffort: typeof profile.reasoning_effort === 'string' ? profile.reasoning_effort : '',
       systemPromptExtra:
         typeof profile.system_prompt_extra === 'string' ? profile.system_prompt_extra : '',
-      enabled: profile.enabled !== false
+      memoryAvailability: (
+        profile.memory_enabled === true
+          ? 'enabled'
+          : profile.memory_enabled === false
+            ? 'disabled'
+            : 'inherit'
+      ) as AgentRuntimeProfileFormState['memoryAvailability'],
+      memoryMode:
+        typeof profile.memory_backend_options?.mode === 'string'
+          ? profile.memory_backend_options.mode
+          : '',
+      memoryBackendOptions: { ...(profile.memory_backend_options ?? {}) },
+      enabled: profile.enabled !== false,
+      agentSwitchable: profile.agent_switchable === true
     }))
     .sort((left, right) => left.profileId.localeCompare(right.profileId));
 }
@@ -212,6 +231,11 @@ function serializeAgentProfiles(
   for (const profile of profiles) {
     const profileId = normalizeProfileId(profile.profileId);
     if (!profileId) continue;
+    const memoryBackendOptions = { ...profile.memoryBackendOptions };
+    delete memoryBackendOptions.mode;
+    if (profile.memoryMode) {
+      memoryBackendOptions.mode = profile.memoryMode;
+    }
     serialized[profileId] = {
       profile_id: profileId,
       description: profile.description.trim(),
@@ -219,7 +243,15 @@ function serializeAgentProfiles(
       model: profile.model.trim() || null,
       reasoning_effort: profile.reasoningEffort.trim() || null,
       system_prompt_extra: profile.systemPromptExtra.trim() || null,
-      enabled: profile.enabled
+      memory_enabled:
+        profile.memoryAvailability === 'enabled'
+          ? true
+          : profile.memoryAvailability === 'disabled'
+            ? false
+            : null,
+      memory_backend_options: memoryBackendOptions,
+      enabled: profile.enabled,
+      agent_switchable: profile.agentSwitchable
     };
   }
   return serialized;
@@ -257,6 +289,8 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     reasoningEffort: '',
     voice: '',
     memoryBackend: 'mnemory',
+    memoryMode: 'full_auto',
+    memoryBackendOptions: {},
     guardrailsBackend: 'intaris',
     agentProfiles: [],
     defaultAgentProfileId: '',
@@ -330,7 +364,16 @@ export function agentToFormState(agent: Agent): AgentFormState {
       typeof llmConfig.reasoning_effort === 'string' ? llmConfig.reasoning_effort : '',
     voice: typeof llmConfig.voice === 'string' ? llmConfig.voice : '',
     memoryBackend:
-      agent.capabilities?.memory_backend === 'none' ? 'none' : 'mnemory',
+      typeof agent.capabilities?.memory_backend === 'string'
+        ? agent.capabilities.memory_backend
+        : 'mnemory',
+    memoryMode:
+      typeof agent.capabilities?.memory_backend_options?.mode === 'string'
+        ? agent.capabilities.memory_backend_options.mode
+        : agent.capabilities?.memory_backend === 'mnemory'
+          ? 'full_auto'
+          : '',
+    memoryBackendOptions: { ...(agent.capabilities?.memory_backend_options ?? {}) },
     guardrailsBackend:
       agent.capabilities?.guardrails_backend === 'none' ? 'none' : 'intaris',
     agentProfiles: profileFormStateFromAgentProfiles(agent.agent_profiles),
@@ -595,6 +638,12 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
     },
     capabilities: {
       memory_backend: form.memoryBackend,
+      memory_backend_options: form.memoryBackend === 'none'
+        ? {}
+        : {
+            ...form.memoryBackendOptions,
+            ...(form.memoryMode ? { mode: form.memoryMode } : {})
+          },
       guardrails_backend: form.guardrailsBackend
     },
     agent_profiles: agentProfiles,
@@ -662,7 +711,9 @@ export function formStateToSystemOverridePayload(form: AgentFormState): Record<s
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
       reasoning_effort: form.reasoningEffort || undefined,
       voice: form.voice || undefined
-    }
+    },
+    agent_profiles: fullPayload.agent_profiles,
+    default_agent_profile_id: fullPayload.default_agent_profile_id
   };
 }
 

@@ -1,4 +1,4 @@
-import type { AttachmentRef, ContextUsage } from '$lib/types/api';
+import type { AttachmentRef, ContextUsage, GenerationPerformanceSnapshot } from '$lib/types/api';
 
 export type ChatV2SchemaVersion = 2;
 export type ChatMode = 'default' | 'plan' | 'build';
@@ -20,6 +20,39 @@ export type ChatResetReason =
   | 'range_too_large'
   | 'server_restart_lost_runtime'
   | 'unsupported_cursor';
+
+export type TimelineScopeKind = 'conversation' | 'session' | 'task_step';
+
+export interface TimelineScope {
+  key: string;
+  kind: TimelineScopeKind;
+  conversation_id?: string | null;
+  session_id?: string | null;
+  task_id?: string | null;
+  step_run_id?: string | null;
+  parent_session_id?: string | null;
+  label?: string | null;
+  status?: string | null;
+  missing_stream?: boolean;
+}
+
+export function conversationTimelineScope(conversationId: string): TimelineScope {
+  return { key: `conversation:${conversationId}`, kind: 'conversation', conversation_id: conversationId };
+}
+
+export function sessionTimelineScope(sessionId: string, conversationId?: string | null): TimelineScope {
+  return { key: `session:${sessionId}`, kind: 'session', session_id: sessionId, conversation_id: conversationId ?? null };
+}
+
+export function taskStepTimelineScope(taskId: string, stepRunId: string, conversationId?: string | null): TimelineScope {
+  return {
+    key: `task_step:${stepRunId}`,
+    kind: 'task_step',
+    task_id: taskId,
+    step_run_id: stepRunId,
+    conversation_id: conversationId ?? null
+  };
+}
 
 export interface SourceRef {
   store: string;
@@ -78,6 +111,18 @@ export interface MessageTimelineItem extends TimelineItemBase {
   notice_id?: string | null;
   notice_kind?: string | null;
   notice_scope?: string | null;
+  reason_class?: string | null;
+  provider_id?: string | null;
+  model?: string | null;
+  retry_after_seconds?: number | null;
+  provider_retry_after_seconds?: number | null;
+  retry_at?: string | null;
+  attempt?: number | null;
+  max_attempts?: number | null;
+  attempts?: number | null;
+  attempts_per_cycle?: number | null;
+  continuation_attempts?: number | null;
+  recoverable?: boolean | null;
   follow_up_conversation_id?: string | null;
   follow_up_session_id?: string | null;
   attachments: AttachmentRef[];
@@ -122,6 +167,7 @@ export interface ToolCallTimelineItem extends TimelineItemBase {
   progress_input_chars?: number | null;
   progress_input_lines?: number | null;
   progress_complete?: boolean | null;
+  managed_conversation?: Record<string, unknown> | null;
   delegation?: Record<string, unknown> | null;
 }
 
@@ -196,7 +242,11 @@ export interface CredentialRequestTimelineItem extends TimelineItemBase {
 
 export interface TodoStateTimelineItem extends TimelineItemBase {
   kind: 'todo_state';
-  todos: Array<Record<string, unknown>>;
+  todos: Array<{
+    content: string;
+    status: string;
+    priority: string;
+  }>;
 }
 
 export interface ArtifactTimelineItem extends TimelineItemBase {
@@ -212,6 +262,16 @@ export interface FileDiffTimelineItem extends TimelineItemBase {
   kind: 'file_diff';
   file_diffs: FileDiffRef[];
   title?: string | null;
+}
+
+export interface AssistantDeliverableTimelineItem extends TimelineItemBase {
+  kind: 'assistant_deliverable';
+  deliverable_id: string;
+  format: string;
+  title?: string | null;
+  content?: string | null;
+  render_metadata?: Record<string, unknown> | null;
+  export_metadata?: Record<string, unknown> | null;
 }
 
 export interface NoticeTimelineItem extends TimelineItemBase {
@@ -259,6 +319,7 @@ export type TimelineItem =
   | CredentialRequestTimelineItem
   | TodoStateTimelineItem
   | ArtifactTimelineItem
+  | AssistantDeliverableTimelineItem
   | FileDiffTimelineItem
   | NoticeTimelineItem
   | CompactionTimelineItem
@@ -297,6 +358,7 @@ export interface RuntimeOverlaySnapshot {
   volatile_items: TimelineItem[];
   cycle_states?: TurnCycleState[];
   context_usage?: ContextUsage | null;
+  last_generation?: GenerationPerformanceSnapshot | null;
 }
 
 export interface ConversationSummary {
@@ -340,6 +402,7 @@ export interface ConversationStateView {
 export interface ChatSnapshot {
   schema_version: ChatV2SchemaVersion;
   projection_version: string;
+  scope?: TimelineScope;
   conversation: ConversationSummary;
   timeline: TimelineWindow;
   state: ConversationStateView;
@@ -360,6 +423,7 @@ export type ChatViewOp =
 export interface ChatSyncResponse {
   schema_version: ChatV2SchemaVersion;
   projection_version: string;
+  scope?: TimelineScope;
   conversation_id: string;
   cursor_before: string;
   cursor_after: string;
@@ -376,6 +440,7 @@ export interface ChatRealtimeFrame {
   type: 'chat_v2_frame';
   schema_version: ChatV2SchemaVersion;
   projection_version: string;
+  scope?: TimelineScope;
   conversation_id: string;
   cursor_before: string;
   cursor_after: string;
@@ -390,6 +455,16 @@ export interface SendMessageV2Request {
   content: string;
   attachments: AttachmentRef[];
   chat_mode?: ChatMode | null;
+}
+
+export interface CommandV2Response {
+  conversation_id: string;
+  client_txn_id: string;
+  status: 'completed' | 'duplicate';
+  result_type: string;
+  text: string;
+  data: Record<string, unknown>;
+  server_time: string;
 }
 
 export interface SendMessageV2Response {
@@ -430,9 +505,19 @@ export interface CancelTurnV2Response {
   server_time: string;
 }
 
+export interface RetryTurnV2Response {
+  conversation_id: string;
+  client_txn_id: string;
+  turn_id: string;
+  status: 'accepted' | 'duplicate';
+  runtime?: RuntimeOverlaySnapshot | null;
+  server_time: string;
+}
+
 export interface TimelineBackfillResponse {
   schema_version: ChatV2SchemaVersion;
   projection_version: string;
+  scope?: TimelineScope;
   conversation_id: string;
   items: TimelineItem[];
   cycle_states?: TurnCycleState[];

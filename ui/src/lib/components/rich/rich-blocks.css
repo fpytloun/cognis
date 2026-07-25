@@ -1,0 +1,2317 @@
+/* Design tokens are defined on `.rich-deliverable`, `.rich-full`, AND
+   `.rich-toc-drawer-root` (not `.rich-block-list`) for independent reasons,
+   all real bugs found via rendered output rather than assumptions:
+   1. `.rich-toolbar` (the document-level title/eyebrow/subtitle header,
+      rendered whenever the payload's first block is not `hero`) is a CSS
+      *sibling* of `.rich-block-list`, not a descendant. Scoping tokens to
+      `.rich-block-list` left `.rich-toolbar` with no working color tokens
+      at all in non-hero-led documents — invisible in practice.
+   2. `.rich-full` (the full-view modal) and `.rich-toc-drawer-root` (the
+      narrow-viewport TOC drawer) are both portaled to `document.body` via
+      `use:portal` specifically to escape this component's isolated
+      stacking context, so neither is a DOM descendant of
+      `.rich-deliverable`. Scoping tokens to only `.rich-deliverable`
+      (fixing bug 1 in isolation) broke the full-view modal the same way:
+      same invisible-text symptom, verified via a computed `--rich-text`
+      read that came back empty. Neither is given the `.rich-deliverable`
+      class itself because that class also carries this component's
+      card-shell layout (border/background/shadow/radius), which would
+      visually conflict with their own full-screen/overlay chrome. */
+.rich-deliverable,
+.rich-full,
+.rich-toc-drawer-root {
+  --rich-surface: rgb(15 23 42 / .82);
+  --rich-surface-raised: rgb(15 23 42 / .38);
+  --rich-surface-solid: rgb(15 23 42 / .72);
+  --rich-text: rgb(248 250 252);
+  --rich-text-secondary: rgb(203 213 225);
+  --rich-muted: rgb(148 163 184);
+  --rich-line: rgb(148 163 184 / .22);
+  --rich-accent: rgb(56 189 248);
+  --rich-accent-soft: rgb(125 211 252);
+  --rich-shadow: rgb(2 6 23 / 0.22);
+  --rich-shadow-lg: rgb(2 6 23 / 0.4);
+  --rich-inset-highlight: rgb(255 255 255 / 0.035);
+
+  /* Radius scale. Previously defined but never referenced anywhere in this
+     file (every radius was hardcoded); now the sole source for every
+     border-radius below. --rich-radius-pill is new, formalizing the
+     recurring 999px pill shape used for chips/badges/citations. */
+  --rich-radius-lg: 1.35rem;
+  --rich-radius-md: 1.1rem;
+  --rich-radius-sm-plus: 0.85rem;
+  --rich-radius-sm: 0.65rem;
+  --rich-radius-xs: 0.45rem;
+  --rich-radius-pill: 999px;
+
+  /* Type scale. Collapses ~30 previously ad-hoc font-size values (see the
+     rich-deliverables design-system audit) onto a small set of intentional
+     steps. Fixed steps cover small/body/emphasis text; the markdown-h1/h2,
+     metric, hero, and pulse-editorial sizes stay fluid via clamp() since
+     those are genuinely viewport-responsive display type, not part of the
+     fixed small-text scale. */
+  --rich-fs-3xs: 0.68rem;
+  --rich-fs-2xs: 0.72rem;
+  --rich-fs-xs: 0.78rem;
+  --rich-fs-sm: 0.85rem;
+  --rich-fs-sm-plus: 0.92rem;
+  --rich-fs-base: 1rem;
+  --rich-fs-md: 1.08rem;
+  --rich-fs-lg: 1.18rem;
+  --rich-fs-xl: 1.3rem;
+  --rich-fs-display-sm: clamp(1.55rem, 8vw, 2.3rem);
+  --rich-fs-display: clamp(2rem, 5vw, 4.75rem);
+  --rich-fs-metric: clamp(1.8rem, 4vw, 3rem);
+  --rich-fs-metric-sm: clamp(2rem, 12vw, 3rem);
+  --rich-fs-markdown-h1: clamp(1.45rem, 3vw, 2rem);
+  --rich-fs-markdown-h2: clamp(1.25rem, 2.4vw, 1.55rem);
+  --rich-fs-pulse-hero: clamp(1.8rem, 5.5vw, 3.4rem);
+  --rich-fs-pulse-hero-sm: clamp(1.65rem, 9vw, 2.3rem);
+  --rich-fs-pulse-lede: clamp(.94rem, 1.5vw, 1.08rem);
+  --rich-fs-pulse-heading: clamp(1.25rem, 2.4vw, 1.7rem);
+  --rich-fs-pulse-card-h4: clamp(1.05rem, 1.8vw, 1.28rem);
+  --rich-fs-pulse-metric: clamp(1.35rem, 3vw, 2rem);
+
+  /* Weight scale. Collapses the non-standard intermediate weights (650,
+     750, 850) found throughout onto three intentional steps. */
+  --rich-fw-medium: 500;
+  --rich-fw-semibold: 700;
+  --rich-fw-bold: 800;
+
+  /* Line-height scale. */
+  --rich-lh-tight: 1;
+  --rich-lh-snug: 1.15;
+  --rich-lh-normal: 1.4;
+  --rich-lh-relaxed: 1.55;
+  --rich-lh-loose: 1.7;
+
+  /* Letter-spacing scale. The four negative values below were already the
+     de-facto distinct values in use (display/metric numbers need
+     progressively tighter tracking than body headings); formalizing them
+     as named steps instead of four independent hardcoded values. */
+  --rich-ls-tightest: -0.06em;
+  --rich-ls-tighter: -0.04em;
+  --rich-ls-tight: -0.035em;
+  --rich-ls-snug: -0.025em;
+  --rich-ls-normal: 0;
+  --rich-ls-wide: 0.08em;
+  --rich-ls-wider: 0.16em;
+
+  /* Spacing scale, 0.25rem base multiple. Applied to the structural rhythm
+     of the layout (list/grid gaps, card/section padding, list-item
+     padding, heading margins). Card/hero container padding stays fluid via
+     clamp() for viewport comfort; fine-grained optical nudges (icon gaps,
+     badge padding, decorative offsets under the smallest step) remain
+     direct values rather than being forced onto the scale, matching how
+     the rest of this token system already treats truly one-off values. */
+  --rich-space-1: 0.25rem;
+  --rich-space-2: 0.5rem;
+  --rich-space-3: 0.75rem;
+  --rich-space-4: 1rem;
+  --rich-space-5: 1.25rem;
+  --rich-space-6: 1.5rem;
+  --rich-space-7: 2rem;
+  --rich-space-card-pad: clamp(1rem, 2vw, 1.45rem);
+  --rich-space-hero-pad: clamp(1.25rem, 3vw, 2.4rem);
+
+  /* Tone tokens: fg/border/bg triples. Class aliases (below) map both UI and
+     Python-authored tone names (success<->positive, danger<->critical) onto
+     the same tokens so any tone renders identically everywhere. */
+  --rich-tone-neutral-fg: rgb(226 232 240);
+  --rich-tone-neutral-border: rgb(148 163 184 / .3);
+  --rich-tone-neutral-bg: rgb(148 163 184 / .1);
+  --rich-tone-info-fg: rgb(186 230 253);
+  --rich-tone-info-border: rgb(56 189 248 / .34);
+  --rich-tone-info-bg: rgb(14 165 233 / .12);
+  --rich-tone-success-fg: rgb(187 247 208);
+  --rich-tone-success-border: rgb(52 211 153 / .34);
+  --rich-tone-success-bg: rgb(16 185 129 / .12);
+  --rich-tone-warning-fg: rgb(253 230 138);
+  --rich-tone-warning-border: rgb(251 191 36 / .38);
+  --rich-tone-warning-bg: rgb(217 119 6 / .14);
+  --rich-tone-danger-fg: rgb(254 202 202);
+  --rich-tone-danger-border: rgb(248 113 113 / .38);
+  --rich-tone-danger-bg: rgb(220 38 38 / .14);
+
+  /* Vivid tone accents for dots/glows/sparklines — distinct from -fg (text),
+     which is intentionally lower-saturation for readability. */
+  --rich-tone-success-accent: rgb(52 211 153);
+  --rich-tone-warning-accent: rgb(251 191 36);
+  --rich-tone-danger-accent: rgb(248 113 113);
+
+  /* Solid (alpha-free) wash source colors for color-mix() based surfaces at
+     arbitrary opacity — NOT the same direction as --rich-text (foreground). */
+  --rich-surface-wash: rgb(15 23 42);
+  --rich-surface-wash-deep: rgb(2 6 23);
+
+  /* Density mode. "airy" is the default (research/publication/notes-style
+     reading comfort); dashboards/RCA/ops archetypes opt into "dense" via
+     data-rich-density="dense" on the root (set from block-mix heuristics —
+     see RichDeliverable.svelte) to tighten the structural spacing rhythm
+     without touching typography or per-block hardcoded values. */
+  --rich-density-gap: var(--rich-space-4);
+  --rich-density-pad: var(--rich-space-card-pad);
+}
+
+.rich-deliverable[data-rich-density="dense"],
+.rich-full[data-rich-density="dense"] {
+  --rich-density-gap: var(--rich-space-3);
+  --rich-density-pad: clamp(0.85rem, 1.6vw, 1.15rem);
+}
+
+.rich-block-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rich-density-gap);
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  /* Defensive baseline: any bare element without its own explicit color rule
+     (e.g. a <strong> added to a block without a dedicated selector) should
+     inherit the token system's text color rather than an arbitrary ambient
+     page/chat color it happens to sit inside. */
+  color: var(--rich-text-secondary);
+}
+
+/* Consistent, branded focus ring for every interactive element inside a
+   rich deliverable, rather than relying on the browser default outline
+   (which is frequently invisible against dark surfaces). */
+.rich-block-list :is(a, button, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--rich-accent);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
+
+/* Shared light-theme raw palette values. Referenced by both the explicit
+   data-resolved-theme="light" override and the prefers-color-scheme
+   fallback below, so each color value is defined exactly once instead of
+   twice (previously ~30 values were duplicated verbatim across both
+   blocks — a maintenance hazard where a fix applied to one copy could be
+   forgotten in the other). */
+:root {
+  --rich-palette-light-surface: rgb(248 250 252);
+  --rich-palette-light-surface-raised: rgb(241 245 249);
+  --rich-palette-light-surface-solid: rgb(241 245 249);
+  --rich-palette-light-text: rgb(23 32 51);
+  --rich-palette-light-text-secondary: rgb(51 65 85);
+  --rich-palette-light-muted: rgb(100 116 139);
+  --rich-palette-light-line: rgb(51 65 85 / .25);
+  --rich-palette-light-accent: rgb(3 105 161);
+  --rich-palette-light-accent-soft: rgb(2 132 199);
+  --rich-palette-light-shadow: rgb(51 65 85 / 0.1);
+  --rich-palette-light-shadow-lg: rgb(51 65 85 / 0.16);
+  --rich-palette-light-inset-highlight: rgb(255 255 255 / 0.6);
+  --rich-palette-light-tone-neutral-fg: rgb(51 65 85);
+  --rich-palette-light-tone-neutral-border: rgb(100 116 139 / .3);
+  --rich-palette-light-tone-neutral-bg: rgb(148 163 184 / .14);
+  --rich-palette-light-tone-info-fg: rgb(7 89 133);
+  --rich-palette-light-tone-info-border: rgb(3 105 161 / .3);
+  --rich-palette-light-tone-info-bg: rgb(224 242 254);
+  --rich-palette-light-tone-success-fg: rgb(6 95 70);
+  --rich-palette-light-tone-success-border: rgb(5 150 105 / .32);
+  --rich-palette-light-tone-success-bg: rgb(209 250 229);
+  --rich-palette-light-tone-warning-fg: rgb(146 64 14);
+  --rich-palette-light-tone-warning-border: rgb(217 119 6 / .34);
+  --rich-palette-light-tone-warning-bg: rgb(254 243 199);
+  --rich-palette-light-tone-danger-fg: rgb(153 27 27);
+  --rich-palette-light-tone-danger-border: rgb(220 38 38 / .3);
+  --rich-palette-light-tone-danger-bg: rgb(254 226 226);
+  --rich-palette-light-tone-success-accent: rgb(5 150 105);
+  --rich-palette-light-tone-warning-accent: rgb(217 119 6);
+  --rich-palette-light-tone-danger-accent: rgb(220 38 38);
+  --rich-palette-light-surface-wash: rgb(226 232 240);
+  --rich-palette-light-surface-wash-deep: rgb(203 213 225);
+}
+
+:root[data-resolved-theme="light"] .rich-deliverable,
+:root[data-resolved-theme="light"] .rich-full,
+:root[data-resolved-theme="light"] .rich-toc-drawer-root {
+  --rich-surface: var(--rich-palette-light-surface);
+  --rich-surface-raised: var(--rich-palette-light-surface-raised);
+  --rich-surface-solid: var(--rich-palette-light-surface-solid);
+  --rich-text: var(--rich-palette-light-text);
+  --rich-text-secondary: var(--rich-palette-light-text-secondary);
+  --rich-muted: var(--rich-palette-light-muted);
+  --rich-line: var(--rich-palette-light-line);
+  --rich-accent: var(--rich-palette-light-accent);
+  --rich-accent-soft: var(--rich-palette-light-accent-soft);
+  --rich-shadow: var(--rich-palette-light-shadow);
+  --rich-shadow-lg: var(--rich-palette-light-shadow-lg);
+  --rich-inset-highlight: var(--rich-palette-light-inset-highlight);
+  --rich-tone-neutral-fg: var(--rich-palette-light-tone-neutral-fg);
+  --rich-tone-neutral-border: var(--rich-palette-light-tone-neutral-border);
+  --rich-tone-neutral-bg: var(--rich-palette-light-tone-neutral-bg);
+  --rich-tone-info-fg: var(--rich-palette-light-tone-info-fg);
+  --rich-tone-info-border: var(--rich-palette-light-tone-info-border);
+  --rich-tone-info-bg: var(--rich-palette-light-tone-info-bg);
+  --rich-tone-success-fg: var(--rich-palette-light-tone-success-fg);
+  --rich-tone-success-border: var(--rich-palette-light-tone-success-border);
+  --rich-tone-success-bg: var(--rich-palette-light-tone-success-bg);
+  --rich-tone-warning-fg: var(--rich-palette-light-tone-warning-fg);
+  --rich-tone-warning-border: var(--rich-palette-light-tone-warning-border);
+  --rich-tone-warning-bg: var(--rich-palette-light-tone-warning-bg);
+  --rich-tone-danger-fg: var(--rich-palette-light-tone-danger-fg);
+  --rich-tone-danger-border: var(--rich-palette-light-tone-danger-border);
+  --rich-tone-danger-bg: var(--rich-palette-light-tone-danger-bg);
+  --rich-tone-success-accent: var(--rich-palette-light-tone-success-accent);
+  --rich-tone-warning-accent: var(--rich-palette-light-tone-warning-accent);
+  --rich-tone-danger-accent: var(--rich-palette-light-tone-danger-accent);
+  --rich-surface-wash: var(--rich-palette-light-surface-wash);
+  --rich-surface-wash-deep: var(--rich-palette-light-surface-wash-deep);
+}
+
+/* Deliverables default to dark regardless of OS preference until Cognis
+   ships app-wide theming: there is no per-deliverable theme toggle (it was
+   removed -- see standalone.ts / RichDeliverable.svelte history), so
+   silently following `prefers-color-scheme: light` left standalone pages
+   and embedded chat cards stuck light on a light-OS machine with no way
+   back to dark. The explicit `data-resolved-theme="light"` selector above
+   is kept so a future app-wide theme switch can still opt a deliverable
+   into light mode; only the OS-driven auto-follow is removed. */
+
+/* Tone class aliases: unify UI tone names (success/danger) with Python/agent
+   tone names (positive/critical) so any tone renders identically across
+   every block that uses tone-{value} classes. */
+.tone-success, .tone-positive { --rich-tone-fg: var(--rich-tone-success-fg); --rich-tone-border: var(--rich-tone-success-border); --rich-tone-bg: var(--rich-tone-success-bg); }
+.tone-warning { --rich-tone-fg: var(--rich-tone-warning-fg); --rich-tone-border: var(--rich-tone-warning-border); --rich-tone-bg: var(--rich-tone-warning-bg); }
+.tone-danger, .tone-critical { --rich-tone-fg: var(--rich-tone-danger-fg); --rich-tone-border: var(--rich-tone-danger-border); --rich-tone-bg: var(--rich-tone-danger-bg); }
+.tone-info { --rich-tone-fg: var(--rich-tone-info-fg); --rich-tone-border: var(--rich-tone-info-border); --rich-tone-bg: var(--rich-tone-info-bg); }
+.tone-neutral { --rich-tone-fg: var(--rich-tone-neutral-fg); --rich-tone-border: var(--rich-tone-neutral-border); --rich-tone-bg: var(--rich-tone-neutral-bg); }
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-block-list {
+  gap: clamp(.75rem, 1.7vw, 1.15rem);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-card,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-sources {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.rich-day-agenda {
+  min-width: 0;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-lg);
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--rich-surface-wash) 95%, transparent), color-mix(in srgb, var(--rich-surface-wash-deep) 92%, transparent)),
+    radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--rich-accent) 12%, transparent), transparent 34%);
+  box-shadow: 0 18px 52px color-mix(in srgb, var(--rich-surface-wash-deep) 18%, transparent), inset 0 1px 0 var(--rich-inset-highlight);
+  padding: var(--rich-density-pad);
+}
+
+.rich-day-agenda > header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: var(--rich-space-4);
+}
+
+.rich-day-agenda > header span,
+.rich-agenda-next {
+  color: var(--rich-accent);
+  font-size: var(--rich-fs-3xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+}
+
+.rich-day-agenda h2 { margin: var(--rich-space-1) 0 0; color: var(--rich-text); font: var(--rich-fw-semibold) var(--rich-fs-xl)/var(--rich-lh-snug) Georgia, serif; }
+.rich-day-agenda > header p { margin: 0; text-align: right; }
+.rich-day-agenda > header time { display: block; font-weight: var(--rich-fw-bold); }
+.rich-day-agenda > header small { color: var(--rich-muted); font-size: var(--rich-fs-3xs); }
+.rich-agenda-all-day { display: flex; flex-wrap: wrap; gap: .35rem .7rem; margin-top: var(--rich-space-3); padding: .5rem .65rem; background: color-mix(in srgb, var(--rich-accent) 9%, transparent); font-size: var(--rich-fs-xs); }
+.rich-agenda-timeline { margin: var(--rich-space-2) 0 0; padding: 0; list-style: none; }
+.rich-agenda-now-marker { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: var(--rich-space-2); margin-top: var(--rich-space-2); color: var(--rich-accent); font-size: var(--rich-fs-3xs); font-weight: var(--rich-fw-bold); }
+.rich-agenda-now-marker span { height: 1px; background: var(--rich-accent); }
+.rich-agenda-timeline li { display: grid; grid-template-columns: 3.6rem minmax(0, 1fr); gap: .7rem; border-top: 1px solid var(--rich-line); padding: .55rem 0; }
+.rich-agenda-timeline li.next { border-left: 3px solid var(--rich-accent); padding-left: .55rem; }
+.rich-agenda-timeline li.current { background: color-mix(in srgb, var(--rich-accent) 6%, transparent); }
+.rich-agenda-timeline li.past { opacity: .72; }
+.rich-agenda-timeline li.rich-agenda-now-marker { grid-template-columns: 1fr auto; border-top: 0; padding: .25rem 0; }
+.rich-agenda-timeline li.free { color: var(--rich-muted); padding-block: .35rem; }
+.rich-agenda-time time { display: block; color: var(--rich-muted); font-size: var(--rich-fs-2xs); font-variant-numeric: tabular-nums; }
+.rich-agenda-timeline strong { display: block; color: var(--rich-text); font-size: var(--rich-fs-sm); }
+.rich-agenda-timeline small { display: block; color: var(--rich-muted); font-size: var(--rich-fs-2xs); }
+.rich-agenda-timeline p { margin: .2rem 0 0; color: var(--rich-text-secondary); font-size: var(--rich-fs-xs); }
+.rich-agenda-tasks { display: grid; grid-template-columns: auto 1fr; gap: var(--rich-space-2) var(--rich-space-4); border-top: 1px solid var(--rich-line); padding-top: .55rem; font-size: var(--rich-fs-xs); }
+.rich-agenda-tasks strong { color: var(--rich-text); }
+.rich-agenda-tasks ul { display: flex; flex-wrap: wrap; gap: .3rem var(--rich-space-4); margin: 0; padding: 0; list-style: none; }
+.rich-agenda-all-day strong { color: var(--rich-text); }
+.rich-day-agenda footer, .rich-agenda-empty { margin: .55rem 0 0; color: var(--rich-muted); font-size: var(--rich-fs-3xs); }
+
+@media (max-width: 560px) {
+  .rich-day-agenda > header { align-items: start; }
+  .rich-agenda-tasks { grid-template-columns: 1fr; }
+  .rich-agenda-tasks ul { display: grid; }
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero {
+  border-width: 0 0 1px;
+  border-color: var(--rich-line);
+  background: transparent;
+  padding: .9rem 0 1.15rem;
+}
+
+/* Pulse's own `.rich-hero` override above has higher specificity than the
+   generic `.rich-hero.has-media` rule (see below), which would otherwise
+   reintroduce padding around what should be a full-bleed hero image and
+   leave the transparent background showing through instead of the photo. */
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero.has-media {
+  border-width: 1px;
+  padding: 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero h2,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-section-heading h3,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card h4,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-card h4 {
+  font-family: Iowan Old Style, Palatino Linotype, Book Antiqua, Georgia, serif;
+  font-weight: var(--rich-fw-semibold);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero h2 {
+  max-width: 46rem;
+  font-size: var(--rich-fs-pulse-hero);
+  line-height: var(--rich-lh-tight);
+  letter-spacing: var(--rich-ls-tighter);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-lede {
+  max-width: 44rem;
+  font-size: var(--rich-fs-pulse-lede);
+  line-height: var(--rich-lh-relaxed);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel {
+  border-width: 1px 0 0;
+  border-color: var(--rich-line);
+  background: transparent;
+  padding: 1rem 0 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-section-heading {
+  margin-bottom: var(--rich-space-3);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-section-heading h3 {
+  font-size: var(--rich-fs-pulse-heading);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-grid,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-columns {
+  gap: var(--rich-space-3) var(--rich-space-4);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card {
+  border-width: 1px 0 0;
+  border-color: var(--rich-line);
+  background: transparent;
+  padding: var(--rich-space-3) 0 0;
+}
+
+/* Pulse's own `.rich-card` override above has higher specificity than the
+   generic `.rich-card.has-media` rule (see below), which would otherwise
+   reintroduce a top-only border and padding around what should be a
+   full-bleed card image and leave the transparent background showing
+   through instead of the photo -- same reasoning as `.rich-hero.has-media`
+   above. */
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card.has-media {
+  border-width: 1px;
+  padding: 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-feature {
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 20%, transparent);
+  border-radius: var(--rich-radius-sm-plus);
+  background: color-mix(in srgb, var(--rich-accent) 8%, transparent);
+  padding: var(--rich-space-4);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-action,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-status,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-metric {
+  border: 0;
+  border-left: 3px solid color-mix(in srgb, var(--rich-accent) 42%, transparent);
+  background: color-mix(in srgb, var(--rich-surface-wash) 38%, transparent);
+  padding: var(--rich-space-3) .85rem;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card:hover {
+  transform: none;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card h4 {
+  margin-top: .15rem;
+  font-size: var(--rich-fs-pulse-card-h4);
+  line-height: var(--rich-lh-snug);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card .rich-markdown {
+  font-size: var(--rich-fs-sm-plus);
+  line-height: var(--rich-lh-relaxed);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-metric {
+  border-width: 1px 0 0;
+  border-radius: 0;
+  background: transparent;
+  padding: .65rem .15rem .35rem 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-metric::before {
+  right: .2rem;
+  top: .75rem;
+  width: .42rem;
+  height: .42rem;
+  box-shadow: none;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-metric strong {
+  font-size: var(--rich-fs-pulse-metric);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-metric p {
+  margin-top: .42rem;
+  font-size: var(--rich-fs-xs);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-card {
+  border-width: 1px 0 0;
+  border-color: var(--rich-line);
+  background: transparent;
+  padding: .85rem 0 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-canvas {
+  /* Chart.js needs real vertical room for axis ticks/titles + legend row;
+     below ~14rem gridlines and labels become illegible. Keep dense but
+     never cramped. */
+  min-height: 14rem;
+  height: 15rem;
+  border-radius: var(--rich-radius-sm-plus);
+  border: 1px solid var(--rich-line);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--rich-surface-wash) 70%, transparent), color-mix(in srgb, var(--rich-surface-wash-deep) 40%, transparent)),
+    radial-gradient(circle at 50% 0%, color-mix(in srgb, var(--rich-accent) 7%, transparent), transparent 45%);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure {
+  margin: 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure img {
+  display: block;
+  width: 100%;
+  max-height: 26rem;
+  object-fit: cover;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure figcaption,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure-source,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-data-source {
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-2xs);
+  line-height: var(--rich-lh-normal);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure figcaption {
+  margin-top: .45rem;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure-source,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-data-source {
+  margin: .3rem 0 0;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-data-source {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: .25rem .8rem;
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure-source a,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-data-source a {
+  color: var(--rich-accent-soft);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-sources {
+  border-width: 1px 0 0;
+  background: transparent;
+  padding: .85rem 0 0;
+}
+
+@media (min-width: 840px) {
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-columns {
+    grid-template-columns: minmax(0, 1.65fr) minmax(16rem, .85fr);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-grid,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-columns {
+    grid-template-columns: 1fr;
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero h2 {
+    font-size: var(--rich-fs-pulse-hero-sm);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-canvas {
+    min-height: 13rem;
+    height: 13.5rem;
+    padding: .6rem;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel {
+    background: var(--rich-surface);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-action,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-status,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card-metric {
+    background: var(--rich-surface-raised);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-hero,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-card,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-card,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-sources,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-metric {
+    border-color: var(--rich-line);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-chart-canvas {
+    background: var(--rich-surface-raised);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) :is(
+    .rich-hero,
+    .rich-panel,
+    .rich-card,
+    .rich-metric,
+    .rich-chart-card,
+    .rich-day-agenda,
+    .rich-sources
+  ) :is(h2, h3, h4, strong) {
+    color: var(--rich-text);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) :is(
+    .rich-hero,
+    .rich-panel,
+    .rich-card,
+    .rich-metric,
+    .rich-chart-card,
+    .rich-day-agenda,
+    .rich-sources
+  ) :is(p, li, small) {
+    color: var(--rich-text-secondary);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-agenda-timeline li.free,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-agenda-time time,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-day-agenda footer,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-agenda-empty,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure figcaption,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure-source,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-data-source {
+    color: var(--rich-muted);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) :is(
+    .rich-figure-source,
+    .rich-data-source,
+    .rich-card,
+    .rich-sources
+  ) a {
+    color: var(--rich-accent);
+  }
+}
+
+.rich-block-anchor {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  scroll-margin-top: 1rem;
+}
+
+.rich-block-anchor:focus {
+  outline: none;
+}
+
+.rich-hero,
+.rich-panel,
+.rich-card,
+.rich-table-card,
+.rich-research-answer,
+.rich-evidence-report,
+.rich-chart-card,
+.rich-diagram,
+.rich-code-card,
+.rich-kv,
+.rich-timeline,
+.rich-sources,
+.rich-unsupported {
+  break-inside: avoid;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-lg);
+  /* Deliberately near-opaque (95%/92%) so cards read correctly regardless of
+     what's behind them (dark chat background, light standalone page, or a
+     test harness with its own chrome) rather than relying on the ambient
+     page color to complete the surface tone. */
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--rich-surface-wash) 95%, transparent), color-mix(in srgb, var(--rich-surface-wash-deep) 92%, transparent)),
+    radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--rich-accent) 12%, transparent), transparent 34%);
+  box-shadow: 0 18px 52px color-mix(in srgb, var(--rich-surface-wash-deep) 18%, transparent), inset 0 1px 0 var(--rich-inset-highlight);
+}
+
+.rich-hero {
+  padding: var(--rich-space-hero-pad);
+  border-color: color-mix(in srgb, var(--rich-accent) 14%, transparent);
+  background:
+    radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--rich-accent) 22%, transparent), transparent 32%),
+    radial-gradient(circle at 92% 8%, color-mix(in srgb, var(--rich-tone-success-accent) 16%, transparent), transparent 30%),
+    linear-gradient(135deg, color-mix(in srgb, var(--rich-surface-wash) 94%, transparent), color-mix(in srgb, var(--rich-surface-wash-deep) 92%, transparent));
+}
+
+/* Hero with a media reference (e.g. an agent-generated banner image): the
+   image becomes a full-bleed background behind the identity block instead
+   of the usual gradient. Content is bottom-aligned so title/subtitle sit
+   over the darkest, most legible part of the overlay gradient rather than
+   the lighter top edge. `.rich-hero-content` carries the hero's normal
+   padding so the non-media layout (padding on `.rich-hero` itself) is
+   unaffected. */
+.rich-hero.has-media {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  min-height: clamp(14rem, 32vw, 22rem);
+  overflow: hidden;
+  padding: 0;
+}
+
+.rich-hero.has-media .rich-media.background {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  margin: 0;
+  border-radius: inherit;
+  opacity: 1;
+}
+
+.rich-hero.has-media .rich-media.background img {
+  filter: saturate(0.92) brightness(0.8);
+}
+
+.rich-hero.has-media .rich-media.background::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgb(2 6 23 / .1) 0%, rgb(2 6 23 / .45) 55%, rgb(2 6 23 / .9) 100%);
+}
+
+.rich-hero-content {
+  position: relative;
+  min-width: 0;
+}
+
+.rich-hero.has-media .rich-hero-content {
+  z-index: 1;
+  width: 100%;
+  padding: var(--rich-space-hero-pad);
+}
+
+.rich-hero.has-media h1,
+.rich-hero.has-media h2,
+.rich-hero.has-media .rich-lede {
+  color: rgb(248 250 252);
+}
+
+.rich-hero.has-media .rich-eyebrow {
+  color: rgb(186 230 253);
+}
+
+.rich-hero h1,
+.rich-hero h2,
+.rich-section-heading h3,
+.rich-card h4,
+.rich-table-card h4,
+.rich-research-answer h4,
+.rich-evidence-report h4,
+.rich-chart-card h4,
+.rich-diagram h4,
+.rich-code-card h4,
+.rich-kv h4,
+.rich-timeline h4,
+.rich-sources h4 {
+  margin: 0;
+  color: var(--rich-text);
+  letter-spacing: var(--rich-ls-tight);
+}
+
+.rich-hero h1,
+.rich-hero h2 {
+  max-width: 58rem;
+  font-size: var(--rich-fs-display);
+  line-height: var(--rich-lh-tight);
+}
+
+.rich-hero h1,
+.rich-hero h2,
+.rich-card h4,
+.rich-section-heading h3,
+.rich-table-card h4,
+.rich-markdown,
+.rich-code {
+  overflow-wrap: anywhere;
+}
+
+.rich-eyebrow,
+.rich-section-heading span,
+.rich-link-preview span,
+.rich-metric span {
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-2xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wider);
+  text-transform: uppercase;
+}
+
+.rich-lede,
+.rich-section-heading p,
+.rich-table-card > p,
+.rich-answer-description,
+.rich-evidence-description,
+.rich-chart-card > p {
+  margin: var(--rich-space-2) 0 0;
+  max-width: 48rem;
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-base);
+  line-height: var(--rich-lh-loose);
+}
+
+.rich-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--rich-space-2);
+  margin-top: var(--rich-space-5);
+}
+
+.rich-chip-row span,
+.rich-metric em {
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 14%, transparent);
+  border-radius: var(--rich-radius-pill);
+  background: color-mix(in srgb, var(--rich-accent) 10%, transparent);
+  color: var(--rich-accent-soft);
+  padding: .35rem .65rem;
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-panel,
+.rich-card,
+.rich-table-card,
+.rich-research-answer,
+.rich-evidence-report,
+.rich-chart-card,
+.rich-diagram,
+.rich-code-card,
+.rich-kv,
+.rich-timeline,
+.rich-sources,
+.rich-unsupported {
+  padding: var(--rich-density-pad);
+}
+
+.rich-section-heading {
+  margin-bottom: var(--rich-space-4);
+}
+
+.rich-stack,
+.rich-disclosure-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rich-density-gap);
+}
+
+.rich-grid,
+.rich-columns {
+  display: grid;
+  min-width: 0;
+  max-width: 100%;
+  gap: var(--rich-density-gap);
+}
+
+.rich-grid {
+  grid-template-columns: repeat(var(--rich-columns, auto-fit), minmax(min(100%, 16rem), 1fr));
+}
+
+.rich-columns {
+  grid-template-columns: repeat(var(--rich-columns, auto-fit), minmax(min(100%, 22rem), 1fr));
+}
+
+.rich-card-header,
+.rich-metric-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: .7rem;
+  min-width: 0;
+}
+
+.rich-card-header > div { min-width: 0; }
+.rich-card h4 a { color: inherit; text-decoration-color: color-mix(in srgb, var(--rich-accent-soft) 55%, transparent); text-underline-offset: .16em; }
+.rich-card-summary { margin: var(--rich-space-3) 0 0; color: var(--rich-text-secondary); font-size: var(--rich-fs-base); font-weight: var(--rich-fw-semibold); line-height: var(--rich-lh-snug); }
+.rich-card-feature { grid-column: span 2; }
+.rich-card-compact { padding: .85rem; }
+.rich-card-compact .rich-markdown { font-size: var(--rich-fs-sm); line-height: var(--rich-lh-relaxed); }
+.rich-card-action { border-color: color-mix(in srgb, var(--rich-accent) 28%, transparent); }
+.rich-card-status { background: linear-gradient(145deg, var(--rich-surface-raised), color-mix(in srgb, var(--rich-tone-success-accent) 16%, var(--rich-surface-wash))); }
+
+/* `visual` card with a resolved image (CardBlock.svelte's `isVisualMedia`):
+   the image becomes a full-bleed background behind the card body, mirroring
+   HeroBlock's `.has-media` overlay but sized for a grid tile rather than a
+   full-width banner. `.rich-card-body` carries the card's normal padding so
+   the non-media layout (padding on `.rich-card` itself) is unaffected, and
+   the legibility gradient keeps title/summary text readable over any photo. */
+.rich-card.has-media {
+  position: relative;
+  display: flex;
+  min-height: clamp(11rem, 26vw, 17rem);
+  overflow: hidden;
+  padding: 0;
+}
+
+.rich-card.has-media .rich-media.background {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  margin: 0;
+  border-radius: inherit;
+  opacity: 1;
+}
+
+.rich-card.has-media .rich-media.background img {
+  filter: saturate(0.92) brightness(0.8);
+}
+
+.rich-card.has-media .rich-media.background figcaption {
+  display: none;
+}
+
+.rich-card.has-media .rich-media.background::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgb(2 6 23 / .05) 0%, rgb(2 6 23 / .35) 45%, rgb(2 6 23 / .88) 100%);
+}
+
+.rich-card-body {
+  position: relative;
+  min-width: 0;
+}
+
+.rich-card.has-media .rich-card-body {
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  width: 100%;
+  padding: var(--rich-density-pad);
+}
+
+.rich-card.has-media h4,
+.rich-card.has-media .rich-card-summary,
+.rich-card.has-media .rich-markdown {
+  color: rgb(248 250 252);
+}
+
+.rich-card.has-media .rich-eyebrow {
+  color: rgb(186 230 253);
+}
+
+.rich-card.has-media .rich-card-summary,
+.rich-card.has-media .rich-markdown {
+  color: rgb(226 232 240);
+}
+
+.rich-metric-heading { align-items: center; justify-content: space-between; }
+.rich-metric-heading .rich-icon { width: 1.7rem; height: 1.7rem; margin-right: -.25rem; }
+.rich-metric-heading time { margin-left: auto; color: var(--rich-muted); font-size: var(--rich-fs-2xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.rich-panel summary { display: grid; gap: var(--rich-space-1); min-height: 2.75rem; align-content: center; cursor: pointer; }
+.rich-panel summary small { overflow: hidden; color: var(--rich-muted); font-size: var(--rich-fs-sm); font-weight: var(--rich-fw-medium); line-height: var(--rich-lh-normal); text-overflow: ellipsis; white-space: nowrap; }
+.rich-panel-context { padding-top: .9rem; }
+.rich-panel-context > p { margin: 0 0 .85rem; color: var(--rich-text-secondary); line-height: var(--rich-lh-relaxed); }
+
+@media (max-width: 430px) {
+  .rich-card-feature { grid-column: span 1; }
+  .rich-card, .rich-panel { padding: var(--rich-space-4); border-radius: var(--rich-radius-md); }
+  .rich-grid,
+  .rich-columns { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 390px) {
+  .rich-grid, .rich-columns { gap: var(--rich-space-3); }
+  .rich-card-summary { font-size: var(--rich-fs-sm-plus); }
+  .rich-card.has-media { min-height: clamp(9.5rem, 46vw, 12rem); }
+}
+
+@media (max-width: 320px) {
+  .rich-card-header { gap: .55rem; }
+  .rich-card-header .rich-icon { width: 1.75rem; height: 1.75rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rich-block-list *,
+  .rich-block-list *::before,
+  .rich-block-list *::after {
+    animation-duration: 0.001ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.rich-grid > .rich-block-list,
+.rich-columns > .rich-block-list {
+  display: contents;
+}
+
+[data-rich-block-type='markdown'] {
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-lg);
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--rich-surface-wash) 95%, transparent), color-mix(in srgb, var(--rich-surface-wash-deep) 92%, transparent)),
+    radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--rich-accent) 9%, transparent), transparent 34%);
+  box-shadow: 0 18px 52px color-mix(in srgb, var(--rich-surface-wash-deep) 14%, transparent), inset 0 1px 0 var(--rich-inset-highlight);
+  padding: var(--rich-density-pad);
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-sm-plus);
+  line-height: var(--rich-lh-loose);
+  overflow-wrap: anywhere;
+}
+
+/* Trim the trailing margin of the last child so markdown nested inside a
+   padded card/callout doesn't leave extra whitespace before the card edge. */
+.rich-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.rich-markdown h1,
+.rich-markdown h2,
+.rich-markdown h3,
+.rich-markdown h4,
+.rich-markdown h5,
+.rich-markdown h6 {
+  margin: var(--rich-space-6) 0 var(--rich-space-2);
+  color: var(--rich-text);
+  font-weight: var(--rich-fw-bold);
+  line-height: var(--rich-lh-snug);
+  letter-spacing: var(--rich-ls-snug);
+}
+
+/* A heading immediately following another heading (e.g. h2 then h3 with no
+   body text between) needs less separation than one following prose. */
+.rich-markdown :is(h1, h2, h3, h4, h5, h6) + :is(h1, h2, h3, h4, h5, h6) {
+  margin-top: .35rem;
+}
+
+.rich-markdown h1:first-child,
+.rich-markdown h2:first-child,
+.rich-markdown h3:first-child,
+.rich-markdown h4:first-child,
+.rich-markdown h5:first-child,
+.rich-markdown h6:first-child {
+  margin-top: 0;
+}
+
+.rich-markdown h1 {
+  font-size: var(--rich-fs-markdown-h1);
+}
+
+.rich-markdown h2 {
+  font-size: var(--rich-fs-markdown-h2);
+}
+
+.rich-markdown h3 {
+  font-size: var(--rich-fs-lg);
+}
+
+.rich-markdown h4 {
+  font-size: var(--rich-fs-md);
+}
+
+.rich-markdown h5 {
+  font-size: var(--rich-fs-sm-plus);
+  letter-spacing: var(--rich-ls-normal);
+}
+
+.rich-markdown h6 {
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+}
+
+.rich-markdown p {
+  margin: .7rem 0;
+  max-width: 68ch;
+}
+
+.rich-markdown ul,
+.rich-markdown ol {
+  margin: .7rem 0;
+  padding-left: 1.3rem;
+}
+
+.rich-markdown ul ul,
+.rich-markdown ul ol,
+.rich-markdown ol ul,
+.rich-markdown ol ol {
+  margin: .3rem 0;
+}
+
+.rich-markdown li {
+  margin: .28rem 0;
+  padding-left: .15rem;
+}
+
+.rich-markdown li::marker {
+  color: var(--rich-muted);
+}
+
+.rich-markdown a {
+  color: var(--rich-accent-soft);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--rich-accent-soft) 45%, transparent);
+  text-underline-offset: .16em;
+  transition: text-decoration-color 150ms ease, color 150ms ease;
+}
+
+.rich-markdown a:hover,
+.rich-markdown a:focus-visible {
+  color: var(--rich-text);
+  text-decoration-color: var(--rich-accent-soft);
+}
+
+.rich-markdown strong {
+  color: var(--rich-text);
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-markdown em {
+  color: var(--rich-text);
+}
+
+.rich-markdown hr {
+  margin: 1.4rem 0;
+  border: none;
+  border-top: 1px solid var(--rich-line);
+}
+
+.rich-markdown mark {
+  border-radius: .3rem;
+  background: color-mix(in srgb, var(--rich-tone-warning-accent) 30%, transparent);
+  color: var(--rich-text);
+  padding: .05rem .25rem;
+}
+
+.rich-markdown sup,
+.rich-markdown sub {
+  color: var(--rich-muted);
+  font-size: .75em;
+}
+
+.rich-markdown blockquote {
+  margin: 1rem 0;
+  border-left: 3px solid color-mix(in srgb, var(--rich-accent) 75%, transparent);
+  color: var(--rich-text-secondary);
+  background: color-mix(in srgb, var(--rich-accent) 12%, var(--rich-surface-wash));
+  padding: var(--rich-space-3) var(--rich-space-4);
+}
+
+.rich-markdown :not(pre) > code {
+  border: 1px solid color-mix(in srgb, var(--rich-accent-soft) 22%, transparent);
+  border-radius: var(--rich-radius-xs);
+  background: color-mix(in srgb, var(--rich-accent) 16%, var(--rich-surface-wash));
+  color: var(--rich-accent-soft);
+  padding: .12rem .32rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: .85em;
+}
+
+.rich-markdown pre {
+  overflow-x: auto;
+  max-width: 100%;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 72%, transparent);
+  padding: .9rem 1rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: var(--rich-fs-sm);
+  line-height: var(--rich-lh-loose);
+}
+
+.rich-markdown pre code {
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+.rich-markdown .markdown-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  margin: 1rem 0;
+  overflow-x: auto;
+  border-radius: var(--rich-radius-md);
+}
+
+.rich-markdown table {
+  width: max-content;
+  min-width: min(42rem, 100%);
+  border-collapse: separate;
+  border-spacing: 0;
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-sm-plus);
+}
+
+.rich-markdown th,
+.rich-markdown td {
+  border-bottom: 1px solid var(--rich-line);
+  padding: .65rem .8rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.rich-markdown th {
+  background: color-mix(in srgb, var(--rich-surface-wash) 74%, transparent);
+  color: var(--rich-text);
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.rich-markdown tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--rich-surface-wash) 24%, transparent);
+}
+
+.rich-callout {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .85rem;
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 16%, transparent);
+  border-radius: var(--rich-radius-md);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--rich-accent) 22%, var(--rich-surface-wash)), var(--rich-surface-raised));
+  padding: var(--rich-space-4);
+  color: var(--rich-text-secondary);
+}
+
+.rich-callout strong {
+  color: var(--rich-text);
+}
+
+.rich-callout-icon {
+  width: .85rem;
+  height: .85rem;
+  margin-top: .32rem;
+  border-radius: var(--rich-radius-pill);
+  background: var(--rich-accent);
+  box-shadow: 0 0 0 .38rem color-mix(in srgb, var(--rich-accent) 12%, transparent);
+}
+
+.rich-callout.tone-success,
+.rich-card.tone-success,
+.rich-metric.tone-success,
+.rich-timeline .tone-success {
+  border-color: color-mix(in srgb, var(--rich-tone-success-accent) 20%, transparent);
+}
+
+.rich-callout.tone-success .rich-callout-icon,
+.rich-metric.tone-success::before {
+  background: var(--rich-tone-success-accent);
+}
+
+.rich-callout.tone-warning,
+.rich-card.tone-warning,
+.rich-metric.tone-warning,
+.rich-timeline .tone-warning {
+  border-color: color-mix(in srgb, var(--rich-tone-warning-accent) 24%, transparent);
+}
+
+.rich-callout.tone-danger,
+.rich-card.tone-danger,
+.rich-metric.tone-danger,
+.rich-timeline .tone-danger {
+  border-color: color-mix(in srgb, var(--rich-tone-danger-accent) 24%, transparent);
+}
+
+.rich-card {
+  min-height: 100%;
+  transition: border-color 150ms ease, transform 150ms ease, background 150ms ease;
+}
+
+.rich-card:hover,
+.rich-link-preview:hover {
+  border-color: color-mix(in srgb, var(--rich-accent-soft) 34%, transparent);
+  transform: translateY(-1px);
+}
+
+.rich-card h4 {
+  margin-top: var(--rich-space-1);
+  font-size: var(--rich-fs-md);
+}
+
+.rich-metric {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-lg);
+  background: linear-gradient(145deg, var(--rich-surface-raised), color-mix(in srgb, var(--rich-accent) 20%, var(--rich-surface-wash)));
+  padding: var(--rich-space-4);
+}
+
+.rich-metric::before {
+  content: '';
+  position: absolute;
+  right: var(--rich-space-4);
+  top: var(--rich-space-4);
+  width: .7rem;
+  height: .7rem;
+  border-radius: var(--rich-radius-pill);
+  background: var(--rich-accent);
+  box-shadow: 0 0 24px currentColor;
+}
+
+.rich-metric strong {
+  display: block;
+  margin-top: .35rem;
+  color: var(--rich-text);
+  font-size: var(--rich-fs-metric);
+  letter-spacing: var(--rich-ls-tightest);
+  line-height: var(--rich-lh-tight);
+}
+
+.rich-metric p {
+  margin: var(--rich-space-3) 0 0;
+  color: var(--rich-muted);
+}
+
+.rich-kv dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  gap: .8rem;
+  margin: 1rem 0 0;
+}
+
+.rich-kv div {
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash) 60%, transparent);
+  padding: .85rem;
+}
+
+.rich-kv dt {
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--rich-ls-wide);
+}
+
+.rich-kv dd {
+  margin: var(--rich-space-1) 0 0;
+  color: var(--rich-text-secondary);
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-timeline ol,
+.rich-sources ol {
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rich-timeline li {
+  display: grid;
+  grid-template-columns: 3.5rem 1fr;
+  gap: .85rem;
+  position: relative;
+  padding: .2rem 0 1rem;
+}
+
+.rich-timeline li + li {
+  border-top: 1px solid var(--rich-line);
+  padding-top: 1rem;
+}
+
+.rich-timeline li > span {
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-sm);
+  font-weight: var(--rich-fw-bold);
+}
+
+.rich-timeline strong {
+  color: var(--rich-text);
+}
+
+.rich-timeline p {
+  margin: var(--rich-space-1) 0 0;
+  color: var(--rich-text-secondary);
+}
+
+.rich-table-wrap {
+  margin-top: 1rem;
+  overflow: auto;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+}
+
+.rich-table-card table {
+  width: 100%;
+  min-width: 34rem;
+  border-collapse: collapse;
+  font-size: var(--rich-fs-sm);
+}
+
+.rich-table-card caption {
+  margin-bottom: var(--rich-space-2);
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-xs);
+  text-align: left;
+  caption-side: top;
+}
+
+.rich-table-card caption strong {
+  color: var(--rich-text);
+}
+
+.rich-table-card th,
+.rich-table-card td {
+  padding: .75rem .85rem;
+  border-bottom: 1px solid var(--rich-line);
+  text-align: left;
+  vertical-align: top;
+  color: var(--rich-text-secondary);
+}
+
+.rich-table-card th {
+  position: sticky;
+  top: 0;
+  background: color-mix(in srgb, var(--rich-surface-wash) 96%, transparent);
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-2xs);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+}
+
+.rich-table-card tbody tr:hover {
+  background: color-mix(in srgb, var(--rich-accent) 6%, transparent);
+}
+
+.rich-table-card tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.rich-research-answer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(14rem, .34fr);
+  gap: 1.2rem;
+}
+
+.rich-answer-content {
+  margin-top: 1rem;
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-base);
+  line-height: var(--rich-lh-loose);
+}
+
+.rich-answer-content p {
+  margin: 0 0 .95rem;
+}
+
+.rich-answer-claim {
+  position: relative;
+  display: grid;
+  grid-template-columns: .65rem minmax(0, 1fr);
+  gap: .65rem;
+  margin: 0 0 .8rem;
+}
+
+.rich-answer-claims {
+  display: grid;
+  gap: .8rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rich-answer-claim-marker {
+  width: .5rem;
+  height: .5rem;
+  margin-top: .55rem;
+  border-radius: 999px;
+  background: var(--rich-accent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--rich-accent) 13%, transparent);
+}
+
+.rich-answer-claim p {
+  margin: 0;
+}
+
+.rich-citation {
+  position: relative;
+  display: inline-flex;
+  margin-left: .2rem;
+  vertical-align: baseline;
+}
+
+.rich-citation button,
+.rich-row-evidence-toggle {
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 18%, transparent);
+  border-radius: var(--rich-radius-pill);
+  background: color-mix(in srgb, var(--rich-accent) 12%, transparent);
+  color: var(--rich-accent-soft);
+  font: inherit;
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-bold);
+  cursor: pointer;
+}
+
+.rich-citation button {
+  padding: .1rem .35rem;
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-citation button:hover,
+.rich-citation button:focus-visible,
+.rich-row-evidence-toggle:hover,
+.rich-row-evidence-toggle:focus-visible {
+  border-color: color-mix(in srgb, var(--rich-accent-soft) 55%, transparent);
+  background: color-mix(in srgb, var(--rich-accent) 22%, transparent);
+  outline: none;
+}
+
+.rich-source-popover {
+  position: absolute;
+  z-index: 4;
+  left: 0;
+  top: calc(100% + .45rem);
+  display: grid;
+  gap: .35rem;
+  width: min(22rem, 80vw);
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 16%, transparent);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 98%, transparent);
+  box-shadow: 0 24px 60px color-mix(in srgb, var(--rich-surface-wash-deep) 45%, transparent);
+  padding: .85rem;
+  color: var(--rich-text-secondary);
+}
+
+.rich-source-popover strong,
+.rich-source-rail strong,
+.rich-claim-card strong,
+.rich-evidence-caveats strong {
+  color: var(--rich-text);
+}
+
+.rich-source-popover small,
+.rich-source-rail small,
+.rich-claim-sources small {
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-xs);
+}
+
+.rich-source-popover span {
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-sm);
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-source-popover a,
+.rich-source-rail a,
+.rich-claim-sources a {
+  color: var(--rich-accent-soft);
+  font-weight: var(--rich-fw-semibold);
+  text-decoration: none;
+}
+
+.rich-answer-points {
+  display: grid;
+  gap: .55rem;
+  margin: 1rem 0 0;
+  padding-left: 1.2rem;
+  color: var(--rich-text-secondary);
+}
+
+.rich-source-rail {
+  align-self: start;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash) 92%, transparent);
+  padding: .9rem;
+  color: var(--rich-text-secondary);
+}
+
+.rich-source-rail ol {
+  display: grid;
+  gap: .75rem;
+  margin: .75rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rich-source-rail li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .15rem .5rem;
+}
+
+.rich-source-rail li > span {
+  color: var(--rich-accent-soft);
+  font-weight: var(--rich-fw-bold);
+}
+
+.rich-source-rail small {
+  grid-column: 2;
+  color: var(--rich-muted);
+}
+
+.rich-source-rail em {
+  color: var(--rich-text-secondary);
+  font-style: normal;
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-source-rail details {
+  grid-column: 2;
+  margin-top: .2rem;
+}
+
+.rich-source-rail summary {
+  cursor: pointer;
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-source-rail details p {
+  margin: .35rem 0 0;
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-sm);
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-claim-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.rich-claim-card {
+  display: grid;
+  gap: .8rem;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash) 58%, transparent);
+  padding: var(--rich-space-4);
+}
+
+.rich-claim-card header {
+  display: grid;
+  gap: .35rem;
+}
+
+.rich-claim-card header span,
+.rich-confidence span,
+.rich-recommendation {
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-2xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+}
+
+.rich-claim-card p,
+.rich-claim-card blockquote {
+  margin: 0;
+  color: var(--rich-text-secondary);
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-confidence {
+  display: grid;
+  gap: .4rem;
+}
+
+.rich-confidence div {
+  overflow: hidden;
+  height: .55rem;
+  border-radius: var(--rich-radius-pill);
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 90%, transparent);
+}
+
+.rich-confidence i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--rich-accent), var(--rich-tone-success-accent));
+}
+
+.rich-claim-card details {
+  border-top: 1px solid var(--rich-line);
+  padding-top: .75rem;
+}
+
+.rich-claim-card summary {
+  cursor: pointer;
+  color: var(--rich-text-secondary);
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-claim-card ul,
+.rich-evidence-caveats ul,
+.rich-row-evidence ul {
+  display: grid;
+  gap: .55rem;
+  margin: .75rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.rich-claim-card li,
+.rich-evidence-caveats li,
+.rich-row-evidence li {
+  color: var(--rich-text-secondary);
+}
+
+.rich-claim-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .45rem .65rem;
+}
+
+.rich-evidence-caveats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.rich-evidence-caveats section {
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 38%, transparent);
+  padding: .9rem;
+}
+
+.rich-table-card th button,
+.rich-table-sort-button,
+.rich-decision-matrix th button {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  width: 100%;
+  justify-content: flex-start;
+  border: 0;
+  border-radius: var(--rich-radius-xs);
+  background: transparent;
+  color: inherit;
+  padding: .1rem .2rem;
+  font: inherit;
+  font-weight: var(--rich-fw-bold);
+  text-transform: uppercase;
+  letter-spacing: var(--rich-ls-wide);
+  cursor: pointer;
+}
+
+.rich-table-card th.align-right button {
+  justify-content: flex-end;
+}
+
+.rich-table-card th button:hover,
+.rich-table-card th button:focus-visible,
+.rich-table-sort-button:hover,
+.rich-table-sort-button:focus-visible,
+.rich-decision-matrix th button:hover,
+.rich-decision-matrix th button:focus-visible {
+  background: color-mix(in srgb, var(--rich-accent) 10%, transparent);
+  color: var(--rich-tone-info-fg);
+  outline: 1px solid color-mix(in srgb, var(--rich-accent) 22%, transparent);
+}
+
+.rich-decision-matrix tr.recommended {
+  background: color-mix(in srgb, var(--rich-tone-success-accent) 8%, transparent);
+}
+
+.rich-decision-matrix tr.recommended td:first-child {
+  box-shadow: inset 3px 0 0 var(--rich-tone-success-accent);
+}
+
+.rich-recommendation {
+  display: inline-flex;
+  margin-left: .45rem;
+  border: 1px solid color-mix(in srgb, var(--rich-tone-success-accent) 16%, transparent);
+  border-radius: var(--rich-radius-pill);
+  background: color-mix(in srgb, var(--rich-tone-success-accent) 10%, transparent);
+  color: var(--rich-tone-success-fg);
+  padding: .12rem .35rem;
+  vertical-align: middle;
+}
+
+.rich-row-evidence-toggle {
+  padding: .28rem .5rem;
+}
+
+.rich-row-evidence td {
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 34%, transparent);
+}
+
+.rich-row-evidence p {
+  margin: var(--rich-space-1) 0 0;
+  color: var(--rich-text-secondary);
+}
+
+.rich-table-card .align-right {
+  text-align: right;
+}
+
+.rich-figure {
+  margin: 0;
+  background: transparent;
+}
+
+.rich-figure img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-lg);
+  object-fit: cover;
+}
+
+.rich-figure figcaption {
+  padding: .65rem .1rem .15rem;
+  color: var(--rich-text);
+  font-size: var(--rich-fs-sm);
+  font-weight: var(--rich-fw-medium);
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-figure-source {
+  margin: 0;
+  padding: .15rem .1rem 0;
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-xs);
+}
+
+.rich-figure-source a {
+  color: var(--rich-accent-soft);
+}
+
+.rich-link-preview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 18%, transparent);
+  border-radius: var(--rich-radius-md);
+  background: linear-gradient(145deg, color-mix(in srgb, var(--rich-accent) 18%, var(--rich-surface-wash)), var(--rich-surface-raised));
+  padding: var(--rich-space-4);
+  text-decoration: none;
+}
+
+.rich-link-preview:has(.rich-link-preview-thumbnail) {
+  grid-template-columns: minmax(0, 1fr) 8rem;
+  gap: var(--rich-space-4);
+  align-items: stretch;
+}
+
+.rich-link-preview-body {
+  min-width: 0;
+}
+
+.rich-link-preview-thumbnail {
+  grid-column: 2;
+  grid-row: 1;
+  width: 100%;
+  height: 100%;
+  min-height: 5.75rem;
+  border-radius: var(--rich-radius-sm);
+  object-fit: cover;
+}
+
+.rich-link-preview strong {
+  display: block;
+  margin-top: var(--rich-space-1);
+  color: var(--rich-text);
+}
+
+.rich-link-preview small {
+  display: block;
+  margin-top: .4rem;
+  color: var(--rich-muted);
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-sources li {
+  display: grid;
+  gap: .2rem;
+  border-top: 1px solid var(--rich-line);
+  padding: .75rem 0;
+}
+
+.rich-sources li:first-child {
+  border-top: 0;
+}
+
+.rich-sources a {
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-sm-plus);
+  font-weight: var(--rich-fw-semibold);
+  line-height: var(--rich-lh-normal);
+}
+
+.rich-sources span {
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-xs);
+}
+
+.rich-sources details {
+  margin-top: .3rem;
+}
+
+.rich-sources summary {
+  cursor: pointer;
+  color: var(--rich-accent-soft);
+  font-size: var(--rich-fs-xs);
+  font-weight: var(--rich-fw-semibold);
+}
+
+.rich-sources details p {
+  margin: .35rem 0 0;
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-sm);
+  line-height: var(--rich-lh-relaxed);
+}
+
+.rich-code {
+  overflow: auto;
+  white-space: pre-wrap;
+  border: 1px solid var(--rich-line);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 72%, transparent);
+  padding: 1rem;
+  color: var(--rich-text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: var(--rich-fs-xs);
+  line-height: var(--rich-lh-loose);
+}
+
+.rich-mermaid {
+  margin-top: 1rem;
+  overflow: auto;
+  border-radius: var(--rich-radius-md);
+  background:
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--rich-accent) 10%, transparent), transparent 34%),
+    linear-gradient(180deg, color-mix(in srgb, var(--rich-surface-wash-deep) 96%, transparent), color-mix(in srgb, var(--rich-surface-wash) 76%, transparent));
+  padding: 1rem;
+  box-shadow: inset 0 0 0 1px var(--rich-line);
+}
+
+.rich-mermaid svg {
+  display: block;
+  width: 100%;
+  min-width: min(38rem, 100%);
+  max-width: 100%;
+  height: auto;
+  color: var(--rich-text-secondary);
+}
+
+.rich-mermaid text,
+.rich-mermaid tspan,
+.rich-mermaid .label,
+.rich-mermaid .nodeLabel,
+.rich-mermaid .edgeLabel {
+  fill: var(--rich-text-secondary) !important;
+  color: var(--rich-text-secondary) !important;
+}
+
+.rich-mermaid .edgeLabel,
+.rich-mermaid .edgeLabel p {
+  background: color-mix(in srgb, var(--rich-surface-wash-deep) 88%, transparent) !important;
+  color: var(--rich-text-secondary) !important;
+}
+
+.rich-quote {
+  margin: 0;
+  border-left: 3px solid var(--rich-accent);
+  border-radius: var(--rich-radius-md);
+  background: color-mix(in srgb, var(--rich-accent) 14%, var(--rich-surface-wash));
+  padding: 1rem 1.15rem;
+}
+
+.rich-quote p {
+  margin: 0;
+  color: var(--rich-text-secondary);
+  font-size: var(--rich-fs-md);
+  line-height: var(--rich-lh-loose);
+}
+
+.rich-quote footer {
+  margin-top: .6rem;
+  color: var(--rich-muted);
+}
+
+.rich-divider {
+  border: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--rich-accent) 35%, transparent), transparent);
+}
+
+.rich-disclosure-group summary,
+.rich-panel > summary,
+.rich-unsupported > summary {
+  cursor: pointer;
+  color: var(--rich-text-secondary);
+  font-weight: var(--rich-fw-semibold);
+  transition: color 150ms ease;
+}
+
+.rich-disclosure-group summary:hover,
+.rich-panel > summary:hover,
+.rich-unsupported > summary:hover,
+.rich-disclosure-group summary:focus-visible,
+.rich-panel > summary:focus-visible,
+.rich-unsupported > summary:focus-visible {
+  color: var(--rich-text);
+}
+
+.rich-disclosure-group summary::marker,
+.rich-panel > summary::marker,
+.rich-unsupported > summary::marker {
+  color: var(--rich-accent-soft);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .rich-disclosure-group summary,
+  .rich-panel > summary,
+  .rich-unsupported > summary {
+    transition: color 150ms ease, background-color 150ms ease;
+  }
+}
+
+/* ---------------------------------------------------------------------
+   Gallery and steps craft. `status`/`status_grid` (DashboardBlock.svelte),
+   `action` (CardBlock.svelte's `.rich-card-action` variant), and
+   `incident_timeline`/`incident_checklist`/`checklist` (IncidentBlock.svelte)
+   already have dedicated, fully-crafted component-scoped styles of their
+   own — they are NOT generic shells, and do not need (or want) rules here;
+   adding same-named classes in this shared stylesheet would just create
+   confusing duplicate/conflicting selectors against those components' own
+   <style> blocks. Gallery and steps, by contrast, genuinely had no
+   dedicated treatment: gallery reused the plain `.rich-grid` card-sizing
+   grid (built for ~16rem cards, not photo thumbnails), and steps rendered
+   through TimelineBlock with a class name (`.rich-timeline`) and content
+   identical to a plain timeline, with no numbered-sequence affordance. */
+
+.rich-gallery {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 11rem), 1fr));
+  gap: var(--rich-space-3);
+}
+
+.rich-gallery .rich-figure {
+  height: 100%;
+}
+
+.rich-gallery .rich-figure img {
+  aspect-ratio: 4 / 3;
+}
+
+/* TimelineBlock.svelte adds this modifier class alongside `.rich-timeline`
+   when `type === 'steps'`, keeping the base timeline styling and turning
+   the existing time/step label span (already rendering the step's own
+   number/label text) into a numbered-circle badge with a connecting line,
+   instead of introducing a second, duplicate CSS-counter number. */
+.rich-steps.rich-timeline li {
+  grid-template-columns: 2.35rem 1fr;
+  align-items: start;
+}
+
+.rich-steps.rich-timeline li > span {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 2.35rem;
+  height: 2.35rem;
+  border: 1px solid color-mix(in srgb, var(--rich-accent) 30%, transparent);
+  border-radius: var(--rich-radius-pill);
+  background: color-mix(in srgb, var(--rich-accent) 14%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.rich-steps.rich-timeline li:not(:last-child) > span::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 1px;
+  height: .85rem;
+  background: var(--rich-line);
+  transform: translateX(-50%);
+}
+
+/* `action` (CardBlock, .rich-card-action) — give the CTA a clearer,
+   button-like identity beyond a plain border tint: a tinted background
+   plus a trailing arrow on the linked heading, so an authored action card
+   reads as "do this" rather than as an ordinary editorial card. */
+.rich-card-action {
+  background:
+    linear-gradient(145deg, color-mix(in srgb, var(--rich-accent) 10%, var(--rich-surface-wash)), color-mix(in srgb, var(--rich-surface-wash-deep) 92%, transparent)),
+    radial-gradient(circle at 15% 0%, color-mix(in srgb, var(--rich-accent) 12%, transparent), transparent 34%);
+}
+
+.rich-card-action h4 a {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+}
+
+.rich-card-action h4 a::after {
+  content: '→';
+  color: var(--rich-accent-soft);
+  transition: transform 150ms ease;
+}
+
+.rich-card-action:hover h4 a::after {
+  transform: translateX(.15rem);
+}
+
+/* `code` (CodeBlock.svelte) — surface the authored language, mirroring the
+   Python/PDF renderer's `.code-language` line so both renderers show it. */
+.rich-code-language {
+  margin: 0 0 .4rem;
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-2xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+}
+
+@media (max-width: 640px) {
+  .rich-block-list {
+    gap: .85rem;
+  }
+
+  .rich-hero,
+  .rich-panel,
+  .rich-card,
+  .rich-table-card,
+  .rich-research-answer,
+  .rich-evidence-report,
+  .rich-chart-card,
+  .rich-diagram,
+  .rich-code-card,
+  .rich-kv,
+  .rich-timeline,
+  .rich-sources {
+    border-radius: var(--rich-radius-md);
+  }
+
+  .rich-hero {
+    padding: 1rem;
+  }
+
+  .rich-hero h2 {
+    font-size: var(--rich-fs-display-sm);
+    line-height: 1.08;
+  }
+
+  .rich-lede,
+  .rich-section-heading p,
+  .rich-table-card > p,
+  .rich-answer-description,
+  .rich-evidence-description,
+  .rich-chart-card > p,
+  .rich-markdown,
+  .rich-quote p {
+    font-size: var(--rich-fs-sm-plus);
+    line-height: var(--rich-lh-loose);
+  }
+
+  .rich-card h4,
+  .rich-table-card h4,
+  .rich-research-answer h4,
+  .rich-evidence-report h4,
+  .rich-chart-card h4,
+  .rich-diagram h4,
+  .rich-code-card h4,
+  .rich-kv h4,
+  .rich-timeline h4,
+  .rich-sources h4 {
+    font-size: var(--rich-fs-md);
+  }
+
+  .rich-panel,
+  .rich-card,
+  .rich-table-card,
+  .rich-research-answer,
+  .rich-evidence-report,
+  .rich-chart-card,
+  .rich-diagram,
+  .rich-code-card,
+  .rich-kv,
+  .rich-timeline,
+  .rich-sources,
+  .rich-unsupported {
+    padding: .85rem;
+  }
+
+  .rich-metric strong {
+    font-size: var(--rich-fs-metric-sm);
+  }
+
+  .rich-timeline li {
+    grid-template-columns: 1fr;
+  }
+
+  .rich-research-answer {
+    grid-template-columns: 1fr;
+  }
+
+  .rich-source-popover {
+    position: fixed;
+    inset: auto 0 0;
+    width: auto;
+    max-height: 55vh;
+    overflow: auto;
+    border-radius: 1rem 1rem 0 0;
+    padding: 1rem;
+  }
+
+  .rich-table-wrap {
+    overflow: visible;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .rich-table-card table,
+  .rich-table-card thead,
+  .rich-table-card tbody,
+  .rich-table-card tr,
+  .rich-table-card td {
+    display: block;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .rich-table-card thead {
+    display: none;
+  }
+
+  .rich-table-card tbody {
+    display: grid;
+    gap: .75rem;
+  }
+
+  .rich-table-card tr {
+    overflow: hidden;
+    border: 1px solid var(--rich-line);
+    border-radius: var(--rich-radius-md);
+    background: color-mix(in srgb, var(--rich-surface-wash) 55%, transparent);
+  }
+
+  .rich-table-card td {
+    display: grid;
+    grid-template-columns: minmax(5.5rem, .4fr) minmax(0, 1fr);
+    gap: .55rem;
+    border-bottom: 1px solid var(--rich-line);
+    padding: .75rem;
+    text-align: left;
+  }
+
+  .rich-table-card td:last-child {
+    border-bottom: 0;
+  }
+
+  .rich-table-card td::before {
+    content: attr(data-label);
+    color: var(--rich-accent-soft);
+    font-size: var(--rich-fs-2xs);
+    font-weight: var(--rich-fw-bold);
+    letter-spacing: var(--rich-ls-wide);
+    text-transform: uppercase;
+  }
+
+  .rich-table-card .align-right {
+    text-align: left;
+  }
+
+  .rich-row-evidence td {
+    display: block;
+  }
+
+  .rich-mermaid {
+    overflow-x: auto;
+    padding: .65rem;
+  }
+
+  .rich-mermaid svg {
+    min-width: 32rem;
+  }
+
+  .rich-steps.rich-timeline li {
+    grid-template-columns: 1.85rem 1fr;
+  }
+
+  .rich-steps.rich-timeline li > span {
+    width: 1.85rem;
+    height: 1.85rem;
+  }
+}
+
+/* Keep disclosure copy readable after the generic rich-panel rules below Pulse styles. */
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary span,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel h4 {
+  color: var(--rich-text-secondary);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary small,
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel :is(p, li) {
+  color: var(--rich-text-secondary);
+}
+
+:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel a {
+  color: var(--rich-accent-soft);
+}
+
+@media (prefers-color-scheme: light) {
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary span,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel h4 {
+    color: var(--rich-text);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel summary small,
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel :is(p, li) {
+    color: var(--rich-text-secondary);
+  }
+
+  :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-panel a {
+    color: var(--rich-accent);
+  }
+}

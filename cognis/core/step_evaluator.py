@@ -53,6 +53,7 @@ step_complete metadata:
   Summary: {summary}
   Claims: {claims}
   Outputs: {outputs}
+  Metadata: {metadata}
   Outcome: {outcome}
   Notification: {notification}
 
@@ -94,8 +95,13 @@ Evaluation checklist:
    runtime policy explicitly allows no user-facing notification. Evaluate task
    completion separately from whether the result should be shown to the user.
 11. Direct completion can also be valid for ready-to-read outputs. Do not
-   penalize the step for bypassing the normal follow-up flow when direct
-   delivery was explicitly selected.
+    penalize the step for bypassing the normal follow-up flow when direct
+    delivery was explicitly selected.
+12. When Metadata contains Pulse v2 quality evidence, require
+    quality_gate_passed=true. Structural composition alone is not success:
+    reject a Pulse with no meaningful non-agenda visual, uncited stories,
+    missing image alt/provenance, no progressive disclosure for multiple
+    stories, or more than one unavailable signal.
 
 Decide:
 - "approved" — the step objective is satisfactorily met based on actual \
@@ -170,6 +176,13 @@ class StepEvaluator:
         malfunction rather than silently approving incomplete work.
         Empty or truncated evaluator output is treated as an evaluator failure.
         """
+        pulse_quality_failure = self._pulse_quality_failure(step_output)
+        if pulse_quality_failure is not None:
+            return self._forced_revise(
+                reasoning="Pulse v2 quality metadata did not pass the authoring gate",
+                feedback=pulse_quality_failure,
+            )
+
         prompt = self._build_prompt(
             step_definition,
             step_output,
@@ -246,6 +259,7 @@ class StepEvaluator:
         formatted_inputs = self._format_step_inputs(step_inputs)
 
         formatted_outputs = json.dumps(step_output.outputs, default=str)[:2000]
+        formatted_metadata = json.dumps(step_output.metadata, default=str)[:4000]
         formatted_claims = "\n".join(f"  - {c}" for c in step_output.claims) or "(none)"
         formatted_outcome = (
             step_output.outcome.model_dump_json()
@@ -273,11 +287,26 @@ class StepEvaluator:
             summary=step_output.summary,
             claims=formatted_claims,
             outputs=formatted_outputs,
+            metadata=formatted_metadata,
             outcome=formatted_outcome,
             notification=formatted_notification,
             content=formatted_content,
             execution_evidence=formatted_execution_evidence,
             task_context=task_context or "(none)",
+        )
+
+    @staticmethod
+    def _pulse_quality_failure(step_output: StepOutput) -> str | None:
+        metadata = step_output.metadata if isinstance(step_output.metadata, dict) else {}
+        render_metadata = metadata.get("deliverable_render_metadata")
+        if not isinstance(render_metadata, dict) or render_metadata.get("pulse_version") != 2:
+            return None
+        quality = render_metadata.get("pulse_quality")
+        if isinstance(quality, dict) and quality.get("quality_gate_passed") is True:
+            return None
+        return (
+            "Revise the Pulse v2 deliverable so its measurable quality metadata passes; "
+            "do not approve structural-only composition."
         )
 
     def _format_step_inputs(self, step_inputs: dict[str, StepOutput]) -> str:

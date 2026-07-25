@@ -33,9 +33,11 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
     ]
     assert skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
     assert "Make the smallest correct change" in agent.system_prompt
+    assert "one bounded implementation scope" in agent.system_prompt
+    assert "granular todos for implementation" in agent.system_prompt
     assert "fix\n  the issue and rerun" in agent.system_prompt
     assert "unrelated pre-existing reason" in agent.system_prompt
-    assert "Do not delegate further" in agent.system_prompt
+    assert "Do not delegate implementation work further" in agent.system_prompt
 
 
 def test_system_research_agent_has_expanded_web_tools() -> None:
@@ -72,12 +74,16 @@ def test_system_review_agents_use_pragmatic_prompts() -> None:
     assert architect.description == "Implementation plan review for architecture and risk"
     assert "security, reliability, testability" in architect.system_prompt
     assert "enterprise-style artifacts" in architect.system_prompt
+    assert "observable workstreams and milestones" in architect.system_prompt
+    assert "Do NOT invent requirements" in architect.system_prompt
     assert "OVERENGINEERING" in architect.system_prompt
 
     assert review.description == "Findings-first code review for defects and regressions"
     assert review.skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
     assert "Primary focus: real bugs, regressions, security issues" in review.system_prompt
     assert "Do not nitpick style or architecture" in review.system_prompt
+    assert "locked to the approved review scope" in review.system_prompt
+    assert "concrete bug, regression, security" in review.system_prompt
     assert "### Must Fix" in review.system_prompt
 
 

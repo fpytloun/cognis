@@ -8,7 +8,7 @@ from time import monotonic
 from typing import Any
 
 from fastapi import APIRouter, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from cognis.api.common import (
     api_exception,
@@ -38,10 +38,11 @@ from cognis.api.models import (
     StepProfileUpdateRequest,
     UserPreferencesResponse,
     UserPreferencesUpdateRequest,
+    WebBackendUpdateRequest,
     WebConfigStatusResponse,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
-from cognis.core.executor_policy import load_executor_policy
+from cognis.core.executor_resolution import labels_match
 from cognis.core.step_profiles import (
     STEP_PROFILE_CUSTOM_SETTING_KEY,
     STEP_PROFILE_OVERRIDES_SETTING_KEY,
@@ -49,21 +50,35 @@ from cognis.core.step_profiles import (
     StepProfileMode,
     serialize_step_profile_override,
 )
+from cognis.logging import get_logger
 from cognis.models.config import normalize_reasoning_level
+from cognis.models.executor_inference import executor_local_inference_configured
 from cognis.models.workflow import StepProfileConfig
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.message_projection import VALID_MESSAGE_PROJECTION_POLICIES
-from cognis.settings_schema import setting_category, validate_setting_value
-from cognis.store.models import SystemWorkflowOverride, WorkflowRow
+from cognis.runtime_settings import apply_runtime_setting
+from cognis.settings_schema import get_setting_spec, validate_setting_value
+from cognis.store.local_models import lock_local_model_dispatch_guard
+from cognis.store.models import (
+    LLMProvider,
+    LocalModelDeployment,
+    LocalModelOperation,
+    Setting,
+    SystemWorkflowOverride,
+    User,
+    WorkflowRow,
+)
 from cognis.store.queries import (
     create_llm_provider,
     delete_llm_provider,
     delete_model_routing,
     delete_setting,
+    get_executor_row,
     get_llm_provider,
     get_setting,
     get_user_ui_state_value,
     get_visible_llm_provider,
+    list_executors,
     list_llm_providers,
     list_model_routing,
     list_settings,
@@ -74,6 +89,7 @@ from cognis.store.queries import (
 )
 
 router = APIRouter(tags=["settings"])
+logger = get_logger(__name__)
 PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
 SAME_SESSION_MODEL_SENTINEL = "__same_session_model__"
 USER_PREFERENCES_STATE_KEY = "ui.preferences"
@@ -219,6 +235,15 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
     if not isinstance(config, dict):
         return
     preset = str(config.get("preset") or "").strip().lower()
+    anthropic_protocol = config.get("protocol", "auto")
+    if preset == "anthropic":
+        protocol = str(anthropic_protocol).strip().lower()
+        if protocol not in {"auto", "anthropic_messages", "litellm"}:
+            raise api_exception(
+                400,
+                "validation_error",
+                "Anthropic protocol must be 'auto', 'anthropic_messages', or 'litellm'",
+            )
     message_projection_policy = config.get("message_projection_policy")
     if message_projection_policy is not None:
         value = str(message_projection_policy).strip().lower()
@@ -267,6 +292,12 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
             "validation_error",
             "Claude subscription OAuth providers must use controller execution location",
         )
+    if preset == "anthropic" and auth_mode == "oauth" and protocol == "litellm":
+        raise api_exception(
+            400,
+            "validation_error",
+            "Claude subscription OAuth requires the native Anthropic Messages protocol",
+        )
     if location != "executor":
         return
     executor_id = config.get("executor_id")
@@ -299,6 +330,47 @@ def _validate_llm_provider_payload(location: str | None, config: dict[str, Any] 
             400,
             "validation_error",
             "Executor-routed providers must specify executor_id or executor_labels",
+        )
+
+
+async def _validate_provider_executor_eligibility(
+    session: Any,
+    *,
+    location: str | None,
+    config: dict[str, Any],
+    owner_email: str,
+) -> None:
+    """Reject new provider selectors that cannot target local inference."""
+
+    if location != "executor":
+        return
+    executor_id = config.get("executor_id")
+    if isinstance(executor_id, str) and executor_id.strip():
+        row = await get_executor_row(
+            session,
+            executor_id.strip(),
+            owner_email=owner_email,
+            include_shared=True,
+        )
+        if row is None or not executor_local_inference_configured(row):
+            raise api_exception(
+                400,
+                "validation_error",
+                "Selected executor is unavailable or has local inference disabled",
+            )
+        return
+    selector = config.get("executor_labels")
+    if not isinstance(selector, dict):
+        return
+    rows = await list_executors(session, owner_email=owner_email, include_shared=True)
+    if not any(
+        executor_local_inference_configured(row) and labels_match(row.labels or {}, selector)
+        for row in rows
+    ):
+        raise api_exception(
+            400,
+            "validation_error",
+            "Executor labels match no active executor with local inference enabled",
         )
 
 
@@ -345,7 +417,11 @@ async def settings_list(request: Request) -> list[SettingsCategoryResponse]:
     for row in rows:
         if row.key in {STEP_PROFILE_OVERRIDES_SETTING_KEY, STEP_PROFILE_CUSTOM_SETTING_KEY}:
             continue
-        grouped[row.category].append(setting_to_response(row))
+        try:
+            spec = get_setting_spec(row.key, require_exposed=True)
+        except ValueError:
+            continue
+        grouped[spec.category].append(setting_to_response(row, spec))
     return [
         SettingsCategoryResponse(category=category, items=items)
         for category, items in sorted(grouped.items())
@@ -520,11 +596,100 @@ async def settings_step_profile_reset(request: Request, profile_id: str) -> Step
 @router.get("/api/v1/settings/{key}", response_model=SettingResponse)
 async def setting_detail(request: Request, key: str) -> SettingResponse:
     require_admin(request)
+    try:
+        spec = get_setting_spec(key, require_exposed=True)
+    except ValueError as exc:
+        raise api_exception(404, "not_found", "Setting not found") from exc
     async with request.app.state.session_factory() as session:
         row = await get_setting(session, key)
     if row is None:
         raise api_exception(404, "not_found", "Setting not found")
-    return setting_to_response(row)
+    return setting_to_response(row, spec)
+
+
+async def _persist_and_apply_setting(
+    request: Request,
+    *,
+    key: str,
+    value: object,
+    updated_by: str,
+) -> SettingResponse:
+    """Serialize local mutations, persist, hot-apply, and converge on DB state."""
+
+    spec = get_setting_spec(key, require_exposed=True)
+    async with request.app.state.settings_update_lock:
+        async with request.app.state.session_factory() as session:
+            previous = await get_setting(session, key)
+            previous_value = previous.value if previous is not None else spec.default
+            previous_updated_by = previous.updated_by if previous is not None else None
+            row = await upsert_setting(
+                session,
+                key=key,
+                value=value,
+                category=spec.category,
+                updated_by=updated_by,
+            )
+            await session.commit()
+            await session.refresh(row)
+            committed_updated_at = row.updated_at
+
+        if spec.application_scope == "hot":
+            try:
+                await apply_runtime_setting(request.app, key, value)
+            except Exception as exc:
+                async with request.app.state.session_factory() as session:
+                    result = await session.execute(
+                        update(Setting)
+                        .where(
+                            Setting.key == key,
+                            Setting.updated_at == committed_updated_at,
+                        )
+                        .values(
+                            value=previous_value,
+                            category=spec.category,
+                            updated_by=previous_updated_by,
+                        )
+                    )
+                    if result.rowcount == 1:  # type: ignore[attr-defined]
+                        await session.commit()
+                        recovery_value = previous_value
+                    else:
+                        await session.rollback()
+                        latest = await get_setting(session, key)
+                        recovery_value = latest.value if latest is not None else spec.default
+                try:
+                    await apply_runtime_setting(request.app, key, recovery_value)
+                except Exception:
+                    logger.exception(
+                        "settings: failed to restore runtime value",
+                        extra={"extra_data": {"key": key}},
+                    )
+                raise api_exception(
+                    500,
+                    "runtime_apply_failed",
+                    "Setting could not be applied locally; the previous value was restored.",
+                ) from exc
+
+            # A concurrent writer in another worker may have committed after us.
+            # Re-read once so this worker converges to the latest durable value.
+            async with request.app.state.session_factory() as session:
+                latest = await get_setting(session, key)
+            if latest is not None and latest.value != value:
+                try:
+                    await apply_runtime_setting(request.app, key, latest.value)
+                except Exception as exc:
+                    logger.exception(
+                        "settings: failed to converge to latest durable value",
+                        extra={"extra_data": {"key": key}},
+                    )
+                    raise api_exception(
+                        500,
+                        "runtime_apply_failed",
+                        "A newer durable value could not be applied locally.",
+                    ) from exc
+                row = latest
+
+        return setting_to_response(row, spec)
 
 
 @router.put("/api/v1/settings/{key}", response_model=SettingResponse)
@@ -534,39 +699,31 @@ async def setting_update(
     user = require_admin(request)
     try:
         validate_setting_value(key, payload.value)
-        category = setting_category(key)
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
-    async with request.app.state.session_factory() as session:
-        row = await upsert_setting(
-            session,
-            key=key,
-            value=payload.value,
-            category=category,
-            updated_by=user.email,
-        )
-        await session.commit()
-        await session.refresh(row)
-    if key == "security.api_read_requests_per_minute":
-        request.app.state.api_rate_limiter.update_limits(
-            read_requests_per_minute=int(payload.value)
-        )
-    elif key == "security.api_write_requests_per_minute":
-        request.app.state.api_rate_limiter.update_limits(
-            write_requests_per_minute=int(payload.value)
-        )
-    elif key in {"executors.allow_in_process", "executors.allow_subprocess"}:
-        policy = await load_executor_policy(request.app.state.session_factory)
-        await request.app.state.providers.executor.apply_policy(policy)
-    elif key == "session.step_timeout_seconds":
-        request.app.state.agent_loop.default_step_timeout_seconds = max(1, int(payload.value))
-    elif key == "evaluator.timeout_ms":
-        request.app.state.step_evaluator.evaluator_timeout_seconds = (
-            max(1, int(payload.value)) / 1000
-        )
-    elif key in {STEP_PROFILE_OVERRIDES_SETTING_KEY, STEP_PROFILE_CUSTOM_SETTING_KEY}:
-        await request.app.state.step_profile_registry.refresh()
-    return setting_to_response(row)
+    return await _persist_and_apply_setting(
+        request,
+        key=key,
+        value=payload.value,
+        updated_by=user.email,
+    )
+
+
+@router.delete("/api/v1/settings/{key}", response_model=SettingResponse)
+async def setting_reset(request: Request, key: str) -> SettingResponse:
+    """Reset a setting to its registry default and apply it to this worker."""
+
+    user = require_admin(request)
+    try:
+        spec = get_setting_spec(key, require_exposed=True)
+    except ValueError as exc:
+        raise api_exception(404, "not_found", "Setting not found") from exc
+    return await _persist_and_apply_setting(
+        request,
+        key=key,
+        value=spec.default,
+        updated_by=user.email,
+    )
 
 
 # -- Web config ----------------------------------------------------------------
@@ -599,9 +756,15 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
             session, "web.browser_fetch.network_idle_after_dom_seconds", 3
         )
         browser_fetch_headed_fallback = await get_setting_value(
-            session, "web.browser_fetch.headed_fallback_enabled", False
+            session, "web.browser_fetch.headed_fallback_enabled", True
         )
+        tavily_enabled = await get_setting_value(session, "web.tavily_enabled", True)
+        brave_enabled = await get_setting_value(session, "web.brave_enabled", True)
+        searxng_enabled = await get_setting_value(session, "web.searxng_enabled", True)
         searxng_url = await get_setting_value(session, "web.searxng_url", "")
+        searxng_engines = await get_setting_value(session, "web.searxng_engines", "")
+        searxng_categories = await get_setting_value(session, "web.searxng_categories", "")
+        searxng_language = await get_setting_value(session, "web.searxng_language", "")
 
     tavily_configured = False
     brave_configured = False
@@ -620,25 +783,34 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
                 pass  # Provider error — treat as not configured
 
     searxng_configured = bool(isinstance(searxng_url, str) and searxng_url.strip())
+    tavily_enabled = bool(tavily_enabled)
+    brave_enabled = bool(brave_enabled)
+    searxng_enabled = bool(searxng_enabled)
 
     available_search = ["direct"]
-    if tavily_configured:
+    if tavily_configured and tavily_enabled:
         available_search.append("tavily")
-    if brave_configured:
+    if brave_configured and brave_enabled:
         available_search.append("brave")
-    if searxng_configured:
+    if searxng_configured and searxng_enabled:
         available_search.append("searxng")
 
     available_fetch = ["direct", "browser"]
-    if tavily_configured:
+    if tavily_configured and tavily_enabled:
         available_fetch.insert(1, "tavily")
 
     available_union = sorted({*available_search, *available_fetch})
+    normalized_search_backend = str(search_backend) if isinstance(search_backend, str) else "direct"
+    if normalized_search_backend not in available_search:
+        normalized_search_backend = "direct"
+    normalized_fetch_backend = str(fetch_backend) if isinstance(fetch_backend, str) else "direct"
+    if normalized_fetch_backend not in available_fetch:
+        normalized_fetch_backend = "direct"
 
     return WebConfigStatusResponse(
         backend=str(legacy_backend) if isinstance(legacy_backend, str) else "direct",
-        search_backend=(str(search_backend) if isinstance(search_backend, str) else "direct"),
-        fetch_backend=(str(fetch_backend) if isinstance(fetch_backend, str) else "direct"),
+        search_backend=normalized_search_backend,
+        fetch_backend=normalized_fetch_backend,
         fetch_fallback_browser=bool(fetch_fallback) if fetch_fallback is not None else True,
         browser_fetch_session_idle_seconds=(
             int(browser_fetch_session_idle) if isinstance(browser_fetch_session_idle, int) else 60
@@ -662,16 +834,135 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
         browser_fetch_headed_fallback_enabled=(
             bool(browser_fetch_headed_fallback)
             if browser_fetch_headed_fallback is not None
-            else False
+            else True
         ),
         tavily_configured=tavily_configured,
+        tavily_enabled=tavily_enabled,
         brave_configured=brave_configured,
+        brave_enabled=brave_enabled,
         searxng_url=str(searxng_url) if isinstance(searxng_url, str) else "",
+        searxng_engines=(str(searxng_engines) if isinstance(searxng_engines, str) else ""),
+        searxng_categories=(str(searxng_categories) if isinstance(searxng_categories, str) else ""),
+        searxng_language=(str(searxng_language) if isinstance(searxng_language, str) else ""),
         searxng_configured=searxng_configured,
+        searxng_enabled=searxng_enabled,
         available_backends=available_union,
         available_search_backends=available_search,
         available_fetch_backends=available_fetch,
     )
+
+
+@router.put(
+    "/api/v1/web-config/backends/{backend}",
+    response_model=WebConfigStatusResponse,
+)
+async def web_backend_update(
+    request: Request,
+    backend: str,
+    payload: WebBackendUpdateRequest,
+) -> WebConfigStatusResponse:
+    """Update one optional web backend while preserving runtime-safe invariants."""
+    user = require_admin(request)
+    if backend not in {"tavily", "brave", "searxng"}:
+        raise api_exception(404, "not_found", "Web backend not found")
+    if payload.remove_configuration and payload.enabled:
+        raise api_exception(
+            400,
+            "validation_error",
+            "A removed backend configuration cannot remain enabled",
+        )
+
+    secrets_provider = getattr(request.app.state.providers, "secrets", None)
+    secret_name = None
+    secret_configured = False
+    if backend != "searxng":
+        secret_name = f"{backend}_api_key"
+        if secrets_provider is None:
+            raise api_exception(503, "provider_unavailable", "Secrets provider is unavailable")
+        try:
+            await secrets_provider.get_secret(secret_name, SYSTEM_USER_EMAIL)
+            secret_configured = True
+        except KeyError:
+            pass
+        except Exception as exc:
+            raise api_exception(
+                503,
+                "provider_unavailable",
+                "Unable to read web backend credentials",
+            ) from exc
+        api_key = (payload.api_key or "").strip()
+        if payload.enabled and not secret_configured and not api_key:
+            raise api_exception(
+                400,
+                "validation_error",
+                f"{backend.title()} requires an API key before it can be enabled",
+            )
+    else:
+        api_key = ""
+
+    async with request.app.state.session_factory() as session:
+        from cognis.store.queries import get_setting_value
+
+        updates: dict[str, object] = {f"web.{backend}_enabled": payload.enabled}
+        if backend == "searxng":
+            for key, submitted in (
+                ("web.searxng_url", payload.searxng_url),
+                ("web.searxng_engines", payload.searxng_engines),
+                ("web.searxng_categories", payload.searxng_categories),
+                ("web.searxng_language", payload.searxng_language),
+            ):
+                current = await get_setting_value(session, key, "")
+                if payload.remove_configuration:
+                    updates[key] = ""
+                elif submitted is not None:
+                    updates[key] = submitted.strip()
+                else:
+                    updates[key] = current if isinstance(current, str) else ""
+            if payload.enabled and not str(updates["web.searxng_url"]).strip():
+                raise api_exception(
+                    400,
+                    "validation_error",
+                    "SearXNG requires an instance URL before it can be enabled",
+                )
+
+        if not payload.enabled:
+            for key in ("web.backend", "web.search_backend", "web.fetch_backend"):
+                current = await get_setting_value(session, key, "direct")
+                if current == backend:
+                    updates[key] = "direct"
+
+        for key, value in updates.items():
+            await upsert_setting(
+                session,
+                key=key,
+                value=value,
+                category=get_setting_spec(key).category,
+                updated_by=user.email,
+            )
+        await session.commit()
+
+    # Apply credential mutations only after the settings transaction succeeds.
+    # A failed secret operation therefore leaves the backend disabled or
+    # unavailable rather than exposing a disabled credential to execution.
+    if secret_name is not None:
+        if payload.remove_configuration:
+            await secrets_provider.delete_secret(
+                secret_name,
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                agent_id=None,
+            )
+        elif api_key:
+            await secrets_provider.set_secret(
+                secret_name,
+                api_key,
+                SYSTEM_USER_EMAIL,
+                scope="system",
+                agent_id=None,
+                description=f"API key for {backend.title()}",
+            )
+
+    return await web_config_status(request)
 
 
 @router.get("/api/v1/llm-providers", response_model=CursorPage[LLMProviderResponse])
@@ -718,6 +1009,31 @@ def _require_provider_manager(request: Request, provider_owner_email: str) -> An
     return user
 
 
+def _llm_provider_preview_requires_admin(
+    *,
+    saved_provider_location: str | None,
+    saved_provider_preset: str | None,
+    preset: str,
+    location: str,
+    has_auth_override: bool,
+) -> bool:
+    """Return whether provider preview discovery needs admin privileges.
+
+    Existing provider managers may use preview discovery only for the safe
+    executor-Ollama case needed to apply current form executor selector values.
+    Auth overrides stay admin-only because preview discovery can resolve
+    controller env vars/secrets before making outbound provider requests.
+    """
+
+    return not (
+        saved_provider_location == "executor"
+        and str(saved_provider_preset or "").strip().lower() == "ollama"
+        and preset.strip().lower() == "ollama"
+        and location == "executor"
+        and not has_auth_override
+    )
+
+
 async def _require_visible_provider_manager(
     request: Request, provider_id: str
 ) -> tuple[Any, Any, str]:
@@ -729,6 +1045,111 @@ async def _require_visible_provider_manager(
     owner_email = provider.owner_email or SYSTEM_USER_EMAIL
     manager = _require_provider_manager(request, owner_email)
     return provider, manager, owner_email
+
+
+async def _provider_deployment_ids(session: Any, provider_id: str) -> list[str]:
+    result = await session.execute(
+        select(LocalModelDeployment.deployment_id)
+        .where(LocalModelDeployment.provider_id == provider_id)
+        .order_by(LocalModelDeployment.deployment_id.asc())
+    )
+    return [str(value) for value in result.scalars().all()]
+
+
+async def _guard_local_provider_update(
+    session: Any,
+    existing: LLMProvider,
+    *,
+    next_owner_email: str,
+    next_location: str,
+    next_config: dict[str, Any],
+    next_status: str,
+) -> None:
+    existing_config = existing.config if isinstance(existing.config, dict) else {}
+    routing_changed = (
+        next_owner_email != (existing.owner_email or SYSTEM_USER_EMAIL)
+        or next_location != existing.location
+        or next_status != existing.status
+        or next_config.get("preset") != existing_config.get("preset")
+        or next_config.get("executor_id") != existing_config.get("executor_id")
+        or next_config.get("executor_labels") != existing_config.get("executor_labels")
+    )
+    deployment_ids = await _provider_deployment_ids(session, existing.provider_id)
+    if routing_changed and existing.managed_local_key is not None:
+        raise api_exception(
+            409,
+            "local_model_dependencies",
+            "Cognis-managed local provider routing is immutable",
+            details={"deployment_ids": deployment_ids},
+        )
+    if not deployment_ids:
+        return
+    active_operation = (
+        await session.execute(
+            select(LocalModelOperation.operation_id)
+            .where(
+                LocalModelOperation.deployment_id.in_(deployment_ids),
+                LocalModelOperation.state.in_(
+                    ["queued", "running", "cancel_requested", "interrupted"]
+                ),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if routing_changed and active_operation is not None:
+        raise api_exception(
+            409,
+            "local_model_dependencies",
+            "cannot change provider routing while local-model operations are active",
+            details={"deployment_ids": deployment_ids},
+        )
+    if not routing_changed:
+        return
+
+    from cognis.core.local_model_providers import LocalModelProviderResolver
+    from cognis.core.local_model_service import resolve_authorized_deployment_executors
+
+    proposed = LLMProvider(
+        provider_id=existing.provider_id,
+        display_name=existing.display_name,
+        location=next_location,
+        backend=existing.backend,
+        owner_email=next_owner_email,
+        config=next_config,
+        status=next_status,
+    )
+    deployments = (
+        await session.execute(
+            select(LocalModelDeployment).where(
+                LocalModelDeployment.deployment_id.in_(deployment_ids)
+            )
+        )
+    ).scalars()
+    for deployment in deployments:
+        shared = deployment.owner_email == SYSTEM_USER_EMAIL
+        owner = await session.get(User, deployment.owner_email)
+        owner_role = owner.role if owner is not None else ("admin" if shared else "user")
+        resolved = await LocalModelProviderResolver().resolve(
+            session,
+            proposed,
+            actor_email=deployment.owner_email,
+            actor_role=owner_role,
+            shared=shared,
+        )
+        provider_host_ids = (
+            {row.executor_id for row in resolved.hosts} if resolved is not None else set()
+        )
+        target_ids = {
+            row.executor_id
+            for row in await resolve_authorized_deployment_executors(session, deployment)
+        }
+        if not target_ids or not target_ids.issubset(provider_host_ids):
+            raise api_exception(
+                409,
+                "local_model_dependencies",
+                "provider routing would exclude referenced deployment targets",
+                details={"deployment_ids": deployment_ids},
+            )
 
 
 @router.post("/api/v1/llm-providers", response_model=LLMProviderResponse)
@@ -743,6 +1164,12 @@ async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> 
         existing = await get_llm_provider(session, provider_id)
         if existing is not None:
             raise api_exception(409, "conflict", "LLM provider already exists")
+        await _validate_provider_executor_eligibility(
+            session,
+            location=payload.location,
+            config=payload.config,
+            owner_email=owner_email,
+        )
         row = await create_llm_provider(
             session,
             provider_id=provider_id,
@@ -776,6 +1203,7 @@ async def llm_provider_update(
 ) -> LLMProviderResponse:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
+        await lock_local_model_dispatch_guard(session)
         existing = await get_visible_llm_provider(session, provider_id, user.email)
         if existing is None:
             raise api_exception(404, "not_found", "LLM provider not found")
@@ -785,9 +1213,28 @@ async def llm_provider_update(
         next_config = dict(payload.config or existing.config or {})
         if payload.owner_scope is not None:
             next_config["scope"] = "system" if next_owner_email == SYSTEM_USER_EMAIL else "user"
-        _validate_llm_provider_payload(
-            payload.location if payload.location is not None else existing.location,
-            next_config,
+        next_location = payload.location if payload.location is not None else existing.location
+        _validate_llm_provider_payload(next_location, next_config)
+        existing_config = existing.config if isinstance(existing.config, dict) else {}
+        selector_changed = (
+            next_location != existing.location
+            or next_config.get("executor_id") != existing_config.get("executor_id")
+            or next_config.get("executor_labels") != existing_config.get("executor_labels")
+        )
+        if selector_changed:
+            await _validate_provider_executor_eligibility(
+                session,
+                location=next_location,
+                config=next_config,
+                owner_email=next_owner_email,
+            )
+        await _guard_local_provider_update(
+            session,
+            existing,
+            next_owner_email=next_owner_email,
+            next_location=payload.location if payload.location is not None else existing.location,
+            next_config=next_config,
+            next_status=payload.status if payload.status is not None else existing.status,
         )
         ok = await update_llm_provider(
             session,
@@ -826,11 +1273,20 @@ async def llm_provider_update(
 async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, bool]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
+        await lock_local_model_dispatch_guard(session)
         existing = await get_visible_llm_provider(session, provider_id, user.email)
         if existing is None:
             raise api_exception(404, "not_found", "LLM provider not found")
         owner_email = existing.owner_email or SYSTEM_USER_EMAIL
         _require_provider_manager(request, owner_email)
+        deployment_ids = await _provider_deployment_ids(session, provider_id)
+        if deployment_ids:
+            raise api_exception(
+                409,
+                "local_model_dependencies",
+                "cannot delete a provider referenced by local-model deployments",
+                details={"deployment_ids": deployment_ids},
+            )
         ok = await delete_llm_provider(session, provider_id)
         await session.commit()
     return {"ok": ok}
@@ -1024,13 +1480,45 @@ async def llm_provider_codex_usage(request: Request, provider_id: str) -> CodexU
 @router.post("/api/v1/llm-providers/discover-models-preview")
 async def llm_provider_discover_models_preview(request: Request) -> dict[str, Any]:
     """Discover models without a saved provider (preview mode)."""
-    require_admin(request)
     body = await request.json()
+    provider_id = body.get("provider_id") if isinstance(body.get("provider_id"), str) else None
     preset = str(body.get("preset", ""))
     base_url = str(body.get("base_url", ""))
     api_key = body.get("api_key") or None
     secret_name = body.get("secret_name") or None
     env_var = body.get("env_var") or None
+    location = str(body.get("location", "controller"))
+    has_auth_override = bool(api_key or secret_name or env_var)
+    saved_provider_location: str | None = None
+    saved_provider_preset: str | None = None
+    if provider_id:
+        saved_provider, _, _ = await _require_visible_provider_manager(request, provider_id)
+        saved_provider_location = saved_provider.location
+        saved_provider_config = dict(saved_provider.config or {})
+        saved_provider_preset = str(saved_provider_config.get("preset", ""))
+    if _llm_provider_preview_requires_admin(
+        saved_provider_location=saved_provider_location,
+        saved_provider_preset=saved_provider_preset,
+        preset=preset,
+        location=location,
+        has_auth_override=has_auth_override,
+    ):
+        require_admin(request)
+    executor_id = body.get("executor_id") if isinstance(body.get("executor_id"), str) else None
+    raw_executor_labels = body.get("executor_labels")
+    if raw_executor_labels is not None and not isinstance(raw_executor_labels, dict):
+        raise api_exception(
+            400,
+            "validation_error",
+            "Executor-routed provider executor_labels must be an object",
+        )
+    executor_labels = raw_executor_labels if isinstance(raw_executor_labels, dict) else None
+    preview_config: dict[str, Any] = {"preset": preset}
+    if executor_id:
+        preview_config["executor_id"] = executor_id
+    if raw_executor_labels is not None:
+        preview_config["executor_labels"] = raw_executor_labels
+    _validate_llm_provider_payload(location, preview_config)
     try:
         models = await request.app.state.providers.llm.discover_models_preview(
             preset=preset,
@@ -1038,6 +1526,9 @@ async def llm_provider_discover_models_preview(request: Request) -> dict[str, An
             api_key=api_key,
             secret_name=secret_name,
             env_var=env_var,
+            location=location,
+            executor_id=executor_id,
+            executor_labels=executor_labels,
         )
     except Exception as exc:
         raise api_exception(

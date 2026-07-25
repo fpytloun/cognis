@@ -22,6 +22,7 @@ const STATIC_SLASH_COMMANDS: StaticSlashCommand[] = [
   { command: '/executor', description: 'Show or switch active executor', acceptsArgument: true, parameterSuggestions: true },
   { command: '/context', description: 'Show context usage' },
   { command: '/info', description: 'Show session details' },
+  { command: '/benchmark', description: 'Run a local-runtime benchmark', acceptsArgument: true, parameterSuggestions: true },
   { command: '/lsp', description: 'Show LSP diagnostics status' },
   { command: '/plan', description: 'Plan/read-only mode; add text for one-shot planning', acceptsArgument: true },
   { command: '/build', description: 'Build/implementation mode; add text for one-shot build', acceptsArgument: true },
@@ -67,7 +68,8 @@ const PREFIX_SYSTEM_COMMANDS = new Set([
   '/retry',
   '/continue',
   '/stop',
-  '/cancel'
+  '/cancel',
+  '/benchmark'
 ]);
 
 export function normalizeSlashCommandInput(value: string): string {

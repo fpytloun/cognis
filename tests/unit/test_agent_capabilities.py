@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cognis.models.agent import AgentCapabilities, AgentDefinition
-from cognis.providers.backends import get_backend, list_backends
+from cognis.providers.backends import get_backend, list_backends, resolve_agent_backends
+from cognis.store.models import Agent
 
 # ---------------------------------------------------------------------------
 # AgentCapabilities model
@@ -29,8 +30,41 @@ class TestAgentCapabilities:
         assert cap.guardrails_enabled is False
 
     def test_invalid_memory_backend(self) -> None:
-        with pytest.raises(ValueError, match="Unknown memory_backend"):
-            AgentCapabilities(memory_backend="invalid")
+        with pytest.raises(ValueError, match="non-empty trimmed"):
+            AgentCapabilities(memory_backend=" ")
+
+    def test_unavailable_memory_backend_is_preserved_for_fail_closed_reads(self) -> None:
+        capabilities = AgentCapabilities(
+            memory_backend="future-memory",
+            memory_backend_options={"future_option": True},
+        )
+
+        assert capabilities.memory_backend == "future-memory"
+        assert capabilities.memory_backend_options == {"future_option": True}
+        assert capabilities.memory_enabled is False
+
+    def test_registry_row_preserves_unavailable_memory_backend(self) -> None:
+        from cognis.core.agent_registry import _row_to_definition
+
+        row = Agent(
+            agent_id="future-agent",
+            owner_email="owner@example.com",
+            name="Future agent",
+            agent_type="primary",
+            is_system=False,
+            hidden=False,
+            status="active",
+            capabilities={
+                "memory_backend": "future-memory",
+                "memory_backend_options": {"future_option": True},
+                "guardrails_backend": "intaris",
+            },
+        )
+
+        definition = _row_to_definition(row)
+
+        assert definition.capabilities.memory_backend == "future-memory"
+        assert definition.capabilities.memory_backend_options == {"future_option": True}
 
     def test_invalid_guardrails_backend(self) -> None:
         with pytest.raises(ValueError, match="Unknown guardrails_backend"):
@@ -97,6 +131,24 @@ class TestBackendRegistry:
         backend = get_backend("memory", "none")
         result = backend.factory(mock_config, mock_registry)
         assert isinstance(result, NullMemoryProvider)
+
+    def test_unavailable_memory_backend_resolves_to_null_provider(self) -> None:
+        from cognis.providers.backends.memory.null import NullMemoryProvider
+
+        agent = AgentDefinition(
+            agent_id="future-agent",
+            owner_email="owner@example.com",
+            name="Future backend",
+            capabilities=AgentCapabilities(memory_backend="future-memory"),
+        )
+        config = MagicMock(default_memory_backend="mnemory", default_guardrails_backend="intaris")
+        registry = MagicMock()
+        registry.guardrails = MagicMock(name="intaris_provider")
+
+        memory, guardrails = resolve_agent_backends(agent, config, registry)
+
+        assert isinstance(memory, NullMemoryProvider)
+        assert guardrails is registry.guardrails
 
     def test_intaris_backend_returns_registry_guardrails(self) -> None:
         mock_config = MagicMock()
@@ -297,6 +349,39 @@ class TestToolRouterCapabilityGating:
 
         assert result.is_error is True
         assert "Memory backend is disabled" in result.output
+        memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_memory_tool_rejected_when_turn_policy_disables_tools(self) -> None:
+        from cognis.core.tool_router import ToolRouter
+        from cognis.models.tool import ToolCall
+        from cognis.tools.registry import ToolRegistry
+
+        memory = MagicMock()
+        router = ToolRouter(guardrails=MagicMock(), memory=memory)
+        agent = AgentDefinition(
+            agent_id="test",
+            owner_email="test@example.com",
+            name="Test",
+        )
+        session = MagicMock(session_id="sess_1", user_email="test@example.com")
+        tool_call = ToolCall(
+            call_id="call_1",
+            name="memory_search",
+            arguments={"query": "test"},
+            runtime_metadata={"memory_policy_enabled": False},
+        )
+
+        result = await router.execute(
+            tool_call,
+            session,
+            agent,
+            ToolRegistry(),
+            executor=MagicMock(),
+        )
+
+        assert result.is_error is True
+        assert "effective turn policy" in result.output
         memory.assert_not_called()
 
     @pytest.mark.asyncio

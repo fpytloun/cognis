@@ -13,7 +13,12 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition, AgentLLMConfig, AgentPermissions
+from cognis.models.agent import (
+    AgentDefinition,
+    AgentLLMConfig,
+    AgentPermissions,
+    AgentRuntimeProfile,
+)
 from cognis.ownership import normalize_executor_scope
 from cognis.store.queries import (
     get_agent,
@@ -100,6 +105,8 @@ You are a focused implementation agent for software engineering tasks.
 ## Instructions
 
 - Make the smallest correct change that solves the task.
+- Work one bounded implementation scope and use granular todos for implementation,
+  test, and acceptance steps.
 - Prefer direct execution over extended discussion.
 - Read enough context to act correctly, but avoid unnecessary exploration.
 - For non-trivial changes, form a short plan before editing.
@@ -126,7 +133,7 @@ You are a focused implementation agent for software engineering tasks.
   the issue and rerun the relevant check. If a check is unavailable or fails
   for an unrelated pre-existing reason, report that clearly with evidence.
 - Stay within scope. Do not broaden the task without a clear reason.
-- Do not delegate further. If the task would be better handled as broader
+- Do not delegate implementation work further. If the task would be better handled as broader
   background work, return that recommendation to the caller instead.
 
 ## Output
@@ -145,6 +152,7 @@ can use git read-only commands to examine status and obtain diffs.
 ## Critical Instructions
 
 - Review ONLY the modified code shown in the diff, NOT existing unchanged code.
+- Stay locked to the approved review scope and acceptance criteria.
 - Output ONLY the final review in the exact format specified below.
 - Do NOT write any files.
 - Do NOT execute any shell commands other than read-only, non-destructive
@@ -160,6 +168,8 @@ can use git read-only commands to examine status and obtain diffs.
 - Do not nitpick style or architecture unless the change clearly violates
   established project conventions or creates a maintenance problem.
 - Do not invent hypothetical issues. Be specific about the scenario that breaks.
+- Treat an issue as blocking only when it is a concrete bug, regression, security
+  or data-loss risk, or violation of approved acceptance criteria.
 - If you are unsure whether something is a real issue, investigate further or
   say that you are unsure instead of flagging it as definite.
 
@@ -214,6 +224,8 @@ implementation plan.
 - Review the plan provided and only the referenced context.
 - Do NOT invent requirements. If information is missing, say exactly what is missing.
 - Be rigorous but proportional to scope.
+- Check that observable workstreams and milestones are decomposed proportionally;
+  plain bullets are sufficient and labels or hierarchy are optional when useful.
 - For small, localized, low-risk changes, prefer APPROVE or APPROVE WITH CHANGES
   when implementation can proceed safely.
 - Use REQUEST REWORK when missing or incorrect decisions would likely cause the
@@ -786,6 +798,13 @@ class AgentRegistry:
             effective.tools = row.tools_override
         if isinstance(row.permissions_override, dict):
             effective.permissions = AgentPermissions.model_validate(row.permissions_override)
+        if isinstance(row.agent_profiles_override, dict):
+            effective.agent_profiles = {
+                profile_id: AgentRuntimeProfile.model_validate(profile)
+                for profile_id, profile in row.agent_profiles_override.items()
+            }
+        if row.default_agent_profile_id_override:
+            effective.default_agent_profile_id = row.default_agent_profile_id_override
         return effective
 
     async def list_secondary_bindings(self, primary_agent_id: str) -> list[str]:

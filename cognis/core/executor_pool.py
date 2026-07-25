@@ -442,16 +442,16 @@ def tool_observed_on(target: ResolvedExecutorTarget, tool_name: str) -> bool:
     """Return whether ``tool_name`` is observed on ``target`` and enabled."""
 
     from cognis.core.executor_resolution import is_tool_enabled
-    from cognis.models.tool import ToolDefinition, ToolSource
+    from cognis.models.tool import NativeToolDefinition, ToolSource
 
     if not target.usable:
         return False
     # Build a minimal stub for is_tool_enabled which just needs name + category
-    stub = ToolDefinition(
+    stub = NativeToolDefinition(
         name=tool_name,
         description="",
         category="",
-        input_schema={"type": "object"},
+        parameters={"type": "object"},
         source=ToolSource(type="executor"),
     )
     if not is_tool_enabled(stub, target.enabled_tools, target.enabled_tool_groups):

@@ -12,7 +12,42 @@ _OPENAI_PRESETS = {"openai", "openai_compatible", "litellm_proxy", "azure", "cha
 _GOOGLE_PRESETS = {"gemini", "google", "vertex_ai"}
 _ANTHROPIC_MIN_VISIBLE_OUTPUT_TOKENS = 4096
 _MIN_ANTHROPIC_MAX_TOKENS = 2048
-_THINKING_EFFORT_ORDER: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
+_ANTHROPIC_ADAPTIVE_MODEL_KEYS = frozenset(
+    {
+        "fable-5",
+        "mythos-5",
+        "mythos-preview",
+        "opus-4-6",
+        "opus-4-7",
+        "opus-4-8",
+        "sonnet-4-6",
+        "sonnet-5",
+    }
+)
+_ANTHROPIC_LEGACY_MODEL_KEYS = frozenset(
+    {
+        "3-5-haiku",
+        "3-7-sonnet",
+        "haiku-3-5",
+        "haiku-4-5",
+        "opus-4",
+        "opus-4-1",
+        "opus-4-5",
+        "sonnet-4",
+        "sonnet-4-5",
+    }
+)
+_ANTHROPIC_ALWAYS_ON_MODEL_KEYS = frozenset({"fable-5", "mythos-5", "mythos-preview"})
+_ANTHROPIC_XHIGH_MODEL_KEYS = frozenset({"fable-5", "mythos-5", "opus-4-7", "opus-4-8", "sonnet-5"})
+_THINKING_EFFORT_ORDER: tuple[str, ...] = (
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
 _ANTHROPIC_THINKING_BUDGETS: dict[str, int] = {
     "low": 2048,
     "medium": 8192,
@@ -178,15 +213,27 @@ def build_reasoning_profile(
 
     family = detect_reasoning_family(model_id, provider_preset=provider_preset)
     preset_family = _family_from_provider_preset(provider_preset)
-    if family in {"unsupported", "generic"} and preset_family is not None:
+    if (
+        family in {"unsupported", "generic"}
+        and preset_family is not None
+        and (
+            preset_family != "anthropic"
+            or any(
+                _is_known_anthropic_reasoning_model(candidate)
+                for candidate in _candidate_model_names(model_id, model_info)
+            )
+        )
+    ):
         family = preset_family
     if family == "anthropic" and _looks_like_adaptive_anthropic_model(model_id, model_info):
         family = "anthropic_adaptive"
 
     if family == "openai":
-        positive = ["low", "medium", "high"]
-        if _supports_openai_xhigh(model_id, model_info):
-            positive.append("xhigh")
+        positive = _positive_model_info_reasoning_efforts(model_info)
+        if not positive:
+            positive = ["low", "medium", "high"]
+            if _supports_openai_xhigh(model_id, model_info):
+                positive.append("xhigh")
         available = ["default"]
         if _supports_openai_none(model_id, model_info):
             available.append("none")
@@ -203,46 +250,49 @@ def build_reasoning_profile(
         if _supports_anthropic_xhigh(model_id, model_info):
             positive.append("xhigh")
         positive.append("max")
-        available = ("default", "none", *positive)
+        adaptive_available = ["default"]
+        if _supports_anthropic_disabled(model_id, model_info):
+            adaptive_available.append("none")
+        adaptive_available.extend(positive)
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
-            available_efforts=available,
-            native_efforts=tuple(level for level in available if level != "default"),
+            available_efforts=tuple(adaptive_available),
+            native_efforts=tuple(level for level in adaptive_available if level != "default"),
         )
 
     if family == "anthropic":
-        available = ("default", "none", "low", "medium", "high", "max")
+        legacy_anthropic_available = ("default", "none", "low", "medium", "high", "max")
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
-            available_efforts=available,
+            available_efforts=legacy_anthropic_available,
             native_efforts=("none", "low", "medium", "high", "max"),
         )
 
     if family == "google":
-        available = ("default", "none", "low", "medium", "high", "max")
+        google_available = ("default", "none", "low", "medium", "high", "max")
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
-            available_efforts=available,
+            available_efforts=google_available,
             native_efforts=("none", "low", "medium", "high", "max"),
         )
 
     if family == "generic":
-        available = ("default", "none", "low", "medium", "high")
+        generic_available = ("default", "none", "low", "medium", "high")
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
-            available_efforts=available,
+            available_efforts=generic_available,
             native_efforts=("none", "low", "medium", "high"),
         )
     if family == "groq":
-        available = ("default", "none", "low", "medium", "high")
+        groq_available = ("default", "none", "low", "medium", "high")
         return ReasoningProfile(
             family=family,
             supports_reasoning=True,
-            available_efforts=available,
+            available_efforts=groq_available,
             native_efforts=("low", "medium", "high"),
         )
 
@@ -299,9 +349,31 @@ def apply_reasoning_config(
     else:
         translated_max_tokens = False
 
-    requested = normalize_reasoning_effort(
-        _coerce_reasoning_value(result.pop("reasoning_effort", None))
-    )
+    had_reasoning_effort = "reasoning_effort" in result
+    raw_reasoning_effort = result.pop("reasoning_effort", None)
+    requested = normalize_reasoning_effort(_coerce_reasoning_value(raw_reasoning_effort))
+    if profile.family in {"anthropic", "anthropic_adaptive"} and "thinking" in result:
+        # A native Anthropic thinking object is authoritative. The generic
+        # Cognis effort shorthand must never rewrite it, but provider
+        # compatibility cleanup and manual-budget validation still apply.
+        thinking = result.get("thinking")
+        thinking_type = thinking.get("type") if isinstance(thinking, dict) else None
+        if profile.family == "anthropic_adaptive" or thinking_type in {"adaptive", "enabled"}:
+            stripped_params = _strip_sampling_params(result)
+        if thinking_type == "enabled":
+            result = _enforce_anthropic_thinking_budget(result, model_info=model_info)
+        return PreparedReasoningConfig(
+            request_kwargs=result,
+            family=profile.family,
+            stripped_params=tuple(stripped_params),
+            translated_max_tokens=translated_max_tokens,
+        )
+    if (
+        requested is None
+        and (not had_reasoning_effort or raw_reasoning_effort is None)
+        and profile.family == "anthropic_adaptive"
+    ):
+        requested = "default"
     if requested is None:
         if _is_openai_reasoning_model(model_id):
             stripped_params = _strip_sampling_params(result)
@@ -319,6 +391,14 @@ def apply_reasoning_config(
             translated_max_tokens=translated_max_tokens,
         )
 
+    if profile.family == "unsupported" and requested != "default":
+        raise ValueError(f"Reasoning effort {requested!r} is not supported by model {model_id!r}")
+    if profile.family == "anthropic_adaptive" and requested not in profile.available_efforts:
+        available = ", ".join(profile.available_efforts)
+        raise ValueError(
+            f"Reasoning effort {requested!r} is not supported by Anthropic model "
+            f"{model_id!r}; available levels: {available}"
+        )
     resolved = _resolve_requested_effort(requested, profile)
     stripped_params = _strip_sampling_params(result)
     effective = _apply_resolved_effort(result, resolved=resolved, profile=profile)
@@ -355,9 +435,10 @@ def _supports_reasoning(
     provider_preset: str,
 ) -> bool:
     if model_info is not None:
-        if model_info.supports_reasoning:
+        if getattr(model_info, "supports_reasoning", False):
             return True
-        if model_info.model_id == model_id and model_info.model_id != "unknown":
+        info_model_id = getattr(model_info, "model_id", "unknown")
+        if info_model_id == model_id and info_model_id != "unknown":
             return False
     return _looks_like_reasoning_model(model_id, provider_preset)
 
@@ -431,74 +512,83 @@ def _candidate_model_names(model_id: str, model_info: ModelInfo | None) -> list[
 
 def _is_known_anthropic_reasoning_model(normalized_model: str) -> bool:
     return any(
-        token in normalized_model
-        for token in (
-            "fable-5",
-            "haiku-3-5",
-            "haiku-3.5",
-            "haiku-4",
-            "mythos-5",
-            "sonnet-5",
-            "claude-3-7",
-            "sonnet-4",
-            "sonnet-4.5",
-            "sonnet-4-5",
-            "sonnet-4-6",
-            "sonnet-4.6",
-            "opus-4",
-            "opus-4.5",
-            "opus-4-5",
-            "opus-4-6",
-            "opus-4.6",
-            "opus-4-7",
-            "opus-4.7",
-            "opus-4-8",
-            "opus-4.8",
-        )
+        _matches_anthropic_model_key(normalized_model, key)
+        for key in _ANTHROPIC_ADAPTIVE_MODEL_KEYS | _ANTHROPIC_LEGACY_MODEL_KEYS
     )
 
 
-def _anthropic_series_version(model_name: str) -> tuple[str, int, int | None] | None:
-    normalized = model_name.lower().replace("_", "-")
-    match = re.search(
-        r"(fable|mythos|opus|sonnet)[\s-]+(\d+)(?:[.-](\d+))?",
-        normalized,
-    )
-    if match is None:
-        return None
-    family = match.group(1)
-    major = int(match.group(2))
-    raw_minor = match.group(3)
-    minor = int(raw_minor) if raw_minor is not None and len(raw_minor) <= 2 else None
-    return family, major, minor
+def looks_like_anthropic_reasoning_model(model_id: str) -> bool:
+    """Return whether a model ID matches a documented Anthropic reasoning model."""
+
+    return _is_known_anthropic_reasoning_model(_normalize_model_name(model_id))
+
+
+def _normalized_anthropic_candidate(model_name: str) -> str:
+    return re.sub(r"[\s._/]+", "-", model_name.strip().lower())
+
+
+def _matches_anthropic_model_key(candidate: str, key: str) -> bool:
+    normalized = _normalized_anthropic_candidate(candidate)
+    for prefix in (f"claude-{key}", key):
+        start = 0
+        while True:
+            index = normalized.find(prefix, start)
+            if index < 0:
+                break
+            before = normalized[index - 1] if index > 0 else ""
+            if before and before.isalnum():
+                start = index + 1
+                continue
+            suffix = normalized[index + len(prefix) :]
+            if (
+                not suffix
+                or suffix == "-alias"
+                or re.fullmatch(r"-\d{8}(?:-[a-z0-9:-]+)?", suffix)
+                or re.fullmatch(r"-v\d+(?::\d+)?", suffix)
+            ):
+                return True
+            start = index + 1
+    return False
+
+
+def _adaptive_anthropic_model_key(model_id: str, model_info: ModelInfo | None) -> str | None:
+    for candidate in _candidate_model_names(model_id, model_info):
+        for key in _ANTHROPIC_ADAPTIVE_MODEL_KEYS:
+            if _matches_anthropic_model_key(candidate, key):
+                return key
+    return None
 
 
 def _looks_like_adaptive_anthropic_model(model_id: str, model_info: ModelInfo | None) -> bool:
-    for candidate in _candidate_model_names(model_id, model_info):
-        version = _anthropic_series_version(candidate)
-        if version is None:
-            continue
-        _, major, minor = version
-        if major > 4:
-            return True
-        if major == 4 and minor is not None and minor >= 6:
-            return True
-    return False
+    return _adaptive_anthropic_model_key(model_id, model_info) is not None
 
 
 def _supports_anthropic_xhigh(model_id: str, model_info: ModelInfo | None) -> bool:
-    for candidate in _candidate_model_names(model_id, model_info):
-        version = _anthropic_series_version(candidate)
-        if version is None:
-            continue
-        family, major, minor = version
-        if family != "opus":
-            continue
-        if major > 4:
-            return True
-        if major == 4 and minor is not None and minor >= 7:
-            return True
-    return False
+    return _adaptive_anthropic_model_key(model_id, model_info) in _ANTHROPIC_XHIGH_MODEL_KEYS
+
+
+def _supports_anthropic_disabled(model_id: str, model_info: ModelInfo | None) -> bool:
+    key = _adaptive_anthropic_model_key(model_id, model_info)
+    return key is not None and key not in _ANTHROPIC_ALWAYS_ON_MODEL_KEYS
+
+
+def reasoning_mode_for_model(
+    model_id: str,
+    *,
+    model_info: ModelInfo | None = None,
+    requested_effort: str | None = None,
+) -> str | None:
+    """Return observable Anthropic reasoning mode for runtime metadata."""
+
+    if not _supports_reasoning(model_info, model_id, "anthropic"):
+        return None
+    key = _adaptive_anthropic_model_key(model_id, model_info)
+    if key is None:
+        return None
+    requested = normalize_reasoning_effort(requested_effort)
+    if requested == "none":
+        return "disabled" if key not in _ANTHROPIC_ALWAYS_ON_MODEL_KEYS else None
+    return "adaptive"
 
 
 def _looks_like_gpt5_candidate(model_name: str) -> bool:
@@ -518,6 +608,18 @@ def _supports_openai_xhigh(model_id: str, model_info: ModelInfo | None) -> bool:
         _looks_like_gpt5_candidate(candidate)
         for candidate in _candidate_model_names(model_id, model_info)
     )
+
+
+def _positive_model_info_reasoning_efforts(model_info: ModelInfo | None) -> list[str]:
+    if model_info is None:
+        return []
+    values: list[str] = []
+    for raw_effort in model_info.reasoning_efforts:
+        effort = normalize_reasoning_effort(raw_effort)
+        if effort is None or effort in {"default", "none"} or effort in values:
+            continue
+        values.append(effort)
+    return values
 
 
 def _family_from_provider_preset(provider_preset: str) -> str | None:
@@ -580,7 +682,12 @@ def _apply_resolved_effort(
         if profile.family == "google":
             request_kwargs["thinking_config"] = {"thinking_budget": 0}
             return "none"
-        if profile.family in {"anthropic", "anthropic_adaptive"}:
+        if profile.family == "anthropic_adaptive":
+            request_kwargs["thinking"] = {"type": "disabled"}
+            request_kwargs.pop("thinking_config", None)
+            _remove_output_config_effort(request_kwargs)
+            return "none"
+        if profile.family == "anthropic":
             request_kwargs.pop("thinking", None)
             request_kwargs.pop("thinking_config", None)
             _remove_output_config_effort(request_kwargs)
@@ -613,7 +720,7 @@ def _apply_resolved_effort(
         if resolved == "none" and resolved not in profile.native_efforts:
             request_kwargs.pop("reasoning_effort", None)
             return None
-        mapped = "high" if resolved in {"xhigh", "max"} else resolved
+        mapped = "high" if resolved in {"xhigh", "max", "ultra"} else resolved
         request_kwargs["reasoning_effort"] = mapped
         return mapped
     return None

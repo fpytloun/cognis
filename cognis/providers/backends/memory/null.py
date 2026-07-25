@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from cognis.models.config import ProviderHealth
 from cognis.providers.backends import register_backend
+from cognis.providers.memory.policy import MemoryRuntimePolicy, disabled_memory_policy
 
 if TYPE_CHECKING:
     from cognis.config import CognisConfig
@@ -118,6 +119,36 @@ class NullMemoryProvider:
         return
 
 
-@register_backend(kind="memory", id="none", display_name="No memory")
+class NoMemoryOptions:
+    """Descriptor contract for the hard-disabled memory backend."""
+
+    defaults: dict[str, Any] = {}
+    modes: tuple[Any, ...] = ()
+
+    def validate_options(self, options: object) -> dict[str, Any]:
+        if options not in ({}, None):
+            raise ValueError("The none memory backend does not accept options")
+        return {}
+
+    def resolve_policy(
+        self,
+        options: dict[str, Any],
+        *,
+        profile_id: str | None,
+    ) -> MemoryRuntimePolicy:
+        del options
+        return disabled_memory_policy(backend_id="none", profile_id=profile_id)
+
+
+NONE_MEMORY_OPTIONS = NoMemoryOptions()
+
+
+@register_backend(
+    kind="memory",
+    id="none",
+    display_name="None",
+    description="Stateless operation with no memory instructions, recall, tools, or remembering.",
+    memory_options=NONE_MEMORY_OPTIONS,
+)
 def _factory(config: CognisConfig, registry: ProviderRegistry) -> NullMemoryProvider:
     return NullMemoryProvider()

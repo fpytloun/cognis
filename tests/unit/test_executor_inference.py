@@ -10,6 +10,45 @@ from cognis.executor.inference import InferenceHandler
 
 
 @pytest.mark.asyncio
+async def test_discover_models_uses_executor_local_ollama_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+    calls: list[dict[str, object]] = []
+
+    async def fake_discover_ollama_models(**kwargs: object) -> list[dict[str, object]]:
+        calls.append(kwargs)
+        return [{"model_id": "ollama/ornith:9b", "name": "ornith:9b"}]
+
+    monkeypatch.setattr(
+        "cognis.executor.inference.discover_ollama_models",
+        fake_discover_ollama_models,
+    )
+
+    result = await handler.discover_models(
+        preset="ollama",
+        base_url="http://localhost:11434",
+        api_key="",
+    )
+
+    assert result == [{"model_id": "ollama/ornith:9b", "name": "ornith:9b"}]
+    assert calls[0]["base_url"] == "http://localhost:11434"
+    assert calls[0]["api_key"] == ""
+
+
+@pytest.mark.asyncio
+async def test_discover_models_rejects_non_ollama_executor_probe() -> None:
+    handler = InferenceHandler()
+
+    with pytest.raises(ValueError, match="supports Ollama only"):
+        await handler.discover_models(
+            preset="openai",
+            base_url="https://api.openai.com",
+            api_key="",
+        )
+
+
+@pytest.mark.asyncio
 async def test_stream_complete_proxies_litellm(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = InferenceHandler()
 

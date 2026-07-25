@@ -1,6 +1,6 @@
 <script lang="ts">
   import Badge from '$lib/components/ui/Badge.svelte';
-  import type { WorkflowComposedTimelineItem } from '$lib/chat';
+  import type { WorkflowComposedTimelineItem } from '$lib/timeline-render-model';
 
   let { item } = $props<{ item: WorkflowComposedTimelineItem }>();
 </script>

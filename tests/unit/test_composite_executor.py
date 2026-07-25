@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from cognis.core.executor_policy import ExecutorPolicy
 from cognis.models.tool import ExecutorCapabilities, ExecutorConfig, ExecutorHandle
 from cognis.providers.executor.composite import CompositeExecutorProvider
 from cognis.tools.executor.lsp.runtime import LSPStatusConfig, LSPStatusReport, LSPStatusTotals
@@ -90,6 +91,40 @@ async def test_get_executor_routes_by_tracked_type() -> None:
     await composite.get_executor(handle)
     ws.get_executor.assert_called_once_with(handle)
     ip.get_executor.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_policy_change_preserves_existing_runtime_and_blocks_next_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ip = _make_mock_provider("in_process")
+    ws = _make_mock_provider("websocket")
+    sp = _make_mock_provider("subprocess")
+    load_policy = AsyncMock(
+        side_effect=[
+            ExecutorPolicy(allow_in_process=True),
+            ExecutorPolicy(allow_in_process=False),
+        ]
+    )
+    monkeypatch.setattr(
+        "cognis.providers.executor.composite.load_executor_policy",
+        load_policy,
+    )
+    composite = CompositeExecutorProvider(
+        ip,
+        ws,
+        sp,
+        session_factory=MagicMock(),
+    )
+    config = ExecutorConfig(executor_id="test", metadata={"executor_type": "in_process"})
+
+    handle = await composite.spawn(config)
+    await composite.get_executor(handle)
+    with pytest.raises(ValueError, match="disabled by deployment policy"):
+        await composite.spawn(config)
+
+    ip.get_executor.assert_awaited_once_with(handle)
+    assert load_policy.await_count == 2
 
 
 @pytest.mark.asyncio

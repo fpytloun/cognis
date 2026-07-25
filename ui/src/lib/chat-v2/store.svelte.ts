@@ -21,10 +21,16 @@ import {
   applySnapshot,
   applySyncResponse,
   emptyChatV2State,
+  markOptimisticUserMessageFailed,
   visibleTimelineItems,
   type ChatV2ClientState,
   type ChatV2SyncResult
 } from './sync-engine';
+
+export interface ChatV2RefreshWatermark {
+  cursor: string | null;
+  runtimeRevision: number | null;
+}
 
 export class ChatV2Store {
   private _state: ChatV2ClientState = $state.raw(emptyChatV2State());
@@ -34,6 +40,20 @@ export class ChatV2Store {
 
   get snapshot(): ChatV2ClientState {
     return this._state;
+  }
+
+  refreshWatermark(): ChatV2RefreshWatermark {
+    return {
+      cursor: this._state.cursor,
+      runtimeRevision: this._state.runtime?.runtime_revision ?? null
+    };
+  }
+
+  replaceFromSnapshotIfUnchanged(snapshot: ChatSnapshot, watermark: ChatV2RefreshWatermark): boolean {
+    const current = this.refreshWatermark();
+    if (current.cursor !== watermark.cursor || current.runtimeRevision !== watermark.runtimeRevision) return false;
+    this.replaceFromSnapshot(snapshot);
+    return true;
   }
 
   replaceFromSnapshot(snapshot: ChatSnapshot): void {
@@ -49,7 +69,11 @@ export class ChatV2Store {
     this._state = addOptimisticUserMessage(this._state, input);
   }
 
-  addLocalSystemMessage(input: { id: string; content: string; createdAt?: string }): void {
+  markOptimisticUserFailed(clientMessageId: string): void {
+    this._state = markOptimisticUserMessageFailed(this._state, clientMessageId);
+  }
+
+  addLocalSystemMessage(input: { id: string; content: string; noticeId?: string | null; createdAt?: string }): void {
     this._state = addLocalSystemMessage(this._state, input);
   }
 
@@ -91,18 +115,34 @@ export class ChatV2Store {
    * updates.
    *
    * The store owns immutable replacement state and keeps it raw to avoid deep
-   * Svelte proxies over large timeline arrays. A structured clone is enough to
-   * keep cached entries isolated from future replacements.
+   * Svelte proxies over large timeline arrays. Use $state.snapshot instead of
+   * structuredClone so any reactive proxy accidentally injected into local
+   * state is converted to plain data before the browser clone algorithm sees it.
    */
-  serializeState(): ChatV2ClientState {
-    return structuredClone(this._state);
+  serializeState(options: { settleRuntimeOverlay?: boolean } = {}): ChatV2ClientState {
+    const state = $state.snapshot(this._state) as ChatV2ClientState;
+    const runtime = state.runtime;
+    const localItems = state.localItems.filter(
+      (item) => !(item.kind === 'message' && item.role === 'system')
+    );
+    if (!options.settleRuntimeOverlay || !runtime?.has_active_turn) {
+      return { ...state, localItems };
+    }
+    const activeTurnId = runtime.active_turn?.turn_id;
+    return {
+      ...state,
+      localItems,
+      runtime: { ...runtime, has_active_turn: false, active_turn: null, volatile_items: [], cycle_states: [] },
+      cycleStates: state.cycleStates.filter((cycleState) => cycleState.turn_id !== activeTurnId)
+    };
   }
 
   /** Restore client state previously captured via {@link serializeState}. */
   restoreState(state: ChatV2ClientState): void {
     // Deep-copy the cached entry so the restored raw state is not aliased with
-    // the cache.
-    const restored = structuredClone(state);
+    // the cache. $state.snapshot is proxy-safe whether the input is plain data
+    // or a reactive proxy from a caller.
+    const restored = $state.snapshot(state) as ChatV2ClientState;
     this._state = { ...restored, cycleStates: restored.cycleStates ?? [] };
   }
 

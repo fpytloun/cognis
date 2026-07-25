@@ -5,7 +5,7 @@
   import Volume2 from 'lucide-svelte/icons/volume-2';
   import { onMount } from 'svelte';
   import { api } from '$lib/api/client';
-  import type { MessageTimelineItem } from '$lib/chat';
+  import type { MessageTimelineItem } from '$lib/timeline-render-model';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
@@ -16,6 +16,7 @@
   import { now as nowStore } from '$lib/stores/now';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import type { Agent } from '$lib/types/api';
+  import { cancellationOriginLabel } from '$lib/cancellation-reason';
 
   let {
     item,
@@ -52,6 +53,16 @@
     agent ? (agent.display_name ?? agent.name) : runtimeAgentName ?? 'Assistant'
   );
   const agentAvatarUrl = $derived(agent?.avatar_url ?? null);
+  const partialStatusLabel = $derived(
+    item.finishReason === 'user_cancelled'
+      ? cancellationOriginLabel('user')
+      : 'partial'
+  );
+  const partialStatusTitle = $derived(
+    item.finishReason === 'user_cancelled'
+      ? 'Response was stopped by the user before completion'
+      : 'Partial response'
+  );
 
   // Per-message agent profile popover state. Clicking the leading avatar
   // opens a popover with the agent's name, type, and description — the
@@ -117,6 +128,7 @@
     if (runtimeProfileLabel) lines.push(`Agent profile: ${runtimeProfileLabel}`);
     if (runtime?.model) lines.push(`Model: ${runtime.model}`);
     if (runtime?.reasoning_effort) lines.push(`Thinking effort: ${runtime.reasoning_effort}`);
+    if (runtime?.reasoning_mode) lines.push(`Thinking mode: ${runtime.reasoning_mode}`);
     return lines.join('\n');
   });
   const deliveryStatusLabel = $derived(
@@ -198,6 +210,10 @@
     if (!item.content || !item.content.trim()) return;
     ttsBusy = true;
     try {
+      // Must start during the click handler. The synthesis request below
+      // crosses an async boundary and would otherwise lose user activation
+      // on browsers with strict autoplay policies.
+      await audioPlayer.unlock();
       const result = await api.tts.synthesize({
         text: item.content,
         message_id: ttsCacheMessageId,
@@ -465,7 +481,7 @@
             <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${modeBadgeClass()}`} title={item.chatModeSource ?? `${explicitChatMode} mode`}>{explicitChatMode}</span>
           {/if}
           {#if item.partial && !item.streaming}
-            <span class="rounded-full border border-slate-600 bg-slate-800/80 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-slate-300" title={item.finishReason === 'user_cancelled' ? 'Response was stopped by the user before completion' : 'Partial response'}>partial</span>
+            <span class="rounded-full border border-slate-600 bg-slate-800/80 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] text-slate-300" title={partialStatusTitle}>{partialStatusLabel}</span>
           {/if}
           <span class="text-slate-500">·</span>
           <span class="text-slate-400" title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>

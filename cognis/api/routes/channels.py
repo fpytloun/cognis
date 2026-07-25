@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from cognis.api.common import error_response, require_current_user
 from cognis.api.models import ChannelPairingRequestResponse
 from cognis.channels.registry import get_channel_meta, list_channel_types
+from cognis.core.agent_profiles import normalize_agent_profile_id, resolve_agent_profile
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
@@ -203,6 +204,45 @@ async def _validate_default_conversation(
     return None
 
 
+async def _validate_channel_default_profile(
+    request: Request,
+    *,
+    agent_id: str,
+    user_email: str,
+    value: object,
+) -> tuple[str | None, Any | None]:
+    """Validate a channel fallback against its owner-scoped primary agent."""
+
+    from cognis.api.serializers import agent_to_response
+    from cognis.models.agent import AgentDefinition
+    from cognis.store.queries import get_agent
+
+    try:
+        profile_id = normalize_agent_profile_id(value)
+    except ValueError as exc:
+        return None, error_response(400, "validation_error", str(exc))
+
+    async with request.app.state.session_factory() as session:
+        agent_row = await get_agent(session, agent_id)
+    if agent_row is None or agent_row.owner_email != user_email:
+        return None, error_response(404, "not_found", "Agent not found")
+    if getattr(agent_row, "agent_type", "primary") != "primary":
+        return None, error_response(
+            400,
+            "validation_error",
+            "Channel accounts support primary agents only",
+        )
+    if profile_id is None:
+        return None, None
+
+    agent = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+    try:
+        resolve_agent_profile(agent, profile_id, source="channel_default")
+    except ValueError as exc:
+        return None, error_response(400, "validation_error", str(exc))
+    return profile_id, None
+
+
 # ---------------------------------------------------------------------------
 # Channel type metadata
 # ---------------------------------------------------------------------------
@@ -248,6 +288,7 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
             "display_name": row.display_name,
             "enabled": row.enabled,
             "agent_id": row.agent_id,
+            "default_agent_profile_id": row.default_agent_profile_id,
             "config": row.config or {},
             "credential_refs": row.credential_refs or {},
             "default_conversation_id": row.default_conversation_id,
@@ -297,18 +338,14 @@ async def create_account(request: Request) -> Any:
     if not agent_id:
         return error_response(400, "validation_error", "agent_id is required")
 
-    from cognis.store.queries import get_agent
-
-    async with session_factory() as session:
-        agent_row = await get_agent(session, agent_id)
-    if agent_row is None:
-        return error_response(404, "not_found", "Agent not found")
-    if getattr(agent_row, "agent_type", "primary") != "primary":
-        return error_response(
-            400,
-            "validation_error",
-            "Channel accounts support primary agents only",
-        )
+    default_agent_profile_id, err = await _validate_channel_default_profile(
+        request,
+        agent_id=agent_id,
+        user_email=user_email,
+        value=body.get("default_agent_profile_id"),
+    )
+    if err is not None:
+        return err
 
     display_name = body.get("display_name", f"{meta.label} Account")
     default_conversation_id = body.get("default_conversation_id")
@@ -359,6 +396,7 @@ async def create_account(request: Request) -> Any:
             config=_settings_with_defaults(meta, body.get("settings")),
             credential_refs=body.get("credential_refs", {}),
             default_conversation_id=default_conversation_id,
+            default_agent_profile_id=default_agent_profile_id,
             allow_new_conversations=body.get("allow_new_conversations", True),
             preferred_for_task_delivery=body.get("preferred_for_task_delivery", False),
             allowed_senders=body.get("allowed_senders", []),
@@ -383,13 +421,14 @@ async def create_account(request: Request) -> Any:
 async def get_account(request: Request, account_id: str) -> Any:
     """Get a channel account by ID."""
     session_factory = request.app.state.session_factory
+    user_email = require_current_user(request).email
 
     from cognis.store.queries import get_channel_account
 
     async with session_factory() as session:
         row = await get_channel_account(session, account_id)
 
-    if row is None:
+    if row is None or row.user_email != user_email:
         return error_response(404, "not_found", "Channel account not found")
 
     result: dict[str, Any] = {
@@ -398,6 +437,7 @@ async def get_account(request: Request, account_id: str) -> Any:
         "display_name": row.display_name,
         "enabled": row.enabled,
         "agent_id": row.agent_id,
+        "default_agent_profile_id": row.default_agent_profile_id,
         "config": row.config or {},
         "credential_refs": row.credential_refs or {},
         "default_conversation_id": row.default_conversation_id,
@@ -425,6 +465,7 @@ async def update_account(request: Request, account_id: str) -> Any:
     """Update a channel account."""
     body = await request.json()
     session_factory = request.app.state.session_factory
+    user_email = require_current_user(request).email
 
     # --- Signal-specific validation on update ---
     from cognis.store.queries import get_channel_account as _get_account
@@ -432,24 +473,28 @@ async def update_account(request: Request, account_id: str) -> Any:
 
     async with session_factory() as session:
         existing_row = await _get_account(session, account_id)
-    if existing_row is None:
+    if existing_row is None or existing_row.user_email != user_email:
         return error_response(404, "not_found", "Channel account not found")
 
     agent_id = body.get("agent_id")
     effective_agent_id = agent_id or existing_row.agent_id
-    if agent_id:
-        from cognis.store.queries import get_agent
-
-        async with session_factory() as session:
-            agent_row = await get_agent(session, agent_id)
-        if agent_row is None:
-            return error_response(404, "not_found", "Agent not found")
-        if getattr(agent_row, "agent_type", "primary") != "primary":
-            return error_response(
-                400,
-                "validation_error",
-                "Channel accounts support primary agents only",
-            )
+    if "default_agent_profile_id" in body:
+        candidate_profile = body["default_agent_profile_id"]
+    elif agent_id and agent_id != existing_row.agent_id:
+        candidate_profile = None
+        body["default_agent_profile_id"] = None
+    else:
+        candidate_profile = existing_row.default_agent_profile_id
+    default_agent_profile_id, err = await _validate_channel_default_profile(
+        request,
+        agent_id=effective_agent_id,
+        user_email=user_email,
+        value=candidate_profile,
+    )
+    if err is not None:
+        return err
+    if "default_agent_profile_id" in body:
+        body["default_agent_profile_id"] = default_agent_profile_id
 
     default_conversation_id = (
         body.get("default_conversation_id")
@@ -503,6 +548,7 @@ async def update_account(request: Request, account_id: str) -> Any:
         "display_name",
         "enabled",
         "agent_id",
+        "default_agent_profile_id",
         "config",
         "credential_refs",
         "default_conversation_id",
@@ -562,6 +608,14 @@ async def update_account(request: Request, account_id: str) -> Any:
 async def delete_account(request: Request, account_id: str) -> Any:
     """Delete a channel account."""
     session_factory = request.app.state.session_factory
+    user_email = require_current_user(request).email
+
+    from cognis.store.queries import get_channel_account
+
+    async with session_factory() as session:
+        existing_row = await get_channel_account(session, account_id)
+    if existing_row is None or existing_row.user_email != user_email:
+        return error_response(404, "not_found", "Channel account not found")
 
     # Stop the adapter first
     channel_manager = getattr(request.app.state, "channel_manager", None)

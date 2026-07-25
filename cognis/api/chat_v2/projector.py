@@ -18,6 +18,7 @@ from cognis.api.chat_v2.item_keys import (
 from cognis.api.chat_v2.normalizer import NormalizedChatEvent
 from cognis.api.chat_v2.schemas import (
     ArtifactTimelineItem,
+    AssistantDeliverableTimelineItem,
     AuthChallengeTimelineItem,
     ChatMode,
     CompactionTimelineItem,
@@ -95,51 +96,88 @@ def project_timeline(events: Iterable[NormalizedChatEvent]) -> TimelineProjectio
     )
 
 
+_CYCLE_BEARING_KINDS = {"tool_call", "tool_result", "thinking"}
+_TURN_BOUNDARY_KINDS = {"user_message", "assistant_message"}
+
+
+def _infer_forward_cycle(
+    events: list[NormalizedChatEvent],
+    start_index: int,
+    turn_id: str,
+) -> int | None:
+    """Return the first following same-turn tool/thinking cycle before a boundary."""
+
+    for candidate in events[start_index:]:
+        candidate_turn_id = candidate.data.get("turn_id")
+        if candidate_turn_id != turn_id:
+            if candidate.kind in _TURN_BOUNDARY_KINDS:
+                break
+            continue
+        if candidate.kind in _TURN_BOUNDARY_KINDS:
+            break
+        if candidate.kind in _CYCLE_BEARING_KINDS and isinstance(candidate.turn_cycle_index, int):
+            return candidate.turn_cycle_index
+    return None
+
+
 def _fill_missing_assistant_turn_cycles(
     events: list[NormalizedChatEvent],
 ) -> list[NormalizedChatEvent]:
-    """Repair legacy assistant events that predate explicit cycle metadata.
+    """Repair events that predate (or were persisted without) cycle metadata.
 
-    The UI intentionally relies on ``turn_cycle_index`` to fold assistant text
-    into the matching tool activity. Normal tool events have carried this
-    metadata for longer than assistant message events in some persisted
-    histories, so canonical projection can safely fill an assistant's missing
-    cycle from the first following same-turn tool/thinking item before the next
-    assistant/user boundary. Assistant-only cycles remain unannotated and
-    therefore standalone.
+    The UI relies on ``turn_cycle_index`` to fold assistant text into the
+    matching tool activity. Two historical gaps exist:
+
+    1. Assistant message events lacked the field before tool events did.
+    2. The primary regular-tool persistence path recorded ``tool_call`` events
+       without the field at all (its paired ``tool_result`` carries it, and the
+       ``_tool_result_item`` projector now backfills from it — but the very
+       first histories predate any tool stamping).
+
+    This pass fills a missing cycle on assistant/tool/thinking events from the
+    nearest same-turn neighbor that carries one, scanning forward first (the
+    first following same-turn cycle-bearing event before the next
+    assistant/user boundary) and then backward (the last preceding same-turn
+    cycle-bearing event within the current turn). Events that cannot be
+    resolved remain unannotated and therefore render standalone.
     """
 
-    if not any(
-        event.kind == "assistant_message" and event.turn_cycle_index is None for event in events
-    ):
+    needs_repair = any(
+        event.turn_cycle_index is None
+        and (event.kind == "assistant_message" or event.kind in _CYCLE_BEARING_KINDS)
+        and isinstance(event.data.get("turn_id"), str)
+        for event in events
+    )
+    if not needs_repair:
         return events
+
+    # Backward pass reference: last seen cycle per turn, reset at turn boundary.
+    last_cycle_by_turn: dict[str, int] = {}
 
     repaired: list[NormalizedChatEvent] = []
     for index, event in enumerate(events):
-        if (
-            event.kind != "assistant_message"
-            or event.turn_cycle_index is not None
-            or not isinstance(event.data.get("turn_id"), str)
-        ):
+        turn_id = event.data.get("turn_id")
+        if isinstance(turn_id, str) and isinstance(event.turn_cycle_index, int):
+            last_cycle_by_turn[turn_id] = event.turn_cycle_index
+
+        repairable = (
+            event.turn_cycle_index is None
+            and (event.kind == "assistant_message" or event.kind in _CYCLE_BEARING_KINDS)
+            and isinstance(turn_id, str)
+        )
+        if not repairable:
             repaired.append(event)
             continue
 
-        turn_id = event.data["turn_id"]
-        inferred_cycle: int | None = None
-        for candidate in events[index + 1 :]:
-            candidate_turn_id = candidate.data.get("turn_id")
-            if candidate_turn_id != turn_id:
-                if candidate.kind in {"user_message", "assistant_message"}:
-                    break
-                continue
-            if candidate.kind in {"user_message", "assistant_message"}:
-                break
-            if candidate.kind in {"tool_call", "tool_result", "thinking"} and isinstance(
-                candidate.turn_cycle_index,
-                int,
-            ):
-                inferred_cycle = candidate.turn_cycle_index
-                break
+        assert isinstance(turn_id, str)
+        inferred_cycle = _infer_forward_cycle(events, index + 1, turn_id)
+        # Backward fallback applies ONLY to tool/thinking events, which always
+        # belong to an in-progress cycle. Assistant messages stay forward-only
+        # (their existing, proven behavior): a trailing assistant message with
+        # no following tool activity is the turn's final answer and must remain
+        # standalone rather than inheriting the prior cycle and folding.
+        if inferred_cycle is None and event.kind in _CYCLE_BEARING_KINDS:
+            inferred_cycle = last_cycle_by_turn.get(turn_id)
 
         if inferred_cycle is None:
             repaired.append(event)
@@ -147,6 +185,7 @@ def _fill_missing_assistant_turn_cycles(
 
         data = {**event.data, "turn_cycle_index": inferred_cycle}
         repaired.append(event.model_copy(update={"data": data, "turn_cycle_index": inferred_cycle}))
+        last_cycle_by_turn[turn_id] = inferred_cycle
     return repaired
 
 
@@ -201,6 +240,8 @@ def _project_event(
         return _todo_state_item(event)
     if event.kind == "artifact":
         return _artifact_item(event)
+    if event.kind == "assistant_deliverable":
+        return _assistant_deliverable_item(event)
     if event.kind == "file_diff":
         return _file_diff_item(event)
     if event.kind == "notice":
@@ -236,6 +277,18 @@ def _message_item(event: NormalizedChatEvent, *, role: str) -> MessageTimelineIt
         notice_id=_str_or_none(data.get("notice_id")),
         notice_kind=_str_or_none(data.get("kind")),
         notice_scope=_str_or_none(data.get("scope")),
+        reason_class=_str_or_none(data.get("reason_class")),
+        provider_id=_str_or_none(data.get("provider_id")),
+        model=_str_or_none(data.get("model")),
+        retry_after_seconds=_nonnegative_float(data.get("retry_after_seconds")),
+        provider_retry_after_seconds=_nonnegative_float(data.get("provider_retry_after_seconds")),
+        retry_at=_str_or_none(data.get("retry_at")),
+        attempt=_nonnegative_int(data.get("attempt")),
+        max_attempts=_nonnegative_int(data.get("max_attempts")),
+        attempts=_nonnegative_int(data.get("attempts")),
+        attempts_per_cycle=_nonnegative_int(data.get("attempts_per_cycle")),
+        continuation_attempts=_nonnegative_int(data.get("continuation_attempts")),
+        recoverable=data.get("recoverable") if isinstance(data.get("recoverable"), bool) else None,
         follow_up_conversation_id=_str_or_none(data.get("follow_up_conversation_id")),
         follow_up_session_id=_str_or_none(data.get("follow_up_session_id")),
         partial=bool(data.get("partial", False)),
@@ -354,16 +407,27 @@ def _tool_result_item(
             if existing_tool is not None
             else _str_or_none(data.get("visible_name") or data.get("display_name"))
         ),
-        turn_id=existing_tool.turn_id
-        if existing_tool is not None
-        else _str_or_none(data.get("turn_id")),
+        turn_id=(
+            existing_tool.turn_id
+            if existing_tool is not None and existing_tool.turn_id is not None
+            else _str_or_none(data.get("turn_id"))
+        ),
+        # Coalesce phase/cycle: prefer the tool_call item's value when present,
+        # but fall back to the tool_result event's value when the tool_call
+        # event landed without a stamp. The primary regular-tool persistence
+        # path historically recorded tool_call events with null cycle/phase
+        # while the paired tool_result event carries them, so preferring the
+        # existing null here would permanently strip the grouping key. Falling
+        # back retroactively repairs those conversations without a data migration.
         assistant_phase_index=(
             existing_tool.assistant_phase_index
-            if existing_tool is not None
+            if existing_tool is not None and existing_tool.assistant_phase_index is not None
             else event.assistant_phase_index
         ),
         turn_cycle_index=(
-            existing_tool.turn_cycle_index if existing_tool is not None else event.turn_cycle_index
+            existing_tool.turn_cycle_index
+            if existing_tool is not None and existing_tool.turn_cycle_index is not None
+            else event.turn_cycle_index
         ),
         arguments=existing_tool.arguments if existing_tool is not None else None,
         arguments_preview=existing_tool.arguments_preview if existing_tool is not None else None,
@@ -392,14 +456,19 @@ def _tool_result_item(
     )
 
 
+_FOLDED_DELEGATION_TOOL_NAMES = frozenset(
+    {"delegate", "retry_subsession", "follow_up_subsession", "fork_subsession", "fork"}
+)
+
+
 class _DelegationFolds:
-    """Tracks delegate/fork delegations folded onto their tool calls.
+    """Tracks delegated sub-session lifecycle payloads folded onto tool calls.
 
     Correlation is by the originating tool ``call_id`` (present on the
     ``started`` event) OR the ``child_session_id`` (the only key present on
-    ``completed``/``cancelled``/``failed`` events). Only synchronous
-    ``delegate``/``fork`` delegations fold; ``task``/``workflow`` (and any
-    delegation with no correlated delegate tool call) keep a standalone card.
+    ``completed``/``cancelled``/``failed`` events). Only synchronous delegated
+    sub-session tools fold; ``task``/``workflow`` (and any delegation with no
+    correlated delegated sub-session tool call) keep a standalone card.
     """
 
     def __init__(self) -> None:
@@ -450,16 +519,16 @@ def _record_tool_delegation(
     items_by_id: dict[str, TimelineItem],
     delegation_folds: _DelegationFolds,
 ) -> bool:
-    """Record a delegate/fork delegation payload and fold it onto its tool call.
+    """Record a delegated sub-session payload and fold it onto its tool call.
 
-    Returns True when the delegation was folded onto an existing delegate/fork
-    tool call (so the standalone card is suppressed), False when it is an
-    async task/workflow delegation or has no correlated delegate tool call and
+    Returns True when the delegation was folded onto an existing delegated
+    sub-session tool call (so the standalone card is suppressed), False when
+    it is an async task/workflow delegation or has no correlated tool call and
     a standalone delegation card should be emitted.
     """
     data = event.data
     mode = _str_or_none(data.get("mode"))
-    # Only synchronous delegate/fork delegations render as a folded tool call.
+    # Only synchronous sub-session delegations render as folded tool calls.
     # Async task/workflow delegations keep their standalone task card.
     if mode is not None and mode not in {"delegate", "fork"}:
         return False
@@ -471,9 +540,10 @@ def _record_tool_delegation(
         return False
     item_id = f"tool:{call_id}"
     existing = items_by_id.get(item_id)
-    # Fold only when the correlated tool call is actually a delegate/fork tool.
+    # Fold only when the correlated tool call is a delegated sub-session tool.
     if not (
-        isinstance(existing, ToolCallTimelineItem) and existing.tool_name in {"delegate", "fork"}
+        isinstance(existing, ToolCallTimelineItem)
+        and existing.tool_name in _FOLDED_DELEGATION_TOOL_NAMES
     ):
         # The tool_call may still arrive later in this window (delegation
         # lifecycle events are recorded in separate seq batches). Record the
@@ -526,6 +596,7 @@ def _delegation_payload(event: NormalizedChatEvent) -> dict[str, Any]:
         "max_tool_calls": _int_or_none(data.get("max_tool_calls")),
         "last_tool": _str_or_none(data.get("last_tool")),
         "error": _str_or_none(data.get("error")),
+        "error_code": _str_or_none(data.get("error_code")),
     }
 
 
@@ -703,6 +774,29 @@ def _artifact_item(event: NormalizedChatEvent) -> ArtifactTimelineItem:
     )
 
 
+def _assistant_deliverable_item(event: NormalizedChatEvent) -> AssistantDeliverableTimelineItem:
+    data = event.data
+    deliverable_id = str(data.get("deliverable_id") or data.get("id") or _fallback_id(event))
+    return AssistantDeliverableTimelineItem(
+        id=f"assistant-deliverable:{deliverable_id}",
+        sort_key=_sort_key(event),
+        source_refs=[event.source_ref],
+        created_at=event.timestamp,
+        updated_at=event.timestamp,
+        status="complete",
+        deliverable_id=deliverable_id,
+        format=str(data.get("format") or "markdown"),
+        title=_str_or_none(data.get("title")),
+        content=_str_or_none(data.get("content")),
+        render_metadata=data.get("render_metadata")
+        if isinstance(data.get("render_metadata"), dict)
+        else None,
+        export_metadata=data.get("export_metadata")
+        if isinstance(data.get("export_metadata"), dict)
+        else None,
+    )
+
+
 def _file_diff_item(event: NormalizedChatEvent) -> FileDiffTimelineItem:
     return FileDiffTimelineItem(
         id=f"file-diff:{event.source_ref.session_id}:{event.source_ref.seq}",
@@ -736,11 +830,15 @@ def _compaction_item(event: NormalizedChatEvent) -> CompactionTimelineItem | obj
         return HIDDEN_EVENT
 
     session_id = _str_or_none(data.get("session_id")) or event.source_ref.session_id
-    previous_session_id = _str_or_none(data.get("source_session_id"))
+    # Legacy compaction checkpoints were recorded in the source session before
+    # rotation and carry no explicit source_session_id. Give them the same
+    # stable identity as the rotated marker so historical conversations fold to
+    # one card instead of rendering a duplicate.
+    previous_session_id = _str_or_none(data.get("source_session_id")) or event.source_ref.session_id
     summary = str(data.get("summary") or "")
     item_id = (
-        f"compaction:{previous_session_id}:{session_id}"
-        if session_id and previous_session_id
+        f"compaction:{previous_session_id}"
+        if previous_session_id
         else f"compaction:{_fallback_id(event)}"
     )
     turns_compacted = data.get("turns_compacted")
@@ -780,7 +878,7 @@ def _error_item(event: NormalizedChatEvent) -> ErrorTimelineItem:
         status="failed",
         title=str(data.get("title") or data.get("error") or "Error"),
         message=_str_or_none(data.get("message")),
-        error_code=_str_or_none(data.get("error_code")),
+        error_code=_str_or_none(data.get("error_code") or data.get("code")),
         recoverable=bool(data.get("recoverable", False)),
     )
 
@@ -873,9 +971,7 @@ def _message_item_id(event: NormalizedChatEvent, *, role: str, message_id: str) 
         # same message_id (= turn_id) but carries a distinct assistant_phase_index;
         # without the phase they collide onto one id and _upsert_item overwrites
         # earlier segments, dropping mid-turn assistant text after reload. This
-        # mirrors _thinking_item_id and the legacy _stable_assistant_timeline_id
-        # (byte-identical) so canonical, runtime overlay, and completion items
-        # merge 1:1 by id.
+        # keeps canonical, runtime overlay, and completion items merged 1:1 by id.
         return assistant_message_item_id(message_id=message_id, phase=event.assistant_phase_index)
     return f"system:{message_id}"
 
@@ -1053,6 +1149,20 @@ def _float_or_none(value: Any) -> float | None:
     if isinstance(value, int | float):
         return float(value)
     return None
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    number = _int_or_none(value)
+    if number is None or number < 0:
+        return None
+    return number
+
+
+def _nonnegative_float(value: Any) -> float | None:
+    number = _float_or_none(value)
+    if number is None or number < 0:
+        return None
+    return number
 
 
 def _todo_list(value: Any) -> list[dict[str, Any]] | None:

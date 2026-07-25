@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -19,8 +20,9 @@ from cognis.tools.executor.web.backends import (
     resolve_fetch_backend,
     resolve_search_backend,
 )
-from cognis.tools.executor.web.backends.direct import DirectBackend
+from cognis.tools.executor.web.backends.direct import DirectBackend, _ddg_search
 from cognis.tools.executor.web.backends.tavily import TavilyBackend
+from cognis.tools.executor.web.handlers import _concurrency_controller
 from cognis.tools.executor.web.headers import (
     BROWSER_HEADERS,
     clamp_timeout,
@@ -39,6 +41,27 @@ _DUMMY_CONTEXT = ToolExecutionContext(
         executor_type="in_process",
     )
 )
+
+
+def test_web_concurrency_controller_is_shared_across_per_call_metadata() -> None:
+    shared: dict[str, object] = {"web_concurrency": {"backend_caps": {"direct": 2}}}
+    first = ToolExecutionContext(
+        executor_handle=_DUMMY_CONTEXT.executor_handle,
+        runtime_metadata={**shared},
+        shared_runtime_metadata=shared,
+    )
+    second = ToolExecutionContext(
+        executor_handle=_DUMMY_CONTEXT.executor_handle,
+        runtime_metadata={**shared},
+        shared_runtime_metadata=shared,
+    )
+
+    first_controller = _concurrency_controller(first)
+    second_controller = _concurrency_controller(second)
+
+    assert first_controller is second_controller
+    assert first_controller.settings.cap_for("direct") == 2
+
 
 _CONTEXT_WITH_TAVILY = ToolExecutionContext(
     executor_handle=ExecutorHandle(
@@ -167,6 +190,25 @@ class TestHtmlConversion:
         assert "requires verification" in result.output
         assert (result.metadata or {}).get("direct_fetch_blocked") is True
         assert (result.metadata or {}).get("direct_fetch_block_signal") == "verification"
+
+    def test_format_response_result_provider_error_page_is_error(self) -> None:
+        response = httpx.Response(
+            200,
+            content=(
+                b"<html><head><title>Error Page | eBay</title></head>"
+                b"<body><h1>SORRY</h1><p>Something went wrong on our end.</p>"
+                b"<p>Please go back and try again or go to eBay Homepage.</p></body></html>"
+            ),
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://www.ebay.com/itm/257616988765"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert result.is_error
+        assert "provider-generated error page" in result.output
+        assert (result.metadata or {}).get("direct_fetch_blocked") is True
+        assert (result.metadata or {}).get("direct_fetch_block_signal") == "provider_error_page"
 
     def test_format_response_result_image_attaches_binary_without_dumping_bytes(self) -> None:
         image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 20
@@ -365,6 +407,8 @@ class TestDynamicWebDefinitions:
         assert "search_depth" not in props
         assert "include_answer" not in props
         assert "topic" not in props
+        assert props["include_images"]["type"] == "boolean"
+        assert props["image_limit"]["maximum"] == 50
 
     def test_tavily_adds_backend_and_params(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -1206,7 +1250,66 @@ class TestDirectBackend:
             region="us-en",
             safesearch="moderate",
             timelimit=None,
+            include_images=False,
+            image_limit=10,
         )
+
+    @pytest.mark.asyncio()
+    async def test_ddg_search_uses_bounded_request_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        constructor_kwargs: list[dict[str, object]] = []
+
+        class _FakeDDGS:
+            def __init__(self, **kwargs: object) -> None:
+                constructor_kwargs.append(kwargs)
+
+            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
+                return []
+
+        fake_module = MagicMock()
+        fake_module.DDGS = _FakeDDGS
+        monkeypatch.setitem(sys.modules, "ddgs", fake_module)
+
+        await _ddg_search("bounded")
+
+        assert constructor_kwargs == [{"timeout": 15}]
+
+    @pytest.mark.asyncio()
+    async def test_search_returns_lazy_artifact_candidates_for_direct_image_results(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor.web.backends.direct import _ddg_search
+
+        class _FakeDDGS:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def text(self, *args: object, **kwargs: object) -> list[dict[str, str]]:
+                return [
+                    {"title": "Article", "href": "https://example.com/article", "body": "Snippet"}
+                ]
+
+            def images(self, *args: object, **kwargs: object) -> list[dict[str, str]]:
+                return [
+                    {
+                        "image": "https://images.example.com/chart.png",
+                        "title": "Revenue chart",
+                        "url": "https://example.com/article",
+                    }
+                ]
+
+        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+
+        result = await _ddg_search("example chart", include_images=True)
+
+        assert "[[media:1]]" in result.output
+        assert "tool_artifact:<tool_call_id>:media:1" in result.output
+        anchors = (result.metadata or {}).get("output_anchors")
+        assert isinstance(anchors, list)
+        media_anchor = next(anchor for anchor in anchors if anchor["anchor"] == "media:1")
+        assert media_anchor["artifact_candidate"]["url"] == "https://images.example.com/chart.png"
+        assert media_anchor["artifact_candidate"]["metadata"]["source_tool"] == "web_search"
 
 
 class TestTavilyBackend:
@@ -1236,6 +1339,23 @@ class TestTavilyBackend:
         stored_output = result.metadata.get("stored_output") if result.metadata else None
         assert isinstance(stored_output, str)
         assert "[[answer]]" in stored_output
+
+    def test_search_preserves_tavily_image_references_as_lazy_artifacts(self) -> None:
+        from cognis.tools.executor.web.backends.tavily import _format_tavily_search
+
+        result = _format_tavily_search(
+            {
+                "results": [],
+                "images": [{"url": "https://cdn.example.com/chart.webp", "description": "Chart"}],
+            }
+        )
+
+        assert not result.is_error
+        assert "[[media:1]]" in result.output
+        anchors = (result.metadata or {}).get("output_anchors")
+        assert isinstance(anchors, list)
+        media_anchor = next(anchor for anchor in anchors if anchor["anchor"] == "media:1")
+        assert media_anchor["artifact_candidate"]["metadata"]["source_tool"] == "web_search"
 
     @pytest.mark.asyncio()
     async def test_search_compacts_noisy_result_content(self) -> None:
@@ -1422,13 +1542,13 @@ class TestSettingsSchema:
         from cognis.settings_schema import validate_setting_value
 
         for backend in ("direct", "tavily", "brave"):
-            validate_setting_value("web.backend", backend)
+            validate_setting_value("web.search_backend", backend)
 
     def test_invalid_backend_rejected(self) -> None:
         from cognis.settings_schema import validate_setting_value
 
         with pytest.raises(ValueError, match="must be one of"):
-            validate_setting_value("web.backend", "grok")
+            validate_setting_value("web.search_backend", "grok")
 
     def test_web_backend_in_default_settings(self) -> None:
         from cognis.bootstrap import DEFAULT_SETTINGS

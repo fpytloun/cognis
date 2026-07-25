@@ -15,6 +15,7 @@ from cognis.api.chat_v2.projector import project_timeline
 from cognis.api.chat_v2.realtime import (
     assistant_completion_runtime_item,
     assistant_stream_runtime_item,
+    compaction_runtime_item,
     delegation_runtime_item,
     thinking_runtime_items,
     tool_call_runtime_item,
@@ -27,6 +28,50 @@ TS = "2026-01-01T00:00:00Z"
 def _canonical_ids(raw_events: list[RawSessionEvent]) -> dict[str, str]:
     projection = project_timeline(normalize_session_events(raw_events).events)
     return {item.id: item.kind for item in projection.timeline.items}
+
+
+def test_compaction_ids_match_from_running_state_through_canonical_projection() -> None:
+    running = compaction_runtime_item(
+        {
+            "session_id": "sess_old",
+            "trigger": "idle_checkpoint",
+            "reason": "long_lived_chat_idle",
+        }
+    )
+    completed = compaction_runtime_item(
+        {
+            "session_id": "sess_new",
+            "previous_session_id": "sess_old",
+            "summary_preview": "Compacted history",
+            "method": "llm",
+            "turns_compacted": 5,
+        },
+        status="compacted",
+    )
+    assert running is not None
+    assert completed is not None
+
+    canonical = _canonical_ids(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess_new",
+                seq=2,
+                type="compaction_summary",
+                data={
+                    "summary": "Compacted history",
+                    "session_id": "sess_new",
+                    "source_session_id": "sess_old",
+                    "method": "llm",
+                    "turns_compacted": 5,
+                    "timeline_visible": True,
+                },
+            )
+        ]
+    )
+
+    assert running.id == completed.id == "compaction:sess_old"
+    assert completed.id in canonical
 
 
 def test_assistant_message_ids_match_across_runtime_and_canonical() -> None:
@@ -121,6 +166,52 @@ def test_thinking_block_ids_match_across_runtime_and_canonical() -> None:
         ]
     )
 
+    assert runtime_items[0].id in canonical
+
+
+def test_thinking_block_ids_match_when_provider_omits_block_id() -> None:
+    turn_id = "turn_1"
+    phase = 1
+
+    runtime_items = thinking_runtime_items(
+        {
+            "session_id": "sess_1",
+            "message_id": turn_id,
+            "turn_id": turn_id,
+            "assistant_phase_index": phase,
+            "source_seq": 11,
+            "updated_at": TS,
+            "blocks": [
+                {
+                    "title": "Thinking",
+                    "content": "reasoning without provider block id",
+                    "source": "summary",
+                    "complete": False,
+                }
+            ],
+        },
+        local_start=0,
+    )
+    assert len(runtime_items) == 1
+
+    canonical = _canonical_ids(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess_1",
+                seq=11,
+                type="assistant_thinking",
+                data={
+                    "message_id": turn_id,
+                    "turn_id": turn_id,
+                    "content": "reasoning without provider block id",
+                    "assistant_phase_index": phase,
+                },
+            )
+        ]
+    )
+
+    assert runtime_items[0].blocks[0].id == "seq-11"
     assert runtime_items[0].id in canonical
 
 
@@ -278,3 +369,29 @@ def test_user_message_ids_match_for_client_message_id() -> None:
     # The optimistic bubble and the live WS event both use
     # user:{client_message_id}; the canonical projection must match.
     assert "user:cmsg_abc" in canonical
+
+
+def test_lifecycle_system_notice_ids_match_command_notice_id() -> None:
+    notice_id = "command:profile:abc123"
+
+    canonical = _canonical_ids(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess_1",
+                seq=17,
+                type="lifecycle",
+                data={
+                    "event": "system_notice",
+                    "message": "Agent profile switched to: fast",
+                    "notice_id": notice_id,
+                    "kind": "command_result",
+                    "scope": "session",
+                    "command": "/profile",
+                },
+            )
+        ]
+    )
+
+    assert f"system:{notice_id}" in canonical
+    assert canonical[f"system:{notice_id}"] == "message"

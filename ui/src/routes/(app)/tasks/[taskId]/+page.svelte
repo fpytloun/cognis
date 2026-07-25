@@ -110,6 +110,7 @@ import Target from 'lucide-svelte/icons/target';
   type SessionDrawerState = {
     conversationId: string;
     sessionId: string;
+    stepRunId: string | null;
     stepName: string;
     agent: Agent | null;
   };
@@ -117,6 +118,11 @@ import Target from 'lucide-svelte/icons/target';
   // Session logs drawer
   let sessionDrawer = $state<SessionDrawerState | null>(null);
   let sessionDrawerBackStack = $state<SessionDrawerState[]>([]);
+  const sessionDrawerStepRun = $derived.by(() => {
+    const stepRunId = sessionDrawer?.stepRunId;
+    if (!stepRunId || !task) return null;
+    return task.step_runs.find((run) => run.step_run_id === stepRunId) ?? null;
+  });
 
   let editForm = $state({
     title: '',
@@ -751,9 +757,11 @@ import Target from 'lucide-svelte/icons/target';
     sessionDrawer = {
       conversationId,
       sessionId,
+      stepRunId: stepRun.step_run_id,
       stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`,
       agent: agentFor(stepRun.agent_id)
     };
+    if (isProjectedStepRun(stepRun)) void loadStepRunDetail(stepRun.step_run_id);
   }
 
   async function openSessionLogsById(sessionId: string): Promise<void> {
@@ -774,6 +782,7 @@ import Target from 'lucide-svelte/icons/target';
     sessionDrawer = {
       conversationId,
       sessionId,
+      stepRunId: null,
       stepName: sessionRow?.delegation_task ?? sessionRow?.agent_id ?? sessionId,
       agent: agentFor(sessionRow?.agent_id ?? null)
     };
@@ -1491,6 +1500,13 @@ import Target from 'lucide-svelte/icons/target';
         ['running', 'evaluating'].includes(activeSelectedAttempt.status)
       ) {
         void loadStepRunDetail(activeSelectedAttempt.step_run_id);
+      }
+      const drawerStepRun = sessionDrawerStepRun;
+      if (drawerStepRun && (
+        isProjectedStepRun(drawerStepRun) ||
+        ['running', 'evaluating'].includes(drawerStepRun.status)
+      )) {
+        void loadStepRunDetail(drawerStepRun.step_run_id);
       }
       try {
         await refreshTaskEscalations();
@@ -2994,8 +3010,11 @@ import Target from 'lucide-svelte/icons/target';
   {#if sessionDrawer}
     {#key `${sessionDrawer.conversationId}:${sessionDrawer.sessionId}`}
       <SessionLogsDrawer
-        conversationId={sessionDrawer.conversationId}
-        sessionId={sessionDrawer.sessionId}
+         conversationId={sessionDrawer.conversationId}
+         sessionId={sessionDrawer.sessionId}
+         stepRunId={sessionDrawer.stepRunId}
+         taskId={task?.task_id ?? null}
+        stepRun={sessionDrawerStepRun}
         stepName={sessionDrawer.stepName}
         agent={sessionDrawer.agent}
         backLabel={sessionDrawerBackStack[sessionDrawerBackStack.length - 1]?.stepName ?? 'Parent session'}

@@ -8,12 +8,28 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from ipaddress import ip_network
 from pathlib import Path
 
 
 def _expand_path(path: str) -> Path:
     """Expand ~ and env vars in a path."""
     return Path(os.path.expandvars(os.path.expanduser(path)))
+
+
+def _bounded_float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name)
+    value = default if raw is None else float(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}")
+    return value
+
+
+def _trusted_proxy_cidrs(raw: str) -> tuple[str, ...]:
+    cidrs = tuple(value.strip() for value in raw.split(",") if value.strip())
+    for cidr in cidrs:
+        ip_network(cidr, strict=False)
+    return cidrs
 
 
 @dataclass(frozen=True)
@@ -49,6 +65,7 @@ class CognisConfig:
 
     # CORS
     cors_origins: list[str]
+    trusted_proxy_cidrs: tuple[str, ...]
 
     # Browser session cookies
     browser_session_ttl_seconds: int
@@ -73,6 +90,7 @@ class CognisConfig:
     artifact_max_size_bytes: int
     artifact_signed_url_ttl_seconds: int
     artifact_signing_secret: str
+    deliverable_share_link_ttl_seconds: int
 
     # Knowledgebase (optional)
     knowledgebase_vector_backend: str
@@ -116,6 +134,12 @@ class CognisConfig:
     default_memory_backend: str
     default_guardrails_backend: str
 
+    # Controller-owned MCP OAuth lifecycle
+    mcp_oauth_refresh_timeout_seconds: float
+
+    # Test-only control-plane routes
+    e2e_mode: bool = False
+
 
 def load_config() -> CognisConfig:
     """Load configuration from environment variables.
@@ -133,6 +157,12 @@ def load_config() -> CognisConfig:
 
     serve_ui_raw = os.environ.get("COGNIS_SERVE_UI", "true").strip().lower()
     serve_ui = serve_ui_raw not in {"0", "false", "no", "off"}
+    e2e_mode = os.environ.get("COGNIS_E2E_MODE", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
     lsp_enabled_raw = os.environ.get("COGNIS_LSP_ENABLED", "true").strip().lower()
     lsp_auto_install_raw = os.environ.get("COGNIS_LSP_AUTO_INSTALL", "true").strip().lower()
@@ -173,7 +203,9 @@ def load_config() -> CognisConfig:
         log_level=os.environ.get("COGNIS_LOG_LEVEL", "info"),
         log_format=os.environ.get("COGNIS_LOG_FORMAT", "json"),
         serve_ui=serve_ui,
+        e2e_mode=e2e_mode,
         cors_origins=cors_origins,
+        trusted_proxy_cidrs=_trusted_proxy_cidrs(os.environ.get("COGNIS_TRUSTED_PROXY_CIDRS", "")),
         browser_session_ttl_seconds=int(
             os.environ.get("COGNIS_BROWSER_SESSION_TTL_SECONDS", str(30 * 24 * 60 * 60))
         ),
@@ -204,6 +236,9 @@ def load_config() -> CognisConfig:
             os.environ.get("COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS", "3600")
         ),
         artifact_signing_secret=os.environ.get("COGNIS_ARTIFACT_SIGNING_SECRET", ""),
+        deliverable_share_link_ttl_seconds=int(
+            os.environ.get("COGNIS_DELIVERABLE_SHARE_LINK_TTL_SECONDS", str(7 * 24 * 60 * 60))
+        ),
         knowledgebase_vector_backend=os.environ.get(
             "COGNIS_KNOWLEDGEBASE_VECTOR_BACKEND", "disabled"
         )
@@ -266,6 +301,12 @@ def load_config() -> CognisConfig:
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
         default_memory_backend=os.environ.get("COGNIS_DEFAULT_MEMORY_BACKEND", "mnemory"),
         default_guardrails_backend=os.environ.get("COGNIS_DEFAULT_GUARDRAILS_BACKEND", "intaris"),
+        mcp_oauth_refresh_timeout_seconds=_bounded_float_env(
+            "COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS",
+            30.0,
+            minimum=5.0,
+            maximum=120.0,
+        ),
     )
 
 
@@ -316,6 +357,9 @@ ENV_TEMPLATE = """\
 # COGNIS_SESSION_COOKIE_DOMAIN=
 # COGNIS_SESSION_COOKIE_SAMESITE=lax
 
+# MCP OAuth refresh (controller-owned, wall-clock bounded)
+# COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS=30
+
 # LSP diagnostics (auto-detect language servers for edit feedback)
 # COGNIS_LSP_ENABLED=true
 # COGNIS_LSP_AUTO_INSTALL=true
@@ -334,6 +378,7 @@ ENV_TEMPLATE = """\
 # COGNIS_ARTIFACT_MAX_SIZE_MB=50
 # COGNIS_ARTIFACT_SIGNED_URL_TTL_SECONDS=3600
 # COGNIS_ARTIFACT_SIGNING_SECRET=
+# COGNIS_DELIVERABLE_SHARE_LINK_TTL_SECONDS=604800
 
 # Knowledgebase (optional; hidden unless backend and embedding route are configured)
 # COGNIS_KNOWLEDGEBASE_VECTOR_BACKEND=disabled

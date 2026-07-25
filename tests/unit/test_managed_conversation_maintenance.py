@@ -109,6 +109,7 @@ async def _create_link(
         )
         link = await create_managed_conversation_link(
             session,
+            link_id=link_id,
             user_email="owner@example.com",
             controller_agent_id="controller",
             controller_conversation_id=controller.conversation_id,
@@ -120,7 +121,6 @@ async def _create_link(
             turn_state=turn_state,
             notify_on_completion=notify_on_completion,
         )
-        link.link_id = link_id
         link.conversation_state = conversation_state
         link.turn_state = turn_state
         link.active_turn_id = active_turn_id

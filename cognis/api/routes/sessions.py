@@ -5,15 +5,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_resource_owner
-from cognis.api.models import SessionCancelResponse, SessionEventsResponse, SessionResponse
-from cognis.api.serializers import serialize_event_rows, session_to_response
-from cognis.api.timeline_visibility import (
-    is_transient_compaction_start_notice,
-    is_visible_persisted_system_message,
+from cognis.api.models import (
+    IntarisSessionDetailResponse,
+    SessionCancelResponse,
+    SessionResponse,
 )
+from cognis.api.serializers import session_to_response
+from cognis.models.config import GenerationPerformanceSnapshot
 from cognis.store.queries import get_session_row
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,24 @@ def _context_usage_for_session(request: Request, session_id: str) -> dict[str, A
     except Exception:
         logger.debug(
             "Failed to fetch cached context usage for session %s", session_id, exc_info=True
+        )
+        return None
+
+
+def _last_generation_for_session(
+    request: Request, session_id: str
+) -> GenerationPerformanceSnapshot | None:
+    session_cache = getattr(request.app.state, "session_cache", None)
+    if session_cache is None or not hasattr(session_cache, "get_last_generation_performance"):
+        return None
+    try:
+        raw = session_cache.get_last_generation_performance(session_id)
+        return GenerationPerformanceSnapshot.model_validate(raw) if raw is not None else None
+    except Exception:
+        logger.debug(
+            "Failed to fetch latest generation performance for session %s",
+            session_id,
+            exc_info=True,
         )
         return None
 
@@ -57,8 +76,8 @@ async def session_detail(request: Request, session_id: str) -> SessionResponse:
     return session_to_response(row)
 
 
-@router.get("/{session_id}/intaris")
-async def session_intaris_detail(request: Request, session_id: str) -> dict[str, Any]:
+@router.get("/{session_id}/intaris", response_model=IntarisSessionDetailResponse)
+async def session_intaris_detail(request: Request, session_id: str) -> IntarisSessionDetailResponse:
     """Fetch Intaris session details (intention, call stats) for a session."""
     async with request.app.state.session_factory() as session:
         row = await get_session_row(session, session_id)
@@ -79,94 +98,25 @@ async def session_intaris_detail(request: Request, session_id: str) -> dict[str,
                 intaris_sid,
                 exc_info=True,
             )
-        return {
-            "session_id": session_id,
-            "intaris_session_id": intaris_sid,
-            "title": intaris_session.title,
-            "intention": intaris_session.intention,
-            "summary": summary,
-            "status": intaris_session.status,
-            "total_calls": intaris_session.total_calls,
-            "approved_count": intaris_session.approved_count,
-            "denied_count": intaris_session.denied_count,
-            "escalated_count": intaris_session.escalated_count,
-            "context_usage": _context_usage_for_session(request, row.session_id),
-        }
+        return IntarisSessionDetailResponse(
+            session_id=session_id,
+            intaris_session_id=intaris_sid,
+            title=intaris_session.title,
+            intention=intaris_session.intention,
+            summary=summary,
+            status=intaris_session.status,
+            total_calls=intaris_session.total_calls,
+            approved_count=intaris_session.approved_count,
+            denied_count=intaris_session.denied_count,
+            escalated_count=intaris_session.escalated_count,
+            context_usage=_context_usage_for_session(request, row.session_id),
+            last_generation=_last_generation_for_session(request, row.session_id),
+        )
     except Exception as exc:
         logger.warning("Failed to fetch Intaris session %s", intaris_sid, exc_info=True)
         raise api_exception(
             502, "intaris_unavailable", "Unable to fetch session details from Intaris"
         ) from exc
-
-
-@router.get("/{session_id}/events", response_model=SessionEventsResponse)
-async def session_events(
-    request: Request,
-    session_id: str,
-    after_seq: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=500),
-) -> SessionEventsResponse:
-    async with request.app.state.session_factory() as session:
-        row = await get_session_row(session, session_id)
-    if row is None:
-        raise api_exception(404, "not_found", "Session not found")
-    require_resource_owner(request, row.user_email)
-    visible_events: list[Any] = []
-    read_after_seq = after_seq
-    result = None
-    while len(visible_events) < limit:
-        previous_after_seq = read_after_seq
-        result = await request.app.state.providers.guardrails.read_events(
-            session_id=row.intaris_session_id or row.session_id,
-            after_seq=read_after_seq,
-            limit=limit - len(visible_events),
-            allow_missing_stream=True,
-        )
-        for event in result.events:
-            event_type = event.get("type") if isinstance(event, dict) else getattr(event, "type", None)
-            data = event.get("data") if isinstance(event, dict) else getattr(event, "data", None)
-            if (
-                event_type == "lifecycle"
-                and isinstance(data, dict)
-                and data.get("event") == "system_notice"
-                and is_transient_compaction_start_notice(data)
-            ):
-                continue
-            if event_type == "system_message" and not (
-                isinstance(data, dict) and is_visible_persisted_system_message(data)
-            ):
-                continue
-            visible_events.append(event)
-        read_after_seq = result.last_seq
-        if not result.has_more or not result.events or read_after_seq <= previous_after_seq:
-            break
-    if result is None:
-        raise api_exception(500, "history_read_failed", "Unable to read session history")
-    if result.missing_stream_fallback_used:
-        logger.warning(
-            "Session history missing in Intaris; returning empty history",
-            extra={
-                "extra_data": {
-                    "session_id": row.session_id,
-                    "intaris_session_id": row.intaris_session_id or row.session_id,
-                }
-            },
-        )
-    return SessionEventsResponse(
-        session_id=session_id,
-        items=serialize_event_rows(
-            visible_events,
-            log_label="session_events",
-            log_context={"session_id": row.session_id},
-        ),
-        last_seq=result.last_seq,
-        has_more=result.has_more,
-        active_thinking=(
-            request.app.state.session_cache.active_thinking_snapshots(row.session_id)
-            if getattr(request.app.state, "session_cache", None) is not None
-            else []
-        ),
-    )
 
 
 @router.post("/{session_id}/cancel", response_model=SessionCancelResponse)

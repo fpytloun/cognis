@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.models.conversation_state import (
@@ -103,8 +103,8 @@ async def resolve_linked_task_context(
     )
     actual = result.first()
     if actual is not None:
-        step_run, task = actual
-        return LinkedConversationContext("task_step", task, step_run)
+        actual_step_run, task = actual
+        return LinkedConversationContext("task_step", task, actual_step_run)
 
     task_id: str | None = None
     step_run_id: str | None = None
@@ -221,12 +221,16 @@ async def snapshot_for_conversation(
     conversation_id: str,
     turn_scheduler: Any | None = None,
     active_session_last_seq: int | None = None,
+    conversation: Conversation | None = None,
+    conversation_todos: list[dict[str, Any]] | None = None,
 ) -> ConversationStateEnvelope | None:
-    conversation = await get_conversation(session, conversation_id)
+    if conversation is None:
+        conversation = await get_conversation(session, conversation_id)
     if (
         conversation is None
         or conversation.user_email != user_email
         or conversation.status == "deleted"
+        or conversation.conversation_id != conversation_id
     ):
         return None
 
@@ -286,7 +290,9 @@ async def snapshot_for_conversation(
             status=getattr(active_session, "status", None),
             completion_reason=getattr(active_session, "completion_reason", None),
             todos=_normalize_todos(
-                await list_conversation_todos(session, conversation.conversation_id)
+                conversation_todos
+                if conversation_todos is not None
+                else await list_conversation_todos(session, conversation.conversation_id)
             ),
         ),
         task=task_state,
@@ -316,25 +322,33 @@ async def linked_conversation_ids_for_task(
     step_result = await session.execute(step_stmt)
     ids.update(cid for cid in step_result.scalars().all() if cid)
 
+    task_link_clause = and_(
+        Conversation.context_data["forked_from"].as_string() == "task",
+        Conversation.context_data["task_id"].as_string() == task_id,
+    )
+    step_link_clause = and_(
+        Conversation.context_data["forked_from"].as_string() == "task_step",
+        Conversation.context_data["task_id"].as_string() == task_id,
+    )
+    if step_run_id is not None:
+        step_link_clause = and_(
+            step_link_clause,
+            Conversation.context_data["step_run_id"].as_string() == step_run_id,
+        )
+
     conv_result = await session.execute(
-        select(Conversation)
+        select(Conversation.conversation_id)
         .where(Conversation.user_email == user_email)
         .where(Conversation.status != "deleted")
-    )
-    for conversation in conv_result.scalars().all():
-        context_data = (
-            conversation.context_data if isinstance(conversation.context_data, dict) else {}
-        )
-        if (
-            (context_data.get("forked_from") == "task" and context_data.get("task_id") == task_id)
-            or (
-                context_data.get("forked_from") == "task_step"
-                and context_data.get("task_id") == task_id
-                and (step_run_id is None or context_data.get("step_run_id") == step_run_id)
+        .where(
+            or_(
+                and_(Conversation.context_type == "task", Conversation.context_ref == task_id),
+                task_link_clause,
+                step_link_clause,
             )
-            or (conversation.context_type == "task" and conversation.context_ref == task_id)
-        ):
-            ids.add(conversation.conversation_id)
+        )
+    )
+    ids.update(cid for cid in conv_result.scalars().all() if cid)
     return sorted(ids)
 
 

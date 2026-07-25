@@ -142,9 +142,11 @@ class _SessionCache:
         self,
         usage: dict[str, object] | None = None,
         tool_runtime_info: dict[str, object] | None = None,
+        performance: dict[str, object] | None = None,
     ) -> None:
         self.usage = usage
         self.tool_runtime_info = tool_runtime_info
+        self.performance = performance
         self.reasoning_effort_override: str | None = None
         self.model_override: str | None = None
         self.model_override_provider_id: str | None = None
@@ -172,6 +174,9 @@ class _SessionCache:
 
     def get_tool_runtime_info(self, _: str) -> dict[str, object] | None:
         return self.tool_runtime_info
+
+    def get_last_generation_performance(self, _: str) -> dict[str, object] | None:
+        return self.performance
 
     def set_reasoning_effort_override(self, _: str, effort: str | None) -> None:
         self.reasoning_effort_override = effort
@@ -2723,6 +2728,7 @@ async def test_context_reports_effective_prompt_budget() -> None:
                     "completion_tokens": 678,
                     "total_tokens": 13_023,
                     "cache_read_input_tokens": 7_277,
+                    "cache_write_tokens": 249,
                     "cache_creation_input_tokens": 248,
                 },
             }
@@ -2764,7 +2770,44 @@ async def test_context_reports_effective_prompt_budget() -> None:
     )
     assert "Last LLM call tokens: 12,345 prompt, 678 completion, 13,023 total" in result.text
     assert "Last LLM call cache read tokens: 7,277" in result.text
-    assert "Last LLM call cache write tokens: 248" in result.text
+    assert "Last LLM call cache write tokens: 249" in result.text
+    assert result.text.count("Last LLM call cache write tokens:") == 1
+
+
+@pytest.mark.asyncio
+async def test_benchmark_reports_safe_placeholder_with_current_local_target() -> None:
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=_SessionCache(
+            usage={"model": "qwen3:8b", "max_context_tokens": 32768},
+            performance={
+                "model": "qwen3:8b",
+                "executor_id": "exec-1",
+                "executor_name": "Workstation",
+                "configured_context_tokens": 32768,
+            },
+        ),
+        compaction_strategy=None,
+        providers=None,
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/benchmark full",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "error"
+    assert result.data["code"] == "benchmark_runtime_operation_unavailable"
+    assert result.data["mode"] == "full"
+    assert result.data["executor_id"] == "exec-1"
+    assert "will not call the provider outside normal generation accounting" in (result.text or "")
 
 
 @pytest.mark.asyncio
@@ -2803,7 +2846,7 @@ async def test_thinking_command_uses_model_specific_levels() -> None:
 
 
 @pytest.mark.asyncio
-async def test_thinking_command_remaps_generic_level_to_current_model() -> None:
+async def test_thinking_command_rejects_level_unsupported_by_current_model() -> None:
     cache = _SessionCache({"model": "gpt-5.4"})
     dispatcher = CommandDispatcher(
         session_factory=None,
@@ -2833,10 +2876,41 @@ async def test_thinking_command_remaps_generic_level_to_current_model() -> None:
 
     assert result is not None
     assert (
-        result.text
-        == "Thinking effort set to: xhigh (mapped from max)\nTakes effect on next message."
+        result.text == "Unsupported level: max\nAvailable: default, none, low, medium, high, xhigh"
     )
-    assert cache.reasoning_effort_override == "xhigh"
+    assert cache.reasoning_effort_override is None
+
+
+@pytest.mark.asyncio
+async def test_thinking_command_rejects_override_for_non_reasoning_model() -> None:
+    cache = _SessionCache({"model": "gpt-4o-mini"})
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(return_value=SimpleNamespace(reasoning_efforts=[]))
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/thinking high",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text == (
+        "Current model 'gpt-4o-mini' does not support thinking effort overrides."
+    )
+    assert cache.reasoning_effort_override is None
 
 
 @pytest.mark.asyncio
@@ -2897,6 +2971,22 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
                 "promoted_requested_count": 2,
                 "promoted_visible_count": 1,
             },
+            performance={
+                "model": "qwen3:8b",
+                "quantization": "Q4_K_M",
+                "runtime": "Ollama",
+                "executor_name": "Workstation",
+                "configured_context_tokens": 32768,
+                "prompt_tokens_per_second": 50.0,
+                "generation_tokens_per_second": 25.0,
+                "time_to_first_token_seconds": 0.8,
+                "load_duration_seconds": 0.25,
+                "total_duration_seconds": 5.0,
+                "processor": "GPU",
+                "gpu_residency": "8 GB",
+                "digest": "sha256:abc",
+                "measured_at": "2026-07-13T12:00:00Z",
+            },
         ),
         compaction_strategy=None,
         providers=SimpleNamespace(
@@ -2954,6 +3044,16 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     assert "Tool search: enabled" in result.text
     # promoted shows as "visible/requested" when cap pressure drops some.
     assert "Tools: 4 visible, 12 eligible, 8 hidden, 1/2 promoted" in result.text
+    assert "Model: qwen3:8b (Q4_K_M)" in result.text
+    assert "Runtime: Ollama on Workstation" in result.text
+    assert "Configured context: 32,768 tokens" in result.text
+    assert "Prompt processing: 50.0 tok/s (pp)" in result.text
+    assert "Generation: 25.0 tok/s (tg)" in result.text
+    assert "First token: 0.80s (TTFT)" in result.text
+    assert "Load: 0.25s" in result.text
+    assert "Total: 5.00s" in result.text
+    assert "Hardware: processor GPU · GPU residency 8 GB" in result.text
+    assert "Digest: sha256:abc" in result.text
 
 
 @pytest.mark.asyncio

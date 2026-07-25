@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from cognis.core.events import EventBus, EventType
 from cognis.core.remember_queue import RememberRetryQueue
-from cognis.store.models import Base, RememberQueueRow, User
+from cognis.store.models import Agent, Base, RememberQueueRow, User
 from cognis.store.queries import create_conversation, create_session
 
 
@@ -21,6 +21,30 @@ class _Worker:
     async def remember(self, **kwargs: object) -> None:
         self.calls += 1
         self.last_kwargs = dict(kwargs)
+
+
+class _StrictWorker:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_kwargs: dict[str, object] | None = None
+
+    async def remember(
+        self,
+        *,
+        session_id: str,
+        messages: list[dict[str, str]],
+        user_email: str,
+        agent_id: str,
+        agent_owner_email: str,
+    ) -> None:
+        self.calls += 1
+        self.last_kwargs = {
+            "session_id": session_id,
+            "messages": messages,
+            "user_email": user_email,
+            "agent_id": agent_id,
+            "agent_owner_email": agent_owner_email,
+        }
 
 
 class _EventReader:
@@ -113,6 +137,31 @@ async def test_remember_queue_processes_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_in_memory_queue_strips_policy_origin_metadata_before_provider_call() -> None:
+    worker = _StrictWorker()
+    queue = RememberRetryQueue(worker, max_depth=10, max_concurrent=1)
+    await queue.start()
+    await queue.enqueue(
+        {
+            "session_id": "s1",
+            "messages": [{"role": "assistant", "content": "done"}],
+            "user_email": "user@example.com",
+            "agent_id": "agent-1",
+            "agent_owner_email": "owner@example.com",
+            "originating_memory_backend": "mnemory",
+            "originating_agent_profile_id": "proactive",
+            "memory_policy_fingerprint": "policy-fingerprint",
+        }
+    )
+    await asyncio.sleep(0.3)
+    await queue.stop()
+
+    assert worker.calls == 1
+    assert worker.last_kwargs is not None
+    assert worker.last_kwargs["session_id"] == "s1"
+
+
+@pytest.mark.asyncio
 async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Path) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-queue.db'}")
     async with engine.begin() as conn:
@@ -139,6 +188,9 @@ async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Pa
             "agent_owner_email": "owner@example.com",
             "user_event_seq": 1,
             "assistant_event_seq": 2,
+            "originating_memory_backend": "mnemory",
+            "originating_agent_profile_id": "proactive",
+            "memory_policy_fingerprint": "policy-fingerprint",
         }
     )
 
@@ -165,10 +217,71 @@ async def test_remember_queue_replays_persisted_items_after_restart(tmp_path: Pa
         {"role": "assistant", "content": "done"},
     ]
     assert worker.last_kwargs["agent_owner_email"] == "owner@example.com"
+    assert "originating_memory_backend" not in worker.last_kwargs
+    assert "originating_agent_profile_id" not in worker.last_kwargs
+    assert "memory_policy_fingerprint" not in worker.last_kwargs
     async with session_factory() as session:
         count = await session.scalar(sa.select(sa.func.count()).select_from(RememberQueueRow))
         assert count == 0
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "future-memory"])
+async def test_durable_replay_drops_item_when_current_agent_backend_is_disabled(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-disabled.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(User(email="user@example.com", password_hash="x", role="user"))
+        session.add(
+            Agent(
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Disabled memory agent",
+                capabilities={
+                    "memory_backend": backend,
+                    "memory_backend_options": {},
+                    "guardrails_backend": "intaris",
+                },
+            )
+        )
+        await session.commit()
+
+    worker = _Worker()
+    queue = RememberRetryQueue(
+        worker,
+        session_factory=session_factory,
+        event_reader=_EventReader(),
+        max_depth=10,
+        max_concurrent=1,
+    )
+    await queue.enqueue(
+        {
+            "session_id": "s1",
+            "intaris_session_id": "intaris-s1",
+            "user_email": "user@example.com",
+            "agent_id": "agent-1",
+            "agent_owner_email": "user@example.com",
+            "user_event_seq": 1,
+            "assistant_event_seq": 2,
+            "originating_memory_backend": "mnemory",
+            "memory_policy_fingerprint": "old-policy",
+        }
+    )
+    await queue.start()
+    await asyncio.sleep(0.4)
+    await queue.stop()
+
+    assert worker.calls == 0
+    async with session_factory() as session:
+        count = await session.scalar(sa.select(sa.func.count()).select_from(RememberQueueRow))
+        assert count == 0
     await engine.dispose()
 
 

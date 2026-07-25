@@ -22,6 +22,7 @@ def build_search_tool_result(
     *,
     answer: str | None,
     results: list[dict[str, object]],
+    images: list[dict[str, object]] | None = None,
 ) -> ToolResult:
     """Build compact anchored text for search-style results."""
     compact_builder = AnchoredTextBuilder()
@@ -72,6 +73,33 @@ def build_search_tool_result(
             kind="search_result",
             label=title or url or f"Result {index}",
             lines=stored_lines,
+        )
+
+    for index, image in enumerate(images or [], start=1):
+        lines = _image_lines(image)
+        anchor = f"media:{index}"
+        lines.append(f"Lazy artifact: tool_artifact:<tool_call_id>:{anchor}")
+        lines.append(
+            "To inspect this image, call artifact_read with "
+            f'artifact_id="tool_artifact:<tool_call_id>:{anchor}".'
+        )
+        label = str(
+            image.get("caption") or image.get("alt") or image.get("url") or f"Image {index}"
+        )
+        artifact_candidate = _image_artifact_candidate(image, source_url="")
+        compact_builder.add_section(
+            anchor,
+            kind="media",
+            label=label,
+            lines=lines,
+            artifact_candidate=artifact_candidate,
+        )
+        stored_builder.add_section(
+            anchor,
+            kind="media",
+            label=label,
+            lines=lines,
+            artifact_candidate=artifact_candidate,
         )
 
     output, anchors = compact_builder.build()
@@ -267,6 +295,9 @@ def _document_metadata_lines(document: dict[str, object]) -> list[str]:
         lines.append(
             f"Extraction status: {_compact_field(extraction_status.strip(), max_chars=200)}"
         )
+    browser_fetch_mode = document.get("browser_fetch_mode")
+    if isinstance(browser_fetch_mode, str) and browser_fetch_mode.strip():
+        lines.append(f"Browser mode: {browser_fetch_mode.strip()}")
     for label, key in fields:
         value = document.get(key)
         if isinstance(value, str) and value.strip():
@@ -290,6 +321,7 @@ def _image_lines(image: dict[str, object]) -> list[str]:
     for label, key in (
         ("Role", "role"),
         ("Source", "source"),
+        ("Source page", "source_page_url"),
         ("Alt", "alt"),
         ("Caption", "caption"),
         ("Width", "width"),
@@ -307,11 +339,10 @@ def _image_artifact_candidate(
     url = image.get("url")
     if not isinstance(url, str) or not url.strip():
         return None
-    metadata: dict[str, object] = {
-        "source_tool": "web_fetch",
-        "source_page_url": source_url,
-    }
-    for key in ("role", "source", "alt", "caption", "width", "height"):
+    metadata: dict[str, object] = {"source_tool": "web_fetch" if source_url else "web_search"}
+    if source_url:
+        metadata["source_page_url"] = source_url
+    for key in ("role", "source", "source_page_url", "alt", "caption", "width", "height"):
         value = image.get(key)
         if value is not None and str(value).strip():
             metadata[key] = value

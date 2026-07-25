@@ -19,6 +19,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -31,6 +32,8 @@ E2E_AGENT_ID = "e2e-test-agent"
 E2E_PROVIDER_ID = "e2e-mock-llm"
 SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 GOLDEN_DIR = Path(__file__).parent / "golden"
+CANONICAL_CAPTURE_DIR = Path(__file__).parents[2] / "ui" / "src" / "lib" / "chat-v2" / "captures"
+PROJECTION_RESET_LOCK = Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,7 @@ def _start_proc(
         "COGNIS_INITIAL_ADMIN_PASSWORD",
         "COGNIS_LOG_FORMAT",
         "COGNIS_LOG_LEVEL",
+        "COGNIS_E2E_MODE",
     ):
         base.pop(key, None)
     base.update(env)
@@ -292,6 +296,7 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
                 "COGNIS_LOG_FORMAT": "text",
                 "COGNIS_LOG_LEVEL": "warning",
                 "COGNIS_CORS_ORIGINS": "*",
+                "COGNIS_E2E_MODE": "true",
                 "COGNIS_DEFAULT_MEMORY_BACKEND": "none",
                 "COGNIS_DEFAULT_GUARDRAILS_BACKEND": "none",
                 "COGNIS_LOCAL_LLM_API_KEY": "mock-key",
@@ -393,7 +398,7 @@ def _seed_e2e_resources(
             "executor_type": "in_process",
             "labels": {"role": "e2e"},
             "enabled_tool_groups": [],
-            "enabled_tools": [],
+            "enabled_tools": ["bash"],
             "is_default": True,
             "config": {},
         },
@@ -417,7 +422,7 @@ def _seed_e2e_resources(
                 "guardrails_backend": "none",
             },
             "tools": {
-                "builtin_tools": ["memory_search", "memory_add"],
+                "builtin_tools": ["memory_search", "memory_add", "bash"],
                 "tool_groups": [],
             },
             "permissions": {
@@ -497,6 +502,7 @@ def capture_ws_events(
         ws.send(json.dumps({"type": "auth", "token": stack.admin_token}))
         auth_msg = json.loads(ws.recv(timeout=15))
         assert auth_msg["type"] == "authenticated", f"WS auth failed: {auth_msg}"
+        _subscribe_chat_v2(ws, stack, conversation_id, events=events)
 
         ws.send(
             json.dumps(
@@ -573,6 +579,7 @@ def capture_ws_events(
             auth2 = json.loads(ws2.recv(timeout=10))
             if auth2.get("type") != "authenticated":
                 return events
+            _subscribe_chat_v2(ws2, stack, conversation_id, events=events)
 
             ws2.send(
                 json.dumps(
@@ -603,57 +610,247 @@ def capture_ws_events(
     except Exception:
         pass  # Best-effort — don't fail the test if reconnect capture fails
 
-    _append_adversarial_refresh(events)
+    # Complete the canonical producer sequence with a server-owned reset and
+    # recovery snapshot.  Use the first live frame cursor so the response is
+    # produced by real range reconciliation rather than fabricated JSON.
+    scope = {"kind": "conversation", "conversation_id": conversation_id}
+    snapshot_response = stack.get(_scope_snapshot_path(scope))
+    if snapshot_response.status_code == 200:
+        current_snapshot = snapshot_response.json()
+        frame = next(
+            (event for event in events if event.get("type") == "chat_v2_frame"),
+            None,
+        )
+        reset_cursor = frame.get("cursor_before") if frame else current_snapshot["cursor"]
+        reset_payload, recovery_payload = _capture_reset_recovery(
+            stack,
+            scope,
+            reset_cursor,
+            current_snapshot,
+        )
+        events.append({"type": "sync", **reset_payload})
+        events.append({"type": "snapshot", **recovery_payload})
     return events
 
 
-def _append_adversarial_refresh(events: list[dict[str, Any]]) -> None:
-    """Append a synthetic ``conversation_view_refresh`` modelling the disappear bug.
+def _scope_snapshot_path(scope: dict[str, Any]) -> str:
+    """Return the native REST snapshot route for a backend-issued scope."""
+    if scope["kind"] == "session":
+        return f"/api/v1/chat/v2/sessions/{scope['session_id']}/snapshot"
+    if scope["kind"] == "task_step":
+        return f"/api/v1/chat/v2/task-steps/{scope['step_run_id']}/snapshot"
+    return f"/api/v1/chat/v2/conversations/{scope['conversation_id']}/snapshot"
 
-    In production a refresh (reloadConversationSubloads → replaceAll) can land in
-    the window after a turn produced an assistant message but before that event
-    is durably queryable from Intaris, so the projection omits it. To reproduce
-    that deterministically in the golden replay, we build a refresh projection
-    from the full set of items seen during the turn MINUS the final assistant
-    message, and emit it as ``conversation_view_refresh``.
 
-    The golden replay routes this through ``ChatTimeline.replaceAll`` and
-    ``INV-REFRESH-NO-DROP`` asserts the omitted assistant message is NOT evicted
-    (the symptom-1 guard preserves unconfirmed-live items).
-    """
-    # Collect the latest projected item per id across all timeline_patch /
-    # runtime snapshot events (the union the client would have on screen).
-    latest: dict[str, dict[str, Any]] = {}
-    final_assistant_id: str | None = None
-    for event in events:
-        items: list[dict[str, Any]] = []
-        if event.get("type") == "timeline_patch":
-            items = event.get("items", []) or []
-        elif event.get("type") == "conversation_runtime_snapshot":
-            items = event.get("timeline_items", []) or []
-        for item in items:
-            item_id = item.get("id")
-            if not isinstance(item_id, str):
-                continue
-            latest[item_id] = item
-            if item.get("kind") == "message" and item.get("role") == "assistant":
-                final_assistant_id = item_id
+def _assert_reset_recovery_snapshot(
+    *,
+    pre_reset: dict[str, Any],
+    reset: dict[str, Any],
+    recovery: dict[str, Any],
+) -> None:
+    """Require a recovery snapshot to use the reset response's projection."""
+    expected = (reset["schema_version"], reset["projection_version"])
+    assert (recovery["schema_version"], recovery["projection_version"]) == expected
+    assert (pre_reset["schema_version"], pre_reset["projection_version"]) != expected
 
-    if not latest or final_assistant_id is None:
-        return
 
-    # Build the adversarial projection: everything EXCEPT the final assistant
-    # message (simulating the refresh-before-persist gap).
-    projection = [item for item_id, item in latest.items() if item_id != final_assistant_id]
+def _capture_reset_recovery(
+    stack: E2EStack,
+    scope: dict[str, Any],
+    cursor: str,
+    pre_reset: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Atomically advance, reset, and fetch a fresh scoped recovery snapshot."""
+    with PROJECTION_RESET_LOCK:
+        sync_path = _scope_snapshot_path(scope).removesuffix("/snapshot") + "/sync"
+        control = stack.post("/api/v1/chat/v2/e2e/projection-generation")
+        assert control.status_code == 200, control.text
+        expected_projection_version = control.json()["projection_version"]
+        reset = stack.get(sync_path, params={"cursor": cursor, "limit": 1})
+        assert reset.status_code == 200, reset.text
+        reset_payload = reset.json()
+        assert reset_payload["reset_required"] is True, reset_payload
+        assert reset_payload["projection_version"] == expected_projection_version, reset_payload
+        recovery = stack.get(_scope_snapshot_path(scope))
+        assert recovery.status_code == 200, recovery.text
+        recovery_payload = recovery.json()
+        _assert_reset_recovery_snapshot(
+            pre_reset=pre_reset,
+            reset=reset_payload,
+            recovery=recovery_payload,
+        )
+    return reset_payload, recovery_payload
 
-    events.append(
-        {
-            "type": "conversation_view_refresh",
-            "timeline_items": projection,
-            "_synthetic": True,
-            "_omitted_id": final_assistant_id,
-        }
+
+def _subscribe_chat_v2(
+    ws: Any,
+    stack: E2EStack,
+    conversation_id: str,
+    *,
+    events: list[dict[str, Any]] | None = None,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Subscribe to a production ChatV2 scope and optionally record its snapshot."""
+    snapshot_scope = scope or {
+        "kind": "conversation",
+        "conversation_id": conversation_id,
+    }
+    snapshot = stack.get(_scope_snapshot_path(snapshot_scope))
+    assert snapshot.status_code == 200, snapshot.text
+    payload = snapshot.json()
+    if events is not None:
+        # The authoritative snapshot must precede every runtime frame.  This
+        # is intentionally fetched through the same native scoped route used
+        # by ChatV2Store, rather than reconstructed from websocket messages.
+        events.append({"type": "snapshot", **payload})
+    ws.send(
+        json.dumps(
+            {
+                "type": "chat_v2_subscribe",
+                "scope": payload["scope"],
+                "cursor": payload["cursor"],
+            }
+        )
     )
+    return payload
+
+
+def capture_scoped_scope_events(
+    stack: E2EStack,
+    scope: dict[str, Any],
+    *,
+    timeout: float = 10,
+) -> list[dict[str, Any]]:
+    """Capture a live backend-issued session/task-step scope.
+
+    The scope is taken from the linked task/session resources returned by the
+    backend.  Both the REST snapshot and websocket subscription use the
+    scope's native route and exact cursor.
+    """
+    import websockets.sync.client as wsc
+
+    def lifecycle_signature(payload: dict[str, Any]) -> tuple[Any, ...]:
+        items = payload.get("timeline", {}).get("items", [])
+        tools = tuple(
+            (
+                item.get("id"),
+                item.get("status"),
+                item.get("result_preview"),
+            )
+            for item in items
+            if item.get("kind") == "tool_call"
+        )
+        completed_messages = tuple(
+            (item.get("id"), item.get("role"), item.get("content"))
+            for item in items
+            if item.get("kind") == "message" and item.get("stable")
+        )
+        return payload.get("scope", {}).get("status"), tools, completed_messages
+
+    conversation_id = scope["conversation_id"]
+    events: list[dict[str, Any]] = []
+    snapshot_response = stack.get(_scope_snapshot_path(scope))
+    assert snapshot_response.status_code == 200, snapshot_response.text
+    snapshot = snapshot_response.json()
+    events.append({"type": "snapshot", **snapshot})
+    current_cursor = snapshot["cursor"]
+    last_snapshot_cursor = current_cursor
+    last_lifecycle_signature = lifecycle_signature(snapshot)
+    with wsc.connect(stack.ws_url, close_timeout=5, open_timeout=10) as ws:
+        ws.send(json.dumps({"type": "auth", "token": stack.admin_token}))
+        auth_msg = json.loads(ws.recv(timeout=15))
+        assert auth_msg["type"] == "authenticated", f"WS auth failed: {auth_msg}"
+        # This is an actual reconnect request on the native scope, not a
+        # synthetic record.  It makes the producer exercise the same
+        # reconnect path used by the UI before it records any frames.
+        events.append(
+            {
+                "type": "reconnect",
+                "scope": snapshot["scope"],
+                "cursor": snapshot["cursor"],
+            }
+        )
+        ws.send(
+            json.dumps(
+                {
+                    "type": "reconnect",
+                    "conversation_id": conversation_id,
+                    "session_id": snapshot["scope"].get("session_id"),
+                    "last_seq": 0,
+                    "chat_v2_cursor": snapshot["cursor"],
+                }
+            )
+        )
+        ws.send(
+            json.dumps(
+                {
+                    "type": "chat_v2_subscribe",
+                    "scope": snapshot["scope"],
+                    "cursor": snapshot["cursor"],
+                }
+            )
+        )
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                event = json.loads(
+                    ws.recv(timeout=min(0.1, max(0.05, deadline - time.monotonic())))
+                )
+                if (
+                    event.get("type") == "chat_v2_frame"
+                    and event.get("cursor_before") != current_cursor
+                ):
+                    # Sync polling may already have consumed the same durable
+                    # events. Do not promote a now-stale realtime duplicate
+                    # after the newer cursor; the live client would reject it.
+                    continue
+                events.append(event)
+                if event.get("type") == "chat_v2_frame" and event.get("cursor_after"):
+                    current_cursor = event["cursor_after"]
+            except TimeoutError:
+                # Capture authoritative lifecycle snapshots while the native
+                # subscription remains attached. A snapshot advances the
+                # replay boundary atomically, avoiding partial-sync cursors
+                # racing ahead of a later full snapshot.
+                live_snapshot_response = stack.get(_scope_snapshot_path(scope))
+                assert live_snapshot_response.status_code == 200, live_snapshot_response.text
+                live_snapshot = live_snapshot_response.json()
+                if live_snapshot["cursor"] != last_snapshot_cursor:
+                    signature = lifecycle_signature(live_snapshot)
+                    if signature != last_lifecycle_signature:
+                        events.append({"type": "snapshot", **live_snapshot})
+                        last_lifecycle_signature = signature
+                    last_snapshot_cursor = live_snapshot["cursor"]
+                    current_cursor = live_snapshot["cursor"]
+            except Exception:
+                break
+
+    # Anchor the reset request to a snapshot that is present in the promoted
+    # sequence. Lifecycle-signature compaction may have skipped cursor-only
+    # snapshots while still advancing ``current_cursor``.
+    pre_reset = stack.get(_scope_snapshot_path(scope))
+    assert pre_reset.status_code == 200, pre_reset.text
+    pre_reset_payload = pre_reset.json()
+    last_promoted_snapshot = next(
+        event for event in reversed(events) if event.get("type") == "snapshot"
+    )
+    if pre_reset_payload["cursor"] != last_promoted_snapshot["cursor"]:
+        events.append({"type": "snapshot", **pre_reset_payload})
+    current_cursor = pre_reset_payload["cursor"]
+
+    # Ask the live scoped endpoint to reconcile an unsupported cursor.  The
+    # server owns the reset_required response; the capture never manufactures
+    # one after the fact.  A fresh snapshot records the recovery boundary.
+    reset_payload, recovery_payload = _capture_reset_recovery(
+        stack,
+        scope,
+        current_cursor,
+        pre_reset_payload,
+    )
+    events.append({"type": "sync", **reset_payload})
+    events.append({"type": "snapshot", **recovery_payload})
+    return events
 
 
 # ---------------------------------------------------------------------------

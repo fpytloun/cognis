@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
@@ -15,6 +16,7 @@ NORMALIZED_REASONING_LEVELS: tuple[str, ...] = (
     "high",
     "xhigh",
     "max",
+    "ultra",
 )
 
 LEGACY_REASONING_LEVEL_ALIASES: dict[str, str] = {
@@ -58,6 +60,7 @@ class LLMProviderConfig(BaseModel):
     sdk: str | None = None
     api_base: str | None = None
     api_key_secret: str | None = None
+    protocol: str = "auto"  # "auto" | "anthropic_messages" | "litellm"
     executor_labels: dict[str, str] | None = None
     executor_backend: str | None = None
     models: list[ModelInfo] = Field(default_factory=list)
@@ -93,6 +96,9 @@ class ModelInfo(BaseModel):
     supports_defer_loading: bool = False
     supports_responses_api: bool = False
     supports_extended_thinking: bool = False
+    supports_strict_tools: bool = False
+    supports_native_tool_search: bool = False
+    supports_pause_turn: bool = False
     supports_openai_namespace_tools: bool = False
     supports_openai_allowed_tools: bool = False
     supports_openai_apply_patch: bool = False
@@ -105,6 +111,8 @@ class ModelInfo(BaseModel):
     input_cost_per_mtok: float | None = None
     output_cost_per_mtok: float | None = None
     tier: str = "standard"
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
+    runtime_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 DEFAULT_MODEL_INFO = ModelInfo(
@@ -145,6 +153,32 @@ class TokenUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+
+
+class GenerationPerformanceSnapshot(BaseModel):
+    """Latest normalized local-model generation performance observation."""
+
+    is_local: bool
+    provider_id: str | None = None
+    provider_name: str | None = None
+    runtime: str | None = None
+    location: str | None = None
+    executor_id: str | None = None
+    executor_name: str | None = None
+    model: str
+    digest: str | None = None
+    quantization: str | None = None
+    configured_context_tokens: int | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    prompt_tokens_per_second: float | None = None
+    generation_tokens_per_second: float | None = None
+    time_to_first_token_seconds: float | None = None
+    load_duration_seconds: float | None = None
+    total_duration_seconds: float | None = None
+    processor: str | None = None
+    gpu_residency: str | None = None
+    measured_at: datetime
 
 
 class Cost(BaseModel):

@@ -448,6 +448,297 @@ def test_messages_to_responses_input_replays_raw_responses_output_items() -> Non
     ]
 
 
+def test_messages_to_responses_input_pairs_call_id_and_item_id_aliases() -> None:
+    call_item = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "bash",
+        "arguments": '{"command":"touch /tmp/x"}',
+    }
+
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command":"touch /tmp/x"}',
+                        },
+                    }
+                ],
+                "_responses_output_items": [call_item],
+            },
+            # Interrupted/recovered paths can persist the output under the raw
+            # Responses item id instead of the function call_id.
+            {"role": "tool", "tool_call_id": "fc_1", "content": "ok"},
+        ]
+    )
+
+    assert result == [
+        call_item,
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+
+
+def test_messages_to_responses_input_alias_match_does_not_complete_parallel_call() -> None:
+    completed = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "read",
+        "arguments": "{}",
+    }
+    interrupted = {
+        "type": "function_call",
+        "id": "fc_2",
+        "call_id": "call_2",
+        "name": "grep",
+        "arguments": "{}",
+    }
+
+    result = messages_to_responses_input(
+        [
+            {"role": "assistant", "_responses_output_items": [completed, interrupted]},
+            {"role": "tool", "tool_call_id": "fc_1", "content": "ok"},
+        ]
+    )
+
+    assert result == [
+        completed,
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+    ]
+
+
+def test_messages_to_responses_input_drops_unmaterialized_raw_calls() -> None:
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_partial",
+        "encrypted_content": "encrypted",
+    }
+    completed_call = {
+        "type": "function_call",
+        "call_id": "call_completed",
+        "name": "read",
+        "arguments": "{}",
+    }
+    interrupted_call = {
+        "type": "function_call",
+        "call_id": "call_interrupted",
+        "name": "grep",
+        "arguments": "{}",
+    }
+    pending_call = {
+        "type": "function_call",
+        "call_id": "call_pending",
+        "name": "glob",
+        "arguments": "{}",
+    }
+
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "I will inspect the repository.",
+                "tool_calls": [
+                    {
+                        "id": "call_completed",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+                "_responses_output_items": [
+                    reasoning_item,
+                    completed_call,
+                    interrupted_call,
+                    pending_call,
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_completed", "content": "ok"},
+        ]
+    )
+
+    assert result == [
+        reasoning_item,
+        {"role": "assistant", "content": "I will inspect the repository."},
+        completed_call,
+        {"type": "function_call_output", "call_id": "call_completed", "output": "ok"},
+    ]
+
+
+def test_messages_to_responses_input_drops_raw_calls_without_any_outputs() -> None:
+    reasoning_item = {
+        "type": "reasoning",
+        "id": "rs_interrupted",
+        "encrypted_content": "encrypted",
+    }
+
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "Starting the requested work.",
+                "_responses_output_items": [
+                    reasoning_item,
+                    {
+                        "type": "function_call",
+                        "call_id": "call_first",
+                        "name": "read",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_second",
+                        "name": "grep",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call_custom",
+                        "name": "apply_patch",
+                        "input": "*** Begin Patch\n*** End Patch\n",
+                    },
+                    {
+                        "type": "apply_patch_call",
+                        "call_id": "call_patch",
+                        "status": "completed",
+                        "operation": {
+                            "type": "update_file",
+                            "path": "/tmp/a.txt",
+                            "diff": "@@\n-old\n+new\n",
+                        },
+                    },
+                ],
+            }
+        ]
+    )
+
+    assert result == [
+        reasoning_item,
+        {"role": "assistant", "content": "Starting the requested work."},
+    ]
+
+
+def test_messages_to_responses_input_drops_reconstructed_call_without_output() -> None:
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "Starting inspection.",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert result == [{"role": "assistant", "content": "Starting inspection."}]
+
+
+def test_messages_to_responses_input_does_not_pair_output_before_call() -> None:
+    result = messages_to_responses_input(
+        [
+            {"role": "tool", "tool_call_id": "call_read", "content": "stale output"},
+            {
+                "role": "assistant",
+                "content": "Starting inspection.",
+                "_responses_output_items": [
+                    {
+                        "type": "function_call",
+                        "call_id": "call_read",
+                        "name": "read",
+                        "arguments": "{}",
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert result == [{"role": "assistant", "content": "Starting inspection."}]
+
+
+def test_messages_to_responses_input_pairs_only_latest_duplicate_call_id() -> None:
+    first_call = {
+        "type": "function_call",
+        "call_id": "call_reused",
+        "name": "read",
+        "arguments": '{"file_path":"old.py"}',
+    }
+    second_call = {
+        "type": "function_call",
+        "call_id": "call_reused",
+        "name": "read",
+        "arguments": '{"file_path":"new.py"}',
+    }
+
+    result = messages_to_responses_input(
+        [
+            {"role": "assistant", "_responses_output_items": [first_call]},
+            {"role": "tool", "tool_call_id": "call_reused", "content": "old output"},
+            {"role": "assistant", "_responses_output_items": [second_call]},
+            {"role": "tool", "tool_call_id": "call_reused", "content": "new output"},
+        ]
+    )
+
+    assert result == [
+        second_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call_reused",
+            "output": "new output",
+        },
+    ]
+
+
+def test_messages_to_responses_input_keeps_completed_raw_multi_call_response() -> None:
+    first_call = {
+        "type": "function_call",
+        "call_id": "call_first",
+        "name": "read",
+        "arguments": "{}",
+    }
+    second_call = {
+        "type": "function_call",
+        "call_id": "call_second",
+        "name": "grep",
+        "arguments": "{}",
+    }
+
+    result = messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "_responses_output_items": [first_call, second_call],
+            },
+            {"role": "tool", "tool_call_id": "call_first", "content": "read result"},
+            {"role": "tool", "tool_call_id": "call_second", "content": "grep result"},
+        ]
+    )
+
+    assert result == [
+        first_call,
+        second_call,
+        {
+            "type": "function_call_output",
+            "call_id": "call_first",
+            "output": "read result",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_second",
+            "output": "grep result",
+        },
+    ]
+
+
 def test_messages_to_responses_input_reconstructs_durable_payload_snapshot() -> None:
     messages = [
         {
@@ -917,6 +1208,58 @@ def test_responses_to_chat_response_normalizes_apply_patch_call() -> None:
     assert tool_call["id"] == "call_patch"
     assert tool_call["function"]["name"] == "apply_patch"
     assert tool_call["function"]["arguments"] == "[patch body omitted]"
+
+
+def test_responses_to_chat_response_deduplicates_output_and_choices_tool_call_by_id() -> None:
+    payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "item_123",
+                "call_id": "call_123",
+                "name": "delegate",
+                "arguments": '{"task":"inspect"}',
+            }
+        ],
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_123",
+                            "function": {
+                                "name": "incorrect_compatibility_call",
+                                "arguments": '{"task":"incorrect"}',
+                            },
+                        },
+                        {
+                            "id": "call_456",
+                            "function": {
+                                "name": "delegate",
+                                "arguments": '{"task":"other"}',
+                            },
+                        },
+                    ]
+                }
+            }
+        ],
+    }
+
+    result = responses_to_chat_response(payload)
+
+    assert result["choices"][0]["message"]["tool_calls"] == [
+        {
+            "id": "call_123",
+            "type": "function",
+            "function": {"name": "delegate", "arguments": '{"task":"inspect"}'},
+        },
+        {
+            "id": "call_456",
+            "type": "function",
+            "function": {"name": "delegate", "arguments": '{"task":"other"}'},
+        },
+    ]
 
 
 def test_responses_to_chat_response_drops_incomplete_apply_patch_arguments() -> None:

@@ -753,6 +753,7 @@ async def test_send_message_formats_matrix_html_mentions_and_thread_relations() 
                 content="Hello **Matrix** @alice:example.org",
                 thread_id="$thread",
                 reply_to_id="$reply",
+                platform_data={"idempotency_key": "txn-stable-chunk-0"},
             )
         )
     finally:
@@ -765,6 +766,7 @@ async def test_send_message_formats_matrix_html_mentions_and_thread_relations() 
     assert b'"m.mentions":{"user_ids":["@alice:example.org"]}' in payload
     assert b'"rel_type":"m.thread"' in payload
     assert b'"m.in_reply_to":{"event_id":"$reply"}' in payload
+    assert requests[0].url.path.endswith("/txn-stable-chunk-0")
 
 
 @pytest.mark.asyncio
@@ -803,6 +805,87 @@ async def test_send_media_uploads_content_b64_and_sends_file_event() -> None:
     assert b'"msgtype":"m.image"' in sent_payload
     assert b'"url":"mxc://example.org/media"' in sent_payload
     assert b'"rel_type":"m.thread"' in sent_payload
+
+
+@pytest.mark.asyncio
+async def test_send_message_embeds_inline_rich_image_in_the_text_event() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/_matrix/media/v3/upload":
+            return httpx.Response(200, json={"content_uri": "mxc://example.org/inline"})
+        return httpx.Response(200, json={"event_id": "$sent"})
+
+    adapter = _adapter()
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await adapter.send_message(
+            OutboundMessage(
+                channel_type="matrix",
+                account_id="matrix-account",
+                chat_id="!room:example.org",
+                content="Daily brief",
+                media=[
+                    MediaAttachment(
+                        filename="brief.png",
+                        mime_type="image/png",
+                        content_b64=base64.b64encode(b"png-bytes").decode(),
+                        disposition="inline",
+                    )
+                ],
+            )
+        )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    assert len(requests) == 2
+    assert requests[0].url.path == "/_matrix/media/v3/upload"
+    assert requests[1].url.path.startswith("/_matrix/client/v3/rooms/")
+    payload = requests[1].read()
+    assert b'<img src=\\"mxc://example.org/inline\\" alt=\\"brief.png\\">' in payload
+    assert b'"msgtype":"m.image"' not in payload
+
+
+@pytest.mark.asyncio
+async def test_send_message_fails_when_inline_rich_image_upload_fails() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, request=request)
+
+    adapter = _adapter()
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await adapter.send_message(
+                OutboundMessage(
+                    channel_type="matrix",
+                    account_id="matrix-account",
+                    chat_id="!room:example.org",
+                    content="Daily brief",
+                    media=[
+                        MediaAttachment(
+                            filename="brief.png",
+                            mime_type="image/png",
+                            content_b64=base64.b64encode(b"png-bytes").decode(),
+                            disposition="inline",
+                        )
+                    ],
+                )
+            )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/_matrix/media/v3/upload"
 
 
 def _stub_inbound_message() -> Any:

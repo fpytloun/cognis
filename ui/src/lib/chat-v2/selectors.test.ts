@@ -4,11 +4,13 @@ import {
   selectActiveTurnId,
   selectHasActiveTurn,
   selectNeedsRecovery,
-  selectQueuedCount,
-  selectRenderItems
+  selectLatestTodoState,
+  selectPendingInputItem,
+  selectPendingInputToolCall,
+  selectQueuedCount
 } from './selectors';
 import { emptyChatV2State, type ChatV2ClientState } from './sync-engine';
-import type { RuntimeOverlaySnapshot, TimelineItem } from './types';
+import type { RuntimeOverlaySnapshot, TimelineItem, ToolCallTimelineItem } from './types';
 
 function state(overrides: Partial<ChatV2ClientState> = {}): ChatV2ClientState {
   return { ...emptyChatV2State(), ...overrides };
@@ -30,38 +32,6 @@ function activeRuntime(overrides: Partial<RuntimeOverlaySnapshot> = {}): Runtime
   };
 }
 
-const sampleItems: TimelineItem[] = [
-  {
-    id: 'message:1',
-    kind: 'message',
-    sort_key: '0000:000000000000001:000000:02:000000000',
-    source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 1, event_type: 'user_message' }],
-    stable: true,
-    role: 'user',
-    content: 'hi',
-    message_id: 'm1',
-    attachments: [],
-    partial: false
-  },
-  {
-    id: 'todo:1',
-    kind: 'todo_state',
-    sort_key: '0000:000000000000001:000000:09:000000000',
-    source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 1, event_type: 'todo_state' }],
-    stable: true,
-    todos: []
-  }
-];
-
-describe('selectRenderItems', () => {
-  it('converts visible items to legacy render shape, dropping non-row kinds', () => {
-    const rendered = selectRenderItems(sampleItems);
-    expect(rendered).toHaveLength(1);
-    expect(rendered[0].kind).toBe('message');
-    expect(rendered[0].id).toBe('message:1');
-  });
-});
-
 describe('runtime selectors', () => {
   it('reports active turn flags', () => {
     expect(selectHasActiveTurn(state())).toBe(false);
@@ -77,5 +47,90 @@ describe('runtime selectors', () => {
     expect(selectNeedsRecovery(state({ syncStatus: 'ready' }))).toBe(false);
     expect(selectQueuedCount(state({ queue: { messages: [], queued_count: 3 } }))).toBe(3);
     expect(selectQueuedCount(state())).toBe(0);
+  });
+});
+
+function tool(overrides: Partial<ToolCallTimelineItem> = {}): ToolCallTimelineItem {
+  return {
+    id: 'tool:call-1',
+    kind: 'tool_call',
+    sort_key: '0001',
+    source_refs: [],
+    stable: true,
+    status: 'complete',
+    call_id: 'call-1',
+    tool_name: 'grep',
+    arguments: {},
+    is_error: false,
+    attachments: [],
+    file_diffs: [],
+    truncated: false,
+    has_full_output: false,
+    ...overrides,
+  };
+}
+
+describe('canonical pending-input selectors', () => {
+  it('ignores historical canonical tool calls and selects a waiting request without legacy fields', () => {
+    const items: TimelineItem[] = [
+      tool({ call_id: 'historical', tool_name: 'grep', result_preview: 'done' }),
+      tool({ call_id: 'question', tool_name: 'request_user_input', status: 'waiting', stable: false }),
+    ];
+
+    expect(() => selectPendingInputToolCall(items)).not.toThrow();
+    expect(selectPendingInputToolCall(items)?.call_id).toBe('question');
+  });
+
+  it('selects canonical question and auth rows directly', () => {
+    const items: TimelineItem[] = [
+      {
+        id: 'questions',
+        kind: 'question_set',
+        sort_key: '0001',
+        source_refs: [],
+        stable: true,
+        status: 'waiting',
+        request_id: 'req-1',
+        questions: [],
+      },
+      {
+        id: 'auth',
+        kind: 'auth_challenge',
+        sort_key: '0002',
+        source_refs: [],
+        stable: true,
+        status: 'waiting',
+        challenge_id: 'auth-1',
+        challenge_kind: 'otp_code',
+        label: 'OTP',
+        message: 'Enter code',
+        metadata: {},
+        required_fields: ['code'],
+      },
+    ];
+
+    expect(selectPendingInputItem(items)?.kind).toBe('auth_challenge');
+  });
+});
+
+describe('canonical todo selectors', () => {
+  it('uses only the newest canonical todo_state despite missing or reordered legacy tool events', () => {
+    const items: TimelineItem[] = [
+      tool({ call_id: 'legacy-result-arrived-first', tool_name: 'step_todo_write', result_preview: '{"todos":[{"content":"wrong","status":"pending"}]}' }),
+      {
+        id: 'todo:authoritative',
+        kind: 'todo_state',
+        sort_key: '0002',
+        source_refs: [],
+        stable: true,
+        status: 'complete',
+        todos: [{ content: 'Canonical authority', status: 'in_progress', priority: 'high' }],
+      },
+      tool({ call_id: 'legacy-call-arrived-last', tool_name: 'step_todo_write', arguments: { todos: [{ content: 'also wrong', status: 'pending' }] } }),
+    ];
+
+    expect(selectLatestTodoState(items)).toEqual([
+      { content: 'Canonical authority', status: 'in_progress', priority: 'high' },
+    ]);
   });
 });

@@ -6,15 +6,19 @@
   import { api, asApiError } from '$lib/api/client';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
   import { formatMcpOAuthStatus, isMcpOAuthStatusCritical, type MCPOAuthStatus } from '$lib/mcp-oauth-status';
-  import { collectModelOptions, createProviderForm, deriveProviderId, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
+  import { collectModelOptions, createProviderForm, deriveProviderId, parseExecutorSelector, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
-  import { defaultModelEntry, type ModelEntry } from '$lib/types/api';
+  import { defaultModelEntry, type LocalModelDeployment, type LocalModelTargetStatus, type ModelEntry } from '$lib/types/api';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
   import EnvVarEditor from '$lib/components/settings/EnvVarEditor.svelte';
+  import ExecutorHealthPanel from '$lib/components/executors/ExecutorHealthPanel.svelte';
+  import LocalInferenceSettings from '$lib/components/executors/LocalInferenceSettings.svelte';
   import ModelCard from '$lib/components/settings/ModelCard.svelte';
   import ModelEditModal from '$lib/components/settings/ModelEditModal.svelte';
   import ModelDiscoveryModal from '$lib/components/settings/ModelDiscoveryModal.svelte';
+  import SystemSettingsEditor from '$lib/components/settings/SystemSettingsEditor.svelte';
+  import WebBackendEditModal from '$lib/components/settings/WebBackendEditModal.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -31,6 +35,13 @@
   import { loadUserPreferences, saveUserPreferences, userPreferences } from '$lib/stores/userPreferences';
   import { wsClient } from '$lib/ws/client';
   import {
+    createWebBackendEditValue,
+    webBackendConfigured,
+    webBackendStatusLabel,
+    type EditableWebBackend,
+    type WebBackendEditValue
+  } from '$lib/web-backends';
+  import {
     disableWebPushForCurrentDevice,
     enableWebPush,
     hasEnabledWebPush,
@@ -42,10 +53,11 @@
   } from '$lib/notifications';
   import {
     executorDegradedDetails,
-    executorObservedNote,
     executorRuntimeBadgeStatus,
     executorRuntimeLabel,
     executorRuntimeSummary,
+    providerInferenceExecutors,
+    providerSelectorCapabilityWarning,
     validateStdioCommand
   } from '$lib/executors';
   import type {
@@ -53,6 +65,7 @@
     ApiKeyMetadata,
     CredentialMetadata,
     ExecutorConfig,
+    ExecutorRuntimeConfig,
     ExecutorTokenResponse,
     HealthResponse,
     LLMProvider,
@@ -213,6 +226,9 @@
   let notice = $state('');
   let settings = $state<SettingsCategory[]>([]);
   let providers = $state<LLMProvider[]>([]);
+  let localModelDeployments = $state<LocalModelDeployment[]>([]);
+  let localModelTargets = $state<Record<string, LocalModelTargetStatus[]>>({});
+  let localModelsUnavailable = $state(false);
   let modelRouting = $state<ModelRouting>(emptyModelRouting());
   let secrets = $state<SecretMetadata[]>([]);
   let credentials = $state<CredentialMetadata[]>([]);
@@ -231,11 +247,17 @@
     browser_fetch_navigation_timeout_seconds: 60,
     browser_fetch_wait_until: 'domcontentloaded',
     browser_fetch_network_idle_after_dom_seconds: 3,
-    browser_fetch_headed_fallback_enabled: false,
+    browser_fetch_headed_fallback_enabled: true,
     tavily_configured: false,
+    tavily_enabled: true,
     brave_configured: false,
+    brave_enabled: true,
     searxng_url: '',
+    searxng_engines: '',
+    searxng_categories: '',
+    searxng_language: '',
     searxng_configured: false,
+    searxng_enabled: true,
     available_backends: ['direct'],
     available_search_backends: ['direct'],
     available_fetch_backends: ['direct'],
@@ -250,8 +272,7 @@
   let webBrowserFetchWaitUntilForm = $state('domcontentloaded');
   let webBrowserFetchNetworkIdleForm = $state(3);
   let webBrowserFetchHeadedFallbackForm = $state(false);
-  let webSearxngUrlForm = $state('');
-  let webKeySetup = $state<{ backend: string; value: string } | null>(null);
+  let editingWebBackend = $state<WebBackendEditValue | null>(null);
   let showExecutorForm = $state(false);
   let executorForm = $state({ executor_id: '', name: '', executor_type: 'websocket', labels: '', status: 'active', shared: false, is_default: false });
   let executorToken = $state<ExecutorTokenResponse | null>(null);
@@ -264,6 +285,7 @@
   // a stale `exec.enabled_tools` snapshot. We accumulate the latest tool
   // list per executor and flush it via a single in-flight promise chain.
   const toolUpdateQueues = new Map<string, { pending: string[]; inFlight: Promise<void> | null }>();
+  const executorLocalInferenceSaveSequences = new Map<string, number>();
 
   async function queueExecutorToolUpdate(executorId: string, nextTools: string[]): Promise<void> {
     const current = toolUpdateQueues.get(executorId) ?? { pending: nextTools, inFlight: null };
@@ -322,8 +344,7 @@
   let isAdmin = $state(false);
   let tabs = $derived(isAdmin ? ALL_TABS : USER_TABS);
   let selectedProviderId = $state('');
-  let selectedSettingKey = $state('');
-  let settingValueText = $state('');
+  let systemSettingsDirty = $state(false);
   let providerForm = $state<ProviderFormState>(createProviderForm());
   let providerTestResult = $state<ProviderTestResult | null>(null);
   let providerOAuthStatus = $state<LLMProviderOAuthStatus | null>(null);
@@ -424,16 +445,14 @@
       passwordForm,
       newApiKeyName,
       newApiKeyExpiresInDays,
-      settingValueText,
       webSearchBackendForm,
       webFetchBackendForm,
-      webFetchFallbackBrowserForm,
-      webSearxngUrlForm
+      webFetchFallbackBrowserForm
     });
   }
 
   function isDirty(): boolean {
-    return snapshotState() !== initialSnapshot;
+    return systemSettingsDirty || snapshotState() !== initialSnapshot;
   }
 
   beforeNavigate((navigation) => {
@@ -486,18 +505,26 @@
     return typeof item?.value === 'boolean' ? item.value : fallback;
   }
 
-  async function toggleBooleanSetting(key: string, nextValue: boolean): Promise<void> {
-    try {
-      await api.settings.update(key, nextValue);
-      await refreshPageState();
-      addToast(`Updated ${key}.`, 'success');
-    } catch (e) {
-      error = asApiError(e).message;
-    }
-  }
-
   function selectedProvider(): LLMProvider | null {
     return providers.find((provider) => provider.provider_id === selectedProviderId) ?? null;
+  }
+
+  function selectedProviderDeployments(): LocalModelDeployment[] {
+    return localModelDeployments.filter(
+      (deployment) => deployment.provider_id === selectedProviderId
+    );
+  }
+
+  function deploymentRollout(deployment: LocalModelDeployment): string {
+    const targets = localModelTargets[deployment.deployment_id] ?? [];
+    if (targets.length === 0) return 'Waiting for target status';
+    const ready = targets.filter((target) => target.state === 'ready').length;
+    const blocked = targets.filter(
+      (target) => target.state === 'blocked' || target.state === 'error'
+    ).length;
+    return blocked > 0
+      ? `${ready}/${targets.length} ready · ${blocked} blocked`
+      : `${ready}/${targets.length} ready`;
   }
 
   function modelOptions(): ProviderModelOption[] {
@@ -564,7 +591,7 @@
       return ['none', 'low', 'medium', 'high', 'max'];
     }
     if (normalized.startsWith('gpt-5') || normalized.includes(' gpt-5')) {
-      return ['none', 'low', 'medium', 'high', 'xhigh'];
+      return ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
     }
     return ['none', 'low', 'medium', 'high'];
   }
@@ -722,6 +749,18 @@
 
   function selectedProviderExecutorError(): string | null {
     return providerExecutorTargetError(providerForm);
+  }
+
+  function localInferenceExecutorOptions(): ExecutorConfig[] {
+    return providerInferenceExecutors(executorConfigs, providerForm.executor_id);
+  }
+
+  function selectedProviderExecutorWarning(): string | null {
+    return providerSelectorCapabilityWarning(
+      executorConfigs,
+      providerForm.executor_id,
+      parseExecutorSelector(providerForm.executor_selector)
+    );
   }
 
   function providerSaveDisabledReason(): string | null {
@@ -886,13 +925,23 @@
     error = '';
     try {
       let models: ModelEntry[];
-      if (selectedProviderId) {
+      const useCurrentFormForDiscovery = providerForm.location === 'executor' && providerForm.preset === 'ollama';
+      if (selectedProviderId && !useCurrentFormForDiscovery) {
         const result = await api.llmProviders.discoverModels(selectedProviderId);
         models = result.models;
       } else {
+        const executorLabels = parseExecutorSelector(providerForm.executor_selector);
         const result = await api.llmProviders.discoverModelsPreview({
+          ...(selectedProviderId ? { provider_id: selectedProviderId } : {}),
           preset: providerForm.preset,
           base_url: providerForm.base_url,
+          location: providerForm.location,
+          ...(providerForm.location === 'executor' && providerForm.executor_id.trim()
+            ? { executor_id: providerForm.executor_id.trim() }
+            : {}),
+          ...(providerForm.location === 'executor' && !providerForm.executor_id.trim() && executorLabels
+            ? { executor_labels: executorLabels }
+            : {}),
           ...(providerForm.auth_mode === 'secret' && providerForm.auth_secret_name
             ? { secret_name: providerForm.auth_secret_name }
             : {}),
@@ -1530,11 +1579,17 @@
         browser_fetch_navigation_timeout_seconds: 60,
         browser_fetch_wait_until: 'domcontentloaded',
         browser_fetch_network_idle_after_dom_seconds: 3,
-        browser_fetch_headed_fallback_enabled: false,
+        browser_fetch_headed_fallback_enabled: true,
         tavily_configured: false,
+        tavily_enabled: true,
         brave_configured: false,
+        brave_enabled: true,
         searxng_url: '',
+        searxng_engines: '',
+        searxng_categories: '',
+        searxng_language: '',
         searxng_configured: false,
+        searxng_enabled: true,
         available_backends: ['direct'],
         available_search_backends: ['direct'],
         available_fetch_backends: ['direct'],
@@ -1549,8 +1604,7 @@
     webBrowserFetchNavigationTimeoutForm = webConfig.browser_fetch_navigation_timeout_seconds ?? 60;
     webBrowserFetchWaitUntilForm = webConfig.browser_fetch_wait_until ?? 'domcontentloaded';
     webBrowserFetchNetworkIdleForm = webConfig.browser_fetch_network_idle_after_dom_seconds ?? 3;
-    webBrowserFetchHeadedFallbackForm = webConfig.browser_fetch_headed_fallback_enabled ?? false;
-    webSearxngUrlForm = webConfig.searxng_url ?? '';
+    webBrowserFetchHeadedFallbackForm = webConfig.browser_fetch_headed_fallback_enabled ?? true;
 
     // Initialize account name form
     accountNameForm = auth.getSnapshot().user?.name ?? '';
@@ -1575,6 +1629,27 @@
       userList = [];
     }
 
+    try {
+      localModelDeployments = await api.localModels.deployments();
+      localModelTargets = Object.fromEntries(
+        await Promise.all(
+          localModelDeployments.map(async (deployment) => [
+            deployment.deployment_id,
+            await api.localModels.targets(deployment.deployment_id)
+          ] as const)
+        )
+      );
+      localModelsUnavailable = false;
+    } catch {
+      localModelDeployments = [];
+      localModelTargets = {};
+      localModelsUnavailable = true;
+    }
+
+    const queryProviderId = new URL(window.location.href).searchParams.get('provider');
+    if (queryProviderId && providers.some((provider) => provider.provider_id === queryProviderId)) {
+      selectedProviderId = queryProviderId;
+    }
     if (selectedProviderId) {
       const next = providers.find((provider) => provider.provider_id === selectedProviderId);
       if (next) {
@@ -1596,6 +1671,36 @@
 
   function isExecutorSaving(executorId: string): boolean {
     return savingExecutorIds.includes(executorId);
+  }
+
+  async function saveExecutorLocalInference(
+    executorId: string,
+    config: ExecutorRuntimeConfig
+  ): Promise<void> {
+    const sequence = (executorLocalInferenceSaveSequences.get(executorId) ?? 0) + 1;
+    executorLocalInferenceSaveSequences.set(executorId, sequence);
+    setExecutorSaving(executorId, true);
+    try {
+      const current = executorConfigs.find((executor) => executor.executor_id === executorId);
+      const updated = await api.executor.update(executorId, {
+        config,
+        expected_config_version: current?.desired_config_version
+      });
+      if (executorLocalInferenceSaveSequences.get(executorId) !== sequence) return;
+      executorConfigs = executorConfigs.map((executor) =>
+        executor.executor_id === executorId ? updated : executor
+      );
+      addToast('Local inference settings saved.', 'success');
+    } catch (caughtError) {
+      if (executorLocalInferenceSaveSequences.get(executorId) !== sequence) return;
+      const apiError = asApiError(caughtError);
+      addToast(apiError.message, 'error', 4_000, 'Unable to save local inference settings');
+      throw new Error(apiError.message);
+    } finally {
+      if (executorLocalInferenceSaveSequences.get(executorId) === sequence) {
+        setExecutorSaving(executorId, false);
+      }
+    }
   }
 
   function canManageExecutor(exec: ExecutorConfig): boolean {
@@ -2205,7 +2310,6 @@
       await api.settings.update('web.browser_fetch.wait_until', webBrowserFetchWaitUntilForm);
       await api.settings.update('web.browser_fetch.network_idle_after_dom_seconds', Number(webBrowserFetchNetworkIdleForm));
       await api.settings.update('web.browser_fetch.headed_fallback_enabled', webBrowserFetchHeadedFallbackForm);
-      await api.settings.update('web.searxng_url', webSearxngUrlForm.trim());
       webConfig = await api.webConfig.status();
       webSearchBackendForm = webConfig.search_backend ?? 'direct';
       webFetchBackendForm = webConfig.fetch_backend ?? 'direct';
@@ -2215,8 +2319,7 @@
       webBrowserFetchNavigationTimeoutForm = webConfig.browser_fetch_navigation_timeout_seconds ?? 60;
       webBrowserFetchWaitUntilForm = webConfig.browser_fetch_wait_until ?? 'domcontentloaded';
       webBrowserFetchNetworkIdleForm = webConfig.browser_fetch_network_idle_after_dom_seconds ?? 3;
-      webBrowserFetchHeadedFallbackForm = webConfig.browser_fetch_headed_fallback_enabled ?? false;
-      webSearxngUrlForm = webConfig.searxng_url ?? '';
+      webBrowserFetchHeadedFallbackForm = webConfig.browser_fetch_headed_fallback_enabled ?? true;
       notice = 'Web backend updated.';
       addToast('Web backend updated.', 'success');
       initialSnapshot = snapshotState();
@@ -2228,51 +2331,101 @@
     }
   }
 
-  async function saveWebApiKey(): Promise<void> {
-    if (!webKeySetup) return;
+  function openWebBackendEditor(backend: EditableWebBackend): void {
+    editingWebBackend = createWebBackendEditValue(backend, webConfig);
+  }
+
+  function resetDisabledBackendSelections(backend: EditableWebBackend): void {
+    if (webSearchBackendForm === backend || webConfig.search_backend === backend) {
+      webSearchBackendForm = 'direct';
+    }
+    if (webFetchBackendForm === backend || webConfig.fetch_backend === backend) {
+      webFetchBackendForm = 'direct';
+    }
+    if (webBackendForm === backend || webConfig.backend === backend) {
+      webBackendForm = 'direct';
+    }
+  }
+
+  async function refreshWebBackendAfterFailure(backend: EditableWebBackend): Promise<void> {
+    try {
+      webConfig = await api.webConfig.status();
+      [settings, secrets] = await Promise.all([api.settings.list(), api.secrets.list()]);
+      const isAvailable = webConfig.available_search_backends.includes(backend)
+        || webConfig.available_fetch_backends.includes(backend);
+      if (!isAvailable) {
+        resetDisabledBackendSelections(backend);
+      }
+      if (editingWebBackend?.backend === backend) {
+        editingWebBackend = createWebBackendEditValue(backend, webConfig);
+      }
+      initialSnapshot = snapshotState();
+    } catch {
+      // Preserve the original mutation error when recovery refresh also fails.
+    }
+  }
+
+  async function saveWebBackendConfig(value: WebBackendEditValue): Promise<void> {
     busy = true;
     error = '';
     try {
-      const secretName = webKeySetup.backend === 'tavily' ? 'tavily_api_key' : 'brave_api_key';
-      await api.secrets.upsert({ name: secretName, value: webKeySetup.value, scope: 'system', description: `API key for ${WEB_BACKEND_INFO[webKeySetup.backend]?.label ?? webKeySetup.backend}` });
-      secrets = await api.secrets.list();
-      webConfig = await api.webConfig.status();
-      webKeySetup = null;
-      notice = 'API key saved.';
-      addToast('API key saved.', 'success');
+      webConfig = await api.webConfig.updateBackend(value.backend, {
+        enabled: value.enabled,
+        api_key: value.apiKey.trim() || null,
+        searxng_url: value.searxngUrl.trim(),
+        searxng_engines: value.searxngEngines.trim(),
+        searxng_categories: value.searxngCategories.trim(),
+        searxng_language: value.searxngLanguage.trim()
+      });
+      if (!value.enabled) {
+        resetDisabledBackendSelections(value.backend);
+      }
+      [settings, secrets] = await Promise.all([api.settings.list(), api.secrets.list()]);
+      if (editingWebBackend?.backend === value.backend) {
+        editingWebBackend = null;
+      }
+      notice = `${WEB_BACKEND_INFO[value.backend].label} updated.`;
+      addToast(notice, 'success');
       initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to save API key');
+      await refreshWebBackendAfterFailure(value.backend);
+      addToast(error, 'error', 4_000, 'Unable to update web backend');
     } finally {
       busy = false;
     }
   }
 
-  function selectSetting(setting: Setting): void {
-    selectedSettingKey = setting.key;
-    settingValueText = JSON.stringify(setting.value, null, 2);
-    initialSnapshot = snapshotState();
-  }
+  async function removeWebBackendConfiguration(backend: EditableWebBackend): Promise<void> {
+    const label = WEB_BACKEND_INFO[backend].label;
+    const confirmed = await confirmAction({
+      title: `Remove ${label} configuration?`,
+      message: backend === 'searxng'
+        ? 'This clears the SearXNG URL and optional defaults. The values cannot be recovered.'
+        : `This permanently deletes the encrypted ${label} API key.`,
+      confirmLabel: backend === 'searxng' ? 'Clear configuration' : 'Remove key'
+    });
+    if (!confirmed) return;
 
-  async function saveSetting(): Promise<void> {
-    try {
-      JSON.parse(settingValueText);
-    } catch {
-      error = 'Setting value must be valid JSON.';
-      return;
-    }
     busy = true;
     error = '';
     try {
-      await api.settings.update(selectedSettingKey, JSON.parse(settingValueText));
-      settings = await api.settings.list();
-      notice = 'Setting updated.';
-      addToast('Setting updated.', 'success');
+      webConfig = await api.webConfig.updateBackend(backend, {
+        enabled: false,
+        remove_configuration: true
+      });
+      resetDisabledBackendSelections(backend);
+      [settings, secrets] = await Promise.all([api.settings.list(), api.secrets.list()]);
+      if (editingWebBackend?.backend === backend) {
+        editingWebBackend = null;
+      }
+      notice = `${label} configuration removed.`;
+      addToast(notice, 'success');
       initialSnapshot = snapshotState();
     } catch (caughtError) {
       error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to save setting');
+      await refreshWebBackendAfterFailure(backend);
+      addToast(error, 'error', 4_000, 'Unable to remove web backend configuration');
     } finally {
       busy = false;
     }
@@ -2516,10 +2669,10 @@
     error = '';
     try {
       await saveUserPreferences(next);
-      addToast('Display preferences saved.', 'success');
+      addToast('Preferences saved.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
-      addToast(error, 'error', 4_000, 'Unable to save display preferences');
+      addToast(error, 'error', 4_000, 'Unable to save preferences');
       await loadUserPreferences();
     } finally {
       busy = false;
@@ -2765,8 +2918,8 @@
                 <span>Executor</span>
                 <select bind:value={providerForm.executor_id} onchange={handleProviderExecutorIdChange} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                   <option value="">Use label selector</option>
-                  {#each executorConfigs.filter((executor) => executor.executor_type !== 'in_process') as executor}
-                    <option value={executor.executor_id}>{executor.name} ({executor.executor_id})</option>
+                  {#each localInferenceExecutorOptions() as executor}
+                    <option value={executor.executor_id}>{executor.name} ({executor.executor_id}){executor.local_inference_enabled ? '' : ' — local inference disabled'}</option>
                   {/each}
                 </select>
                 <span class="block text-xs text-slate-400">Choose a concrete executor when this provider depends on executor-local auth or runtime state.</span>
@@ -2778,10 +2931,13 @@
               {#if selectedProviderExecutorError()}
                 <p class="text-xs text-rose-300">{selectedProviderExecutorError()}</p>
               {/if}
+              {#if selectedProviderExecutorWarning()}
+                <p class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">{selectedProviderExecutorWarning()}</p>
+              {/if}
               {#if executorConfigs.length > 0}
                 <div class="flex flex-wrap gap-2">
                   <span class="text-xs text-slate-400 self-center">Use labels from:</span>
-                  {#each executorConfigs.filter((executor) => executor.executor_type !== 'in_process') as executor}
+                  {#each executorConfigs.filter((executor) => executor.executor_type === 'websocket' && executor.local_inference_enabled) as executor}
                     <Button size="sm" variant="secondary" onclick={() => { providerForm.executor_id = ''; providerForm.executor_selector = executorSelectorFor(executor.labels); }} disabled={Object.keys(executor.labels || {}).length === 0}>{executor.name}</Button>
                   {/each}
                 </div>
@@ -2924,6 +3080,18 @@
             </label>
           {/if}
 
+          {#if providerForm.preset === 'ollama'}
+            <div class="rounded-2xl border border-sky-500/20 bg-sky-500/10 p-4 text-xs leading-5 text-sky-100">
+              <p class="font-medium text-sky-50">Ollama must already be installed and running.</p>
+              <p class="mt-1 text-sky-100/85">
+                Cognis only performs read-only discovery via <code>/api/tags</code> and <code>/api/show</code>, then sends requests through LiteLLM. The model context window is also sent at runtime as Ollama <code>num_ctx</code>, bounded by discovered model metadata when available.
+              </p>
+              <p class="mt-1 text-sky-100/70">
+                <code>localhost</code> is resolved where the provider runs: the controller for controller providers, or the selected executor for executor-routed inference.
+              </p>
+            </div>
+          {/if}
+
           {#if ['openai', 'openai_compatible', 'litellm_proxy'].includes(providerForm.preset)}
             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-200">
               <input bind:checked={providerForm.use_responses_api} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
@@ -2951,18 +3119,77 @@
             </label>
           {/if}
 
+          {#if selectedProviderId && providerForm.preset === 'ollama'}
+            <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4">
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p class="text-xs uppercase tracking-[0.25em] text-sky-300">Managed models</p>
+                  <p class="mt-2 text-xs leading-5 text-slate-400">This provider owns host scope and inference routing. Each deployment manages one model rollout within it.</p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onclick={() => goto(`/local-models?provider=${encodeURIComponent(selectedProviderId)}`)}
+                >
+                  Open Local Models
+                </Button>
+              </div>
+              {#if selectedProviderDeployments().length > 0}
+                <div class="mt-4 space-y-2">
+                  {#each selectedProviderDeployments() as deployment (deployment.deployment_id)}
+                    <a
+                      href={`/local-models?provider=${encodeURIComponent(selectedProviderId)}&deployment=${encodeURIComponent(deployment.deployment_id)}`}
+                      class="block rounded-xl border border-slate-800 bg-slate-950/60 p-3 transition hover:border-sky-500/40"
+                    >
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <span class="font-mono text-sm text-slate-100">{deployment.runtime_name}</span>
+                        <span class="text-xs text-sky-200">{deploymentRollout(deployment)}</span>
+                      </div>
+                      <p class="mt-2 text-xs text-slate-400">
+                        {deployment.runtime_name === providerForm.default_model ? 'Default model' : 'Managed model'} ·
+                        {deployment.selector.executor_ids?.length
+                          ? `${deployment.selector.executor_ids.length} host${deployment.selector.executor_ids.length === 1 ? '' : 's'}`
+                          : `labels ${JSON.stringify(deployment.selector.match_labels ?? {})}`}
+                      </p>
+                    </a>
+                  {/each}
+                </div>
+              {:else if localModelsUnavailable}
+                <p class="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-100">Managed deployment status is temporarily unavailable. Open Local Models to retry; no empty state is being inferred.</p>
+              {:else}
+                <p class="mt-4 text-sm text-slate-400">No managed deployments use this provider yet.</p>
+              {/if}
+            </div>
+          {/if}
+
           <!-- Models -->
           <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-4">
             <div class="flex items-center justify-between gap-3">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Models</p>
               <div class="flex gap-2">
-                <Button size="sm" variant="secondary" onclick={discoverModels} disabled={busy || providerForm.location === 'executor'}>
+                {#if providerForm.preset === 'ollama'}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onclick={() => goto(selectedProviderId ? `/local-models?provider=${encodeURIComponent(selectedProviderId)}` : '/local-models')}
+                  >
+                    Local Models
+                  </Button>
+                {/if}
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onclick={discoverModels}
+                  disabled={busy || (providerForm.location === 'executor' && (providerForm.preset !== 'ollama' || providerExecutorTargetError(providerForm) !== null))}
+                >
                   Discover
                 </Button>
               </div>
             </div>
-            {#if providerForm.location === 'executor'}
-              <p class="mt-3 text-xs text-slate-400">Model discovery runs from the controller. For executor-routed providers, add models manually.</p>
+            {#if providerForm.location === 'executor' && providerForm.preset === 'ollama'}
+              <p class="mt-3 text-xs text-slate-400">Ollama discovery runs on the selected executor and uses that executor's view of the base URL, so <code>localhost:11434</code> means Ollama on the executor host.</p>
+            {:else if providerForm.location === 'executor'}
+              <p class="mt-3 text-xs text-slate-400">Executor-routed discovery is currently available for Ollama providers only; add other executor-routed models manually.</p>
             {/if}
 
             <!-- Default model selection -->
@@ -3414,6 +3641,20 @@
             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
               <input
                 type="checkbox"
+                checked={$userPreferences.chat.keep_assistant_messages_separate}
+                disabled={busy}
+                class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                onchange={(event) => void updateChatPreference('keep_assistant_messages_separate', event.currentTarget.checked)}
+              />
+              <span>
+                <span class="block font-medium text-slate-100">Keep assistant messages separate</span>
+                <span class="mt-1 block text-xs leading-5 text-slate-500">Do not fold assistant text into tool activity groups. Tool and thinking activity stays grouped.</span>
+              </span>
+            </label>
+
+            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+              <input
+                type="checkbox"
                 checked={$userPreferences.chat.group_tool_calls}
                 disabled={busy}
                 class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
@@ -3457,9 +3698,9 @@
               <span>Search backend</span>
               <select bind:value={webSearchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="direct">Direct (DuckDuckGo)</option>
-                <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
-                <option value="brave" disabled={!webConfig.brave_configured}>{WEB_BACKEND_INFO.brave.label}{webConfig.brave_configured ? '' : ' (not configured)'}</option>
-                <option value="searxng" disabled={!webConfig.searxng_configured}>{WEB_BACKEND_INFO.searxng.label}{webConfig.searxng_configured ? '' : ' (URL not set)'}</option>
+                <option value="tavily" disabled={!webConfig.available_search_backends.includes('tavily')}>{WEB_BACKEND_INFO.tavily.label}{webConfig.available_search_backends.includes('tavily') ? '' : ' (unavailable)'}</option>
+                <option value="brave" disabled={!webConfig.available_search_backends.includes('brave')}>{WEB_BACKEND_INFO.brave.label}{webConfig.available_search_backends.includes('brave') ? '' : ' (unavailable)'}</option>
+                <option value="searxng" disabled={!webConfig.available_search_backends.includes('searxng')}>{WEB_BACKEND_INFO.searxng.label}{webConfig.available_search_backends.includes('searxng') ? '' : ' (unavailable)'}</option>
               </select>
             </label>
             <p class="text-sm leading-6 text-slate-400">{searchBackendDescription(webSearchBackendForm)}</p>
@@ -3467,7 +3708,7 @@
               <span>Fetch backend</span>
               <select bind:value={webFetchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
                 <option value="direct">Direct extraction (httpx + trafilatura)</option>
-                <option value="tavily" disabled={!webConfig.tavily_configured}>{WEB_BACKEND_INFO.tavily.label}{webConfig.tavily_configured ? '' : ' (not configured)'}</option>
+                <option value="tavily" disabled={!webConfig.available_fetch_backends.includes('tavily')}>{WEB_BACKEND_INFO.tavily.label}{webConfig.available_fetch_backends.includes('tavily') ? '' : ' (unavailable)'}</option>
                 <option value="browser">{WEB_BACKEND_INFO.browser.label}</option>
               </select>
             </label>
@@ -3482,8 +3723,8 @@
             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3 text-sm text-slate-200">
               <input bind:checked={webBrowserFetchHeadedFallbackForm} type="checkbox" class="mt-1 rounded border-slate-600 bg-slate-950 text-sky-400 focus:ring-sky-300" />
               <span class="space-y-1">
-                <span class="block font-medium text-slate-100">Headed last-resort fallback</span>
-                <span class="block text-xs leading-5 text-slate-400">After headless browser fetch fails or extracts an empty/block page, retry in headed mode when the executor also enables headed browser sessions.</span>
+                <span class="block font-medium text-slate-100">Prefer headed browser fallback</span>
+                <span class="block text-xs leading-5 text-slate-400">After direct extraction fails, use headed mode when the executor enables headed browser sessions. Headless mode is selected only on executors that do not support headed sessions.</span>
               </span>
             </label>
             <div class="grid gap-3 md:grid-cols-2">
@@ -3513,11 +3754,6 @@
                 <Input bind:value={webBrowserFetchWaitTimeoutForm} type="number" min="1" max="300" step="1" />
               </label>
             </div>
-            <label class="space-y-2 text-sm font-medium text-slate-200">
-              <span>SearXNG instance URL (search backend = searxng)</span>
-              <Input bind:value={webSearxngUrlForm} placeholder="http://localhost:8888" />
-              <span class="block text-xs text-slate-500">Run your own SearXNG (e.g. <code>docker run -p 8888:8080 searxng/searxng</code>) and point cognis at it. cognis does not orchestrate SearXNG itself.</span>
-            </label>
             <Button class="w-full justify-center" onclick={saveWebBackend} disabled={!isAdmin || busy}>Save</Button>
           </div>
         </Card>
@@ -3549,13 +3785,11 @@
               <div class="flex items-center justify-between gap-3">
                 <div>
                   <p class="font-medium text-white">{WEB_BACKEND_INFO.tavily.label}</p>
-                  <p class="text-xs text-slate-400">{webConfig.tavily_configured ? 'API key configured' : 'Not configured'}</p>
+                  <p class="text-xs text-slate-400">{webBackendStatusLabel('tavily', webConfig)}</p>
                 </div>
                 <div class="flex items-center gap-2">
-                  {#if !webConfig.tavily_configured}
-                    <Button size="sm" variant="secondary" onclick={() => { webKeySetup = { backend: 'tavily', value: '' }; }}>Setup</Button>
-                  {/if}
-                  <ProviderStatusBadge status={webConfig.tavily_configured ? 'healthy' : 'degraded'} />
+                  <Button size="sm" variant="secondary" onclick={() => openWebBackendEditor('tavily')}>Edit</Button>
+                  <ProviderStatusBadge status={webConfig.tavily_configured && webConfig.tavily_enabled ? 'healthy' : 'degraded'} />
                 </div>
               </div>
             </div>
@@ -3565,13 +3799,25 @@
               <div class="flex items-center justify-between gap-3">
                 <div>
                   <p class="font-medium text-white">{WEB_BACKEND_INFO.brave.label}</p>
-                  <p class="text-xs text-slate-400">{webConfig.brave_configured ? 'API key configured' : 'Not configured'}</p>
+                  <p class="text-xs text-slate-400">{webBackendStatusLabel('brave', webConfig)}</p>
                 </div>
                 <div class="flex items-center gap-2">
-                  {#if !webConfig.brave_configured}
-                    <Button size="sm" variant="secondary" onclick={() => { webKeySetup = { backend: 'brave', value: '' }; }}>Setup</Button>
-                  {/if}
-                  <ProviderStatusBadge status={webConfig.brave_configured ? 'healthy' : 'degraded'} />
+                  <Button size="sm" variant="secondary" onclick={() => openWebBackendEditor('brave')}>Edit</Button>
+                  <ProviderStatusBadge status={webConfig.brave_configured && webConfig.brave_enabled ? 'healthy' : 'degraded'} />
+                </div>
+              </div>
+            </div>
+
+            <!-- SearXNG -->
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div>
+                  <p class="font-medium text-white">{WEB_BACKEND_INFO.searxng.label}</p>
+                  <p class="text-xs text-slate-400">{webBackendStatusLabel('searxng', webConfig)}</p>
+                </div>
+                <div class="flex items-center gap-2">
+                  <Button size="sm" variant="secondary" onclick={() => openWebBackendEditor('searxng')}>Edit</Button>
+                  <ProviderStatusBadge status={webConfig.searxng_configured && webConfig.searxng_enabled ? 'healthy' : 'degraded'} />
                 </div>
               </div>
             </div>
@@ -3581,25 +3827,6 @@
             </p>
           </div>
 
-          <!-- Inline API key setup -->
-          {#if webKeySetup}
-            <div class="mt-4 space-y-3 border-t border-slate-800 pt-4">
-              <p class="text-sm font-medium text-white">Configure {WEB_BACKEND_INFO[webKeySetup.backend]?.label ?? webKeySetup.backend}</p>
-              <label class="space-y-2 text-sm font-medium text-slate-200">
-                <span>API Key</span>
-                <Input bind:value={webKeySetup.value} type="password" placeholder="Enter API key" />
-              </label>
-              {#if WEB_BACKEND_INFO[webKeySetup.backend]?.link}
-                <p class="text-xs text-slate-400">
-                  Get your key at <a href={WEB_BACKEND_INFO[webKeySetup.backend].link} target="_blank" rel="noopener noreferrer" class="text-sky-400 underline">{WEB_BACKEND_INFO[webKeySetup.backend].link}</a>
-                </p>
-              {/if}
-              <div class="flex gap-2">
-                <Button onclick={saveWebApiKey} disabled={busy || !webKeySetup.value}>Save key</Button>
-                <Button variant="secondary" onclick={() => { webKeySetup = null; }}>Cancel</Button>
-              </div>
-            </div>
-          {/if}
         </Card>
       </div>
     {:else if activeTab === 'executors'}
@@ -3689,8 +3916,8 @@
           {@const toolGroups = [...new Set(executorTools.map(t => t.category))].sort()}
           {@const canManage = canManageExecutor(exec)}
           <Card class="p-5 space-y-4">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center gap-3">
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div class="flex flex-wrap items-center gap-3">
                 <h3 class="text-lg font-medium text-white">{exec.name}</h3>
                 <span class="px-2 py-0.5 bg-zinc-700 text-zinc-300 text-xs font-mono rounded">{exec.executor_type}</span>
                 <span class="px-2 py-0.5 rounded text-xs {exec.status === 'active' ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-400'}">{exec.status}</span>
@@ -3704,8 +3931,11 @@
                 {#if exec.shared}
                   <span class="px-2 py-0.5 bg-cyan-500/20 text-cyan-300 text-xs rounded">shared</span>
                 {/if}
+                {#if !exec.local_inference_enabled}
+                  <span class="px-2 py-0.5 rounded bg-amber-500/15 text-amber-200 text-xs">local inference disabled</span>
+                {/if}
               </div>
-              <div class="flex gap-2">
+              <div class="flex flex-wrap gap-2">
                 {#if canManage}
                   <Button variant="secondary" size="sm" onclick={() => {
                     editingExecutor = exec;
@@ -3753,8 +3983,14 @@
             {/if}
 
             <div class="text-xs text-slate-500 font-mono">ID: {exec.executor_id}</div>
-            {#if executorObservedNote(exec)}
-              <div class="text-xs text-slate-500">{executorObservedNote(exec)}</div>
+            <ExecutorHealthPanel executor={exec} />
+            {#if exec.executor_type === 'websocket'}
+              <LocalInferenceSettings
+                executor={exec}
+                editable={canManage}
+                saving={isExecutorSaving(exec.executor_id)}
+                onSave={(config) => saveExecutorLocalInference(exec.executor_id, config)}
+              />
             {/if}
             {#if executorRuntimeSummary(exec)}
               <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-sky-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
@@ -4634,20 +4870,20 @@
                 <h2 class="text-lg font-semibold text-white">Local executor modes</h2>
                 <p class="text-sm text-slate-400">For multi-user production deployments, disable local executor modes and rely on websocket executors only.</p>
                 <div class="grid gap-3 md:grid-cols-2">
-                  <button class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4 text-left" onclick={() => toggleBooleanSetting('executors.allow_in_process', !settingBool('executors.allow_in_process', true))}>
+                  <div class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4">
                     <div class="flex items-center justify-between gap-3">
                       <p class="font-medium text-white">Allow in-process executors</p>
                       <ProviderStatusBadge status={settingBool('executors.allow_in_process', true) ? 'healthy' : 'degraded'} />
                     </div>
                     <p class="mt-2 text-sm text-slate-400">Disable to prevent controller-local tool execution in production.</p>
-                  </button>
-                  <button class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4 text-left" onclick={() => toggleBooleanSetting('executors.allow_subprocess', !settingBool('executors.allow_subprocess', true))}>
+                  </div>
+                  <div class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-4">
                     <div class="flex items-center justify-between gap-3">
                       <p class="font-medium text-white">Allow subprocess executors</p>
                       <ProviderStatusBadge status={settingBool('executors.allow_subprocess', true) ? 'healthy' : 'degraded'} />
                     </div>
                     <p class="mt-2 text-sm text-slate-400">Disable to require persistent websocket executors instead of local child processes.</p>
-                  </button>
+                  </div>
                 </div>
               </div>
             </Card>
@@ -4710,24 +4946,18 @@
                 <pre class="mt-3 whitespace-pre-wrap text-xs text-slate-300">{diagnosticsEnvBlock()}</pre>
               </div>
 
-              <div class="mt-4 grid gap-3 md:grid-cols-2">
-                {#each groupedSettings() as setting}
-                  <button class="rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-left text-slate-200" onclick={() => selectSetting(setting)}>
-                    <p class="font-medium">{setting.key}</p>
-                    <p class="mt-1 text-xs text-slate-400">{setting.category}</p>
-                  </button>
-                {/each}
-              </div>
-
-              {#if selectedSettingKey}
-                <div class="mt-4 space-y-3 border-t border-slate-800 pt-4">
-                  <p class="text-sm font-medium text-white">Edit {selectedSettingKey}</p>
-                  <textarea bind:value={settingValueText} class="min-h-[220px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100"></textarea>
-                  <Button onclick={saveSetting} disabled={!isAdmin || busy}>Save setting</Button>
-                </div>
-              {/if}
             </Card>
           </div>
+
+        {/if}
+
+        {#if isAdmin}
+          <SystemSettingsEditor
+            {settings}
+            disabled={busy}
+            onsettingschange={(nextSettings) => { settings = nextSettings; }}
+            ondirtychange={(dirty) => { systemSettingsDirty = dirty; }}
+          />
         {/if}
       </div>
     {:else if activeTab === 'tools'}
@@ -5240,7 +5470,7 @@
                   <div class="flex gap-2">
                     <Button variant="secondary" size="sm" onclick={() => refreshMcpOAuthStatus(srv.server_id)}>Check</Button>
                     <Button variant="primary" size="sm" onclick={() => startMcpOAuth(srv)}>Authorize</Button>
-                    {#if oauthStatus?.connected}
+                    {#if oauthStatus?.connected || oauthStatus?.authorized}
                       <Button variant="secondary" size="sm" onclick={() => disconnectMcpOAuth(srv)}>Disconnect</Button>
                     {/if}
                   </div>
@@ -5481,6 +5711,17 @@
       </div>
     </Sheet>
   {/if}
+{/if}
+
+{#if editingWebBackend}
+  <WebBackendEditModal
+    backendValue={editingWebBackend}
+    configured={webBackendConfigured(editingWebBackend.backend, webConfig)}
+    {busy}
+    onclose={() => (editingWebBackend = null)}
+    onsave={(value) => void saveWebBackendConfig(value)}
+    onremove={() => void removeWebBackendConfiguration(editingWebBackend!.backend)}
+  />
 {/if}
 
 <!-- Secret creation modal -->

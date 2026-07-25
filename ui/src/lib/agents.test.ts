@@ -212,6 +212,7 @@ describe('agent payload mapping', () => {
     const payload = formStateToPayload(form);
     expect(payload.capabilities).toEqual({
       memory_backend: 'none',
+      memory_backend_options: {},
       guardrails_backend: 'none'
     });
   });
@@ -360,7 +361,10 @@ describe('agent payload mapping', () => {
           model: 'gpt-fast',
           reasoning_effort: 'low',
           system_prompt_extra: 'Be concise.',
+          memory_enabled: false,
+          memory_backend_options: { mode: 'proactive' },
           enabled: true,
+          agent_switchable: true,
           metadata: { tier: 'cheap' }
         }
       },
@@ -378,7 +382,11 @@ describe('agent payload mapping', () => {
         model: 'gpt-fast',
         reasoningEffort: 'low',
         systemPromptExtra: 'Be concise.',
-        enabled: true
+        memoryAvailability: 'disabled',
+        memoryMode: 'proactive',
+        memoryBackendOptions: { mode: 'proactive' },
+        enabled: true,
+        agentSwitchable: true
       }
     ]);
     expect(form.defaultAgentProfileId).toBe('fast');
@@ -397,10 +405,17 @@ describe('agent payload mapping', () => {
         model: 'gpt-fast',
         reasoning_effort: 'low',
         system_prompt_extra: 'Be concise.',
-        enabled: true
+        memory_enabled: false,
+        memory_backend_options: { mode: 'proactive' },
+        enabled: true,
+        agent_switchable: true
       }
     });
     expect(payload.default_agent_profile_id).toBe('fast');
+
+    const systemOverride = formStateToSystemOverridePayload(form);
+    expect(systemOverride.agent_profiles).toEqual(payload.agent_profiles);
+    expect(systemOverride.default_agent_profile_id).toBe('fast');
   });
 
   it('selects the first runtime profile as default when the selected default is invalid', () => {
@@ -413,7 +428,11 @@ describe('agent payload mapping', () => {
         model: '',
         reasoningEffort: '',
         systemPromptExtra: '',
-        enabled: true
+        memoryAvailability: 'inherit',
+        memoryMode: '',
+        memoryBackendOptions: {},
+        enabled: true,
+        agentSwitchable: false
       }
     ];
     form.defaultAgentProfileId = 'missing';
@@ -421,6 +440,59 @@ describe('agent payload mapping', () => {
     const payload = formStateToPayload(form);
 
     expect(payload.default_agent_profile_id).toBe('quality');
+  });
+
+  it('preserves unknown future backend ids and serializes provider mode options', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      capabilities: {
+        memory_backend: 'future-memory',
+        memory_backend_options: { mode: 'future-mode', future_flag: true },
+        guardrails_backend: 'intaris'
+      }
+    } as never);
+
+    expect(form.memoryBackend).toBe('future-memory');
+    expect(form.memoryMode).toBe('future-mode');
+    expect(formStateToPayload(form).capabilities).toEqual({
+      memory_backend: 'future-memory',
+      memory_backend_options: { mode: 'future-mode', future_flag: true },
+      guardrails_backend: 'intaris'
+    });
+  });
+
+  it('round-trips future backend and profile options without inventing a mode', () => {
+    const form = agentToFormState({
+      agent_id: 'agent-1',
+      name: 'Agent',
+      agent_type: 'primary',
+      capabilities: {
+        memory_backend: 'future-memory',
+        memory_backend_options: { strategy: 'compact', future_flag: true },
+        guardrails_backend: 'intaris'
+      },
+      agent_profiles: {
+        specialist: {
+          profile_id: 'specialist',
+          memory_backend_options: { profile_flag: 'kept' }
+        }
+      }
+    } as never);
+
+    expect(form.memoryMode).toBe('');
+    const payload = formStateToPayload(form);
+    expect(payload.capabilities).toEqual({
+      memory_backend: 'future-memory',
+      memory_backend_options: { strategy: 'compact', future_flag: true },
+      guardrails_backend: 'intaris'
+    });
+    expect(payload.agent_profiles).toMatchObject({
+      specialist: {
+        memory_backend_options: { profile_flag: 'kept' }
+      }
+    });
   });
 });
 

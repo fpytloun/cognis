@@ -35,6 +35,7 @@ from cognis.api.models import (
     WorkflowRunResponse,
 )
 from cognis.core.anchored_output import markdown_heading_anchors
+from cognis.core.managed_conversations import project_managed_conversation_state
 from cognis.logging import get_logger
 from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.task import TaskModel
@@ -122,6 +123,14 @@ def conversation_to_response(
     has_unread = last_message_at is not None and (
         last_read_at is None or last_message_at > last_read_at
     )
+    managed_projection = (
+        project_managed_conversation_state(
+            managed_link,
+            scheduler_active_turn_id=(active_turn_state or {}).get("turn_id"),
+        )
+        if managed_link is not None
+        else None
+    )
     return ConversationResponse(
         conversation_id=row.conversation_id,
         user_email=row.user_email,
@@ -162,10 +171,27 @@ def conversation_to_response(
                 "controller_conversation_id": platform_data.get("controller_conversation_id"),
                 "controller_session_id": platform_data.get("controller_session_id"),
                 "target_agent_id": platform_data.get("target_agent_id"),
-                "conversation_state": getattr(managed_link, "conversation_state", None),
-                "turn_state": getattr(managed_link, "turn_state", None),
-                "last_result_summary": getattr(managed_link, "last_result_summary", None),
-                "last_error": getattr(managed_link, "last_error", None),
+                "conversation_state": (
+                    managed_projection.conversation_state if managed_projection else None
+                ),
+                "turn_state": managed_projection.turn_state if managed_projection else None,
+                "active_turn_id": (
+                    managed_projection.active_turn_id if managed_projection else None
+                ),
+                "last_result_summary": (
+                    managed_projection.last_result_summary if managed_projection else None
+                ),
+                "last_result_turn_id": (
+                    managed_projection.last_result_turn_id if managed_projection else None
+                ),
+                "last_settlement_is_current": (
+                    managed_projection.last_settlement_is_current if managed_projection else False
+                ),
+                "consistency_warnings": (
+                    list(managed_projection.consistency_warnings) if managed_projection else []
+                ),
+                "last_error": managed_projection.last_error if managed_projection else None,
+                "completed_at": managed_projection.completed_at if managed_projection else None,
                 "control_metadata": getattr(managed_link, "control_metadata", None),
                 "follow_up_conversation_id": (
                     (getattr(managed_link, "control_metadata", None) or {}).get(
@@ -239,12 +265,20 @@ def agent_to_response(row: Any) -> AgentResponse:
         llm_config = llm_config.model_dump(mode="json", exclude_none=True)
     agent_profiles = getattr(row, "agent_profiles", None) or {}
     if isinstance(agent_profiles, dict):
-        agent_profiles = {
-            key: value.model_dump(mode="json", exclude_none=True)
-            if hasattr(value, "model_dump")
-            else value
-            for key, value in agent_profiles.items()
-        }
+        serialized_profiles: dict[str, object] = {}
+        for key, value in agent_profiles.items():
+            serialized = (
+                value.model_dump(mode="json", exclude_none=True)
+                if hasattr(value, "model_dump")
+                else value
+            )
+            if isinstance(serialized, dict):
+                if serialized.get("memory_backend_options") == {}:
+                    serialized.pop("memory_backend_options")
+                if serialized.get("memory_enabled") is None:
+                    serialized.pop("memory_enabled", None)
+            serialized_profiles[key] = serialized
+        agent_profiles = serialized_profiles
     permissions = getattr(row, "permissions", None)
     if hasattr(permissions, "model_dump"):
         permissions = permissions.model_dump(mode="json", exclude_none=True)
@@ -366,11 +400,24 @@ def project_to_response(
     )
 
 
-def setting_to_response(row: Any) -> SettingResponse:
+def setting_to_response(row: Any, spec: Any | None = None) -> SettingResponse:
+    if spec is None:
+        raise ValueError(f"Setting {row.key} has no registered metadata")
     return SettingResponse(
         key=row.key,
         value=row.value,
         category=row.category,
+        section=spec.section,
+        label=spec.label,
+        description=spec.description,
+        default_value=spec.default,
+        value_type=spec.value_type,
+        options=list(spec.options),
+        minimum=spec.minimum,
+        maximum=spec.maximum,
+        unit=spec.unit,
+        is_overridden=row.value != spec.default,
+        apply_scope=spec.application_scope,
         updated_by=row.updated_by,
         updated_at=row.updated_at,
     )
@@ -481,17 +528,31 @@ def task_comment_to_response(row: Any) -> TaskCommentResponse:
     )
 
 
-def deliverable_to_response(row: Any) -> DeliverableResponse:
+def deliverable_to_response(row: Any, *, include_rich_payload: bool = True) -> DeliverableResponse:
+    from cognis.models.deliverable import rich_payload_for_projection
+
+    rich_payload = _coerce_dict_or_none(getattr(row, "rich_payload", None))
     return DeliverableResponse(
         deliverable_id=row.deliverable_id,
         step_run_id=row.step_run_id,
+        conversation_id=getattr(row, "conversation_id", None),
+        session_id=getattr(row, "session_id", None),
+        turn_id=getattr(row, "turn_id", None),
         version=row.version,
         attempt_number=getattr(row, "attempt_number", 1),
-        content=row.content,
+        content=row.content if include_rich_payload else "",
         format=row.format,
         title=row.title,
         target=row.target,
-        outputs=_coerce_dict_or_none(getattr(row, "outputs", None)) or {},
+        outputs=(_coerce_dict_or_none(getattr(row, "outputs", None)) or {})
+        if include_rich_payload
+        else {},
+        rich_payload=rich_payload
+        if include_rich_payload
+        else rich_payload_for_projection(rich_payload),
+        validation_warnings=getattr(row, "validation_warnings", None) or [],
+        render_metadata=_coerce_dict_or_none(getattr(row, "render_metadata", None)) or {},
+        export_metadata=_coerce_dict_or_none(getattr(row, "export_metadata", None)) or {},
         status=row.status,
         evaluator_feedback=getattr(row, "evaluator_feedback", None),
         created_at=getattr(row, "created_at", None),

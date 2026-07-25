@@ -16,7 +16,7 @@ CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_USAGE_DASHBOARD_URL = "https://chatgpt.com/codex/settings/usage"
-CODEX_CLIENT_VERSION = "0.124.0"
+CODEX_CLIENT_VERSION = "0.144.1"
 CODEX_MODEL_CACHE_TTL_SECONDS = 300.0
 
 _CODEX_CATALOG: dict[str, dict[str, Any]] | None = None
@@ -37,6 +37,9 @@ _CODEX_NATIVE_PDF_MODELS = {
     # currently advertises text/image modalities only, while the Responses
     # transport accepts PDFs for these models.
     "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark",
@@ -136,7 +139,8 @@ def bundled_codex_model_entries(
             load_bundled_codex_catalog().values(),
             key=lambda model: int(model.get("priority") or 999),
         )
-        if item.get("supported_in_api") is not False and item.get("visibility") != "hidden"
+        if item.get("supported_in_api") is not False
+        and str(item.get("visibility") or "").strip().lower() not in {"hide", "hidden"}
     ]
     seen = {entry["model_id"] for entry in entries}
     for model in configured_models or []:

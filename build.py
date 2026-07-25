@@ -11,6 +11,7 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 REPO_ROOT = Path(__file__).resolve().parent
 UI_DIR = REPO_ROOT / "ui"
 UI_BUILD_DIR = UI_DIR / "build"
+STANDALONE_UI_BUILD_DIR = UI_DIR / "standalone-build"
 PACKAGE_UI_DIR = REPO_ROOT / "cognis" / "ui_dist"
 
 
@@ -37,6 +38,7 @@ class CustomBuildHook(BuildHookInterface):
 
         subprocess.run([npm, "ci"], cwd=UI_DIR, check=True)
         subprocess.run([npm, "run", "build"], cwd=UI_DIR, check=True)
+        subprocess.run([npm, "run", "build:standalone"], cwd=UI_DIR, check=True)
 
     def _stage_built_assets(self) -> None:
         if PACKAGE_UI_DIR.exists():
@@ -49,6 +51,12 @@ class CustomBuildHook(BuildHookInterface):
             return
 
         shutil.copytree(UI_BUILD_DIR, PACKAGE_UI_DIR)
+        if STANDALONE_UI_BUILD_DIR.exists():
+            shutil.copytree(STANDALONE_UI_BUILD_DIR, PACKAGE_UI_DIR / "standalone")
+        else:
+            self._warn(
+                "No standalone UI assets found; rich deliverables will use static HTML fallback."
+            )
 
     def _warn(self, message: str) -> None:
         sys.stderr.write(f"[cognis build] {message}\n")

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from cognis.core.context import events_to_messages
+from cognis.core.context import _native_attachment_blocks, events_to_messages
 from cognis.models.workflow import (
     StepDefinition,
     StepInputConfig,
@@ -16,6 +16,52 @@ from cognis.models.workflow import (
     resolve_effective_input,
     resolve_source_names,
 )
+
+
+def _anthropic_envelope(*, status: str = "continuable") -> dict[str, object]:
+    return {
+        "contract_version": 1,
+        "native_blocks": [
+            {"type": "thinking", "thinking": "reason", "signature": "signed"},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "tool_use", "id": "tool_1", "name": "read", "input": {"path": "x"}},
+            {"type": "tool_use", "id": "tool_2", "name": "glob", "input": {"pattern": "*"}},
+        ],
+        "stop_reason": "tool_use",
+        "stop_details": {"stop_sequence": None},
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+        "pending_client_message_id": None,
+        "pending_server_message_id": "msg_1",
+        "bundle_fingerprint": "bundle",
+        "provider_fingerprint": "provider",
+        "model_fingerprint": "model",
+        "thinking_fingerprint": "thinking",
+        "continuation_status": status,
+    }
+
+
+def test_file_input_capability_does_not_claim_native_audio_support() -> None:
+    blocks, unsupported = _native_attachment_blocks(
+        [
+            {
+                "artifact_id": "art-audio",
+                "kind": "audio",
+                "mime_type": "audio/mp4",
+                "filename": "voice.m4a",
+                "url": "https://artifacts.example/voice.m4a",
+            }
+        ],
+        SimpleNamespace(
+            supports_vision=False,
+            supports_pdf_input=False,
+            supports_audio_input=False,
+            supports_file_input=True,
+        ),
+    )
+
+    assert blocks == []
+    assert unsupported == ["voice.m4a"]
+
 
 # ---------------------------------------------------------------------------
 # StepInputConfig model tests
@@ -67,6 +113,125 @@ def test_step_input_config_rejects_mixed_all_source() -> None:
 def test_step_input_config_full_rejects_all_source() -> None:
     with pytest.raises(ValueError, match="cannot use source='all'"):
         StepInputConfig(type="full", source="all")
+
+
+def test_events_to_messages_rehydrates_exact_native_tool_only_envelope() -> None:
+    envelope = _anthropic_envelope()
+    messages = events_to_messages(
+        [
+            {
+                "type": "tool_call",
+                "data": {
+                    "name": "read",
+                    "call_id": "tool_1",
+                    "arguments": {"path": "x"},
+                    "anthropic_native_envelope": envelope,
+                },
+            },
+            {
+                "type": "tool_call",
+                "data": {"name": "glob", "call_id": "tool_2", "arguments": {"pattern": "*"}},
+            },
+            {"type": "tool_result", "data": {"call_id": "tool_1", "result": "x"}},
+            {"type": "tool_result", "data": {"call_id": "tool_2", "result": "x"}},
+        ]
+    )
+
+    assert messages[0]["content"] is None
+    assert messages[0]["_anthropic_native_envelope"] == envelope
+    assert [call["id"] for call in messages[0]["tool_calls"]] == ["tool_1", "tool_2"]
+
+
+def test_events_to_messages_discards_unresolved_native_tool_batch_without_repair() -> None:
+    messages = events_to_messages(
+        [
+            {
+                "type": "tool_call",
+                "data": {
+                    "name": "read",
+                    "call_id": "tool_1",
+                    "arguments": {},
+                    "anthropic_native_envelope": _anthropic_envelope(),
+                },
+            },
+            {
+                "type": "tool_call",
+                "data": {"name": "glob", "call_id": "tool_2", "arguments": {}},
+            },
+            {"type": "tool_result", "data": {"call_id": "tool_1", "result": "partial"}},
+        ]
+    )
+
+    assert messages == []
+
+
+def test_events_to_messages_discards_only_incomplete_native_batch() -> None:
+    first = _anthropic_envelope()
+    first["native_blocks"] = [
+        {"type": "tool_use", "id": "done", "name": "read", "input": {}},
+    ]
+    second = _anthropic_envelope()
+    second["native_blocks"] = [
+        {"type": "tool_use", "id": "missing", "name": "glob", "input": {}},
+    ]
+    messages = events_to_messages(
+        [
+            {
+                "type": "tool_call",
+                "data": {
+                    "name": "read",
+                    "call_id": "done",
+                    "arguments": {},
+                    "anthropic_native_envelope": first,
+                },
+            },
+            {"type": "tool_result", "data": {"call_id": "done", "result": "ok"}},
+            {
+                "type": "tool_call",
+                "data": {
+                    "name": "glob",
+                    "call_id": "missing",
+                    "arguments": {},
+                    "anthropic_native_envelope": second,
+                },
+            },
+            {"type": "user_message", "data": {"content": "continue"}},
+        ]
+    )
+
+    assert [message["role"] for message in messages] == ["assistant", "tool", "user"]
+    assert messages[0]["tool_calls"][0]["id"] == "done"
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda envelope: envelope.update(contract_version=2),
+        lambda envelope: envelope["native_blocks"].append({"type": "unknown"}),  # type: ignore[index]
+        lambda envelope: envelope["native_blocks"].append(  # type: ignore[index]
+            {"type": "text", "text": "x" * (256 * 1024)}
+        ),
+    ],
+)
+def test_events_to_messages_rejects_invalid_native_envelope(mutator: object) -> None:
+    envelope = _anthropic_envelope()
+    mutator(envelope)  # type: ignore[operator]
+    messages = events_to_messages(
+        [
+            {
+                "type": "tool_call",
+                "data": {
+                    "name": "read",
+                    "call_id": "tool_1",
+                    "arguments": {},
+                    "anthropic_native_envelope": envelope,
+                },
+            }
+        ]
+    )
+
+    assert "_anthropic_native_envelope" not in messages[0]
+    assert len(messages) == 2
 
 
 # ---------------------------------------------------------------------------

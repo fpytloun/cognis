@@ -21,6 +21,8 @@ from cognis.models.schedule import (
 )
 from cognis.models.task import TaskDelivery
 from cognis.tools.builtin import schedule as schedule_mod
+from cognis.tools.introspection import validate_available_tool_call_with_context
+from cognis.tools.native_validation import NativeValidationContext
 
 # ---------------------------------------------------------------------------
 # Schedule model validation
@@ -29,6 +31,59 @@ from cognis.tools.builtin import schedule as schedule_mod
 
 class TestScheduleModelValidation:
     """Test ScheduleModel field validation."""
+
+    def test_declared_interval_schema_enforces_minimum(self) -> None:
+        result = asyncio.run(
+            validate_available_tool_call_with_context(
+                [schedule_mod.MANAGE_SCHEDULES_TOOL],
+                "manage_schedules",
+                {
+                    "action": "create",
+                    "name": "Too frequent",
+                    "schedule_type": "interval",
+                    "interval_seconds": 5,
+                },
+                None,
+            )
+        )
+
+        assert result["valid"] is False
+
+    def test_update_domain_validation_uses_persisted_schedule(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        existing = SimpleNamespace(
+            schedule_id="schedule-1",
+            created_by="owner@example.com",
+            schedule_type="interval",
+            cron_expr=None,
+            interval_seconds=60,
+            one_shot_at=None,
+        )
+
+        async def fake_get_schedule(_session: object, schedule_id: str) -> object:
+            assert schedule_id == "schedule-1"
+            return existing
+
+        monkeypatch.setattr("cognis.store.queries.get_schedule", fake_get_schedule)
+        result = asyncio.run(
+            validate_available_tool_call_with_context(
+                [schedule_mod.MANAGE_SCHEDULES_TOOL],
+                "manage_schedules",
+                {
+                    "action": "update",
+                    "schedule_id": "schedule-1",
+                    "schedule_type": "cron",
+                },
+                NativeValidationContext(
+                    actor_email="owner@example.com",
+                    session_factory=lambda: _Session(),
+                ),
+            )
+        )
+
+        assert result["valid"] is False
+        assert any(error["code"] == "invalid_schedule_definition" for error in result["errors"])
 
     def test_cron_requires_expr(self) -> None:
         with pytest.raises(ValueError, match="cron_expr is required"):
@@ -669,11 +724,13 @@ class TestScheduleToolDefinitionOutput:
         assert payload["task_template"]["api_token"] == "[redacted]"
 
     def test_schema_exposes_get_and_patch_guidance(self) -> None:
-        schema = schedule_mod.MANAGE_SCHEDULES_TOOL.parameters
-        assert "options" in schema["properties"]["action"]["enum"]
-        assert "get" in schema["properties"]["action"]["enum"]
-        assert "include_definition" in schema["properties"]
-        assert "delivery_target" in schema["properties"]
+        operations = schedule_mod.MANAGE_SCHEDULES_TOOL.native_operations
+        assert operations is not None
+        by_name = {operation.operation: operation for operation in operations}
+        assert "options" not in by_name
+        assert "get" in by_name
+        assert "include_definition" in by_name["list"].input_schema["properties"]
+        assert "delivery_target" in by_name["create"].input_schema["properties"]
         assert "patch" in schedule_mod.MANAGE_SCHEDULES_TOOL.description.lower()
 
     def test_update_preserves_omitted_task_definition_fields(self, monkeypatch: Any) -> None:
@@ -1039,54 +1096,17 @@ class TestScheduleToolDefinitionOutput:
         assert result.is_error is True
         assert "Workflow wf_other_user not found or not available" in result.output
 
-    def test_options_returns_valid_values_and_available_ids(self, monkeypatch: Any) -> None:
-        agent = SimpleNamespace(
-            agent_id="lumi",
-            name="Lumi",
-            display_name="Lumi",
-            status="active",
-        )
-        workflow = SimpleNamespace(
-            workflow_id="wf_custom",
-            name="Custom Workflow",
-            is_system=False,
-        )
-
-        async def fake_list_visible_agents(_db: object, user_email: str) -> list[Any]:
-            assert user_email == "user@example.com"
-            return [(agent, None)]
-
-        async def fake_list_workflows(
-            _db: object, *, owner_email: str | None = None, include_system: bool = True
-        ) -> list[Any]:
-            assert owner_email == "user@example.com"
-            assert include_system is False
-            return [workflow]
-
-        monkeypatch.setattr(schedule_mod, "list_visible_agents", fake_list_visible_agents)
-        monkeypatch.setattr(schedule_mod, "list_workflows", fake_list_workflows)
-
-        result = asyncio.run(
-            schedule_mod._handle_options(lambda: _Session(), user_email="user@example.com")
-        )
-
-        assert result.is_error is False
-        payload = json.loads(result.output)
-        assert "latest_active_for_agent" in payload["valid_values"]["delivery_mode"]
-        assert "delivery_mode=specific_conversation" in payload["conditional_fields"]
-        assert any(
-            item["agent_id"] == "lumi"
-            and item["name"] == "Lumi"
-            and item["display_name"] == "Lumi"
-            and item["status"] == "active"
-            and item["shared"] is False
-            and item["agent_profiles"] == []
-            for item in payload["available_agents"]
-        )
-        assert any(
-            item["workflow_id"] == "system:general-task" for item in payload["available_workflows"]
-        )
-        assert any(item["workflow_id"] == "wf_custom" for item in payload["available_workflows"])
+    def test_descriptor_replaces_options_action(self) -> None:
+        descriptor = schedule_mod.MANAGE_SCHEDULES_TOOL.descriptor
+        assert descriptor is not None
+        create = next(item for item in descriptor.operations if item.operation == "create")
+        assert {item.source for item in create.dynamic_options} >= {
+            "schedule.visible_agents",
+            "schedule.agent_profiles",
+            "schedule.available_workflows",
+        }
+        update = next(item for item in descriptor.operations if item.operation == "update")
+        assert update.semantics.omitted == "preserve the persisted schedule field"
 
     def test_update_recomputes_next_fire_for_timing_changes(self, monkeypatch: Any) -> None:
         row = _schedule_row(

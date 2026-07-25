@@ -270,7 +270,8 @@ def _format_tavily_search(data: dict[str, Any]) -> ToolResult:
     """Format Tavily search response into readable output."""
     answer = data.get("answer")
     results = data.get("results", [])
-    if not results and not answer:
+    images = _format_tavily_images(data.get("images"))
+    if not results and not answer and not images:
         return ToolResult(output="No search results found.")
     formatted_results = [
         {
@@ -284,7 +285,31 @@ def _format_tavily_search(data: dict[str, Any]) -> ToolResult:
     return build_search_tool_result(
         answer=str(answer) if isinstance(answer, str) else None,
         results=formatted_results,
+        images=images,
     )
+
+
+def _format_tavily_images(value: object) -> list[dict[str, object]]:
+    """Normalize Tavily's URL and object image response variants."""
+    if not isinstance(value, list):
+        return []
+    images: list[dict[str, object]] = []
+    for item in value:
+        if isinstance(item, str) and item:
+            images.append({"url": item, "source": "tavily_search"})
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("image_url") or item.get("image")
+            if isinstance(url, str) and url:
+                images.append(
+                    {
+                        "url": url,
+                        "alt": item.get("description") or item.get("title"),
+                        "caption": item.get("description") or item.get("title"),
+                        "source": "tavily_search",
+                        "source_page_url": item.get("source_url") or item.get("url"),
+                    }
+                )
+    return images
 
 
 def _format_tavily_crawl(data: dict[str, Any]) -> ToolResult:

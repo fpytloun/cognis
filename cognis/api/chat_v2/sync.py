@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -18,7 +20,12 @@ from cognis.api.chat_v2.cursors import (
     encode_cursor,
     validate_cursor,
 )
-from cognis.api.chat_v2.event_store import RawSessionEvent, SessionEventStore
+from cognis.api.chat_v2.event_store import (
+    RawSessionEvent,
+    SessionEventPage,
+    SessionEventStore,
+    SessionWatermark,
+)
 from cognis.api.chat_v2.normalizer import normalize_session_events
 from cognis.api.chat_v2.projector import project_timeline
 from cognis.api.chat_v2.schemas import (
@@ -38,9 +45,11 @@ from cognis.api.chat_v2.schemas import (
     StrictModel,
     TimelineBackfillResponse,
     TimelineItem,
+    TimelineScope,
     TimelineWindow,
     UpsertTimelineItemOp,
 )
+from cognis.models.config import GenerationPerformanceSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +59,11 @@ SCHEMA_VERSION = 2
 # (with unphased message:{id} items) forces a clean reset on its next sync
 # instead of mixing old and new ids under the same projection version.
 PROJECTION_VERSION = "chat-v2-projection-v3"
+_projection_version = PROJECTION_VERSION
 SNAPSHOT_SESSION_EVENT_LIMIT = 5_000
 SNAPSHOT_WINDOW_EVENT_LIMIT = 800
+_SESSION_READ_CACHE_MAX_ENTRIES = 512
+_SNAPSHOT_PROJECTION_CACHE_MAX_CONVERSATIONS = 32
 
 # Process-scoped runtime epoch component. The runtime revision counter used for
 # WebSocket runtime overlays is an in-memory, per-conversation counter that
@@ -69,10 +81,21 @@ SNAPSHOT_WINDOW_EVENT_LIMIT = 800
 RUNTIME_PROCESS_EPOCH = uuid.uuid4().hex
 
 
-def runtime_epoch_for(conversation_id: str) -> str:
-    """Return the process-scoped runtime epoch for a conversation."""
+def runtime_epoch_for(scope_key: str) -> str:
+    """Return the process-scoped runtime epoch for one timeline view."""
 
-    return f"conversation:{conversation_id}:{RUNTIME_PROCESS_EPOCH}"
+    return f"timeline:{scope_key}:{RUNTIME_PROCESS_EPOCH}"
+
+
+def current_projection_version() -> str:
+    return _projection_version
+
+
+def advance_projection_generation() -> str:
+    global _projection_version
+    _projection_version = f"{PROJECTION_VERSION}-e2e-{uuid.uuid4().hex}"
+    clear_chat_v2_read_caches()
+    return _projection_version
 
 
 SYNC_DEFAULT_LIMIT = 500
@@ -111,6 +134,7 @@ class RuntimeOverlayInput(StrictModel):
     runtime_revision: int = Field(ge=0)
     active_turn: dict[str, Any] | None = None
     context_usage: dict[str, Any] | None = None
+    last_generation: GenerationPerformanceSnapshot | None = None
 
 
 class _EventWindow(StrictModel):
@@ -119,11 +143,33 @@ class _EventWindow(StrictModel):
 
 
 EventPostProcessor = Callable[[list[RawSessionEvent]], Awaitable[list[RawSessionEvent]]]
+_SessionReadKey = tuple[str, int | None, int | None, int, str]
+_SnapshotProjectionKey = tuple[
+    str,
+    tuple[tuple[str, str, int], ...],
+    tuple[tuple[str, str, int], ...],
+    int,
+    str,
+]
+_IMMUTABLE_WATERMARK_CACHE: OrderedDict[str, int] = OrderedDict()
+_IMMUTABLE_WINDOW_CACHE: OrderedDict[_SessionReadKey, SessionEventPage] = OrderedDict()
+_SNAPSHOT_PROJECTION_CACHE: OrderedDict[_SnapshotProjectionKey, tuple[TimelineWindow, bool]] = (
+    OrderedDict()
+)
+
+
+def clear_chat_v2_read_caches() -> None:
+    """Clear process-local Chat v2 read/projection caches."""
+
+    _IMMUTABLE_WATERMARK_CACHE.clear()
+    _IMMUTABLE_WINDOW_CACHE.clear()
+    _SNAPSHOT_PROJECTION_CACHE.clear()
 
 
 async def build_chat_snapshot(
     *,
-    conversation: ConversationSummary,
+    scope: TimelineScope,
+    conversation: ConversationSummary | None,
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
     cursor_secret: str,
@@ -131,41 +177,72 @@ async def build_chat_snapshot(
     state: ConversationStateView | None = None,
     runtime_input: RuntimeOverlayInput | None = None,
     event_post_processor: EventPostProcessor | None = None,
+    event_post_processor_cache_key: str | None = None,
+    session_cache: Any = None,
     now: datetime | None = None,
 ) -> ChatSnapshot:
     """Build an authoritative Chat v2 snapshot from current session events."""
 
     current_time = now or datetime.now(UTC)
-    watermarks = await _read_high_watermarks(session_refs=session_refs, event_store=event_store)
-    window = await _read_latest_window(
+    watermarks = await _read_high_watermarks(
         session_refs=session_refs,
         event_store=event_store,
+        session_cache=session_cache,
+    )
+    processor_cache_key = (
+        event_post_processor_cache_key
+        if event_post_processor is not None and event_post_processor_cache_key is not None
+        else "none"
+    )
+    cache_key = _snapshot_projection_cache_key(
+        conversation_id=scope.key,
+        session_refs=session_refs,
+        watermarks=watermarks,
         limit=SNAPSHOT_WINDOW_EVENT_LIMIT,
+        event_post_processor_cache_key=processor_cache_key,
     )
-    if event_post_processor is not None:
-        window = window.model_copy(update={"events": await event_post_processor(window.events)})
-    hydrated_events = await _hydrate_window_pairings(
-        list(window.events),
-        session_refs=session_refs,
-        event_store=event_store,
+    cached_projection = (
+        _snapshot_projection_cache_get(cache_key)
+        if event_post_processor is None or event_post_processor_cache_key is not None
+        else None
     )
-    projected_window = _project_window(hydrated_events)
+    if cached_projection is not None:
+        projected_window, has_more_before = cached_projection
+    else:
+        window = await _read_latest_window(
+            session_refs=session_refs,
+            event_store=event_store,
+            limit=SNAPSHOT_WINDOW_EVENT_LIMIT,
+            session_cache=session_cache,
+        )
+        if event_post_processor is not None:
+            window = window.model_copy(update={"events": await event_post_processor(window.events)})
+        hydrated_events = await _hydrate_window_pairings(
+            list(window.events),
+            session_refs=session_refs,
+            event_store=event_store,
+            session_cache=session_cache,
+        )
+        projected_window = _project_window(hydrated_events)
+        has_more_before = window.has_more_before
+        if event_post_processor is None or event_post_processor_cache_key is not None:
+            _snapshot_projection_cache_put(cache_key, (projected_window, has_more_before))
     timeline = projected_window.model_copy(
         update={
-            "has_more_before": window.has_more_before,
+            "has_more_before": has_more_before,
             "before_cursor": _encode_before_cursor_for_items(
-                conversation_id=conversation.conversation_id,
+                conversation_id=scope.key,
                 session_refs=session_refs,
                 items=projected_window.items,
                 cursor_secret=cursor_secret,
                 now=current_time,
             )
-            if window.has_more_before
+            if has_more_before
             else None,
         }
     )
     cursor = _encode_cursor(
-        conversation_id=conversation.conversation_id,
+        conversation_id=scope.key,
         session_refs=session_refs,
         events=[],
         watermarks=watermarks,
@@ -173,7 +250,8 @@ async def build_chat_snapshot(
         now=current_time,
     )
     return ChatSnapshot(
-        projection_version=PROJECTION_VERSION,
+        projection_version=current_projection_version(),
+        scope=scope,
         conversation=conversation,
         timeline=timeline,
         state=state or _empty_state(current_time),
@@ -186,7 +264,7 @@ async def build_chat_snapshot(
 
 async def build_chat_sync_response(
     *,
-    conversation_id: str,
+    scope: TimelineScope,
     cursor: str,
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
@@ -197,25 +275,28 @@ async def build_chat_sync_response(
     state: ConversationStateView | None = None,
     runtime_input: RuntimeOverlayInput | None = None,
     event_post_processor: EventPostProcessor | None = None,
+    event_post_processor_cache_key: str | None = None,
+    session_cache: Any = None,
     now: datetime | None = None,
 ) -> ChatSyncResponse:
     """Build a conservative cursor-checked incremental sync response."""
 
+    del event_post_processor_cache_key
     validated_limit = validate_sync_limit(limit)
     current_time = now or datetime.now(UTC)
     try:
         previous = validate_cursor(
             cursor,
             cursor_secret,
-            conversation_id=conversation_id,
-            projection_version=PROJECTION_VERSION,
+            scope_key=scope.key,
+            projection_version=current_projection_version(),
             now=current_time,
         )
     except ChatCursorError as exc:
         if exc.code == "cursor_invalid":
             raise
         return _reset_sync_response(
-            conversation_id=conversation_id,
+            scope=scope,
             cursor_before=cursor,
             reason=_cursor_error_reason(exc),
             runtime_input=runtime_input,
@@ -224,7 +305,7 @@ async def build_chat_sync_response(
 
     if _cursor_lineage(previous) != _lineage_entries(session_refs):
         return _reset_sync_response(
-            conversation_id=conversation_id,
+            scope=scope,
             cursor_before=cursor,
             reason="lineage_changed",
             runtime_input=runtime_input,
@@ -236,10 +317,11 @@ async def build_chat_sync_response(
         event_store=event_store,
         previous=previous,
         limit=validated_limit + 1,
+        session_cache=session_cache,
     )
     if range_too_large or len(raw_events) > validated_limit:
         return _reset_sync_response(
-            conversation_id=conversation_id,
+            scope=scope,
             cursor_before=cursor,
             reason="range_too_large",
             runtime_input=runtime_input,
@@ -251,19 +333,20 @@ async def build_chat_sync_response(
         raw_events,
         session_refs=session_refs,
         event_store=event_store,
+        session_cache=session_cache,
     )
     timeline = _project_window(raw_events)
     touched_items = timeline.items
     if len(touched_items) > validated_limit:
         return _reset_sync_response(
-            conversation_id=conversation_id,
+            scope=scope,
             cursor_before=cursor,
             reason="range_too_large",
             runtime_input=runtime_input,
             now=current_time,
         )
     cursor_after = _encode_cursor_for_watermarks(
-        conversation_id=conversation_id,
+        conversation_id=scope.key,
         session_refs=session_refs,
         watermarks=watermarks,
         cursor_secret=cursor_secret,
@@ -280,8 +363,9 @@ async def build_chat_sync_response(
         ops.append(ReplaceQueueOp(queue=queue))
 
     return ChatSyncResponse(
-        projection_version=PROJECTION_VERSION,
-        conversation_id=conversation_id,
+        projection_version=current_projection_version(),
+        scope=scope,
+        conversation_id=scope.conversation_id,
         cursor_before=cursor,
         cursor_after=cursor_after,
         ops=ops,
@@ -295,13 +379,14 @@ async def build_chat_sync_response(
 
 async def build_timeline_backfill_response(
     *,
-    conversation_id: str,
+    scope: TimelineScope,
     before: str | None,
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
     cursor_secret: str,
     limit: int = BACKFILL_DEFAULT_LIMIT,
     event_post_processor: EventPostProcessor | None = None,
+    session_cache: Any = None,
     now: datetime | None = None,
 ) -> TimelineBackfillResponse:
     """Build an older timeline page.
@@ -314,12 +399,13 @@ async def build_timeline_backfill_response(
     validated_limit = validate_backfill_limit(limit)
     current_time = now or datetime.now(UTC)
     window = await _read_backfill_window(
-        conversation_id=conversation_id,
+        conversation_id=scope.key,
         before=before,
         session_refs=session_refs,
         event_store=event_store,
         cursor_secret=cursor_secret,
         limit=validated_limit,
+        session_cache=session_cache,
         now=current_time,
     )
     if event_post_processor is not None:
@@ -328,17 +414,19 @@ async def build_timeline_backfill_response(
         list(window.events),
         session_refs=session_refs,
         event_store=event_store,
+        session_cache=session_cache,
     )
     page = _project_window(hydrated_events)
     page_items = page.items
     return TimelineBackfillResponse(
-        projection_version=PROJECTION_VERSION,
-        conversation_id=conversation_id,
+        projection_version=current_projection_version(),
+        scope=scope,
+        conversation_id=scope.conversation_id,
         items=page_items,
         cycle_states=page.cycle_states,
         has_more_before=window.has_more_before,
         before_cursor=_encode_before_cursor_for_items(
-            conversation_id=conversation_id,
+            conversation_id=scope.key,
             session_refs=session_refs,
             items=page_items,
             cursor_secret=cursor_secret,
@@ -422,6 +510,7 @@ def state_view_from_snapshot(
 def runtime_input_from_scheduler(
     *,
     conversation_id: str,
+    scope_key: str | None = None,
     active_session_id: str | None,
     turn_scheduler: Any,
     session_cache: Any = None,
@@ -435,12 +524,20 @@ def runtime_input_from_scheduler(
         and active_session_id
         else None
     )
+    last_generation = (
+        session_cache.get_last_generation_performance(active_session_id)
+        if session_cache is not None
+        and hasattr(session_cache, "get_last_generation_performance")
+        and active_session_id
+        else None
+    )
     if turn_scheduler is None:
         return RuntimeOverlayInput(
-            runtime_epoch=runtime_epoch_for(conversation_id),
+            runtime_epoch=runtime_epoch_for(scope_key or f"conversation:{conversation_id}"),
             runtime_revision=0,
             active_turn=None,
             context_usage=context_usage,
+            last_generation=last_generation,
         )
     running = turn_scheduler.running_turn_state(conversation_id)
     checkpoint = turn_scheduler.active_turn_checkpoint(conversation_id)
@@ -454,10 +551,11 @@ def runtime_input_from_scheduler(
             "chat_mode_source": running.get("chat_mode_source"),
         }
     return RuntimeOverlayInput(
-        runtime_epoch=runtime_epoch_for(conversation_id),
+        runtime_epoch=runtime_epoch_for(scope_key or f"conversation:{conversation_id}"),
         runtime_revision=1 if active_turn is not None else 0,
         active_turn=active_turn,
         context_usage=context_usage,
+        last_generation=last_generation,
     )
 
 
@@ -483,6 +581,7 @@ def _runtime_overlay(
         active_turn=active_turn,
         volatile_items=[],
         context_usage=runtime_input.context_usage,
+        last_generation=runtime_input.last_generation,
     )
 
 
@@ -534,14 +633,18 @@ async def _read_high_watermarks(
     *,
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
+    session_cache: Any = None,
 ) -> dict[tuple[str, str], int]:
-    watermarks: dict[tuple[str, str], int] = {}
-    for ref in session_refs:
-        watermark = await event_store.read_session_high_watermark(
-            session_id=ref.event_store_session_id
+    async def _read_one(ref: ConversationSessionRef) -> tuple[tuple[str, str], int]:
+        watermark = await _read_session_high_watermark(
+            ref=ref,
+            event_store=event_store,
+            session_cache=session_cache,
         )
-        watermarks[(ref.store, ref.event_store_session_id)] = watermark.last_seq
-    return watermarks
+        return (ref.store, ref.event_store_session_id), watermark.last_seq
+
+    pairs = await asyncio.gather(*[_read_one(ref) for ref in session_refs])
+    return dict(pairs)
 
 
 async def _read_latest_window(
@@ -549,22 +652,31 @@ async def _read_latest_window(
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
     limit: int,
+    session_cache: Any = None,
 ) -> _EventWindow:
     raw_events: list[RawSessionEvent] = []
     remaining = limit
     has_more_before = False
+    pages = await asyncio.gather(
+        *[
+            _read_session_events(
+                ref=ref,
+                event_store=event_store,
+                limit=limit,
+                direction="backward",
+                session_cache=session_cache,
+            )
+            for ref in session_refs
+        ]
+    )
 
     for lineage_index in range(len(session_refs) - 1, -1, -1):
         if remaining <= 0:
             has_more_before = lineage_index >= 0
             break
         ref = session_refs[lineage_index]
-        page = await event_store.read_session_events(
-            session_id=ref.event_store_session_id,
-            limit=remaining,
-            direction="backward",
-        )
-        tagged = _tag_events(page.events, ref)
+        page = pages[lineage_index]
+        tagged = _tag_events(page.events[-remaining:], ref)
         raw_events.extend(tagged)
         remaining -= len(tagged)
         if page.has_more_before:
@@ -582,6 +694,7 @@ async def _read_events_after_cursor(
     event_store: SessionEventStore,
     previous: InternalChatCursorPayload,
     limit: int,
+    session_cache: Any = None,
 ) -> tuple[list[RawSessionEvent], dict[tuple[str, str], int], bool]:
     previous_watermarks = {
         (watermark.store, watermark.session_id): watermark.last_seq
@@ -590,32 +703,38 @@ async def _read_events_after_cursor(
     current_watermarks = await _read_high_watermarks(
         session_refs=session_refs,
         event_store=event_store,
+        session_cache=session_cache,
     )
-    raw_events: list[RawSessionEvent] = []
-    remaining = limit
-    range_too_large = False
-    for ref in session_refs:
-        if remaining <= 0:
-            range_too_large = True
-            break
+
+    async def _read_changed(
+        ref: ConversationSessionRef,
+    ) -> tuple[ConversationSessionRef, SessionEventPage | None]:
         key = (ref.store, ref.event_store_session_id)
         after_seq = previous_watermarks.get(key, 0)
         if current_watermarks.get(key, 0) <= after_seq:
-            continue
-        page = await event_store.read_session_events(
-            session_id=ref.event_store_session_id,
+            return ref, None
+        return ref, await _read_session_events(
+            ref=ref,
+            event_store=event_store,
             after_seq=after_seq,
-            limit=remaining,
+            limit=limit,
+            session_cache=session_cache,
         )
+
+    pages = await asyncio.gather(*[_read_changed(ref) for ref in session_refs])
+    raw_events: list[RawSessionEvent] = []
+    range_too_large = False
+    for ref, page in pages:
+        if page is None:
+            continue
         raw_events.extend(_tag_events(page.events, ref))
-        remaining -= len(page.events)
         if page.has_more_after:
             range_too_large = True
-            break
-        if remaining <= 0:
-            range_too_large = True
-            break
-    return _sort_raw_events(raw_events), current_watermarks, range_too_large
+    sorted_events = _sort_raw_events(raw_events)
+    if len(sorted_events) >= limit:
+        range_too_large = True
+        sorted_events = sorted_events[:limit]
+    return sorted_events, current_watermarks, range_too_large
 
 
 async def _read_backfill_window(
@@ -627,24 +746,26 @@ async def _read_backfill_window(
     cursor_secret: str,
     limit: int,
     now: datetime,
+    session_cache: Any = None,
 ) -> _EventWindow:
     if before is None:
         return await _read_latest_window(
             session_refs=session_refs,
             event_store=event_store,
             limit=limit,
+            session_cache=session_cache,
         )
 
     try:
         payload = validate_cursor(
             before,
             cursor_secret,
-            conversation_id=conversation_id,
-            projection_version=PROJECTION_VERSION,
+            scope_key=conversation_id,
+            projection_version=current_projection_version(),
             now=now,
         )
     except ChatCursorError as exc:
-        raise ChatV2SyncError("invalid_before_cursor", str(exc)) from exc
+        raise ChatV2SyncError(_cursor_error_reason(exc), str(exc)) from exc
     if _cursor_lineage(payload) != _lineage_entries(session_refs):
         raise ChatV2SyncError("lineage_changed", "Timeline cursor lineage no longer matches")
     if len(payload.session_watermarks) != 1:
@@ -664,22 +785,30 @@ async def _read_backfill_window(
     raw_events: list[RawSessionEvent] = []
     remaining = limit
     has_more_before = False
+    pages = await asyncio.gather(
+        *[
+            _read_session_events(
+                ref=ref,
+                event_store=event_store,
+                before_seq=target.last_seq if index == target_index else None,
+                limit=limit,
+                direction="backward",
+                session_cache=session_cache,
+            )
+            for index, ref in enumerate(session_refs[: target_index + 1])
+        ]
+    )
     for lineage_index in range(target_index, -1, -1):
         if remaining <= 0:
             has_more_before = lineage_index >= 0
             break
         ref = session_refs[lineage_index]
         before_seq = target.last_seq if lineage_index == target_index else None
-        page = await event_store.read_session_events(
-            session_id=ref.event_store_session_id,
-            before_seq=before_seq,
-            limit=remaining,
-            direction="backward",
-        )
+        page = pages[lineage_index]
         events = page.events
         if before_seq is not None:
             events = [event for event in events if event.seq < before_seq]
-        tagged = _tag_events(events, ref)
+        tagged = _tag_events(events[-remaining:], ref)
         raw_events.extend(tagged)
         remaining -= len(tagged)
         if page.has_more_before:
@@ -689,6 +818,210 @@ async def _read_backfill_window(
             has_more_before = True
 
     return _EventWindow(events=_sort_raw_events(raw_events), has_more_before=has_more_before)
+
+
+async def _read_session_high_watermark(
+    *,
+    ref: ConversationSessionRef,
+    event_store: SessionEventStore,
+    session_cache: Any = None,
+) -> SessionWatermark:
+    cached_entry = _warm_session_cache_entry(ref, session_cache)
+    if cached_entry is not None:
+        return SessionWatermark(
+            store_id=ref.store,
+            session_id=ref.event_store_session_id,
+            last_seq=int(getattr(cached_entry, "last_event_seq", 0) or 0),
+        )
+
+    if _is_immutable_session(ref):
+        cached = _IMMUTABLE_WATERMARK_CACHE.get(ref.event_store_session_id)
+        if cached is not None:
+            _IMMUTABLE_WATERMARK_CACHE.move_to_end(ref.event_store_session_id)
+            return SessionWatermark(
+                store_id=ref.store,
+                session_id=ref.event_store_session_id,
+                last_seq=cached,
+            )
+
+    watermark = await event_store.read_session_high_watermark(session_id=ref.event_store_session_id)
+    if _is_immutable_session(ref):
+        _IMMUTABLE_WATERMARK_CACHE[ref.event_store_session_id] = watermark.last_seq
+        _bounded_lru_prune(_IMMUTABLE_WATERMARK_CACHE, _SESSION_READ_CACHE_MAX_ENTRIES)
+    return watermark
+
+
+async def _read_session_events(
+    *,
+    ref: ConversationSessionRef,
+    event_store: SessionEventStore,
+    after_seq: int | None = None,
+    before_seq: int | None = None,
+    limit: int,
+    direction: Literal["forward", "backward"] = "forward",
+    session_cache: Any = None,
+) -> SessionEventPage:
+    cached_entry = _warm_session_cache_entry(ref, session_cache)
+    if cached_entry is not None:
+        return _session_event_page_from_cache(
+            ref=ref,
+            cached_entry=cached_entry,
+            after_seq=after_seq,
+            before_seq=before_seq,
+            limit=limit,
+            direction=direction,
+        )
+
+    cache_key: _SessionReadKey | None = None
+    if _is_immutable_session(ref):
+        cache_key = (ref.event_store_session_id, after_seq, before_seq, limit, direction)
+        cached_page = _IMMUTABLE_WINDOW_CACHE.get(cache_key)
+        if cached_page is not None:
+            _IMMUTABLE_WINDOW_CACHE.move_to_end(cache_key)
+            return cached_page
+
+    page = await event_store.read_session_events(
+        session_id=ref.event_store_session_id,
+        after_seq=after_seq,
+        before_seq=before_seq,
+        limit=limit,
+        direction=direction,
+    )
+    if cache_key is not None:
+        _IMMUTABLE_WINDOW_CACHE[cache_key] = page
+        _bounded_lru_prune(_IMMUTABLE_WINDOW_CACHE, _SESSION_READ_CACHE_MAX_ENTRIES)
+    return page
+
+
+def _warm_session_cache_entry(ref: ConversationSessionRef, session_cache: Any) -> Any | None:
+    if session_cache is None or not hasattr(session_cache, "get_entry"):
+        return None
+    entry = session_cache.get_entry(ref.session_id)
+    if entry is None or not bool(getattr(entry, "initialized", False)):
+        return None
+    intaris_session_id = str(getattr(entry, "intaris_session_id", "") or ref.event_store_session_id)
+    if intaris_session_id != ref.event_store_session_id:
+        return None
+    if not _session_cache_entry_has_complete_prefix(entry):
+        return None
+    return entry
+
+
+def _session_cache_entry_has_complete_prefix(cached_entry: Any) -> bool:
+    """Return true when cached events can safely serve canonical Chat v2 reads.
+
+    SessionCache prunes ``entry.events`` after compaction while preserving the
+    high watermark. Chat v2 snapshot/sync reads are canonical history reads, so
+    a cache entry is safe only when it still contains a contiguous prefix from
+    sequence 1 through ``last_event_seq``. Otherwise we fall back to Intaris.
+    """
+
+    last_seq = int(getattr(cached_entry, "last_event_seq", 0) or 0)
+    events = list(getattr(cached_entry, "events", []))
+    if last_seq <= 0:
+        return not events
+    if len(events) < last_seq:
+        return False
+    seqs = sorted(int(getattr(event, "seq", 0) or 0) for event in events)
+    return seqs == list(range(1, last_seq + 1))
+
+
+def _session_event_page_from_cache(
+    *,
+    ref: ConversationSessionRef,
+    cached_entry: Any,
+    after_seq: int | None,
+    before_seq: int | None,
+    limit: int,
+    direction: Literal["forward", "backward"],
+) -> SessionEventPage:
+    source_events = [
+        RawSessionEvent(
+            store_id=ref.store,
+            session_id=ref.event_store_session_id,
+            seq=int(event.seq),
+            type=str(event.type),
+            data=dict(event.data),
+        )
+        for event in list(getattr(cached_entry, "events", []))
+    ]
+    last_seq = int(getattr(cached_entry, "last_event_seq", 0) or 0)
+    if direction == "backward":
+        candidates = [
+            event for event in source_events if before_seq is None or event.seq < before_seq
+        ]
+        events = candidates[-limit:]
+        return SessionEventPage(
+            store_id=ref.store,
+            session_id=ref.event_store_session_id,
+            events=events,
+            first_seq=events[0].seq if events else None,
+            last_seq=last_seq,
+            has_more_before=len(candidates) > len(events),
+            has_more_after=False,
+        )
+
+    remaining = [event for event in source_events if event.seq > (after_seq or 0)]
+    events = remaining[:limit]
+    return SessionEventPage(
+        store_id=ref.store,
+        session_id=ref.event_store_session_id,
+        events=events,
+        first_seq=events[0].seq if events else None,
+        last_seq=last_seq,
+        has_more_after=len(remaining) > len(events),
+    )
+
+
+def _is_immutable_session(ref: ConversationSessionRef) -> bool:
+    return ref.status == "completed" or ref.completion_reason == "compacted"
+
+
+def _snapshot_projection_cache_key(
+    *,
+    conversation_id: str,
+    session_refs: Sequence[ConversationSessionRef],
+    watermarks: dict[tuple[str, str], int],
+    limit: int,
+    event_post_processor_cache_key: str,
+) -> _SnapshotProjectionKey:
+    lineage = tuple((ref.store, ref.event_store_session_id, ref.ordinal) for ref in session_refs)
+    watermark_items = tuple(
+        (store, session_id, last_seq)
+        for (store, session_id), last_seq in sorted(watermarks.items())
+    )
+    return (
+        conversation_id,
+        lineage,
+        watermark_items,
+        limit,
+        event_post_processor_cache_key,
+    )
+
+
+def _snapshot_projection_cache_get(
+    key: _SnapshotProjectionKey,
+) -> tuple[TimelineWindow, bool] | None:
+    value = _SNAPSHOT_PROJECTION_CACHE.get(key)
+    if value is not None:
+        _SNAPSHOT_PROJECTION_CACHE.move_to_end(key)
+    return value
+
+
+def _snapshot_projection_cache_put(
+    key: _SnapshotProjectionKey,
+    value: tuple[TimelineWindow, bool],
+) -> None:
+    _SNAPSHOT_PROJECTION_CACHE[key] = value
+    _bounded_lru_prune(
+        _SNAPSHOT_PROJECTION_CACHE,
+        _SNAPSHOT_PROJECTION_CACHE_MAX_CONVERSATIONS,
+    )
+
+
+def _bounded_lru_prune(cache: OrderedDict[Any, Any], max_entries: int) -> None:
+    while len(cache) > max_entries:
+        cache.popitem(last=False)
 
 
 def _tag_events(
@@ -759,6 +1092,7 @@ async def _hydrate_window_pairings(
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
     lookback_limit: int = PAIRING_HYDRATION_LOOKBACK_LIMIT,
+    session_cache: Any = None,
 ) -> list[RawSessionEvent]:
     """Backfill tool_call events whose pairing fell outside the read window.
 
@@ -795,17 +1129,20 @@ async def _hydrate_window_pairings(
 
     refs_by_key = {(ref.store, ref.event_store_session_id): ref for ref in session_refs}
     hydrated: list[RawSessionEvent] = []
-    for key, call_ids in orphan_call_ids.items():
+
+    async def _hydrate_key(key: tuple[str, str], call_ids: set[str]) -> list[RawSessionEvent]:
         ref = refs_by_key.get(key)
         boundary_seq = min_referencing_seq.get(key)
         if ref is None or boundary_seq is None or boundary_seq <= 1:
-            continue
+            return []
         try:
-            page = await event_store.read_session_events(
-                session_id=ref.event_store_session_id,
+            page = await _read_session_events(
+                ref=ref,
+                event_store=event_store,
                 before_seq=boundary_seq,
                 limit=lookback_limit,
                 direction="backward",
+                session_cache=session_cache,
             )
         except Exception:
             logger.warning(
@@ -813,8 +1150,9 @@ async def _hydrate_window_pairings(
                 extra={"extra_data": {"session_id": ref.session_id}},
                 exc_info=True,
             )
-            continue
+            return []
         remaining = set(call_ids)
+        resolved: list[RawSessionEvent] = []
         for candidate in page.events:
             if not remaining:
                 break
@@ -822,8 +1160,15 @@ async def _hydrate_window_pairings(
                 continue
             candidate_call_id = str(candidate.data.get("call_id") or "").strip()
             if candidate_call_id in remaining:
-                hydrated.extend(_tag_events([candidate], ref))
+                resolved.extend(_tag_events([candidate], ref))
                 remaining.discard(candidate_call_id)
+        return resolved
+
+    hydrated_groups = await asyncio.gather(
+        *[_hydrate_key(key, call_ids) for key, call_ids in orphan_call_ids.items()]
+    )
+    for group in hydrated_groups:
+        hydrated.extend(group)
     if not hydrated:
         return list(raw_events)
     return _sort_raw_events([*hydrated, *raw_events])
@@ -841,8 +1186,8 @@ def _encode_cursor(
 ) -> str:
     watermarks = watermarks if watermarks is not None else _event_watermarks(events)
     payload = InternalChatCursorPayload(
-        conversation_id=conversation_id,
-        projection_version=PROJECTION_VERSION,
+        scope_key=conversation_id,
+        projection_version=current_projection_version(),
         session_watermarks=[
             CursorSessionWatermark(store=store, session_id=session_id, last_seq=last_seq)
             for (store, session_id), last_seq in sorted(watermarks.items())
@@ -867,8 +1212,8 @@ def _encode_before_cursor_for_items(
     if source_ref is None:
         return None
     payload = InternalChatCursorPayload(
-        conversation_id=conversation_id,
-        projection_version=PROJECTION_VERSION,
+        scope_key=conversation_id,
+        projection_version=current_projection_version(),
         session_watermarks=[
             CursorSessionWatermark(
                 store=source_ref.store,
@@ -911,8 +1256,8 @@ def _encode_cursor_for_watermarks(
     view_revision: int,
 ) -> str:
     payload = InternalChatCursorPayload(
-        conversation_id=conversation_id,
-        projection_version=PROJECTION_VERSION,
+        scope_key=conversation_id,
+        projection_version=current_projection_version(),
         session_watermarks=[
             CursorSessionWatermark(store=store, session_id=session_id, last_seq=last_seq)
             for (store, session_id), last_seq in sorted(watermarks.items())
@@ -955,7 +1300,7 @@ def _cursor_lineage(payload: InternalChatCursorPayload) -> list[CursorLineageEnt
 
 def _reset_sync_response(
     *,
-    conversation_id: str,
+    scope: TimelineScope,
     cursor_before: str,
     reason: ChatResetReason,
     runtime_input: RuntimeOverlayInput | None,
@@ -963,8 +1308,9 @@ def _reset_sync_response(
 ) -> ChatSyncResponse:
     runtime = _runtime_overlay(runtime_input, generated_at=now)
     return ChatSyncResponse(
-        projection_version=PROJECTION_VERSION,
-        conversation_id=conversation_id,
+        projection_version=current_projection_version(),
+        scope=scope,
+        conversation_id=scope.conversation_id,
         cursor_before=cursor_before,
         cursor_after=cursor_before,
         ops=[],

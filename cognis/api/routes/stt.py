@@ -120,6 +120,7 @@ async def transcribe_stt(
             filename=filename,
             language=language,
             prompt=prompt,
+            acting_user_email=user.email,
         )
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc

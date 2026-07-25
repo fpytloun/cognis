@@ -297,7 +297,24 @@ def format_response_result(
         output_format=output_format,
         options=options,
     )
-    block_reason = _blocked_empty_extraction_reason(document.as_dict())
+    document_data = document.as_dict()
+    from cognis.tools.executor.web.quality import classify_provider_error_page
+
+    provider_error = classify_provider_error_page(document_data, document.content)
+    if provider_error:
+        return ToolResult(
+            output=(
+                "Web fetch loaded a provider-generated error page instead of the requested "
+                f"content ({provider_error})."
+            ),
+            is_error=True,
+            metadata={
+                "extracted_document": document_data,
+                "direct_fetch_blocked": True,
+                "direct_fetch_block_signal": provider_error,
+            },
+        )
+    block_reason = _blocked_empty_extraction_reason(document_data)
     if block_reason:
         return ToolResult(
             output=(
@@ -306,14 +323,14 @@ def format_response_result(
             ),
             is_error=True,
             metadata={
-                "extracted_document": document.as_dict(),
+                "extracted_document": document_data,
                 "direct_fetch_blocked": True,
                 "direct_fetch_block_signal": block_reason,
             },
         )
     return ToolResult(
         output=document.content,
-        metadata={"extracted_document": document.as_dict()},
+        metadata={"extracted_document": document_data},
     )
 
 

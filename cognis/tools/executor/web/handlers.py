@@ -91,6 +91,17 @@ def _selected_search_backend(arguments: dict[str, Any], context: ToolExecutionCo
     return configured if isinstance(configured, str) and configured else "direct"
 
 
+def _concurrency_controller(context: ToolExecutionContext) -> WebConcurrencyController:
+    """Return one process-wide controller shared by independent tool calls."""
+    runtime_metadata = context.runtime_metadata
+    shared = context.shared_runtime_metadata
+    if shared is None:
+        return get_or_create_controller(runtime_metadata)
+    if "web_concurrency" not in shared and "web_concurrency" in runtime_metadata:
+        shared["web_concurrency"] = runtime_metadata["web_concurrency"]
+    return get_or_create_controller(shared)
+
+
 def _backend_label(backend: Any, default: str = "direct") -> str:
     """Return a short identifier for a resolved backend object."""
     if backend is None:
@@ -112,6 +123,8 @@ def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
     that browser fallback can usually overcome."""
     metadata = result.metadata or {}
     if _looks_like_blocked_empty_extraction(metadata):
+        return True
+    if metadata.get("direct_fetch_blocked") or metadata.get("direct_fetch_block_signal"):
         return True
     if not result.is_error:
         return False
@@ -570,7 +583,7 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
     shared = context.shared_runtime_metadata or {}
     if BROWSER_MANAGER_KEY not in runtime_metadata and BROWSER_MANAGER_KEY in shared:
         runtime_metadata[BROWSER_MANAGER_KEY] = shared[BROWSER_MANAGER_KEY]
-    controller = get_or_create_controller(runtime_metadata)
+    controller = _concurrency_controller(context)
 
     primary_backend = resolve_fetch_backend(runtime_metadata, backend_name)
     primary_label = _backend_label(primary_backend)
@@ -670,7 +683,7 @@ def _browser_fallback_attempts(runtime_metadata: dict[str, Any]) -> list[tuple[s
     """Prefer headed fallback when possible; use headless only if headed cannot run."""
     headed = (
         get_headed_browser_fetch_backend(runtime_metadata)
-        if bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", False))
+        if bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", True))
         else None
     )
     if headed is not None:
@@ -682,7 +695,7 @@ def _browser_fallback_attempts(runtime_metadata: dict[str, Any]) -> list[tuple[s
 
 
 def _headed_fallback_skipped_reason(runtime_metadata: dict[str, Any]) -> str:
-    if not bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", False)):
+    if not bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", True)):
         return (
             "Headed browser fallback is disabled (web.browser_fetch.headed_fallback_enabled=false)."
         )
@@ -730,6 +743,7 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             "include_answer",
             "include_raw_content",
             "include_images",
+            "image_limit",
             "include_image_descriptions",
             "include_favicon",
             "include_domains",
@@ -766,7 +780,7 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
     retry_attempted = False
 
     runtime_metadata = context.runtime_metadata
-    controller = get_or_create_controller(runtime_metadata)
+    controller = _concurrency_controller(context)
     backend = resolve_search_backend(runtime_metadata, backend_name)
     backend_label = _backend_label(backend)
     is_tavily_backend = isinstance(backend, TavilyBackend)
@@ -864,7 +878,7 @@ async def handle_web_crawl(arguments: dict[str, Any], context: ToolExecutionCont
 
     fetch_backend = resolve_fetch_backend(runtime_metadata)
     backend_label = _backend_label(fetch_backend)
-    controller = get_or_create_controller(runtime_metadata)
+    controller = _concurrency_controller(context)
     return await crawl_site(
         url=url,
         fetch_backend=fetch_backend,

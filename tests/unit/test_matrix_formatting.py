@@ -14,15 +14,14 @@ def test_matrix_markdown_renders_headings_and_lists() -> None:
     assert "<li>verify</li>" in html
 
 
-def test_matrix_markdown_renders_tables_as_matrix_html() -> None:
+def test_matrix_markdown_linearizes_tables_for_client_portability() -> None:
     html = markdown_to_matrix_html(
         "| Check | Result |\n| --- | --- |\n| tests | ✅ |\n| lint | ✅ |"
     )
 
-    assert "<table>" in html
-    assert "<th>Check</th>" in html
-    assert "<td>tests</td>" in html
-    assert "<td>✅</td>" in html
+    assert "<table>" not in html
+    assert "<strong>Check:</strong> tests" in html
+    assert "<strong>Result:</strong> ✅" in html
 
 
 def test_matrix_markdown_preserves_code_and_links() -> None:
@@ -40,6 +39,26 @@ def test_matrix_markdown_normalizes_task_lists() -> None:
 
     assert "<li>☑ done</li>" in html
     assert "<li>☐ pending</li>" in html
+
+
+def test_matrix_markdown_supports_gfm_strikethrough_and_two_space_nested_lists() -> None:
+    html = markdown_to_matrix_html("~~obsolete~~\n\n- parent\n  - nested")
+
+    assert "<del>obsolete</del>" in html
+    assert "<li>nested</li>" in html
+    assert html.count("<ul>") == 2
+
+
+def test_matrix_compact_rich_markdown_avoids_margin_heavy_paragraphs_and_lists() -> None:
+    html = markdown_to_matrix_html(
+        "# Brief\n\nFirst paragraph.\n\nSecond paragraph.\n\n- one\n- two",
+        compact=True,
+    )
+
+    assert "<h1>Brief</h1>" in html
+    assert "<p>" not in html
+    assert "<ul>" not in html
+    assert "• one<br/>" in html
 
 
 def test_matrix_markdown_sanitizes_unsafe_html_and_links() -> None:

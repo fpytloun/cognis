@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
-from cognis.providers.memory.mnemory import MnemoryProvider
+from cognis.providers.memory.mnemory import MnemoryHTTPStatusError, MnemoryProvider
 from cognis.runtime_context import scoped_runtime_context
 
 
@@ -80,6 +81,29 @@ class _Client:
         del json, params
         self.requests.append((method, path, headers))
         return _Response(self.payload)
+
+
+class _ValidationErrorClient:
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict[str, object] | None = None,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        del json, params, headers
+        request = httpx.Request(method, f"https://mnemory.test{path}")
+        return httpx.Response(
+            422,
+            json={
+                "detail": (
+                    "Unknown category 'technology'. Valid categories: decisions, home, technical"
+                )
+            },
+            request=request,
+        )
 
 
 @pytest.mark.asyncio
@@ -247,6 +271,24 @@ async def test_delete_memory_tool_calls_mnemory_delete_endpoint() -> None:
         )
     ]
     assert auth.calls == [("user@example.com", "agent-1", ["mnemory"], "user@example.com")]
+
+
+@pytest.mark.asyncio
+async def test_memory_add_preserves_mnemory_validation_detail() -> None:
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    provider.client = _ValidationErrorClient()
+
+    with pytest.raises(MnemoryHTTPStatusError) as exc_info:
+        await provider.add_memory_tool(
+            {"content": "test", "categories": ["technology"]},
+            agent_id="agent-1",
+            user_email="user@example.com",
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == (
+        "Unknown category 'technology'. Valid categories: decisions, home, technical"
+    )
 
 
 @pytest.mark.asyncio

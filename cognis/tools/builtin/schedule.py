@@ -19,7 +19,15 @@ from cognis.models.schedule import (
     ScheduleModel,
     describe_schedule,
 )
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import (
+    NativeToolOperation,
+    ToolDefinition,
+    ToolDynamicOption,
+    ToolMutationKind,
+    ToolResult,
+    ToolSource,
+    ToolValueSemantics,
+)
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy
 from cognis.store.queries import (
     count_active_tasks_for_schedule,
@@ -38,172 +46,367 @@ logger = get_logger(__name__)
 
 _SOURCE = ToolSource(type="builtin")
 
-MANAGE_SCHEDULES_TOOL = ToolDefinition(
-    name="manage_schedules",
-    description=(
-        "Create, inspect, list, update, delete, and trigger scheduled tasks. "
-        "Schedules are task factories that create tasks on a cron expression, "
-        "fixed interval, or one-shot basis. Use this to set up recurring "
-        "tasks, reminders, heartbeat checks, and timed automations. Use update "
-        "as a patch: omitted fields are preserved. Use get/status before editing "
-        "an existing schedule so task instructions are not lost."
-    ),
-    parameters={
+_DESCRIPTION = (
+    "Create, inspect, list, update, delete, and trigger scheduled tasks. "
+    "Schedules are task factories that create tasks on a cron expression, "
+    "fixed interval, or one-shot basis. Use this to set up recurring "
+    "tasks, reminders, heartbeat checks, and timed automations. Use update "
+    "as a patch: omitted fields are preserved. Use get/status before editing "
+    "an existing schedule so task instructions are not lost. Call describe_tool "
+    "before unfamiliar or complex mutations."
+)
+
+_BASE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": [
+                "list",
+                "get",
+                "create",
+                "update",
+                "delete",
+                "trigger",
+                "status",
+            ],
+            "description": (
+                "The operation to perform. Use describe_tool for full operation semantics "
+                "and live option-provider metadata."
+            ),
+        },
+        "schedule_id": {
+            "type": "string",
+            "description": "Schedule ID (required for update, delete, trigger, status).",
+        },
+        "name": {
+            "type": "string",
+            "description": "Human-readable name for the schedule.",
+        },
+        "description": {
+            "type": "string",
+            "description": "Description of what this schedule does.",
+        },
+        "schedule_type": {
+            "type": "string",
+            "enum": ["cron", "interval", "one_shot"],
+            "description": "Type of schedule trigger. Default: cron.",
+        },
+        "cron_expr": {
+            "type": "string",
+            "description": (
+                "Cron expression (5 fields: minute hour day month weekday). "
+                "Examples: '0 9 * * 1-5' (weekdays at 9am), "
+                "'*/30 * * * *' (every 30 min), '0 8 * * *' (daily at 8am)."
+            ),
+        },
+        "interval_seconds": {
+            "type": "integer",
+            "minimum": 10,
+            "description": "Interval in seconds (minimum 10). For interval type.",
+        },
+        "one_shot_at": {
+            "type": "string",
+            "description": "ISO-8601 timestamp for one-shot execution.",
+        },
+        "timezone": {
+            "type": "string",
+            "description": "IANA timezone for cron evaluation. Default: UTC.",
+        },
+        "agent_id": {
+            "type": "string",
+            "description": "Agent to run the task. Defaults to current agent.",
+        },
+        "agent_profile_id": {
+            "type": ["string", "null"],
+            "description": (
+                "Optional runtime profile for the selected schedule agent. Omit or pass null "
+                "to use that agent's default profile."
+            ),
+        },
+        "workflow_id": {
+            "type": "string",
+            "description": "Workflow to use for the task (optional).",
+        },
+        "task_title": {
+            "type": "string",
+            "description": "Title for tasks created by this schedule.",
+        },
+        "task_description": {
+            "type": "string",
+            "description": "Description/prompt for tasks created by this schedule.",
+        },
+        "task_priority": {
+            "type": "integer",
+            "description": "Priority for created tasks (0=normal, higher=more urgent).",
+        },
+        "enabled": {
+            "type": "boolean",
+            "description": "Whether the schedule is active.",
+        },
+        "delivery_mode": {
+            "type": "string",
+            "enum": [
+                "preferred_channel",
+                "latest_active_for_agent",
+                "specific_conversation",
+            ],
+            "description": (
+                "How task results are delivered. "
+                "'preferred_channel' uses the configured preferred channel (default); "
+                "'latest_active_for_agent' delivers to the most recent active conversation; "
+                "'specific_conversation' requires delivery_target."
+            ),
+        },
+        "delivery_target": {
+            "type": "string",
+            "description": "Conversation ID, required when delivery_mode is specific_conversation.",
+        },
+        "expected_output": {
+            "type": "string",
+            "description": (
+                "What the agent should produce. Used for semantic step evaluation "
+                "in workflow-driven tasks."
+            ),
+        },
+        "completion_mode_family": {
+            "type": "string",
+            "enum": ["default", "direct"],
+            "description": (
+                "How successful task completion is delivered. 'default' uses the normal "
+                "follow-up flow. 'direct' sends the final assistant message directly to the "
+                "resolved target channel."
+            ),
+        },
+        "allow_silent_completion": {
+            "type": "boolean",
+            "description": (
+                "If true, the agent may complete silently when the work succeeded and there is "
+                "nothing user-actionable to report."
+            ),
+        },
+        "max_concurrent_runs": {
+            "type": "integer",
+            "description": "Maximum active tasks this schedule may have at once.",
+        },
+        "delete_after_run": {
+            "type": "boolean",
+            "description": "Whether to delete a one-shot schedule after it fires.",
+        },
+        "interaction_mode_override": {
+            "type": "string",
+            "enum": ["none", "explicit_gates", "step_requests"],
+            "description": "Interaction policy for tasks created by this schedule.",
+        },
+        "session_policy": {
+            "type": "object",
+            "description": (
+                "Optional Intaris session policy for created tasks. Supports "
+                "allow_policies and deny_policies; prefer plain English strings."
+            ),
+        },
+        "include_definition": {
+            "type": "boolean",
+            "description": (
+                "For list/status, include the full persisted schedule definition. "
+                "Defaults to true so prompt and delivery fields are visible for safe edits."
+            ),
+        },
+    },
+    "required": ["action"],
+}
+
+_READ_SEMANTICS = ToolValueSemantics(
+    omitted="use the operation default or leave the value absent",
+    null="accepted only where the operation schema explicitly permits null",
+    arrays="arrays are filters or returned resource collections",
+    concurrency="reads observe the current committed schedule state",
+)
+_MUTATION_SEMANTICS = ToolValueSemantics(
+    omitted="use the operation default or leave the value absent",
+    null="accepted only where the operation schema explicitly permits null",
+    arrays="replace supplied arrays",
+    concurrency="validated against current schedule state and committed atomically",
+)
+_PATCH_SEMANTICS = ToolValueSemantics(
+    omitted="preserve the persisted schedule field",
+    null="clear only fields whose operation schema explicitly permits null",
+    arrays="replace supplied arrays",
+    concurrency="call get/status first to avoid overwriting a concurrent edit",
+)
+
+
+def _operation(
+    name: str,
+    *,
+    kind: ToolMutationKind,
+    fields: tuple[str, ...] = (),
+    required: tuple[str, ...] = (),
+    example: dict[str, Any],
+    semantics: ToolValueSemantics | None = None,
+    dynamic_options: list[ToolDynamicOption] | None = None,
+    validator_ids: tuple[str, ...] = (),
+    all_of: list[dict[str, Any]] | None = None,
+    side_effects: list[str] | None = None,
+) -> NativeToolOperation:
+    properties = _BASE_SCHEMA["properties"]
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": {
-            "action": {
-                "type": "string",
-                "enum": [
-                    "options",
-                    "list",
-                    "get",
-                    "create",
-                    "update",
-                    "delete",
-                    "trigger",
-                    "status",
-                ],
-                "description": "The action to perform. Use options to discover valid values.",
-            },
-            "schedule_id": {
-                "type": "string",
-                "description": "Schedule ID (required for update, delete, trigger, status).",
-            },
-            "name": {
-                "type": "string",
-                "description": "Human-readable name for the schedule.",
-            },
-            "description": {
-                "type": "string",
-                "description": "Description of what this schedule does.",
-            },
-            "schedule_type": {
-                "type": "string",
-                "enum": ["cron", "interval", "one_shot"],
-                "description": "Type of schedule trigger. Default: cron.",
-            },
-            "cron_expr": {
-                "type": "string",
-                "description": (
-                    "Cron expression (5 fields: minute hour day month weekday). "
-                    "Examples: '0 9 * * 1-5' (weekdays at 9am), "
-                    "'*/30 * * * *' (every 30 min), '0 8 * * *' (daily at 8am)."
-                ),
-            },
-            "interval_seconds": {
-                "type": "integer",
-                "description": "Interval in seconds (minimum 10). For interval type.",
-            },
-            "one_shot_at": {
-                "type": "string",
-                "description": "ISO-8601 timestamp for one-shot execution.",
-            },
-            "timezone": {
-                "type": "string",
-                "description": "IANA timezone for cron evaluation. Default: UTC.",
-            },
-            "agent_id": {
-                "type": "string",
-                "description": "Agent to run the task. Defaults to current agent.",
-            },
-            "agent_profile_id": {
-                "type": ["string", "null"],
-                "description": (
-                    "Optional runtime profile for the selected schedule agent. Omit or pass null "
-                    "to use that agent's default profile."
-                ),
-            },
-            "workflow_id": {
-                "type": "string",
-                "description": "Workflow to use for the task (optional).",
-            },
-            "task_title": {
-                "type": "string",
-                "description": "Title for tasks created by this schedule.",
-            },
-            "task_description": {
-                "type": "string",
-                "description": "Description/prompt for tasks created by this schedule.",
-            },
-            "task_priority": {
-                "type": "integer",
-                "description": "Priority for created tasks (0=normal, higher=more urgent).",
-            },
-            "enabled": {
-                "type": "boolean",
-                "description": "Whether the schedule is active.",
-            },
-            "delivery_mode": {
-                "type": "string",
-                "enum": [
-                    "preferred_channel",
-                    "latest_active_for_agent",
-                    "specific_conversation",
-                ],
-                "description": (
-                    "How task results are delivered. "
-                    "'preferred_channel' uses the configured preferred channel (default); "
-                    "'latest_active_for_agent' delivers to the most recent active conversation; "
-                    "'specific_conversation' requires delivery_target."
-                ),
-            },
-            "delivery_target": {
-                "type": "string",
-                "description": "Conversation ID, required when delivery_mode is specific_conversation.",
-            },
-            "expected_output": {
-                "type": "string",
-                "description": (
-                    "What the agent should produce. Used for semantic step evaluation "
-                    "in workflow-driven tasks."
-                ),
-            },
-            "completion_mode_family": {
-                "type": "string",
-                "enum": ["default", "direct"],
-                "description": (
-                    "How successful task completion is delivered. 'default' uses the normal "
-                    "follow-up flow. 'direct' sends the final assistant message directly to the "
-                    "resolved target channel."
-                ),
-            },
-            "allow_silent_completion": {
-                "type": "boolean",
-                "description": (
-                    "If true, the agent may complete silently when the work succeeded and there is "
-                    "nothing user-actionable to report."
-                ),
-            },
-            "max_concurrent_runs": {
-                "type": "integer",
-                "description": "Maximum active tasks this schedule may have at once.",
-            },
-            "delete_after_run": {
-                "type": "boolean",
-                "description": "Whether to delete a one-shot schedule after it fires.",
-            },
-            "interaction_mode_override": {
-                "type": "string",
-                "enum": ["none", "explicit_gates", "step_requests"],
-                "description": "Interaction policy for tasks created by this schedule.",
-            },
-            "session_policy": {
-                "type": "object",
-                "description": (
-                    "Optional Intaris session policy for created tasks. Supports "
-                    "allow_policies and deny_policies; prefer plain English strings."
-                ),
-            },
-            "include_definition": {
-                "type": "boolean",
-                "description": (
-                    "For list/status, include the full persisted schedule definition. "
-                    "Defaults to true so prompt and delivery fields are visible for safe edits."
-                ),
-            },
+            "action": {"type": "string", "const": name},
+            **{field: properties[field] for field in fields},
         },
-        "required": ["action"],
+        "required": ["action", *required],
+        "additionalProperties": False,
+    }
+    if all_of:
+        schema["allOf"] = all_of
+    return NativeToolOperation(
+        operation=name,
+        summary=f"{name}: {_DESCRIPTION.split('.', 1)[0]}",
+        mutation_kind=kind,
+        input_schema=schema,
+        semantics=semantics
+        or (_READ_SEMANTICS if kind is ToolMutationKind.READ else _MUTATION_SEMANTICS),
+        dynamic_options=dynamic_options or [],
+        examples=[example],
+        side_effects=side_effects
+        if side_effects is not None
+        else ([] if kind is ToolMutationKind.READ else ["May modify durable schedule state."]),
+        validator_ids=list(validator_ids),
+    )
+
+
+_DEFINITION_FIELDS = (
+    "name",
+    "description",
+    "schedule_type",
+    "cron_expr",
+    "interval_seconds",
+    "one_shot_at",
+    "timezone",
+    "agent_id",
+    "agent_profile_id",
+    "workflow_id",
+    "task_title",
+    "task_description",
+    "task_priority",
+    "enabled",
+    "delivery_mode",
+    "delivery_target",
+    "expected_output",
+    "completion_mode_family",
+    "allow_silent_completion",
+    "max_concurrent_runs",
+    "delete_after_run",
+    "interaction_mode_override",
+    "session_policy",
+)
+_SCHEDULE_OPTIONS = [
+    ToolDynamicOption(path="$.agent_id", source="schedule.visible_agents"),
+    ToolDynamicOption(path="$.agent_profile_id", source="schedule.agent_profiles"),
+    ToolDynamicOption(path="$.workflow_id", source="schedule.available_workflows"),
+]
+_CREATE_CONSTRAINTS = [
+    {
+        "if": {"not": {"required": ["schedule_type"]}},
+        "then": {"required": ["cron_expr"]},
     },
+    {
+        "if": {
+            "properties": {"schedule_type": {"const": "interval"}},
+            "required": ["schedule_type"],
+        },
+        "then": {"required": ["interval_seconds"]},
+    },
+    {
+        "if": {
+            "properties": {"schedule_type": {"const": "one_shot"}},
+            "required": ["schedule_type"],
+        },
+        "then": {"required": ["one_shot_at"]},
+        "else": {
+            "if": {
+                "properties": {"schedule_type": {"const": "cron"}},
+                "required": ["schedule_type"],
+            },
+            "then": {"required": ["cron_expr"]},
+        },
+    },
+]
+
+MANAGE_SCHEDULES_TOOL = ToolDefinition(
+    name="manage_schedules",
+    description=_DESCRIPTION,
+    parameters={},
+    native_operations=[
+        _operation(
+            "list",
+            kind=ToolMutationKind.READ,
+            fields=("include_definition",),
+            example={"action": "list"},
+        ),
+        _operation(
+            "get",
+            kind=ToolMutationKind.READ,
+            fields=("schedule_id",),
+            required=("schedule_id",),
+            example={"action": "get", "schedule_id": "schedule-id"},
+        ),
+        _operation(
+            "create",
+            kind=ToolMutationKind.CREATE,
+            fields=_DEFINITION_FIELDS,
+            required=("name",),
+            example={
+                "action": "create",
+                "name": "Daily check",
+                "schedule_type": "cron",
+                "cron_expr": "0 8 * * *",
+            },
+            dynamic_options=_SCHEDULE_OPTIONS,
+            validator_ids=("schedule.definition",),
+            all_of=_CREATE_CONSTRAINTS,
+        ),
+        _operation(
+            "update",
+            kind=ToolMutationKind.UPDATE,
+            fields=("schedule_id", *_DEFINITION_FIELDS),
+            required=("schedule_id",),
+            example={
+                "action": "update",
+                "schedule_id": "schedule-id",
+                "name": "Updated schedule",
+            },
+            semantics=_PATCH_SEMANTICS,
+            dynamic_options=_SCHEDULE_OPTIONS,
+            validator_ids=("schedule.definition",),
+        ),
+        _operation(
+            "delete",
+            kind=ToolMutationKind.DELETE,
+            fields=("schedule_id",),
+            required=("schedule_id",),
+            example={"action": "delete", "schedule_id": "schedule-id"},
+        ),
+        _operation(
+            "trigger",
+            kind=ToolMutationKind.EXECUTE,
+            fields=("schedule_id",),
+            required=("schedule_id",),
+            example={"action": "trigger", "schedule_id": "schedule-id"},
+            side_effects=[
+                "Creates a task immediately without changing the schedule's next fire time."
+            ],
+        ),
+        _operation(
+            "status",
+            kind=ToolMutationKind.READ,
+            fields=("schedule_id", "include_definition"),
+            required=("schedule_id",),
+            example={"action": "status", "schedule_id": "schedule-id"},
+        ),
+    ],
     source=_SOURCE,
     category="schedule",
     read_only=False,
@@ -211,7 +414,7 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
 )
 
 _TOOL_NAMES = {"manage_schedules"}
-_ACTIONS = ("options", "list", "get", "create", "update", "delete", "trigger", "status")
+_ACTIONS = ("list", "get", "create", "update", "delete", "trigger", "status")
 _SCHEDULE_TYPES = ("cron", "interval", "one_shot")
 _DELIVERY_MODES = ("preferred_channel", "latest_active_for_agent", "specific_conversation")
 _COMPLETION_MODE_FAMILIES = ("default", "direct")
@@ -242,8 +445,6 @@ async def handle_schedule_tool(
     action = arguments.get("action", "")
 
     try:
-        if action == "options":
-            return await _handle_options(session_factory, user_email)
         if action == "list":
             return await _handle_list(session_factory, user_email, arguments)
         if action == "get":
@@ -270,72 +471,6 @@ async def handle_schedule_tool(
 # ---------------------------------------------------------------------------
 # Action handlers
 # ---------------------------------------------------------------------------
-
-
-async def _handle_options(
-    session_factory: Any,
-    user_email: str,
-) -> ToolResult:
-    """Return LLM-facing schedule tool options and conditional field rules."""
-    async with session_factory() as db:
-        agents = await list_visible_agents(db, user_email)
-        workflows = await list_workflows(db, owner_email=user_email, include_system=False)
-
-    agent_options = [
-        {
-            "agent_id": row.agent_id,
-            "name": row.name,
-            "display_name": getattr(row, "display_name", None),
-            "status": row.status,
-            "default_agent_profile_id": getattr(row, "default_agent_profile_id", None),
-            "agent_profiles": _agent_profiles_options(row),
-            "shared": grant is not None,
-        }
-        for row, grant in agents
-        if getattr(row, "status", "active") == "active"
-    ]
-    workflow_options = [
-        {
-            "workflow_id": workflow.workflow_id,
-            "name": workflow.name,
-            "is_system": True,
-        }
-        for workflow in SYSTEM_WORKFLOWS.values()
-    ]
-    workflow_options.extend(
-        {
-            "workflow_id": row.workflow_id,
-            "name": row.name,
-            "is_system": bool(getattr(row, "is_system", False)),
-        }
-        for row in workflows
-    )
-
-    payload = {
-        "valid_values": {
-            "action": list(_ACTIONS),
-            "schedule_type": list(_SCHEDULE_TYPES),
-            "delivery_mode": list(_DELIVERY_MODES),
-            "completion_mode_family": list(_COMPLETION_MODE_FAMILIES),
-            "interaction_mode_override": list(_INTERACTION_MODE_OVERRIDES),
-        },
-        "conditional_fields": {
-            "schedule_type=cron": ["cron_expr"],
-            "schedule_type=interval": ["interval_seconds"],
-            "schedule_type=one_shot": ["one_shot_at"],
-            "delivery_mode=specific_conversation": ["delivery_target"],
-            "delivery_mode=preferred_channel": ["omit delivery_target"],
-            "delivery_mode=latest_active_for_agent": ["omit delivery_target"],
-        },
-        "notes": [
-            "Use get or status before update; update is patch-style and omitted fields are preserved.",
-            "Optional empty strings are ignored. Do not send delivery_target except for specific_conversation.",
-            "For silent scheduled tasks, set allow_silent_completion=true and interaction_mode_override=none.",
-        ],
-        "available_agents": agent_options,
-        "available_workflows": workflow_options,
-    }
-    return ToolResult(output=json.dumps(payload, indent=2))
 
 
 async def _handle_list(
@@ -933,31 +1068,6 @@ async def _validate_delivery_target(
     if conversation is None or conversation.user_email != user_email:
         return ToolResult(output=f"Conversation {conversation_id} not found.", is_error=True)
     return None
-
-
-def _agent_profiles_options(row: Any) -> list[dict[str, Any]]:
-    profiles = getattr(row, "agent_profiles", None)
-    if not isinstance(profiles, dict):
-        return []
-    options: list[dict[str, Any]] = []
-    for profile_id, profile in profiles.items():
-        if not isinstance(profile_id, str) or not profile_id:
-            continue
-        if hasattr(profile, "model_dump"):
-            profile_payload = profile.model_dump(mode="json", exclude_none=True)
-        elif isinstance(profile, dict):
-            profile_payload = dict(profile)
-        else:
-            continue
-        options.append(
-            {
-                "profile_id": profile_id,
-                "description": profile_payload.get("description"),
-                "enabled": profile_payload.get("enabled", True),
-                "is_default": profile_id == getattr(row, "default_agent_profile_id", None),
-            }
-        )
-    return options
 
 
 async def _validate_agent_profile(

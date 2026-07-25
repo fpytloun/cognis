@@ -23,9 +23,11 @@ from cognis.models.skill import ResolvedSkill, SkillToolSpec
 from cognis.models.tool import (
     ExecutorHandle,
     ToolCall,
-    ToolDefinition,
     ToolSource,
     sanitize_mcp_tool_name,
+)
+from cognis.models.tool import (
+    NativeToolDefinition as ToolDefinition,
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.runtime_context import RuntimeAccessContext
@@ -774,16 +776,16 @@ async def test_merge_remote_runtime_inventory_prefers_remote_and_builtin_on_coll
 
     result = await _merge_remote_runtime_inventory(
         remote_tools_data=[
-            {
-                "name": colliding_name,
-                "description": "Remote tool",
-                "parameters": {"type": "object", "properties": {}},
-                "source": ToolSource(type="executor").model_dump(mode="json"),
-                "category": "mcp",
-                "read_only": True,
-                "timeout_seconds": 30,
-                "non_bypassable": False,
-            }
+            ToolDefinition(
+                name=colliding_name,
+                description="Remote tool",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                category="mcp",
+                read_only=True,
+                timeout_seconds=30,
+                non_bypassable=False,
+            ).model_dump(mode="json")
         ],
         agent_tools=[_builtin_tool(colliding_name), _builtin_tool("list_agents")],
         providers=providers,
@@ -991,6 +993,103 @@ class _RuntimeSessionFactory:
 
 def _runtime_session_factory() -> _RuntimeSessionFactory:
     return _RuntimeSessionFactory()
+
+
+class _WebSecretsProvider:
+    async def get_secret(self, name: str, _user_email: str) -> str:
+        return {
+            "tavily_api_key": "tavily-key",
+            "brave_api_key": "brave-key",
+        }[name]
+
+
+@pytest.mark.asyncio
+async def test_resolve_web_config_excludes_disabled_backends_and_normalizes_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values: dict[str, object] = {
+        "web.backend": "tavily",
+        "web.search_backend": "brave",
+        "web.fetch_backend": "tavily",
+        "web.tavily_enabled": False,
+        "web.brave_enabled": False,
+        "web.searxng_enabled": False,
+        "web.searxng_url": "https://search.example.com",
+    }
+
+    async def _get_setting_value(_session: object, key: str, default: object = None) -> object:
+        return values.get(key, default)
+
+    monkeypatch.setattr(store_queries, "get_setting_value", _get_setting_value)
+    providers = SimpleNamespace(
+        _session_factory=_runtime_session_factory,
+        secrets=_WebSecretsProvider(),
+    )
+
+    config = await runtime_support._resolve_web_config(providers, "user@example.com")
+
+    assert config["web_search_backend"] == "direct"
+    assert config["web_fetch_backend"] == "direct"
+    assert config["web_backend"] == "direct"
+    assert config["web_available_search_backends"] == ["direct"]
+    assert config["web_available_fetch_backends"] == ["direct", "browser"]
+    assert config["web_searxng_url"] == ""
+    assert config["web_secrets"] == {}
+
+
+@pytest.mark.asyncio
+async def test_resolve_web_config_keeps_configured_backends_enabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values: dict[str, object] = {
+        "web.search_backend": "searxng",
+        "web.fetch_backend": "tavily",
+        "web.searxng_url": "https://search.example.com",
+    }
+
+    async def _get_setting_value(_session: object, key: str, default: object = None) -> object:
+        return values.get(key, default)
+
+    monkeypatch.setattr(store_queries, "get_setting_value", _get_setting_value)
+    providers = SimpleNamespace(
+        _session_factory=_runtime_session_factory,
+        secrets=_WebSecretsProvider(),
+    )
+
+    config = await runtime_support._resolve_web_config(providers, "user@example.com")
+
+    assert config["web_search_backend"] == "searxng"
+    assert config["web_fetch_backend"] == "tavily"
+    assert config["web_available_search_backends"] == [
+        "direct",
+        "tavily",
+        "brave",
+        "searxng",
+    ]
+    assert config["web_available_fetch_backends"] == ["direct", "tavily", "browser"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_web_config_fails_closed_when_settings_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_setting_value(_session: object, _key: str, _default: object = None) -> object:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store_queries, "get_setting_value", _get_setting_value)
+    providers = SimpleNamespace(
+        _session_factory=_runtime_session_factory,
+        secrets=_WebSecretsProvider(),
+    )
+
+    config = await runtime_support._resolve_web_config(providers, "user@example.com")
+
+    assert config["web_backend"] == "direct"
+    assert config["web_search_backend"] == "direct"
+    assert config["web_fetch_backend"] == "direct"
+    assert config["web_available_search_backends"] == ["direct"]
+    assert config["web_available_fetch_backends"] == ["direct", "browser"]
+    assert config["web_secrets"] == {}
 
 
 def _shared_in_process_connection() -> InProcessExecutorConnection:

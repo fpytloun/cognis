@@ -650,7 +650,12 @@ async def test_mcp_connect_timeout_surfaces_late_auth_cleanup_error(
     request = httpx.Request("POST", "https://mcp.example/mcp")
     response = httpx.Response(
         401,
-        headers={"www-authenticate": 'Bearer error="invalid_token"'},
+        headers={
+            "www-authenticate": (
+                'Bearer error="insufficient_scope", scope="tools.write tools.read", '
+                'resource_metadata="https://mfg.example/.well-known/oauth-protected-resource/mcp"'
+            )
+        },
         request=request,
     )
     auth_error = ExceptionGroup(
@@ -756,7 +761,12 @@ def test_coerce_client_error_extracts_http_status_from_exception_group() -> None
     request = httpx.Request("POST", "https://mfg.prd.lumilens.com/mcp")
     response = httpx.Response(
         401,
-        headers={"www-authenticate": 'Bearer error="invalid_token"'},
+        headers={
+            "www-authenticate": (
+                'Bearer error="insufficient_scope", scope="tools.write tools.read", '
+                'resource_metadata="https://mfg.example/.well-known/oauth-protected-resource/mcp"'
+            )
+        },
         request=request,
     )
     exc = ExceptionGroup(
@@ -775,7 +785,37 @@ def test_coerce_client_error_extracts_http_status_from_exception_group() -> None
     assert result.status_code == 401
     assert result.auth_error == "authorization_required"
     assert result.authorization_required is True
-    assert result.www_authenticate == "Bearer [redacted]"
+    assert result.www_authenticate.startswith("Bearer [redacted]")
+    assert result.authorization_challenge == {
+        "error": "insufficient_scope",
+        "scope": "tools.write tools.read",
+        "resource_metadata": "https://mfg.example/.well-known/oauth-protected-resource/mcp",
+    }
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_auth_error"),
+    [
+        ('Bearer realm="mcp"', "forbidden"),
+        ('Bearer error="insufficient_scope", scope="tools.write"', "insufficient_scope"),
+    ],
+)
+def test_coerce_client_error_only_classifies_explicit_403_insufficient_scope(
+    header: str,
+    expected_auth_error: str,
+) -> None:
+    request = httpx.Request("POST", "https://mfg.example/mcp")
+    response = httpx.Response(
+        403,
+        headers={"www-authenticate": header},
+        request=request,
+    )
+    exc = httpx.HTTPStatusError("403 Forbidden", request=request, response=response)
+
+    result = mcp_module._coerce_client_error("mfg-portal", "call_tool", exc)
+
+    assert result.status_code == 403
+    assert result.auth_error == expected_auth_error
 
 
 def test_strip_empty_optionals_preserves_zero_and_false() -> None:

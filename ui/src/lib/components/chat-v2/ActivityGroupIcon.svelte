@@ -3,6 +3,7 @@
   import Database from 'lucide-svelte/icons/database';
   import FilePenLine from 'lucide-svelte/icons/file-pen-line';
   import Globe from 'lucide-svelte/icons/globe';
+  import Image from 'lucide-svelte/icons/image';
   import Monitor from 'lucide-svelte/icons/monitor';
   import Search from 'lucide-svelte/icons/search';
   import Send from 'lucide-svelte/icons/send';
@@ -29,6 +30,8 @@
   <Globe class={className} />
 {:else if icon === 'browser'}
   <Monitor class={className} />
+{:else if icon === 'image'}
+  <Image class={className} />
 {:else if icon === 'database'}
   <Database class={className} />
 {:else if icon === 'brain'}

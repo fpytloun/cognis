@@ -61,11 +61,13 @@ from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
     ToolCapability,
-    ToolDefinition,
     ToolSource,
     effective_mcp_auth_config,
     stable_tool_id,
     tool_display_name,
+)
+from cognis.models.tool import (
+    NativeToolDefinition as ToolDefinition,
 )
 from cognis.ownership import is_shared_owner_email
 from cognis.runtime_context import RuntimeAccessContext

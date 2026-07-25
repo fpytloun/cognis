@@ -1,19 +1,21 @@
-# Cognis: Workflow Composer and Workflow-First Execution
+# Cognis: Workflow Composer in Bounded Execution
 
 ## Purpose
 
-This spec turns workflows from an advanced background-task feature into the
-primary harness primitive for non-trivial work.
+This spec defines workflow composition as one durable execution option within
+bounded routing. Direct execution, delegates, managed conversations, and tasks
+remain first-class alternatives; workflows are selected when explicit durable
+steps, deliverables, evaluation, or gates are required.
 
 The goal is not to route every user turn through a controller classifier. The
 goal is to let the **main agent already talking to the user** decide when a
-request should stay inline, when it should use `system:general-task`, and when
-it should compose a richer workflow with explicit intermediate steps,
+request should stay inline, use a delegate or managed conversation, become a
+durable task, or compose a richer workflow with explicit intermediate steps,
 evaluation, deliverables, and optional scheduling.
 
 This spec defines:
 
-- the workflow-first execution model for main-chat agents
+- bounded execution routing for main-chat agents
 - `compose_and_run_workflow` as the main authoring primitive
 - hidden system agents for workflow composition and skill decomposition
 - ephemeral workflow lifecycle and promotion to persistent workflows
@@ -57,8 +59,8 @@ missing is a practical authoring path from natural language to a workflow run.
 The user's primary agent has the richest context: conversation history,
 recalled memories, current intention, and the user's wording. It is better
 positioned than a bounded classifier to decide whether the request should be
-answered inline, wrapped in `system:general-task`, or expanded into a
-multi-step workflow.
+answered inline, delegated, continued in a managed conversation, wrapped in a
+durable task, or expanded into a multi-step workflow.
 
 This spec does **not** add a new entrypoint agent and does **not** move this
 decision into the controller's hot path.
@@ -75,8 +77,10 @@ Examples:
 - inspect a tool-heavy external system and summarize findings
 - perform a one-step operational task that should be checked before delivery
 
-It is **not** the preferred fallback for every coding request. Coding work may
-instead compose into a shorter or longer workflow depending on scope.
+It is **not** the preferred fallback for every coding request. Coding work
+should use the least costly safe direct, delegated, managed, task, or workflow
+shape; workflow composition is reserved for explicit durable step or gate
+contracts.
 
 ### 3. Skills stay compatible with official `SKILL.md`
 
@@ -127,13 +131,18 @@ useful and more reliable. The composition stage therefore depends on the work in
 
 ## Execution Model
 
-Main-chat turns fall into three classes:
+Main-chat turns use the least costly safe shape:
 
-1. **Inline** — conversational, trivial, or naturally single-turn work.
-2. **General-task** — bounded, tool-heavy, or exploratory work where explicit
-   decomposition adds little value but evaluation still matters.
-3. **Composed workflow** — multi-step, multi-source, recurring, or
-   deliverable-sensitive work where the controller should enforce structure.
+1. **Direct** — one agent can inspect, act, validate, and report without a
+   durable background boundary.
+2. **Delegate** — one bounded terminal exploration, consultation, or review
+   result.
+3. **Managed conversation** — visible iterative work that benefits from
+   follow-up and reusable context.
+4. **Task** — durable background ownership, pause/resume, status, or later
+   retrieval without a custom step definition.
+5. **Composed workflow** — work requiring explicit durable steps, deliverables,
+   evaluation, or gates.
 
 The primary agent makes this decision with guidance from the always-attached
 `cognis-orchestrator` system skill.

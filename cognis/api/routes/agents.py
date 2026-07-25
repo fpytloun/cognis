@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field, ValidationError
@@ -34,12 +35,15 @@ from cognis.api.models import (
     CursorPage,
 )
 from cognis.api.serializers import agent_to_response
-from cognis.core.agent_profiles import resolve_agent_profile
+from cognis.core.agent_management import live_agent_profile_references
+from cognis.core.agent_profiles import resolve_agent_profile, validate_agent_profile_configuration
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.agent import AgentDefinition, AgentPermissions, AgentRuntimeProfile
 from cognis.ownership import normalize_executor_scope
+from cognis.providers.backends import get_backend
+from cognis.providers.memory.policy import memory_backend_descriptors
 from cognis.store.models import Schedule, Task
 from cognis.store.queries import (
     add_secondary_binding,
@@ -77,6 +81,14 @@ _SYSTEM_AGENT_LLM_FIELDS = {
 }
 
 
+@router.get("/memory-backends")
+async def list_memory_backends(request: Request) -> dict[str, list[dict[str, Any]]]:
+    """Return authoritative provider-owned memory configuration metadata."""
+
+    require_current_user(request)
+    return {"items": memory_backend_descriptors()}
+
+
 def _sync_metadata(synced: bool, error_detail: str | None = None) -> dict[str, object]:
     return {
         "personality_synced": synced,
@@ -85,9 +97,33 @@ def _sync_metadata(synced: bool, error_detail: str | None = None) -> dict[str, o
     }
 
 
-def _validate_agent_definition_payload(payload: dict[str, object]) -> AgentDefinition:
+def _validate_agent_definition_payload(
+    payload: dict[str, object],
+    *,
+    allowed_unavailable_memory_backend: str | None = None,
+    allowed_unavailable_memory_options: dict[str, object] | None = None,
+    allowed_unavailable_profile_memory_options: dict[str, dict[str, object]] | None = None,
+) -> AgentDefinition:
     try:
         definition = AgentDefinition.model_validate(payload)
+        try:
+            get_backend("memory", definition.capabilities.memory_backend)
+        except ValueError:
+            if (
+                definition.capabilities.memory_backend != allowed_unavailable_memory_backend
+                or definition.capabilities.memory_backend_options
+                != (allowed_unavailable_memory_options or {})
+                or {
+                    profile_id: dict(profile.memory_backend_options)
+                    for profile_id, profile in definition.agent_profiles.items()
+                    if profile.memory_backend_options
+                }
+                != (allowed_unavailable_profile_memory_options or {})
+            ):
+                raise ValueError(
+                    f"Unknown memory_backend {definition.capabilities.memory_backend!r}"
+                ) from None
+        validate_agent_profile_configuration(definition)
         resolve_agent_profile(definition, None, source="agent_default")
     except (ValidationError, ValueError) as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
@@ -408,7 +444,38 @@ async def update_agent_route(
         } & updates.keys():
             candidate = agent_to_response(row).model_dump()
             candidate.update(updates)
-            candidate_definition = _validate_agent_definition_payload(candidate)
+            candidate_definition = _validate_agent_definition_payload(
+                candidate,
+                allowed_unavailable_memory_backend=(
+                    previous_definition.capabilities.memory_backend
+                ),
+                allowed_unavailable_memory_options=(
+                    previous_definition.capabilities.memory_backend_options
+                ),
+                allowed_unavailable_profile_memory_options={
+                    profile_id: dict(profile.memory_backend_options)
+                    for profile_id, profile in previous_definition.agent_profiles.items()
+                    if profile.memory_backend_options
+                },
+            )
+            if "agent_profiles" in updates:
+                for profile_id, previous_profile in previous_definition.agent_profiles.items():
+                    candidate_profile = candidate_definition.agent_profiles.get(profile_id)
+                    if previous_profile.enabled and (
+                        candidate_profile is None or not candidate_profile.enabled
+                    ):
+                        references = await live_agent_profile_references(
+                            session, agent_id, profile_id
+                        )
+                        if references:
+                            details = ", ".join(
+                                f"{kind}={count}" for kind, count in sorted(references.items())
+                            )
+                            raise api_exception(
+                                409,
+                                "profile_in_use",
+                                f"Runtime profile is in use: {details}",
+                            )
             if "capabilities" in updates:
                 updates["capabilities"] = candidate_definition.capabilities.model_dump(mode="json")
         ok = await update_agent(
@@ -483,7 +550,14 @@ async def _update_system_agent_route(
         raise api_exception(403, "forbidden", "This system agent cannot be overridden")
 
     updates = payload.model_dump(exclude_unset=True)
-    allowed_top_level = {"llm_config", "skills", "tools", "permissions"}
+    allowed_top_level = {
+        "llm_config",
+        "skills",
+        "tools",
+        "permissions",
+        "agent_profiles",
+        "default_agent_profile_id",
+    }
     forbidden = sorted(key for key in updates if key not in allowed_top_level)
     if forbidden:
         raise api_exception(
@@ -517,6 +591,57 @@ async def _update_system_agent_route(
         except ValidationError as exc:
             raise api_exception(400, "validation_error", str(exc)) from exc
 
+    raw_profiles = updates.get("agent_profiles")
+    profiles_override: dict[str, dict[str, Any]] | None = None
+    if raw_profiles is not None:
+        if not isinstance(raw_profiles, dict):
+            raise api_exception(
+                403, "forbidden", "System agent runtime profile overrides must be an object"
+            )
+        for profile_id in raw_profiles:
+            if (
+                not isinstance(profile_id, str)
+                or not profile_id.strip()
+                or profile_id != profile_id.strip()
+                or "/" in profile_id
+            ):
+                raise api_exception(
+                    400,
+                    "validation_error",
+                    "Runtime profile keys must be non-empty, trimmed, and must not contain '/'",
+                )
+        try:
+            profiles_override = {
+                profile_id: AgentRuntimeProfile.model_validate(profile).model_dump(
+                    mode="json", exclude_none=True
+                )
+                for profile_id, profile in raw_profiles.items()
+            }
+        except ValidationError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
+        for profile_id, profile in profiles_override.items():
+            embedded_id = profile.get("profile_id")
+            if embedded_id is not None and embedded_id != profile_id:
+                raise api_exception(
+                    400,
+                    "validation_error",
+                    (
+                        f"Runtime profile key '{profile_id}' does not match embedded "
+                        f"profile_id '{embedded_id}'"
+                    ),
+                )
+
+    raw_default_profile_id = updates.get("default_agent_profile_id")
+    default_profile_override = (
+        raw_default_profile_id.strip()
+        if isinstance(raw_default_profile_id, str) and raw_default_profile_id.strip()
+        else None
+    )
+    if default_profile_override and "/" in default_profile_override:
+        raise api_exception(
+            400, "validation_error", "default_agent_profile_id must not contain '/'"
+        )
+
     async with request.app.state.session_factory() as session:
         existing = await get_system_agent_override(
             session, owner_email=user.email, agent_id=agent_id
@@ -541,6 +666,31 @@ async def _update_system_agent_route(
             if "permissions" in updates
             else (existing.permissions_override if existing else None)
         )
+        profiles_override_to_store = (
+            profiles_override
+            if "agent_profiles" in updates
+            else (existing.agent_profiles_override if existing else None)
+        )
+        default_profile_override_to_store = (
+            default_profile_override
+            if "default_agent_profile_id" in updates
+            else (existing.default_agent_profile_id_override if existing else None)
+        )
+        candidate_profiles = (
+            profiles_override_to_store
+            if isinstance(profiles_override_to_store, dict)
+            else {
+                profile_id: profile.model_dump(mode="json", exclude_none=True)
+                for profile_id, profile in base.agent_profiles.items()
+            }
+        )
+        candidate_default = default_profile_override_to_store or base.default_agent_profile_id
+        if candidate_default and candidate_default not in candidate_profiles:
+            raise api_exception(
+                400,
+                "validation_error",
+                f"Default runtime profile '{candidate_default}' is not defined",
+            )
         await upsert_system_agent_override(
             session,
             owner_email=user.email,
@@ -550,6 +700,8 @@ async def _update_system_agent_route(
             tools_override=tools_override_to_store,
             permissions_override=permissions_override_to_store,
             execution_override=None,
+            agent_profiles_override=profiles_override_to_store,
+            default_agent_profile_id_override=default_profile_override_to_store,
         )
         await session.commit()
 
@@ -627,6 +779,7 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, row, required="edit")
+        source_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
         new_agent_id = f"{slugify(row.display_name or row.name)}-{uuid.uuid4().hex[:6]}"
         new_row = await create_agent(
             session,
@@ -641,8 +794,12 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
             tools=row.tools,
             permissions=row.permissions,
             llm_config=row.llm_config,
-            agent_profiles=row.agent_profiles,
-            default_agent_profile_id=row.default_agent_profile_id,
+            capabilities=source_definition.capabilities.model_dump(mode="json"),
+            agent_profiles={
+                profile_id: profile.model_dump(mode="json", exclude_none=True)
+                for profile_id, profile in source_definition.agent_profiles.items()
+            },
+            default_agent_profile_id=source_definition.default_agent_profile_id,
             execution=row.execution,
             avatar_image_id=row.avatar_image_id,
             agent_type=row.agent_type,
@@ -689,6 +846,10 @@ async def disable_system_agent(request: Request, agent_id: str) -> AgentResponse
             tools_override=(existing.tools_override if existing else None),
             permissions_override=(existing.permissions_override if existing else None),
             execution_override=(existing.execution_override if existing else None),
+            agent_profiles_override=(existing.agent_profiles_override if existing else None),
+            default_agent_profile_id_override=(
+                existing.default_agent_profile_id_override if existing else None
+            ),
         )
         await session.commit()
     agent = await request.app.state.agent_registry.get(
@@ -719,6 +880,10 @@ async def enable_system_agent(request: Request, agent_id: str) -> AgentResponse:
             tools_override=(existing.tools_override if existing else None),
             permissions_override=(existing.permissions_override if existing else None),
             execution_override=(existing.execution_override if existing else None),
+            agent_profiles_override=(existing.agent_profiles_override if existing else None),
+            default_agent_profile_id_override=(
+                existing.default_agent_profile_id_override if existing else None
+            ),
         )
         await session.commit()
     agent = await request.app.state.agent_registry.get(

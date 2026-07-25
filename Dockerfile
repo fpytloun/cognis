@@ -7,6 +7,7 @@ RUN npm ci
 COPY ui/ ./
 COPY docs/ ../docs/
 RUN npm run build
+RUN npm run build:standalone
 
 
 FROM python:3.12-slim AS runtime
@@ -24,6 +25,7 @@ COPY docs/ ./docs/
 COPY scripts/ ./scripts/
 COPY ui/ ./ui/
 COPY --from=ui-build /app/ui/build ./ui/build
+COPY --from=ui-build /app/ui/standalone-build ./ui/standalone-build
 
 ENV UV_PROJECT_ENVIRONMENT=/usr/local
 

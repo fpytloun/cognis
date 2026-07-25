@@ -8,7 +8,8 @@ import type {
   QuestionSetReply,
   SidebarProjection,
 } from '$lib/types/api';
-import { isAuthChallengeInputToolCall, type ToolCallTimelineItem } from '$lib/chat';
+import { isAuthChallengeToolCall } from '$lib/chat-v2/selectors';
+import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
 
 export interface ConversationRetryScope {
   sessions: boolean;
@@ -22,6 +23,74 @@ export type PendingDirectQuestionKind = 'question' | 'auth_challenge';
 export const DEFAULT_INITIAL_TIMELINE_LIMIT = 200;
 export const DIRECT_CHAT_INITIAL_SESSION_LIMIT = 20;
 export const DIRECT_CHAT_INITIAL_TIMELINE_LIMIT = 80;
+
+export function shouldApplyLegacyLifecycleFrame(chatV2OwnsConversation: boolean): boolean {
+  return !chatV2OwnsConversation;
+}
+
+export const LEGACY_LIFECYCLE_EVENT_TYPES = [
+  'turn_started',
+  'queued',
+  'turn_settled',
+  'message_complete',
+  'conversation_updated',
+  'reconnected',
+  'history_rebased',
+  'session_reset',
+  'session_compacted',
+  'workflow_step_question',
+  'auth_challenge',
+] as const;
+
+export function applyRuntimeAuthoritySequence(params: {
+  chatV2OwnsConversation: boolean;
+  canonicalActive: boolean;
+  legacyFrames: Array<{ type: string; active: boolean }>;
+}): boolean {
+  let active = params.canonicalActive;
+  for (const frame of params.legacyFrames) {
+    if (shouldApplyLegacyLifecycleFrame(params.chatV2OwnsConversation)) active = frame.active;
+  }
+  return active;
+}
+
+const CHAT_V2_OWNED_CONVERSATION_FIELDS = new Set([
+  'has_active_turn',
+  'active_session_status',
+  'active_session_completion_reason',
+  'active_turn_chat_mode',
+  'active_turn_chat_mode_source',
+]);
+
+export function conversationStatePatchForAuthority<T extends Record<string, unknown>>(
+  patch: T,
+  chatV2OwnsConversation: boolean,
+): Partial<T> {
+  if (!chatV2OwnsConversation) return patch;
+  return Object.fromEntries(
+    Object.entries(patch).filter(([key]) => !CHAT_V2_OWNED_CONVERSATION_FIELDS.has(key)),
+  ) as Partial<T>;
+}
+
+export function conversationStateTurnActivity(params: {
+  currentActive: boolean;
+  snapshotActive: boolean;
+  hasPendingInput: boolean;
+  chatV2OwnsConversation: boolean;
+}): boolean {
+  if (params.chatV2OwnsConversation) return params.currentActive;
+  return params.snapshotActive && !params.hasPendingInput;
+}
+
+export function resolveTurnActivityAuthority(params: {
+  chatV2OwnsConversation: boolean;
+  canonicalActive: boolean;
+  legacyActive: boolean | null;
+}): boolean {
+  return params.chatV2OwnsConversation
+    ? params.canonicalActive
+    : params.legacyActive ?? params.canonicalActive;
+}
 
 export interface SidebarProjectionFilter {
   selectedChannels: string[];
@@ -119,6 +188,48 @@ export function shouldRefreshForStaleRuntime(input: RuntimeStalenessInput): bool
  * timeline unstable under an actively scrolling user.
  */
 export const CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS = 5000;
+export const SIDEBAR_RESYNC_MIN_INTERVAL_MS = 5000;
+export const MISSING_CONVERSATION_RECOVERY_COOLDOWN_MS = 5000;
+export const CONVERSATION_SWITCH_TIMEOUT_MS = 35_000;
+
+export interface ChatV2ConversationRealtime {
+  acquireChatV2: (scope: TimelineScope, cursor: string) => void;
+  updateChatV2Cursor: (scope: TimelineScope, cursor: string) => void;
+  releaseChatV2: (scopeKey: string) => void;
+}
+
+/**
+ * Own the conversation scope for one mounted main chat page. Recovery and
+ * reset snapshots refresh the cursor only; they never create another ref.
+ */
+export class ChatV2ConversationLifecycle {
+  private acquiredScopeKey: string | null = null;
+
+  constructor(private readonly realtime: ChatV2ConversationRealtime) {}
+
+  acceptSnapshot(scope: TimelineScope, cursor: string): void {
+    if (this.acquiredScopeKey !== null && this.acquiredScopeKey !== scope.key) {
+      this.release();
+    }
+    if (this.acquiredScopeKey === scope.key) {
+      this.realtime.updateChatV2Cursor(scope, cursor);
+      return;
+    }
+    this.realtime.acquireChatV2(scope, cursor);
+    this.acquiredScopeKey = scope.key;
+  }
+
+  release(): void {
+    if (this.acquiredScopeKey === null) return;
+    const scopeKey = this.acquiredScopeKey;
+    this.acquiredScopeKey = null;
+    this.realtime.releaseChatV2(scopeKey);
+  }
+
+  get scopeKey(): string | null {
+    return this.acquiredScopeKey;
+  }
+}
 
 /**
  * Refresh reasons that must never be debounced: they indicate the client KNOWS
@@ -141,6 +252,17 @@ export const STALE_RUNTIME_REFRESH_MAX_ATTEMPTS = 3;
  * the periodic refresh is the only recovery path — it must not stop entirely.
  */
 export const STALE_RUNTIME_REFRESH_BACKOFF_MS = 5 * 60_000;
+
+export const CONTROLLER_RECOVERY_MAX_DELAY_MS = 30_000;
+export const CONTROLLER_RECOVERY_MAX_ATTEMPTS = 8;
+
+export function nextControllerRecoveryDelayMs(attempt: number): number {
+  return Math.min(1_000 * 2 ** Math.max(0, attempt), CONTROLLER_RECOVERY_MAX_DELAY_MS);
+}
+
+export function shouldContinueControllerRecovery(attempts: number): boolean {
+  return attempts < CONTROLLER_RECOVERY_MAX_ATTEMPTS;
+}
 
 /**
  * Decide whether a stale-runtime refresh attempt is due. Normal cadence for
@@ -171,6 +293,109 @@ export function shouldDebounceConversationViewRefresh(params: {
   if (FORCED_VIEW_REFRESH_REASONS.has(params.reason)) return false;
   if (params.lastRefreshAt <= 0) return false;
   return params.now - params.lastRefreshAt < (params.minIntervalMs ?? CONVERSATION_VIEW_REFRESH_MIN_INTERVAL_MS);
+}
+
+export function shouldDebounceSidebarResync(params: {
+  lastSuccessfulSyncAt: number;
+  now: number;
+  minIntervalMs?: number;
+}): boolean {
+  if (params.lastSuccessfulSyncAt <= 0) return false;
+  return params.now - params.lastSuccessfulSyncAt < (params.minIntervalMs ?? SIDEBAR_RESYNC_MIN_INTERVAL_MS);
+}
+
+export function missingConversationPatchNeedsRecovery(patch: {
+  has_unread?: boolean | null;
+  active_session_status?: string | null;
+  active_session_completion_reason?: string | null;
+  pending_notification_types?: string[] | null;
+}): boolean {
+  return Boolean(patch.has_unread)
+    || (patch.pending_notification_types?.length ?? 0) > 0
+    || conversationHasAttention(patch);
+}
+
+export function shouldRecoverMissingConversationRow(params: {
+  conversationId: string;
+  patch: {
+    has_unread?: boolean | null;
+    active_session_status?: string | null;
+    active_session_completion_reason?: string | null;
+    pending_notification_types?: string[] | null;
+  };
+  lastAttemptByConversation: ReadonlyMap<string, number>;
+  now: number;
+  cooldownMs?: number;
+}): boolean {
+  if (!missingConversationPatchNeedsRecovery(params.patch)) return false;
+  const lastAttemptAt = params.lastAttemptByConversation.get(params.conversationId) ?? 0;
+  if (lastAttemptAt > 0 && params.now - lastAttemptAt < (params.cooldownMs ?? MISSING_CONVERSATION_RECOVERY_COOLDOWN_MS)) {
+    return false;
+  }
+  return true;
+}
+
+export function shouldApplyPendingNotificationRefresh(params: {
+  requestEpoch: number;
+  currentEpoch: number | undefined;
+}): boolean {
+  return params.currentEpoch === params.requestEpoch;
+}
+
+export function isConversationSwitchStale(params: {
+  startedAt: number;
+  now: number;
+  timeoutMs?: number;
+}): boolean {
+  if (params.startedAt <= 0) return false;
+  const timeoutMs = params.timeoutMs ?? CONVERSATION_SWITCH_TIMEOUT_MS;
+  return params.now - params.startedAt >= timeoutMs;
+}
+
+export function shouldApplyChatV2Recovery(conversationId: string, routeConversationId: string): boolean {
+  return Boolean(conversationId) && conversationId === routeConversationId;
+}
+
+export function shouldApplyChatSendFailureSideEffects(
+  sendConversationId: string,
+  routeConversationId: string,
+): boolean {
+  return Boolean(sendConversationId) && sendConversationId === routeConversationId;
+}
+
+const TERMINAL_RETRY_REJECTION_CODES = new Set([
+  'retry_turn_not_available',
+  'retry_source_not_persisted',
+]);
+
+export function shouldClearRecoverableRetry(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = 'code' in error ? error.code : undefined;
+  return typeof code === 'string' && TERMINAL_RETRY_REJECTION_CODES.has(code);
+}
+
+export function settleWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  timer: Pick<Window, 'setTimeout' | 'clearTimeout'> = window,
+): Promise<PromiseSettledResult<T>> {
+  let timeoutId: number | undefined;
+  const settled: Promise<PromiseSettledResult<T>> = promise.then(
+    (value): PromiseFulfilledResult<T> => ({ status: 'fulfilled', value }),
+    (reason): PromiseRejectedResult => ({ status: 'rejected', reason }),
+  );
+  const timedOut = new Promise<PromiseRejectedResult>((resolve) => {
+    timeoutId = timer.setTimeout(() => {
+      resolve({
+        status: 'rejected',
+        reason: new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)} seconds.`),
+      });
+    }, timeoutMs);
+  });
+  return Promise.race([settled, timedOut]).finally(() => {
+    if (timeoutId !== undefined) timer.clearTimeout(timeoutId);
+  });
 }
 
 export function isRuntimeSnapshotOlderThanView(
@@ -272,17 +497,120 @@ function maxTimestampValue<T extends string | null | undefined>(left: T, right: 
   return timestampValue(right) > timestampValue(left) ? right : left;
 }
 
+function hasOwn(object: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+export function hasUnreadFromConversationTimestamps(
+  lastMessageAt: string | null | undefined,
+  lastReadAt: string | null | undefined,
+): boolean {
+  const lastMessageValue = timestampValue(lastMessageAt);
+  if (lastMessageValue <= 0) return false;
+  const lastReadValue = timestampValue(lastReadAt);
+  return lastReadValue <= 0 || lastMessageValue > lastReadValue;
+}
+
+export function mergeConversationRowPatch<T extends Conversation>(
+  existing: T,
+  patch: Partial<Conversation>,
+): T {
+  const hasLastReadAt = hasOwn(patch, 'last_read_at');
+  const hasLastMessageAt = hasOwn(patch, 'last_message_at');
+  const merged = {
+    ...existing,
+    ...patch,
+  } as T;
+  if (hasLastReadAt) {
+    merged.last_read_at = maxTimestampValue(existing.last_read_at, patch.last_read_at) ?? null;
+  }
+  if (hasLastMessageAt) {
+    merged.last_message_at = maxTimestampValue(existing.last_message_at, patch.last_message_at) ?? null;
+  }
+  if (hasLastReadAt || hasLastMessageAt) {
+    merged.has_unread = hasUnreadFromConversationTimestamps(merged.last_message_at, merged.last_read_at);
+  } else if (typeof patch.has_unread === 'boolean') {
+    merged.has_unread = patch.has_unread;
+  }
+  return merged;
+}
+
 export function mergeConversationPreservingActivity(
   existing: Conversation | null | undefined,
   incoming: Conversation,
 ): Conversation {
   if (!existing) return incoming;
-  return {
-    ...existing,
+  const incomingIsOlder = timestampValue(incoming.updated_at) < timestampValue(existing.updated_at);
+  // A sidebar request can finish after a newer socket event. Preserve the
+  // volatile runtime projection from that newer event instead of letting the
+  // late REST row re-arm a completed turn or restore a cleared attention dot.
+  const runtimeProjection = incomingIsOlder
+    ? {
+        has_active_turn: existing.has_active_turn,
+        active_turn_chat_mode: existing.active_turn_chat_mode,
+        active_turn_chat_mode_source: existing.active_turn_chat_mode_source,
+        active_session_status: existing.active_session_status,
+        active_session_completion_reason: existing.active_session_completion_reason,
+        pending_notification_types: existing.pending_notification_types,
+      }
+    : {};
+  return mergeConversationRowPatch(existing, {
     ...incoming,
+    ...runtimeProjection,
     last_message_at: maxTimestampValue(existing.last_message_at, incoming.last_message_at),
     updated_at: maxTimestampValue(existing.updated_at, incoming.updated_at),
-  };
+  });
+}
+
+/**
+ * A pending-input event is replayable across reconnects. Rebuilding the same
+ * form must retain its in-memory answers, page, collapsed state, and submit
+ * state; only a different notification represents a new form.
+ */
+export function shouldResetPendingDirectQuestionForm(
+  currentNotificationId: string | null | undefined,
+  nextNotificationId: string | null | undefined,
+): boolean {
+  return currentNotificationId !== nextNotificationId;
+}
+
+export function mergeSidebarConversationRows(
+  existing: Conversation[],
+  incoming: Conversation[],
+  { reset = false }: { reset?: boolean } = {},
+): Conversation[] {
+  const existingById = new Map(existing.map((conversation) => [conversation.conversation_id, conversation]));
+  const next = reset
+    ? []
+    : existing.filter((conversation) => !isAgentDirectConversationSummary(conversation));
+  const indexById = new Map(next.map((conversation, index) => [conversation.conversation_id, index]));
+  for (const conversation of incoming) {
+    if (isAgentDirectConversationSummary(conversation)) {
+      continue;
+    }
+    const row = mergeConversationPreservingActivity(existingById.get(conversation.conversation_id), conversation);
+    const index = indexById.get(conversation.conversation_id);
+    if (index === undefined) {
+      indexById.set(conversation.conversation_id, next.length);
+      next.push(row);
+    } else {
+      next[index] = mergeConversationPreservingActivity(next[index], row);
+    }
+  }
+  return [...next].sort((left, right) => {
+    const activityDelta = conversationActivityValue(right) - conversationActivityValue(left);
+    if (activityDelta !== 0) return activityDelta;
+    const createdDelta = timestampValue(right.created_at) - timestampValue(left.created_at);
+    if (createdDelta !== 0) return createdDelta;
+    return left.conversation_id.localeCompare(right.conversation_id);
+  });
+}
+
+export function removeSidebarConversationRow(
+  existing: Conversation[],
+  conversationId: string,
+): Conversation[] {
+  return existing.filter((conversation) => conversation.conversation_id !== conversationId);
 }
 
 export function cloneSidebarProjection(projection: SidebarProjection): SidebarProjection {
@@ -367,6 +695,8 @@ export interface FailedTurnRetryTailItem {
   role?: string | null;
   content?: string | null;
   text?: string | null;
+  noticeKind?: string | null;
+  noticeScope?: string | null;
   partial?: boolean | null;
   turnId?: string | null;
   orderKey?: string | null;
@@ -400,7 +730,6 @@ const ROOT_SESSION_TIMELINE_EVENT_TYPES = new Set<string>([
   'session_compaction_finished',
   'session_compaction_started',
   'session_compacted',
-  'timeline_patch',
 ]);
 
 const RECOVERABLE_FAILED_TURN_NOTICE_MARKERS = [
@@ -427,6 +756,13 @@ export const SESSION_LOG_POLL_INTERVAL_MS = 3000;
 export const SESSION_LOG_POLL_MAX_INTERVAL_MS = 30000;
 export const CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX = 24;
 export const CHAT_USER_SCROLL_DELTA_THRESHOLD_PX = 2;
+/**
+ * Distance from the bottom of the rendered rows (px) within which scrolling
+ * down triggers downward window re-expansion, so unmounted newer rows remount
+ * before the user hits the very bottom. Larger than the live-tail threshold so
+ * expansion happens ahead of the edge and stays smooth.
+ */
+export const CHAT_TIMELINE_EXPAND_DOWN_THRESHOLD_PX = 400;
 
 export interface ChatScrollState {
   distanceFromBottom: number;
@@ -579,6 +915,228 @@ export function shouldApplyScrollRestore(params: {
 }): boolean {
   const threshold = params.driftThresholdPx ?? CHAT_SCROLL_RESTORE_DRIFT_THRESHOLD_PX;
   return Math.abs(params.currentScrollTop - params.capturedScrollTop) <= threshold;
+}
+
+/**
+ * Timeline render window bounds over the renderable-items array.
+ *
+ * `start` is the first rendered index. `end` is exclusive; `null` means "up to
+ * the current tail" (no upper bound) so freshly appended items render live.
+ * A finite `end` bounds the mounted DOM for very long conversations, but MUST
+ * be re-expanded when the user scrolls back toward the tail — otherwise newer
+ * rows stay unmounted and the user has to jump to bottom to see them.
+ */
+export interface TimelineWindow {
+  start: number;
+  end: number | null;
+}
+
+export const TIMELINE_WINDOW_TARGET_ROWS = 100;
+export const TIMELINE_WINDOW_PAGE_ROWS = 50;
+export const TIMELINE_WINDOW_MAX_ROWS = TIMELINE_WINDOW_TARGET_ROWS + TIMELINE_WINDOW_PAGE_ROWS;
+export const TIMELINE_VIEWPORT_FILL_SLACK_PX = 96;
+export const TIMELINE_VIEWPORT_FILL_MAX_ATTEMPTS = 8;
+
+export interface TimelineViewportFillParams {
+  visibleStartIndex: number;
+  hasOlderMessages: boolean;
+  loadingOlderMessages: boolean;
+  scrollHeight: number;
+  clientHeight: number;
+  slackPx?: number;
+}
+
+/**
+ * Decide whether the chat should opportunistically page older rows into the
+ * mounted window because the current DOM does not fill the viewport.
+ *
+ * The render window is counted in raw timeline items, but Chat v2 can collapse
+ * large tool-call/activity groups into a handful of DOM rows. In that case the
+ * tail window may contain enough raw items while still being visually too short
+ * for the user to scroll up and trigger manual older loading.
+ */
+export function shouldAutoLoadOlderForViewport(params: TimelineViewportFillParams): boolean {
+  if (params.loadingOlderMessages) return false;
+  if (params.visibleStartIndex <= 0 && !params.hasOlderMessages) return false;
+  if (params.clientHeight <= 0) return false;
+  const slackPx = params.slackPx ?? TIMELINE_VIEWPORT_FILL_SLACK_PX;
+  return params.scrollHeight <= params.clientHeight + slackPx;
+}
+
+/** Resolve the effective (exclusive) end index for a window over `total` rows. */
+export function timelineWindowEnd(window: TimelineWindow, total: number): number {
+  return Math.min(total, window.end ?? total);
+}
+
+/** Number of currently rendered rows. */
+export function timelineWindowSize(window: TimelineWindow, total: number): number {
+  return Math.max(0, timelineWindowEnd(window, total) - Math.min(window.start, timelineWindowEnd(window, total)));
+}
+
+/** Whether rows newer than the window's end are hidden (unmounted). */
+export function timelineWindowHasHiddenTail(window: TimelineWindow, total: number): boolean {
+  return timelineWindowEnd(window, total) < total;
+}
+
+/**
+ * Expand the window upward by one page (scrolling toward older history that is
+ * already in memory). The end is kept but bounded so the mounted span never
+ * exceeds the max; when the tail was unbounded it becomes finite so the DOM
+ * stays capped while paging up.
+ */
+export function expandWindowUp(
+  window: TimelineWindow,
+  total: number,
+  pageRows = TIMELINE_WINDOW_PAGE_ROWS,
+  maxRows = TIMELINE_WINDOW_MAX_ROWS,
+): TimelineWindow {
+  const currentEnd = timelineWindowEnd(window, total);
+  const start = Math.max(0, window.start - pageRows);
+  const end = Math.min(total, currentEnd, start + maxRows);
+  return { start, end: end >= total ? null : end };
+}
+
+/**
+ * Expand older rows into a visually under-filled live tail without detaching
+ * the user from the newest rows. This is intentionally less aggressive than
+ * explicit scroll-up paging: while the window is live (`end === null`), keep it
+ * live even if the raw mounted span exceeds the steady-state cap. The auto-fill
+ * caller is separately bounded by attempt count, and once the user explicitly
+ * scrolls up the normal capped windowing rules apply again.
+ */
+export function expandWindowUpPreservingLiveTail(
+  window: TimelineWindow,
+  total: number,
+  pageRows = TIMELINE_WINDOW_PAGE_ROWS,
+  maxRows = TIMELINE_WINDOW_MAX_ROWS,
+): TimelineWindow {
+  if (window.end === null) {
+    return clampWindow({ start: Math.max(0, window.start - pageRows), end: null }, total);
+  }
+  return expandWindowUp(window, total, pageRows, maxRows);
+}
+
+/**
+ * Expand the window downward by one page (scrolling back toward the tail). The
+ * end grows first; once the tail is reachable the end becomes `null` (live).
+ * The start is advanced only if needed to keep the mounted span within max.
+ * This is the missing inverse of {@link expandWindowUp} — without it, hidden
+ * newer rows never remount on scroll-down.
+ */
+export function expandWindowDown(
+  window: TimelineWindow,
+  total: number,
+  pageRows = TIMELINE_WINDOW_PAGE_ROWS,
+  maxRows = TIMELINE_WINDOW_MAX_ROWS,
+): TimelineWindow {
+  const currentEnd = timelineWindowEnd(window, total);
+  const nextEnd = Math.min(total, currentEnd + pageRows);
+  const start = Math.max(0, window.start, nextEnd - maxRows);
+  return { start, end: nextEnd >= total ? null : nextEnd };
+}
+
+/**
+ * Recompute the window after older items are prepended (REST backfill).
+ *
+ * Two invariants, in priority order:
+ *  1. The newly prepended older page MUST be rendered (that is what the user
+ *     asked for by scrolling to the top) — so `start` goes to 0.
+ *  2. The previously rendered newer rows MUST stay mounted (no tail cut, so
+ *     the content the user was reading does not vanish) — so `end` shifts down
+ *     by `prependedCount`.
+ * Both can be satisfied at once by widening the mounted span; the window is a
+ * DOM-perf bound, and briefly exceeding the steady-state target right after an
+ * explicit user backfill is fine. A hard ceiling (`maxSpanRows`) still caps the
+ * DOM for pathological prepends; when exceeded, the fetched older page wins
+ * (start stays 0) and the far tail is dropped — it is reachable again via
+ * downward re-expansion on scroll-down.
+ */
+export function windowAfterPrepend(
+  window: TimelineWindow,
+  prependedCount: number,
+  total: number,
+  maxSpanRows = TIMELINE_WINDOW_MAX_ROWS * 3,
+): TimelineWindow {
+  if (prependedCount <= 0) {
+    return clampWindow(window, total);
+  }
+  const priorEnd = window.end === null ? total - prependedCount : window.end;
+  const shiftedEnd = Math.min(total, priorEnd + prependedCount);
+  // start=0 shows the fetched page; end keeps the prior newer rows mounted,
+  // capped at the hard span ceiling (fetched page wins; far tail, if dropped,
+  // is recoverable via downward re-expansion).
+  const end = Math.min(total, Math.max(prependedCount, Math.min(shiftedEnd, maxSpanRows)));
+  return { start: 0, end: end >= total ? null : end };
+}
+
+/**
+ * Recompute the window after an automatic viewport-fill backfill. When the user
+ * has not explicitly scrolled up and the tail is live, keep the tail live and
+ * temporarily allow a wider mounted raw span so collapsed tool groups can fill
+ * the viewport without hiding the newest rows. Explicit/manual backfills keep
+ * using the normal capped prepend behavior.
+ */
+export function windowAfterViewportFillBackfill(
+  window: TimelineWindow,
+  prependedCount: number,
+  total: number,
+  preserveLiveTail: boolean,
+): TimelineWindow {
+  if (preserveLiveTail && window.end === null && prependedCount > 0) {
+    return clampWindow({ start: 0, end: null }, total);
+  }
+  return windowAfterPrepend(window, prependedCount, total);
+}
+
+/** Clamp a window's bounds to `total`, collapsing a full-tail end to `null`. */
+export function clampWindow(window: TimelineWindow, total: number): TimelineWindow {
+  const end = timelineWindowEnd(window, total);
+  const start = Math.min(Math.max(0, window.start), end);
+  return { start, end: end >= total ? null : end };
+}
+
+/**
+ * Freeze the window's tail while the user is scrolled up and new items arrive,
+ * anchored to the COUNT of rows that were newer than the frozen end at freeze
+ * time rather than an absolute index. Passing the number of rows appended
+ * since the freeze (`appendedSinceFreeze`) shifts the frozen end so appends do
+ * not remount the tail, while a prepend (which also changes indices) is
+ * absorbed by callers via {@link windowAfterPrepend} before this runs.
+ */
+export function freezeTailWindow(
+  window: TimelineWindow,
+  total: number,
+  previousTotal: number,
+): TimelineWindow {
+  if (window.end !== null) {
+    return clampWindow(window, total);
+  }
+  if (previousTotal <= 0 || total <= previousTotal) {
+    return clampWindow(window, total);
+  }
+  // The tail was unbounded and rows were appended: freeze the end at the prior
+  // total so the newly appended rows stay hidden (user is reading older
+  // history). Prepends are handled before this by windowAfterPrepend, so an
+  // index freeze here is safe against appends only.
+  return clampWindow({ start: window.start, end: previousTotal }, total);
+}
+
+/**
+ * Element-anchored scroll restore. Given the viewport-relative top offset of a
+ * reference row before a DOM mutation and its offset after, return the delta to
+ * add to `scrollTop` so the reference row stays visually fixed.
+ *
+ * This is immune to changes that add rows ABOVE and remove rows BELOW in the
+ * same commit (the DOM-window prepend+tail-cut case), unlike a whole-document
+ * `scrollHeight` delta which conflates the two.
+ */
+export function anchoredScrollTop(params: {
+  currentScrollTop: number;
+  anchorTopBefore: number;
+  anchorTopAfter: number;
+}): number {
+  const shift = params.anchorTopAfter - params.anchorTopBefore;
+  return params.currentScrollTop + shift;
 }
 
 export function nextPollDelayMs(currentDelayMs: number): number {
@@ -753,6 +1311,9 @@ export function pendingNotificationTypesFromNotifications(
 
 function isRecoverableFailedTurnNotice(item: FailedTurnRetryTailItem): boolean {
   if (item.kind !== 'system_message' && item.kind !== 'notice') return false;
+  if (item.noticeKind === 'model_error') {
+    return item.noticeScope == null || item.noticeScope === 'failed_turn';
+  }
   const text = `${item.text ?? ''}\n${item.content ?? ''}`;
   return RECOVERABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => text.includes(marker));
 }
@@ -969,7 +1530,7 @@ export function pendingInputRequestKind(params: {
   pendingDirectKind?: PendingDirectQuestionKind | null;
 }): PendingDirectQuestionKind {
   if (params.pendingStepTool) {
-    return isAuthChallengeInputToolCall(params.pendingStepTool) ? 'auth_challenge' : 'question';
+    return isAuthChallengeToolCall(params.pendingStepTool) ? 'auth_challenge' : 'question';
   }
   return params.pendingDirectKind === 'auth_challenge' ? 'auth_challenge' : 'question';
 }

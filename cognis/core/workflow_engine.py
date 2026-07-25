@@ -41,6 +41,7 @@ from cognis.core.chat_modes import ResolvedChatMode
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.gate_conditions import evaluate_gate_conditions_detailed
+from cognis.core.harness_guards import SameTurnToolCallLedger
 from cognis.core.project_runtime import build_project_context_message
 from cognis.core.runtime import ResolvedStepRuntime, TransientExecutorUnavailable
 from cognis.core.session_fork import fork_session_events
@@ -70,6 +71,7 @@ from cognis.runtime_context import (
     current_workspace_root,
     scoped_runtime_context,
 )
+from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.queries import (
     claim_pending_context_task_comments,
     create_step_run,
@@ -259,9 +261,13 @@ class WorkflowEngine:
         turn_id: str | None = None,
         client_message_id: str | None = None,
         chat_mode: ResolvedChatMode | None = None,
+        is_retry: bool = False,
+        user_message_already_recorded: bool = False,
+        user_message_event_seq: int | None = None,
         consume_boundary_batch: Callable[[str], Any] | None = None,
         get_current_assistant_phase: Callable[[], int] | None = None,
         get_assistant_phase_for_tool: Callable[[str], int | None] | None = None,
+        same_turn_tool_call_ledger: SameTurnToolCallLedger | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
 
@@ -313,6 +319,9 @@ class WorkflowEngine:
             agent=agent,
             executor_agent=agent,
             policy=CHAT_POLICY,
+            is_retry=is_retry,
+            user_message_already_recorded=user_message_already_recorded,
+            remember_user_event_seq=user_message_event_seq,
             user_message=user_message,
             client_message_id=client_message_id,
             user_attachments=user_attachments or [],
@@ -338,6 +347,8 @@ class WorkflowEngine:
             consume_boundary_batch=consume_boundary_batch,
             get_current_assistant_phase=get_current_assistant_phase,
             get_assistant_phase_for_tool=get_assistant_phase_for_tool,
+            same_turn_tool_call_ledger=same_turn_tool_call_ledger
+            or SameTurnToolCallLedger(),
         )
         ctx.workspace_root, ctx.working_directory = _resolve_execution_paths(
             workspace_root=ctx.workspace_root,
@@ -1510,6 +1521,18 @@ class WorkflowEngine:
             )
             return step_output
 
+        artifact_store = getattr(self._agent_loop, "artifact_store", None)
+        if artifact_store is not None:
+            try:
+                await hydrate_deliverable_payload(deliverable, artifact_store)
+            except Exception:
+                logger.warning(
+                    "workflow: failed to hydrate persisted deliverable for evaluation",
+                    extra={"extra_data": {"deliverable_id": step_output.deliverable_id}},
+                    exc_info=True,
+                )
+                return step_output
+
         persisted_content = getattr(deliverable, "content", None)
         if not isinstance(persisted_content, str) or not persisted_content.strip():
             logger.warning(
@@ -1858,7 +1881,7 @@ class WorkflowEngine:
                             user_email=user_email,
                             conversation_id=task.source_ref,
                             session_id=None,
-                            source_type="task",
+                            source_type="task_gate_follow_up",
                             source_id=task.task_id,
                             channel_type=channel_type,
                             account_id=account_id,
@@ -2454,6 +2477,9 @@ class WorkflowEngine:
                             deliverable_id=rejected_deliverable.deliverable_id,
                         )
                         await db_session.commit()
+                        artifact_store = getattr(self._agent_loop, "artifact_store", None)
+                        if artifact_store is not None:
+                            await hydrate_deliverable_payload(rejected_deliverable, artifact_store)
                         latest_output = (
                             dict(prior_run.output)
                             if isinstance(getattr(prior_run, "output", None), dict)
@@ -2698,6 +2724,7 @@ class WorkflowEngine:
                     user_email=task.created_by,
                     agent_id=task.agent_id,
                     account_id=account.account_id,
+                    prefer_unthreaded=True,
                 )
                 if latest is not None:
                     return latest.conversation_id
@@ -2730,26 +2757,24 @@ class WorkflowEngine:
             if isinstance(raw_deliverable_id, str) and raw_deliverable_id:
                 async with self._session_factory() as db_session:
                     deliverable_row = await get_deliverable(db_session, raw_deliverable_id)
-                if deliverable_row is not None and deliverable_row.content.strip():
+                if deliverable_row is not None:
                     final_deliverable_id = deliverable_row.deliverable_id
                     deliverable_already_delivered = (
                         deliverable_row.status == DeliverableStatus.DELIVERED
                     )
-                    safe_content = task.result_data.get("final_channel_content")
-                    if not isinstance(safe_content, str) or not safe_content.strip():
-                        safe_content = self._channel_safe_deliverable_content(
-                            deliverable_row.content,
-                            deliverable_row.format,
-                        )
-                    final_content = safe_content.strip()
-            raw_content = task.result_data.get("final_channel_content")
-            if not raw_content and final_format != "html":
+            raw_content = None
+            if final_deliverable_id is None:
+                raw_content = task.result_data.get("final_channel_content")
+            if not raw_content and (final_deliverable_id is not None or final_format != "html"):
                 raw_content = task.result_data.get("final_content")
             if not final_content and isinstance(raw_content, str):
                 final_content = raw_content.strip()
             raw_attachments = task.result_data.get("attachments")
             if isinstance(raw_attachments, list):
                 attachments = [item for item in raw_attachments if isinstance(item, dict)]
+
+        if not final_content and final_deliverable_id is not None:
+            final_content = self._build_task_delivery_fallback(task)
 
         if not final_content:
             logger.warning(
@@ -2814,22 +2839,37 @@ class WorkflowEngine:
             )
             return
 
-        sent = await self._channel_delivery.send_to_conversation(
+        from cognis.channels.delivery import ChannelDeliveryStatus
+
+        delivery_status = await self._channel_delivery.deliver_task_to_conversation(
             target_conversation_id,
-            final_content,
+            task_id=task.task_id,
+            content=final_content,
             attachments=attachments,
+            deliverable_id=final_deliverable_id,
         )
-        if not sent:
+        if delivery_status != ChannelDeliveryStatus.SENT:
             logger.warning(
-                "task_delivery: direct delivery send failed; falling back",
-                extra={"extra_data": {"task_id": task.task_id}},
+                "task_delivery: direct delivery remains incomplete",
+                extra={
+                    "extra_data": {
+                        "task_id": task.task_id,
+                        "delivery_status": delivery_status,
+                    }
+                },
             )
-            task.applied_completion_mode = "default"
             task.applied_completion_reason = (
-                "Direct delivery fell back because channel send failed."
+                "Direct channel delivery is pending durable retry."
+                if delivery_status != ChannelDeliveryStatus.UNCERTAIN
+                else "Direct channel delivery outcome is uncertain and requires reconciliation."
             )
             await self._update_applied_completion_fields(task)
-            await self._deliver_task_result_default(task, target_conversation_id)
+            await self._publish_task_terminal_event(
+                task,
+                conversation_id=target_conversation_id,
+                direct_delivery=True,
+                channel_delivery_status=delivery_status,
+            )
             return
 
         logger.info(
@@ -2841,15 +2881,6 @@ class WorkflowEngine:
                 }
             },
         )
-
-        if final_deliverable_id is not None:
-            async with self._session_factory() as db_session:
-                await update_deliverable_status(
-                    db_session,
-                    final_deliverable_id,
-                    status=DeliverableStatus.DELIVERED,
-                )
-                await db_session.commit()
 
         event_type = EventType.TASK_FAILED
         if task.status == TaskStatus.COMPLETED:
@@ -2889,13 +2920,17 @@ class WorkflowEngine:
         """Deliver task results through the normal follow-up flow."""
 
         result_data = task.result_data if isinstance(task.result_data, dict) else {}
-        final_content = result_data.get("final_channel_content")
-        if not final_content and result_data.get("final_format") != "html":
-            final_content = result_data.get("final_content")
-        final_content = final_content.strip() or None if isinstance(final_content, str) else None
         final_deliverable_id = result_data.get("final_deliverable_id")
         if not isinstance(final_deliverable_id, str):
             final_deliverable_id = None
+        final_content = None
+        if final_deliverable_id is None:
+            final_content = result_data.get("final_channel_content")
+        if not final_content and (
+            final_deliverable_id is not None or result_data.get("final_format") != "html"
+        ):
+            final_content = result_data.get("final_content")
+        final_content = final_content.strip() or None if isinstance(final_content, str) else None
 
         task_event = {
             TaskStatus.COMPLETED: "task_result",
@@ -3010,7 +3045,7 @@ class WorkflowEngine:
                         user_email=user_email,
                         conversation_id=target_conversation_id,
                         session_id=delivery_session_id,
-                        source_type="task",
+                        source_type="task_result_follow_up",
                         source_id=task.task_id,
                         channel_type=channel_type,
                         account_id=account_id,
@@ -3726,19 +3761,26 @@ class WorkflowEngine:
         if task.status == TaskStatus.COMPLETED:
             final_deliverable = await self._resolve_final_deliverable(task, state, workflow)
             if final_deliverable is not None and final_deliverable.content.strip():
-                result["final_deliverable_id"] = final_deliverable.deliverable_id
-                result["final_content"] = final_deliverable.content
-                result["final_format"] = final_deliverable.format
-                result["final_channel_content"] = self._channel_safe_deliverable_content(
+                channel_content = self._channel_safe_deliverable_content(
                     final_deliverable.content,
                     str(final_deliverable.format),
                 )
+                summary = self._truncate_channel_fallback_field(channel_content, max_length=2000)
+                result["final_deliverable_id"] = final_deliverable.deliverable_id
+                result["final_content"] = summary
+                result["final_content_summary"] = summary
+                result["final_format"] = final_deliverable.format
                 if final_deliverable.title:
                     result["final_title"] = final_deliverable.title
             else:
                 last_output = self._last_step_output(state)
                 if last_output is not None and last_output.content.strip():
-                    result["final_content"] = last_output.content
+                    summary = self._truncate_channel_fallback_field(
+                        last_output.content,
+                        max_length=2000,
+                    )
+                    result["final_content"] = summary
+                    result["final_content_summary"] = summary
                     result["final_format"] = "markdown"
                     result["final_channel_content"] = self._channel_safe_deliverable_content(
                         last_output.content,
@@ -3800,6 +3842,9 @@ class WorkflowEngine:
                     DeliverableStatus.APPROVED,
                     DeliverableStatus.DELIVERED,
                 }:
+                    artifact_store = getattr(self._agent_loop, "artifact_store", None)
+                    if artifact_store is not None:
+                        await hydrate_deliverable_payload(row, artifact_store)
                     return Deliverable.model_validate(
                         {
                             "deliverable_id": row.deliverable_id,
@@ -3827,6 +3872,9 @@ class WorkflowEngine:
                     db_session, prior_run.step_run_id
                 )
             if row is not None:
+                artifact_store = getattr(self._agent_loop, "artifact_store", None)
+                if artifact_store is not None:
+                    await hydrate_deliverable_payload(row, artifact_store)
                 return Deliverable.model_validate(
                     {
                         "deliverable_id": row.deliverable_id,

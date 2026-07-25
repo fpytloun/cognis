@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy import event as sa_event
 
 from cognis.core.conversation_state import (
     linked_conversation_ids_for_task,
@@ -277,5 +278,156 @@ async def test_linked_conversation_fanout_includes_step_and_forks(tmp_path: obje
                 task_id="task_1",
             )
         assert ids == ["conv_step", "conv_task"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_linked_conversation_fanout_uses_sql_predicates_for_unrelated_rows(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _factory(tmp_path)
+    statements: list[str] = []
+
+    def _capture_sql(
+        _conn: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if "FROM conversations" in statement:
+            statements.append(" ".join(statement.split()))
+
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                task_id="task_1",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Task",
+            )
+            await create_task(
+                session,
+                task_id="task_other",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Other",
+            )
+            await create_step_run(
+                session,
+                step_run_id="sr_1",
+                task_id="task_1",
+                step_name="implement",
+                step_type="agent",
+                agent_id="agent-1",
+                conversation_id="conv_step",
+            )
+            await create_step_run(
+                session,
+                step_run_id="sr_2",
+                task_id="task_1",
+                step_name="review",
+                step_type="agent",
+                agent_id="agent-1",
+                conversation_id="conv_step_other",
+            )
+            session.add_all(
+                [
+                    Conversation(
+                        conversation_id="conv_step",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    ),
+                    Conversation(
+                        conversation_id="conv_step_other",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    ),
+                    Conversation(
+                        conversation_id="conv_task_context",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="task",
+                        context_ref="task_1",
+                    ),
+                    Conversation(
+                        conversation_id="conv_task_fork",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                        context_data={"forked_from": "task", "task_id": "task_1"},
+                    ),
+                    Conversation(
+                        conversation_id="conv_step_fork",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                        context_data={
+                            "forked_from": "task_step",
+                            "task_id": "task_1",
+                            "step_run_id": "sr_1",
+                        },
+                    ),
+                    Conversation(
+                        conversation_id="conv_step_fork_other",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                        context_data={
+                            "forked_from": "task_step",
+                            "task_id": "task_1",
+                            "step_run_id": "sr_2",
+                        },
+                    ),
+                    *[
+                        Conversation(
+                            conversation_id=f"conv_unrelated_{index}",
+                            user_email="user@test.com",
+                            agent_id="agent-1",
+                            context_type="web" if index % 2 else "task",
+                            context_ref="task_other" if index % 2 == 0 else None,
+                            context_data={
+                                "forked_from": "task_step" if index % 3 == 0 else "task",
+                                "task_id": "task_other",
+                                "step_run_id": f"sr_unrelated_{index}",
+                            },
+                        )
+                        for index in range(500)
+                    ],
+                ]
+            )
+            await session.commit()
+
+            sa_event.listen(engine.sync_engine, "before_cursor_execute", _capture_sql)
+            try:
+                ids = await linked_conversation_ids_for_task(
+                    session,
+                    user_email="user@test.com",
+                    task_id="task_1",
+                    step_run_id="sr_1",
+                )
+            finally:
+                sa_event.remove(engine.sync_engine, "before_cursor_execute", _capture_sql)
+
+        assert ids == [
+            "conv_step",
+            "conv_step_fork",
+            "conv_task_context",
+            "conv_task_fork",
+        ]
+        conversation_selects = [
+            statement for statement in statements if "FROM conversations" in statement
+        ]
+        assert len(conversation_selects) == 1
+        conversation_select = conversation_selects[0]
+        assert "SELECT conversations.conversation_id" in conversation_select
+        assert "conversations.context_type = ?" in conversation_select
+        assert "conversations.context_ref = ?" in conversation_select
+        assert "JSON_EXTRACT(conversations.context_data" in conversation_select
     finally:
         await engine.dispose()

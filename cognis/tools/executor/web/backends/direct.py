@@ -10,6 +10,7 @@ search returns an actionable error suggesting Tavily or Brave.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -26,6 +27,7 @@ from cognis.tools.executor.web.headers import (
 )
 
 logger = logging.getLogger(__name__)
+_DDG_REQUEST_TIMEOUT_SECONDS = 15
 
 _fetch_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
 _search_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
@@ -79,7 +81,15 @@ class DirectBackend:
         # result is an httpx.Response
         response_url = str(getattr(result, "url", "") or "")
         final_url = response_url if response_url.startswith(("http://", "https://")) else url
-        return format_response_result(result, output_format, source_url=final_url, options=options)
+        # Extraction is synchronous and CPU-heavy. Keep it off the executor
+        # event loop so websocket pings and heartbeats remain responsive.
+        return await asyncio.to_thread(
+            format_response_result,
+            result,
+            output_format,
+            source_url=final_url,
+            options=options,
+        )
 
     async def search(
         self,
@@ -96,6 +106,8 @@ class DirectBackend:
         region = opts.get("region", "us-en")
         safesearch = opts.get("safesearch", "moderate")
         timelimit = opts.get("timelimit")  # d, w, m, y
+        include_images = opts.get("include_images") is True
+        image_limit = _clamp_image_limit(opts.get("image_limit"), default=10)
 
         try:
             return await _search_breaker.call(
@@ -105,6 +117,8 @@ class DirectBackend:
                     region=region,
                     safesearch=safesearch,
                     timelimit=timelimit,
+                    include_images=include_images,
+                    image_limit=image_limit,
                 )
             )
         except CircuitBreakerError:
@@ -131,15 +145,18 @@ async def _ddg_search(
     region: str = "us-en",
     safesearch: str = "moderate",
     timelimit: str | None = None,
+    include_images: bool = False,
+    image_limit: int = 10,
 ) -> ToolResult:
     """Execute DuckDuckGo search in a thread (the library is sync)."""
     import asyncio
 
-    def _sync_search() -> list[dict[str, str]]:
+    def _sync_search() -> tuple[list[dict[str, str]], list[dict[str, object]]]:
         from ddgs import DDGS
 
-        return list(
-            DDGS().text(
+        ddgs = DDGS(timeout=_DDG_REQUEST_TIMEOUT_SECONDS)
+        text_results = list(
+            ddgs.text(
                 query,
                 max_results=max_results,
                 region=region,
@@ -147,10 +164,21 @@ async def _ddg_search(
                 timelimit=timelimit,
             )
         )
+        image_results: list[dict[str, object]] = []
+        if include_images:
+            image_results = list(
+                ddgs.images(
+                    query,
+                    max_results=image_limit,
+                    region=region,
+                    safesearch=safesearch,
+                )
+            )
+        return text_results, image_results
 
-    results = await asyncio.to_thread(_sync_search)
+    results, raw_images = await asyncio.to_thread(_sync_search)
 
-    if not results:
+    if not results and not raw_images:
         return ToolResult(output="No search results found.")
 
     formatted_results: list[dict[str, object]] = [
@@ -161,4 +189,22 @@ async def _ddg_search(
         }
         for r in results
     ]
-    return build_search_tool_result(answer=None, results=formatted_results)
+    images = [
+        {
+            "url": image.get("image") or image.get("thumbnail"),
+            "alt": image.get("title"),
+            "caption": image.get("title"),
+            "source": "duckduckgo_image_search",
+            "source_page_url": image.get("url"),
+        }
+        for image in raw_images
+        if isinstance(image.get("image") or image.get("thumbnail"), str)
+    ]
+    return build_search_tool_result(answer=None, results=formatted_results, images=images)
+
+
+def _clamp_image_limit(value: object, *, default: int) -> int:
+    try:
+        return min(max(int(value), 0), 50)
+    except (TypeError, ValueError):
+        return default

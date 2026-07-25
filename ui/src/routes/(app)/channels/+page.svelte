@@ -47,6 +47,7 @@
   let draft = $state<ChannelEditorDraft>({
     display_name: '',
     agent_id: '',
+    default_agent_profile_id: '',
     adapter_location: 'controller',
     executor_id: '',
     dm_policy: 'pairing',
@@ -76,6 +77,7 @@
   const emptyDraft = (): ChannelEditorDraft => ({
     display_name: '',
     agent_id: '',
+    default_agent_profile_id: '',
     adapter_location: 'controller',
     executor_id: '',
     dm_policy: 'pairing',
@@ -214,6 +216,7 @@
   }
 
   async function refreshPairingRequests(): Promise<void> {
+    if (document.hidden) return;
     try {
       pairingRequests = await api.channels.listPairingRequests();
     } catch {
@@ -271,6 +274,7 @@
         channel_type: selectedType.channel_type,
         display_name: draft.display_name,
         agent_id: draft.agent_id,
+        default_agent_profile_id: draft.default_agent_profile_id || null,
         settings,
         credential_refs,
         adapter_location: draft.adapter_location,
@@ -323,6 +327,7 @@
       const updates: Record<string, unknown> = {
         display_name: draft.display_name,
         agent_id: draft.agent_id,
+        default_agent_profile_id: draft.default_agent_profile_id || null,
         adapter_location: draft.adapter_location,
         executor_id: draft.executor_id || null,
         dm_policy: draft.dm_policy,
@@ -507,7 +512,7 @@
   onMount(() => {
     void loadData();
     const interval = window.setInterval(() => {
-      if (activeTab === 'pairing') {
+      if (activeTab === 'pairing' && !document.hidden) {
         void refreshPairingRequests();
       }
     }, 10_000);

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.11.2"
+version = "0.12.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "TBD" }
@@ -43,6 +43,7 @@ dependencies = [
     "python-dateutil>=2.9.0",
     "Markdown>=3.7",
     "pypdf>=5.4.0",
+    "Pillow>=11.0.0",
     "weasyprint>=63.0",
     "playwright>=1.53.0",
     "playwright-stealth>=2.0.0",
@@ -55,6 +56,7 @@ dependencies = [
     "beautifulsoup4>=4.14.3",
     "readability-lxml>=0.8.4.1",
     "tiktoken>=0.8.0",
+    "psutil>=6.1.0",
 ]
 
 [project.optional-dependencies]
@@ -87,13 +89,16 @@ cognis-executor = "cognis.executor.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cognis"]
-include = ["cognis/ui_dist/**/*", "cognis/providers/llm/data/*.json"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/LICENSE",
+    "/README.md",
     "/build.py",
+    "/cognis/**/*",
     "/ui/**/*",
     "/docs/**/*",
+    "/pyproject.toml",
 ]
 
 [tool.hatch.build.hooks.custom]

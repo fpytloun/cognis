@@ -35,6 +35,16 @@ Approved-exception baseline for `claude_code`:
 
 ## Memory Provider (Mnemory)
 
+Memory backends additionally expose server-owned descriptor metadata, strict
+option validation/defaults, and a resolver to a provider-neutral frozen policy:
+`enabled`, bootstrap instructions/core behavior, `auto_recall`,
+`auto_remember`, `tools_enabled`, and a stable fingerprint. Provider mode names
+are metadata only and are not branched on by generic runtime logic. Options
+merge shallowly by field; arbitrary prompt text, URLs, and credentials are not
+accepted. Remember queue records contain only safe backend/profile/fingerprint
+metadata, never raw provider options, and current hard disablement is rechecked
+before durable replay when possible.
+
 ### Protocol
 
 ```python

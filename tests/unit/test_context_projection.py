@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
+
 from cognis.core.context import _compact_oldest_droppable_tool_group
 from cognis.core.context_projection import (
     CRITICAL_ESCALATE_FRACTION,
@@ -10,12 +13,13 @@ from cognis.core.context_projection import (
     ProjectionResult,
     ProjectionTurnState,
     ReprojectDecision,
+    compacted_tool_group_anchors,
     decide_pressure_mode,
     project_messages,
     should_reproject,
 )
 from cognis.core.invariants import check_projection_monotonicity
-from cognis.core.message_markers import TURN_BOUNDARY
+from cognis.core.message_markers import PROJECTED_COMPACTED, PROTECTED_TOOL_OUTPUT, TURN_BOUNDARY
 from cognis.core.pruning import prune_tool_outputs
 
 
@@ -39,8 +43,10 @@ def _tool_result(
     *,
     tool_name: str,
     recovery_call_id: str | None = None,
+    source_call_id: str | None = None,
+    token_estimate: int | None = None,
 ) -> dict[str, object]:
-    return {
+    result: dict[str, object] = {
         "role": "tool",
         "tool_call_id": call_id,
         "content": content,
@@ -48,6 +54,11 @@ def _tool_result(
         "_recovery_call_id": recovery_call_id,
         "_output_size": len(content),
     }
+    if source_call_id is not None:
+        result["_source_call_id"] = source_call_id
+    if token_estimate is not None:
+        result["_token_estimate"] = token_estimate
+    return result
 
 
 def test_project_messages_compacts_older_completed_tool_groups() -> None:
@@ -76,6 +87,110 @@ def test_project_messages_compacts_older_completed_tool_groups() -> None:
     assert '"content_preview":' in assistant_args
     assert result.messages[3]["content"] == "recent 1"
     assert result.messages[5]["content"] == "recent 2"
+
+
+def test_project_messages_compacts_only_required_savings() -> None:
+    messages = [
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "A" * 4_000, tool_name="read", recovery_call_id="call-1"),
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "B" * 4_000, tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "read", {"path": "c.py"}),
+        _tool_result("call-3", "C" * 4_000, tool_name="read", recovery_call_id="call-3"),
+    ]
+
+    result = project_messages(
+        messages,
+        preserve_recent_completed_tool_groups=1,
+        required_savings_tokens=500,
+        token_counter=lambda text: len(text),
+    )
+
+    assert "Tool output omitted from prompt." in str(result.messages[1]["content"])
+    assert result.messages[3]["content"] == "B" * 4_000
+    assert result.messages[5]["content"] == "C" * 4_000
+
+
+def test_savings_target_prefers_recoverable_groups() -> None:
+    messages = [
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "A" * 4_000, tool_name="read"),
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "B" * 4_000, tool_name="read", recovery_call_id="call-2"),
+    ]
+
+    result = project_messages(
+        messages,
+        required_savings_tokens=500,
+        token_counter=lambda text: len(text),
+    )
+
+    assert result.messages[1]["content"] == "A" * 4_000
+    assert "Tool output omitted from prompt." in str(result.messages[3]["content"])
+
+
+def test_project_messages_keeps_all_groups_when_no_savings_are_required() -> None:
+    messages: list[dict[str, object]] = []
+    for index in range(4):
+        call_id = f"call-{index}"
+        messages.extend(
+            [
+                _assistant_tool_call(call_id, "read", {"path": f"{index}.py"}),
+                _tool_result(
+                    call_id,
+                    f"result-{index}",
+                    tool_name="read",
+                    recovery_call_id=call_id,
+                ),
+            ]
+        )
+
+    result = project_messages(
+        messages,
+        preserve_recent_completed_tool_groups=1,
+        required_savings_tokens=0,
+    )
+
+    assert all(
+        "Tool output omitted from prompt." not in str(message.get("content"))
+        for message in result.messages
+    )
+
+
+def test_cross_turn_seed_uses_explicit_compacted_anchors_after_marker_stripping() -> None:
+    messages = [
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "old", tool_name="read", recovery_call_id="call-1"),
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "recent", tool_name="read", recovery_call_id="call-2"),
+    ]
+    projected = project_messages(messages, preserve_recent_completed_tool_groups=1)
+    compacted_anchors = compacted_tool_group_anchors(projected.messages)
+    stripped_messages = [
+        {key: value for key, value in message.items() if key != PROJECTED_COMPACTED}
+        for message in projected.messages
+    ]
+    stripped_result = ProjectionResult(
+        messages=stripped_messages,
+        mutable_start_index=projected.mutable_start_index,
+    )
+    state = ProjectionTurnState(
+        turn_id="turn-1",
+        policy=ProjectionPolicy.from_budget(
+            max_context_tokens=128_000,
+            available_prompt_tokens=100_000,
+        ),
+    )
+
+    state.seed_from_cross_turn_result(
+        stripped_result,
+        stripped_messages,
+        compacted_anchors=compacted_anchors,
+    )
+
+    assert len(state.demoted_anchors) == 1
+    assert len(state.committed_preservations) == 1
+    assert state.demoted_anchors.isdisjoint(state.committed_preservations)
 
 
 def test_projection_policy_scales_context_windows_sublinearly() -> None:
@@ -457,11 +572,11 @@ def test_project_messages_critical_mode_preserves_protected_and_newest_latest_tu
                     tool_name="step_todo_write",
                     recovery_call_id="call-protected",
                 ),
-                "_protected_tool_output": True,
+                PROTECTED_TOOL_OUTPUT: True,
             },
         ]
     )
-    for index in range(2):
+    for index in range(3):
         call_id = f"call-{index}"
         messages.extend(
             [
@@ -481,6 +596,7 @@ def test_project_messages_critical_mode_preserves_protected_and_newest_latest_tu
     assert "Tool output omitted from prompt." in str(result.messages[4]["content"])
     assert "call_id 'call-0'" in str(result.messages[4]["content"])
     assert result.messages[6]["content"] == "evidence 1" * 1000
+    assert result.messages[8]["content"] == "evidence 2" * 1000
 
 
 def test_project_messages_compacts_prior_turn_but_preserves_latest_turn() -> None:
@@ -808,7 +924,7 @@ def test_should_reproject_reprojects_when_crossing_steady_target() -> None:
     assert decision == ReprojectDecision.reproject
 
 
-def test_should_reproject_critical_always_critical_reproject() -> None:
+def test_should_reproject_critical_skips_when_prefix_unchanged_and_under_target() -> None:
     policy = ProjectionPolicy.from_budget(
         max_context_tokens=200_000, available_prompt_tokens=100_000
     )
@@ -820,6 +936,24 @@ def test_should_reproject_critical_always_critical_reproject() -> None:
         pressure_mode=PressureMode.critical,
         prior_pressure_mode=PressureMode.critical,
         oversized_appended=False,
+        prefix_fingerprint_unchanged=True,
+    )
+    assert decision == ReprojectDecision.skip
+
+
+def test_should_reproject_critical_reprojects_when_prefix_mutates() -> None:
+    policy = ProjectionPolicy.from_budget(
+        max_context_tokens=200_000, available_prompt_tokens=100_000
+    )
+    decision = should_reproject(
+        new_message_count=5,
+        last_message_count=5,
+        new_token_estimate=policy.steady_target_tokens - 1,
+        steady_target_tokens=policy.steady_target_tokens,
+        pressure_mode=PressureMode.critical,
+        prior_pressure_mode=PressureMode.critical,
+        oversized_appended=False,
+        prefix_fingerprint_unchanged=False,
     )
     assert decision == ReprojectDecision.critical_reproject
 
@@ -991,6 +1125,314 @@ def test_project_messages_critical_can_demote_committed_preservations() -> None:
     # Under critical with preserve_recent=1, only the newest same-turn group is kept.
     # call-1 should be compacted even though it was committed.
     assert "Tool output omitted" in str(result_critical.messages[2]["content"])
+
+
+def test_project_messages_critical_prunes_demoted_committed_preservations() -> None:
+    messages = [
+        {"role": "user", "content": "old task"},
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "content of a.py", tool_name="read", recovery_call_id="call-1"),
+        {"role": "assistant", "content": "done with turn 1"},
+        {"role": "user", "content": "new task"},
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "content of b.py", tool_name="read", recovery_call_id="call-2"),
+    ]
+    state = ProjectionTurnState(
+        turn_id="t1",
+        policy=ProjectionPolicy.from_budget(
+            max_context_tokens=200_000,
+            available_prompt_tokens=100_000,
+            phase="within_turn",
+            pressure_mode=PressureMode.normal,
+        ),
+    )
+
+    project_messages(messages, policy=state.policy, prior_state=state)
+    assert state.committed_preservations
+
+    critical_policy = ProjectionPolicy.from_budget(
+        max_context_tokens=200_000,
+        available_prompt_tokens=100_000,
+        phase="within_turn",
+        pressure_mode=PressureMode.critical,
+    )
+    result_critical = project_messages(messages, policy=critical_policy, prior_state=state)
+    assert "Tool output omitted" in str(result_critical.messages[2]["content"])
+
+    noncritical_policy = replace(
+        state.policy,
+        preserve_recent_completed_tool_groups=0,
+        pressure_mode=PressureMode.pressure,
+    )
+    result_noncritical = project_messages(messages, policy=noncritical_policy, prior_state=state)
+    assert "Tool output omitted" in str(result_noncritical.messages[2]["content"])
+
+
+def test_project_messages_critical_pins_recovery_outputs_across_cycles() -> None:
+    messages = [
+        {"role": "user", "content": "recover evidence"},
+        _assistant_tool_call("recovery-1", "read_tool_output", {"call_id": "source-1"}),
+        _tool_result(
+            "recovery-1",
+            "recovered source evidence",
+            tool_name="read_tool_output",
+            recovery_call_id="recovery-1",
+            source_call_id="source-1",
+            token_estimate=10,
+        ),
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "content of b.py", tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "read", {"path": "c.py"}),
+        _tool_result("call-3", "content of c.py", tool_name="read", recovery_call_id="call-3"),
+        _assistant_tool_call("call-4", "read", {"path": "d.py"}),
+        _tool_result("call-4", "content of d.py", tool_name="read", recovery_call_id="call-4"),
+    ]
+    policy = ProjectionPolicy.from_budget(
+        max_context_tokens=200_000,
+        available_prompt_tokens=100_000,
+        phase="within_turn",
+        pressure_mode=PressureMode.critical,
+    )
+    state = ProjectionTurnState(turn_id="t1", policy=policy)
+    state.record_recovery_result(result_call_id="recovery-1", source_call_id="source-1")
+
+    result1 = project_messages(messages, policy=policy, prior_state=state)
+    result2 = project_messages(messages, policy=policy, prior_state=state)
+
+    assert result1.messages[2]["content"] == "recovered source evidence"
+    assert result2.messages[2]["content"] == "recovered source evidence"
+
+
+def _stable_prefix_payload(result: ProjectionResult) -> str:
+    return json.dumps(
+        result.messages[: result.mutable_start_index],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def test_critical_projection_repeats_byte_identical_prefix_without_new_demotions() -> None:
+    messages = [
+        {"role": "user", "content": "old task"},
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "content of a.py", tool_name="read", recovery_call_id="call-1"),
+        {"role": "assistant", "content": "done with old task"},
+        {"role": "user", "content": "latest task"},
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "content of b.py", tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "read", {"path": "c.py"}),
+        _tool_result("call-3", "content of c.py", tool_name="read", recovery_call_id="call-3"),
+    ]
+    policy = replace(
+        ProjectionPolicy.from_budget(
+            max_context_tokens=200_000,
+            available_prompt_tokens=100_000,
+            phase="within_turn",
+            pressure_mode=PressureMode.critical,
+        ),
+        preserve_recent_completed_tool_groups=1,
+    )
+    state = ProjectionTurnState(turn_id="t1", policy=policy)
+
+    first = project_messages(messages, policy=policy, prior_state=state)
+    second = project_messages(messages, policy=policy, prior_state=state)
+
+    assert first.mutable_start_index == second.mutable_start_index
+    assert _stable_prefix_payload(first) == _stable_prefix_payload(second)
+    assert "Tool output omitted" in str(first.messages[2]["content"])
+    assert "Tool output omitted" in str(first.messages[6]["content"])
+
+
+def test_demoted_group_stays_placeholder_when_budget_later_allows_preservation() -> None:
+    messages = [
+        {"role": "user", "content": "old task"},
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "content of a.py", tool_name="read", recovery_call_id="call-1"),
+        {"role": "assistant", "content": "done with old task"},
+        {"role": "user", "content": "latest task"},
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "content of b.py", tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "read", {"path": "c.py"}),
+        _tool_result("call-3", "content of c.py", tool_name="read", recovery_call_id="call-3"),
+    ]
+    state = ProjectionTurnState(
+        turn_id="t1",
+        policy=ProjectionPolicy.from_budget(
+            max_context_tokens=200_000,
+            available_prompt_tokens=100_000,
+            phase="within_turn",
+            pressure_mode=PressureMode.critical,
+        ),
+    )
+    critical_policy = replace(
+        state.policy,
+        pressure_mode=PressureMode.critical,
+        preserve_recent_completed_tool_groups=1,
+    )
+
+    first = project_messages(messages, policy=critical_policy, prior_state=state)
+    call2_placeholder = first.messages[6]["content"]
+    assert "Tool output omitted" in str(call2_placeholder)
+
+    generous_policy = replace(
+        state.policy,
+        pressure_mode=PressureMode.normal,
+        preserve_recent_completed_tool_groups=10,
+        preserve_recent_completed_tool_tokens=1_000_000,
+    )
+    second = project_messages(messages, policy=generous_policy, prior_state=state)
+
+    assert second.messages[6]["content"] == call2_placeholder
+    assert second.messages[8]["content"] == "content of c.py"
+
+
+def test_project_messages_demotes_oldest_candidate_first() -> None:
+    messages = [
+        {"role": "user", "content": "task"},
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "content of a.py", tool_name="read", recovery_call_id="call-1"),
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "content of b.py", tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "read", {"path": "c.py"}),
+        _tool_result("call-3", "content of c.py", tool_name="read", recovery_call_id="call-3"),
+    ]
+
+    result = project_messages(
+        messages,
+        preserve_recent_completed_tool_groups=2,
+        pressure_mode=PressureMode.pressure,
+    )
+
+    assert "Tool output omitted" in str(result.messages[2]["content"])
+    assert result.messages[4]["content"] == "content of b.py"
+    assert result.messages[6]["content"] == "content of c.py"
+
+
+def test_prune_projected_messages_demotes_oldest_outside_protect_budget_first() -> None:
+    messages = [
+        _assistant_tool_call("call-1", "read", {"path": "a.py"}),
+        _tool_result("call-1", "old evidence", tool_name="read", recovery_call_id="call-1"),
+        _assistant_tool_call("call-2", "read", {"path": "b.py"}),
+        _tool_result("call-2", "middle evidence", tool_name="read", recovery_call_id="call-2"),
+        _assistant_tool_call("call-3", "read", {"path": "c.py"}),
+        _tool_result("call-3", "new evidence", tool_name="read", recovery_call_id="call-3"),
+    ]
+
+    result = prune_tool_outputs(
+        messages,
+        protect_tokens=2,
+        minimum_savings=1,
+        pressure_mode=PressureMode.critical,
+        token_counter=lambda value: 1 if value else 0,
+    )
+
+    assert "Tool output omitted" in str(result[1]["content"])
+    assert result[3]["content"] == "middle evidence"
+    assert result[5]["content"] == "new evidence"
+
+
+def test_project_messages_recovery_pin_cap_yields_oldest_first() -> None:
+    messages = [
+        {"role": "user", "content": "old recoveries"},
+        _assistant_tool_call("pin-old", "read_tool_output", {"call_id": "source-old"}),
+        _tool_result(
+            "pin-old",
+            "old recovered evidence",
+            tool_name="read_tool_output",
+            recovery_call_id="pin-old",
+            source_call_id="source-old",
+            token_estimate=30,
+        ),
+        _assistant_tool_call("pin-new", "read_tool_output", {"call_id": "source-new"}),
+        _tool_result(
+            "pin-new",
+            "new recovered evidence",
+            tool_name="read_tool_output",
+            recovery_call_id="pin-new",
+            source_call_id="source-new",
+            token_estimate=30,
+        ),
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "latest work"},
+        _assistant_tool_call("latest-1", "read", {"path": "a.py"}),
+        _tool_result(
+            "latest-1", "latest evidence 1", tool_name="read", recovery_call_id="latest-1"
+        ),
+        _assistant_tool_call("latest-2", "read", {"path": "b.py"}),
+        _tool_result(
+            "latest-2", "latest evidence 2", tool_name="read", recovery_call_id="latest-2"
+        ),
+    ]
+    policy = replace(
+        ProjectionPolicy.from_budget(
+            max_context_tokens=200_000,
+            available_prompt_tokens=100_000,
+            phase="within_turn",
+            pressure_mode=PressureMode.critical,
+        ),
+        preserve_recent_completed_tool_tokens=100,
+    )
+    state = ProjectionTurnState(turn_id="t1", policy=policy)
+    state.record_recovery_result(result_call_id="pin-old", source_call_id="source-old")
+    state.record_recovery_result(result_call_id="pin-new", source_call_id="source-new")
+
+    result = project_messages(messages, policy=policy, prior_state=state)
+
+    assert "Tool output omitted" in str(result.messages[2]["content"])
+    assert result.messages[4]["content"] == "new recovered evidence"
+
+
+def test_prune_projected_messages_preserves_recovery_pins_within_cap() -> None:
+    messages = [
+        _assistant_tool_call("pin", "read_tool_output", {"call_id": "source"}),
+        _tool_result(
+            "pin",
+            "pinned recovery",
+            tool_name="read_tool_output",
+            recovery_call_id="pin",
+            source_call_id="source",
+            token_estimate=10,
+        ),
+        _assistant_tool_call("drop", "read", {"path": "x.py"}),
+        _tool_result(
+            "drop",
+            "drop me",
+            tool_name="read",
+            recovery_call_id="drop",
+            token_estimate=10,
+        ),
+    ]
+
+    result = prune_tool_outputs(
+        messages,
+        protect_tokens=0,
+        minimum_savings=1,
+        pressure_mode=PressureMode.critical,
+        recovery_result_call_ids={"pin"},
+        recovery_pin_budget_tokens=20,
+        token_counter=lambda value: int(messages[0].get("_token_estimate", 10)) if value else 0,
+    )
+
+    assert result[1]["content"] == "pinned recovery"
+    assert result[3][PROJECTED_COMPACTED] is True
+
+
+def test_projection_turn_state_recovery_loop_counter() -> None:
+    state = ProjectionTurnState(
+        turn_id="t1",
+        policy=ProjectionPolicy.from_budget(
+            max_context_tokens=200_000,
+            available_prompt_tokens=100_000,
+        ),
+    )
+
+    assert state.record_recovery_result(result_call_id="helper-1", source_call_id="source") == 1
+    assert state.record_recovery_result(result_call_id="helper-2", source_call_id="source") == 2
+
+    assert state.recovery_result_call_ids == {"helper-1", "helper-2"}
+    assert state.recovery_per_source_counts["source"] == 2
+    assert state.recovery_loop_detected_count == 1
 
 
 # ── TURN_BOUNDARY marker ──────────────────────────────────────────────────────

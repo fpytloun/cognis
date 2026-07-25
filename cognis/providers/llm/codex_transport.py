@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -53,14 +54,14 @@ def _codex_headers(auth: CodexAuth, kwargs: dict[str, Any]) -> dict[str, str]:
     extra_headers = kwargs.get("extra_headers")
     if isinstance(extra_headers, dict):
         headers.update({str(key): str(value) for key, value in extra_headers.items()})
+    headers["x-client-request-id"] = str(uuid.uuid4())
     return headers
 
 
 class DirectCodexResponsesStream:
-    """Async iterator over Codex SSE data events with owned HTTP resources."""
+    """Async iterator over Codex SSE data events."""
 
-    def __init__(self, client: httpx.AsyncClient, response: httpx.Response) -> None:
-        self._client = client
+    def __init__(self, response: httpx.Response) -> None:
         self._response = response
 
     async def __aiter__(self) -> AsyncIterator[dict[str, Any]]:
@@ -79,7 +80,6 @@ class DirectCodexResponsesStream:
 
     async def aclose(self) -> None:
         await self._response.aclose()
-        await self._client.aclose()
 
 
 class DirectCodexHTTPStatusError(RuntimeError):
@@ -139,21 +139,49 @@ class DirectCodexTransport:
 
     name = "direct_codex"
 
-    def __init__(self, auth: CodexAuth) -> None:
+    def __init__(
+        self,
+        auth: CodexAuth,
+        *,
+        client_factory: Callable[[], httpx.AsyncClient] = httpx.AsyncClient,
+    ) -> None:
         self._auth = auth
+        self._client_factory = client_factory
+        self._client: httpx.AsyncClient | None = None
+
+    def update_auth(self, auth: CodexAuth) -> None:
+        """Use refreshed OAuth credentials for subsequent requests."""
+
+        self._auth = auth
+
+    def _http_client(self) -> httpx.AsyncClient:
+        client = self._client
+        if client is None or client.is_closed:
+            client = self._client_factory()
+            self._client = client
+        return client
+
+    async def aclose(self) -> None:
+        """Close the shared HTTP connection pool."""
+
+        client, self._client = self._client, None
+        if client is not None and not client.is_closed:
+            await client.aclose()
 
     async def responses(self, **kwargs: Any) -> Any:
         payload, stream = _codex_payload(kwargs)
         headers = _codex_headers(self._auth, kwargs)
-        timeout = kwargs.get("timeout")
-        client = httpx.AsyncClient(
-            timeout=timeout
-            if timeout is not None
-            else (DEFAULT_CODEX_STREAM_HTTP_TIMEOUT if stream else DEFAULT_CODEX_HTTP_TIMEOUT)
+        timeout = kwargs.get("timeout") or (
+            DEFAULT_CODEX_STREAM_HTTP_TIMEOUT if stream else DEFAULT_CODEX_HTTP_TIMEOUT
         )
+        client = self._http_client()
         if stream:
             request = client.build_request(
-                "POST", CODEX_RESPONSES_URL, json=payload, headers=headers
+                "POST",
+                CODEX_RESPONSES_URL,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
             )
             response = await client.send(request, stream=True)
             try:
@@ -162,15 +190,16 @@ class DirectCodexTransport:
                 _raise_for_status(response)
             except Exception:
                 await response.aclose()
-                await client.aclose()
                 raise
-            return DirectCodexResponsesStream(client, response)
-        try:
-            response = await client.post(CODEX_RESPONSES_URL, json=payload, headers=headers)
-            _raise_for_status(response)
-            data = response.json()
-            if not isinstance(data, dict):
-                raise RuntimeError("Direct Codex transport returned a non-object response")
-            return data
-        finally:
-            await client.aclose()
+            return DirectCodexResponsesStream(response)
+        response = await client.post(
+            CODEX_RESPONSES_URL,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+        )
+        _raise_for_status(response)
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("Direct Codex transport returned a non-object response")
+        return data

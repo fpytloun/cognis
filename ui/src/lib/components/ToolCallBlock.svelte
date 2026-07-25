@@ -2,7 +2,8 @@
   import Check from 'lucide-svelte/icons/check';
   import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
-  import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/chat';
+  import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/timeline-render-model';
+  import type { TimelineScope } from '$lib/chat-v2/types';
   import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
@@ -15,19 +16,23 @@
   import { highlightToolOutput, inferLanguageFromPath, isReadToolName, pathFromToolArguments } from '$lib/syntax/tool-output';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import { canOpenToolOutput, toolOutputOpenLabel } from '$lib/tool-output-status';
-  import { delegationToolCallDisplayTitle, skillLoadDisplayName, stepTodoWriteStatusSummary, toolOutputHelperPresentation, workflowToolPresentation } from '$lib/tool-call-summary';
+  import { delegationToolCallDisplayTitle, managedConversationToolPresentation, memoryToolPresentation, nativeInspectionToolPresentation, skillLoadDisplayName, stepTodoWriteStatusSummary, toolOutputHelperPresentation, webToolPresentation, workflowToolPresentation } from '$lib/tool-call-summary';
   import { formatStepQuestionResponse, normalizeStepQuestionAnswers, normalizeStepQuestions, type StepQuestionAnswer } from '$lib/tool-call-question-set';
+  import { formatPatchPreparationProgressLabel, shouldShowPatchPreparationProgress } from '$lib/tool-call-progress';
   import { displayToolName } from '$lib/tools-display';
-  import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
+  import { renderMarkdown } from '$lib/markdown';
+  import { cancellationOrigin, cancellationOriginLabel } from '$lib/cancellation-reason';
 
   let {
     item,
-    sourceToolCalls = new Map<string, ToolCallTimelineItem>(),
+    getToolCall = () => null,
     onViewSession,
+    scope,
   } = $props<{
     item: ToolCallTimelineItem;
-    sourceToolCalls?: Map<string, ToolCallTimelineItem>;
+    getToolCall?: (callId: string) => ToolCallTimelineItem | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    scope?: TimelineScope | undefined;
   }>();
 
   type StructuredEntry = { key: string; value: unknown };
@@ -45,6 +50,7 @@
   let terminalTailing = $state(true);
   let terminalEl = $state<HTMLPreElement | null>(null);
   let outputDrawerTarget = $state<ToolCallTimelineItem | null>(null);
+  let deliverablePreviewId = $state('');
   let copiedBox = $state<'input' | 'output' | null>(null);
   let delegateAutoExpanded = $state(false);
   let bashExpandTimer: number | null = null;
@@ -65,6 +71,7 @@
       // Delegate/fork: auto-expand while running so the delegation progress
       // (title, tool-call stats, todo pie) is visible without a manual click.
       || (isDelegateTool() && (isActiveToolStatus(item.status) || isDelegationActive()))
+      || (isManagedConversationTool() && isActiveToolStatus(item.status))
   );
 
   $effect(() => {
@@ -85,7 +92,7 @@
   });
 
   $effect(() => {
-    if (!isDelegateTool() || !delegationRunning) return;
+    if (!(delegationRunning || managedConversationRunning())) return;
     delegateDurationNowMs = Date.now();
     const timer = window.setInterval(() => {
       delegateDurationNowMs = Date.now();
@@ -201,13 +208,29 @@
     return match?.[1] ? decodeURIComponent(match[1]) : null;
   }
 
+  function deliverablePreviewUrl(deliverableId: string): string {
+    const accessorConversationId = conversationId();
+    const query = accessorConversationId
+      ? `?accessor_conversation_id=${encodeURIComponent(accessorConversationId)}`
+      : '';
+    return `/api/v1/deliverables/${encodeURIComponent(deliverableId)}/view${query}`;
+  }
+
   function isApplyPatchTool(target: ToolCallTimelineItem = item): boolean {
     return normalizedToolName(target).includes('applypatch');
   }
 
   function isDelegateTool(target: ToolCallTimelineItem = item): boolean {
     const name = normalizedToolName(target);
-    return name === 'delegate' || name === 'fork';
+    return name === 'delegate'
+      || name === 'retrysubsession'
+      || name === 'followupsubsession'
+      || name === 'forksubsession'
+      || name === 'fork';
+  }
+
+  function isManagedConversationTool(target: ToolCallTimelineItem = item): boolean {
+    return normalizedToolName(target).startsWith('agentconversation');
   }
 
   // Delegation details folded onto the delegate tool call (title/progress/
@@ -252,16 +275,27 @@
     return toolOutputHelperPresentation(item) !== null;
   }
 
-  function sourceToolCall(): ToolCallTimelineItem | null {
-    const presentation = toolOutputHelperPresentation(item);
-    if (!presentation) return null;
-    return sourceToolCalls.get(presentation.sourceCallId) ?? null;
+  function isRichMemoryTool(): boolean {
+    return memoryToolPresentation(item) !== null;
   }
 
-  function hasDeliverableFooter(presentation: ReturnType<typeof workflowToolPresentation>): boolean {
-    return presentation?.kind === 'write_deliverable'
-      && (Boolean(presentation.deliverableId) || presentation.outputKeys.length > 0);
+  function isRichManagedConversationTool(): boolean {
+    return managedConversationToolPresentation(item) !== null;
   }
+
+  function isRichNativeInspectionTool(): boolean {
+    return nativeInspectionToolPresentation(item) !== null;
+  }
+
+  function isRichWebTool(): boolean {
+    return webToolPresentation(item) !== null;
+  }
+
+  const sourceToolCall = $derived.by((): ToolCallTimelineItem | null => {
+    const presentation = toolOutputHelperPresentation(item);
+    if (!presentation) return null;
+    return getToolCall(presentation.sourceCallId);
+  });
 
   function hasRawPayload(): boolean {
     return Boolean((item.arguments && Object.keys(item.arguments).length > 0) || item.result != null);
@@ -309,7 +343,9 @@
 
   function delegationStatusDisplayText(): string {
     const status = delegationStatusLabel();
-    return status ? status.charAt(0).toUpperCase() + status.slice(1) : '';
+    const detail = delegation?.error ?? delegation?.resultSummary ?? delegation?.summary;
+    return cancellationOriginLabel(cancellationOrigin(status, detail))
+      ?? (status ? status.charAt(0).toUpperCase() + status.slice(1) : '');
   }
 
   function delegationSummaryText(): string {
@@ -341,10 +377,10 @@
     return cleaned.join('\n').trim();
   }
 
-  function delegationOutputHtml(): string {
+  const delegationOutputHtml = $derived.by(() => {
     const output = stripDelegateDisplayAnchors(delegationOutputText());
     return output ? renderMarkdown(output) : '';
-  }
+  });
 
   function parseTimeMs(value: string | null | undefined): number | null {
     if (!value) return null;
@@ -389,6 +425,40 @@
     return 'bg-sky-300';
   }
 
+  function managedConversationRunning(): boolean {
+    if (!isManagedConversationTool()) return false;
+    return isActiveToolStatus(
+      managedConversationToolPresentation(item)?.displayStatus || item.status,
+    );
+  }
+
+  function managedConversationStatusText(status: string): string {
+    const presentation = managedConversationToolPresentation(item);
+    const detail = presentation?.error ?? presentation?.resultSummary;
+    const cancellationLabel = cancellationOriginLabel(cancellationOrigin(status, detail));
+    if (cancellationLabel) return cancellationLabel;
+    if (!status) return isActiveToolStatus(item.status) ? 'Running' : item.status;
+    return status.charAt(0).toUpperCase() + status.slice(1);
+  }
+
+  function managedConversationStatusTextClass(status: string, error = ''): string {
+    const normalized = status.toLowerCase();
+    if (error || normalized === 'failed' || normalized === 'error' || normalized === 'interrupted') return 'text-rose-300';
+    if (normalized === 'completed' || normalized === 'complete' || normalized === 'idle' || normalized === 'closed') return 'text-emerald-300';
+    return 'text-sky-300';
+  }
+
+  function managedConversationStatusDotClass(status: string, error = ''): string {
+    const normalized = status.toLowerCase();
+    if (error || normalized === 'failed' || normalized === 'error' || normalized === 'interrupted') return 'bg-rose-300';
+    if (normalized === 'completed' || normalized === 'complete' || normalized === 'idle' || normalized === 'closed') return 'bg-emerald-300';
+    return 'bg-sky-300';
+  }
+
+  function managedConversationHref(conversationId: string): string {
+    return `/chat/${encodeURIComponent(conversationId)}`;
+  }
+
   function compactSessionId(sessionId: string): string {
     if (!sessionId) return '';
     if (sessionId.length <= 18) return sessionId;
@@ -421,6 +491,11 @@
       return truncate(outputHelperPresentation.summary, 120);
     }
 
+    const memoryPresentation = memoryToolPresentation(target);
+    if (memoryPresentation) {
+      return truncate(memoryPresentation.summary, 120);
+    }
+
     const workflowPresentation = workflowToolPresentation(target);
     if (workflowPresentation?.kind === 'write_deliverable') {
       return truncate(workflowPresentation.title, 120);
@@ -430,6 +505,21 @@
     }
     if (workflowPresentation?.kind === 'step_todo_write') {
       return truncate(workflowPresentation.statusSummary || `${workflowPresentation.count} todos`, 120);
+    }
+
+    const managedPresentation = managedConversationToolPresentation(target);
+    if (managedPresentation) {
+      return truncate(managedPresentation.requestText || managedPresentation.resultSummary || managedPresentation.summary, 120);
+    }
+
+    const nativePresentation = nativeInspectionToolPresentation(target);
+    if (nativePresentation) {
+      return truncate(nativePresentation.requestText || nativePresentation.summary, 120);
+    }
+
+    const webPresentation = webToolPresentation(target);
+    if (webPresentation) {
+      return truncate(webPresentation.requestText || webPresentation.summary, 120);
     }
 
     if (name === 'skillload') {
@@ -490,7 +580,7 @@
       if (typeof args.content === 'string') return truncate(args.content);
     }
     // Delegation
-    if (name.includes('delegate') || name.includes('fork') || name.includes('spawn')) {
+    if (isDelegateTool(target) || name.includes('spawn')) {
       const displayTitle = delegationToolCallDisplayTitle(args);
       if (displayTitle) return truncate(displayTitle);
     }
@@ -529,25 +619,17 @@
   }
 
   function isPreparingPatch(): boolean {
-    return isApplyPatchTool()
-      && item.status === 'started'
-      && item.progressPhase === 'preparing_input'
-      && !item.arguments?.patchText;
+    return shouldShowPatchPreparationProgress(item);
   }
 
   function preparingPatchText(): string {
-    const lines = item.progressInputLines;
-    const chars = item.progressInputChars;
-    const parts: string[] = [];
-    if (typeof lines === 'number' && lines > 0) parts.push(`${lines.toLocaleString()} lines`);
-    if (typeof chars === 'number' && chars > 0) parts.push(`${chars.toLocaleString()} chars`);
-    return parts.length > 0 ? `Preparing patch (${parts.join(', ')})` : 'Preparing patch';
+    return formatPatchPreparationProgressLabel(item);
   }
 
-  function formatArguments(): string {
+  const formattedArguments = $derived.by(() => {
     if (!item.arguments) return '';
     return formatCallArguments(item);
-  }
+  });
 
   function formatCallArguments(target: ToolCallTimelineItem): string {
     if (!target.arguments) return '';
@@ -585,6 +667,14 @@
       .replace(/^<tool_result[^>]*>\n?/, '')
       .replace(/\n?<\/tool_result>\s*$/, '');
   }
+
+  const rawOutputText = $derived(cleanResult(item.result));
+  const rawOutputData = $derived(formatOutput(rawOutputText, outputExpanded, item));
+  const formattedArgumentsData = $derived(formatMaybeJson(formattedArguments, inputExpanded));
+  const originalOutputText = $derived(cleanResult(sourceToolCall?.result));
+  const originalOutputData = $derived.by(() =>
+    sourceToolCall ? formatOutput(originalOutputText, outputExpanded, sourceToolCall) : emptyFormattedOutput()
+  );
 
   function paginatedText(raw: string, showAll: boolean): { text: string; totalLines: number; hiddenCount: number } {
     const lines = raw.split('\n');
@@ -624,17 +714,26 @@
     return { html: null, ...paginated };
   }
 
-  function formatOutput(raw: string, showAll: boolean): {
+  function formatOutput(raw: string, showAll: boolean, target: ToolCallTimelineItem = item): {
     html: string | null;
     text: string;
     totalLines: number;
     hiddenCount: number;
   } {
     const json = formatMaybeJson(raw, showAll);
-    if (json.html || item.isError || !isReadToolName(item.toolName)) return json;
-    const language = inferLanguageFromPath(pathFromToolArguments(item.arguments));
+    if (json.html || target.isError || !isReadToolName(target.toolName)) return json;
+    const language = inferLanguageFromPath(pathFromToolArguments(target.arguments));
     if (!language) return json;
     return { ...json, html: highlightToolOutput(json.text, language) };
+  }
+
+  function emptyFormattedOutput(): {
+    html: string | null;
+    text: string;
+    totalLines: number;
+    hiddenCount: number;
+  } {
+    return { html: null, text: '', totalLines: 0, hiddenCount: 0 };
   }
 
   function borderColor(): string {
@@ -670,7 +769,7 @@
     return '';
   }
 
-  function parsedToolResult(): Record<string, unknown> | null {
+  const parsedToolResult = $derived.by((): Record<string, unknown> | null => {
     if (item.result == null) return null;
     try {
       const parsed = JSON.parse(cleanResult(item.result));
@@ -678,14 +777,14 @@
     } catch {
       return null;
     }
-  }
+  });
 
   function stepRequestResponse(): string {
-    return formatStepQuestionResponse(item, parsedToolResult());
+    return formatStepQuestionResponse(item, parsedToolResult);
   }
 
   function stepRequestAnswers(): StepQuestionAnswer[] {
-    return normalizeStepQuestionAnswers(item, parsedToolResult());
+    return normalizeStepQuestionAnswers(item, parsedToolResult);
   }
 
   function completedQuestionPageIndex(answers: StepQuestionAnswer[]): number {
@@ -701,7 +800,7 @@
   }
 
   function stepRequestError(): string {
-    const error = parsedToolResult()?.error;
+    const error = parsedToolResult?.error;
     return typeof error === 'string' ? error : '';
   }
 
@@ -711,10 +810,6 @@
 
   function terminalTitle(): string {
     return descriptionText() || commandText();
-  }
-
-  function renderDeliverableContent(content: string, format: string): string {
-    return format === 'html' ? sanitizeHtml(content) : renderMarkdown(content);
   }
 
   function formatStructuredValue(value: unknown): string {
@@ -739,6 +834,41 @@
     if (status === 'cancelled' || status === 'canceled') return 'border-slate-600/60 bg-slate-800/50 text-slate-300';
     if (status === 'in_progress' || status === 'active' || status === 'running') return 'border-sky-500/35 bg-sky-500/10 text-sky-100';
     return 'border-amber-500/35 bg-amber-500/10 text-amber-100';
+  }
+
+  function memoryItemClass(accent: string): string {
+    if (accent === 'artifact') return 'border-violet-400/20 bg-violet-500/5';
+    if (accent === 'category') return 'border-amber-400/20 bg-amber-500/5';
+    return 'border-cyan-400/15 bg-slate-950/35';
+  }
+
+  function memoryItemTitleClass(accent: string): string {
+    if (accent === 'artifact') return 'text-violet-100';
+    if (accent === 'category') return 'text-amber-100';
+    return 'text-cyan-50';
+  }
+
+  function nativeInspectionToneClass(error = ''): string {
+    return error ? 'border-rose-500/30 bg-rose-500/5' : 'border-sky-500/25 bg-sky-500/5';
+  }
+
+  function nativeInspectionHeadingClass(error = ''): string {
+    return error ? 'text-rose-300' : 'text-sky-300';
+  }
+
+  function nativeReadLineHtml(content: string, path: string): string {
+    const language = inferLanguageFromPath(path);
+    return highlightToolOutput(content, language ?? 'plaintext');
+  }
+
+  function savedMemoryItemLabel(items: Array<{ accent: string }>, index: number): string {
+    const memoryCount = items.filter((item) => item.accent === 'memory').length;
+    const current = items[index];
+    if (current?.accent === 'artifact') return 'Attached artifact';
+    if (current?.accent !== 'memory') return 'Detail';
+    if (memoryCount === 1) return 'Saved memory';
+    const ordinal = items.slice(0, index + 1).filter((item) => item.accent === 'memory').length;
+    return `Saved memory ${ordinal}`;
   }
 
   function hasStructuredEntries(entries: StructuredEntry[]): boolean {
@@ -907,7 +1037,7 @@
                   {/if}
                 </div>
                 <div class="prose prose-sm prose-invert max-h-[34vh] max-w-none overflow-auto px-3 py-2 text-slate-200">
-                  {@html delegationOutputHtml()}
+                  {@html delegationOutputHtml}
                 </div>
               </div>
             {:else if delegationSummaryText() && (!delegationRunning || delegation?.error)}
@@ -919,8 +1049,6 @@
         </div>
 
         {#if hasRawPayload()}
-          {@const rawOutputText = cleanResult(item.result)}
-          {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
           <div>
             <button
               class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
@@ -935,7 +1063,7 @@
                 {#if item.arguments && Object.keys(item.arguments).length > 0}
                   <div>
                     <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
-                    <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                    <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
                   </div>
                 {/if}
                 {#if item.result != null}
@@ -952,6 +1080,155 @@
               </div>
             {/if}
           </div>
+        {/if}
+      {/if}
+      {#if isManagedConversationTool()}
+        {@const managedPresentation = managedConversationToolPresentation(item)}
+        {#if managedPresentation}
+          {@const displayStatus = managedPresentation.displayStatus}
+          <div class={`overflow-hidden rounded-2xl border ${managedPresentation.error ? 'border-rose-500/30 bg-rose-500/5' : 'border-violet-400/25 bg-violet-500/5'} text-sm text-slate-100 shadow-inner`}>
+            <div class={`flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3 ${managedPresentation.error ? 'border-rose-500/15' : 'border-violet-400/15'}`}>
+              <div class="min-w-0 flex-1 space-y-1.5">
+                <p class={`text-[11px] font-medium uppercase tracking-[0.22em] ${managedPresentation.error ? 'text-rose-300' : 'text-violet-200'}`}>Managed conversation</p>
+                <h4 class="truncate text-base font-semibold text-slate-50" title={managedPresentation.requestText || managedPresentation.title}>{managedPresentation.title}</h4>
+                <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-400">
+                  {#if managedPresentation.primaryConversation?.agentId}
+                    <span class="font-mono text-slate-300">{managedPresentation.primaryConversation.agentId}</span>
+                    <span class="text-slate-600">·</span>
+                  {/if}
+                  {#if managedPresentation.primaryConversation?.conversationId}
+                    <span class="font-mono text-slate-400" title={managedPresentation.primaryConversation.conversationId}>{compactSessionId(managedPresentation.primaryConversation.conversationId)}</span>
+                    <span class="text-slate-600">·</span>
+                  {/if}
+                  <span class={`inline-flex items-center gap-1.5 font-medium ${managedConversationStatusTextClass(displayStatus, managedPresentation.error)}`}>
+                    <span class={`h-1.5 w-1.5 rounded-full ${managedConversationStatusDotClass(displayStatus, managedPresentation.error)}`}></span>
+                    {managedConversationStatusText(displayStatus)}
+                  </span>
+                  {#if managedConversationRunning()}
+                    <span class="text-slate-600">·</span>
+                    <span class="inline-flex items-center gap-1.5 text-sky-300">
+                      <LiveDots inline={true} size="sm" tone="sky" />
+                    </span>
+                  {:else if item.durationMs != null}
+                    <span class="text-slate-600">·</span>
+                    <span class="tabular-nums text-slate-400">{formatDurationMs(item.durationMs)}</span>
+                  {/if}
+                </div>
+              </div>
+              <div class="flex shrink-0 flex-wrap items-center gap-2">
+                {#if managedPresentation.primaryConversation?.conversationId}
+                  <a
+                    class="rounded-lg border border-violet-300/30 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-50 transition hover:border-violet-200/60 hover:bg-violet-500/20"
+                    href={managedConversationHref(managedPresentation.primaryConversation.conversationId)}
+                  >
+                    Open conversation
+                  </a>
+                {/if}
+              </div>
+            </div>
+
+            <div class="space-y-3 px-4 py-3">
+              {#if managedPresentation.todos.length > 0 || managedPresentation.toolCallCount != null || managedPresentation.lastTool}
+                <div class="flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400">
+                  {#if managedPresentation.todos.length > 0}
+                    <TodoProgressPopover todos={managedPresentation.todos} label="Managed conversation todo progress" />
+                    <span>{managedPresentation.todoSummary}</span>
+                  {/if}
+                  {#if managedPresentation.toolCallCount != null}
+                    {#if managedPresentation.todos.length > 0}<span class="text-slate-600">·</span>{/if}
+                    <span class="tabular-nums">{managedPresentation.toolCallCount} tool calls</span>
+                  {/if}
+                  {#if managedPresentation.lastTool}
+                    {#if managedPresentation.todos.length > 0 || managedPresentation.toolCallCount != null}<span class="text-slate-600">·</span>{/if}
+                    <span class="min-w-0 truncate">last: <span class="font-mono text-slate-300">{managedPresentation.lastTool}</span></span>
+                  {/if}
+                </div>
+              {/if}
+              {#if managedPresentation.resultSummary}
+                <div class={`rounded-xl border px-3 py-2 text-xs leading-5 ${managedPresentation.error ? 'border-rose-400/25 bg-rose-500/10 text-rose-100' : 'border-violet-300/15 bg-slate-950/35 text-slate-200'}`}>
+                  <p class="line-clamp-5 whitespace-pre-wrap">{managedPresentation.resultSummary}</p>
+                </div>
+              {/if}
+
+              {#if managedPresentation.conversations.length > 1}
+                <div class="space-y-2">
+                  <p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-violet-100/60">Conversations</p>
+                  <div class="grid gap-2">
+                    {#each managedPresentation.conversations as conversation}
+                      <div class="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-violet-300/15 bg-slate-950/30 px-3 py-2 text-xs">
+                        <div class="min-w-0">
+                          <p class="truncate font-medium text-slate-100" title={conversation.title || conversation.conversationId}>{conversation.title || conversation.conversationId || 'Managed conversation'}</p>
+                          <p class="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5 text-slate-400">
+                            {#if conversation.agentId}<span class="font-mono">{conversation.agentId}</span>{/if}
+                            {#if conversation.conversationId}<span class="font-mono" title={conversation.conversationId}>{compactSessionId(conversation.conversationId)}</span>{/if}
+                            {#if conversation.status}<span class={managedConversationStatusTextClass(conversation.status, conversation.error)}>{managedConversationStatusText(conversation.status)}</span>{/if}
+                          </p>
+                        </div>
+                        {#if conversation.conversationId}
+                          <a class="rounded-lg border border-slate-600/70 bg-slate-900/70 px-2.5 py-1 text-[11px] font-medium text-slate-100 transition hover:border-violet-300/50 hover:bg-violet-500/10" href={managedConversationHref(conversation.conversationId)}>Open</a>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+
+              {#if managedPresentation.requestDetails.length > 0}
+                <dl class="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+                  {#each managedPresentation.requestDetails.slice(0, 4) as detail}
+                    <dt class="text-violet-200/50">{detail.key}</dt>
+                    <dd class="min-w-0 truncate text-violet-50/85" title={String(detail.value)}>{String(detail.value)}</dd>
+                  {/each}
+                </dl>
+              {/if}
+              {#if managedPresentation.primaryConversation?.controllerConversationId || managedPresentation.primaryConversation?.followUpConversationId}
+                <div class="flex flex-wrap gap-3 text-xs">
+                  {#if managedPresentation.primaryConversation?.controllerConversationId}
+                    <a class="font-medium text-violet-200 underline decoration-violet-400/40 underline-offset-2 transition hover:text-violet-100" href={managedConversationHref(managedPresentation.primaryConversation.controllerConversationId)}>Controller conversation</a>
+                  {/if}
+                  {#if managedPresentation.primaryConversation?.followUpConversationId}
+                    <a class="font-medium text-violet-200 underline decoration-violet-400/40 underline-offset-2 transition hover:text-violet-100" href={managedConversationHref(managedPresentation.primaryConversation.followUpConversationId)}>Follow-up conversation</a>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          </div>
+
+          {#if hasRawPayload()}
+            {@const rawOutputText = cleanResult(item.result)}
+            {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
+            <div>
+              <button
+                class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+                onclick={() => { rawExpanded = !rawExpanded; }}
+                type="button"
+              >
+                <span>{rawExpanded ? '▼' : '▶'}</span>
+                <span>Raw payload</span>
+              </button>
+              {#if rawExpanded}
+                <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                  {#if item.arguments && Object.keys(item.arguments).length > 0}
+                    <div>
+                      <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                      <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
+                    </div>
+                  {/if}
+                  {#if item.result != null}
+                    <div>
+                      <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                      <div class="relative">
+                        <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                        <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                          {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
         {/if}
       {/if}
       {#if isStepRequestInput()}
@@ -1109,8 +1386,6 @@
         </div>
 
         {#if hasRawPayload()}
-          {@const rawOutputText = cleanResult(item.result)}
-          {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
           <div>
             <button
               class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
@@ -1125,7 +1400,7 @@
                 {#if item.arguments && Object.keys(item.arguments).length > 0}
                   <div>
                     <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
-                    <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                    <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
                   </div>
                 {/if}
                 {#if item.result != null}
@@ -1145,9 +1420,439 @@
         {/if}
 
       {:else}
-        {#if isRichToolOutputHelper()}
+        {#if isRichWebTool()}
+          {@const webPresentation = webToolPresentation(item)}
+          {#if webPresentation}
+            <div class={`overflow-hidden rounded-2xl border ${webPresentation.error ? 'border-rose-500/30 bg-rose-500/5' : 'border-violet-500/25 bg-violet-500/5'}`}>
+              <div class={`flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3 ${webPresentation.error ? 'border-rose-500/15' : 'border-violet-500/15'}`}>
+                <div class="min-w-0 flex-1">
+                  <p class={`text-xs font-medium uppercase tracking-widest ${webPresentation.error ? 'text-rose-300' : 'text-violet-300'}`}>{webPresentation.title}</p>
+                  {#if webPresentation.requestText}
+                    <a href={webPresentation.webKind === 'fetch' ? webPresentation.requestText : undefined} target="_blank" rel="noreferrer" class={`mt-1 block truncate text-sm font-semibold ${webPresentation.error ? 'text-rose-50' : 'text-violet-50'} ${webPresentation.webKind === 'fetch' ? 'hover:underline' : ''}`}>{webPresentation.requestText}</a>
+                  {/if}
+                  <p class={`mt-2 text-xs leading-5 ${webPresentation.error ? 'text-rose-100/80' : 'text-violet-100/80'}`}>{webPresentation.summary}</p>
+                </div>
+                {#if webPresentation.badges.length > 0}
+                  <div class={`flex max-w-full flex-wrap justify-end gap-2 text-[11px] ${webPresentation.error ? 'text-rose-100/75' : 'text-violet-100/75'}`}>
+                    {#each webPresentation.badges as badge}
+                      <span class={`rounded-full border px-2 py-0.5 ${webPresentation.error ? 'border-rose-400/25' : 'border-violet-400/25'}`}>{badge}</span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+
+              {#if webPresentation.error}
+                <p class="m-4 rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-sm leading-6 text-rose-100">{webPresentation.error}</p>
+              {/if}
+
+              {#if webPresentation.answer}
+                <section class="border-t border-violet-500/15 px-4 py-3">
+                  <p class="mb-2 text-xs font-medium uppercase tracking-widest text-violet-300">Answer</p>
+                  <div class="prose prose-sm prose-invert max-w-none rounded-xl border border-violet-400/15 bg-slate-950/35 px-3 py-2 text-slate-100">
+                    {@html renderMarkdown(webPresentation.answer)}
+                  </div>
+                </section>
+              {/if}
+
+              {#if webPresentation.results.length > 0}
+                <section class="space-y-2 border-t border-violet-500/15 px-4 py-3">
+                  <p class="text-xs font-medium uppercase tracking-widest text-violet-300">Results</p>
+                  {#each webPresentation.results as result, index (`${result.url}:${index}`)}
+                    <article class="rounded-xl border border-violet-400/15 bg-slate-950/30 px-3 py-2">
+                      <div class="flex flex-wrap items-start justify-between gap-2">
+                        <a href={result.url} target="_blank" rel="noreferrer" class="min-w-0 text-sm font-semibold text-slate-100 hover:text-violet-200 hover:underline [overflow-wrap:anywhere]">{result.title}</a>
+                        {#if result.domain || result.score}
+                          <div class="flex gap-2 text-[10px] text-slate-400">
+                            {#if result.domain}<span>{result.domain}</span>{/if}
+                            {#if result.score}<span>{result.score}</span>{/if}
+                          </div>
+                        {/if}
+                      </div>
+                      {#if result.snippet}<p class="mt-2 text-xs leading-5 text-slate-300">{result.snippet}</p>{/if}
+                    </article>
+                  {/each}
+                </section>
+              {/if}
+
+              {#if webPresentation.content}
+                <section class="border-t border-violet-500/15 px-4 py-3">
+                  <p class="mb-2 text-xs font-medium uppercase tracking-widest text-violet-300">Extracted content</p>
+                  <pre class="max-h-[36vh] overflow-auto whitespace-pre-wrap rounded-xl border border-violet-400/15 bg-slate-950/35 px-3 py-2 text-xs leading-5 text-slate-100">{webPresentation.content}</pre>
+                </section>
+              {/if}
+
+              {#if webPresentation.media.length > 0}
+                <section class="space-y-2 border-t border-violet-500/15 px-4 py-3">
+                  <p class="text-xs font-medium uppercase tracking-widest text-violet-300">Image references</p>
+                  <div class="grid gap-2 md:grid-cols-2">
+                    {#each webPresentation.media as media, index (`${media.url}:${index}`)}
+                      <article class="rounded-xl border border-violet-400/15 bg-slate-950/30 px-3 py-2">
+                        <a href={media.url} target="_blank" rel="noreferrer" class="block truncate text-sm font-medium text-slate-100 hover:text-violet-200 hover:underline" title={media.url}>{media.label}</a>
+                        {#if media.source || media.sourcePageUrl}
+                          <p class="mt-1 truncate text-[11px] text-slate-400">{media.sourcePageUrl || media.source}</p>
+                        {/if}
+                        {#if media.artifactRef}
+                          <p class="mt-2 font-mono text-[10px] text-violet-100/75" title={media.artifactRef}>lazy artifact available</p>
+                        {/if}
+                      </article>
+                    {/each}
+                  </div>
+                </section>
+              {/if}
+
+              {#if canOpenToolOutput(item) && scope}
+                <div class="border-t border-violet-500/15 px-4 py-3">
+                  <button class="rounded-lg border border-violet-500/30 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-100 hover:bg-violet-500/20" type="button" onclick={() => { openToolOutput(item); }}>
+                    {toolOutputOpenLabel(item)}
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/if}
+        {:else if isRichNativeInspectionTool()}
+          {@const nativePresentation = nativeInspectionToolPresentation(item)}
+          {#if nativePresentation}
+            <div class={`overflow-hidden rounded-2xl border ${nativeInspectionToneClass(nativePresentation.error)} text-sm text-slate-100 shadow-inner`}>
+              <div class={`flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3 ${nativePresentation.error ? 'border-rose-500/15' : 'border-sky-500/15'}`}>
+                <div class="min-w-0 flex-1">
+                  <p class={`text-xs font-medium uppercase tracking-widest ${nativeInspectionHeadingClass(nativePresentation.error)}`}>Native tool output</p>
+                  <h4 class="mt-1 truncate text-sm font-semibold text-slate-50" title={nativePresentation.requestText || nativePresentation.title}>{nativePresentation.title}</h4>
+                  <p class="mt-2 text-xs leading-5 text-slate-300">{nativePresentation.summary}</p>
+                </div>
+                {#if nativePresentation.badges.length > 0}
+                  <div class="flex max-w-full flex-wrap justify-end gap-2 text-[11px] text-sky-100/75">
+                    {#each nativePresentation.badges as badge}
+                      <span class="rounded-full border border-sky-400/25 px-2 py-0.5">{badge}</span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+
+              <div class="space-y-3 px-4 py-3">
+                <section class="rounded-xl border border-sky-400/15 bg-slate-950/30 px-3 py-2">
+                  <p class="mb-2 text-xs font-medium uppercase tracking-widest text-sky-300">{nativePresentation.requestLabel}</p>
+                  {#if nativePresentation.requestText}
+                    <p class="font-mono text-sm text-slate-100 [overflow-wrap:anywhere]">{nativePresentation.requestText}</p>
+                  {:else}
+                    <p class="text-sm text-slate-400">No request summary was recorded.</p>
+                  {/if}
+                  {#if nativePresentation.requestDetails.length > 0}
+                    <div class="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-400">
+                      {#each nativePresentation.requestDetails.slice(0, 6) as detail}
+                        <span class="rounded-full border border-slate-700/80 bg-slate-950/35 px-2 py-0.5">
+                          <span class="text-slate-500">{detail.key}:</span>
+                          <span class="ml-1 text-slate-200">{formatStructuredValue(detail.value)}</span>
+                        </span>
+                      {/each}
+                    </div>
+                  {/if}
+                </section>
+
+                {#if nativePresentation.error}
+                  <div class="rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-xs leading-5 text-rose-100">{nativePresentation.error}</div>
+                {:else if nativePresentation.nativeKind === 'read' && nativePresentation.readLines.length > 0}
+                  <section class="overflow-hidden rounded-xl border border-sky-400/15 bg-slate-950/35">
+                    <div class="flex items-center justify-between gap-2 border-b border-sky-400/10 px-3 py-2">
+                      <span class="text-[10px] font-semibold uppercase tracking-[0.18em] text-sky-100/60">File content</span>
+                      {#if nativePresentation.path}
+                        <span class="truncate font-mono text-[11px] text-slate-400" title={nativePresentation.path}>{nativePresentation.path}</span>
+                      {/if}
+                    </div>
+                    <div class="max-h-[46vh] overflow-auto">
+                      <table class="w-full border-collapse font-mono text-xs leading-5">
+                        <tbody>
+                          {#each nativePresentation.readLines as line}
+                            <tr class="align-top hover:bg-slate-900/60">
+                              <td class="select-none border-r border-slate-800/80 bg-slate-950/70 px-3 py-0 text-right tabular-nums text-slate-500">{line.lineNumber}</td>
+                              <td class="min-w-0 px-3 py-0 text-slate-200">
+                                <pre class="m-0 whitespace-pre">{@html nativeReadLineHtml(line.content, nativePresentation.path)}</pre>
+                              </td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+                {:else if nativePresentation.grepGroups.length > 0}
+                  <section class="space-y-2">
+                    <p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-sky-100/60">Matches</p>
+                    {#each nativePresentation.grepGroups as group}
+                      <article class="overflow-hidden rounded-xl border border-sky-400/15 bg-slate-950/35">
+                        <div class="border-b border-sky-400/10 px-3 py-2">
+                          <p class="truncate font-mono text-xs text-sky-100" title={group.path}>{group.path}</p>
+                        </div>
+                        <div class="max-h-[32vh] overflow-auto">
+                          <table class="w-full border-collapse font-mono text-xs leading-5">
+                            <tbody>
+                              {#each group.matches as match}
+                                <tr class={`${match.isMatch ? 'text-slate-100' : 'text-slate-400'} hover:bg-slate-900/60`}>
+                                  <td class="select-none border-r border-slate-800/80 bg-slate-950/70 px-3 py-0 text-right tabular-nums text-slate-500">{match.lineNumber}</td>
+                                  <td class="px-3 py-0 whitespace-pre">{match.text}</td>
+                                </tr>
+                              {/each}
+                            </tbody>
+                          </table>
+                        </div>
+                      </article>
+                    {/each}
+                  </section>
+                {:else if nativePresentation.pathEntries.length > 0}
+                  <section class="overflow-hidden rounded-xl border border-sky-400/15 bg-slate-950/35">
+                    <div class="flex items-center justify-between gap-2 border-b border-sky-400/10 px-3 py-2">
+                      <span class="text-[10px] font-semibold uppercase tracking-[0.18em] text-sky-100/60">Paths</span>
+                      <span class="text-[11px] text-slate-500">{nativePresentation.pathEntries.length} item{nativePresentation.pathEntries.length === 1 ? '' : 's'}</span>
+                    </div>
+                    <ul class="max-h-[42vh] divide-y divide-slate-800/60 overflow-auto">
+                      {#each nativePresentation.pathEntries as entry}
+                        <li class="flex min-w-0 items-center gap-2 px-3 py-1.5 font-mono text-xs text-slate-200">
+                          <span class="shrink-0 text-slate-500">{entry.kind === 'directory' ? 'dir' : entry.kind === 'file' ? 'file' : 'path'}</span>
+                          <span class="min-w-0 truncate" title={entry.path}>{entry.path}</span>
+                        </li>
+                      {/each}
+                    </ul>
+                  </section>
+                {:else if nativePresentation.outputText}
+                  <section class="rounded-xl border border-sky-400/15 bg-slate-950/35">
+                    <div class="border-b border-sky-400/10 px-3 py-2">
+                      <span class="text-[10px] font-semibold uppercase tracking-[0.18em] text-sky-100/60">Output</span>
+                    </div>
+                    <pre class="max-h-[42vh] overflow-auto whitespace-pre-wrap px-3 py-2 text-xs leading-5 text-slate-200">{nativePresentation.outputText}</pre>
+                  </section>
+                {/if}
+
+                {#if nativePresentation.footer}
+                  <p class="rounded-xl border border-slate-700/70 bg-slate-950/35 px-3 py-2 text-xs leading-5 text-slate-400">{nativePresentation.footer}</p>
+                {/if}
+
+                {#if canOpenToolOutput(item) && scope}
+                  <button class="rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { openToolOutput(item); }}>
+                    {toolOutputOpenLabel(item)}
+                  </button>
+                {/if}
+              </div>
+            </div>
+
+            {#if hasRawPayload()}
+              <div>
+                <button
+                  class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+                  onclick={() => { rawExpanded = !rawExpanded; }}
+                  type="button"
+                >
+                  <span>{rawExpanded ? '▼' : '▶'}</span>
+                  <span>Raw payload</span>
+                </button>
+                {#if rawExpanded}
+                  <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                    {#if item.arguments && Object.keys(item.arguments).length > 0}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                        <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
+                      </div>
+                    {/if}
+                    {#if item.result != null}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                        <div class="relative">
+                          <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                          <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                            {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                          </button>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+        {:else if isRichMemoryTool()}
+          {@const memoryPresentation = memoryToolPresentation(item)}
+          {#if memoryPresentation}
+            <div class={`overflow-hidden rounded-2xl border ${memoryPresentation.error ? 'border-rose-500/30 bg-rose-500/5' : 'border-cyan-500/25 bg-cyan-500/5'}`}>
+              <div class={`flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3 ${memoryPresentation.error ? 'border-rose-500/15' : 'border-cyan-500/15'}`}>
+                <div class="min-w-0 flex-1">
+                  <p class={`text-xs font-medium uppercase tracking-widest ${memoryPresentation.error ? 'text-rose-300' : 'text-cyan-300'}`}>Memory</p>
+                  <h4 class={`mt-1 truncate text-sm font-semibold ${memoryPresentation.error ? 'text-rose-50' : 'text-cyan-50'}`}>{memoryPresentation.title}</h4>
+                  <p class={`mt-2 text-xs leading-5 ${memoryPresentation.error ? 'text-rose-100/80' : 'text-cyan-100/80'}`}>{memoryPresentation.summary}</p>
+                </div>
+                {#if memoryPresentation.badges.length > 0}
+                  <div class={`flex max-w-full flex-wrap justify-end gap-2 text-[11px] ${memoryPresentation.error ? 'text-rose-100/75' : 'text-cyan-100/75'}`}>
+                    {#each memoryPresentation.badges as badge}
+                      <span class={`rounded-full border px-2 py-0.5 ${memoryPresentation.error ? 'border-rose-400/25' : 'border-cyan-400/25'}`}>{badge}</span>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+
+              {#if memoryPresentation.variant === 'saved'}
+                <section class="space-y-3 px-4 py-3">
+                  {#if memoryPresentation.error}
+                    <div class="rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2">
+                      <p class="text-sm leading-6 text-rose-100">{memoryPresentation.resultSummary}</p>
+                      <p class="mt-2 text-xs leading-5 text-rose-100/85">{memoryPresentation.error}</p>
+                    </div>
+                  {:else if memoryPresentation.resultItems.length > 0}
+                    {#each memoryPresentation.resultItems as resultItem, index (`${resultItem.title}:${index}`)}
+                      <article class={`rounded-xl border px-3 py-3 ${memoryItemClass(resultItem.accent)}`}>
+                        <div class="flex flex-wrap items-start justify-between gap-2">
+                          <p class="text-xs font-medium uppercase tracking-widest text-cyan-300">
+                            {savedMemoryItemLabel(memoryPresentation.resultItems, index)}
+                          </p>
+                          {#if resultItem.title && resultItem.title !== 'Memory'}
+                            <span class="rounded-full border border-cyan-400/20 bg-slate-950/30 px-2 py-0.5 font-mono text-[10px] text-cyan-100/80">{resultItem.title}</span>
+                          {/if}
+                        </div>
+                        {#if resultItem.body}
+                          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-100 [overflow-wrap:anywhere]">{resultItem.body}</p>
+                        {:else if memoryPresentation.requestText}
+                          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-100 [overflow-wrap:anywhere]">{memoryPresentation.requestText}</p>
+                        {/if}
+                        {#if resultItem.meta.length > 0}
+                          <div class="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-400">
+                            {#each resultItem.meta as entry}
+                              <span class="rounded-full border border-slate-700/80 bg-slate-950/35 px-2 py-0.5">
+                                <span class="text-slate-500">{entry.key}:</span>
+                                <span class="ml-1 text-slate-200">{formatStructuredValue(entry.value)}</span>
+                              </span>
+                            {/each}
+                          </div>
+                        {/if}
+                      </article>
+                    {/each}
+                  {:else}
+                    <article class="rounded-xl border border-cyan-400/15 bg-slate-950/30 px-3 py-3">
+                      <p class="text-xs font-medium uppercase tracking-widest text-cyan-300">{memoryPresentation.requestLabel}</p>
+                      {#if memoryPresentation.requestText}
+                        <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-100 [overflow-wrap:anywhere]">{memoryPresentation.requestText}</p>
+                      {:else}
+                        <p class="mt-2 text-sm leading-6 text-slate-400">Memory save completed.</p>
+                      {/if}
+                    </article>
+                  {/if}
+                </section>
+              {:else}
+                <div class="grid gap-3 px-4 py-3 md:grid-cols-2">
+                  <section class={`rounded-xl border px-3 py-2 ${memoryPresentation.error ? 'border-rose-400/15 bg-slate-950/30' : 'border-cyan-400/15 bg-slate-950/30'}`}>
+                    <p class={`mb-2 text-xs font-medium uppercase tracking-widest ${memoryPresentation.error ? 'text-rose-300' : 'text-cyan-300'}`}>{memoryPresentation.requestLabel}</p>
+                    {#if memoryPresentation.requestText}
+                      <p class="whitespace-pre-wrap text-sm leading-6 text-slate-100 [overflow-wrap:anywhere]">{memoryPresentation.requestText}</p>
+                    {:else}
+                      <p class="text-sm leading-6 text-slate-400">No request summary was recorded.</p>
+                    {/if}
+                    {#if memoryPresentation.requestDetails.length > 0}
+                      <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                        {#each memoryPresentation.requestDetails as entry}
+                          <div>
+                            <dt class={`font-medium uppercase tracking-wider ${memoryPresentation.error ? 'text-rose-100/70' : 'text-cyan-100/70'}`}>{entry.key}</dt>
+                            <dd class="mt-1 whitespace-pre-wrap text-slate-100 [overflow-wrap:anywhere]">{formatStructuredValue(entry.value)}</dd>
+                          </div>
+                        {/each}
+                      </dl>
+                    {/if}
+                  </section>
+
+                  <section class={`rounded-xl border px-3 py-2 ${memoryPresentation.error ? 'border-rose-400/15 bg-rose-500/10' : 'border-cyan-400/15 bg-slate-950/30'}`}>
+                    <p class={`mb-2 text-xs font-medium uppercase tracking-widest ${memoryPresentation.error ? 'text-rose-300' : 'text-cyan-300'}`}>{memoryPresentation.resultLabel}</p>
+                    <p class={`text-sm leading-6 ${memoryPresentation.error ? 'text-rose-100' : 'text-slate-100'}`}>{memoryPresentation.resultSummary}</p>
+                    {#if memoryPresentation.error}
+                      <p class="mt-2 rounded-lg border border-rose-400/25 bg-rose-500/10 px-2 py-1.5 text-xs leading-5 text-rose-100">{memoryPresentation.error}</p>
+                    {/if}
+                    {#if memoryPresentation.resultDetails.length > 0}
+                      <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                        {#each memoryPresentation.resultDetails as entry}
+                          <div>
+                            <dt class={`font-medium uppercase tracking-wider ${memoryPresentation.error ? 'text-rose-100/70' : 'text-cyan-100/70'}`}>{entry.key}</dt>
+                            <dd class="mt-1 whitespace-pre-wrap text-slate-100 [overflow-wrap:anywhere]">{formatStructuredValue(entry.value)}</dd>
+                          </div>
+                        {/each}
+                      </dl>
+                    {/if}
+                  </section>
+                </div>
+
+                {#if memoryPresentation.answer}
+                  <section class="border-t border-cyan-500/15 px-4 py-3">
+                    <p class="mb-2 text-xs font-medium uppercase tracking-widest text-cyan-300">Answer</p>
+                    <div class="prose prose-sm prose-invert max-w-none rounded-xl border border-cyan-400/15 bg-slate-950/35 px-3 py-2 text-slate-100">
+                      {@html renderMarkdown(memoryPresentation.answer)}
+                    </div>
+                  </section>
+                {/if}
+
+                {#if memoryPresentation.text}
+                  <section class="border-t border-cyan-500/15 px-4 py-3">
+                    <p class="mb-2 text-xs font-medium uppercase tracking-widest text-cyan-300">Text</p>
+                    <pre class="max-h-[36vh] overflow-auto whitespace-pre-wrap rounded-xl border border-cyan-400/15 bg-slate-950/35 px-3 py-2 text-xs leading-5 text-slate-100">{memoryPresentation.text}</pre>
+                  </section>
+                {/if}
+
+                {#if memoryPresentation.resultItems.length > 0}
+                  <section class="space-y-2 border-t border-cyan-500/15 px-4 py-3">
+                    <p class="text-xs font-medium uppercase tracking-widest text-cyan-300">Items</p>
+                    {#each memoryPresentation.resultItems as resultItem, index (`${resultItem.title}:${index}`)}
+                      <article class={`rounded-xl border px-3 py-2 ${memoryItemClass(resultItem.accent)}`}>
+                        <div class="flex flex-wrap items-start justify-between gap-2">
+                          <h5 class={`min-w-0 text-sm font-semibold [overflow-wrap:anywhere] ${memoryItemTitleClass(resultItem.accent)}`}>{resultItem.title}</h5>
+                          <span class="rounded-full border border-slate-600/70 px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-300">{resultItem.accent}</span>
+                        </div>
+                        {#if resultItem.body}
+                          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-200 [overflow-wrap:anywhere]">{resultItem.body}</p>
+                        {/if}
+                        {#if resultItem.meta.length > 0}
+                          <div class="mt-2 flex flex-wrap gap-2 text-[11px] text-slate-400">
+                            {#each resultItem.meta as entry}
+                              <span class="rounded-full border border-slate-700/80 bg-slate-950/35 px-2 py-0.5">
+                                <span class="text-slate-500">{entry.key}:</span>
+                                <span class="ml-1 text-slate-200">{formatStructuredValue(entry.value)}</span>
+                              </span>
+                            {/each}
+                          </div>
+                        {/if}
+                      </article>
+                    {/each}
+                  </section>
+                {/if}
+              {/if}
+            </div>
+
+            {#if hasRawPayload()}
+              <div>
+                <button
+                  class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
+                  onclick={() => { rawExpanded = !rawExpanded; }}
+                  type="button"
+                >
+                  <span>{rawExpanded ? '▼' : '▶'}</span>
+                  <span>Raw payload</span>
+                </button>
+                {#if rawExpanded}
+                  <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
+                    {#if item.arguments && Object.keys(item.arguments).length > 0}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                        <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
+                      </div>
+                    {/if}
+                    {#if item.result != null}
+                      <div>
+                        <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                        <div class="relative">
+                          <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                          <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                            {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                          </button>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+        {:else if isRichToolOutputHelper()}
           {@const outputHelper = toolOutputHelperPresentation(item)}
-          {@const originalCall = sourceToolCall()}
+          {@const originalCall = sourceToolCall}
           {#if outputHelper}
             <div class="overflow-hidden rounded-2xl border border-cyan-500/25 bg-cyan-500/5">
               <div class="flex flex-wrap items-start justify-between gap-3 border-b border-cyan-500/15 px-4 py-3">
@@ -1221,7 +1926,7 @@
                         <span class="rounded-full border border-sky-400/25 px-2 py-0.5 text-sky-100">anchors available</span>
                       {/if}
                     </div>
-                    {#if canOpenToolOutput(originalCall) && conversationId()}
+                    {#if canOpenToolOutput(originalCall) && scope}
                       <button class="mt-3 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { openToolOutput(originalCall); }}>
                         Open original output
                       </button>
@@ -1230,7 +1935,7 @@
                 {:else}
                   <div class="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-100">
                     <p>The original tool call is not present in the loaded timeline page. The referenced call ID is <span class="font-mono">{outputHelper.sourceCallId}</span>.</p>
-                    {#if conversationId()}
+                    {#if scope}
                       <button class="mt-2 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-100 hover:bg-amber-500/20" type="button" onclick={() => { openReferencedToolOutput(outputHelper.sourceCallId); }}>
                         Open referenced output
                       </button>
@@ -1251,8 +1956,6 @@
                   <span>Original call raw</span>
                 </button>
                 {#if originalCallExpanded}
-                  {@const originalOutputText = cleanResult(originalCall.result)}
-                  {@const originalOutputData = formatOutput(originalOutputText, outputExpanded)}
                   <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
                     {#if originalCall.arguments && Object.keys(originalCall.arguments).length > 0}
                       <div>
@@ -1274,8 +1977,6 @@
             {/if}
 
             {#if hasRawPayload()}
-              {@const rawOutputText = cleanResult(item.result)}
-              {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
               <div>
                 <button
                   class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
@@ -1290,7 +1991,7 @@
                     {#if item.arguments && Object.keys(item.arguments).length > 0}
                       <div>
                         <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
-                        <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                        <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
                       </div>
                     {/if}
                     {#if item.result != null}
@@ -1312,31 +2013,35 @@
         {:else if workflowToolPresentation(item)}
           {@const workflowPresentation = workflowToolPresentation(item)}
           {#if workflowPresentation?.kind === 'write_deliverable'}
-            <div class="overflow-hidden rounded-2xl border border-emerald-500/25 bg-emerald-500/5">
-              <div class="flex flex-wrap items-center justify-between gap-2 border-b border-emerald-500/15 px-4 py-3">
+            <div class="rounded-2xl border border-emerald-500/25 bg-emerald-500/5 px-4 py-3">
+              <div class="flex flex-wrap items-start justify-between gap-3">
                 <div class="min-w-0">
-                  <p class="text-xs font-medium uppercase tracking-widest text-emerald-300">Deliverable written</p>
+                  <p class="text-xs font-medium uppercase tracking-widest text-emerald-300">Deliverable captured</p>
                   <h4 class="mt-1 truncate text-sm font-semibold text-emerald-50">{workflowPresentation.title}</h4>
+                  <p class="mt-2 text-xs leading-5 text-emerald-100/75">{workflowPresentation.note}</p>
                 </div>
                 <div class="flex flex-wrap gap-2 text-[11px] text-emerald-100/75">
                   <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">{workflowPresentation.format}</span>
+                  <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">{workflowPresentation.status}</span>
                   {#if workflowPresentation.length !== null}
                     <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">{workflowPresentation.length.toLocaleString()} chars</span>
                   {/if}
-                  {#if workflowPresentation.version !== null}
-                    <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">v{workflowPresentation.version}</span>
-                  {/if}
-                </div>
+                   {#if workflowPresentation.version !== null}
+                     <span class="rounded-full border border-emerald-400/25 px-2 py-0.5">v{workflowPresentation.version}</span>
+                   {/if}
+                   {#if workflowPresentation.deliverableId}
+                     <button
+                       class="rounded-full border border-emerald-400/35 bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-50 transition hover:bg-emerald-500/20"
+                       type="button"
+                       onclick={() => { deliverablePreviewId = workflowPresentation.deliverableId; }}
+                     >
+                       View deliverable
+                     </button>
+                   {/if}
+                 </div>
               </div>
-              <div class="max-h-[50vh] overflow-auto px-4 py-3">
-                {#if workflowPresentation.format === 'plain'}
-                  <pre class="whitespace-pre-wrap text-sm leading-6 text-slate-100">{workflowPresentation.content}</pre>
-                {:else}
-                  <div class="prose prose-sm prose-invert max-w-none text-slate-100">{@html renderDeliverableContent(workflowPresentation.content, workflowPresentation.format)}</div>
-                {/if}
-              </div>
-              {#if hasDeliverableFooter(workflowPresentation)}
-                <div class="flex flex-wrap gap-3 border-t border-emerald-500/15 px-4 py-2 text-[11px] text-emerald-100/70">
+              {#if workflowPresentation.deliverableId || workflowPresentation.outputKeys.length > 0}
+                <div class="mt-3 flex flex-wrap gap-3 border-t border-emerald-500/15 pt-2 text-[11px] text-emerald-100/70">
                   {#if workflowPresentation.deliverableId}
                     <span>Deliverable: <span class="font-mono text-emerald-100">{workflowPresentation.deliverableId}</span></span>
                   {/if}
@@ -1456,8 +2161,6 @@
             </div>
           {/if}
           {#if hasRawPayload()}
-            {@const rawOutputText = cleanResult(item.result)}
-            {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
             <div>
               <button
                 class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
@@ -1472,7 +2175,7 @@
                   {#if item.arguments && Object.keys(item.arguments).length > 0}
                     <div>
                       <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
-                      <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                      <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
                     </div>
                   {/if}
                   {#if item.result != null}
@@ -1503,7 +2206,7 @@
           <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-sm text-sky-50">
             <LiveDots label={preparingPatchText()} size="sm" inline={true} />
             <p class="mt-2 text-xs text-sky-100/70">
-              Codex is streaming a native patch input. This will turn into the normal apply_patch call once the patch is complete.
+              Patch input is streaming from the provider. This will turn into the normal apply_patch call once the patch is complete.
             </p>
           </div>
         {/if}
@@ -1536,7 +2239,7 @@
               <pre bind:this={terminalEl} onscroll={onTerminalScroll} onpointerdown={pinTerminal} class={`max-h-[50vh] overflow-auto p-3 pr-10 font-mono text-xs leading-5 ${item.isError ? 'text-rose-200' : 'text-emerald-100'}`}><span class="text-sky-300">{terminalPrompt()}</span>{#if outputText}
 {@html renderTerminalOutput(`\n${outputText}`)}{/if}</pre>
             </div>
-            {#if canOpenToolOutput(item) && conversationId()}
+            {#if canOpenToolOutput(item) && scope}
               <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { pinTerminal(); openToolOutput(item); }}>
                 {toolOutputOpenLabel(item)}
               </button>
@@ -1544,10 +2247,10 @@
           </div>
         {/if}
 
-        {#if (!hasDiffs() || rawExpanded) && !isBashTool() && !isDelegateTool() && !isRichWorkflowTool() && !isRichToolOutputHelper()}
+        {#if (!hasDiffs() || rawExpanded) && !isBashTool() && !isDelegateTool() && !isRichWorkflowTool() && !isRichToolOutputHelper() && !isRichMemoryTool() && !isRichManagedConversationTool() && !isRichNativeInspectionTool() && !isRichWebTool()}
           {#if item.arguments && Object.keys(item.arguments).length > 0}
-            {@const inputText = formatArguments()}
-            {@const inputData = formatMaybeJson(inputText, inputExpanded)}
+            {@const inputText = formattedArguments}
+            {@const inputData = formattedArgumentsData}
             <div>
               <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Input</p>
               <div class="relative">
@@ -1579,8 +2282,8 @@
           {/if}
 
           {#if item.result != null}
-            {@const outputText = cleanResult(item.result)}
-            {@const outputData = formatOutput(outputText, outputExpanded)}
+            {@const outputText = rawOutputText}
+            {@const outputData = rawOutputData}
             {#if !isBashTool()}
               <div>
                 <p class="mb-1 text-xs font-medium uppercase tracking-widest text-slate-500">Output</p>
@@ -1590,7 +2293,7 @@
                     {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
                   </button>
                 </div>
-                {#if canOpenToolOutput(item) && conversationId()}
+                {#if canOpenToolOutput(item) && scope}
                   <button class="mt-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3 py-1.5 text-xs font-medium text-sky-100 hover:bg-sky-500/20" type="button" onclick={() => { openToolOutput(item); }}>
                     {toolOutputOpenLabel(item)}
                   </button>
@@ -1614,8 +2317,6 @@
       {/if}
 
       {#if isBashTool() && (item.result != null || (item.arguments && Object.keys(item.arguments).length > 0))}
-        {@const rawOutputText = cleanResult(item.result)}
-        {@const rawOutputData = formatOutput(rawOutputText, outputExpanded)}
         <div>
           <button
             class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
@@ -1629,7 +2330,7 @@
             <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
               <div>
                 <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
-                <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formatArguments()}</pre>
+                <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
               </div>
               <div>
                 <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
@@ -1690,10 +2391,35 @@
 
 <ToolOutputDrawer
   open={outputDrawerOpen}
-  conversationId={conversationId()}
-  sessionId={drawerItem.sessionId}
+  {scope}
   callId={drawerItem.recoveryCallId ?? drawerItem.callId}
   toolName={drawerItem.toolName}
   isTerminal={isBashTool(drawerItem)}
   onClose={() => { outputDrawerOpen = false; outputDrawerTarget = null; }}
 />
+
+{#if deliverablePreviewId}
+  <div class="fixed inset-0 z-[2147483000] flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+    <dialog
+      open
+      class="flex h-[min(90vh,64rem)] w-[min(96vw,82rem)] flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 p-0 shadow-2xl"
+      aria-label="Deliverable preview"
+    >
+      <header class="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+        <h3 class="text-sm font-semibold text-slate-100">Deliverable preview</h3>
+        <button
+          class="rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-slate-800"
+          type="button"
+          onclick={() => { deliverablePreviewId = ''; }}
+        >
+          Close
+        </button>
+      </header>
+      <iframe
+        class="min-h-0 flex-1 bg-slate-950"
+        title="Deliverable preview"
+        src={deliverablePreviewUrl(deliverablePreviewId)}
+      ></iframe>
+    </dialog>
+  </div>
+{/if}

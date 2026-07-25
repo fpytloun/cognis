@@ -1,15 +1,19 @@
 import { apiUrl } from '$lib/config';
+import { fetchWithTimeout, isFetchTimeoutError } from '$lib/api/fetch';
 import type {
   CancelTurnV2Response,
   ChatSnapshot,
   ChatSyncResponse,
+  CommandV2Response,
   ControlMutationV2Request,
   QueueMutationResponse,
   QueueUpdateV2Request,
+  RetryTurnV2Response,
   SendMessageV2Request,
   SendMessageV2Response,
   TimelineBackfillResponse
 } from './types';
+import type { TimelineScope } from './types';
 
 export class ChatV2ApiError extends Error {
   readonly code: string;
@@ -31,6 +35,7 @@ export interface ChatV2ApiClientOptions {
 
 type RequestOptions = RequestInit & {
   fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 };
 
 function encodeQuery(params: Record<string, string | number | boolean | null | undefined>): string {
@@ -83,19 +88,27 @@ async function readError(response: Response): Promise<ChatV2ApiError> {
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { fetchImpl = fetch, headers, body, ...rest } = options;
+  const { fetchImpl = fetch, headers, body, timeoutMs, ...rest } = options;
   const nextHeaders = new Headers(headers ?? {});
 
   if (body && !nextHeaders.has('Content-Type') && !(body instanceof FormData)) {
     nextHeaders.set('Content-Type', 'application/json');
   }
 
-  const response = await fetchImpl(apiUrl(path), {
-    ...rest,
-    credentials: 'include',
-    headers: nextHeaders,
-    body
-  });
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(apiUrl(path), {
+      ...rest,
+      credentials: 'include',
+      headers: nextHeaders,
+      body
+    }, { fetchImpl, timeoutMs });
+  } catch (error) {
+    if (isFetchTimeoutError(error)) {
+      throw new ChatV2ApiError(error.message, { code: 'request_timeout', status: 0 });
+    }
+    throw error;
+  }
 
   if (!response.ok) {
     throw await readError(response);
@@ -120,19 +133,50 @@ export class ChatV2ApiClient {
     this.fetchImpl = options.fetch ?? fetch;
   }
 
-  snapshot(conversationId: string): Promise<ChatSnapshot> {
-    return request<ChatSnapshot>(`/api/v1/chat/v2/conversations/${conversationId}/snapshot`, {
+  private scopePath(scope: TimelineScope | string, operation: 'snapshot' | 'sync' | 'timeline' | `tool-outputs/${string}`): string {
+    const resolved = typeof scope === 'string'
+      ? { kind: 'conversation' as const, conversation_id: scope }
+      : scope;
+    if (resolved.kind === 'session' && resolved.session_id) {
+      return `/api/v1/chat/v2/sessions/${encodeURIComponent(resolved.session_id)}/${operation}`;
+    }
+    if (resolved.kind === 'task_step' && resolved.step_run_id) {
+      return `/api/v1/chat/v2/task-steps/${encodeURIComponent(resolved.step_run_id)}/${operation}`;
+    }
+    if (resolved.conversation_id) {
+      return `/api/v1/chat/v2/conversations/${encodeURIComponent(resolved.conversation_id)}/${operation}`;
+    }
+    throw new Error('Chat v2 scope has no addressable identifier');
+  }
+
+  toolOutputPage(
+    scope: TimelineScope | string,
+    callId: string,
+    options: { offset?: number; limit?: number; latest?: boolean; signal?: AbortSignal } = {}
+  ): Promise<import('$lib/types/api').ToolOutputPageResponse> {
+    return request(
+      `${this.scopePath(scope, `tool-outputs/${encodeURIComponent(callId)}`)}${encodeQuery({
+        offset: options.offset,
+        limit: options.limit,
+        latest: options.latest,
+      })}`,
+      { fetchImpl: this.fetchImpl, signal: options.signal }
+    );
+  }
+
+  snapshot(scope: TimelineScope | string): Promise<ChatSnapshot> {
+    return request<ChatSnapshot>(this.scopePath(scope, 'snapshot'), {
       fetchImpl: this.fetchImpl
     });
   }
 
   sync(
-    conversationId: string,
+    scope: TimelineScope | string,
     cursor: string,
     options: { limit?: number } = {}
   ): Promise<ChatSyncResponse> {
     return request<ChatSyncResponse>(
-      `/api/v1/chat/v2/conversations/${conversationId}/sync${encodeQuery({
+      `${this.scopePath(scope, 'sync')}${encodeQuery({
         cursor,
         limit: options.limit
       })}`,
@@ -141,11 +185,11 @@ export class ChatV2ApiClient {
   }
 
   timeline(
-    conversationId: string,
+    scope: TimelineScope | string,
     options: { before?: string | null; limit?: number } = {}
   ): Promise<TimelineBackfillResponse> {
     return request<TimelineBackfillResponse>(
-      `/api/v1/chat/v2/conversations/${conversationId}/timeline${encodeQuery({
+      `${this.scopePath(scope, 'timeline')}${encodeQuery({
         before: options.before ?? null,
         limit: options.limit
       })}`,
@@ -168,6 +212,22 @@ export class ChatV2ApiClient {
     );
   }
 
+  executeCommand(
+    conversationId: string,
+    clientTxnId: string,
+    content: string
+  ): Promise<CommandV2Response> {
+    return request<CommandV2Response>(
+      `/api/v1/chat/v2/conversations/${conversationId}/commands/${clientTxnId}`,
+      {
+        fetchImpl: this.fetchImpl,
+        method: 'PUT',
+        timeoutMs: 600_000,
+        body: JSON.stringify({ content })
+      }
+    );
+  }
+
   cancelTurn(
     conversationId: string,
     payload: ControlMutationV2Request
@@ -177,6 +237,21 @@ export class ChatV2ApiClient {
       method: 'POST',
       body: JSON.stringify(payload)
     });
+  }
+
+  retryTurn(
+    conversationId: string,
+    turnId: string,
+    payload: ControlMutationV2Request
+  ): Promise<RetryTurnV2Response> {
+    return request<RetryTurnV2Response>(
+      `/api/v1/chat/v2/conversations/${conversationId}/turns/${turnId}/retry`,
+      {
+        fetchImpl: this.fetchImpl,
+        method: 'POST',
+        body: JSON.stringify(payload)
+      }
+    );
   }
 
   deleteQueuedMessage(

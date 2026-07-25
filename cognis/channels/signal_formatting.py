@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from cognis.channels.markdown_rendering import normalize_portable_markdown
+
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _HR_RE = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 _UNORDERED_LIST_RE = re.compile(r"^(\s*)([-*+])\s+(.*)$")
@@ -59,7 +61,7 @@ class _RenderedText:
 
 def format_for_signal(content: str, max_length: int) -> list[SignalFormattedChunk]:
     """Format assistant output into Signal-ready chunks."""
-    rendered = _render_blocks(content)
+    rendered = _render_blocks(normalize_portable_markdown(content))
     if not rendered.text and not rendered.spans:
         return []
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { prepareTimelineRows } from './tool-groups';
+import { isInternalToolCall, prepareTimelineRows } from './tool-groups';
 import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
 import type { ActivitySegmentRow } from './tool-groups';
 import type { MessageTimelineItem, ThinkingTimelineItem, TimelineItem, ToolCallTimelineItem } from './types';
@@ -21,6 +21,26 @@ function activityEntryIds(row: ActivitySegmentRow): string[] {
   );
 }
 
+function rowShape(rows: ReturnType<typeof prepareTimelineRows>): string[] {
+  return rows.map((row) => {
+    if (row.kind === 'activity_segment') {
+      return [
+        row.kind,
+        row.id,
+        row.summary.label,
+        ...activityEntryIds(row)
+      ].join('|');
+    }
+    if (row.kind === 'tool_group') {
+      return [row.kind, row.id, row.summary.label, row.items.map((item) => item.call_id).join(',')].join('|');
+    }
+    if (row.kind === 'thinking_group') {
+      return [row.kind, row.id].join('|');
+    }
+    return [row.kind, row.item.id].join('|');
+  });
+}
+
 function tool(id: string, toolName: string, overrides: Partial<ToolCallTimelineItem> = {}): ToolCallTimelineItem {
   return {
     id,
@@ -32,6 +52,7 @@ function tool(id: string, toolName: string, overrides: Partial<ToolCallTimelineI
     call_id: id,
     tool_name: toolName,
     turn_id: 'turn-1',
+    turn_cycle_index: 0,
     assistant_phase_index: 0,
     arguments: null,
     is_error: false,
@@ -88,6 +109,14 @@ const THINKING_VISIBLE_PREFERENCES = {
   }
 };
 
+const SEPARATE_ASSISTANT_MESSAGES_PREFERENCES = {
+  ...DEFAULT_USER_PREFERENCES,
+  chat: {
+    ...DEFAULT_USER_PREFERENCES.chat,
+    keep_assistant_messages_separate: true
+  }
+};
+
 describe('prepareTimelineRows', () => {
   it('groups consecutive same-turn same-phase tool calls', () => {
     const rows = prepareTimelineRows([
@@ -139,7 +168,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].summary.toolCount).toBe(4);
   });
 
-  it('merges split file-read and file-edit groups into one editing activity', () => {
+  it('keeps file-read and file-edit classifications split while merging same edit runs across cycles', () => {
     const rows = prepareTimelineRows([
       tool('a', 'read', { assistant_phase_index: 0, turn_cycle_index: 0 }),
       tool('b', 'grep', { assistant_phase_index: 1, turn_cycle_index: 0 }),
@@ -156,13 +185,11 @@ describe('prepareTimelineRows', () => {
       })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Editing files…');
-    expect(rows[0].summary.toolCount).toBe(5);
-    expect(rows[0].summary.detailLabel).toBe('2 files (+3/-2)');
-    expect(activityEntryIds(rows[0])).toEqual(['tools:a,b', 'tools:c,d', 'tools:e']);
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'activity_segment']);
+    expect(rows[0].kind === 'tool_group' ? rows[0].summary.label : '').toBe('Exploring…');
+    expect(rows[0].kind === 'tool_group' ? rows[0].items.map((item) => item.id) : []).toEqual(['a', 'b']);
+    expect(rows[1].kind === 'activity_segment' ? rows[1].summary.label : '').toBe('Editing files…');
+    expect(rows[1].kind === 'activity_segment' ? activityEntryIds(rows[1]) : []).toEqual(['tools:c,d', 'tools:e']);
   });
 
   it('does not merge non-file exploration into editing activity', () => {
@@ -222,7 +249,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].toolGroups[0].items.map((item) => item.id)).toEqual(['a', 'b']);
   });
 
-  it('keeps active assistant text visible when it folds into a live activity group', () => {
+  it('keeps live assistant text standalone until backend confirms tool activity', () => {
     const rows = prepareTimelineRows([
       message('m', {
         turn_id: 'turn-1',
@@ -234,14 +261,18 @@ describe('prepareTimelineRows', () => {
       tool('a', 'read', { turn_cycle_index: 0, status: 'running', stable: false })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].defaultExpanded).toBe(true);
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m', 'tools:a']);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].kind).toBe('item');
+    expect(rows[1].kind).toBe('tool_group');
+    if (rows[0].kind !== 'item' || rows[1].kind !== 'tool_group') return;
+    expect(rows[0].item.id).toBe('m');
+    expect(rows[1].items.map((item) => item.id)).toEqual(['a']);
   });
 
-  it('keeps live assistant text collapsed when backend marks the cycle as tool activity', () => {
+  it('keeps live assistant text EXPANDED during streaming even when backend marks tool activity', () => {
+    // The streamed text must stay visible through the fold transition (no
+    // mid-stream collapse into the one-line preview). The segment collapses
+    // only once the assistant message completes.
     const rows = prepareTimelineRows([
       message('m', {
         turn_id: 'turn-1',
@@ -263,8 +294,144 @@ describe('prepareTimelineRows', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].kind).toBe('activity_segment');
     if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].defaultExpanded).toBe(false);
+    expect(rows[0].id).toBe('activity-segment:turn-1:0:t:a');
+    expect(rows[0].defaultExpanded).toBe(true);
     expect(activityEntryIds(rows[0])).toEqual(['assistant:m', 'tools:a']);
+  });
+
+  it('collapses the segment once the live assistant text completes', () => {
+    const rows = prepareTimelineRows([
+      message('m', {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        content: 'I inspected this.',
+        partial: false,
+        status: 'complete'
+      }),
+      tool('a', 'read', { turn_cycle_index: 0, status: 'complete', stable: true })
+    ], DEFAULT_USER_PREFERENCES, [
+      {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        lifecycle_status: 'complete',
+        has_tool_activity: true
+      }
+    ]);
+
+    expect(rows[0].kind).toBe('activity_segment');
+    if (rows[0].kind !== 'activity_segment') return;
+    expect(rows[0].defaultExpanded).toBe(false);
+  });
+
+  it('keeps activity segment ids stable when assistant completion folds with existing tool activity', () => {
+    const runningRows = prepareTimelineRows([
+      message('m', {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        content: 'I will inspect this.',
+        partial: true,
+        status: 'running'
+      }),
+      tool('a', 'read', { turn_cycle_index: 0, status: 'running', stable: false })
+    ], DEFAULT_USER_PREFERENCES, [
+      {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        lifecycle_status: 'open',
+        has_tool_activity: true
+      }
+    ]);
+    const completedRows = prepareTimelineRows([
+      message('m', {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        content: 'I will inspect this.',
+        partial: false,
+        status: 'complete'
+      }),
+      tool('a', 'read', { turn_cycle_index: 0, status: 'complete', stable: true })
+    ], DEFAULT_USER_PREFERENCES, [
+      {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        lifecycle_status: 'complete',
+        has_tool_activity: true
+      }
+    ]);
+
+    expect(runningRows[0].kind).toBe('activity_segment');
+    expect(completedRows[0].kind).toBe('activity_segment');
+    if (runningRows[0].kind !== 'activity_segment' || completedRows[0].kind !== 'activity_segment') return;
+    expect(runningRows[0].id).toBe('activity-segment:turn-1:0:t:a');
+    expect(completedRows[0].id).toBe(runningRows[0].id);
+  });
+
+  it('keeps the segment id stable when a tool result arrives with file_diffs (reclassify edit)', () => {
+    // A bash/read group whose result later carries file_diffs reclassifies
+    // command/explore -> edit. With a stable (turn, cycle) id, that must NOT
+    // change the segment id (which would remount the block and reset expansion).
+    const before = prepareTimelineRows([
+      message('m', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'Editing.' }),
+      tool('a', 'bash', { turn_cycle_index: 0, status: 'running', stable: false })
+    ], DEFAULT_USER_PREFERENCES);
+    const after = prepareTimelineRows([
+      message('m', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'Editing.' }),
+      tool('a', 'bash', {
+        turn_cycle_index: 0,
+        status: 'complete',
+        stable: true,
+        file_diffs: [{ path: 'src/app.ts', diff: '--- a/src/app.ts\n+++ b/src/app.ts\n-old\n+new' }]
+      })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(before[0].kind).toBe('activity_segment');
+    expect(after[0].kind).toBe('activity_segment');
+    if (before[0].kind !== 'activity_segment' || after[0].kind !== 'activity_segment') return;
+    expect(before[0].id).toBe('activity-segment:turn-1:0:t:a');
+    expect(after[0].id).toBe(before[0].id);
+  });
+
+  it('keeps the segment id stable when an assistant folds at the front of a tool-first segment', () => {
+    // A tool-first segment (>1 file-work group) that later gains an assistant
+    // message at its front must keep its id (first-item id would otherwise flip
+    // from the tool to the assistant and remount the block, resetting state).
+    const toolFirst = prepareTimelineRows([
+      tool('a', 'apply_patch', {
+        turn_cycle_index: 0,
+        file_diffs: [{ path: 'a.ts', diff: '--- a/a.ts\n+++ b/a.ts\n-x\n+y' }]
+      }),
+      message('sep', { turn_id: 'turn-1', turn_cycle_index: 0, content: '', role: 'assistant' }),
+      tool('b', 'read', { turn_cycle_index: 0 })
+    ], DEFAULT_USER_PREFERENCES);
+    const toolFirstSegment = toolFirst.find((row) => row.kind === 'activity_segment');
+    // The segment id is derived from the stable (turn, cycle), so regardless of
+    // whether the assistant entry is first, the id is the same.
+    expect(toolFirstSegment?.kind === 'activity_segment' ? toolFirstSegment.id : null).toBe(
+      'activity-segment:turn-1:0:t:a'
+    );
+  });
+
+  it('keeps all activity segment ids unique across a complex same-turn timeline', () => {
+    // Guard against keyed-each id collisions: segments derive their id from the
+    // stable (turn, cycle) plus a per-cycle ordinal, so no two segments — even
+    // ones that share a (turn, cycle) after a classification split — can ever
+    // produce the same key.
+    const rows = prepareTimelineRows([
+      message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'Explore.' }),
+      tool('a', 'read', { turn_cycle_index: 0 }),
+      tool('b', 'grep', { turn_cycle_index: 0 }),
+      message('m2', { turn_id: 'turn-1', turn_cycle_index: 1, content: 'Edit.' }),
+      tool('c', 'apply_patch', {
+        turn_cycle_index: 1,
+        file_diffs: [{ path: 'x.ts', diff: '--- a/x.ts\n+++ b/x.ts\n-o\n+n' }]
+      }),
+      message('m3', { turn_id: 'turn-1', turn_cycle_index: 2, content: 'Run.' }),
+      tool('d', 'bash', { turn_cycle_index: 2 })
+    ], DEFAULT_USER_PREFERENCES);
+
+    const segmentIds = rows.flatMap((row) => (row.kind === 'activity_segment' ? [row.id] : []));
+    expect(segmentIds.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(segmentIds).size).toBe(segmentIds.length);
   });
 
   it('groups same-cycle tools with distinct per-tool phases under one assistant', () => {
@@ -284,7 +451,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].summary.toolCount).toBe(2);
   });
 
-  it('merges adjacent same-kind assistant tool activity across turn cycles', () => {
+  it('keeps adjacent same-kind assistant tool activity in one stable segment across stamped cycles', () => {
     const rows = prepareTimelineRows([
       message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will edit this.' }),
       tool('a', 'apply_patch', { turn_cycle_index: 0 }),
@@ -295,10 +462,8 @@ describe('prepareTimelineRows', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].kind).toBe('activity_segment');
     if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Editing files…');
-    expect(rows[0].summary.toolCount).toBe(2);
     expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a', 'assistant:m2', 'tools:b']);
-    expect(rows[0].toolGroups.map((group) => group.items[0].id)).toEqual(['a', 'b']);
+    expect(rows[0].summary.toolCount).toBe(2);
   });
 
   it('uses the latest assistant snippet while an activity group is running', () => {
@@ -343,7 +508,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].assistantPreview).toBe('First snippet.');
   });
 
-  it('merges a leading same-kind tool group with following assistant tool activity', () => {
+  it('keeps a leading same-kind tool group with following stamped cycles', () => {
     const rows = prepareTimelineRows([
       tool('a', 'bash', { source_refs: [sourceRef(1)], turn_cycle_index: 0 }),
       message('m1', {
@@ -362,16 +527,17 @@ describe('prepareTimelineRows', () => {
       tool('c', 'bash', { source_refs: [sourceRef(5)], turn_cycle_index: 2 })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Running commands…');
-    expect(rows[0].summary.toolCount).toBe(3);
-    expect(activityEntryIds(rows[0])).toEqual(['tools:a', 'assistant:m1', 'tools:b', 'assistant:m2', 'tools:c']);
-    expect(rows[0].toolGroups.flatMap((group) => group.items.map((item) => item.id))).toEqual(['a', 'b', 'c']);
+    expect(rows.map((row) => row.kind)).toEqual(['activity_segment']);
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual([
+      'tools:a',
+      'assistant:m1',
+      'tools:b',
+      'assistant:m2',
+      'tools:c'
+    ]);
   });
 
-  it('merges same-kind tool groups separated by a matching assistant message', () => {
+  it('keeps same-kind tool groups in one segment when the assistant is in a later stamped cycle', () => {
     const rows = prepareTimelineRows([
       tool('a', 'read', { turn_cycle_index: 0 }),
       message('m1', {
@@ -382,11 +548,12 @@ describe('prepareTimelineRows', () => {
       tool('b', 'grep', { turn_cycle_index: 1 })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Exploring…');
-    expect(activityEntryIds(rows[0])).toEqual(['tools:a', 'assistant:m1', 'tools:b']);
+    expect(rows.map((row) => row.kind)).toEqual(['activity_segment']);
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual([
+      'tools:a',
+      'assistant:m1',
+      'tools:b'
+    ]);
   });
 
   it('folds a same-cycle post-tool assistant message into the activity group', () => {
@@ -406,7 +573,53 @@ describe('prepareTimelineRows', () => {
     expect(activityEntryIds(rows[0])).toEqual(['tools:a', 'assistant:m1']);
   });
 
-  it('folds a missing-cycle assistant with the immediately following same-turn tool group after reload', () => {
+  it('does not trailing-fold a LIVE (partial) assistant even with a matching-cycle tool group', () => {
+    // Regression: while streaming, the final answer must render standalone.
+    // The backend cycle can transiently collide with the tool group's cycle
+    // (phase-vs-cycle skew, completion-frame coercion). If a live assistant
+    // folded here it would vanish into the collapsed activity segment and
+    // re-appear only when a later frame corrected its cycle.
+    const rows = prepareTimelineRows([
+      tool('a', 'read', { turn_cycle_index: 0, status: 'complete', stable: true }),
+      message('m1', {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        content: 'Streaming the final answer…',
+        partial: true,
+        stable: false,
+        status: 'running'
+      })
+    ], DEFAULT_USER_PREFERENCES, [
+      { turn_id: 'turn-1', turn_cycle_index: 0, lifecycle_status: 'open', has_tool_activity: true }
+    ]);
+
+    // The tool renders as its own group; the live assistant stays a standalone
+    // item and is NOT absorbed into the segment.
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'item']);
+  });
+
+  it('trailing-folds the SAME assistant once it settles (partial -> complete)', () => {
+    const rows = prepareTimelineRows([
+      tool('a', 'read', { turn_cycle_index: 0, status: 'complete', stable: true }),
+      message('m1', {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        content: 'The final answer.',
+        partial: false,
+        stable: true,
+        status: 'complete'
+      })
+    ], DEFAULT_USER_PREFERENCES, [
+      { turn_id: 'turn-1', turn_cycle_index: 0, lifecycle_status: 'complete', has_tool_activity: true }
+    ]);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('activity_segment');
+    if (rows[0].kind !== 'activity_segment') return;
+    expect(activityEntryIds(rows[0])).toEqual(['tools:a', 'assistant:m1']);
+  });
+
+  it('does not fold a missing-cycle assistant with the immediately following same-turn tool group after reload', () => {
     const rows = prepareTimelineRows([
       message('m1', {
         turn_id: 'turn-1',
@@ -421,13 +634,10 @@ describe('prepareTimelineRows', () => {
       })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a']);
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group']);
   });
 
-  it('does not let unrelated backend cycle metadata disable missing-cycle fallback', () => {
+  it('requires assistant cycle metadata regardless of unrelated backend cycle state', () => {
     const rows = prepareTimelineRows([
       message('m1', {
         turn_id: 'turn-1',
@@ -448,13 +658,10 @@ describe('prepareTimelineRows', () => {
       }
     ]);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a']);
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group']);
   });
 
-  it('keeps missing-cycle fallback even when backend reports the tool cycle state', () => {
+  it('does not infer assistant cycle metadata from backend tool cycle state', () => {
     const rows = prepareTimelineRows([
       message('m1', {
         turn_id: 'turn-1',
@@ -475,13 +682,10 @@ describe('prepareTimelineRows', () => {
       }
     ]);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a']);
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group']);
   });
 
-  it('keeps a missing-cycle assistant collapsed while preserving following tool-cycle groups', () => {
+  it('keeps a missing-cycle assistant separate while preserving following tool-cycle groups', () => {
     const rows = prepareTimelineRows([
       message('m1', {
         turn_id: 'turn-1',
@@ -501,14 +705,11 @@ describe('prepareTimelineRows', () => {
       })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Exploring…');
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a', 'tools:b']);
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'activity_segment']);
+    expect(rows[1].kind === 'activity_segment' ? activityEntryIds(rows[1]) : []).toEqual(['tools:a', 'tools:b']);
   });
 
-  it('folds a streaming assistant preface immediately when its cycle has not resolved yet', () => {
+  it('does not fold a streaming assistant preface when its cycle has not resolved yet', () => {
     const rows = prepareTimelineRows([
       message('m1', {
         turn_id: 'turn-1',
@@ -526,11 +727,12 @@ describe('prepareTimelineRows', () => {
       })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].defaultExpanded).toBe(true);
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a']);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].kind).toBe('item');
+    expect(rows[1].kind).toBe('tool_group');
+    if (rows[0].kind !== 'item' || rows[1].kind !== 'tool_group') return;
+    expect(rows[0].item.id).toBe('m1');
+    expect(rows[1].items.map((item) => item.id)).toEqual(['a']);
   });
 
   it('does not fold a missing-cycle final assistant message backward without following activity', () => {
@@ -548,7 +750,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[1].kind === 'item' ? rows[1].item.id : '').toBe('m1');
   });
 
-  it('keeps a later-cycle tool in the same compatible activity without folding it under the earlier assistant', () => {
+  it('keeps a later-cycle same-kind tool inside the earlier assistant activity run', () => {
     const rows = prepareTimelineRows([
       message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will inspect this.' }),
       tool('a', 'read', { turn_cycle_index: 0 }),
@@ -559,7 +761,6 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].kind).toBe('activity_segment');
     if (rows[0].kind !== 'activity_segment') return;
     expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a', 'tools:b']);
-    expect(rows[0].toolGroups.map((group) => group.items[0].id)).toEqual(['a', 'b']);
   });
 
   it('keeps assistant-only cycles standalone between tool cycles', () => {
@@ -575,34 +776,54 @@ describe('prepareTimelineRows', () => {
     expect(rows[2].kind === 'tool_group' ? rows[2].items.map((item) => item.id) : []).toEqual(['b']);
   });
 
-  it('merges adjacent same-kind command activity across cycles for stable live grouping', () => {
+  it('keeps adjacent same-kind command activity in one segment across stamped cycles', () => {
     const rows = prepareTimelineRows([
       tool('a', 'bash', { turn_cycle_index: 0 }),
       tool('b', 'bash', { turn_cycle_index: 1 })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Running commands…');
-    expect(activityEntryIds(rows[0])).toEqual(['tools:a', 'tools:b']);
+    expect(rows.map((row) => row.kind)).toEqual(['activity_segment']);
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual(['tools:a', 'tools:b']);
   });
 
-  it('merges adjacent same-turn exploration activity across tool cycles', () => {
+  it('keeps adjacent same-turn exploration activity in one segment across stamped cycles', () => {
     const rows = prepareTimelineRows([
       tool('a', 'read', { turn_id: 'turn-1', turn_cycle_index: 0 }),
       tool('b', 'grep', { turn_id: 'turn-1', turn_cycle_index: 1 })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Exploring…');
-    expect(rows[0].summary.toolCount).toBe(2);
-    expect(activityEntryIds(rows[0])).toEqual(['tools:a', 'tools:b']);
+    expect(rows.map((row) => row.kind)).toEqual(['activity_segment']);
+    expect(rows[0].kind === 'activity_segment' ? rows[0].summary.label : '').toBe('Exploring…');
+    expect(rows[0].kind === 'activity_segment' ? rows[0].summary.toolCount : 0).toBe(2);
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual(['tools:a', 'tools:b']);
   });
 
-  it('merges same-kind activity across cycles with matching assistant prefaces', () => {
+  it('escalates file work to editing when an edit appears, keeping pre-edit reads exploring', () => {
+    // Forward escalation (no cycle metadata): reads before the first edit stay
+    // "Exploring…"; the edit begins a new "Editing files…" segment and the
+    // following reads fold into it. Pre-edit reads are never folded backward.
+    const rows = prepareTimelineRows([
+      tool('a', 'read', { turn_cycle_index: undefined as unknown as number }),
+      tool('b', 'grep', { turn_cycle_index: undefined as unknown as number }),
+      tool('c', 'apply_patch', { turn_cycle_index: undefined as unknown as number }),
+      tool('d', 'read', { turn_cycle_index: undefined as unknown as number }),
+      tool('e', 'grep', { turn_cycle_index: undefined as unknown as number })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['activity_segment', 'activity_segment']);
+    expect(rows[0].kind === 'activity_segment' ? rows[0].summary.label : '').toBe('Exploring…');
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual([
+      'tools:a', 'tools:b'
+    ]);
+    expect(rows[1].kind === 'activity_segment' ? rows[1].summary.label : '').toBe('Editing files…');
+    expect(rows[1].kind === 'activity_segment' ? activityEntryIds(rows[1]) : []).toEqual([
+      'tools:c', 'tools:d', 'tools:e'
+    ]);
+    const segmentIds = rows.flatMap((row) => row.kind === 'activity_segment' ? [row.id] : []);
+    expect(new Set(segmentIds).size).toBe(segmentIds.length);
+  });
+
+  it('keeps same-kind activity with matching assistant prefaces in one segment across stamped cycles', () => {
     const rows = prepareTimelineRows([
       message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will inspect this.' }),
       tool('a', 'read', { turn_cycle_index: 0 }),
@@ -611,14 +832,162 @@ describe('prepareTimelineRows', () => {
     ], DEFAULT_USER_PREFERENCES);
 
     expect(rows).toHaveLength(1);
-    expect(rows[0].kind).toBe('activity_segment');
-    if (rows[0].kind !== 'activity_segment') return;
-    expect(rows[0].summary.label).toBe('Exploring…');
-    expect(activityEntryIds(rows[0])).toEqual(['assistant:m1', 'tools:a', 'assistant:m2', 'tools:b']);
-    expect(rows[0].toolGroups.map((group) => group.items[0].id)).toEqual(['a', 'b']);
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual([
+      'assistant:m1',
+      'tools:a',
+      'assistant:m2',
+      'tools:b'
+    ]);
   });
 
-  it('merges adjacent file-read and file-edit activity segments into editing activity', () => {
+  it('keeps assistant prefaces separate while preserving tool groups', () => {
+    const rows = prepareTimelineRows([
+      message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will inspect this.' }),
+      tool('a', 'read', { turn_cycle_index: 0 }),
+      tool('b', 'grep', { turn_cycle_index: 0 }),
+      message('m2', { turn_id: 'turn-1', turn_cycle_index: 1, content: 'I will inspect more.' }),
+      tool('c', 'glob', { turn_cycle_index: 1 })
+    ], SEPARATE_ASSISTANT_MESSAGES_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group', 'item', 'tool_group']);
+    expect(rows[0].kind === 'item' ? rows[0].item.id : '').toBe('m1');
+    expect(rows[1].kind === 'tool_group' ? rows[1].items.map((item) => item.id) : []).toEqual(['a', 'b']);
+    expect(rows[2].kind === 'item' ? rows[2].item.id : '').toBe('m2');
+    expect(rows[3].kind === 'tool_group' ? rows[3].items.map((item) => item.id) : []).toEqual(['c']);
+  });
+
+  it('merges adjacent same-kind tool groups across cycles while assistant messages stay separate', () => {
+    const rows = prepareTimelineRows([
+      message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will inspect this.' }),
+      tool('a', 'read', { turn_cycle_index: 0, assistant_phase_index: 0 }),
+      tool('b', 'grep', { turn_cycle_index: 1, assistant_phase_index: 1 }),
+      tool('c', 'glob', { turn_cycle_index: 2, assistant_phase_index: 2 })
+    ], SEPARATE_ASSISTANT_MESSAGES_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group']);
+    expect(rows[0].kind === 'item' ? rows[0].item.id : '').toBe('m1');
+    expect(rows[1].kind === 'tool_group' ? rows[1].items.map((item) => item.id) : []).toEqual(['a', 'b', 'c']);
+    expect(rows[1].kind === 'tool_group' ? rows[1].summary.toolCount : 0).toBe(3);
+  });
+
+  it('does not merge same-kind tool groups from different turns while assistant messages stay separate', () => {
+    const rows = prepareTimelineRows([
+      tool('a', 'read', { turn_id: 'turn-1', turn_cycle_index: 0 }),
+      tool('b', 'grep', { turn_id: 'turn-2', turn_cycle_index: 0 })
+    ], SEPARATE_ASSISTANT_MESSAGES_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'tool_group']);
+    expect(rows[0].kind === 'tool_group' ? rows[0].items.map((item) => item.id) : []).toEqual(['a']);
+    expect(rows[1].kind === 'tool_group' ? rows[1].items.map((item) => item.id) : []).toEqual(['b']);
+  });
+
+  it('keeps streaming assistant messages separate from same-cycle tool activity', () => {
+    const rows = prepareTimelineRows([
+      message('m1', {
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        stable: false,
+        partial: true,
+        content: 'Inspecting…'
+      }),
+      tool('a', 'read', {
+        turn_cycle_index: 0,
+        stable: false,
+        status: 'running'
+      })
+    ], SEPARATE_ASSISTANT_MESSAGES_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group']);
+    expect(rows[0].kind === 'item' ? rows[0].item.id : '').toBe('m1');
+    expect(rows[1].kind === 'tool_group' ? rows[1].items.map((item) => item.id) : []).toEqual(['a']);
+  });
+
+  it('keeps completed assistant output separate after grouped tool activity', () => {
+    const rows = prepareTimelineRows([
+      tool('a', 'read', { turn_cycle_index: 0 }),
+      tool('b', 'grep', { turn_cycle_index: 0 }),
+      message('final', { turn_id: 'turn-1', content: 'Done.' })
+    ], SEPARATE_ASSISTANT_MESSAGES_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'item']);
+    expect(rows[0].kind === 'tool_group' ? rows[0].items.map((item) => item.id) : []).toEqual(['a', 'b']);
+    expect(rows[1].kind === 'item' ? rows[1].item.id : '').toBe('final');
+  });
+
+  it('keeps delegation tool activity grouped while assistant messages stay separate', () => {
+    const rows = prepareTimelineRows([
+      message('preface', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'Delegating this.' }),
+      tool('delegate', 'delegate', { turn_cycle_index: 0 }),
+      tool('follow-up', 'follow_up_subsession', { turn_cycle_index: 0 })
+    ], SEPARATE_ASSISTANT_MESSAGES_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'tool_group']);
+    expect(rows[0].kind === 'item' ? rows[0].item.id : '').toBe('preface');
+    expect(rows[1].kind === 'tool_group' ? rows[1].summary.label : '').toBe('Delegating work…');
+    expect(rows[1].kind === 'tool_group' ? rows[1].items.map((item) => item.id) : []).toEqual([
+      'delegate',
+      'follow-up'
+    ]);
+  });
+
+  it('streaming and reload produce identical file-work escalation', () => {
+    // The escalation must be identical whether the items arrive as a live
+    // stream or are reprojected from canonical history — join/continuation keys
+    // are name-derived and immutable, never dependent on live status.
+    const items = (stable: boolean) => [
+      tool('r1', 'read', { turn_cycle_index: 0, stable, status: stable ? 'complete' : 'running' as const }),
+      tool('e1', 'apply_patch', { turn_cycle_index: 1, stable, status: stable ? 'complete' : 'running' as const }),
+      tool('r2', 'read', { turn_cycle_index: 2, stable, status: stable ? 'complete' : 'running' as const })
+    ];
+    const live = prepareTimelineRows(items(false), DEFAULT_USER_PREFERENCES);
+    const reloaded = prepareTimelineRows(items(true), DEFAULT_USER_PREFERENCES);
+
+    const summarize = (rows: ReturnType<typeof prepareTimelineRows>) =>
+      rows.map((row) => {
+        if (row.kind === 'activity_segment') return `SEG:${row.summary.label}:${activityEntryIds(row).join(',')}`;
+        if (row.kind === 'tool_group') return `TG:${row.summary.label}`;
+        if (row.kind === 'item') return `IT:${row.item.id}`;
+        return `OTHER:${row.kind}`;
+      });
+
+    expect(summarize(live)).toEqual(summarize(reloaded));
+    // r1 explores (lone read group, no assistant → bare tool group); e1
+    // escalates to editing; r2 folds into the editing run.
+    expect(summarize(reloaded)).toEqual([
+      'TG:Exploring…',
+      'SEG:Editing files…:tools:e1,tools:r2'
+    ]);
+  });
+
+  it('a bash with late file_diffs still escapes the editing run (name-based classification)', () => {
+    // file_diffs is live-mutable and can appear on a bash RESULT. It must not
+    // reclassify bash as file-edit, otherwise streaming and reload would group
+    // differently and the command would wrongly absorb the following read.
+    const rows = prepareTimelineRows([
+      tool('e1', 'apply_patch', {
+        turn_cycle_index: 0,
+        file_diffs: [{ path: 'a.ts', diff: '--- a/a.ts\n+++ b/a.ts\n-x\n+y' }]
+      }),
+      tool('sh', 'bash', {
+        turn_cycle_index: 1,
+        // A shell that happens to report file diffs on completion.
+        file_diffs: [{ path: 'b.ts', diff: '--- a/b.ts\n+++ b/b.ts\n-p\n+q' }]
+      }),
+      tool('r1', 'read', { turn_cycle_index: 2 })
+    ], DEFAULT_USER_PREFERENCES);
+
+    // e1 (lone edit group, no assistant) renders as a bare tool group; bash
+    // breaks any file-work run; the read after bash starts its own exploring.
+    const kinds = rows.map((row) =>
+      row.kind === 'activity_segment' ? `SEG:${row.summary.label}` : row.kind === 'tool_group' ? `TG:${row.summary.label}` : `IT`
+    );
+    expect(kinds).toEqual(['TG:Editing files…', 'TG:Running commands…', 'TG:Exploring…']);
+  });
+
+  it('folds file reads after an edit into the same Editing segment', () => {
+    // Reads that follow an edit are part of the edit flow (read-modify-write),
+    // so they collapse into the "Editing files…" segment rather than starting a
+    // new "Exploring…" one.
     const rows = prepareTimelineRows([
       message('m1', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will edit this.' }),
       tool('a', 'apply_patch', { turn_cycle_index: 0 }),
@@ -667,7 +1036,10 @@ describe('prepareTimelineRows', () => {
     ]);
   });
 
-  it('groups contiguous file tool cycles while keeping assistant-only and command cycles separate', () => {
+  it('escalates a contiguous file flow: pre-edit reads explore, then one editing run', () => {
+    // The reported behavior: a few read-only cycles show "Exploring…"; once an
+    // apply_patch appears the run becomes "Editing files…" and subsequent file
+    // reads collapse into it; a non-file tool (bash) escapes the editing run.
     const rows = prepareTimelineRows([
       message('m0', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I understand the request.' }),
       message('m1', { turn_id: 'turn-1', turn_cycle_index: 1, content: 'I will inspect the files.' }),
@@ -681,23 +1053,35 @@ describe('prepareTimelineRows', () => {
       message('m6', { turn_id: 'turn-1', turn_cycle_index: 6, content: 'Done.' })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows.map((row) => row.kind)).toEqual(['item', 'activity_segment', 'activity_segment', 'item']);
+    expect(rows.map((row) => row.kind)).toEqual([
+      'item',
+      'activity_segment',
+      'activity_segment',
+      'activity_segment',
+      'item'
+    ]);
     expect(rows[0].kind === 'item' ? rows[0].item.id : '').toBe('m0');
-    expect(rows[1].kind === 'activity_segment' ? rows[1].summary.label : '').toBe('Editing files…');
+    // Pre-edit read stays Exploring (never folded backward into Editing).
+    expect(rows[1].kind === 'activity_segment' ? rows[1].summary.label : '').toBe('Exploring…');
     expect(rows[1].kind === 'activity_segment' ? activityEntryIds(rows[1]) : []).toEqual([
       'assistant:m1',
-      'tools:read-1',
+      'tools:read-1'
+    ]);
+    // Edit starts Editing; the following read (read-2) and edit-2 fold in.
+    expect(rows[2].kind === 'activity_segment' ? rows[2].summary.label : '').toBe('Editing files…');
+    expect(rows[2].kind === 'activity_segment' ? activityEntryIds(rows[2]) : []).toEqual([
       'tools:edit-1',
       'assistant:m3',
       'tools:read-2',
       'tools:edit-2'
     ]);
-    expect(rows[2].kind === 'activity_segment' ? rows[2].summary.label : '').toBe('Running commands…');
-    expect(rows[2].kind === 'activity_segment' ? activityEntryIds(rows[2]) : []).toEqual([
+    // bash escapes the editing run into its own command segment.
+    expect(rows[3].kind === 'activity_segment' ? rows[3].summary.label : '').toBe('Running commands…');
+    expect(rows[3].kind === 'activity_segment' ? activityEntryIds(rows[3]) : []).toEqual([
       'assistant:m5',
       'tools:test-1'
     ]);
-    expect(rows[3].kind === 'item' ? rows[3].item.id : '').toBe('m6');
+    expect(rows[4].kind === 'item' ? rows[4].item.id : '').toBe('m6');
   });
 
   it('groups adjacent same-turn tools despite live assistant phase instability', () => {
@@ -735,13 +1119,98 @@ describe('prepareTimelineRows', () => {
     expect(settled[0].items.map((item) => item.id)).toEqual(live[0].items.map((item) => item.id));
   });
 
-  it('does not group tools across different turn cycles', () => {
+  it('keeps streaming and reload activity grouping equivalent for stamped turn cycles', () => {
+    const live = prepareTimelineRows([
+      message('message:turn-1:phase:0', {
+        message_id: 'turn-1',
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        partial: true,
+        stable: false,
+        status: 'running',
+        content: 'I will inspect this.'
+      }),
+      tool('tool:call-read', 'read', {
+        call_id: 'call-read',
+        id: 'tool:call-read',
+        turn_cycle_index: 0,
+        stable: false,
+        status: 'running'
+      }),
+      message('message:turn-1:phase:1', {
+        message_id: 'turn-1',
+        turn_id: 'turn-1',
+        turn_cycle_index: 1,
+        partial: true,
+        stable: false,
+        status: 'running',
+        content: 'I will run tests.'
+      }),
+      tool('tool:call-test', 'bash', {
+        call_id: 'call-test',
+        id: 'tool:call-test',
+        turn_cycle_index: 1,
+        stable: false,
+        status: 'running'
+      })
+    ], DEFAULT_USER_PREFERENCES, [
+      { turn_id: 'turn-1', turn_cycle_index: 0, lifecycle_status: 'open', has_tool_activity: true },
+      { turn_id: 'turn-1', turn_cycle_index: 1, lifecycle_status: 'open', has_tool_activity: true }
+    ]);
+    const reloaded = prepareTimelineRows([
+      message('message:turn-1:phase:0', {
+        message_id: 'turn-1',
+        turn_id: 'turn-1',
+        turn_cycle_index: 0,
+        partial: false,
+        stable: true,
+        status: 'complete',
+        content: 'I will inspect this.'
+      }),
+      tool('tool:call-read', 'read', {
+        call_id: 'call-read',
+        id: 'tool:call-read',
+        turn_cycle_index: 0,
+        stable: true,
+        status: 'complete'
+      }),
+      message('message:turn-1:phase:1', {
+        message_id: 'turn-1',
+        turn_id: 'turn-1',
+        turn_cycle_index: 1,
+        partial: false,
+        stable: true,
+        status: 'complete',
+        content: 'I will run tests.'
+      }),
+      tool('tool:call-test', 'bash', {
+        call_id: 'call-test',
+        id: 'tool:call-test',
+        turn_cycle_index: 1,
+        stable: true,
+        status: 'complete'
+      })
+    ], DEFAULT_USER_PREFERENCES, [
+      { turn_id: 'turn-1', turn_cycle_index: 0, lifecycle_status: 'complete', has_tool_activity: true },
+      { turn_id: 'turn-1', turn_cycle_index: 1, lifecycle_status: 'complete', has_tool_activity: true }
+    ]);
+
+    expect(rowShape(live)).toEqual(rowShape(reloaded));
+    expect(rowShape(live)).toEqual([
+      'activity_segment|activity-segment:turn-1:0:t:call-read|Exploring…|assistant:message:turn-1:phase:0|tools:tool:call-read',
+      'activity_segment|activity-segment:turn-1:1:t:call-test|Running commands…|assistant:message:turn-1:phase:1|tools:tool:call-test'
+    ]);
+  });
+
+  it('keeps generic same-kind tools in one segment across different turn cycles', () => {
     const rows = prepareTimelineRows([
       tool('a', 'custom_tool', { turn_cycle_index: 0, stable: true, status: 'complete' }),
       tool('b', 'another_custom_tool', { turn_cycle_index: 1, stable: true, status: 'complete' })
     ], DEFAULT_USER_PREFERENCES);
 
-    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'tool_group']);
+    expect(rows.map((row) => row.kind)).toEqual(['activity_segment']);
+    expect(rows[0].kind === 'activity_segment' ? rows[0].summary.label : '').toBe('Using tools…');
+    expect(rows[0].kind === 'activity_segment' ? activityEntryIds(rows[0]) : []).toEqual(['tools:a', 'tools:b']);
   });
 
   it('deduplicates repeated live and persisted tool-call projections by call id', () => {
@@ -852,12 +1321,51 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].summary.status).toBe('running');
   });
 
+  it('recomputes cached tool group summaries when a running tool completes', () => {
+    const runningRows = prepareTimelineRows([
+      tool('read', 'read', { status: 'running', updated_at: '2026-07-08T10:00:00Z' })
+    ], DEFAULT_USER_PREFERENCES);
+    const completedRows = prepareTimelineRows([
+      tool('read', 'read', { status: 'complete', updated_at: '2026-07-08T10:00:01Z' })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(runningRows[0].kind).toBe('tool_group');
+    expect(completedRows[0].kind).toBe('tool_group');
+    if (runningRows[0].kind !== 'tool_group' || completedRows[0].kind !== 'tool_group') return;
+    expect(runningRows[0].summary.status).toBe('running');
+    expect(completedRows[0].summary.status).toBe('complete');
+  });
+
+  it('recomputes cached activity segment summaries when a running tool completes', () => {
+    const runningRows = prepareTimelineRows([
+      message('m', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will inspect this.' }),
+      tool('read', 'read', {
+        turn_cycle_index: 0,
+        status: 'running',
+        updated_at: '2026-07-08T10:00:00Z'
+      })
+    ], DEFAULT_USER_PREFERENCES);
+    const completedRows = prepareTimelineRows([
+      message('m', { turn_id: 'turn-1', turn_cycle_index: 0, content: 'I will inspect this.' }),
+      tool('read', 'read', {
+        turn_cycle_index: 0,
+        status: 'complete',
+        updated_at: '2026-07-08T10:00:01Z'
+      })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(runningRows[0].kind).toBe('activity_segment');
+    expect(completedRows[0].kind).toBe('activity_segment');
+    if (runningRows[0].kind !== 'activity_segment' || completedRows[0].kind !== 'activity_segment') return;
+    expect(runningRows[0].summary.status).toBe('running');
+    expect(completedRows[0].summary.status).toBe('complete');
+  });
+
   it('classifies native read-only inspection tools as exploration', () => {
     const rows = prepareTimelineRows([
       tool('subsession', 'get_subsession'),
       tool('directory', 'list_directory'),
       tool('tools', 'search_tools'),
-      tool('conversation', 'agent_conversation_get'),
       tool('tasks', 'list_tasks'),
       tool('workflow', 'get_workflow'),
       tool('office', 'office_read')
@@ -873,7 +1381,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].kind).toBe('tool_group');
     if (rows[0].kind !== 'tool_group') return;
     expect(rows[0].summary.label).toBe('Exploring…');
-    expect(rows[0].summary.toolCount).toBe(7);
+    expect(rows[0].summary.toolCount).toBe(6);
   });
 
   it('classifies all memory tools as memory access', () => {
@@ -890,12 +1398,22 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].summary.toolCount).toBe(3);
   });
 
-  it('keeps interactive prompt tools ungrouped', () => {
-    const rows = prepareTimelineRows([
+  it('hides interactive prompt tools by default and keeps them ungrouped when shown', () => {
+    const items = [
       tool('before', 'read'),
       tool('prompt', 'request_user_input', { status: 'waiting' }),
       tool('after', 'grep')
-    ], DEFAULT_USER_PREFERENCES);
+    ];
+    const hiddenRows = prepareTimelineRows(items, DEFAULT_USER_PREFERENCES);
+    expect(hiddenRows.map((row) => row.kind)).toEqual(['tool_group']);
+
+    const rows = prepareTimelineRows(items, {
+      ...DEFAULT_USER_PREFERENCES,
+      chat: {
+        ...DEFAULT_USER_PREFERENCES.chat,
+        show_internal_tool_calls: true
+      }
+    });
 
     expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'item', 'tool_group']);
     expect(rows[1].kind).toBe('item');
@@ -919,7 +1437,23 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].summary.toolCount).toBe(3);
   });
 
-  it('keeps read-only managed conversation tools as exploration', () => {
+  it('classifies delegate lineage tools as delegation', () => {
+    const rows = prepareTimelineRows([
+      tool('delegate', 'delegate'),
+      tool('retry', 'retry_subsession'),
+      tool('follow-up', 'follow_up_subsession'),
+      tool('fork', 'fork_subsession'),
+      tool('legacy-fork', 'fork')
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('tool_group');
+    if (rows[0].kind !== 'tool_group') return;
+    expect(rows[0].summary.label).toBe('Delegating work…');
+    expect(rows[0].summary.toolCount).toBe(5);
+  });
+
+  it('keeps managed conversation inspection tools grouped as delegation work', () => {
     const rows = prepareTimelineRows([
       tool('get', 'agent_conversation_get'),
       tool('list', 'agent_conversation_list'),
@@ -929,7 +1463,7 @@ describe('prepareTimelineRows', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].kind).toBe('tool_group');
     if (rows[0].kind !== 'tool_group') return;
-    expect(rows[0].summary.label).toBe('Exploring…');
+    expect(rows[0].summary.label).toBe('Delegating work…');
   });
 
   it('starts a new live tool segment after a different tool category', () => {
@@ -1001,9 +1535,17 @@ describe('prepareTimelineRows', () => {
         blocks: []
       },
       tool('todo', 'todo_write'),
+      tool('todo-list', 'todo_list'),
+      tool('step-todo-list', 'step_todo_list'),
       tool('search-tools', 'search_tools'),
+      tool('describe-tool', 'describe_tool'),
+      tool('validate-tool-call', 'validate_tool_call'),
       tool('skill-load', 'skill_load'),
       tool('skill-asset', 'skill_asset_materialize'),
+      tool('profile', 'switch_agent_profile'),
+      tool('executor', 'switch_executor'),
+      tool('question', 'request_user_input', { status: 'waiting' }),
+      tool('step-question', 'step_request_questions', { status: 'waiting' }),
       tool('read-output', 'read_tool_output'),
       tool('search-output', 'search_tool_output'),
       tool('list-output-anchors', 'list_tool_output_anchors'),
@@ -1015,6 +1557,32 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].kind).toBe('tool_group');
     if (rows[0].kind !== 'tool_group') return;
     expect(rows[0].items[0].id).toBe('read');
+  });
+
+  it('restores each newly hidden internal helper when the preference is enabled', () => {
+    const newlyInternalTools = [
+      'todo_list',
+      'step_todo_list',
+      'switch_agent_profile',
+      'switch_executor',
+      'request_user_input',
+      'step_request_questions',
+      'attach_artifact'
+    ];
+    const visiblePreferences = {
+      ...DEFAULT_USER_PREFERENCES,
+      chat: {
+        ...DEFAULT_USER_PREFERENCES.chat,
+        show_internal_tool_calls: true
+      }
+    };
+
+    for (const toolName of newlyInternalTools) {
+      const item = tool(toolName, toolName);
+      expect(isInternalToolCall(item)).toBe(true);
+      expect(prepareTimelineRows([item], DEFAULT_USER_PREFERENCES)).toEqual([]);
+      expect(prepareTimelineRows([item], visiblePreferences)).toHaveLength(1);
+    }
   });
 
   it('shows failed internal helper tools even when internal helpers are hidden', () => {
@@ -1037,13 +1605,15 @@ describe('prepareTimelineRows', () => {
     expect(visibleToolIds).toEqual(['skill-load', 'skill-asset', 'read']);
   });
 
-  it('uses dedicated labels for web, browser, and knowledgebase groups', () => {
+   it('uses dedicated labels for web, browser, image, and knowledgebase groups', () => {
     const webRows = prepareTimelineRows([tool('a', 'web_search'), tool('b', 'web_fetch')], DEFAULT_USER_PREFERENCES);
     const browserRows = prepareTimelineRows([tool('a', 'browser_open'), tool('b', 'browser_snapshot')], DEFAULT_USER_PREFERENCES);
+    const imageRows = prepareTimelineRows([tool('a', 'image_generate'), tool('b', 'image_edit')], DEFAULT_USER_PREFERENCES);
     const kbRows = prepareTimelineRows([tool('a', 'knowledgebase_search'), tool('b', 'knowledgebase_read_source_context')], DEFAULT_USER_PREFERENCES);
 
     expect(webRows[0].kind === 'tool_group' ? webRows[0].summary.label : '').toBe('Searching web…');
     expect(browserRows[0].kind === 'tool_group' ? browserRows[0].summary.label : '').toBe('Using browser…');
+    expect(imageRows[0].kind === 'tool_group' ? imageRows[0].summary.label : '').toBe('Generating images…');
     expect(kbRows[0].kind === 'tool_group' ? kbRows[0].summary.label : '').toBe('Querying knowledgebase…');
   });
 

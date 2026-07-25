@@ -25,8 +25,8 @@ def test_host_for_extracts_lowercase_host() -> None:
 
 def test_settings_defaults_are_sane() -> None:
     settings = WebConcurrencySettings()
-    assert settings.global_cap >= 1
-    assert settings.cap_for("direct") >= 1
+    assert settings.global_cap == 16
+    assert settings.cap_for("direct") == 4
     assert settings.cap_for("brave") >= 1
     # Unknown backend falls back to global cap.
     assert settings.cap_for("not-a-backend") == settings.global_cap

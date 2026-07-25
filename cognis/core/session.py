@@ -340,6 +340,23 @@ def _intaris_session_context(
     return policy, source_label
 
 
+def _explicit_profile_for_fork(
+    source_session: SessionModel,
+    source_conversation: ConversationModel,
+    *,
+    target_agent_id: str,
+) -> str | None:
+    """Preserve only an explicit profile owned by the fork target agent."""
+
+    if source_session.agent_id != target_agent_id:
+        return None
+    if source_session.agent_profile_id:
+        return source_session.agent_profile_id
+    if source_conversation.agent_id == target_agent_id:
+        return source_conversation.agent_profile_id
+    return None
+
+
 class SessionManager:
     """Manage conversation/session metadata and external session correlation."""
 
@@ -362,8 +379,13 @@ class SessionManager:
         if self.session_lock is not None:
             self.session_lock.evict(session_id)
 
-    async def refresh_intaris_session_policy(self, session: SessionModel) -> None:
-        """Widen an existing Intaris session policy when runtime paths become known."""
+    async def refresh_intaris_session_policy(
+        self,
+        session: SessionModel,
+        *,
+        session_policy_override: dict[str, Any] | None = None,
+    ) -> None:
+        """Refresh Intaris policy from runtime paths and any explicit inherited clauses."""
 
         workdir = _resolve_runtime_workdir()
         if not workdir:
@@ -374,8 +396,8 @@ class SessionManager:
             )
             project_paths = await _project_source_paths(db_session, project_id)
         runtime_access = current_runtime_access_context.get()
-        session_policy = None
-        if runtime_access and runtime_access.session_policy:
+        session_policy = session_policy_override
+        if session_policy is None and runtime_access and runtime_access.session_policy:
             session_policy = runtime_access.session_policy
         new_policy = _intaris_session_policy(
             workdir,
@@ -831,9 +853,15 @@ class SessionManager:
         fork_title = title or (
             f"Fork: {source_conversation.title}" if source_conversation.title else "Forked chat"
         )
+        explicit_profile_id = _explicit_profile_for_fork(
+            source_session,
+            source_conversation,
+            target_agent_id=agent.agent_id,
+        )
         conversation, session = await self.create_conversation_with_root_session(
             user_email=user_email,
             agent_id=agent.agent_id,
+            agent_profile_id=explicit_profile_id,
             context=fork_context,
             title=fork_title,
             title_source="manual",
@@ -1094,13 +1122,31 @@ class SessionManager:
         session_row.intaris_session_id = session_row.session_id
         return _to_session_model(session_row)
 
-    async def _read_history_events(self, session: SessionModel) -> list[CachedEvent]:
+    async def _read_history_events(
+        self,
+        session: SessionModel,
+        *,
+        after_seq: int = 0,
+        limit: int = 0,
+        last_n: int | None = None,
+        allow_missing_stream: bool = False,
+    ) -> list[CachedEvent]:
         cache_entry = self.session_cache.get_entry(session.session_id)
         if cache_entry is not None and cache_entry.initialized and cache_entry.events:
-            return sorted(list(cache_entry.events), key=lambda event: event.seq)
+            events = sorted(list(cache_entry.events), key=lambda event: event.seq)
+            if after_seq:
+                events = [event for event in events if event.seq > after_seq]
+            if last_n is not None:
+                events = events[-last_n:]
+            elif limit:
+                events = events[:limit]
+            return events
         event_read = await self.providers.guardrails.read_events(
             session_id=session.intaris_session_id or session.session_id,
-            after_seq=0,
+            after_seq=after_seq,
+            limit=limit,
+            last_n=last_n,
+            allow_missing_stream=allow_missing_stream,
         )
         events: list[CachedEvent] = []
         for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0) or 0)):
@@ -1167,6 +1213,7 @@ class SessionManager:
         agent_profile_id: str | None = None,
         expected_output: str | None = None,
         constraints: dict[str, Any] | None = None,
+        delegation_metadata: dict[str, Any] | None = None,
         intention: str | None = None,
         workspace_root: str | None = None,
         working_directory: str | None = None,
@@ -1185,6 +1232,7 @@ class SessionManager:
                     parent_session_id=parent_session.session_id,
                     delegation_mode=mode,
                     delegation_task=task_description,
+                    delegation_metadata=delegation_metadata,
                 )
                 resolved_intention = _normalize_intention(
                     intention or self._build_child_intention(child_agent, task_description)
@@ -1203,6 +1251,7 @@ class SessionManager:
                         "task_description": task_description,
                         "expected_output": expected_output,
                         "constraints": constraints or {},
+                        "delegation_metadata": delegation_metadata or {},
                     },
                 )
                 with scoped_runtime_context(
@@ -1464,6 +1513,7 @@ class SessionManager:
         intention: str,
         completion_reason: str = "compacted",
         compaction_summary: str | None = None,
+        compaction_summary_event_data: dict[str, Any] | None = None,
         tail_events: list[Any] | None = None,
     ) -> SessionModel:
         """Create a new root session, completing the current one.
@@ -1630,19 +1680,28 @@ class SessionManager:
                     content=compaction_summary,
                 )
             )
+        summary_event_data = dict(compaction_summary_event_data or {})
+        summary_event_data.update(
+            {
+                "summary": compaction_summary,
+                "session_id": new_session.session_id,
+                "source_session_id": current_session.session_id,
+            }
+        )
+        summary_event_data.setdefault("method", "rotation")
+        summary_event_data.setdefault("marker_role", "context_seed")
+        # The rotated session owns the durable, user-visible compaction marker.
+        # Callers that provide no event metadata (manual or deferred rotation)
+        # must not lose it after a page reload.
+        summary_event_data.setdefault("timeline_visible", True)
+        summary_event_data.setdefault("trigger", completion_reason)
+
         durable_summary_events = (
             with_session_events_turn_id(
                 [
                     SessionEvent(
                         type="compaction_summary",
-                        data={
-                            "summary": compaction_summary,
-                            "method": "rotation",
-                            "marker_role": "context_seed",
-                            "timeline_visible": False,
-                            "trigger": completion_reason,
-                            "source_session_id": current_session.session_id,
-                        },
+                        data=summary_event_data,
                     )
                 ],
                 None,
@@ -1917,7 +1976,15 @@ class SessionManager:
                     await self.event_bus.publish(
                         Event(
                             type=EventType.SESSION_RECOVERED,
-                            data={"session_id": recovered_id},
+                            data={
+                                "session_id": recovered_id,
+                                "title": "Controller restarted",
+                                "message": (
+                                    "The controller restarted while this session was active. "
+                                    "Saved work is preserved; resume the session if needed."
+                                ),
+                                "reason": "controller_restart",
+                            },
                         )
                     )
                 follow_up_policy = FollowUpPolicy(llm=None)
@@ -2158,6 +2225,7 @@ def _to_session_model(row: Any) -> SessionModel:
         agent_profile_id=getattr(row, "agent_profile_id", None),
         delegation_mode=row.delegation_mode,
         delegation_task=row.delegation_task,
+        delegation_metadata=dict(getattr(row, "delegation_metadata", None) or {}),
         status=row.status,
         completion_reason=getattr(row, "completion_reason", None),
         intaris_session_id=row.intaris_session_id,

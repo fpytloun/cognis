@@ -302,7 +302,10 @@ MATRIX_META = ChannelMeta(
         supports_media=True,
         supports_typing=True,
         supports_markdown=True,
+        supports_sanitized_html=True,
+        supports_inline_media=True,
         supports_read_receipts=True,
+        supports_idempotent_send=True,
         max_message_length=4000,
     ),
     credential_fields=[

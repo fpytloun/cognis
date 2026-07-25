@@ -5,15 +5,14 @@
  * This is a render-boundary conversion only: it is applied per item at
  * render time and carries NO mutable state, no merge/reconcile, and no
  * identity churn. Item identity and ordering are owned entirely by the
- * Chat v2 store (`chatV2Store.visibleItems`). This is intentionally NOT a
- * lifecycle bridge into the legacy mutable `ChatTimeline` store — feeding
- * Chat v2 state through that store is what caused the disappear/reorder/
- * hang bugs, so it is deliberately avoided here.
+ * Chat v2 store (`chatV2Store.visibleItems`). This is only a render-boundary
+ * adapter; state is never routed through a second mutable timeline store.
  */
-import { createMarkdownStreamer, renderMarkdown, type MarkdownStreamer } from '$lib/markdown';
+import { renderMarkdown } from '$lib/markdown';
 import { normalizeFileDiffs } from '$lib/diff';
 import { parseTodoSnapshot } from '$lib/todos';
 import type {
+  AssistantDeliverableTimelineItem,
   CompactionTimelineItem,
   DelegationRuntime,
   DelegationTimelineItem,
@@ -24,7 +23,7 @@ import type {
   ThinkingTimelineItem,
   TimelineItem as RenderTimelineItem,
   ToolCallTimelineItem
-} from '$lib/chat';
+} from '$lib/timeline-render-model';
 import type {
   CompactionTimelineItem as ChatV2CompactionTimelineItem,
   DelegationTimelineItem as ChatV2DelegationTimelineItem,
@@ -36,6 +35,8 @@ import type {
   TimelineItem as ChatV2TimelineItem,
   ToolCallTimelineItem as ChatV2ToolCallTimelineItem
 } from './types';
+
+export type RenderMarkdownContent = (content: string, key: string, streaming: boolean) => string;
 
 // Kinds that produce a visible timeline row. Anything else (e.g. todo_state,
 // or an unknown future kind) renders nothing and must be excluded BEFORE
@@ -51,33 +52,13 @@ const RENDERABLE_KINDS: ReadonlySet<string> = new Set([
   'notice',
   'error',
   'artifact',
+  'assistant_deliverable',
   'file_diff',
   'compaction',
   'question_set',
   'auth_challenge',
   'credential_request'
 ]);
-
-const messageStreamers = new Map<string, MarkdownStreamer>();
-const thinkingStreamers = new Map<string, MarkdownStreamer>();
-
-function getMessageStreamer(id: string): MarkdownStreamer {
-  let streamer = messageStreamers.get(id);
-  if (!streamer) {
-    streamer = createMarkdownStreamer();
-    messageStreamers.set(id, streamer);
-  }
-  return streamer;
-}
-
-function getThinkingStreamer(id: string): MarkdownStreamer {
-  let streamer = thinkingStreamers.get(id);
-  if (!streamer) {
-    streamer = createMarkdownStreamer();
-    thinkingStreamers.set(id, streamer);
-  }
-  return streamer;
-}
 
 /**
  * Whether a Chat v2 item produces a visible timeline row. Cheap (kind check
@@ -92,12 +73,22 @@ export function isRenderableChatV2Item(item: ChatV2TimelineItem): boolean {
  * Convert a single Chat v2 timeline item to its legacy leaf prop shape.
  * Returns null for items that have no visible row (e.g. todo_state).
  */
-export function toRenderItem(item: ChatV2TimelineItem): RenderTimelineItem | null {
+export function toRenderItem(
+  item: ChatV2TimelineItem,
+  renderMarkdownContent: RenderMarkdownContent = statelessMarkdown
+): RenderTimelineItem | null {
+  return convertToRenderItem(item, renderMarkdownContent);
+}
+
+function convertToRenderItem(
+  item: ChatV2TimelineItem,
+  renderMarkdownContent: RenderMarkdownContent
+): RenderTimelineItem | null {
   switch (item.kind) {
     case 'message':
-      return toRenderMessage(item);
+      return toRenderMessage(item, renderMarkdownContent);
     case 'thinking':
-      return toRenderThinking(item);
+      return toRenderThinking(item, renderMarkdownContent);
     case 'tool_call':
       return toRenderToolCall(item);
     case 'delegation':
@@ -120,6 +111,8 @@ export function toRenderItem(item: ChatV2TimelineItem): RenderTimelineItem | nul
         item.sort_key,
         item.created_at ?? item.updated_at ?? null
       );
+    case 'assistant_deliverable':
+      return toRenderAssistantDeliverable(item);
     case 'file_diff':
       return notice(
         item.id,
@@ -168,12 +161,34 @@ export function toRenderItem(item: ChatV2TimelineItem): RenderTimelineItem | nul
  */
 export function toRenderItems(items: ChatV2TimelineItem[]): RenderTimelineItem[] {
   return items
-    .map(toRenderItem)
+    .map((item) => toRenderItem(item))
     .filter((item): item is RenderTimelineItem => item !== null);
 }
 
+function statelessMarkdown(content: string): string {
+  return renderMarkdown(content);
+}
+
+function toRenderAssistantDeliverable(
+  item: Extract<ChatV2TimelineItem, { kind: 'assistant_deliverable' }>
+): AssistantDeliverableTimelineItem {
+  return {
+    id: item.id,
+    kind: 'assistant_deliverable',
+    orderKey: item.sort_key,
+    sourceRefs: item.source_refs?.map((ref) => `${ref.store}:${ref.session_id}:${ref.seq}`) ?? [],
+    createdAt: item.created_at ?? undefined,
+    updatedAt: item.updated_at ?? undefined,
+    deliverableId: item.deliverable_id,
+    format: item.format,
+    title: item.title ?? undefined,
+    content: item.content ?? undefined,
+  };
+}
+
 function toRenderMessage(
-  item: Extract<ChatV2TimelineItem, { kind: 'message' }>
+  item: Extract<ChatV2TimelineItem, { kind: 'message' }>,
+  renderMarkdownContent: RenderMarkdownContent
 ): MessageTimelineItem | SystemMessageTimelineItem {
   if (item.role === 'system') {
     return toRenderSystemMessage(item);
@@ -185,7 +200,7 @@ function toRenderMessage(
     sessionId: firstSessionId(item),
     role: item.role,
     content: item.content,
-    html: renderMessageHtml(item, streaming),
+    html: renderMarkdownContent(item.content, `message:${item.id}`, streaming),
     seq: firstSeq(item),
     timestamp: item.created_at ?? item.updated_at ?? null,
     turnId: item.turn_id ?? null,
@@ -195,6 +210,14 @@ function toRenderMessage(
     // so this resolves to false and no message hangs "in progress".
     streaming,
     attachments: item.attachments,
+    optimistic: item.role === 'user' && item.source_refs.length === 0,
+    deliveryStatus: item.role === 'user' && item.source_refs.length === 0
+      ? item.status === 'failed'
+        ? 'failed'
+        : item.status === 'pending'
+          ? 'sending'
+          : undefined
+      : undefined,
     clientMessageId: item.client_message_id ?? null,
     partial: item.partial,
     assistantPhaseIndex: item.assistant_phase_index ?? undefined,
@@ -203,21 +226,6 @@ function toRenderMessage(
     chatModeSource: item.chat_mode_source as MessageTimelineItem['chatModeSource'],
     orderKey: item.sort_key
   } satisfies MessageTimelineItem;
-}
-
-function renderMessageHtml(item: Extract<ChatV2TimelineItem, { kind: 'message' }>, streaming: boolean): string {
-  if (item.role !== 'assistant') {
-    return renderMarkdown(item.content);
-  }
-  if (streaming) {
-    const html = getMessageStreamer(item.id).render(item.content);
-    return html || (item.content ? renderMarkdown(item.content) : '');
-  }
-  const streamer = messageStreamers.get(item.id);
-  if (!streamer) return renderMarkdown(item.content);
-  const html = streamer.finalize(item.content);
-  messageStreamers.delete(item.id);
-  return html;
 }
 
 function toRenderSystemMessage(
@@ -230,6 +238,18 @@ function toRenderSystemMessage(
     noticeId: item.notice_id ?? null,
     noticeKind: item.notice_kind ?? null,
     noticeScope: item.notice_scope ?? null,
+    reasonClass: item.reason_class ?? null,
+    providerId: item.provider_id ?? null,
+    model: item.model ?? null,
+    retryAfterSeconds: item.retry_after_seconds ?? null,
+    providerRetryAfterSeconds: item.provider_retry_after_seconds ?? null,
+    retryAt: item.retry_at ?? null,
+    attempt: item.attempt ?? null,
+    maxAttempts: item.max_attempts ?? null,
+    attempts: item.attempts ?? null,
+    attemptsPerCycle: item.attempts_per_cycle ?? null,
+    continuationAttempts: item.continuation_attempts ?? null,
+    recoverable: item.recoverable ?? null,
     followUpConversationId: item.follow_up_conversation_id ?? null,
     followUpSessionId: item.follow_up_session_id ?? null,
     timestamp: item.created_at ?? item.updated_at ?? null,
@@ -237,7 +257,10 @@ function toRenderSystemMessage(
   };
 }
 
-function toRenderThinking(item: ChatV2ThinkingTimelineItem): ThinkingTimelineItem {
+function toRenderThinking(
+  item: ChatV2ThinkingTimelineItem,
+  renderMarkdownContent: RenderMarkdownContent
+): ThinkingTimelineItem {
   // 1:1 conversion. Each canonical thinking item already maps to a single
   // rendered thinking block; there is no merging across items here.
   const blocks = item.blocks.map((block): ThinkingBlock => {
@@ -247,7 +270,7 @@ function toRenderThinking(item: ChatV2ThinkingTimelineItem): ThinkingTimelineIte
       block_id: block.id,
       title: block.title ?? 'Thinking',
       content,
-      html: renderThinkingBlockHtml(`${item.id}:${block.id}`, content, blockStatus === 'running'),
+      html: renderMarkdownContent(content, `thinking:${item.id}:${block.id}`, blockStatus === 'running'),
       source: 'summary',
       complete: blockStatus !== 'running',
       startedAt: block.started_at ?? null,
@@ -272,18 +295,6 @@ function toRenderThinking(item: ChatV2ThinkingTimelineItem): ThinkingTimelineIte
   };
 }
 
-function renderThinkingBlockHtml(id: string, content: string, streaming: boolean): string {
-  if (streaming) {
-    const html = getThinkingStreamer(id).render(content);
-    return html || (content ? renderMarkdown(content) : '');
-  }
-  const streamer = thinkingStreamers.get(id);
-  if (!streamer) return renderMarkdown(content);
-  const html = streamer.finalize(content);
-  thinkingStreamers.delete(id);
-  return html;
-}
-
 function toRenderToolCall(item: ChatV2ToolCallTimelineItem): ToolCallTimelineItem {
   const status = normalizeToolStatus(item.status);
   return {
@@ -301,7 +312,7 @@ function toRenderToolCall(item: ChatV2ToolCallTimelineItem): ToolCallTimelineIte
     // structured args were projected.
     arguments: toRenderArguments(item),
     result: item.result_preview ?? undefined,
-    streamedOutput: item.streamed_output ?? undefined,
+    streamedOutput: item.streamed_output ?? item.result_preview ?? undefined,
     isError: item.is_error,
     durationMs: item.duration_ms ?? undefined,
     attachments: item.attachments,
@@ -311,11 +322,12 @@ function toRenderToolCall(item: ChatV2ToolCallTimelineItem): ToolCallTimelineIte
     hasFullOutput: item.has_full_output,
     recoveryCallId: item.recovery_call_id ?? null,
     toolOutputArtifactId: item.tool_output_artifact_id ?? null,
-    evaluation: item.evaluation as ToolCallTimelineItem['evaluation'],
+    evaluation: toRenderEvaluation(item.evaluation),
     progressPhase: item.progress_phase ?? undefined,
     progressInputChars: item.progress_input_chars ?? undefined,
     progressInputLines: item.progress_input_lines ?? undefined,
     progressComplete: item.progress_complete ?? undefined,
+    managedConversation: item.managed_conversation ?? undefined,
     delegation: toRenderDelegationRuntime(item.delegation),
     assistantPhaseIndex: item.assistant_phase_index ?? undefined,
     turnCycleIndex: item.turn_cycle_index ?? undefined,
@@ -338,25 +350,60 @@ function toRenderDelegationRuntime(
   if (!value || typeof value !== 'object') return undefined;
   const todos = value.todos ? parseTodoSnapshot(value.todos) : undefined;
   return {
-    childSessionId: (value.child_session_id as string) ?? null,
-    status: (value.status as string) ?? null,
-    agentId: (value.agent_id as string) ?? null,
-    usedAgentId: (value.used_agent_id as string) ?? null,
-    title: (value.title as string) ?? null,
-    summary: (value.summary as string) ?? null,
-    startedAt: (value.started_at as string) ?? null,
-    durationMs: (value.duration_ms as number) ?? null,
-    resultSummary: (value.result_summary as string) ?? null,
-    resultContent: (value.result_content as string) ?? null,
-    resultSource: (value.result_source as string) ?? null,
-    resultTruncated: (value.result_truncated as boolean) ?? null,
-    resultAnchors: value.result_anchors,
+    childSessionId: nullableString(value.child_session_id),
+    status: nullableString(value.status),
+    agentId: nullableString(value.agent_id),
+    usedAgentId: nullableString(value.used_agent_id),
+    title: nullableString(value.title),
+    summary: nullableString(value.summary),
+    startedAt: nullableString(value.started_at),
+    durationMs: nullableNumber(value.duration_ms),
+    resultSummary: nullableString(value.result_summary),
+    resultContent: nullableString(value.result_content),
+    resultSource: nullableString(value.result_source),
+    resultTruncated: nullableBoolean(value.result_truncated),
+    resultAnchors: isRecord(value.result_anchors) ? value.result_anchors : undefined,
     todos,
-    toolCallCount: (value.tool_call_count as number) ?? null,
-    maxToolCalls: (value.max_tool_calls as number) ?? null,
-    lastTool: (value.last_tool as string) ?? null,
-    error: (value.error as string) ?? null
+    toolCallCount: nullableNumber(value.tool_call_count),
+    maxToolCalls: nullableNumber(value.max_tool_calls),
+    lastTool: nullableString(value.last_tool),
+    error: nullableString(value.error)
   };
+}
+
+function toRenderEvaluation(value: unknown): ToolCallTimelineItem['evaluation'] {
+  if (!isRecord(value) || typeof value.decision !== 'string') return undefined;
+  return {
+    decision: value.decision,
+    reasoning: optionalString(value.reasoning),
+    risk: optionalString(value.risk),
+    path: optionalString(value.path),
+    latency_ms: optionalNumber(value.latency_ms)
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function nullableString(value: unknown): string | null {
+  return optionalString(value) ?? null;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function nullableNumber(value: unknown): number | null {
+  return optionalNumber(value) ?? null;
+}
+
+function nullableBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
 }
 
 function toRenderDelegation(item: ChatV2DelegationTimelineItem): DelegationTimelineItem {

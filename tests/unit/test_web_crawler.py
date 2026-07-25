@@ -435,6 +435,7 @@ async def test_map_site_urls_html_crawl_respects_max_breadth_per_level() -> None
 class _FakeContext:
     def __init__(self, runtime_metadata: dict[str, Any]) -> None:
         self.runtime_metadata = runtime_metadata
+        self.shared_runtime_metadata = None
 
 
 @pytest.mark.asyncio

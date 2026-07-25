@@ -10,14 +10,22 @@ from typing import Any
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from cognis.api.executor_runtime import reconcile_executor
+from cognis.api.executor_runtime import (
+    persist_executor_resource_snapshot,
+    reconcile_executor,
+)
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.logging import get_logger
+from cognis.models.executor_resources import (
+    ExecutorResourceSnapshot,
+    normalize_executor_resource_snapshot,
+)
 from cognis.models.tool import (
     MCP_SERVER_IDS_KEY,
     ExecutorCapabilities,
+    MCPAuthConfig,
     MCPServerConfig,
     effective_mcp_auth_config,
 )
@@ -42,6 +50,29 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(1, parsed)
+
+
+def _runtime_authorization_challenge(row: Any, server_id: str) -> dict[str, str] | None:
+    runtime_metadata = getattr(row, "runtime_metadata", None)
+    if not isinstance(runtime_metadata, dict):
+        return None
+    server_statuses = runtime_metadata.get("mcp_servers")
+    if not isinstance(server_statuses, list):
+        return None
+    for status in reversed(server_statuses):
+        if not isinstance(status, dict) or status.get("server_id") != server_id:
+            continue
+        challenge = status.get("authorization_challenge")
+        if not isinstance(challenge, dict):
+            continue
+        safe_challenge = {
+            key: value
+            for key, value in challenge.items()
+            if key in {"scope", "resource_metadata", "authorization_uri", "issuer", "error"}
+            and isinstance(value, str)
+        }
+        return safe_challenge or None
+    return None
 
 
 async def handle_executor_websocket(
@@ -116,6 +147,15 @@ async def handle_executor_websocket(
             row.executor_type,
             row.owner_email,
         )
+        ready_snapshot = normalize_executor_resource_snapshot(params.get("resource_snapshot"))
+        ready_received_at = datetime.now(UTC)
+        ready_runtime_metadata = _ready_runtime_metadata(
+            row,
+            environment=params.get("environment"),
+            platform=params.get("platform"),
+            resource_snapshot=ready_snapshot,
+            received_at=ready_received_at,
+        )
         conn = ws_provider.register_connection(
             executor_id,
             ws,
@@ -123,12 +163,33 @@ async def handle_executor_websocket(
             ready=False,
             metadata=_executor_connection_metadata(
                 labels=row.labels or {},
-                environment=params.get("environment"),
-                platform=params.get("platform") or {},
+                environment=ready_runtime_metadata.get("environment"),
+                platform=ready_runtime_metadata.get("platform") or {},
+                resource_snapshot=ready_snapshot,
                 status=row.status,
                 owner_email=row.owner_email,
             ),
         )
+
+        async def _resource_snapshot_received(
+            callback_executor_id: str,
+            payload: dict[str, Any],
+        ) -> None:
+            try:
+                await persist_executor_resource_snapshot(
+                    ws.app,
+                    callback_executor_id,
+                    payload,
+                    connection=conn,
+                )
+            except Exception:
+                _logger.debug(
+                    "executor_ws: failed to persist resource snapshot",
+                    extra={"extra_data": {"executor_id": callback_executor_id}},
+                    exc_info=True,
+                )
+
+        conn.register_resource_snapshot_callback(_resource_snapshot_received)
 
     # Acknowledge executor.ready before sending executor.configure.
     # The runner waits for this response before entering the normal
@@ -147,7 +208,13 @@ async def handle_executor_websocket(
     # freshly-reconnected executor has _configured=False and needs a full
     # configure handshake.
     async with session_factory() as session:
-        await update_executor_runtime_state(session, executor_id, runtime_state="offline")
+        await update_executor_runtime_state(
+            session,
+            executor_id,
+            runtime_state="offline",
+            runtime_metadata=ready_runtime_metadata,
+            last_observed_at=ready_received_at if ready_snapshot is not None else None,
+        )
         await session.commit()
 
     _logger.info("executor_ws: executor %s registered, starting reconcile", executor_id)
@@ -175,6 +242,18 @@ async def handle_executor_websocket(
         runtime_state,
         configure_ok,
     )
+    local_model_reconciler = getattr(ws.app.state, "local_model_reconciler", None)
+    if local_model_reconciler is not None and configure_ok:
+        local_model_runtime_manager = getattr(
+            ws.app.state,
+            "local_model_runtime_manager",
+            None,
+        )
+        if local_model_runtime_manager is not None:
+            await local_model_runtime_manager.executor_connected(executor_id)
+        local_model_reconciler.trigger(executor_id=executor_id)
+    if configure_ok and runtime_state in {"active", "degraded"}:
+        ws_provider.schedule_browser_terminal_flush(executor_id)
 
     # Start any channel accounts assigned to this executor
     channel_manager = getattr(ws.app.state, "channel_manager", None)
@@ -203,6 +282,13 @@ async def handle_executor_websocket(
             "executor_ws: executor %s disconnected (is_current=%s)",
             executor_id,
             is_current,
+            extra={
+                "extra_data": {
+                    "executor_id": executor_id,
+                    "is_current": is_current,
+                    **conn.close_metadata,
+                }
+            },
         )
         # Clean up executor-hosted channel adapters before unregistering
         if channel_manager is not None and is_current:
@@ -214,6 +300,14 @@ async def handle_executor_websocket(
                     extra={"extra_data": {"executor_id": executor_id}},
                     exc_info=True,
                 )
+        local_model_runtime_manager = getattr(
+            ws.app.state,
+            "local_model_runtime_manager",
+            None,
+        )
+        if local_model_runtime_manager is not None and is_current:
+            with contextlib.suppress(Exception):
+                await local_model_runtime_manager.executor_disconnected(executor_id)
         ws_provider.unregister_connection(executor_id, conn)
         if is_current:
             async with session_factory() as session:
@@ -245,7 +339,12 @@ async def _resolve_executor_mcp_payload(
         tool_timeout = _coerce_positive_int(tool_timeout_raw, 300)
         connect_timeout = _coerce_positive_int(connect_timeout_raw, 15)
         for server_id in server_ids:
-            mcp_row = await get_mcp_server(session, str(server_id), owner_email=row.owner_email)
+            mcp_row = await get_mcp_server(
+                session,
+                str(server_id),
+                owner_email=row.owner_email,
+                include_shared=True,
+            )
             if mcp_row is None or mcp_row.status != "active":
                 continue
             invalid_reason = invalid_mcp_config_reason(
@@ -298,6 +397,10 @@ async def _resolve_executor_mcp_payload(
                         user_email=row.owner_email,
                         server=mcp_row,
                         headers={k: v for k, v in headers.items() if k.lower() != "authorization"},
+                        authorization_challenge=_runtime_authorization_challenge(
+                            row,
+                            str(server_id),
+                        ),
                     )
                 except MCPOAuthError as exc:
                     warning = (
@@ -345,6 +448,8 @@ async def _resolve_executor_mcp_payload(
                             oauth_executor_name=result.oauth_executor_name,
                             redirect_uri=result.redirect_uri,
                             instructions=result.instructions,
+                            scopes=result.scopes,
+                            resource=result.resource,
                         )
                     )
                     _logger.warning(
@@ -359,7 +464,7 @@ async def _resolve_executor_mcp_payload(
                     )
                     continue
                 headers = result.headers
-                auth_config = {"type": "static_headers"}
+                auth_config = MCPAuthConfig(type="static_headers")
             servers.append(
                 MCPServerConfig(
                     name=mcp_row.name,
@@ -418,6 +523,7 @@ def _executor_connection_metadata(
     labels: dict[str, Any],
     environment: Any,
     platform: dict[str, Any],
+    resource_snapshot: ExecutorResourceSnapshot | None,
     status: str,
     owner_email: str | None,
 ) -> dict[str, Any]:
@@ -430,6 +536,49 @@ def _executor_connection_metadata(
     }
     if isinstance(environment, dict):
         metadata["environment"] = environment
+    if resource_snapshot is not None:
+        metadata["resource_snapshot"] = resource_snapshot.model_dump(
+            mode="json",
+            exclude={"freshness"},
+        )
+    return metadata
+
+
+def _ready_runtime_metadata(
+    row: Any,
+    *,
+    environment: Any,
+    platform: Any,
+    resource_snapshot: ExecutorResourceSnapshot | None,
+    received_at: datetime,
+) -> dict[str, Any]:
+    """Merge authenticated ready metadata without losing prior runtime state."""
+
+    metadata = dict(getattr(row, "runtime_metadata", None) or {})
+    if isinstance(environment, dict):
+        metadata["environment"] = {
+            key: value[:1024]
+            for key, value in environment.items()
+            if key in {"user", "home", "cwd", "hostname", "source", "observed_at"}
+            and isinstance(value, str)
+        }
+    if isinstance(platform, dict):
+        metadata["platform"] = {
+            key: value[:128]
+            for key, value in platform.items()
+            if key in {"os", "arch", "python"} and isinstance(value, str)
+        }
+    if resource_snapshot is not None:
+        previous_snapshot = normalize_executor_resource_snapshot(metadata.get("resource_snapshot"))
+        if (
+            previous_snapshot is None
+            or resource_snapshot.observed_at >= previous_snapshot.observed_at
+        ):
+            metadata["resource_snapshot"] = resource_snapshot.model_dump(
+                mode="json",
+                exclude={"freshness"},
+            )
+            metadata["resource_snapshot_received_at"] = received_at.isoformat()
     return metadata
 
 

@@ -7,12 +7,20 @@ import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
+from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.executor_inference import (
+    executor_local_inference_config_confirmed,
+    resolve_executor_local_inference_config,
+)
+from cognis.models.executor_resources import normalize_executor_resource_snapshot
+from cognis.models.local_models import OllamaRuntimeCapability
 from cognis.models.tool import ExecutorCapabilities, ToolDefinition
+from cognis.ownership import is_shared_owner_email
 from cognis.store.queries import (
-    bump_executor_reconfigure_generation,
     get_executor_row,
+    normalize_executor_desired_config_version,
     update_executor_runtime_state,
 )
 from cognis.tools.skills import resolve_skills_for_agent
@@ -24,6 +32,7 @@ RUNTIME_METADATA_SCHEMA_VERSION = 1
 CONFIGURE_CAPABILITY_MCP_RUNTIME_STATUS = "mcp_runtime_status_v1"
 MAX_SAFE_ERROR_LENGTH = 240
 MAX_SAFE_STDERR_LENGTH = 240
+RESOURCE_SNAPSHOT_MIN_PERSIST_INTERVAL_SECONDS = 30
 
 
 def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
@@ -31,32 +40,46 @@ def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
     tasks: dict[str, asyncio.Task[None]] = getattr(app.state, "executor_reconcile_tasks", {})
     if not hasattr(app.state, "executor_reconcile_tasks"):
         app.state.executor_reconcile_tasks = tasks
+    pending: set[str] = getattr(app.state, "executor_reconcile_pending", set())
+    if not hasattr(app.state, "executor_reconcile_pending"):
+        app.state.executor_reconcile_pending = pending
     existing = tasks.get(executor_id)
     if existing is not None and not existing.done():
+        pending.add(executor_id)
         return
 
     async def _run() -> None:
+        cancelled = False
         try:
-            await reconcile_executor(app, executor_id)
-        except Exception as exc:
-            _logger.warning(
-                "executor_runtime: background reconcile failed for %s: %s",
-                executor_id,
-                _safe_error_message(str(exc)),
-                exc_info=True,
-            )
             try:
-                await _mark_reconcile_failed(app, executor_id, exc)
-            except Exception:
+                await reconcile_executor(app, executor_id)
+            except Exception as exc:
                 _logger.warning(
-                    "executor_runtime: failed to persist reconcile failure for %s",
+                    "executor_runtime: background reconcile failed for %s: %s",
                     executor_id,
+                    _safe_error_message(str(exc)),
                     exc_info=True,
                 )
+                try:
+                    await _mark_reconcile_failed(app, executor_id, exc)
+                except Exception:
+                    _logger.warning(
+                        "executor_runtime: failed to persist reconcile failure for %s",
+                        executor_id,
+                        exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         finally:
             current = tasks.get(executor_id)
             if current is asyncio.current_task():
                 tasks.pop(executor_id, None)
+            if cancelled:
+                pending.discard(executor_id)
+            elif executor_id in pending:
+                pending.discard(executor_id)
+                schedule_executor_reconfigure(app, executor_id)
 
     tasks[executor_id] = asyncio.create_task(_run(), name=f"executor-reconcile-{executor_id}")
 
@@ -75,6 +98,22 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     executor_id,
                 )
                 return False
+
+            raw_desired_version = int(getattr(row, "desired_config_version", 0) or 0)
+            if raw_desired_version < 1:
+                async with app.state.session_factory() as session:
+                    normalized = await normalize_executor_desired_config_version(
+                        session,
+                        executor_id,
+                    )
+                    await session.commit()
+                if normalized:
+                    row.desired_config_version = 1
+                else:
+                    # A concurrent config update won the conditional write. Reload
+                    # rather than replacing its newer generation with the legacy floor.
+                    connection = None
+                    continue
 
             target_version = max(int(getattr(row, "desired_config_version", 0) or 0), 1)
             applied_version = int(getattr(row, "applied_config_version", 0) or 0)
@@ -96,22 +135,33 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
             }:
                 observed_tools = list(getattr(row, "observed_tools", None) or [])
                 runtime_metadata = getattr(row, "runtime_metadata", None) or {}
+                local_inference_enabled = _fast_path_local_inference_enabled(
+                    row,
+                    runtime_metadata,
+                )
                 app.state.providers.executor.websocket.mark_ready(
                     executor_id,
                     ExecutorCapabilities(
                         tools=[
                             str(tool.get("name", "")) for tool in observed_tools if tool.get("name")
                         ],
-                        inference=True,
+                        inference=local_inference_enabled,
+                        local_inference=local_inference_enabled,
                         inference_models=[],
                         inference_type="litellm_proxy",
                         channels=True,
+                        local_model_runtime=(
+                            _ollama_runtime_capability(runtime_metadata.get("ollama_runtime"))
+                            if local_inference_enabled
+                            else None
+                        ),
                     ),
                     metadata=_executor_connection_metadata(
                         labels=row.labels or {},
                         environment=runtime_metadata.get("environment"),
                         platform=runtime_metadata.get("platform") or {},
                         status=row.status,
+                        owner_email=row.owner_email,
                         runtime_metadata=runtime_metadata,
                     ),
                 )
@@ -133,7 +183,6 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 await update_executor_runtime_state(
                     session,
                     executor_id,
-                    desired_config_version=target_version,
                     runtime_state="reconfiguring",
                 )
                 await session.commit()
@@ -210,17 +259,27 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 applied_version,
                 len(observed_tools),
             )
+            result_runtime_metadata = _sanitize_configure_result_runtime_metadata(
+                configure_result.get("runtime_metadata"),
+                received_at=datetime.now(UTC),
+            )
             runtime_metadata = _merge_runtime_metadata(
                 configure_metadata,
-                dict(configure_result.get("runtime_metadata") or {}),
+                result_runtime_metadata,
             )
             capabilities = ExecutorCapabilities(
                 tools=list(caps_raw.get("tools") or []),
                 inference=bool(caps_raw.get("inference", False)),
+                local_inference=caps_raw.get("local_inference") is True,
                 inference_models=list(caps_raw.get("inference_models") or []),
                 inference_type=caps_raw.get("inference_type"),
                 channels=bool(caps_raw.get("channels", False)),
+                local_model_runtime=_ollama_runtime_capability(caps_raw.get("local_model_runtime")),
             )
+            if not _live_local_inference_capability_matches(row, capabilities):
+                capabilities.inference = False
+                capabilities.local_inference = False
+                capabilities.local_model_runtime = None
             app.state.providers.executor.websocket.mark_ready(
                 executor_id,
                 capabilities,
@@ -229,6 +288,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     environment=runtime_metadata.get("environment"),
                     platform=runtime_metadata.get("platform") or {},
                     status=row.status,
+                    owner_email=row.owner_email,
                     runtime_metadata=runtime_metadata,
                 ),
             )
@@ -304,13 +364,75 @@ async def _persist_runtime_state(
         )
 
 
+async def persist_executor_resource_snapshot(
+    app: Any,
+    executor_id: str,
+    payload: Any,
+    *,
+    connection: Any | None = None,
+) -> bool:
+    """Persist one newer current snapshot without creating sample history."""
+
+    snapshot = normalize_executor_resource_snapshot(payload)
+    if snapshot is None:
+        return False
+    lock = _get_executor_lock(app, executor_id)
+    async with lock:
+        if connection is not None and not _is_current_connection(app, executor_id, connection):
+            return False
+        async with app.state.session_factory() as session:
+            row = await get_executor_row(session, executor_id)
+            if row is None:
+                return False
+            runtime_metadata = dict(getattr(row, "runtime_metadata", None) or {})
+            previous = normalize_executor_resource_snapshot(
+                runtime_metadata.get("resource_snapshot")
+            )
+            snapshot_payload = snapshot.model_dump(
+                mode="json",
+                exclude={"freshness"},
+            )
+            if previous is not None and snapshot.observed_at < previous.observed_at:
+                return False
+            if (
+                previous is not None
+                and previous.observed_at == snapshot.observed_at
+                and previous.model_dump(mode="json", exclude={"freshness"}) == snapshot_payload
+            ):
+                return False
+            received_at = datetime.now(UTC)
+            previous_received_at = _coerce_utc_datetime(
+                runtime_metadata.get("resource_snapshot_received_at")
+            )
+            elapsed_since_previous = (
+                (received_at - previous_received_at).total_seconds()
+                if previous_received_at is not None
+                else None
+            )
+            if (
+                elapsed_since_previous is not None
+                and 0 <= elapsed_since_previous < RESOURCE_SNAPSHOT_MIN_PERSIST_INTERVAL_SECONDS
+            ):
+                return False
+            runtime_metadata["resource_snapshot"] = snapshot_payload
+            runtime_metadata["resource_snapshot_received_at"] = received_at.isoformat()
+            await update_executor_runtime_state(
+                session,
+                executor_id,
+                runtime_metadata=runtime_metadata,
+                last_observed_at=received_at,
+            )
+            await session.commit()
+    return True
+
+
 async def _invalidate_mcp_oauth_tokens_for_runtime_failures(
     app: Any,
     row: Any,
     *,
     runtime_metadata: dict[str, Any],
 ) -> None:
-    """Invalidate OAuth tokens rejected by MCP resource servers and request one retry."""
+    """Try one controller-owned refresh after an MCP resource rejects authorization."""
 
     service = getattr(app.state.providers, "mcp_oauth_service", None)
     if service is None:
@@ -318,18 +440,51 @@ async def _invalidate_mcp_oauth_tokens_for_runtime_failures(
     failed_server_ids = _authorization_failed_mcp_server_ids(runtime_metadata)
     if not failed_server_ids:
         return
+    runtime_servers = {
+        item.get("server_id"): item
+        for item in runtime_metadata.get("mcp_servers", [])
+        if isinstance(item, dict) and isinstance(item.get("server_id"), str)
+    }
 
-    invalidated = False
     for server_id in failed_server_ids:
         try:
-            marked = await service.mark_token_invalid_for_server(
-                user_email=str(getattr(row, "owner_email", "") or ""),
-                server_id=server_id,
-                reason="mcp_resource_authorization_failed",
+            item = runtime_servers.get(server_id, {})
+            raw_challenge = item.get("authorization_challenge")
+            challenge = (
+                {str(key): str(value) for key, value in raw_challenge.items()}
+                if isinstance(raw_challenge, dict)
+                else None
+            )
+            if item.get("auth_error") == "insufficient_scope":
+                await service.require_reauthorization_for_server(
+                    user_email=str(getattr(row, "owner_email", "") or ""),
+                    server_id=server_id,
+                    reason="insufficient_scope",
+                    authorization_challenge=challenge,
+                )
+            else:
+                await service.refresh_token_for_server_id(
+                    user_email=str(getattr(row, "owner_email", "") or ""),
+                    server_id=server_id,
+                    force=True,
+                    reason="mcp_resource_authorization_failed",
+                )
+        except MCPOAuthError as exc:
+            _logger.warning(
+                "executor_runtime: MCP OAuth recovery did not complete",
+                extra={
+                    "extra_data": {
+                        "executor_id": row.executor_id,
+                        "server_id": server_id,
+                        "reason": exc.reason or "refresh_failed",
+                        "retryable": exc.retryable,
+                        "outcome_unknown": exc.outcome_unknown,
+                    }
+                },
             )
         except Exception:
             _logger.warning(
-                "executor_runtime: failed to invalidate rejected MCP OAuth token",
+                "executor_runtime: failed to recover rejected MCP OAuth token",
                 extra={
                     "extra_data": {
                         "executor_id": row.executor_id,
@@ -338,30 +493,6 @@ async def _invalidate_mcp_oauth_tokens_for_runtime_failures(
                 },
                 exc_info=True,
             )
-            continue
-        invalidated = invalidated or bool(marked)
-
-    if not invalidated:
-        return
-
-    async with app.state.session_factory() as session:
-        bumped = await bump_executor_reconfigure_generation(
-            session,
-            row.executor_id,
-            runtime_state="reconfiguring",
-        )
-        await session.commit()
-    if not bumped:
-        return
-    _logger.info(
-        "executor_runtime: scheduled executor reconfigure after MCP OAuth token invalidation",
-        extra={
-            "extra_data": {
-                "executor_id": row.executor_id,
-                "server_ids": failed_server_ids,
-            }
-        },
-    )
 
 
 def _authorization_failed_mcp_server_ids(runtime_metadata: dict[str, Any]) -> list[str]:
@@ -379,6 +510,11 @@ def _authorization_failed_mcp_server_ids(runtime_metadata: dict[str, Any]) -> li
         if item.get("authorization_required") is not True:
             continue
         if item.get("status") != "failed":
+            continue
+        if item.get("status_code") != 401 and item.get("auth_error") not in {
+            "invalid_token",
+            "insufficient_scope",
+        }:
             continue
         server_ids.append(server_id)
         seen.add(server_id)
@@ -444,6 +580,11 @@ async def _build_configure_payload(
         row, app.state.providers
     )
     web_config = await _resolve_web_config(app.state.providers, row.owner_email)
+    executor_config = row.config if isinstance(row.config, dict) else {}
+    inference_config = resolve_executor_local_inference_config(executor_config)
+    ollama_runtime = inference_config.ollama_runtime.model_copy(
+        update={"management_enabled": inference_config.ollama_management_enabled}
+    )
     scoped_secrets.update(web_config.get("web_secrets", {}))
     skill_manifests: list[dict[str, Any]] = []
     try:
@@ -498,6 +639,9 @@ async def _build_configure_payload(
             exc_info=True,
         )
 
+    previous_metadata = getattr(row, "runtime_metadata", None) or {}
+    previous_platform = previous_metadata.get("platform")
+    previous_environment = previous_metadata.get("environment")
     metadata = {
         "schema_version": RUNTIME_METADATA_SCHEMA_VERSION,
         "configure_capabilities": [CONFIGURE_CAPABILITY_MCP_RUNTIME_STATUS],
@@ -506,9 +650,24 @@ async def _build_configure_payload(
         "mcp_servers": [],
         "warnings": [],
         "config_version": desired_version,
-        "platform": {},
-        "environment": {},
+        "platform": dict(previous_platform) if isinstance(previous_platform, dict) else {},
+        "environment": (
+            dict(previous_environment) if isinstance(previous_environment, dict) else {}
+        ),
     }
+    previous_snapshot = normalize_executor_resource_snapshot(
+        previous_metadata.get("resource_snapshot")
+    )
+    if previous_snapshot is not None:
+        metadata["resource_snapshot"] = previous_snapshot.model_dump(
+            mode="json",
+            exclude={"freshness"},
+        )
+        previous_received_at = _coerce_utc_datetime(
+            previous_metadata.get("resource_snapshot_received_at")
+        )
+        if previous_received_at is not None:
+            metadata["resource_snapshot_received_at"] = previous_received_at.isoformat()
     if mcp_metadata:
         metadata["mcp_servers"] = list(mcp_metadata.get("mcp_servers") or [])
         metadata["warnings"] = list(mcp_metadata.get("warnings") or [])
@@ -516,7 +675,14 @@ async def _build_configure_payload(
         "config_version": desired_version,
         "enabled_tools": row.enabled_tools or [],
         "enabled_tool_groups": row.enabled_tool_groups or [],
-        "config": row.config or {},
+        "config": {
+            **executor_config,
+            "local_inference_enabled": inference_config.local_inference_enabled,
+            "ollama_runtime": ollama_runtime.model_dump(
+                mode="json",
+                exclude={"endpoint"},
+            ),
+        },
         "mcp_servers": [server.model_dump(mode="json") for server in mcp_servers],
         "secrets": scoped_secrets,
         "web_config": {
@@ -544,7 +710,7 @@ async def _build_configure_payload(
                 "web_browser_fetch_network_idle_after_dom_seconds", 3
             ),
             "web_browser_fetch_headed_fallback_enabled": web_config.get(
-                "web_browser_fetch_headed_fallback_enabled", False
+                "web_browser_fetch_headed_fallback_enabled", True
             ),
             "web_concurrency": web_config.get("web_concurrency", {}),
             "web_available_backends": web_config.get("web_available_backends", ["direct"]),
@@ -556,6 +722,8 @@ async def _build_configure_payload(
             ),
         },
         "skill_manifests": skill_manifests,
+        "ollama_runtime": ollama_runtime.model_dump(mode="json"),
+        "local_inference_enabled": inference_config.local_inference_enabled,
     }
     return payload, metadata
 
@@ -570,23 +738,245 @@ def _merge_runtime_metadata(base: dict[str, Any], result: dict[str, Any]) -> dic
     merged.setdefault("warnings", [])
     warnings = merged.get("warnings")
     if isinstance(warnings, list):
-        base_warnings = base.get("warnings") if isinstance(base.get("warnings"), list) else []
-        result_warnings = result.get("warnings") if isinstance(result.get("warnings"), list) else []
+        base_warning_value = base.get("warnings")
+        result_warning_value = result.get("warnings")
+        base_warnings = base_warning_value if isinstance(base_warning_value, list) else []
+        result_warnings = result_warning_value if isinstance(result_warning_value, list) else []
         merged["warnings"] = [
             str(item)[:MAX_SAFE_ERROR_LENGTH] for item in [*base_warnings, *result_warnings]
         ][:10]
     else:
         merged["warnings"] = []
-    base_mcp_servers = base.get("mcp_servers") if isinstance(base.get("mcp_servers"), list) else []
-    result_mcp_servers = (
-        result.get("mcp_servers") if isinstance(result.get("mcp_servers"), list) else []
-    )
+    base_mcp_value = base.get("mcp_servers")
+    result_mcp_value = result.get("mcp_servers")
+    base_mcp_servers = base_mcp_value if isinstance(base_mcp_value, list) else []
+    result_mcp_servers = result_mcp_value if isinstance(result_mcp_value, list) else []
     merged["mcp_servers"] = [*base_mcp_servers, *result_mcp_servers]
     return merged
 
 
+def _sanitize_reported_runtime_metadata(value: Any) -> dict[str, Any]:
+    """Allowlist bounded diagnostics returned by an authenticated executor."""
+
+    if not isinstance(value, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    configure_capabilities = value.get("configure_capabilities")
+    if isinstance(configure_capabilities, list):
+        sanitized["configure_capabilities"] = _bounded_string_list(
+            configure_capabilities,
+            max_items=32,
+            max_length=64,
+        )
+    platform = value.get("platform")
+    if isinstance(platform, dict):
+        sanitized_platform = _string_mapping(
+            platform,
+            allowed={"os", "arch", "python"},
+            max_value_length=128,
+        )
+        if sanitized_platform:
+            sanitized["platform"] = sanitized_platform
+    environment = value.get("environment")
+    if isinstance(environment, dict):
+        sanitized_environment = _string_mapping(
+            environment,
+            allowed={"user", "home", "cwd", "hostname", "source", "observed_at"},
+            max_value_length=1024,
+        )
+        if sanitized_environment:
+            sanitized["environment"] = sanitized_environment
+    ollama_runtime = _ollama_runtime_capability(value.get("ollama_runtime"))
+    if ollama_runtime is not None:
+        sanitized["ollama_runtime"] = ollama_runtime.model_dump(mode="json")
+    if isinstance(value.get("local_inference_enabled"), bool):
+        sanitized["local_inference_enabled"] = value["local_inference_enabled"]
+    mcp_servers = value.get("mcp_servers")
+    if isinstance(mcp_servers, list):
+        sanitized["mcp_servers"] = [
+            _sanitize_mcp_server_status(item)
+            for item in mcp_servers[:128]
+            if isinstance(item, dict)
+        ]
+    warnings = value.get("warnings")
+    if isinstance(warnings, list):
+        sanitized["warnings"] = [
+            item[:MAX_SAFE_ERROR_LENGTH] for item in warnings[:128] if isinstance(item, str)
+        ]
+    for issue_key in ("runtime_issues", "degraded_issues"):
+        issues = value.get(issue_key)
+        if isinstance(issues, list):
+            sanitized[issue_key] = [
+                _bounded_mapping(
+                    item,
+                    allowed={"source", "kind", "title", "severity", "message"},
+                )
+                for item in issues[:128]
+                if isinstance(item, dict)
+            ]
+    officecli = value.get("officecli")
+    if isinstance(officecli, dict):
+        sanitized["officecli"] = _bounded_mapping(
+            officecli,
+            allowed={"available", "enabled", "version", "platform", "error"},
+        )
+    for key in (
+        "officecli_available",
+        "officecli_enabled",
+        "officecli_auto_install",
+        "officecli_version",
+        "officecli_platform",
+        "officecli_error",
+        "lsp_init_failed",
+        "lsp_warning",
+    ):
+        if key not in value:
+            continue
+        item = value.get(key)
+        if isinstance(item, (bool, int)) or item is None:
+            sanitized[key] = item
+        elif isinstance(item, str):
+            sanitized[key] = item[:MAX_SAFE_ERROR_LENGTH]
+    return sanitized
+
+
+def _sanitize_configure_result_runtime_metadata(
+    value: Any,
+    *,
+    received_at: datetime,
+) -> dict[str, Any]:
+    sanitized = _sanitize_reported_runtime_metadata(value)
+    snapshot = normalize_executor_resource_snapshot(
+        value.get("resource_snapshot") if isinstance(value, dict) else None
+    )
+    if snapshot is not None:
+        sanitized["resource_snapshot"] = snapshot.model_dump(
+            mode="json",
+            exclude={"freshness"},
+        )
+        sanitized["resource_snapshot_received_at"] = received_at.isoformat()
+    return sanitized
+
+
+def _string_mapping(
+    value: dict[str, Any],
+    *,
+    allowed: set[str],
+    max_value_length: int,
+) -> dict[str, str]:
+    return {
+        key: item[:max_value_length]
+        for key, item in value.items()
+        if key in allowed and isinstance(item, str)
+    }
+
+
+def _bounded_mapping(
+    value: dict[str, Any],
+    *,
+    allowed: set[str],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key not in allowed:
+            continue
+        if isinstance(item, str):
+            result[key] = item[:MAX_SAFE_ERROR_LENGTH]
+        elif isinstance(item, (bool, int)) or item is None:
+            result[key] = item
+    return result
+
+
+def _bounded_string_list(
+    value: list[Any],
+    *,
+    max_items: int,
+    max_length: int,
+) -> list[str]:
+    return [item[:max_length] for item in value[:max_items] if isinstance(item, str)]
+
+
+def _sanitize_mcp_server_status(value: dict[str, Any]) -> dict[str, Any]:
+    result = _bounded_mapping(
+        value,
+        allowed={
+            "server_id",
+            "name",
+            "status",
+            "phase",
+            "error_class",
+            "timed_out",
+            "message",
+            "stderr_summary",
+            "tool_count",
+            "auth_error",
+            "authorization_required",
+            "status_code",
+            "www_authenticate",
+        },
+    )
+    challenge = value.get("authorization_challenge")
+    if isinstance(challenge, dict):
+        result["authorization_challenge"] = {
+            key[:64]: item[:1024]
+            for key, item in list(challenge.items())[:32]
+            if isinstance(key, str) and isinstance(item, str)
+        }
+    return result
+
+
 def _safe_error_message(message: str) -> str:
     return " ".join(message.split())[:MAX_SAFE_ERROR_LENGTH] or "unknown error"
+
+
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _ollama_runtime_capability(value: Any) -> OllamaRuntimeCapability | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        return OllamaRuntimeCapability.model_validate(value)
+    except Exception:
+        return None
+
+
+def _fast_path_local_inference_enabled(
+    row: Any,
+    runtime_metadata: dict[str, Any],
+) -> bool:
+    """Combine persisted desired intent with the last strict live advertisement."""
+
+    return executor_local_inference_config_confirmed(row)
+
+
+def _live_local_inference_capability_matches(
+    row: Any,
+    capabilities: ExecutorCapabilities,
+) -> bool:
+    """Require live flags and the effective endpoint to match desired config."""
+
+    desired = resolve_executor_local_inference_config(row.config or {})
+    advertised = capabilities.local_model_runtime
+    return (
+        desired.local_inference_enabled
+        and capabilities.inference
+        and capabilities.local_inference
+        and advertised is not None
+        and advertised.port == desired.ollama_runtime.port
+        and advertised.endpoint == desired.ollama_runtime.endpoint
+        and advertised.management_enabled is desired.ollama_management_enabled
+    )
 
 
 def _get_executor_lock(app: Any, executor_id: str) -> asyncio.Lock:
@@ -610,12 +1000,15 @@ def _executor_connection_metadata(
     environment: Any,
     platform: dict[str, Any],
     status: str,
+    owner_email: str | None,
     runtime_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "labels": labels,
         "platform": platform,
         "status": status,
+        "owner_email": owner_email,
+        "shared": is_shared_owner_email(owner_email),
     }
     if isinstance(environment, dict):
         metadata["environment"] = environment

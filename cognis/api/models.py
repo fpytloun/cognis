@@ -10,7 +10,9 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 from pydantic_core import PydanticCustomError
 
 from cognis.core.question_sets import normalize_questions, normalize_reply
+from cognis.models.config import GenerationPerformanceSnapshot
 from cognis.models.conversation_state import ConversationStateEnvelope
+from cognis.models.executor_resources import ExecutorResourceSnapshot
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import SessionPolicy, WorkflowState
 
@@ -160,6 +162,7 @@ class UserChatPreferences(BaseModel):
 
     show_thinking_blocks: bool = False
     group_tool_calls: bool = True
+    keep_assistant_messages_separate: bool = False
     show_internal_tool_calls: bool = False
 
 
@@ -221,14 +224,32 @@ class WebConfigStatusResponse(BaseModel):
     browser_fetch_navigation_timeout_seconds: int = 60
     browser_fetch_wait_until: str = "domcontentloaded"
     browser_fetch_network_idle_after_dom_seconds: int = 3
-    browser_fetch_headed_fallback_enabled: bool = False
+    browser_fetch_headed_fallback_enabled: bool = True
     tavily_configured: bool = False
+    tavily_enabled: bool = True
     brave_configured: bool = False
+    brave_enabled: bool = True
     searxng_url: str = ""
+    searxng_engines: str = ""
+    searxng_categories: str = ""
+    searxng_language: str = ""
     searxng_configured: bool = False
+    searxng_enabled: bool = True
     available_backends: list[str] = Field(default_factory=lambda: ["direct"])
     available_search_backends: list[str] = Field(default_factory=lambda: ["direct"])
     available_fetch_backends: list[str] = Field(default_factory=lambda: ["direct"])
+
+
+class WebBackendUpdateRequest(BaseModel):
+    """Editable configuration for one optional web backend."""
+
+    enabled: bool
+    api_key: str | None = None
+    remove_configuration: bool = False
+    searxng_url: str | None = None
+    searxng_engines: str | None = None
+    searxng_categories: str | None = None
+    searxng_language: str | None = None
 
 
 class ConversationContextModel(BaseModel):
@@ -263,6 +284,13 @@ class ConversationOpenRequest(BaseModel):
     agent_id: str
     agent_profile_id: str | None = None
     context_type: str = "web"
+    include_state: bool = Field(
+        True,
+        description=(
+            "Include the legacy conversation_state snapshot. Chat v2 callers should "
+            "disable this and load canonical state from the chat v2 snapshot endpoint."
+        ),
+    )
     candidate_conversation_ids: list[str] = Field(default_factory=list)
     candidate_conversations: list[ConversationOpenCandidate] = Field(default_factory=list)
 
@@ -307,7 +335,15 @@ class ConversationResponse(BaseModel):
     last_read_at: datetime | None = None
     has_unread: bool = False
     has_active_turn: bool = False
-    managed_agent: dict[str, Any] | None = None
+    managed_agent: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Additive managed-conversation lifecycle payload. Correlate "
+            "last_result_summary with last_result_turn_id; "
+            "last_settlement_is_current indicates whether that settlement "
+            "belongs to the projected current/terminal turn."
+        ),
+    )
     created_at: datetime | None = None
     updated_at: datetime | None = None
     conversation_state: ConversationStateEnvelope | None = None
@@ -323,7 +359,13 @@ class ManagedConversationActionRequest(BaseModel):
 class ManagedConversationActionResponse(BaseModel):
     status: str
     conversation_id: str
-    managed_agent: dict[str, Any] | None = None
+    managed_agent: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Additive managed-conversation lifecycle payload with explicit "
+            "active_turn_id and last_result_turn_id correlation."
+        ),
+    )
     result: dict[str, Any] | None = None
 
 
@@ -389,6 +431,7 @@ class ActiveToolOutputSnapshotResponse(BaseModel):
     tool_output_artifact_id: str | None = None
     anchors_available: bool = False
     anchor_count: int = 0
+    managed_conversation: dict[str, Any] | None = None
     updated_at: str | None = None
 
 
@@ -568,13 +611,19 @@ class SessionResponse(BaseModel):
     updated_at: datetime | None = None
 
 
-class SessionEventsResponse(BaseModel):
+class IntarisSessionDetailResponse(BaseModel):
     session_id: str
-    items: list[MessageEventResponse]
-    timeline_items: list[dict[str, Any]] = Field(default_factory=list)
-    last_seq: int = 0
-    has_more: bool = False
-    active_thinking: list[ActiveThinkingSnapshotResponse] = Field(default_factory=list)
+    intaris_session_id: str
+    title: str | None = None
+    intention: str | None = None
+    summary: str | None = None
+    status: str
+    total_calls: int
+    approved_count: int
+    denied_count: int
+    escalated_count: int
+    context_usage: dict[str, Any] | None = None
+    last_generation: GenerationPerformanceSnapshot | None = None
 
 
 class SessionCancelResponse(BaseModel):
@@ -701,6 +750,9 @@ class SidebarProjectionResponse(BaseModel):
     agent_direct_chats: list[AgentDirectChatResponse] = Field(default_factory=list)
     conversations: CursorPage[ConversationResponse]
     context_types: list[str] = Field(default_factory=list)
+    removed_conversation_ids: list[str] = Field(default_factory=list)
+    full_resync_required: bool = False
+    sync_timestamp: datetime | None = None
 
 
 class AgentCardResponse(BaseModel):
@@ -746,6 +798,17 @@ class SettingResponse(BaseModel):
     key: str
     value: Any
     category: str
+    section: str
+    label: str
+    description: str
+    default_value: Any = None
+    value_type: str
+    options: list[Any] = Field(default_factory=list)
+    minimum: int | float | None = None
+    maximum: int | float | None = None
+    unit: str | None = None
+    is_overridden: bool = False
+    apply_scope: str
     updated_by: str | None = None
     updated_at: datetime | None = None
 
@@ -1186,7 +1249,10 @@ class WorkflowRunResponse(BaseModel):
 
 class DeliverableResponse(BaseModel):
     deliverable_id: str
-    step_run_id: str
+    step_run_id: str | None = None
+    conversation_id: str | None = None
+    session_id: str | None = None
+    turn_id: str | None = None
     version: int
     attempt_number: int = 1
     content: str
@@ -1194,6 +1260,10 @@ class DeliverableResponse(BaseModel):
     title: str | None = None
     target: str | None = None
     outputs: dict[str, Any] = Field(default_factory=dict)
+    rich_payload: dict[str, Any] | None = None
+    validation_warnings: list[str] = Field(default_factory=list)
+    render_metadata: dict[str, Any] = Field(default_factory=dict)
+    export_metadata: dict[str, Any] = Field(default_factory=dict)
     status: str
     evaluator_feedback: str | None = None
     created_at: datetime | None = None
@@ -1750,6 +1820,57 @@ class SkillUpdateRequest(BaseModel):
     agent_id: str | None = None
 
 
+class SkillMappingPatch(BaseModel):
+    set: dict[str, Any] = Field(default_factory=dict)
+    remove: list[str] = Field(default_factory=list)
+
+
+class SkillNamedListPatch(BaseModel):
+    upsert: list[dict[str, Any]] = Field(default_factory=list)
+    remove: list[str] = Field(default_factory=list)
+
+
+class SkillAssetListPatch(BaseModel):
+    upsert: list[SkillAssetInput] = Field(default_factory=list)
+    remove: list[str] = Field(default_factory=list)
+
+
+class SkillPatchRequest(BaseModel):
+    """Partial skill update; omitted fields are preserved."""
+
+    expected_current_version_id: str | None = None
+    expected_content_hash: str | None = None
+    name: str | None = None
+    description: str | None = None
+    instructions: str | None = None
+    tags: list[str] | None = None
+    attach_to_all_agents: bool | None = None
+    linked_tool_ids: list[str] | None = None
+    secret_placeholders: list[str] | None = None
+    prompt_templates: SkillMappingPatch | None = None
+    tools: SkillNamedListPatch | None = None
+    steps: SkillNamedListPatch | None = None
+    assets: SkillAssetListPatch | None = None
+
+    @model_validator(mode="after")
+    def reject_null_non_clearable_fields(self) -> SkillPatchRequest:
+        for field in (
+            "name",
+            "instructions",
+            "tags",
+            "attach_to_all_agents",
+            "linked_tool_ids",
+            "secret_placeholders",
+            "prompt_templates",
+            "tools",
+            "steps",
+            "assets",
+        ):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
+        return self
+
+
 class SkillImportRequest(BaseModel):
     url: str | None = None
     content: str | None = None
@@ -1803,11 +1924,17 @@ class ExecutorConfigResponse(BaseModel):
     enabled_tools: list[str] = Field(default_factory=list)
     enabled_tool_groups: list[str] = Field(default_factory=list)
     config: dict[str, Any] = Field(default_factory=dict)
+    local_inference_enabled: bool = True
+    ollama_management_enabled: bool = True
+    ollama_port: int = 11434
+    ollama_endpoint: str = "http://127.0.0.1:11434"
+    local_inference_config_status: Literal["applying", "confirmed", "unconfirmed"] = "unconfirmed"
     status: str = "active"
     runtime_state: str = "offline"
     desired_config_version: int = 0
     applied_config_version: int = 0
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
+    resource_snapshot: ExecutorResourceSnapshot | None = None
     last_observed_at: datetime | None = None
     is_default: bool = False
     shared: bool = False
@@ -1829,6 +1956,7 @@ class ExecutorCreateRequest(BaseModel):
 
 
 class ExecutorUpdateRequest(BaseModel):
+    expected_config_version: int | None = Field(default=None, ge=0)
     name: str | None = None
     labels: dict[str, Any] | None = None
     enabled_tools: list[str] | None = None

@@ -6,8 +6,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from cognis.channels.delivery import ChannelDeliveryService
+from cognis.channels.delivery import (
+    ChannelDeliveryService,
+    ChannelDeliveryStatus,
+    ChannelProjection,
+)
 from cognis.core.events import Event, EventBus, EventType
+from cognis.models.channel import ChannelCapabilities, OutboundMessage
 
 
 def _make_service() -> ChannelDeliveryService:
@@ -262,6 +267,11 @@ async def test_materialize_media_attachment_loads_artifact_bytes(
             )()
         ),
     )
+    authorized = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.channels.delivery._artifact_authorized_for_delivery",
+        authorized,
+    )
 
     media, fallback_text, materialized = await service._materialize_media_attachment(  # noqa: SLF001
         {
@@ -270,12 +280,15 @@ async def test_materialize_media_attachment_loads_artifact_bytes(
             "mime_type": "application/pdf",
             "filename": "report.pdf",
             "size_bytes": 9,
-        }
+        },
+        owner_email="user@example.com",
+        conversation_id="conv-1",
     )
 
     assert materialized is True
     assert fallback_text is None
     assert media.content_b64 == base64.b64encode(b"pdf-bytes").decode("ascii")
+    authorized.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -313,6 +326,10 @@ async def test_materialize_media_attachment_falls_back_to_artifact_link_on_failu
         raise RuntimeError("artifact unavailable")
 
     manager._artifact_store.async_load = boom  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "cognis.channels.delivery._artifact_authorized_for_delivery",
+        AsyncMock(return_value=True),
+    )
 
     media, fallback_text, materialized = await service._materialize_media_attachment(  # noqa: SLF001
         {
@@ -320,13 +337,77 @@ async def test_materialize_media_attachment_falls_back_to_artifact_link_on_failu
             "url": "https://cognis.example.com/diagram.png",
             "mime_type": "image/png",
             "filename": "diagram.png",
-        }
+        },
+        owner_email="user@example.com",
+        conversation_id="conv-1",
     )
 
     assert media is not None
     assert materialized is True
     assert fallback_text is None
     assert media.url == "https://cognis.example.com/diagram.png"
+
+
+@pytest.mark.asyncio
+async def test_materialize_media_attachment_fails_closed_when_authorization_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    manager = _Manager()
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: manager,
+    )
+    load = AsyncMock()
+    manager._artifact_store.async_load = load  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "cognis.store.queries.get_artifact_record",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    media, fallback_text, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+        {
+            "artifact_id": "artifact-denied",
+            "url": "https://cognis.example.com/private.pdf",
+        },
+        owner_email="user@example.com",
+        conversation_id="conv-1",
+    )
+
+    assert media is None
+    assert fallback_text is None
+    assert materialized is False
+    load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_materialize_media_attachment_fails_closed_without_artifact_store() -> None:
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: type("_Manager", (), {"_artifact_store": None})(),
+    )
+
+    media, fallback_text, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+        {
+            "artifact_id": "artifact-denied",
+            "url": "https://cognis.example.com/private.pdf",
+        },
+        owner_email="user@example.com",
+        conversation_id="conv-1",
+    )
+
+    assert media is None
+    assert fallback_text is None
+    assert materialized is False
 
 
 @pytest.mark.asyncio
@@ -392,6 +473,10 @@ async def test_deliver_outbox_sends_attachment_only_follow_up(
     monkeypatch.setattr(
         "cognis.store.queries.mark_channel_delivery_sent", AsyncMock(return_value=True)
     )
+    monkeypatch.setattr(
+        "cognis.store.queries.set_channel_delivery_attachments",
+        AsyncMock(return_value=True),
+    )
     monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_failed", AsyncMock())
     monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_uncertain", AsyncMock())
 
@@ -416,11 +501,108 @@ async def test_deliver_outbox_sends_attachment_only_follow_up(
 
 
 @pytest.mark.asyncio
-async def test_send_to_route_marks_signal_attachment_fallback_as_partial(
+async def test_deliver_outbox_keeps_partial_multipart_delivery_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _Session()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _Manager(),
+    )
+    service._send_to_route = AsyncMock(return_value=ChannelDeliveryStatus.PARTIAL)  # type: ignore[method-assign]
+    row = type(
+        "OutboxRow",
+        (),
+        {
+            "channel_type": "matrix",
+            "account_id": "acct-1",
+            "chat_id": "room-1",
+            "thread_id": None,
+            "conversation_id": "conv-1",
+            "completed_chunk_count": 2,
+            "projection_digest": "digest",
+        },
+    )()
+    claim = AsyncMock(return_value=row)
+    mark_sent = AsyncMock(return_value=True)
+    mark_failed = AsyncMock(return_value=True)
+    mark_uncertain = AsyncMock(return_value=True)
+    monkeypatch.setattr("cognis.store.queries.claim_channel_delivery_outbox", claim)
+    monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_sent", mark_sent)
+    monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_failed", mark_failed)
+    monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_uncertain", mark_uncertain)
+    monkeypatch.setattr(
+        "cognis.store.queries.mark_channel_delivery_chunk_sent",
+        AsyncMock(return_value=True),
+    )
+
+    await service._deliver_outbox(  # noqa: SLF001
+        delivery_id="cdel-partial",
+        final_content="multipart",
+        fallback_text=None,
+        ignore_next_attempt=True,
+    )
+
+    mark_sent.assert_not_awaited()
+    mark_uncertain.assert_not_awaited()
+    mark_failed.assert_awaited_once()
+    assert mark_failed.await_args.kwargs["last_error"] == "channel_send_failed"
+    assert service._send_to_route.await_args.kwargs["start_chunk_index"] == 2
+    assert service._send_to_route.await_args.kwargs["expected_projection_digest"] == "digest"
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_leaves_normal_non_deliverable_message_unchanged() -> None:
+    class _Adapter:
+        capabilities = ChannelCapabilities(supports_markdown=True, max_message_length=4000)
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send_message(self, message: OutboundMessage) -> str:
+            self.sent.append(message.content)
+            return "msg-1"
+
+    adapter = _Adapter()
+
+    class _TextManager:
+        _artifact_store = None
+
+        def find_adapter_for_channel(
+            self, channel_type: str, account_id: str
+        ) -> tuple[object, object]:
+            assert channel_type == "matrix"
+            assert account_id == "acct-1"
+            return adapter, object()
+
+    service = ChannelDeliveryService(
+        session_factory=AsyncMock(),
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _TextManager(),
+    )
+
+    status = await service._send_to_route(  # noqa: SLF001
+        channel_type="matrix",
+        account_id="acct-1",
+        chat_id="room-1",
+        thread_id=None,
+        content="Normal **markdown** message",
+    )
+
+    assert status == "sent"
+    assert adapter.sent == ["Normal **markdown** message"]
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_does_not_send_when_attachment_materialization_is_partial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Adapter:
-        capabilities = type("Caps", (), {"max_message_length": 4000})()
+        capabilities = ChannelCapabilities(max_message_length=4000)
 
         def __init__(self) -> None:
             self.sent_message: object | None = None
@@ -461,15 +643,106 @@ async def test_send_to_route_marks_signal_attachment_fallback_as_partial(
         media=[{"artifact_id": "img_1"}],
     )
 
-    assert status == "partial"
-    assert adapter.sent_message is not None
-    assert adapter.sent_message.content == "Artifact ready.\n\nhttps://cognis.example.com/image.png"
+    assert status == ChannelDeliveryStatus.INCOMPLETE
+    assert adapter.sent_message is None
+
+
+@pytest.mark.asyncio
+async def test_send_to_conversation_does_not_treat_partial_as_delivered() -> None:
+    service = _make_service()
+    service._resolve_channel = AsyncMock(return_value=("matrix", "acct-1", "room-1", None))  # type: ignore[method-assign]
+    service._send_to_route = AsyncMock(return_value="partial")  # type: ignore[method-assign]
+
+    delivered = await service.send_to_conversation("conv-1", "content")
+
+    assert delivered is False
+    service._send_to_route.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_to_route_resumes_after_failure_without_duplicate_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = ["chunk one", "chunk two", "chunk three", "chunk four"]
+
+    class _Adapter:
+        capabilities = ChannelCapabilities(
+            supports_markdown=True,
+            supports_idempotent_send=True,
+            max_message_length=100,
+        )
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.fail_once = True
+
+        async def send_message(self, message: OutboundMessage) -> str:
+            if message.content == "chunk three" and self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("transient")
+            self.sent.append(message.content)
+            return f"msg-{len(self.sent)}"
+
+    adapter = _Adapter()
+
+    class _ChunkManager(_Manager):
+        def find_adapter_for_channel(
+            self, channel_type: str, account_id: str
+        ) -> tuple[object, object]:
+            return adapter, object()
+
+    service = ChannelDeliveryService(
+        session_factory=AsyncMock(),
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _ChunkManager(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_deliverable_channel_projection",
+        AsyncMock(return_value=ChannelProjection(chunks=chunks, identity="dlv-resume:v1")),
+    )
+    progress: list[tuple[int, int, str]] = []
+
+    async def save_progress(completed: int, total: int, digest: str) -> bool:
+        progress.append((completed, total, digest))
+        return True
+
+    first = await service._send_to_route(  # noqa: SLF001
+        channel_type="matrix",
+        account_id="acct-1",
+        chat_id="room-1",
+        thread_id=None,
+        content="fallback",
+        deliverable_id="dlv-resume",
+        on_chunk_sent=save_progress,
+        delivery_idempotency_key="cdel-resume",
+    )
+    assert first == ChannelDeliveryStatus.PARTIAL
+    assert [item[0] for item in progress] == [1, 2]
+
+    second = await service._send_to_route(  # noqa: SLF001
+        channel_type="matrix",
+        account_id="acct-1",
+        chat_id="room-1",
+        thread_id=None,
+        content="fallback",
+        deliverable_id="dlv-resume",
+        start_chunk_index=progress[-1][0],
+        expected_projection_digest=progress[-1][2],
+        expected_projected_chunk_count=len(chunks),
+        on_chunk_sent=save_progress,
+        delivery_idempotency_key="cdel-resume",
+    )
+
+    assert second == ChannelDeliveryStatus.SENT
+    assert adapter.sent == chunks
+    assert [item[0] for item in progress] == [1, 2, 3, 4]
 
 
 @pytest.mark.asyncio
 async def test_send_to_route_treats_missing_signal_message_id_as_failure() -> None:
     class _Adapter:
-        capabilities = type("Caps", (), {"max_message_length": 4000})()
+        capabilities = ChannelCapabilities(max_message_length=4000)
 
         async def send_message(self, message: object) -> str | None:
             return None
@@ -499,13 +772,13 @@ async def test_send_to_route_treats_missing_signal_message_id_as_failure() -> No
         media=None,
     )
 
-    assert status == "failed"
+    assert status == ChannelDeliveryStatus.UNCERTAIN
 
 
 @pytest.mark.asyncio
 async def test_send_to_route_treats_blank_signal_message_id_as_failure() -> None:
     class _Adapter:
-        capabilities = type("Caps", (), {"max_message_length": 4000})()
+        capabilities = ChannelCapabilities(max_message_length=4000)
 
         async def send_message(self, message: object) -> str | None:
             return ""
@@ -535,13 +808,13 @@ async def test_send_to_route_treats_blank_signal_message_id_as_failure() -> None
         media=None,
     )
 
-    assert status == "failed"
+    assert status == ChannelDeliveryStatus.UNCERTAIN
 
 
 @pytest.mark.asyncio
 async def test_send_to_route_allows_non_signal_media_send_without_message_id() -> None:
     class _Adapter:
-        capabilities = type("Caps", (), {"max_message_length": 4000})()
+        capabilities = ChannelCapabilities(max_message_length=4000)
 
         async def send_message(self, message: object) -> str | None:
             return None

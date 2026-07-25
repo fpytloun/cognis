@@ -36,6 +36,10 @@ import X from 'lucide-svelte/icons/x';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import ChatV2TimelineList from '$lib/components/chat-v2/ChatV2TimelineList.svelte';
+  import ScopedChatV2Timeline from '$lib/components/chat-v2/ScopedChatV2Timeline.svelte';
+  import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
+  import SessionDetailsContent from '$lib/components/session/SessionDetailsContent.svelte';
+  import SessionDetailsPanel from '$lib/components/session/SessionDetailsPanel.svelte';
   import TimelineTodoDrawer from '$lib/components/timeline/TimelineTodoDrawer.svelte';
   import TimelineViewport from '$lib/components/timeline/TimelineViewport.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
@@ -49,6 +53,7 @@ import X from 'lucide-svelte/icons/x';
     buildConversationUrl,
     CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
     CHAT_USER_SCROLL_DELTA_THRESHOLD_PX,
+    CHAT_TIMELINE_EXPAND_DOWN_THRESHOLD_PX,
     conversationPendingSnapshotFlags,
     conversationMatchesSidebarProjectionFilter,
     conversationAttentionDotClass,
@@ -66,6 +71,9 @@ import X from 'lucide-svelte/icons/x';
     lastOpenedConversationEntry,
     managedConversationTurnState,
     mergeConversationPreservingActivity,
+    mergeConversationRowPatch,
+    mergeSidebarConversationRows,
+    removeSidebarConversationRow,
     getNextHistoryAfterSeq,
     isNearScrollBottom,
     isMissingSessionError,
@@ -82,6 +90,9 @@ import X from 'lucide-svelte/icons/x';
     parseConversationStatusFilter,
     parseLastOpenedConversationEntry,
     pendingInputRequestKind,
+    conversationStatePatchForAuthority,
+    conversationStateTurnActivity,
+    shouldApplyLegacyLifecycleFrame,
     questionSetReplyText,
     rememberSidebarProjectionSnapshot,
     serializeLastOpenedConversationEntry,
@@ -90,9 +101,37 @@ import X from 'lucide-svelte/icons/x';
     setConversationStatusSearchParam,
     chatScrollDimensionsChanged,
     shouldApplyScrollRestore,
+    anchoredScrollTop,
+    timelineWindowEnd,
+    timelineWindowSize,
+    timelineWindowHasHiddenTail,
+    shouldAutoLoadOlderForViewport,
+    expandWindowUp,
+    expandWindowUpPreservingLiveTail,
+    expandWindowDown,
+    windowAfterPrepend,
+    windowAfterViewportFillBackfill,
+    clampWindow,
+    freezeTailWindow,
+    TIMELINE_WINDOW_TARGET_ROWS as TIMELINE_WINDOW_TARGET_ROWS_HELPER,
+    TIMELINE_WINDOW_PAGE_ROWS as TIMELINE_WINDOW_PAGE_ROWS_HELPER,
+    TIMELINE_WINDOW_MAX_ROWS as TIMELINE_WINDOW_MAX_ROWS_HELPER,
+    TIMELINE_VIEWPORT_FILL_MAX_ATTEMPTS,
+    type TimelineWindow,
     shouldAttemptStaleRuntimeRefresh,
+    shouldApplyPendingNotificationRefresh,
     shouldDebounceConversationViewRefresh,
+    shouldDebounceSidebarResync,
+    shouldRecoverMissingConversationRow,
+    shouldResetPendingDirectQuestionForm,
+    isConversationSwitchStale,
+    shouldApplyChatSendFailureSideEffects,
+    shouldApplyChatV2Recovery,
+    shouldClearRecoverableRetry,
+    settleWithTimeout,
     shouldReconcileAfterReconnect,
+    nextControllerRecoveryDelayMs,
+    shouldContinueControllerRecovery,
     shouldPreserveLiveTailOnResize,
     shouldRefreshForStaleRuntime,
     isRuntimeSnapshotOlderThanView,
@@ -100,13 +139,14 @@ import X from 'lucide-svelte/icons/x';
     shouldSuppressPreSessionSocketError,
     nextConversationLoadId,
     nextPollDelayMs,
+    ChatV2ConversationLifecycle,
     type ChatModeTone,
     type ConversationStatusFilter,
     type PendingDirectQuestion,
     CHAT_STORAGE_KEYS,
+    CONVERSATION_SWITCH_TIMEOUT_MS,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
-  import { loadSessionLog, refreshSessionLog, type SessionLogState } from '$lib/session-log';
   import { edgeSwipe } from '$lib/actions/edgeSwipe';
   import { scrollPersist } from '$lib/actions/scrollPersist';
   import { auth } from '$lib/stores/auth';
@@ -145,7 +185,9 @@ import X from 'lucide-svelte/icons/x';
   import {
     cleanSearchSnippet,
     findLocalChatMatches,
+    findVisibleServerSearchTarget,
     mergeSearchResultsByTarget,
+    serverSearchFallbackTargetId,
     type ChatSearchResult,
     type LocalChatMatch
   } from '$lib/chat-search';
@@ -157,23 +199,20 @@ import X from 'lucide-svelte/icons/x';
     parseChatModeDirectiveInput,
     slashParameterSuggestionCommand
   } from '$lib/slash-commands';
-  import {
-    findPendingStepRequestInputCall,
-    parseTodoSnapshot,
-    type MessageTimelineItem,
-    timelinePatchContainsActiveWork,
-    type TimelineItem,
-    type TodoSnapshotItem
-  } from '$lib/chat';
   import { chatV2Api } from '$lib/chat-v2/api';
+  import { conversationTimelineScope } from '$lib/chat-v2/types';
   import { MemoryChatV2Outbox, createIndexedDbChatV2Outbox, type OutboxEntry } from '$lib/chat-v2/outbox';
   import { ChatV2Store } from '$lib/chat-v2/store.svelte';
-  import { selectRenderItems } from '$lib/chat-v2/selectors';
-  import { isRenderableChatV2Item } from '$lib/chat-v2/render-adapter';
+  import { isRenderableTimelineItem, selectLatestTodoState, selectPendingInputToolCall } from '$lib/chat-v2/selectors';
   import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
   import type { ChatRealtimeFrame, ChatSnapshot, TimelineItem as ChatV2TimelineItem } from '$lib/chat-v2/types';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
-  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, Escalation, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection, SlashCommandSuggestion } from '$lib/types/api';
+  import {
+    localPerformanceMetrics,
+    mergeLatestPerformance,
+    responsivenessBadge
+  } from '$lib/generation-performance';
+  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, ConversationTodoItem, Escalation, GenerationPerformanceSnapshot, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection, SlashCommandSuggestion } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
   import { isNonFatalWebSocketBackpressureError } from '$lib/ws/errors';
 
@@ -218,7 +257,8 @@ import X from 'lucide-svelte/icons/x';
   let sidebarProjectionFailed = $state(false);
   let currentConversation = $state<Conversation | null>(null);
   let sessions = $state<Session[]>([]);
-  let conversationTodoSnapshots = $state<Record<string, TodoSnapshotItem[]>>({});
+  type ChatTodo = ConversationTodoItem & { priority: string };
+  let conversationTodoSnapshots = $state<Record<string, ChatTodo[]>>({});
   let conversationSubloadsLoading = $state(false);
   let cachedConversationRefreshing = $state(false);
   let composer = $state('');
@@ -295,24 +335,42 @@ import X from 'lucide-svelte/icons/x';
   let queueEditContent = $state('');
   let queueEditError = $state('');
   const chatV2Store = new ChatV2Store();
+  const chatV2Lifecycle = new ChatV2ConversationLifecycle(wsClient);
   const chatV2Outbox = typeof indexedDB === 'undefined'
     ? new MemoryChatV2Outbox()
     : createIndexedDbChatV2Outbox();
   let chatV2OutboxReady = false;
   let chatV2OutboxDraining = false;
 
-  let visibleStartIndex = $state(0);
+  const TIMELINE_WINDOW_TARGET_ROWS = TIMELINE_WINDOW_TARGET_ROWS_HELPER;
+  const TIMELINE_WINDOW_PAGE_ROWS = TIMELINE_WINDOW_PAGE_ROWS_HELPER;
+  const TIMELINE_WINDOW_MAX_ROWS = TIMELINE_WINDOW_MAX_ROWS_HELPER;
+  // Single window object over renderable rows. `start` is the first rendered
+  // index; `end` null means "render to the tail" (live). Kept in sync with the
+  // pure helpers in chat-page.ts so the logic is unit-testable.
+  let timelineWindow = $state<TimelineWindow>({ start: 0, end: null });
+  let visibleStartIndex = $derived(timelineWindow.start);
+  let visibleEndIndex = $derived(timelineWindow.end);
+  let timelineViewportFillScheduled = false;
+  let timelineViewportFillInFlight = false;
+  let lastRenderableVisibleCount = 0;
   let activeConversationId = '';
   let routeConversationId = $derived(page.params.conversationId ?? '');
   let activeSessionLastSeq = 0;
   let conversationViewServerTimeMs = 0;
   let lastConversationViewRefreshAt = 0;
+  let lastSidebarSyncAt = 0;
+  let lastSidebarSyncTimestamp: string | null = null;
+  let pendingNotificationEpoch = 0;
+  const pendingNotificationEpochByConversation = new Map<string, number>();
+  const missingConversationRecoveryAt = new Map<string, number>();
   let lastRuntimeSnapshotAt = 0;
   let lastStaleRuntimeRefreshAttemptAt = 0;
   let staleRuntimeRefreshAttempts = 0;
   let viewRefreshInFlight: Promise<void> | null = null;
   let staleRuntimeGuardTimer: number | null = null;
   const STALE_RUNTIME_REFRESH_MS = 30000;
+  const CONVERSATION_SUBLOAD_TIMEOUT_MS = 35_000;
   let olderMessagesCursor = $state<string | null>(null);
   let hasOlderMessages = $state(false);
   const CONVERSATION_VIEW_CACHE_LIMIT = 8;
@@ -323,6 +381,10 @@ import X from 'lucide-svelte/icons/x';
   let escalationBusyCallId = $state<string | null>(null);
   let escalationResolutionPending = $state<Escalation | null>(null);
   let escalationError = $state('');
+  let controllerRecoveryPending = $state(false);
+  let controllerRecoveryTimer: number | null = null;
+  let controllerRecoveryAttempts = $state(0);
+  let controllerRecoveryConversationId: string | null = null;
   let escalationCountdownTimer: number | null = null;
   let notificationRefreshTimer: number | null = null;
   let pushPromptDismissed = $state(hasDismissedWebPushPrompt());
@@ -332,15 +394,15 @@ import X from 'lucide-svelte/icons/x';
   let pushDeliveryError = $state('');
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
-  // Track the turn_id of the most recently settled/cancelled turn so that a
-  // late timeline_patch (arriving after cancel teardown due to the coalesce
-  // buffer race) cannot re-arm turnInProgress for an already-finished turn.
+  // Track the turn_id of the most recently settled/cancelled turn.
   let lastSettledTurnId = $state<string | null>(null);
   // Track the turn_id of the currently running turn (set on turn_started).
   let currentActiveTurnId = $state<string | null>(null);
   let activeTurnChatMode = $state<ChatModeTone>('default');
   let lastSubmittedMessage = '';
   let lastRecoverableMessage = $state('');
+  let lastRecoverableTurnId = $state<string | null>(null);
+  let suppressedRecoverableTurnId = $state<string | null>(null);
   let showNewChatModal = $state(false);
   let newChatAgentId = $state('');
   let newChatAgentProfileId = $state('');
@@ -355,13 +417,6 @@ import X from 'lucide-svelte/icons/x';
   let subSessionPanelOpen = $state(false);
   let subSessionClosing = $state(false);
   let subSessionId = $state('');
-  let subSessionTimeline = $state<TimelineItem[]>([]);
-  let subSessionLog = $state<SessionLogState | null>(null);
-  let subSessionLoading = $state(false);
-  let subSessionError = $state('');
-  let subSessionPollDelayMs = $state(SESSION_LOG_POLL_INTERVAL_MS);
-  let subSessionTimelineEl = $state<HTMLDivElement | null>(null);
-  let subSessionTimelineContentEl = $state<HTMLDivElement | null>(null);
   let subSessionUserScrolledUp = $state(false);
   let timelineEl = $state<HTMLDivElement | null>(null);
   let timelineContentEl = $state<HTMLDivElement | null>(null);
@@ -377,6 +432,7 @@ import X from 'lucide-svelte/icons/x';
   // position as a user gesture and falsely re-pin the tail.
   let programmaticScrollTarget: number | null = null;
   let bottomScrollPending = false;
+  let pendingBottomScrollForce = false;
   let userScrollIntentUp = false;
   let lastTimelineTouchY: number | null = null;
   let lastTimelineScrollTop = $state(0);
@@ -385,6 +441,12 @@ import X from 'lucide-svelte/icons/x';
   let chatSidebarCollapsed = $state(false);
   const chatV2CanonicalRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const chatV2CanonicalRecoveryInFlight = new Set<string>();
+  // Set when a recovery is requested while one is already in flight. The
+  // in-flight recovery re-runs once on completion instead of being silently
+  // dropped. Without this, a debounced mid-turn sync (whose server-side event
+  // read predates the assistant-message flush) swallows the immediate settle
+  // recovery, and the just-streamed final message stays missing until reload.
+  const chatV2CanonicalRecoveryRerun = new Set<string>();
   const CHAT_V2_CANONICAL_RECOVERY_DEBOUNCE_MS = 1_000;
 
   function applyChatV2Snapshot(snapshot: ChatSnapshot): void {
@@ -393,8 +455,20 @@ import X from 'lucide-svelte/icons/x';
     lastConversationViewRefreshAt = Date.now();
     lastRuntimeSnapshotAt = Date.now();
     applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
+    applyLastGenerationSnapshot(chatV2Store.snapshot.runtime?.last_generation);
+    // Refresh the older-history cursor from the snapshot when we do not already
+    // hold one. Without this, a snapshot recovery (reconnect, outbox drain,
+    // cancel) left olderMessagesCursor stale/empty and subsequent scroll-up
+    // backfills became no-ops. A deeper cursor from prior backfill is kept.
+    if (olderMessagesCursor === null) {
+      olderMessagesCursor = snapshot.timeline.before_cursor ?? null;
+      hasOlderMessages = Boolean(snapshot.timeline.has_more_before && olderMessagesCursor);
+    }
     applyChatV2StateToTimeline();
-    wsClient.subscribeChatV2Conversation(snapshot.conversation.conversation_id, snapshot.cursor);
+    chatV2Lifecycle.acceptSnapshot(
+      conversationTimelineScope(snapshot.conversation.conversation_id),
+      snapshot.cursor,
+    );
   }
 
   function chatV2OwnsActiveConversation(conversationId: string | null = conversationIdFromRoute()): boolean {
@@ -403,6 +477,10 @@ import X from 'lucide-svelte/icons/x';
       && chatV2Store.snapshot.cursor
       && chatV2Store.snapshot.conversationId === conversationId
     );
+  }
+
+  function chatV2RecoveryMatchesRoute(conversationId: string): boolean {
+    return shouldApplyChatV2Recovery(conversationId, conversationIdFromRoute());
   }
 
   async function applyChatV2Frame(frame: ChatRealtimeFrame): Promise<void> {
@@ -429,6 +507,7 @@ import X from 'lucide-svelte/icons/x';
       // stale-runtime refresh budget.
       staleRuntimeRefreshAttempts = 0;
       applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
+      applyLastGenerationSnapshot(chatV2Store.snapshot.runtime?.last_generation);
     }
     if (frame.ops.length === 0 && frame.runtime?.has_active_turn === true) {
       applyChatV2RuntimeToTimeline();
@@ -441,7 +520,14 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function recoverChatV2Canonical(conversationId: string): Promise<void> {
-    if (chatV2CanonicalRecoveryInFlight.has(conversationId)) return;
+    if (!chatV2RecoveryMatchesRoute(conversationId)) return;
+    if (chatV2CanonicalRecoveryInFlight.has(conversationId)) {
+      // A recovery is already running. Mark a re-run so the in-flight call
+      // fetches once more after it finishes — the current in-flight sync may
+      // have started before the events we now need were flushed.
+      chatV2CanonicalRecoveryRerun.add(conversationId);
+      return;
+    }
     chatV2CanonicalRecoveryInFlight.add(conversationId);
     try {
       const cursor = chatV2Store.snapshot.conversationId === conversationId
@@ -452,32 +538,47 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       const response = await chatV2Api.sync(conversationId, cursor);
+      if (!chatV2RecoveryMatchesRoute(conversationId)) return;
       const result = chatV2Store.applySync(response);
       if (response.reset_required || result.outcome === 'reset_required' || result.outcome === 'cursor_mismatch') {
         await recoverChatV2Snapshot(conversationId);
         return;
       }
       applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
+      applyLastGenerationSnapshot(chatV2Store.snapshot.runtime?.last_generation);
       applyChatV2StateToTimeline();
       if (chatV2Store.snapshot.cursor) {
         wsClient.updateChatV2Cursor(conversationId, chatV2Store.snapshot.cursor);
       }
     } catch (error) {
+      if (!chatV2RecoveryMatchesRoute(conversationId)) return;
       const apiError = asApiError(error);
       if (apiError.status === 503 || apiError.code === 'event_store_unavailable') {
         historyError = apiError.message;
-        reportError(error);
+        markControllerUnavailable(error);
         return;
       }
       await recoverChatV2Snapshot(conversationId);
     } finally {
       chatV2CanonicalRecoveryInFlight.delete(conversationId);
+      if (chatV2CanonicalRecoveryRerun.delete(conversationId)) {
+        // A recovery was requested while this one ran. Run it again so the
+        // freshly flushed canonical events (e.g. the settle assistant message)
+        // are pulled. Guard against unbounded loops: this only re-runs once per
+        // in-flight completion, and each re-run advances the cursor watermark.
+        if (chatV2OwnsActiveConversation(conversationId)) {
+          void recoverChatV2Canonical(conversationId);
+        }
+      }
     }
   }
 
   async function recoverChatV2Snapshot(conversationId: string): Promise<void> {
+    if (!chatV2RecoveryMatchesRoute(conversationId)) return;
     try {
-      applyChatV2Snapshot(await chatV2Api.snapshot(conversationId));
+      const snapshot = await chatV2Api.snapshot(conversationId);
+      if (!chatV2RecoveryMatchesRoute(conversationId)) return;
+      applyChatV2Snapshot(snapshot);
     } catch (error) {
       const failureMessage = asApiError(error).message;
       if (conversationIdFromRoute() !== conversationId) {
@@ -485,6 +586,9 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       historyError = failureMessage;
+      if (markControllerUnavailable(error)) {
+        return;
+      }
       if (chatV2Store.snapshot.conversationId === conversationId) {
         if (chatV2Store.visibleItems.length === 0) {
           chatV2Store.reset();
@@ -563,7 +667,8 @@ import X from 'lucide-svelte/icons/x';
           await chatV2Api.sendMessage(entry.conversation_id, entry.client_txn_id, {
             content: entry.content,
             attachments: entry.attachments,
-            client_message_id: entry.client_message_id
+            client_message_id: entry.client_message_id,
+            chat_mode: entry.chat_mode
           });
           await chatV2Outbox.update(entry.client_txn_id, {
             status: 'acked',
@@ -602,6 +707,8 @@ import X from 'lucide-svelte/icons/x';
     awaitingAssistantStart = false;
     currentActiveTurnId = state.runtime?.active_turn?.turn_id ?? null;
     if (!turnInProgress) currentActiveTurnId = null;
+    shrinkTailWindowIfPinned();
+    lastRenderableVisibleCount = renderableVisibleItems.length;
   }
 
   function applyChatV2RuntimeToTimeline(): void {
@@ -612,15 +719,16 @@ import X from 'lucide-svelte/icons/x';
 
   let localCommandResultOrdinal = 0;
 
-  function appendChatV2LocalSystemMessage(text: string, idHint: string): void {
+  function appendChatV2LocalSystemMessage(text: string, idHint: string, noticeId?: string | null): void {
     const content = text.trim();
     const targetConversationId = currentConversation?.conversation_id ?? conversationIdFromRoute();
     if (!content || !chatV2OwnsActiveConversation(targetConversationId)) return;
     localCommandResultOrdinal += 1;
     const idSafeHint = idHint.replace(/[^a-zA-Z0-9_.:-]/g, '_').slice(0, 80) || 'result';
     chatV2Store.addLocalSystemMessage({
-      id: `local-command:${idSafeHint}:${Date.now()}:${localCommandResultOrdinal}`,
-      content
+      id: noticeId ? `system:${noticeId}` : `local-command:${idSafeHint}:${Date.now()}:${localCommandResultOrdinal}`,
+      content,
+      noticeId
     });
     applyChatV2StateToTimeline();
     saveCurrentConversationView();
@@ -641,6 +749,59 @@ import X from 'lucide-svelte/icons/x';
     return lines.join('\n');
   }
 
+  async function applyCommandResponse(
+    response: import('$lib/chat-v2/types').CommandV2Response
+  ): Promise<void> {
+    const data = response.data;
+    if (response.result_type === 'error') {
+      addToast(response.text || 'Command failed', 'error', 4000);
+      return;
+    }
+    if (response.result_type === 'conversation_created') {
+      const createdConversationId = typeof data.conversation_id === 'string' ? data.conversation_id : '';
+      if (createdConversationId) {
+        await goto(`/chat/${createdConversationId}`);
+        return;
+      }
+    }
+    if (
+      response.result_type === 'session_compacted'
+      || response.result_type === 'session_reset'
+      || response.result_type === 'history_rebased'
+    ) {
+      const sessionId = typeof data.session_id === 'string' ? data.session_id : '';
+      if (sessionId) syncConversationActiveSession(sessionId);
+      awaitingAssistantStart = false;
+      turnInProgress = false;
+      clearConversationTurnState(response.conversation_id);
+      scheduleChatV2CanonicalRecovery(response.conversation_id, { immediate: true });
+    }
+    if (currentConversation && typeof data.resolved_agent_profile_id === 'string') {
+      patchConversationInList(currentConversation.conversation_id, {
+        agent_profile_id: data.resolved_agent_profile_id
+      });
+    }
+    if (currentConversation && typeof data.executor_id === 'string') {
+      patchConversationInList(currentConversation.conversation_id, {
+        active_executor_id: data.executor_id,
+        active_executor_source: 'user'
+      });
+    }
+    appendChatV2LocalSystemMessage(
+      response.text,
+      `rest:${response.result_type}:${response.client_txn_id}`
+    );
+  }
+
+  async function executeCommandWithRetry(conversationId: string, content: string) {
+    const clientTxnId = crypto.randomUUID();
+    try {
+      return await chatV2Api.executeCommand(conversationId, clientTxnId, content);
+    } catch {
+      return chatV2Api.executeCommand(conversationId, clientTxnId, content);
+    }
+  }
+
   interface SessionInfoData {
     intaris_session_id: string;
     intention: string | null;
@@ -651,6 +812,7 @@ import X from 'lucide-svelte/icons/x';
     denied_count: number;
     escalated_count: number;
     context_usage?: ContextUsage | null;
+    last_generation?: GenerationPerformanceSnapshot | null;
   }
   let sessionInfo = $state<SessionInfoData | null>(null);
   let sessionInfoLoading = $state(false);
@@ -678,38 +840,12 @@ import X from 'lucide-svelte/icons/x';
   }
 
   const conversationViewCache = new Map<string, ConversationViewCacheEntry>();
-  const EMPTY_RENDER_ITEMS: TimelineItem[] = [];
   let conversationViewSaveTimer: number | null = null;
   const RETRYABLE_FAILED_TURN_NOTICE_MARKERS = [
     'Your tool results have been saved. Please try sending your message again.',
     'A model error occurred while generating the response.',
     'Turn failed: the model did not produce output',
   ];
-
-  function projectRenderItems(items: ChatV2TimelineItem[] = renderableVisibleItems): TimelineItem[] {
-    return selectRenderItems(items);
-  }
-
-  function latestTodoSnapshotFromChatV2(items: ChatV2TimelineItem[], resetOnUserMessage = false): TodoSnapshotItem[] {
-    let lowerBound = 0;
-    if (resetOnUserMessage) {
-      for (let index = items.length - 1; index >= 0; index -= 1) {
-        const item = items[index];
-        if (item?.kind === 'message' && item.role === 'user') {
-          lowerBound = index;
-          break;
-        }
-      }
-    }
-    for (let index = items.length - 1; index >= 0; index -= 1) {
-      if (index < lowerBound) break;
-      const item = items[index];
-      if (item?.kind === 'todo_state') {
-        return parseTodoSnapshot(item.todos);
-      }
-    }
-    return [];
-  }
 
   function isChatV2MessageStreaming(item: ChatV2TimelineItem): boolean {
     return item.kind === 'message'
@@ -739,17 +875,23 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function isRecoverableFailedTurnChatV2Notice(item: ChatV2TimelineItem): boolean {
+    if (item.kind === 'error') {
+      return item.recoverable === true;
+    }
     if (item.kind === 'notice') {
       const text = `${item.title ?? ''}\n${item.message ?? ''}`;
       return RETRYABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => text.includes(marker));
     }
     if (item.kind === 'message' && item.role === 'system') {
+      if (item.notice_kind === 'model_error') {
+        return item.notice_scope == null || item.notice_scope === 'failed_turn';
+      }
       return RETRYABLE_FAILED_TURN_NOTICE_MARKERS.some((marker) => item.content.includes(marker));
     }
     return false;
   }
 
-  function hasRetryableFailedTurnTailChatV2(items: ChatV2TimelineItem[]): boolean {
+  function retryableFailedTurnIdFromTailChatV2(items: ChatV2TimelineItem[]): string | null {
     let latestUserTurnId: string | null | undefined = null;
     let latestUserOrderKey: string | null = null;
     for (let index = items.length - 1; index >= 0; index -= 1) {
@@ -760,7 +902,7 @@ import X from 'lucide-svelte/icons/x';
         break;
       }
     }
-    if (latestUserTurnId == null && latestUserOrderKey == null) return false;
+    if (latestUserTurnId == null && latestUserOrderKey == null) return null;
 
     let sawCompletedAssistant = false;
     let sawFailureNotice = false;
@@ -783,11 +925,11 @@ import X from 'lucide-svelte/icons/x';
         }
       }
     }
-    return !sawCompletedAssistant && sawFailureNotice;
+    return !sawCompletedAssistant && sawFailureNotice ? (latestUserTurnId ?? null) : null;
   }
 
-  function findPendingStepRequestInputCallFromChatV2(): ReturnType<typeof findPendingStepRequestInputCall> {
-    return findPendingStepRequestInputCall(projectRenderItems(renderableVisibleItems.filter((item) => item.kind === 'tool_call')));
+  function findPendingStepRequestInputCallFromChatV2(): ReturnType<typeof selectPendingInputToolCall> {
+    return selectPendingInputToolCall(renderableVisibleItems);
   }
 
   function nextSessionInfoRequestId(): number {
@@ -882,11 +1024,25 @@ import X from 'lucide-svelte/icons/x';
     return contextUsage ?? sessionInfo?.context_usage ?? null;
   }
 
+  function activeLastGeneration(): GenerationPerformanceSnapshot | null {
+    return lastGenerationPerformance ?? sessionInfo?.last_generation ?? null;
+  }
+
   function applyContextUsageSnapshot(usage: ContextUsage | null | undefined): void {
     if (!usage) return;
     contextUsage = usage;
     if (sessionInfo) {
       sessionInfo = { ...sessionInfo, context_usage: usage };
+    }
+  }
+
+  function applyLastGenerationSnapshot(
+    performance: GenerationPerformanceSnapshot | null | undefined
+  ): void {
+    if (performance === undefined) return;
+    lastGenerationPerformance = mergeLatestPerformance(lastGenerationPerformance, performance);
+    if (sessionInfo) {
+      sessionInfo = { ...sessionInfo, last_generation: performance };
     }
   }
 
@@ -1095,35 +1251,13 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     applyQueuedMessageSnapshot(event.queued_messages, event.queued_count);
+    applyLastGenerationSnapshot(event.last_generation);
     lastRuntimeSnapshotAt = Date.now();
     // A genuine runtime snapshot proves the WebSocket works: re-arm the
     // stale-runtime refresh budget.
     staleRuntimeRefreshAttempts = 0;
-    const hasRuntimeActivity = (
-      event.active_streams.length > 0
-      || event.active_tool_outputs.length > 0
-      || event.active_thinking.length > 0
-    );
-    const hasActiveTurn = event.has_active_turn ?? hasRuntimeActivity;
-
-    // Legacy runtime-snapshot path. With Chat v2 owning the canonical timeline
-    // this only updates page-level turn flags; the visible timeline is driven
-    // by Chat v2 frames, not by this snapshot.
-    turnInProgress = hasRuntimeActivity || hasActiveTurn;
-    if (typeof event.has_active_turn === 'boolean' && currentConversation) {
-      patchConversationInList(currentConversation.conversation_id, {
-        has_active_turn: event.has_active_turn,
-        active_turn_chat_mode: event.active_turn_chat_mode ?? null,
-        active_turn_chat_mode_source: event.active_turn_chat_mode_source ?? null,
-      });
-      activeTurnChatMode = event.has_active_turn
-        ? normalizeChatModeTone(event.active_turn_chat_mode)
-        : 'default';
-    }
-    setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
-    if (turnInProgress) {
-      awaitingAssistantStart = false;
-    }
+    // Chat v2 runtime frames are the sole authority for turn state. This
+    // compatibility event retains queue/performance metadata only.
   }
 
   async function refreshQueuedMessages(conversationId = currentConversation?.conversation_id ?? ''): Promise<void> {
@@ -1238,10 +1372,11 @@ import X from 'lucide-svelte/icons/x';
     return currentConversation;
   }
   let contextUsage = $state<ContextUsage | null>(null);
+  let lastGenerationPerformance = $state<GenerationPerformanceSnapshot | null>(null);
   let subSessionInfoOpen = $state(false);
   let subSessionInfo = $state<SessionInfoData | null>(null);
   let subSessionInfoLoading = $state(false);
-  type ChatTodo = TodoSnapshotItem;
+  const NON_TERMINAL_SESSION_STATES = new Set(['active', 'idle', 'running']);
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
   let directQuestionAnswers = $state<QuestionDraftAnswers>({});
@@ -1267,6 +1402,8 @@ import X from 'lucide-svelte/icons/x';
   let conversationLoadRequestId = 0;
   let mobileDrawerPreviouslyFocused: HTMLElement | null = null;
   let initialLoadTimeoutTimer: number | null = null;
+  let conversationSwitchTimeoutTimer: number | null = null;
+  let conversationSwitchStartedAt = 0;
 
   const CHAT_INITIAL_LOAD_TIMEOUT_MS = 10000;
   const emptySearchMatchedIds = new Set<string>();
@@ -1403,8 +1540,8 @@ import X from 'lucide-svelte/icons/x';
    * The set of session IDs in the active session's compaction lineage.
    * Walks the previous_session_id chain from the active session, stopping
    * at any session with parent_session_id set (sub-sessions are not lineage).
-   * Used by the session filter in ChatTimeline.applyEvent to allow in-flight
-   * items from compaction predecessors while rejecting sub-session items.
+    * Used by the session filter to allow in-flight items from compaction
+    * predecessors while rejecting sub-session items.
    */
   let activeSessionLineage: ReadonlySet<string> = $derived.by(() => {
     const activeSessionId = currentConversation?.active_session_id;
@@ -1428,14 +1565,19 @@ import X from 'lucide-svelte/icons/x';
     return status !== null && BLOCKED_SESSION_STATES.has(status);
   }
 
-  function startNewConversationFromBlockedSession(): void {
+  async function startNewConversationFromBlockedSession(): Promise<void> {
     if (!currentConversation || isReadOnly(currentConversation)) return;
     error = '';
     awaitingAssistantStart = false;
     turnInProgress = false;
     activeTurnChatMode = 'default';
     clearConversationTurnState(currentConversation.conversation_id);
-    wsClient.sendMessage(currentConversation.conversation_id, '/new', [], null);
+    try {
+      const response = await executeCommandWithRetry(currentConversation.conversation_id, '/new');
+      await applyCommandResponse(response);
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to start a new conversation');
+    }
   }
 
   function directQuestionOptions(options: unknown): string[] {
@@ -1676,7 +1818,7 @@ import X from 'lucide-svelte/icons/x';
     return directQuestionReplyHasAnswer(reply) && directQuestionReplySatisfiesRequired(questions, reply);
   }
 
-  function pendingInputToolKind(pendingStepTool: ReturnType<typeof findPendingStepRequestInputCall>): PendingDirectQuestion['kind'] {
+  function pendingInputToolKind(pendingStepTool: ReturnType<typeof selectPendingInputToolCall>): PendingDirectQuestion['kind'] {
     return pendingInputRequestKind({
       pendingStepTool,
       pendingDirectKind: pendingDirectQuestion?.kind ?? null
@@ -1796,7 +1938,7 @@ import X from 'lucide-svelte/icons/x';
     if (backendTodos !== null) {
       return backendTodos;
     }
-    const latestTodos = latestTodoSnapshotFromChatV2(chatV2Store.visibleItems, currentConversation?.context?.type === 'web');
+    const latestTodos = selectLatestTodoState(chatV2Store.visibleItems, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       return latestTodos;
     }
@@ -1816,15 +1958,15 @@ import X from 'lucide-svelte/icons/x';
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
   }));
 
-  function visibleTodoSnapshot(todos: TodoSnapshotItem[] | undefined): TodoSnapshotItem[] {
+  function visibleTodoSnapshot(todos: ChatTodo[] | undefined): ChatTodo[] {
     return activeVisibleTodos(todos);
   }
 
-  function hasIncompleteTodo(todos: TodoSnapshotItem[]): boolean {
+  function hasIncompleteTodo(todos: ChatTodo[]): boolean {
     return todos.some((todo) => todo.status !== 'completed' && todo.status !== 'cancelled');
   }
 
-  function setConversationTodoSnapshot(conversationId: string | null | undefined, todos: TodoSnapshotItem[]): void {
+  function setConversationTodoSnapshot(conversationId: string | null | undefined, todos: ChatTodo[]): void {
     if (!conversationId) return;
     const current = conversationTodoSnapshots[conversationId];
     if (
@@ -1844,7 +1986,7 @@ import X from 'lucide-svelte/icons/x';
     };
   }
 
-  function conversationTodoProgressTodos(conversation: Conversation): TodoSnapshotItem[] {
+  function conversationTodoProgressTodos(conversation: Conversation): ChatTodo[] {
     if (conversation.conversation_id === currentConversation?.conversation_id) {
       return visibleChatProgressTodos.length > 0
         ? visibleChatProgressTodos
@@ -1860,22 +2002,7 @@ import X from 'lucide-svelte/icons/x';
       && hasIncompleteTodo(todos);
   }
 
-  function todoSnapshotFromSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): TodoSnapshotItem[] | null {
-    if (event.type === 'tool_call' && event.tool_name === 'step_todo_write') {
-      return parseTodoSnapshot(event.arguments?.todos);
-    }
-    if (event.type === 'tool_result' && (event.tool_name === 'step_todo_write' || event.tool_name === 'step_todo_list')) {
-      try {
-        const parsed = JSON.parse(event.result.replace(/^<tool_result[^>]*>\n?/, '').replace(/\n?<\/tool_result>\s*$/, ''));
-        return parseTodoSnapshot((parsed as Record<string, unknown>)?.todos);
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-
-  function backendTodoSnapshot(state: ConversationStateEnvelope | null): TodoSnapshotItem[] | null {
+  function backendTodoSnapshot(state: ConversationStateEnvelope | null): ChatTodo[] | null {
     if (!state) return null;
     const activeSessionTodos = state.active_session?.todos;
     const taskTodos = (state.task?.relevant_step ?? state.task?.current_step ?? null)?.todos;
@@ -1891,9 +2018,14 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function conversationStateConversationPatch(state: ConversationStateEnvelope): Partial<Conversation> {
+    const pendingInput = conversationPendingSnapshotFlags(state).hasAnyPendingInput;
     const patch: Partial<Conversation> = {
       pending_notification_types: state.pending?.notification_types ?? [],
-      has_active_turn: state.active_turn?.has_active_turn ?? false,
+      // A turn that is waiting for a question, credential, auth challenge, or
+      // escalation is paused from the user's perspective. Do not render it as
+      // active and trigger stale-runtime recovery refreshes that remount the
+      // input form.
+      has_active_turn: Boolean(state.active_turn?.has_active_turn) && !pendingInput,
       active_session_status: state.active_session?.status ?? null,
       active_session_completion_reason: state.active_session?.completion_reason ?? null,
       active_turn_chat_mode: typeof state.active_turn?.chat_mode === 'string'
@@ -1913,10 +2045,16 @@ import X from 'lucide-svelte/icons/x';
     if (!state) return;
     const { patchConversationRows = true } = options;
     const conversationId = state.conversation_id;
+    const chatV2OwnsConversation = chatV2OwnsActiveConversation(conversationId);
     if (conversationId === currentConversation?.conversation_id) {
       backendConversationState = state;
-      turnInProgress = Boolean(state.active_turn?.has_active_turn);
       const pendingFlags = conversationPendingSnapshotFlags(state);
+      turnInProgress = conversationStateTurnActivity({
+        currentActive: turnInProgress,
+        snapshotActive: Boolean(state.active_turn?.has_active_turn),
+        hasPendingInput: pendingFlags.hasAnyPendingInput,
+        chatV2OwnsConversation,
+      });
       if (!pendingFlags.hasDirectQuestion) {
         pendingDirectQuestion = null;
       }
@@ -1931,7 +2069,14 @@ import X from 'lucide-svelte/icons/x';
       }
     }
     if (patchConversationRows) {
-      patchConversationInList(conversationId, conversationStateConversationPatch(state));
+      patchConversationInList(
+        conversationId,
+        conversationStatePatchForAuthority(
+          conversationStateConversationPatch(state) as Record<string, unknown>,
+          chatV2OwnsConversation,
+        ) as Partial<Conversation>,
+        { pendingNotificationSource: 'server' },
+      );
     }
     const todos = backendTodoSnapshot(state);
     if (todos !== null) {
@@ -2059,9 +2204,8 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function mergeConversationList(items: Conversation[], { reset = false }: { reset?: boolean } = {}): void {
-    const next = reset ? [] : conversations.filter((conversation) => !isAgentDirectConversation(conversation));
-    const indexById = new Map(next.map((conversation, index) => [conversation.conversation_id, index]));
     for (const conversation of items) {
+      observePendingNotificationServerPush(conversation.conversation_id);
       applyConversationStateSnapshot(conversation.conversation_state, { patchConversationRows: false });
       if (currentConversation?.conversation_id === conversation.conversation_id) {
         currentConversation = mergeConversationPreservingActivity(currentConversation, conversation);
@@ -2072,17 +2216,9 @@ import X from 'lucide-svelte/icons/x';
       }
       if (isAgentDirectConversation(conversation)) {
         patchAgentDirectChat(conversation);
-        continue;
-      }
-      const index = indexById.get(conversation.conversation_id);
-      if (index === undefined) {
-        indexById.set(conversation.conversation_id, next.length);
-        next.push(conversation);
-      } else {
-        next[index] = mergeConversationPreservingActivity(next[index], conversation);
       }
     }
-    conversations = sortConversationsByActivity(next);
+    conversations = mergeSidebarConversationRows(conversations, items, { reset });
   }
 
   function patchAgentDirectChat(conversation: Conversation): void {
@@ -2107,37 +2243,72 @@ import X from 'lucide-svelte/icons/x';
     agentDirectChats = sortAgentDirectChats([...merged.values()]);
   }
 
+  function observePendingNotificationServerPush(conversationId: string | null | undefined): void {
+    if (!conversationId) return;
+    pendingNotificationEpoch += 1;
+    pendingNotificationEpochByConversation.set(conversationId, pendingNotificationEpoch);
+  }
+
+  function beginPendingNotificationRefresh(conversationId: string): number {
+    pendingNotificationEpoch += 1;
+    pendingNotificationEpochByConversation.set(conversationId, pendingNotificationEpoch);
+    return pendingNotificationEpoch;
+  }
+
+  function maybeRecoverMissingConversationRow(conversationId: string, patch: Partial<Conversation>): void {
+    const now = Date.now();
+    if (!shouldRecoverMissingConversationRow({
+      conversationId,
+      patch,
+      lastAttemptByConversation: missingConversationRecoveryAt,
+      now,
+    })) {
+      return;
+    }
+    missingConversationRecoveryAt.set(conversationId, now);
+    void resyncSidebarData('missing-attention-row', { force: true });
+  }
+
   function patchConversationInList(
     conversationId: string,
     patch: Partial<Conversation>,
-    options: { touchUpdatedAt?: boolean; touchLastMessageAt?: boolean } = {}
+    options: {
+      touchUpdatedAt?: boolean;
+      touchLastMessageAt?: boolean;
+      pendingNotificationSource?: 'server' | 'refetch';
+    } = {}
   ): void {
+    if (Object.prototype.hasOwnProperty.call(patch, 'pending_notification_types') && options.pendingNotificationSource === 'server') {
+      observePendingNotificationServerPush(conversationId);
+    }
     const index = conversations.findIndex((conversation) => conversation.conversation_id === conversationId);
     const now = new Date().toISOString();
     if (index < 0) {
       const direct = agentDirectChats.find((item) => item.conversation.conversation_id === conversationId);
       if (direct) {
-        const updatedDirectConversation: Conversation = {
-          ...direct.conversation,
+        const effectivePatch: Partial<Conversation> = {
           ...patch,
-          updated_at: options.touchUpdatedAt ? patch.updated_at ?? now : patch.updated_at ?? direct.conversation.updated_at,
-          last_message_at: options.touchLastMessageAt ? patch.last_message_at ?? now : patch.last_message_at ?? direct.conversation.last_message_at,
+          ...(options.touchUpdatedAt ? { updated_at: patch.updated_at ?? now } : {}),
+          ...(options.touchLastMessageAt ? { last_message_at: patch.last_message_at ?? now } : {}),
         };
+        const updatedDirectConversation = mergeConversationRowPatch(direct.conversation, effectivePatch);
         patchAgentDirectChat(updatedDirectConversation);
         if (currentConversation?.conversation_id === conversationId) {
           currentConversation = { ...currentConversation, ...updatedDirectConversation };
         }
         rememberSidebarProjection();
+        return;
       }
+      maybeRecoverMissingConversationRow(conversationId, patch);
       return;
     }
     const existing = conversations[index];
-    const updated: Conversation = {
-      ...existing,
+    const effectivePatch: Partial<Conversation> = {
       ...patch,
-      updated_at: options.touchUpdatedAt ? patch.updated_at ?? now : patch.updated_at ?? existing.updated_at,
-      last_message_at: options.touchLastMessageAt ? patch.last_message_at ?? now : patch.last_message_at ?? existing.last_message_at,
+      ...(options.touchUpdatedAt ? { updated_at: patch.updated_at ?? now } : {}),
+      ...(options.touchLastMessageAt ? { last_message_at: patch.last_message_at ?? now } : {}),
     };
+    const updated = mergeConversationRowPatch(existing, effectivePatch);
     const next = [...conversations];
     next[index] = updated;
     conversations = sortConversationsByActivity(next);
@@ -2146,6 +2317,46 @@ import X from 'lucide-svelte/icons/x';
       currentConversation = { ...currentConversation, ...updated };
     }
     rememberSidebarProjection();
+  }
+
+  function removeConversationFromSidebar(
+    conversationId: string,
+    { markCurrentDeleted = false }: { markCurrentDeleted?: boolean } = {}
+  ): void {
+    const previousConversationCount = conversations.length;
+    const previousDirectCount = agentDirectChats.length;
+    conversations = removeSidebarConversationRow(conversations, conversationId);
+    agentDirectChats = agentDirectChats.filter(
+      (item) => item.conversation.conversation_id !== conversationId
+    );
+    conversationViewCache.delete(conversationId);
+    clearLastOpenedConversation(conversationId);
+    if (currentConversation?.conversation_id === conversationId && markCurrentDeleted) {
+      currentConversation = { ...currentConversation, status: 'deleted' };
+      turnInProgress = false;
+      activeTurnChatMode = 'default';
+    }
+    if (previousConversationCount !== conversations.length || previousDirectCount !== agentDirectChats.length) {
+      rememberSidebarProjection();
+    }
+  }
+
+  function applySidebarConversationUpsert(conversation: Conversation): void {
+    const conversationId = conversation.conversation_id;
+    if (currentConversation?.conversation_id === conversationId) {
+      currentConversation = mergeConversationPreservingActivity(currentConversation, conversation);
+      turnInProgress = currentConversation.has_active_turn;
+      activeTurnChatMode = currentConversation.has_active_turn
+        ? normalizeChatModeTone(currentConversation.active_turn_chat_mode)
+        : 'default';
+    }
+    if (conversationMatchesSidebarProjectionFilter(conversation, currentSidebarProjectionFilter())) {
+      mergeConversationList([conversation]);
+      patchAgentDirectChat(conversation);
+      rememberSidebarProjection();
+    } else {
+      removeConversationFromSidebar(conversationId);
+    }
   }
 
   function syncConversationActiveSession(activeSessionId: string | null | undefined): void {
@@ -2194,16 +2405,6 @@ import X from 'lucide-svelte/icons/x';
     );
   }
 
-  function recordTodoSnapshotFromSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent): void {
-    const conversationId = 'conversation_id' in event && typeof event.conversation_id === 'string'
-      ? event.conversation_id
-      : currentConversation?.conversation_id;
-    const todos = todoSnapshotFromSocketEvent(event);
-    if (todos !== null) {
-      setConversationTodoSnapshot(conversationId, todos);
-    }
-  }
-
   function touchConversationViewCache(conversationId: string, entry: ConversationViewCacheEntry): void {
     conversationViewCache.delete(conversationId);
     conversationViewCache.set(conversationId, entry);
@@ -2215,33 +2416,42 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function saveCurrentConversationView(): void {
-    if (!currentConversation) return;
-    if (conversationViewSaveTimer !== null && typeof window !== 'undefined') {
-      window.clearTimeout(conversationViewSaveTimer);
-      conversationViewSaveTimer = null;
+    try {
+      if (!currentConversation) return;
+      if (conversationViewSaveTimer !== null && typeof window !== 'undefined') {
+        window.clearTimeout(conversationViewSaveTimer);
+        conversationViewSaveTimer = null;
+      }
+      touchConversationViewCache(currentConversation.conversation_id, {
+        conversation: { ...currentConversation },
+        sessions: sessions.map((session) => ({ ...session })),
+        // Keep the live Chat v2 overlay when switching within this tab. A
+        // snapshot only carries scheduler state, not an idle-checkpoint
+        // compaction item, so discarding this overlay made the compaction card
+        // and the optimistic user message disappear until canonical history
+        // eventually caught up.
+        chatV2State: chatV2Store.serializeState(),
+        queuedCount,
+        queuedMessages: queuedMessages.map((message) => ({ ...message })),
+        contextUsage,
+        sessionInfo: sessionInfo ? { ...sessionInfo } : null,
+        visibleStartIndex,
+        scrollTop: timelineEl?.scrollTop ?? lastTimelineScrollTop,
+        userScrolledUp,
+        // The cached runtime is reconciled immediately by snapshots and
+        // runtime frames, but preserving it avoids a blank active turn while
+        // the conversation is briefly viewed elsewhere in the same tab.
+        turnInProgress,
+        awaitingAssistantStart,
+        activeSessionLastSeq,
+        olderMessagesCursor,
+        hasOlderMessages,
+        activeTurnChatMode,
+        fetchedAt: Date.now(),
+      });
+    } catch (error) {
+      console.warn('Failed to save conversation view cache', error);
     }
-    touchConversationViewCache(currentConversation.conversation_id, {
-      conversation: { ...currentConversation },
-      sessions: sessions.map((session) => ({ ...session })),
-      chatV2State: chatV2Store.serializeState(),
-      queuedCount,
-      queuedMessages: queuedMessages.map((message) => ({ ...message })),
-      contextUsage,
-      sessionInfo: sessionInfo ? { ...sessionInfo } : null,
-      visibleStartIndex,
-      scrollTop: timelineEl?.scrollTop ?? lastTimelineScrollTop,
-      userScrolledUp,
-      // Active/progress state is backend-owned and must not be
-      // resurrected from the client view cache after a missed terminal
-      // websocket event. It is refreshed by Chat v2 snapshots or runtime frames.
-      turnInProgress: false,
-      awaitingAssistantStart: false,
-      activeSessionLastSeq,
-      olderMessagesCursor,
-      hasOlderMessages,
-      activeTurnChatMode,
-      fetchedAt: Date.now(),
-    });
   }
 
   function scheduleCurrentConversationViewSave(): void {
@@ -2266,16 +2476,12 @@ import X from 'lucide-svelte/icons/x';
     currentConversation = { ...entry.conversation };
     sessions = entry.sessions.map((session) => ({ ...session }));
     chatV2Store.restoreState(entry.chatV2State);
-    // The cached entry may have been saved mid-turn. Turn/progress state is
-    // backend-owned and forced off here, so clear any stale runtime overlay so
-    // no streaming rows hang until the background refresh re-confirms runtime.
-    chatV2Store.settleRuntimeOverlay();
     queuedCount = entry.queuedCount;
     queuedMessages = entry.queuedMessages.map((message) => ({ ...message }));
     contextUsage = entry.contextUsage;
     sessionInfo = entry.sessionInfo ? { ...entry.sessionInfo } : null;
-    turnInProgress = false;
-    awaitingAssistantStart = false;
+    turnInProgress = entry.turnInProgress;
+    awaitingAssistantStart = entry.awaitingAssistantStart;
     activeSessionLastSeq = entry.activeSessionLastSeq;
     olderMessagesCursor = entry.olderMessagesCursor ?? null;
     hasOlderMessages = entry.hasOlderMessages ?? false;
@@ -2301,13 +2507,15 @@ import X from 'lucide-svelte/icons/x';
     // Reset the canonical Chat v2 store immediately so the outgoing
     // conversation's content cannot flash into the incoming conversation.
     chatV2Store.reset();
-    visibleStartIndex = 0;
+    timelineWindow = { start: 0, end: null };
+    lastRenderableVisibleCount = 0;
     activeSessionLastSeq = 0;
     olderMessagesCursor = null;
     hasOlderMessages = false;
     queuedCount = 0;
     queuedMessages = [];
     contextUsage = null;
+    lastGenerationPerformance = null;
     sessionInfo = null;
     turnInProgress = false;
     awaitingAssistantStart = false;
@@ -2320,6 +2528,8 @@ import X from 'lucide-svelte/icons/x';
     escalationError = '';
     escalationResolutionPending = null;
     lastRecoverableMessage = '';
+    lastRecoverableTurnId = null;
+    suppressedRecoverableTurnId = null;
     editingTitle = false;
     subSessionPanelOpen = false;
     // Opening/switching a conversation lands at the tail (latest message).
@@ -2340,6 +2550,25 @@ import X from 'lucide-svelte/icons/x';
       turnInProgress = false;
       activeTurnChatMode = 'default';
     }
+  }
+
+  function sidebarConversationById(conversationId: string): Conversation | null {
+    if (currentConversation?.conversation_id === conversationId) return currentConversation;
+    return (
+      conversations.find((conversation) => conversation.conversation_id === conversationId)
+      ?? agentDirectChats.find((item) => item.conversation.conversation_id === conversationId)?.conversation
+      ?? null
+    );
+  }
+
+  function markConversationReadLocally(conversationId: string | null | undefined, readAt?: string | null): void {
+    if (!conversationId) return;
+    const conversation = sidebarConversationById(conversationId);
+    const readFloor = readAt ?? conversation?.last_message_at ?? conversation?.last_read_at ?? null;
+    patchConversationInList(conversationId, {
+      has_unread: false,
+      ...(readFloor ? { last_read_at: readFloor } : {}),
+    });
   }
 
   async function loadConversationPage(reset = false): Promise<void> {
@@ -2394,15 +2623,29 @@ import X from 'lucide-svelte/icons/x';
     );
   }
 
-  function applySidebarProjection(projection: SidebarProjection): void {
-    agents = projection.agents;
-    agentDirectChats = projection.agent_direct_chats;
-    applyAvailableChannelTypes(projection.context_types);
-    mergeConversationList(projection.conversations.items, { reset: true });
-    conversationCursor = projection.conversations.cursor;
-    conversationsHasMore = projection.conversations.has_more;
+  function applySidebarProjection(projection: SidebarProjection, options: { reset?: boolean } = {}): void {
+    const reset = options.reset ?? true;
+    if (reset || projection.agents.length > 0) agents = projection.agents;
+    if (reset) {
+      agentDirectChats = projection.agent_direct_chats;
+    } else if (projection.agent_direct_chats.length > 0) {
+      mergeAgentDirectChats(projection.agent_direct_chats);
+    }
+    if (reset || projection.context_types.length > 0) applyAvailableChannelTypes(projection.context_types);
+    mergeConversationList(projection.conversations.items, { reset });
+    for (const removedId of projection.removed_conversation_ids ?? []) {
+      removeConversationFromSidebar(removedId);
+    }
+    if (reset) {
+      conversationCursor = projection.conversations.cursor;
+      conversationsHasMore = projection.conversations.has_more;
+    }
     sidebarProjectionLoaded = true;
     sidebarProjectionFailed = false;
+    if (projection.sync_timestamp) {
+      lastSidebarSyncTimestamp = projection.sync_timestamp;
+      lastSidebarSyncAt = Date.now();
+    }
   }
 
   function applyCachedSidebarProjection(key = sidebarProjectionCacheKey()): boolean {
@@ -2534,7 +2777,7 @@ import X from 'lucide-svelte/icons/x';
 
   function syncServiceWorkerActiveConversation(active = true): void {
     if (typeof navigator === 'undefined' || !navigator.serviceWorker?.controller) return;
-    const conversationId = currentConversation?.conversation_id ?? conversationIdFromRoute();
+    const conversationId = switchingConversationId ?? currentConversation?.conversation_id ?? conversationIdFromRoute();
     const focused = typeof document !== 'undefined'
       && document.visibilityState === 'visible'
       && document.hasFocus();
@@ -2591,13 +2834,15 @@ import X from 'lucide-svelte/icons/x';
   function beginConversationSwitch(conversationId: string, visible: boolean): number {
     conversationSwitchRequestId = nextConversationLoadId(conversationSwitchRequestId);
     switchingConversationId = visible ? conversationId : null;
+    conversationSwitchStartedAt = visible ? Date.now() : 0;
     backendConversationState = null;
+    scheduleConversationSwitchTimeout(conversationSwitchRequestId);
     return conversationSwitchRequestId;
   }
 
   function resetConversationSwitch(): void {
     conversationSwitchRequestId = nextConversationLoadId(conversationSwitchRequestId);
-    switchingConversationId = null;
+    clearConversationSwitch();
   }
 
   function finishConversationSwitch(conversationId: string, switchRequestId: number): void {
@@ -2605,8 +2850,62 @@ import X from 'lucide-svelte/icons/x';
       isCurrentConversationLoad(switchRequestId, conversationSwitchRequestId)
       && switchingConversationId === conversationId
     ) {
-      switchingConversationId = null;
+      clearConversationSwitch();
     }
+  }
+
+  function clearConversationSwitchTimeout(): void {
+    if (conversationSwitchTimeoutTimer !== null) {
+      window.clearTimeout(conversationSwitchTimeoutTimer);
+      conversationSwitchTimeoutTimer = null;
+    }
+  }
+
+  function clearConversationSwitch(): void {
+    clearConversationSwitchTimeout();
+    switchingConversationId = null;
+    conversationSwitchStartedAt = 0;
+  }
+
+  function expireStaleConversationSwitch(now = Date.now()): boolean {
+    const expiredConversationId = switchingConversationId;
+    if (!expiredConversationId) return false;
+    if (!isConversationSwitchStale({ startedAt: conversationSwitchStartedAt, now })) {
+      const elapsedMs = now - conversationSwitchStartedAt;
+      scheduleConversationSwitchTimeout(
+        conversationSwitchRequestId,
+        Math.max(1, CONVERSATION_SWITCH_TIMEOUT_MS - elapsedMs)
+      );
+      return false;
+    }
+    try {
+      if (currentConversation?.conversation_id !== expiredConversationId) {
+        currentConversation = null;
+        activeConversationId = '';
+        clearConversationViewState();
+        conversationSubloadsLoading = false;
+        cachedConversationRefreshing = false;
+        error = 'Conversation switch is taking longer than expected. Retry or reload if it does not recover.';
+        syncServiceWorkerActiveConversation(false);
+      }
+    } finally {
+      clearConversationSwitch();
+    }
+    return true;
+  }
+
+  function scheduleConversationSwitchTimeout(
+    switchRequestId: number,
+    delayMs = CONVERSATION_SWITCH_TIMEOUT_MS
+  ): void {
+    clearConversationSwitchTimeout();
+    if (!switchingConversationId) return;
+    conversationSwitchTimeoutTimer = window.setTimeout(() => {
+      conversationSwitchTimeoutTimer = null;
+      if (isCurrentConversationLoad(switchRequestId, conversationSwitchRequestId)) {
+        expireStaleConversationSwitch();
+      }
+    }, delayMs);
   }
 
   function conversationAgent(conversation: Conversation): Agent | undefined {
@@ -2656,18 +2955,9 @@ import X from 'lucide-svelte/icons/x';
     return conversationAgent(conversation) ?? fallbackAgentForConversation(conversation);
   }
 
-  function messageAgent(item: MessageTimelineItem): Agent | null {
-    const runtimeAgentId = item.runtime?.agent_id;
-    if (runtimeAgentId) {
-      return agents.find((agent) => agent.agent_id === runtimeAgentId)
-        ?? (currentConversation?.agent_id === runtimeAgentId ? fallbackAgentForConversation(currentConversation) : null);
-    }
-    return currentConversation ? conversationAgentForDisplay(currentConversation) : null;
-  }
-
   async function refreshCurrentConversationMetadata(): Promise<void> {
     if (!currentConversation) return;
-    const updated = await api.conversations.detail(currentConversation.conversation_id);
+    const updated = await api.conversations.detail(currentConversation.conversation_id, { includeState: false });
     currentConversation = updated;
     patchConversationInList(updated.conversation_id, updated);
   }
@@ -2771,6 +3061,16 @@ import X from 'lucide-svelte/icons/x';
     const session = sessions.find((session) => session.session_id === subSessionId);
     if (!session) return undefined;
     return agents.find((agent) => agent.agent_id === session.agent_id);
+  }
+
+  function subSessionStatus(): string | null {
+    if (!subSessionId) return null;
+    return sessions.find((session) => session.session_id === subSessionId)?.status ?? subSessionInfo?.status ?? null;
+  }
+
+  function shouldPollSubSession(): boolean {
+    const status = subSessionStatus();
+    return Boolean(subSessionPanelOpen && subSessionId && (!status || NON_TERMINAL_SESSION_STATES.has(status)));
   }
 
   function searchResultAgent(result: ConversationSearchMatch): Agent | undefined {
@@ -2907,9 +3207,16 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function scrollToTimelineItem(id: string): void {
+    const total = renderableVisibleItems.length;
     const fullIndex = renderableVisibleItems.findIndex((item) => item.id === id);
     if (fullIndex >= 0 && fullIndex < visibleStartIndex) {
-      visibleStartIndex = Math.max(0, fullIndex - 5);
+      const start = Math.max(0, fullIndex - 5);
+      const end = Math.min(total, start + TIMELINE_WINDOW_MAX_ROWS);
+      timelineWindow = { start, end: end >= total ? null : end };
+    } else if (fullIndex >= 0 && fullIndex >= timelineWindowEndIndex()) {
+      const end = Math.min(total, fullIndex + 6);
+      const start = Math.max(0, end - TIMELINE_WINDOW_MAX_ROWS);
+      timelineWindow = { start, end: end >= total ? null : end };
     }
     void tick().then(() => {
       const node = timelineEl?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
@@ -2953,7 +3260,7 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     const conversationId = currentConversation.conversation_id;
-    const local = findLocalChatMatches(projectRenderItems(), q).map((match) => ({
+    const local = findLocalChatMatches(renderableVisibleItems, q).map((match) => ({
       source: 'local' as const,
       local: match,
       targetId: localResultId(match)
@@ -2970,7 +3277,7 @@ import X from 'lucide-svelte/icons/x';
       const server = response.matches.map((match) => ({
         source: 'server' as const,
         server: match,
-        targetId: nearestMessageIdForTimestamp(match.match.ts) ?? `${match.intaris_session_id}:${match.match.ref_id ?? match.match.ts ?? match.match.snippet}`
+        targetId: findVisibleServerSearchTarget(renderableVisibleItems, match) ?? serverSearchFallbackTargetId(match)
       }));
       const rawResults = [
         ...local,
@@ -3147,22 +3454,44 @@ import X from 'lucide-svelte/icons/x';
     const conversation = conversations.find((candidate) => candidate.conversation_id === conversationId)
       ?? agentDirectChats.find((item) => item.conversation.conversation_id === conversationId)?.conversation
       ?? (currentConversation?.conversation_id === conversationId ? currentConversation : null);
-    if (!conversation) return;
+    if (!conversation) {
+      if (present) {
+        patchConversationInList(
+          conversationId,
+          { pending_notification_types: [notificationType] },
+          { pendingNotificationSource: 'server' },
+        );
+      }
+      return;
+    }
     const currentTypes = conversation.pending_notification_types ?? [];
     const nextTypes = present
       ? Array.from(new Set([...currentTypes, notificationType]))
       : currentTypes.filter((type) => type !== notificationType);
-    patchConversationInList(conversationId, { pending_notification_types: nextTypes });
+    patchConversationInList(
+      conversationId,
+      { pending_notification_types: nextTypes },
+      { pendingNotificationSource: 'server' },
+    );
   }
 
   function refreshConversationPendingNotificationTypes(conversationId: string | null | undefined): void {
     if (!conversationId) return;
+    const requestEpoch = beginPendingNotificationRefresh(conversationId);
     void api.notifications
       .list(conversationId)
       .then((notifications) => {
-        patchConversationInList(conversationId, {
-          pending_notification_types: pendingNotificationTypesFromNotifications(notifications),
-        });
+        if (!shouldApplyPendingNotificationRefresh({
+          requestEpoch,
+          currentEpoch: pendingNotificationEpochByConversation.get(conversationId),
+        })) {
+          return;
+        }
+        patchConversationInList(
+          conversationId,
+          { pending_notification_types: pendingNotificationTypesFromNotifications(notifications) },
+          { pendingNotificationSource: 'refetch' },
+        );
       })
       .catch(() => {});
   }
@@ -3189,6 +3518,43 @@ import X from 'lucide-svelte/icons/x';
 
   async function refreshSidebarData(): Promise<void> {
     await loadSidebarProjection();
+  }
+
+  async function resyncSidebarData(reason: string, options: { force?: boolean } = {}): Promise<void> {
+    if (
+      !options.force &&
+      shouldDebounceSidebarResync({
+        lastSuccessfulSyncAt: lastSidebarSyncAt,
+        now: Date.now(),
+      })
+    ) {
+      return;
+    }
+    const filters = {
+      contextTypes: selectedChannels.length > 0 ? selectedChannels : null,
+      agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
+      status: selectedConversationStatus,
+    };
+    try {
+      const isDeltaRequest = Boolean(lastSidebarSyncTimestamp);
+      const response = isDeltaRequest
+        ? await api.conversations.sidebar(null, filters, { changedSince: lastSidebarSyncTimestamp })
+        : await api.conversations.sidebar(null, filters);
+      if (isDeltaRequest && (response.agents.length > 0 || response.context_types.length > 0)) {
+        applySidebarProjection(response, { reset: true });
+        rememberSidebarProjection();
+        return;
+      }
+      if (response.full_resync_required) {
+        await loadSidebarProjection();
+        return;
+      }
+      applySidebarProjection(response, { reset: !isDeltaRequest });
+      rememberSidebarProjection();
+    } catch (error) {
+      console.debug('Sidebar resync failed', { reason, error });
+      await loadSidebarProjection();
+    }
   }
 
   async function forceRefreshConversationHistory(): Promise<void> {
@@ -3276,7 +3642,10 @@ import X from 'lucide-svelte/icons/x';
       .filter((item) => item.task_id === null)
       .map((item) => pendingDirectQuestionFromNotification(item))
       .find((item): item is PendingDirectQuestion => item !== null) ?? null;
-    if (directQuestion?.notificationId !== pendingDirectQuestion?.notificationId) {
+    if (shouldResetPendingDirectQuestionForm(
+      pendingDirectQuestion?.notificationId,
+      directQuestion?.notificationId,
+    )) {
       directQuestionAnswers = restoreDirectQuestionDraft(directQuestion);
       directQuestionPageIndex = 0;
       directQuestionCollapsed = false;
@@ -3298,8 +3667,10 @@ import X from 'lucide-svelte/icons/x';
         ? await api.notifications.list(null, { taskId })
         : await api.notifications.list(currentConversation.conversation_id);
       applyEscalationNotifications(notifications, taskId);
+      escalationError = '';
     } catch (caughtError) {
       escalationError = asApiError(caughtError).message;
+      markControllerUnavailable(caughtError);
     }
   }
 
@@ -3324,6 +3695,81 @@ import X from 'lucide-svelte/icons/x';
       applyPendingDirectQuestionNotifications(conversationNotifications);
     } catch (caughtError) {
       escalationError = asApiError(caughtError).message;
+      markControllerUnavailable(caughtError);
+    }
+  }
+
+  function clearControllerRecovery(): void {
+    if (controllerRecoveryTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(controllerRecoveryTimer);
+    }
+    controllerRecoveryTimer = null;
+    controllerRecoveryAttempts = 0;
+    controllerRecoveryConversationId = null;
+    controllerRecoveryPending = false;
+  }
+
+  function markControllerUnavailable(caughtError: unknown, conversationId?: string): boolean {
+    if (asApiError(caughtError).status !== 503) return false;
+    controllerRecoveryConversationId = conversationId
+      ?? currentConversation?.conversation_id
+      ?? conversationIdFromRoute()
+      ?? null;
+    controllerRecoveryPending = true;
+    scheduleControllerRecovery();
+    return true;
+  }
+
+  function scheduleControllerRecovery(): void {
+    if (
+      typeof window === 'undefined'
+      || controllerRecoveryTimer !== null
+      || !controllerRecoveryConversationId
+      || document.hidden
+      || !shouldContinueControllerRecovery(controllerRecoveryAttempts)
+    ) {
+      return;
+    }
+    const conversationId = controllerRecoveryConversationId;
+    const delayMs = nextControllerRecoveryDelayMs(controllerRecoveryAttempts);
+    controllerRecoveryAttempts += 1;
+    controllerRecoveryTimer = window.setTimeout(() => {
+      controllerRecoveryTimer = null;
+      void (async () => {
+        await retryControllerRecovery(conversationId);
+        if (controllerRecoveryPending && (sessionsError || historyError || escalationError)) {
+          scheduleControllerRecovery();
+        } else {
+          clearControllerRecovery();
+        }
+      })();
+    }, delayMs);
+  }
+
+  async function retryControllerRecovery(conversationId: string): Promise<void> {
+    if (currentConversation?.conversation_id !== conversationId) {
+      await openConversation(conversationId);
+      return;
+    }
+    await retryConversationSubloads();
+    await refreshEscalations();
+  }
+
+  async function retryControllerRecoveryNow(): Promise<void> {
+    const conversationId = controllerRecoveryConversationId ?? conversationIdFromRoute();
+    if (!conversationId) return;
+    controllerRecoveryAttempts = 0;
+    await retryControllerRecovery(conversationId);
+    if (sessionsError || historyError || escalationError) {
+      scheduleControllerRecovery();
+    } else {
+      clearControllerRecovery();
+    }
+  }
+
+  function resumeControllerRecoveryIfPending(): void {
+    if (controllerRecoveryPending) {
+      scheduleControllerRecovery();
     }
   }
 
@@ -3362,7 +3808,40 @@ import X from 'lucide-svelte/icons/x';
 
   function syncVisibleWindow(): void {
     // Window over renderable rows only (matches displayedTimeline slicing).
-    visibleStartIndex = Math.max(0, renderableVisibleItems.length - 100);
+    // Live tail: no upper bound, start a target-sized page from the end.
+    timelineWindow = {
+      start: Math.max(0, renderableVisibleItems.length - TIMELINE_WINDOW_TARGET_ROWS),
+      end: null,
+    };
+  }
+
+  function timelineWindowEndIndex(total = renderableVisibleItems.length): number {
+    return timelineWindowEnd(timelineWindow, total);
+  }
+
+  function clampVisibleWindow(total = renderableVisibleItems.length): void {
+    timelineWindow = clampWindow(timelineWindow, total);
+  }
+
+  function visibleWindowSize(total = renderableVisibleItems.length): number {
+    return timelineWindowSize(timelineWindow, total);
+  }
+
+  function shrinkTailWindowIfPinned(): void {
+    const total = renderableVisibleItems.length;
+    if (userScrolledUp) {
+      // Freeze the tail so items arriving while the user reads older history do
+      // not remount the tail. freezeTailWindow anchors to the prior count, so
+      // appends are hidden; prepends are absorbed by windowAfterPrepend before
+      // this runs (never an index freeze under a prepend).
+      timelineWindow = freezeTailWindow(timelineWindow, total, lastRenderableVisibleCount);
+      return;
+    }
+    if (timelineWindow.end !== null || visibleWindowSize(total) > TIMELINE_WINDOW_TARGET_ROWS) {
+      syncVisibleWindow();
+    } else {
+      clampVisibleWindow(total);
+    }
   }
 
   function timelineDistanceFromBottom(): number {
@@ -3414,10 +3893,18 @@ import X from 'lucide-svelte/icons/x';
       userScrolledUp = false;
       tailPinned = true;
     }
+    pendingBottomScrollForce = pendingBottomScrollForce || force;
+    if (bottomScrollPending) return;
     bottomScrollPending = true;
     requestAnimationFrame(() => {
+      const shouldForce = pendingBottomScrollForce;
+      pendingBottomScrollForce = false;
       bottomScrollPending = false;
-      if (!force && userScrolledUp) return;
+      if (!shouldForce && userScrolledUp) return;
+      if (shouldForce) {
+        userScrolledUp = false;
+        tailPinned = true;
+      }
       if (timelineEl) {
         programmaticScroll = true;
         timelineEl.scrollTop = timelineEl.scrollHeight;
@@ -3452,6 +3939,58 @@ import X from 'lucide-svelte/icons/x';
    * (or scrollToBottom) — an unguarded write is processed by
    * handleTimelineScroll as a user gesture and corrupts the scroll state.
    */
+  interface TimelineScrollAnchor {
+    key: string;
+    top: number;
+    scrollTop: number;
+  }
+
+  /**
+   * Capture an element-anchored scroll reference: the first row whose top edge
+   * is at or below the viewport top, plus its viewport-relative top offset.
+   * Element anchoring survives simultaneous add-above / remove-below commits
+   * (the DOM-window prepend + tail-cut case) that a scrollHeight delta cannot.
+   */
+  function captureTimelineAnchor(): TimelineScrollAnchor | null {
+    if (!timelineEl) return null;
+    const viewportTop = timelineEl.getBoundingClientRect().top;
+    const rows = timelineEl.querySelectorAll<HTMLElement>('[data-timeline-row-key]');
+    for (const row of rows) {
+      const key = row.getAttribute('data-timeline-row-key');
+      if (!key) continue;
+      const top = row.getBoundingClientRect().top - viewportTop;
+      // First row whose top is within (or just above) the viewport top edge.
+      if (top >= -1) {
+        return { key, top, scrollTop: timelineEl.scrollTop };
+      }
+    }
+    return null;
+  }
+
+  function restoreTimelineAnchor(anchor: TimelineScrollAnchor | null): void {
+    if (!timelineEl || !anchor) return;
+    const viewportTop = timelineEl.getBoundingClientRect().top;
+    const row = timelineEl.querySelector<HTMLElement>(
+      `[data-timeline-row-key="${cssEscape(anchor.key)}"]`
+    );
+    if (!row) return;
+    const topAfter = row.getBoundingClientRect().top - viewportTop;
+    const target = anchoredScrollTop({
+      currentScrollTop: timelineEl.scrollTop,
+      anchorTopBefore: anchor.top,
+      anchorTopAfter: topAfter,
+    });
+    if (Math.abs(target - timelineEl.scrollTop) < 1) return;
+    writeProgrammaticScrollTop(target);
+  }
+
+  function cssEscape(value: string): string {
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+      return CSS.escape(value);
+    }
+    return value.replace(/["\\]/g, '\\$&');
+  }
+
   function writeProgrammaticScrollTop(value: number): void {
     if (!timelineEl) return;
     programmaticScroll = true;
@@ -3479,11 +4018,15 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     const distanceFromBottom = timelineDistanceFromBottom();
+    const hasHiddenNewerRows = timelineWindowEndIndex() < renderableVisibleItems.length;
+    const scrollStateDistanceFromBottom = hasHiddenNewerRows
+      ? CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX + 1
+      : distanceFromBottom;
 
     const nextState = nextChatScrollState({
       currentScrollTop,
       lastScrollTop: lastTimelineScrollTop,
-      distanceFromBottom,
+      distanceFromBottom: scrollStateDistanceFromBottom,
       userScrolledUp,
       userScrollIntentUp,
       bottomThresholdPx: CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
@@ -3495,7 +4038,7 @@ import X from 'lucide-svelte/icons/x';
     // userScrolledUp, causing the ResizeObserver and shouldPreserveLiveTailOnResize
     // to use stale state.
     tailPinned = !userScrolledUp;
-    if (isNearScrollBottom(nextState.distanceFromBottom, CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX)) {
+    if (!hasHiddenNewerRows && isNearScrollBottom(nextState.distanceFromBottom, CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX)) {
       userScrollIntentUp = false;
       lastTimelineTouchY = null;
     }
@@ -3505,6 +4048,15 @@ import X from 'lucide-svelte/icons/x';
     if (currentScrollTop <= 24 && (visibleStartIndex > 0 || hasOlderMessages)) {
       void loadOlder();
     }
+
+    // Downward re-expansion: when the user scrolls back toward the tail and
+    // newer rows are still unmounted, grow the window so they remount in place.
+    // Without this the tail stays hidden until an explicit jump-to-bottom.
+    if (hasHiddenNewerRows && distanceFromBottom <= CHAT_TIMELINE_EXPAND_DOWN_THRESHOLD_PX) {
+      const anchor = captureTimelineAnchor();
+      timelineWindow = expandWindowDown(timelineWindow, renderableVisibleItems.length);
+      void tick().then(() => restoreTimelineAnchor(anchor));
+    }
   }
 
   function jumpToBottom(): void {
@@ -3512,7 +4064,21 @@ import X from 'lucide-svelte/icons/x';
     userScrollIntentUp = false;
     lastTimelineTouchY = null;
     tailPinned = true;
-    scrollToBottom(true);
+    syncVisibleWindow();
+    void tick().then(() => scrollToBottom(true));
+  }
+
+  function jumpToActiveTimelineStart(request: { scrollTop: number; rowKey: string | null }): void {
+    if (!timelineEl) return;
+    // Treat contextual navigation as explicit upward intent and update every
+    // live-tail guard before the programmatic write. Resize/stream growth then
+    // preserves this reading position instead of scheduling a bottom re-pin.
+    userScrolledUp = true;
+    userScrollIntentUp = true;
+    tailPinned = false;
+    bottomScrollPending = false;
+    pendingBottomScrollForce = false;
+    writeProgrammaticScrollTop(request.scrollTop);
   }
 
   function handleTimelineWheel(event: WheelEvent): void {
@@ -3750,9 +4316,11 @@ import X from 'lucide-svelte/icons/x';
         approved_count: detail.approved_count,
         denied_count: detail.denied_count,
         escalated_count: detail.escalated_count,
-        context_usage: detail.context_usage ?? null
+        context_usage: detail.context_usage ?? null,
+        last_generation: detail.last_generation ?? null
       };
       applyContextUsageSnapshot(detail.context_usage);
+      applyLastGenerationSnapshot(detail.last_generation);
     } catch {
       if (!isStaleSessionInfoLoad(requestId, conversationId, sid)) {
         sessionInfo = null;
@@ -3778,6 +4346,7 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
       applyContextUsageSnapshot(detail.context_usage);
+      applyLastGenerationSnapshot(detail.last_generation);
     } catch {
       // Context diagnostics are opportunistic; the Info panel can still load details on demand.
     }
@@ -3797,7 +4366,8 @@ import X from 'lucide-svelte/icons/x';
         approved_count: detail.approved_count,
         denied_count: detail.denied_count,
         escalated_count: detail.escalated_count,
-        context_usage: detail.context_usage ?? null
+        context_usage: detail.context_usage ?? null,
+        last_generation: detail.last_generation ?? null
       };
     } catch {
       subSessionInfo = null;
@@ -3819,9 +4389,7 @@ import X from 'lucide-svelte/icons/x';
     const reloadSessions = options.reloadSessions ?? true;
     const reloadHistory = options.reloadHistory ?? true;
     const shouldResubscribe = options.resubscribe ?? false;
-    // The ChatTimeline store handles live-item preservation automatically:
-    // replaceAll() re-applies any pending rAF patches after the snapshot,
-    // and the session filter bypasses during active turns (turnInProgress).
+    // The scoped ChatV2 store reconciles live items with the canonical snapshot.
     // NOTE: the scroll position itself is captured at APPLY time (right before
     // the snapshot mutates the DOM), never here before the async fetch — a
     // pre-fetch capture restored a stale position and yanked actively-scrolling
@@ -3835,12 +4403,24 @@ import X from 'lucide-svelte/icons/x';
     // to the bottom.
     const preTailPinned = tailPinned;
     const initialLoadPolicy = conversationInitialLoadPolicy(currentConversation);
-    const [conversationResult, sessionResult, chatV2SnapshotResult] = await Promise.allSettled([
-      reloadSessions ? api.conversations.detail(conversationId) : Promise.resolve(null),
-      reloadSessions
-        ? api.conversations.sessions(conversationId, initialLoadPolicy.sessionOptions)
-        : Promise.resolve(sessions),
-      reloadHistory ? chatV2Api.snapshot(conversationId) : Promise.resolve(null),
+    const [conversationResult, sessionResult, chatV2SnapshotResult] = await Promise.all([
+      settleWithTimeout(
+        reloadSessions ? api.conversations.detail(conversationId, { includeState: false }) : Promise.resolve(null),
+        CONVERSATION_SUBLOAD_TIMEOUT_MS,
+        'Conversation detail',
+      ),
+      settleWithTimeout(
+        reloadSessions
+          ? api.conversations.sessions(conversationId, initialLoadPolicy.sessionOptions)
+          : Promise.resolve(sessions),
+        CONVERSATION_SUBLOAD_TIMEOUT_MS,
+        'Conversation sessions',
+      ),
+      settleWithTimeout(
+        reloadHistory ? chatV2Api.snapshot(conversationId) : Promise.resolve(null),
+        CONVERSATION_SUBLOAD_TIMEOUT_MS,
+        'Chat snapshot',
+      ),
     ]);
 
     if (isStaleConversationLoad(requestId)) {
@@ -3876,6 +4456,9 @@ import X from 'lucide-svelte/icons/x';
         : new Error('Chat v2 snapshot unavailable');
       const failureMessage = asApiError(failure).message;
       historyError = failureMessage;
+      if (markControllerUnavailable(failure)) {
+        return;
+      }
       if (!chatV2OwnsActiveConversation(conversationId) || chatV2Store.visibleItems.length === 0) {
         chatV2Store.reset();
         applyChatV2StateToTimeline();
@@ -3918,17 +4501,23 @@ import X from 'lucide-svelte/icons/x';
       const nextError = asApiError(sessionResult.reason).message;
       if (!(isPreSessionChatConversation(previousConversation, 0) && isMissingSessionError(nextError))) {
         sessionsError = nextError;
+        markControllerUnavailable(sessionResult.reason);
       }
     }
     if (conversationFailure && !sessionsError) {
       const nextError = asApiError(conversationFailure).message;
       sessionsError = nextError;
-      reportError(conversationFailure);
+      if (!markControllerUnavailable(conversationFailure)) {
+        reportError(conversationFailure);
+      }
     }
 
     if (reloadHistory && chatV2Snapshot) {
       if (preservedScrollTop !== null) {
-        visibleStartIndex = Math.min(preservedVisibleStartIndex, Math.max(0, renderableVisibleItems.length - 100));
+        timelineWindow = {
+          start: Math.min(preservedVisibleStartIndex, Math.max(0, renderableVisibleItems.length - TIMELINE_WINDOW_TARGET_ROWS)),
+          end: null,
+        };
       } else {
         syncVisibleWindow();
         userScrolledUp = false;
@@ -3965,9 +4554,16 @@ import X from 'lucide-svelte/icons/x';
     );
 
     if (!sessionsError && !skipNotificationRefresh) {
-      await refreshPendingNotifications();
+      const notificationResult = await settleWithTimeout(
+        refreshPendingNotifications(),
+        CONVERSATION_SUBLOAD_TIMEOUT_MS,
+        'Pending notifications',
+      );
       if (isStaleConversationLoad(requestId)) {
         return;
+      }
+      if (notificationResult.status === 'rejected') {
+        reportError(notificationResult.reason);
       }
     } else {
       escalations = [];
@@ -3990,6 +4586,12 @@ import X from 'lucide-svelte/icons/x';
           // misread as a user gesture (which could falsely re-attach the tail
           // and trigger a jump to the bottom).
           if (
+            // Never restore an old scrolled-up position over a user who is now
+            // pinned to the tail: if they jumped to the bottom while the refresh
+            // settled, restoring would yank them back up and re-show the jump
+            // button. Their current pinned state wins.
+            !tailPinned &&
+            userScrolledUp &&
             shouldApplyScrollRestore({
               capturedScrollTop: preservedScrollTop,
               currentScrollTop: timelineEl.scrollTop,
@@ -4056,29 +4658,10 @@ import X from 'lucide-svelte/icons/x';
     ));
   }
 
-  function timelinePatchHasActiveWork(event: CognisWebSocketEvent): boolean {
-    if (event.type !== 'timeline_patch') return false;
-    return timelinePatchContainsActiveWork(
-      event.items.filter((item) => timelinePatchItemBelongsToActiveSessionFromProjection(item))
-    );
-  }
-
-  function timelinePatchItemBelongsToActiveSessionFromProjection(item: import('$lib/types/api').TimelineProjectionItem): boolean {
-    const kind = typeof item.kind === 'string' ? item.kind : '';
-    if (kind !== 'message' && kind !== 'tool_call' && kind !== 'thinking') return true;
-    const sessionId = typeof item.sessionId === 'string' ? item.sessionId : null;
-    const activeSessionId = currentConversation?.active_session_id ?? null;
-    if (!sessionId || !activeSessionId) return true;
-    if (sessionId === activeSessionId) return true;
-    // During an active turn, allow items from the compaction lineage but reject
-    // sub-session items (same logic as _itemBelongsToSession in the store).
-    if (turnInProgress) {
-      return activeSessionLineage.has(sessionId);
-    }
-    return false;
-  }
-
   async function refreshConversationView(reason: string): Promise<void> {
+    if (switchingConversation) {
+      expireStaleConversationSwitch();
+    }
     if (!currentConversation || document.hidden || initializing || switchingConversation) {
       return;
     }
@@ -4157,6 +4740,12 @@ import X from 'lucide-svelte/icons/x';
 
     const requestId = beginConversationLoad();
     const previousConversationId = activeConversationId;
+    if (
+      controllerRecoveryConversationId !== null
+      && controllerRecoveryConversationId !== conversationId
+    ) {
+      clearControllerRecovery();
+    }
     const isInitialLoad = !initialConversationResolved && !currentConversation;
     const switchRequestId = beginConversationSwitch(conversationId, !isInitialLoad);
     saveCurrentConversationView();
@@ -4172,6 +4761,7 @@ import X from 'lucide-svelte/icons/x';
     invalidateSessionInfo();
     mobileListOpen = false;
 
+    chatV2Lifecycle.release();
     if (previousConversationId) {
       wsClient.unsubscribeConversation(previousConversationId);
     }
@@ -4204,10 +4794,11 @@ import X from 'lucide-svelte/icons/x';
         cachedView.conversation.active_session_id ?? null,
         { replaceCursor: true },
       );
+      markConversationReadLocally(conversationId);
       api.conversations.markRead(conversationId).catch(() => {});
       conversationSubloadsLoading = true;
       try {
-        const conversation = await api.conversations.detail(conversationId);
+        const conversation = await api.conversations.detail(conversationId, { includeState: false });
         if (isStaleConversationLoad(requestId)) {
           return;
         }
@@ -4225,12 +4816,16 @@ import X from 'lucide-svelte/icons/x';
         if (isStaleConversationLoad(requestId)) {
           return;
         }
+        markConversationReadLocally(conversationId);
         patchConversationInList(conversationId, {
-          has_unread: false,
           active_session_id: currentConversation?.active_session_id,
         });
       } catch (caughtError) {
         if (!isStaleConversationLoad(requestId)) {
+          if (markControllerUnavailable(caughtError, conversationId)) {
+            error = '';
+            return;
+          }
           historyError = asApiError(caughtError).message;
         }
       } finally {
@@ -4245,7 +4840,7 @@ import X from 'lucide-svelte/icons/x';
     clearConversationViewState();
 
     try {
-      const conversation = await api.conversations.detail(conversationId);
+      const conversation = await api.conversations.detail(conversationId, { includeState: false });
       if (isStaleConversationLoad(requestId)) {
         return;
       }
@@ -4269,6 +4864,7 @@ import X from 'lucide-svelte/icons/x';
 
       activeConversationId = conversationId;
       currentConversation = conversation;
+      error = '';
       initialLoadTimedOut = false;
       persistLastOpenedConversation(conversation);
       mergeConversationList([conversation]);
@@ -4297,17 +4893,22 @@ import X from 'lucide-svelte/icons/x';
         return;
       }
 
+      markConversationReadLocally(conversationId);
       api.conversations.markRead(conversationId).catch(() => {});
       currentConversation = {
         ...(currentConversation ?? conversation),
         has_unread: false,
       };
+      markConversationReadLocally(conversationId);
       patchConversationInList(conversationId, {
-        has_unread: false,
         active_session_id: currentConversation.active_session_id,
       });
     } catch (caughtError) {
       if (isStaleConversationLoad(requestId)) {
+        return;
+      }
+      if (markControllerUnavailable(caughtError, conversationId)) {
+        error = '';
         return;
       }
       error = asApiError(caughtError).message;
@@ -4695,8 +5296,14 @@ import X from 'lucide-svelte/icons/x';
     input.value = '';
   }
 
-  async function resolveDirectQuestionNotificationId(pendingStepTool: ReturnType<typeof findPendingStepRequestInputCall>): Promise<string> {
-    let notificationId = pendingStepTool?.notificationId ?? pendingDirectQuestion?.notificationId ?? '';
+  async function resolveDirectQuestionNotificationId(pendingStepTool: ReturnType<typeof selectPendingInputToolCall>): Promise<string> {
+    const argumentNotificationId = pendingStepTool?.arguments?.notification_id;
+    const argumentRequestId = pendingStepTool?.arguments?.request_id;
+    let notificationId =
+      (typeof argumentNotificationId === 'string' ? argumentNotificationId : '')
+      || (typeof argumentRequestId === 'string' ? argumentRequestId : '')
+      || pendingDirectQuestion?.notificationId
+      || '';
     if (!notificationId && currentConversation) {
       try {
         const list = await api.notifications.list(currentConversation.conversation_id);
@@ -4730,18 +5337,26 @@ import X from 'lucide-svelte/icons/x';
     userScrolledUp = false;
     tailPinned = true;
     scrollToBottom(true);
-    const stepName =
-      typeof pendingStepTool?.arguments?.step_name === 'string'
-        ? (pendingStepTool.arguments.step_name as string)
-        : pendingDirectQuestion.stepName;
-    haptic.success();
-    if (inputKind === 'auth_challenge') {
-      wsClient.respondAuthChallenge(notificationId, responseText, stepName);
-    } else {
-      wsClient.respondStepQuestion(notificationId, reply, stepName);
+    try {
+      if (inputKind === 'auth_challenge') {
+        await api.notifications.resolve(notificationId, {
+          decision: 'continue',
+          response: responseText
+        });
+      } else {
+        await api.notifications.resolve(notificationId, {
+          decision: 'continue',
+          response_payload: reply as unknown as Record<string, unknown>
+        });
+      }
+      haptic.success();
+      clearActiveDirectQuestionDraft();
+      return true;
+    } catch (caughtError) {
+      directQuestionSubmitting = false;
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to submit response');
+      return false;
     }
-    clearActiveDirectQuestionDraft();
-    return true;
   }
 
   async function cancelDirectQuestionRequest(): Promise<void> {
@@ -4887,20 +5502,21 @@ import X from 'lucide-svelte/icons/x';
       ? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
       : null;
     const willQueueBehindActiveTurn = !isSlashCommand && !isStepInputReply && turnInProgress;
+    const composerAttachmentsSnapshot = $state.snapshot(composerAttachments) as typeof composerAttachments;
 
     if (!isSlashCommand && !isStepInputReply && clientMessageId && !willQueueBehindActiveTurn) {
       saveOptimisticUserMessageDraft({
         conversationId: directQuestionDraftConversationId() ?? routeConversationId,
         clientMessageId,
         content: optimisticContent,
-        attachments: composerAttachments,
+        attachments: composerAttachmentsSnapshot,
         createdAt: Date.now(),
       });
       // Pass the current chat mode so the plan-mode marker is visible
       // immediately on the optimistic bubble (Issue D — no blink).
       chatV2Store.addOptimisticUser({
         content: optimisticContent,
-        attachments: composerAttachments,
+        attachments: composerAttachmentsSnapshot,
         clientMessageId,
       });
       applyChatV2StateToTimeline();
@@ -4909,6 +5525,8 @@ import X from 'lucide-svelte/icons/x';
     if (!isSlashCommand) {
       lastSubmittedMessage = content;
       lastRecoverableMessage = '';
+      lastRecoverableTurnId = null;
+      suppressedRecoverableTurnId = null;
       if (!willQueueBehindActiveTurn) {
         awaitingAssistantStart = true;
         turnInProgress = true;
@@ -4933,7 +5551,7 @@ import X from 'lucide-svelte/icons/x';
     if (composerElement) composerElement.value = '';
     await tick();
     syncComposerHeight();
-    const attachments = [...composerAttachments];
+    const attachments = composerAttachmentsSnapshot;
     composerAttachments = [];
 
     if (isStepInputReply) {
@@ -4951,14 +5569,13 @@ import X from 'lucide-svelte/icons/x';
         userScrolledUp = false;
         tailPinned = true;
         scrollToBottom(true);
-        const stepName =
-          typeof pendingStepTool?.arguments?.step_name === 'string'
-            ? (pendingStepTool.arguments.step_name as string)
-            : pendingDirectQuestion?.stepName;
-        haptic.success();
-        if (inputKind === 'auth_challenge') {
-          wsClient.respondAuthChallenge(notificationId, content, stepName);
-        } else {
+        try {
+          if (inputKind === 'auth_challenge') {
+            await api.notifications.resolve(notificationId, {
+              decision: 'continue',
+              response: content
+            });
+          } else {
           const questions = directQuestionItems();
           const reply = buildDirectQuestionReply(questions, content);
           if (!directQuestionReplySatisfiesRequired(questions, reply)) {
@@ -4966,10 +5583,19 @@ import X from 'lucide-svelte/icons/x';
             addToast('Answer all required questions before sending.', 'error');
             return;
           }
-          wsClient.respondStepQuestion(notificationId, reply, stepName);
+            await api.notifications.resolve(notificationId, {
+              decision: 'continue',
+              response_payload: reply as unknown as Record<string, unknown>
+            });
+          }
+          haptic.success();
+          clearActiveDirectQuestionDraft();
+          return;
+        } catch (caughtError) {
+          directQuestionSubmitting = false;
+          addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to submit response');
+          return;
         }
-        clearActiveDirectQuestionDraft();
-        return;
       }
 
       // Fall back to a regular message: we saw a pending step_request_questions
@@ -4987,25 +5613,28 @@ import X from 'lucide-svelte/icons/x';
     tailPinned = true;
     scrollToBottom(true);
     haptic.success();
-    if (isSlashCommand || chatModeDirective?.oneShot) {
-      // Chat v2 send intentionally rejects slash commands until the command
-      // dispatcher is modeled as a first-class v2 write operation. Keep the
-      // existing command transport for now instead of silently breaking
-      // /new, /plan, /build, and one-shot `/plan ...`/`/build ...`
-      // directives. Normal user messages use v2 below.
-      wsClient.sendMessage(sendConversationId, outboundContent, attachments, clientMessageId);
+    if (isSlashCommand) {
+      try {
+        const response = await executeCommandWithRetry(sendConversationId, outboundContent);
+        await applyCommandResponse(response);
+      } catch (caughtError) {
+        addToast(asApiError(caughtError).message, 'error', 4000, 'Command failed');
+      }
       return;
     }
     const clientTxnId = clientMessageId ?? crypto.randomUUID();
     const effectiveClientMessageId = clientMessageId ?? clientTxnId;
     const createdAt = new Date().toISOString();
     let outboxStored = false;
+    const effectiveContent = chatModeDirective?.oneShot ? (chatModeDirective.content ?? '') : outboundContent;
+    const effectiveChatMode = chatModeDirective?.oneShot ? chatModeDirective.mode : undefined;
     const outboxEntry: OutboxEntry = {
       client_txn_id: clientTxnId,
       client_message_id: effectiveClientMessageId,
       conversation_id: sendConversationId,
-      content: outboundContent,
+      content: effectiveContent,
       attachments,
+      chat_mode: effectiveChatMode,
       status: 'pending',
       created_at: createdAt,
       updated_at: createdAt
@@ -5019,9 +5648,10 @@ import X from 'lucide-svelte/icons/x';
     }
     try {
       await chatV2Api.sendMessage(sendConversationId, clientTxnId, {
-        content: outboundContent,
+        content: effectiveContent,
         attachments,
-        client_message_id: effectiveClientMessageId
+        client_message_id: effectiveClientMessageId,
+        chat_mode: effectiveChatMode
       });
       if (outboxStored) {
         await chatV2Outbox.update(clientTxnId, { status: 'acked', updated_at: new Date().toISOString() }).catch(() => undefined);
@@ -5041,11 +5671,15 @@ import X from 'lucide-svelte/icons/x';
           last_error: asApiError(caughtError).message
         }).catch(() => undefined);
       }
+      if (!shouldApplyChatSendFailureSideEffects(sendConversationId, conversationIdFromRoute())) return;
       awaitingAssistantStart = false;
       turnInProgress = chatV2Store.snapshot.runtime?.has_active_turn === true;
       currentActiveTurnId = chatV2Store.snapshot.runtime?.active_turn?.turn_id ?? null;
       applyChatV2StateToTimeline();
       await recoverChatV2Snapshot(sendConversationId).catch(() => undefined);
+      // Keep the durable optimistic row visible, but make admission failure
+      // explicit instead of leaving it indefinitely in the sending state.
+      chatV2Store.markOptimisticUserFailed(effectiveClientMessageId);
       addToast(asApiError(caughtError).message, 'error');
     }
   }
@@ -5133,18 +5767,39 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
+  async function retryFailedTurn(turnId: string | null): Promise<void> {
+    if (!currentConversation || !turnId || turnInProgress || awaitingAssistantStart) return;
+    error = '';
+    awaitingAssistantStart = true;
+    try {
+      await chatV2Api.retryTurn(currentConversation.conversation_id, turnId, {
+        client_txn_id: crypto.randomUUID()
+      });
+      lastRecoverableMessage = '';
+      lastRecoverableTurnId = null;
+      await recoverChatV2Canonical(currentConversation.conversation_id);
+    } catch (caughtError) {
+      const apiError = asApiError(caughtError);
+      error = apiError.message;
+      if (shouldClearRecoverableRetry(caughtError)) {
+        suppressedRecoverableTurnId = turnId;
+        lastRecoverableMessage = '';
+        lastRecoverableTurnId = null;
+      }
+      awaitingAssistantStart = false;
+      turnInProgress = chatV2Store.snapshot.runtime?.has_active_turn === true;
+      currentActiveTurnId = chatV2Store.snapshot.runtime?.active_turn?.turn_id ?? null;
+      await recoverChatV2Snapshot(currentConversation.conversation_id).catch(() => undefined);
+      reportError(caughtError);
+    }
+  }
+
   async function retryLastTurn(): Promise<void> {
-    if (!currentConversation || !lastSubmittedMessage) return;
-    composer = lastSubmittedMessage;
-    syncComposerHeight();
-    await handleSend();
+    await retryFailedTurn(lastRecoverableTurnId);
   }
 
   async function continueFailedTurn(): Promise<void> {
-    if (!currentConversation || !canRetryFailedTurn) return;
-    composer = 'Continue';
-    syncComposerHeight();
-    await handleSend();
+    await retryFailedTurn(retryableFailedTurnId);
   }
 
   function syncComposerHeight(): void {
@@ -5198,13 +5853,144 @@ import X from 'lucide-svelte/icons/x';
     if (current === null) return;
     escalationResolutionPending = current;
     escalationBusyCallId = callId;
-    wsClient.resolveEscalation(callId, decision);
+    try {
+      await api.notifications.resolve(callId, { decision });
+    } catch (caughtError) {
+      escalationResolutionPending = null;
+      escalationBusyCallId = null;
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to resolve approval');
+    }
+  }
+
+  async function sendConversationModeText(text: string): Promise<void> {
+    if (!currentConversation || !text.trim()) return;
+    const clientTxnId = crypto.randomUUID();
+    try {
+      await chatV2Api.sendMessage(currentConversation.conversation_id, clientTxnId, {
+        content: text.trim(),
+        attachments: [],
+        client_message_id: clientTxnId
+      });
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to send message');
+    }
   }
 
   function escalationSecondsRemaining(esc: Escalation): number {
     const timeout = esc.timeout_seconds ?? escalationTimeoutSeconds;
     const elapsed = (Date.now() - (esc.received_at ?? Date.now())) / 1000;
     return Math.max(0, Math.ceil(timeout - elapsed));
+  }
+
+  function nextAnimationFrame(): Promise<void> {
+    if (typeof requestAnimationFrame === 'undefined') return Promise.resolve();
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  function shouldFillTimelineViewport(): boolean {
+    return shouldAutoLoadOlderForViewport({
+      visibleStartIndex,
+      hasOlderMessages,
+      loadingOlderMessages,
+      scrollHeight: timelineEl?.scrollHeight ?? 0,
+      clientHeight: timelineEl?.clientHeight ?? 0,
+    });
+  }
+
+  function scheduleTimelineViewportFill(): void {
+    if (timelineViewportFillScheduled || timelineViewportFillInFlight) return;
+    if (typeof requestAnimationFrame === 'undefined') return;
+    timelineViewportFillScheduled = true;
+    requestAnimationFrame(() => {
+      timelineViewportFillScheduled = false;
+      void ensureTimelineViewportFilled();
+    });
+  }
+
+  async function backfillOlderForViewportFillPreservingTail(): Promise<boolean> {
+    if (!olderMessagesCursor || !currentConversation) return false;
+
+    loadingOlderMessages = true;
+    try {
+      const beforeCount = renderableVisibleItems.length;
+      const beforeCursor = olderMessagesCursor;
+      const response = await chatV2Api.timeline(currentConversation.conversation_id, {
+        before: olderMessagesCursor
+      });
+      chatV2Store.applyBackfill(response);
+      applyChatV2StateToTimeline();
+      olderMessagesCursor = response.before_cursor ?? null;
+      hasOlderMessages = Boolean(response.has_more_before && olderMessagesCursor);
+
+      const prependedCount = Math.max(0, renderableVisibleItems.length - beforeCount);
+      timelineWindow = windowAfterViewportFillBackfill(
+        timelineWindow,
+        prependedCount,
+        renderableVisibleItems.length,
+        true,
+      );
+      saveCurrentConversationView();
+      await tick();
+      await nextAnimationFrame();
+      scheduleScrollToBottom(false, 1);
+
+      return prependedCount > 0 || beforeCursor !== olderMessagesCursor;
+    } catch (caughtError) {
+      const message = asApiError(caughtError).message;
+      if (isRecoverableBackfillCursorError(caughtError)) {
+        olderMessagesCursor = null;
+        hasOlderMessages = false;
+      } else {
+        addToast(`Unable to load older messages: ${message}`, 'error');
+      }
+      return false;
+    } finally {
+      loadingOlderMessages = false;
+    }
+  }
+
+  async function ensureTimelineViewportFilled(): Promise<void> {
+    if (timelineViewportFillInFlight) return;
+    timelineViewportFillInFlight = true;
+    try {
+      for (let attempt = 0; attempt < TIMELINE_VIEWPORT_FILL_MAX_ATTEMPTS; attempt += 1) {
+        await tick();
+        if (!shouldFillTimelineViewport()) break;
+        if (visibleStartIndex <= 0) {
+          if (!hasOlderMessages) break;
+          if (!userScrolledUp && timelineWindow.end === null) {
+            const changed = await backfillOlderForViewportFillPreservingTail();
+            if (!changed) break;
+            continue;
+          }
+          await loadOlder();
+          await tick();
+          await nextAnimationFrame();
+          continue;
+        }
+
+        const beforeStart = visibleStartIndex;
+        const beforeEnd = visibleEndIndex;
+        const beforeCount = renderableVisibleItems.length;
+        const wasTailPinned = !userScrolledUp && timelineWindow.end === null;
+        const anchor = wasTailPinned ? null : captureTimelineAnchor();
+        timelineWindow = expandWindowUpPreservingLiveTail(timelineWindow, renderableVisibleItems.length);
+        await tick();
+        await nextAnimationFrame();
+        if (wasTailPinned) {
+          scheduleScrollToBottom(false, 1);
+        } else {
+          restoreTimelineAnchor(anchor);
+        }
+
+        const changed = beforeStart !== visibleStartIndex
+          || beforeEnd !== visibleEndIndex
+          || beforeCount !== renderableVisibleItems.length;
+        if (!changed) break;
+      }
+    } finally {
+      timelineViewportFillInFlight = false;
+    }
   }
 
   async function loadOlder(): Promise<void> {
@@ -5217,70 +6003,74 @@ import X from 'lucide-svelte/icons/x';
     loadingOlderMessages = true;
 
     try {
-      // The scroll anchor MUST be captured immediately before the DOM-mutating
-      // apply — never before async work. Capturing before a network fetch and
-      // restoring after it snapped actively-scrolling users back to the
-      // pre-fetch position (the "jumps back while scrolling up" bug).
-      let anchor: { scrollHeight: number; scrollTop: number } | null = null;
+      // Element-anchored restore: the reference row stays visually fixed across
+      // the prepend, immune to a simultaneous tail-window change. The anchor is
+      // captured immediately before each DOM-mutating apply — never before the
+      // network fetch (capturing before async work snapped actively-scrolling
+      // users back to the pre-fetch position).
       if (visibleStartIndex > 0) {
-        anchor = { scrollHeight: timelineEl.scrollHeight, scrollTop: timelineEl.scrollTop };
-        visibleStartIndex = Math.max(0, visibleStartIndex - 50);
+        const anchor = captureTimelineAnchor();
+        timelineWindow = expandWindowUp(timelineWindow, renderableVisibleItems.length);
         await tick();
+        requestAnimationFrame(() => {
+          restoreTimelineAnchor(anchor);
+          loadingOlderMessages = false;
+        });
       } else if (olderMessagesCursor && currentConversation) {
+        const beforeCount = renderableVisibleItems.length;
         const response = await chatV2Api.timeline(currentConversation.conversation_id, {
           before: olderMessagesCursor
         });
-        if (timelineEl) {
-          anchor = { scrollHeight: timelineEl.scrollHeight, scrollTop: timelineEl.scrollTop };
-        }
+        const anchor = captureTimelineAnchor();
         chatV2Store.applyBackfill(response);
         applyChatV2StateToTimeline();
         olderMessagesCursor = response.before_cursor ?? null;
         hasOlderMessages = Boolean(response.has_more_before && olderMessagesCursor);
-        visibleStartIndex = 0;
+        // Keep the rows the user was reading mounted (do NOT reset to the oldest
+        // page): shift the window down by however many rows were prepended so
+        // the same newer rows stay rendered and the anchor restore is exact.
+        const prependedCount = Math.max(0, renderableVisibleItems.length - beforeCount);
+        timelineWindow = windowAfterPrepend(timelineWindow, prependedCount, renderableVisibleItems.length);
         saveCurrentConversationView();
         await tick();
-      }
-      const capturedAnchor = anchor;
-      requestAnimationFrame(() => {
-        if (timelineEl && capturedAnchor) {
-          const growth = timelineEl.scrollHeight - capturedAnchor.scrollHeight;
-          const target = capturedAnchor.scrollTop + growth;
-          const current = timelineEl.scrollTop;
-          // The browser's native scroll anchoring may have already applied the
-          // prepend compensation (target) or left the position untouched
-          // (captured value). Either way the adjustment write is safe. If the
-          // position matches neither, the user kept scrolling between capture
-          // and this frame — leave them alone instead of snapping them back.
-          const matchesUncompensated = shouldApplyScrollRestore({
-            capturedScrollTop: capturedAnchor.scrollTop,
-            currentScrollTop: current,
-          });
-          const matchesCompensated = shouldApplyScrollRestore({
-            capturedScrollTop: target,
-            currentScrollTop: current,
-          });
-          if (matchesUncompensated || matchesCompensated) {
-            writeProgrammaticScrollTop(target);
-          }
-        }
+        requestAnimationFrame(() => {
+          restoreTimelineAnchor(anchor);
+          loadingOlderMessages = false;
+        });
+      } else {
         loadingOlderMessages = false;
-      });
+      }
     } catch (caughtError) {
       const message = asApiError(caughtError).message;
-      addToast(`Unable to load older messages: ${message}`, 'error');
+      // A stale before-cursor after compaction/lineage change is recoverable:
+      // clear it so the next scroll re-fetches from the fresh window instead of
+      // failing forever. Only surface a toast for genuinely unexpected errors.
+      if (isRecoverableBackfillCursorError(caughtError)) {
+        olderMessagesCursor = null;
+        hasOlderMessages = false;
+      } else {
+        addToast(`Unable to load older messages: ${message}`, 'error');
+      }
       loadingOlderMessages = false;
       // No scroll restore on failure: nothing mutated the timeline DOM, so the
-      // user's current position is already correct. The previous unguarded
-      // scrollTop restore here fought actively-scrolling users.
+      // user's current position is already correct.
     }
+  }
+
+  function isRecoverableBackfillCursorError(caughtError: unknown): boolean {
+    const apiError = asApiError(caughtError);
+    const message = (apiError.message ?? '').toLowerCase();
+    return (
+      apiError.status === 400
+      && (message.includes('lineage') || message.includes('cursor'))
+    );
   }
 
   async function openCreatedConversation(conversationId: string): Promise<void> {
     let createdConversation: Conversation | null = null;
 
     try {
-      createdConversation = await api.conversations.detail(conversationId);
+      createdConversation = await api.conversations.detail(conversationId, { includeState: false });
       const desiredStatusFilter = conversationStatusFilterForConversation(createdConversation, selectedConversationStatus);
       if (selectedConversationStatus !== desiredStatusFilter) {
         selectedConversationStatus = desiredStatusFilter;
@@ -5311,7 +6101,7 @@ import X from 'lucide-svelte/icons/x';
 
   async function patchCreatedConversationRow(conversationId: string): Promise<void> {
     try {
-      const createdConversation = await api.conversations.detail(conversationId);
+      const createdConversation = await api.conversations.detail(conversationId, { includeState: false });
       if (!conversationMatchesSidebarProjectionFilter(createdConversation, currentSidebarProjectionFilter())) {
         return;
       }
@@ -5326,6 +6116,7 @@ import X from 'lucide-svelte/icons/x';
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent | ChatRealtimeFrame): void {
     const currentId = conversationIdFromRoute();
     const chatV2OwnsCurrent = chatV2OwnsActiveConversation(currentId);
+    const legacyLifecycleEnabled = shouldApplyLegacyLifecycleFrame(chatV2OwnsCurrent);
     if (event.type === 'chat_v2_frame') {
       if (event.conversation_id === currentId) {
         void applyChatV2Frame(event);
@@ -5334,10 +6125,22 @@ import X from 'lucide-svelte/icons/x';
     }
     const eventSessionId = 'session_id' in event && typeof event.session_id === 'string' ? event.session_id : null;
     const eventPreviousSessionId = event.type === 'session_compacted' ? event.previous_session_id : null;
-    // A new conversation was created on another device/tab. Reload the sidebar
-    // so the new row appears without requiring a manual refresh.
+    // A new conversation was created on another device/tab. Newer servers send
+    // the hydrated sidebar row so this can stay local; fall back to a full
+    // projection refresh for older/no-row payloads.
     if (event.type === 'sidebar_conversation_upsert') {
-      void refreshSidebarData();
+      const upsert = event as typeof event & { conversation?: Conversation | null };
+      if (upsert.conversation) {
+        applySidebarConversationUpsert(upsert.conversation);
+      } else {
+        void refreshSidebarData();
+      }
+      return;
+    }
+    if (event.type === 'sidebar_conversation_removed') {
+      removeConversationFromSidebar(event.conversation_id, {
+        markCurrentDeleted: event.conversation_id === currentId,
+      });
       return;
     }
     if (event.type === 'conversation_created') {
@@ -5360,7 +6163,11 @@ import X from 'lucide-svelte/icons/x';
         if (todos !== null) {
           setConversationTodoSnapshot(otherConvId, todos);
         }
-        patchConversationInList(otherConvId, conversationStateConversationPatch(event.state));
+        patchConversationInList(
+          otherConvId,
+          conversationStateConversationPatch(event.state),
+          { pendingNotificationSource: 'server' },
+        );
         return;
       }
       if (event.type === 'conversation_state_delta') {
@@ -5371,24 +6178,27 @@ import X from 'lucide-svelte/icons/x';
           if (todos !== null) {
             setConversationTodoSnapshot(otherConvId, todos);
           }
-          patchConversationInList(otherConvId, conversationStateConversationPatch(state));
+          patchConversationInList(
+            otherConvId,
+            conversationStateConversationPatch(state),
+            { pendingNotificationSource: 'server' },
+          );
         }
         return;
       }
-      recordTodoSnapshotFromSocketEvent(event);
       if (event.type === 'conversation_updated' && event.conversation_id) {
         const patch = conversationUpdatedRowPatch(event);
         if (Object.keys(patch).length > 0) {
           patchConversationInList(event.conversation_id, patch, {
             touchUpdatedAt: typeof event.title === 'string' || typeof event.updated_at === 'string',
             touchLastMessageAt: typeof event.last_message_at === 'string',
+            pendingNotificationSource: Array.isArray(event.pending_notification_types) ? 'server' : undefined,
           });
         }
       } else if (
         event.type === 'turn_started'
         || (event.type === 'queued' && event.command_result !== true)
-        || event.type === 'timeline_patch'
-        || event.type === 'delegation_started'
+         || event.type === 'delegation_started'
       ) {
         setConversationTurnIndicator(
           otherConvId,
@@ -5490,12 +6300,15 @@ import X from 'lucide-svelte/icons/x';
       if (event.type === 'message_complete') {
         patchConversationInList(
           currentConversation.conversation_id,
-          { has_unread: false, last_message_at: event.completed_at ?? undefined },
+          {
+            has_unread: false,
+            last_message_at: event.completed_at ?? undefined,
+            last_read_at: event.completed_at ?? new Date().toISOString(),
+          },
           { touchLastMessageAt: true }
         );
       } else if (
-        event.type === 'timeline_patch'
-        || event.type === 'delegation_started'
+         event.type === 'delegation_started'
         || event.type === 'delegation_completed'
         || event.type === 'delegation_failed'
         || event.type === 'workflow_composed'
@@ -5564,7 +6377,11 @@ import X from 'lucide-svelte/icons/x';
           active_executor_source: 'user'
         });
       }
-      appendChatV2LocalSystemMessage(event.text, `system:${event.command ?? event.code ?? 'message'}`);
+      appendChatV2LocalSystemMessage(
+        event.text,
+        `system:${event.command ?? event.code ?? 'message'}`,
+        event.notice_id
+      );
       return;
     }
 
@@ -5573,7 +6390,7 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (event.type === 'queued_messages_updated' || event.type === 'queued' || event.type === 'message_complete' || event.type === 'turn_settled') {
+    if (legacyLifecycleEnabled && (event.type === 'queued_messages_updated' || event.type === 'queued' || event.type === 'message_complete' || event.type === 'turn_settled')) {
       queuedCount = event.queued_count ?? 0;
       if ('messages' in event && Array.isArray(event.messages)) {
         applyQueuedMessageSnapshot(event.messages, event.queued_count ?? event.messages.length);
@@ -5582,7 +6399,7 @@ import X from 'lucide-svelte/icons/x';
       }
     }
 
-    if (event.type === 'turn_started' || event.type === 'queued') {
+    if (legacyLifecycleEnabled && (event.type === 'turn_started' || event.type === 'queued')) {
       turnInProgress = true;
       if (event.type === 'turn_started') {
         // Track the current turn_id so we can guard against late patches
@@ -5607,6 +6424,15 @@ import X from 'lucide-svelte/icons/x';
       if (isNonFatalWebSocketBackpressureError({ code: event.code, message: nextError })) {
         return;
       }
+      if (chatV2OwnsCurrent) {
+        if (event.code === 'session_ended' && currentConversation) {
+          void api.conversations.sessions(currentConversation.conversation_id).then((s) => {
+            sessions = s;
+            syncActiveSessionAttention(currentConversation?.conversation_id, s);
+          }).catch(() => {});
+        }
+        return;
+      }
       if (shouldSuppressPreSessionSocketError({
         code: event.code,
         message: nextError,
@@ -5628,8 +6454,7 @@ import X from 'lucide-svelte/icons/x';
         error = '';
         awaitingAssistantStart = false;
         turnInProgress = false;
-        // Record the settled turn_id so late timeline_patches (from the
-        // coalesce buffer race) cannot re-arm turnInProgress (Issue B).
+        // Record the settled turn_id for diagnostics and retry state.
         if (currentActiveTurnId) lastSettledTurnId = currentActiveTurnId;
         currentActiveTurnId = null;
         clearConversationTurnState(currentConversation?.conversation_id);
@@ -5670,6 +6495,13 @@ import X from 'lucide-svelte/icons/x';
       }
       if (event.recoverable) {
         lastRecoverableMessage = lastSubmittedMessage;
+        const retryEvent = event as { turn_id?: string };
+        const recoverableTurnId = typeof retryEvent.turn_id === 'string'
+          ? retryEvent.turn_id
+          : currentActiveTurnId;
+        lastRecoverableTurnId = recoverableTurnId === suppressedRecoverableTurnId
+          ? null
+          : recoverableTurnId;
       }
       return;
     }
@@ -5691,27 +6523,11 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    if (!chatV2OwnsCurrent && (timelinePatchHasActiveWork(event) || event.type === 'delegation_started')) {
-      // Guard: don't re-arm turnInProgress for a late patch belonging to an
-      // already-settled/cancelled turn (Issue B). A coalesced live.thinking
-      // patch can arrive after the turn_cancelled error and after
-      // turnInProgress was cleared, re-arming the spinner indefinitely.
-      // Check if the patch's items all belong to the last settled turn_id.
-      const isLateSettledPatch = lastSettledTurnId !== null
-        && event.type === 'timeline_patch'
-        && event.items.length > 0
-        && event.items.every((item) => {
-          const itemTurnId = (item as unknown as { turnId?: string }).turnId;
-          return itemTurnId === lastSettledTurnId;
-        });
-      if (!isLateSettledPatch) {
-        awaitingAssistantStart = false;
-        turnInProgress = true;
-        setConversationTurnIndicator(currentConversation?.conversation_id, true);
-      }
+    if (!chatV2OwnsCurrent && event.type === 'delegation_started') {
+      awaitingAssistantStart = false;
+      turnInProgress = true;
+      setConversationTurnIndicator(currentConversation?.conversation_id, true);
     }
-
-    recordTodoSnapshotFromSocketEvent(event);
 
     const pendingNotificationType = notificationTypeForEvent(event.type);
     if (pendingNotificationType) {
@@ -5733,7 +6549,7 @@ import X from 'lucide-svelte/icons/x';
       syncConversationActiveSession(event.session_id);
     }
 
-    if (event.type === 'turn_settled' || event.type === 'task_paused') {
+    if (legacyLifecycleEnabled && (event.type === 'turn_settled' || event.type === 'task_paused')) {
       awaitingAssistantStart = false;
       turnInProgress = false;
       if (currentConversation) {
@@ -5746,8 +6562,9 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (event.type === 'message_complete' || event.type === 'workflow_completed' || event.type === 'workflow_failed' || event.type === 'workflow_cancelled') {
-      awaitingAssistantStart = false;
-      turnInProgress = false;
+      if (!chatV2OwnsCurrent) {
+        awaitingAssistantStart = false;
+        turnInProgress = false;
       // Record the settled turn_id (same guard as cancel path — Issue B).
       if (currentActiveTurnId) lastSettledTurnId = currentActiveTurnId;
       if (event.type === 'message_complete' && event.turn_id) lastSettledTurnId = event.turn_id;
@@ -5761,10 +6578,14 @@ import X from 'lucide-svelte/icons/x';
         directQuestionPageIndex = 0;
         directQuestionCollapsed = false;
       }
-      directQuestionSubmitting = false;
+        directQuestionSubmitting = false;
+      }
       // Update context usage from message_complete
       if (event.type === 'message_complete' && event.context_usage) {
         applyContextUsageSnapshot(event.context_usage);
+      }
+      if (event.type === 'message_complete') {
+        applyLastGenerationSnapshot(event.last_generation);
       }
       if (currentConversation && event.type === 'message_complete') {
         const agentObj = agents.find((a) => a.agent_id === currentConversation?.agent_id);
@@ -5774,6 +6595,7 @@ import X from 'lucide-svelte/icons/x';
       }
       // Mark as read since the user is viewing this conversation
       if (currentConversation && !document.hidden) {
+        markConversationReadLocally(currentConversation.conversation_id);
         api.conversations.markRead(currentConversation.conversation_id).catch(() => {});
       }
     }
@@ -5828,13 +6650,18 @@ import X from 'lucide-svelte/icons/x';
     if (event.type === 'conversation_updated') {
       if (currentConversation && event.conversation_id === currentConversation.conversation_id) {
         const patch = conversationUpdatedRowPatch(event);
-        if (typeof event.has_active_turn === 'boolean') {
+        if (chatV2OwnsCurrent) {
+          delete patch.has_active_turn;
+          delete patch.active_turn_chat_mode;
+          delete patch.active_turn_chat_mode_source;
+        } else if (typeof event.has_active_turn === 'boolean') {
           turnInProgress = event.has_active_turn;
         }
         if (Object.keys(patch).length > 0) {
           patchConversationInList(currentConversation.conversation_id, patch, {
             touchUpdatedAt: typeof event.title === 'string' || typeof event.updated_at === 'string',
             touchLastMessageAt: typeof event.last_message_at === 'string',
+            pendingNotificationSource: Array.isArray(event.pending_notification_types) ? 'server' : undefined,
           });
         }
       }
@@ -5845,9 +6672,11 @@ import X from 'lucide-svelte/icons/x';
     // here we only refresh the session list and active session.
     if (event.type === 'session_compacted') {
       syncConversationActiveSession(event.session_id);
-      awaitingAssistantStart = false;
-      turnInProgress = false;
-      setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      if (!chatV2OwnsCurrent) {
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      }
       if (event.command_result === true) {
         appendChatV2LocalSystemMessage(sessionCompactedMessage(event), 'session_compacted');
       }
@@ -5869,18 +6698,19 @@ import X from 'lucide-svelte/icons/x';
     // Handle session_reset: clear timeline for new session
     if (event.type === 'session_reset') {
       syncConversationActiveSession(event.session_id);
-      awaitingAssistantStart = false;
-      turnInProgress = false;
-      activeSessionLastSeq = 0;
-      olderMessagesCursor = null;
-      hasOlderMessages = false;
-      setConversationTurnIndicator(currentConversation?.conversation_id, false);
-      // Chat v2 owns the canonical timeline; reset the store and let the
-      // canonical snapshot/frames repopulate the new session.
-      chatV2Store.reset();
-      syncVisibleWindow();
-      void recoverChatV2Snapshot(event.conversation_id);
-      scrollToBottom(true);
+      if (!chatV2OwnsCurrent) {
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
+        activeSessionLastSeq = 0;
+        olderMessagesCursor = null;
+        hasOlderMessages = false;
+        chatV2Store.reset();
+        syncVisibleWindow();
+        scrollToBottom(true);
+      } else {
+        scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
+      }
       // Refresh session list
       if (currentConversation) {
         api.conversations.sessions(currentConversation.conversation_id)
@@ -5895,21 +6725,25 @@ import X from 'lucide-svelte/icons/x';
 
     // Handle history_rebased: reload the same conversation in place.
     if (event.type === 'history_rebased') {
-      awaitingAssistantStart = false;
-      turnInProgress = false;
-      activeSessionLastSeq = 0;
-      olderMessagesCursor = null;
-      hasOlderMessages = false;
-      queuedCount = 0;
-      queuedMessages = [];
-      directQuestionSubmitting = false;
-      pendingDirectQuestion = null;
-      pendingCredentialRequest = null;
-      directQuestionPageIndex = 0;
-      directQuestionCollapsed = false;
-      escalationBusyCallId = null;
-      escalationResolutionPending = null;
-      setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      if (!chatV2OwnsCurrent) {
+        awaitingAssistantStart = false;
+        turnInProgress = false;
+        activeSessionLastSeq = 0;
+        olderMessagesCursor = null;
+        hasOlderMessages = false;
+        queuedCount = 0;
+        queuedMessages = [];
+        directQuestionSubmitting = false;
+        pendingDirectQuestion = null;
+        pendingCredentialRequest = null;
+        directQuestionPageIndex = 0;
+        directQuestionCollapsed = false;
+        escalationBusyCallId = null;
+        escalationResolutionPending = null;
+        setConversationTurnIndicator(currentConversation?.conversation_id, false);
+      } else {
+        scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
+      }
       if (event.session_id) {
         syncConversationActiveSession(event.session_id);
       }
@@ -5928,10 +6762,13 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (event.type === 'reconnected') {
+      void resyncSidebarData('websocket-reconnect', { force: true });
       const previousTurnInProgress = turnInProgress;
-      awaitingAssistantStart = false;
-      turnInProgress = event.has_active_turn ?? hasAnyActiveTurnTimelineItem();
-      setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
+      if (!chatV2OwnsCurrent) {
+        awaitingAssistantStart = false;
+        turnInProgress = event.has_active_turn ?? hasAnyActiveTurnTimelineItem();
+        setConversationTurnIndicator(currentConversation?.conversation_id, turnInProgress);
+      }
       if (currentConversation) {
         const shouldRefresh = shouldReconcileAfterReconnect({
           remoteLastSeq: event.last_seq,
@@ -5946,31 +6783,49 @@ import X from 'lucide-svelte/icons/x';
 
     if (event.type === 'workflow_step_question' && event.notification_id) {
       if (!event.task_id) {
-        pendingDirectQuestion = pendingDirectQuestionFromQuestionSet(
+        const nextQuestion = pendingDirectQuestionFromQuestionSet(
           event.notification_id,
           event.step_name,
           event.questions,
           event.context,
         );
-        directQuestionAnswers = {};
-        directQuestionPageIndex = 0;
-        directQuestionCollapsed = false;
-        directQuestionSubmitting = false;
-        awaitingAssistantStart = false;
-        turnInProgress = false;
-        setConversationTurnIndicator(currentConversation?.conversation_id, false);
+        if (shouldResetPendingDirectQuestionForm(
+          pendingDirectQuestion?.notificationId,
+          nextQuestion.notificationId,
+        )) {
+          directQuestionAnswers = restoreDirectQuestionDraft(nextQuestion);
+          directQuestionPageIndex = 0;
+          directQuestionCollapsed = false;
+          directQuestionSubmitting = false;
+        }
+        pendingDirectQuestion = nextQuestion;
+        if (!chatV2OwnsCurrent) {
+          awaitingAssistantStart = false;
+          turnInProgress = false;
+          setConversationTurnIndicator(currentConversation?.conversation_id, false);
+        }
       }
     }
 
     if (event.type === 'auth_challenge' && event.notification_id) {
       if (!event.task_id) {
-        pendingDirectQuestion = pendingDirectQuestionFromAuthChallengeEvent(event);
-        directQuestionPageIndex = 0;
-        directQuestionCollapsed = false;
-        directQuestionSubmitting = false;
-        awaitingAssistantStart = false;
-        turnInProgress = false;
-        setConversationTurnIndicator(currentConversation?.conversation_id, false);
+        const nextQuestion = pendingDirectQuestionFromAuthChallengeEvent(event);
+        if (!nextQuestion) return;
+        if (shouldResetPendingDirectQuestionForm(
+          pendingDirectQuestion?.notificationId,
+          nextQuestion.notificationId,
+        )) {
+          directQuestionAnswers = restoreDirectQuestionDraft(nextQuestion);
+          directQuestionPageIndex = 0;
+          directQuestionCollapsed = false;
+          directQuestionSubmitting = false;
+        }
+        pendingDirectQuestion = nextQuestion;
+        if (!chatV2OwnsCurrent) {
+          awaitingAssistantStart = false;
+          turnInProgress = false;
+          setConversationTurnIndicator(currentConversation?.conversation_id, false);
+        }
       }
     }
 
@@ -6026,84 +6881,20 @@ import X from 'lucide-svelte/icons/x';
     await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
 
-  let subSessionPollTimer: number | null = null;
-
-  async function handleViewSession(sessionId: string): Promise<void> {
+  function handleViewSession(sessionId: string): void {
     if (!currentConversation) return;
     subSessionId = sessionId;
     subSessionPanelOpen = true;
-    subSessionLoading = true;
-    subSessionError = '';
-    subSessionTimeline = [];
-    subSessionLog = null;
-    subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
-    subSessionUserScrolledUp = false;
     subSessionInfo = null;
     subSessionInfoOpen = false;
-    try {
-      const conversationId = currentConversation.conversation_id;
-      const result = await loadSessionLog(
-        sessionId,
-        (afterSeq, limit) => api.conversations.sessionEvents(conversationId, sessionId, afterSeq, limit),
-      );
-      subSessionLog = result;
-      subSessionTimeline = result.timeline;
-    } catch (err) {
-      subSessionError = asApiError(err)?.message ?? 'Failed to load session events';
-    } finally {
-      subSessionLoading = false;
-    }
-    startSubSessionPolling();
-  }
-
-  function startSubSessionPolling(): void {
-    stopSubSessionPolling();
-    const tick = async (): Promise<void> => {
-      try {
-        if (document.hidden || !subSessionPanelOpen || !subSessionId || !currentConversation) {
-          return;
-        }
-        if (!subSessionLog) return;
-        const conversationId = currentConversation.conversation_id;
-        const result = await refreshSessionLog(
-          subSessionLog,
-          (afterSeq, limit) => api.conversations.sessionEvents(conversationId, subSessionId, afterSeq, limit),
-        );
-        subSessionLog = result;
-        subSessionTimeline = result.timeline;
-        subSessionPollDelayMs = SESSION_LOG_POLL_INTERVAL_MS;
-      } catch {
-        subSessionPollDelayMs = nextPollDelayMs(subSessionPollDelayMs);
-      } finally {
-        if (subSessionPanelOpen) {
-          subSessionPollTimer = window.setTimeout(() => {
-            void tick();
-          }, subSessionPollDelayMs);
-        }
-      }
-    };
-    subSessionPollTimer = window.setTimeout(() => {
-      void tick();
-    }, subSessionPollDelayMs);
-  }
-
-  function stopSubSessionPolling(): void {
-    if (subSessionPollTimer !== null) {
-      window.clearTimeout(subSessionPollTimer);
-      subSessionPollTimer = null;
-    }
   }
 
   function closeSubSessionPanel(): void {
-    stopSubSessionPolling();
     subSessionClosing = true;
     setTimeout(() => {
       subSessionPanelOpen = false;
       subSessionClosing = false;
       subSessionId = '';
-      subSessionTimeline = [];
-      subSessionLog = null;
-      subSessionUserScrolledUp = false;
       subSessionInfo = null;
       subSessionInfoOpen = false;
     }, 250);
@@ -6155,6 +6946,7 @@ import X from 'lucide-svelte/icons/x';
       if (shouldPreserveLiveTailOnResize({ tailPinned, autoScrollPending: bottomScrollPending })) {
         scheduleScrollToBottom(false, 2);
       }
+      scheduleTimelineViewportFill();
     });
     if (timelineEl) {
       observer.observe(timelineEl);
@@ -6169,7 +6961,20 @@ import X from 'lucide-svelte/icons/x';
   });
 
   $effect(() => {
-    const latestTodos = latestTodoSnapshotFromChatV2(chatV2Store.visibleItems, currentConversation?.context?.type === 'web');
+    currentConversation?.conversation_id;
+    conversationSubloadsLoading;
+    displayedTimeline.length;
+    visibleStartIndex;
+    visibleEndIndex;
+    hasOlderMessages;
+    loadingOlderMessages;
+
+    if (!currentConversation || conversationSubloadsLoading) return;
+    scheduleTimelineViewportFill();
+  });
+
+  $effect(() => {
+    const latestTodos = selectLatestTodoState(chatV2Store.visibleItems, currentConversation?.context?.type === 'web');
     if (latestTodos.length > 0) {
       retainedChatTodos = latestTodos;
       return;
@@ -6282,26 +7087,35 @@ import X from 'lucide-svelte/icons/x';
     return sortAgentDirectChats(agentDirectChats);
   });
   // Canonical Chat v2 visible items are the single source of truth for the
-  // rendered timeline. The native renderer consumes them directly; read-only
-  // consumers (search, todos, retry-tail) use the per-item legacy-shape
-  // projection. There is no legacy ChatTimeline merge store in this path.
+  // rendered timeline. Native selectors operate on the same canonical union;
+  // there is no legacy render projection or structural cast.
   //
-  // Window over RENDERABLE items only. Non-row items (todo_state, unknown
-  // kinds) must be excluded before slicing so a tail of such items cannot push
-  // real messages out of the visible window (which would render blank rows).
-  let renderableVisibleItems = $derived.by<ChatV2TimelineItem[]>(() =>
-    chatV2Store.visibleItems.filter(isRenderableChatV2Item)
-  );
-  let displayedTimeline = $derived(renderableVisibleItems.slice(visibleStartIndex));
+  // Window over explicitly renderable canonical items only. The policy is
+  // exhaustive, so newly added kinds cannot silently create blank rows.
+   let renderableVisibleItems = $derived.by<ChatV2TimelineItem[]>(() =>
+     chatV2Store.visibleItems.filter(isRenderableTimelineItem)
+   );
+  let displayedTimeline = $derived.by<ChatV2TimelineItem[]>(() => {
+    const end = timelineWindowEndIndex(renderableVisibleItems.length);
+    const start = Math.min(Math.max(0, visibleStartIndex), end);
+    return renderableVisibleItems.slice(start, end);
+  });
   let displayedTimelineHasStreaming = $derived(displayedTimeline.some((item) => isInlineLiveChatV2Item(item)));
-  const canRetryFailedTurn = $derived.by(() =>
-    Boolean(currentConversation)
+  const retryableFailedTurnId = $derived.by(() =>
+    currentConversation
       && !turnInProgress
       && !awaitingAssistantStart
       && !pendingDirectQuestion
       && !directQuestionSubmitting
       && !isReadOnly(currentConversation)
-      && hasRetryableFailedTurnTailChatV2(displayedTimeline)
+      ? (() => {
+          const turnId = retryableFailedTurnIdFromTailChatV2(displayedTimeline);
+          return turnId === suppressedRecoverableTurnId ? null : turnId;
+        })()
+      : null
+  );
+  const canRetryFailedTurn = $derived.by(() =>
+    retryableFailedTurnId !== null
   );
   let chatSearchMatchedMessageIds = $derived.by(() => new Set(chatSearchResults.map((result) => result.targetId)));
   let selectedChatSearchTargetId = $derived(chatSearchResults[chatSearchSelectedIndex]?.targetId ?? null);
@@ -6350,21 +7164,27 @@ import X from 'lucide-svelte/icons/x';
     visibilityHandler = () => {
       syncServiceWorkerActiveConversation();
       if (!document.hidden) {
+        resumeControllerRecoveryIfPending();
+        void resyncSidebarData('visibility');
         void refreshConversationView('visibility');
         if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
         void refreshPendingNotifications();
+      } else {
       }
     };
     focusHandler = () => {
       syncServiceWorkerActiveConversation();
+      void resyncSidebarData('focus');
       void refreshConversationView('focus');
       if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
     };
     pageShowHandler = () => {
+      void resyncSidebarData('pageshow');
       void refreshConversationView('pageshow');
       if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
     };
     onlineHandler = () => {
+      void resyncSidebarData('online');
       void refreshConversationView('online');
       if (currentConversation) void drainChatV2Outbox(currentConversation.conversation_id);
     };
@@ -6466,6 +7286,8 @@ import X from 'lucide-svelte/icons/x';
         window.clearTimeout(foregroundSyncTimer);
         foregroundSyncTimer = null;
       }
+      clearControllerRecovery();
+      clearConversationSwitchTimeout();
       if (staleRuntimeGuardTimer !== null) {
         window.clearInterval(staleRuntimeGuardTimer);
         staleRuntimeGuardTimer = null;
@@ -6474,11 +7296,12 @@ import X from 'lucide-svelte/icons/x';
         window.clearTimeout(timer);
       }
       chatV2CanonicalRecoveryTimers.clear();
+      chatV2CanonicalRecoveryRerun.clear();
+      chatV2Lifecycle.release();
       if (activeConversationId) {
         wsClient.unsubscribeConversation(activeConversationId);
       }
       syncServiceWorkerActiveConversation(false);
-      stopSubSessionPolling();
     };
   });
 </script>
@@ -6887,7 +7710,7 @@ import X from 'lucide-svelte/icons/x';
             {:else}
             {#each visibleConversationSections as section (section.key)}
               <section class="space-y-1" aria-labelledby={`history-section-${section.key}`}>
-                <p id={`history-section-${section.key}`} class="sticky top-0 z-10 rounded-lg bg-slate-950/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500 backdrop-blur first:mt-0">{section.label}</p>
+                <p id={`history-section-${section.key}`} class="sticky top-0 z-10 rounded-lg bg-slate-950 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500 first:mt-0">{section.label}</p>
                 {#each section.conversations as conversation (conversation.conversation_id)}
                   {@const agent = conversationAgentForDisplay(conversation)}
                   {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
@@ -7218,16 +8041,7 @@ import X from 'lucide-svelte/icons/x';
             >
               <Search class="h-4 w-4" />
             </button>
-            <button
-              class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
-              onclick={toggleHeaderInfo}
-              type="button"
-              title="Session details"
-              aria-label="Toggle session details"
-              aria-expanded={headerInfoOpen}
-            >
-              <Info class="h-4 w-4" />
-            </button>
+            <SessionDetailsButton open={headerInfoOpen} loading={sessionInfoLoading} onclick={toggleHeaderInfo} />
             {#if !isAgentDirectConversation(currentConversation)}
               <div class="hidden flex-wrap gap-2 sm:flex">
                 {#if currentConversation?.status === 'archived'}
@@ -7271,6 +8085,8 @@ import X from 'lucide-svelte/icons/x';
       -->
       {#if headerInfoOpen && currentConversation}
         {@const panelAgent = conversationAgentForDisplay(currentConversation)}
+        {@const panelPerformance = activeLastGeneration()}
+        {@const panelResponsiveness = panelPerformance ? responsivenessBadge(panelPerformance) : null}
         <div class="max-h-[min(70vh,calc(var(--app-viewport-height,100dvh)-8rem))] overflow-y-auto overscroll-contain border-b border-slate-800/80 bg-slate-900/40 px-3 py-3 sm:max-h-[min(72vh,calc(var(--app-viewport-height,100dvh)-9rem))] sm:px-4 sm:py-4 lg:px-5">
           {#if headerInfoMode === 'context'}
             <button
@@ -7281,6 +8097,9 @@ import X from 'lucide-svelte/icons/x';
               <ArrowLeft class="h-3.5 w-3.5" />
               Back
             </button>
+          {/if}
+          {#if headerInfoMode !== 'context'}
+            <h2 class="mb-3 text-sm font-semibold text-white">Conversation Info</h2>
           {/if}
           <div class={`mb-3 flex-wrap items-center gap-2 text-sm text-slate-300 sm:hidden ${headerInfoMode === 'context' ? 'hidden' : 'flex'}`}>
             <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
@@ -7323,6 +8142,15 @@ import X from 'lucide-svelte/icons/x';
           {:else if sessionInfo}
             {@const panelContextUsage = contextUsage ?? sessionInfo.context_usage}
             {@const narrativeText = sessionNarrativeText(sessionInfo)}
+            {#if headerInfoMode !== 'context'}
+              <SessionDetailsContent
+                detail={sessionInfo}
+                sessionId={currentConversation.active_session_id ?? sessionInfo.intaris_session_id}
+                contextUsage={panelContextUsage}
+                performance={activeLastGeneration()}
+                onOpenIntaris={openIntarisSession}
+              />
+            {:else}
             {#if headerInfoMode !== 'context' && narrativeText}
               <div class="mb-3">
                 <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{sessionNarrativeLabel(sessionInfo)}</p>
@@ -7347,6 +8175,83 @@ import X from 'lucide-svelte/icons/x';
               </div>
               <Button size="sm" variant="secondary" onclick={() => void openIntarisSession(sessionInfo?.intaris_session_id ?? '')}>Open in Intaris</Button>
             </div>
+            {/if}
+            {#if headerInfoMode !== 'context'}
+              <div class="mt-4 grid gap-3 lg:grid-cols-2">
+                <section class="rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
+                  <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Runtime</p>
+                  <dl class="mt-2 grid gap-2 text-xs sm:grid-cols-2">
+                    <div>
+                      <dt class="text-slate-500">Model</dt>
+                      <dd class="mt-0.5 break-all text-slate-200">{panelPerformance?.model ?? panelContextUsage?.model ?? 'Unknown'}</dd>
+                    </div>
+                    <div>
+                      <dt class="text-slate-500">Provider</dt>
+                      <dd class="mt-0.5 text-slate-200">{panelPerformance?.provider_name ?? panelPerformance?.provider_id ?? panelContextUsage?.provider_id ?? 'Cloud or default'}</dd>
+                    </div>
+                    {#if panelPerformance?.runtime}
+                      <div>
+                        <dt class="text-slate-500">Runtime</dt>
+                        <dd class="mt-0.5 text-slate-200">{panelPerformance.runtime}</dd>
+                      </div>
+                    {/if}
+                    {#if panelPerformance?.executor_name || panelPerformance?.executor_id}
+                      <div>
+                        <dt class="text-slate-500">Executor</dt>
+                        <dd class="mt-0.5 text-slate-200">{panelPerformance.executor_name ?? panelPerformance.executor_id}</dd>
+                      </div>
+                    {/if}
+                    {#if panelPerformance?.configured_context_tokens}
+                      <div>
+                        <dt class="text-slate-500">Configured context</dt>
+                        <dd class="mt-0.5 text-slate-200">{formatTokenCount(panelPerformance.configured_context_tokens)} tokens</dd>
+                      </div>
+                    {/if}
+                    {#if panelPerformance?.quantization}
+                      <div>
+                        <dt class="text-slate-500">Quantization</dt>
+                        <dd class="mt-0.5 text-slate-200">{panelPerformance.quantization}</dd>
+                      </div>
+                    {/if}
+                  </dl>
+                </section>
+                <section class="rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
+                  <div class="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Last generation</p>
+                      <p class="mt-1 text-xs text-slate-500">
+                        {panelPerformance ? `Measured ${new Date(panelPerformance.measured_at).toLocaleString()}` : 'Local runtime telemetry is not available for this model.'}
+                      </p>
+                    </div>
+                    {#if panelResponsiveness}
+                      <span
+                        class={`rounded-full border px-2 py-1 text-[10px] font-semibold ${panelResponsiveness.tone === 'good' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : panelResponsiveness.tone === 'slow' ? 'border-amber-400/30 bg-amber-400/10 text-amber-100' : 'border-sky-400/30 bg-sky-400/10 text-sky-100'}`}
+                        title={panelResponsiveness.detail}
+                      >
+                        {panelResponsiveness.label}
+                      </span>
+                    {/if}
+                  </div>
+                  {#if panelPerformance}
+                    <div class="mt-3 grid gap-2 sm:grid-cols-2">
+                      {#each localPerformanceMetrics(panelPerformance) as metric}
+                        <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
+                          <p class="text-[10px] uppercase tracking-wide text-slate-500">{metric.label} · {metric.raw}</p>
+                          <p class="mt-1 text-xs font-medium text-slate-100">{metric.value}</p>
+                        </div>
+                      {/each}
+                    </div>
+                    {#if panelResponsiveness}
+                      <p class="mt-2 text-[11px] text-slate-500">{panelResponsiveness.label} for {panelResponsiveness.detail}.</p>
+                    {/if}
+                    {#if panelPerformance.processor || panelPerformance.gpu_residency || panelPerformance.digest}
+                      <p class="mt-2 break-all text-[11px] text-slate-500">
+                        {[panelPerformance.processor ? `Processor ${panelPerformance.processor}` : null, panelPerformance.gpu_residency ? `GPU residency ${panelPerformance.gpu_residency}` : null, panelPerformance.digest ? `Digest ${panelPerformance.digest}` : null].filter(Boolean).join(' · ')}
+                      </p>
+                    {/if}
+                  {/if}
+                </section>
+              </div>
             {/if}
             {#if panelContextUsage}
               {@const policy = panelContextUsage.projection_policy}
@@ -7428,6 +8333,7 @@ import X from 'lucide-svelte/icons/x';
                 </div>
               </div>
             {/if}
+            {/if}
           {:else}
             <p class="text-xs text-slate-500">Unable to load session details.</p>
           {/if}
@@ -7502,7 +8408,7 @@ import X from 'lucide-svelte/icons/x';
                 {#each queuedMessages as queued (queued.queue_id)}
                   {@const canMutateQueue = canMutateQueuedMessages()}
                   {@const isExpanded = queueIsExpanded(queued.queue_id)}
-                  <div class="rounded-xl border border-sky-300/20 bg-slate-950/40 px-2.5 py-2">
+                  <div class="chat-queue-item-enter rounded-xl border border-sky-300/20 bg-slate-950/40 px-2.5 py-2">
                     <div class="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
                       <span class="shrink-0 rounded-full border border-sky-300/20 bg-sky-400/10 px-2 py-0.5 text-[11px] font-medium text-sky-100">#{queued.position}</span>
                       <span class="shrink-0 text-[11px] uppercase tracking-wide text-sky-200/70">waiting</span>
@@ -7561,13 +8467,13 @@ import X from 'lucide-svelte/icons/x';
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p class="min-w-0 flex-1 break-words">{error}</p>
               <div class="flex shrink-0 items-center gap-2">
-                {#if lastRecoverableMessage}
+                {#if lastRecoverableTurnId}
                   <Button size="sm" variant="secondary" onclick={retryLastTurn}>Retry</Button>
                 {/if}
                 <button
                   aria-label="Dismiss error"
                   class="inline-flex h-8 w-8 items-center justify-center rounded-lg text-rose-100 transition hover:bg-rose-500/20"
-                  onclick={() => { error = ''; lastRecoverableMessage = ''; }}
+                  onclick={() => { error = ''; lastRecoverableMessage = ''; lastRecoverableTurnId = null; }}
                   type="button"
                 >
                   <X class="h-4 w-4" />
@@ -7603,7 +8509,20 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if sessionsError && !isPreSessionConversation}
+        {#if controllerRecoveryPending}
+          <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p>
+                {shouldContinueControllerRecovery(controllerRecoveryAttempts)
+                  ? 'Controller is reconnecting. Your saved conversation remains visible and updates will retry automatically.'
+                  : 'Controller is still unavailable. Your saved conversation remains visible; retry when it is back.'}
+              </p>
+              <Button size="sm" variant="secondary" onclick={() => void retryControllerRecoveryNow()}>Retry now</Button>
+            </div>
+          </div>
+        {/if}
+
+        {#if sessionsError && !isPreSessionConversation && !controllerRecoveryPending}
           <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-3 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Session details are temporarily unavailable: {sessionsError}</p>
@@ -7612,7 +8531,7 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if historyError && !isPreSessionConversation}
+        {#if historyError && !isPreSessionConversation && !controllerRecoveryPending}
           <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Conversation history is temporarily unavailable: {historyError}</p>
@@ -7621,7 +8540,7 @@ import X from 'lucide-svelte/icons/x';
           </div>
         {/if}
 
-        {#if escalationError}
+        {#if escalationError && !controllerRecoveryPending}
           <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <p>Escalation updates are temporarily unavailable: {escalationError}</p>
@@ -7641,14 +8560,14 @@ import X from 'lucide-svelte/icons/x';
 
         <!-- Timeline -->
         <TimelineViewport
-          items={EMPTY_RENDER_ITEMS}
+          items={[]}
           hasStreamingItems={displayedTimelineHasStreaming}
           agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
           bind:viewportElement={timelineEl}
           bind:contentElement={timelineContentEl}
           bind:userScrolledUp
-          class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain px-2.5 py-1.5 sm:p-4"
-          contentClass="space-y-3"
+          class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:auto] px-2.5 py-1.5 sm:p-4"
+          contentClass="space-y-3 [overflow-anchor:auto]"
           onScroll={handleTimelineScroll}
           onWheel={handleTimelineWheel}
           onTouchStart={handleTimelineTouchStart}
@@ -7656,12 +8575,14 @@ import X from 'lucide-svelte/icons/x';
           onTouchEnd={handleTimelineTouchEnd}
           onKeydown={handleTimelineKeydown}
           onPointerDown={closeHeaderInfo}
-          onViewSession={handleViewSession}
+           onViewSession={handleViewSession}
+           onJumpToBottom={jumpToBottom}
+           onJumpToActiveStart={jumpToActiveTimelineStart}
           autoScrollOnResize={false}
           followPausedLabel="Scroll to bottom"
           testId="timeline-viewport"
         >
-            {#if hasOlderMessages && visibleStartIndex === 0 && !loadingOlderMessages}
+            {#if (visibleStartIndex > 0 || hasOlderMessages) && !loadingOlderMessages}
               <button
                 class="mx-auto block rounded-full border border-slate-700 bg-slate-900/80 px-3 py-1.5 text-xs text-slate-300 transition hover:border-sky-500/50 hover:text-sky-100"
                 onclick={() => void loadOlder()}
@@ -7699,6 +8620,7 @@ import X from 'lucide-svelte/icons/x';
             {:else}
               <ChatV2TimelineList
                 items={displayedTimeline}
+                scope={currentConversation ? { key: `conversation:${currentConversation.conversation_id}`, kind: 'conversation', conversation_id: currentConversation.conversation_id } : undefined}
                 cycleStates={chatV2Store.cycleStates}
                 agent={currentConversation ? conversationAgentForDisplay(currentConversation) : null}
                 searchQuery={chatSearchQuery}
@@ -8146,7 +9068,7 @@ import X from 'lucide-svelte/icons/x';
                   type="submit"
                   aria-label={turnInProgress ? 'Queue message' : pendingDirectQuestion ? 'Answer' : 'Send'}
                   title={turnInProgress ? 'Queue message after current turn' : pendingDirectQuestion ? 'Answer' : 'Send'}
-                  class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition hover:bg-sky-400 disabled:opacity-50"
+                  class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition duration-100 hover:bg-sky-400 active:scale-90 disabled:opacity-50"
                   disabled={directQuestionSubmitting || voiceTranscribing}
                 >
                   <ArrowUp class="h-4 w-4" stroke-width="2.5" />
@@ -8212,15 +9134,15 @@ import X from 'lucide-svelte/icons/x';
       {#if subSessionPanelOpen}
         <!-- Backdrop -->
         <button
-          class={`absolute inset-0 z-20 bg-slate-950/50 backdrop-blur-sm transition-opacity duration-250 ${subSessionClosing ? 'opacity-0' : 'opacity-100'}`}
+          class={`absolute inset-0 z-20 bg-slate-950/80 transition-opacity duration-250 ${subSessionClosing ? 'opacity-0' : 'opacity-100'}`}
           onclick={closeSubSessionPanel}
           type="button"
           aria-label="Close sub-session"
         ></button>
 
         <!-- Drawer -->
-        <aside class={`absolute inset-0 z-30 flex h-full w-full flex-col border-l border-slate-800/80 bg-slate-900/95 shadow-2xl backdrop-blur ${subSessionClosing ? 'animate-slide-out-right' : 'animate-slide-in-right'}`}>
-          <div class="flex items-center gap-3 border-b border-slate-800/80 px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
+        <aside class={`absolute inset-0 z-30 flex h-full min-h-0 w-full flex-col overflow-hidden border-l border-slate-800/80 bg-slate-900 shadow-2xl ${subSessionClosing ? 'animate-slide-out-right' : 'animate-slide-in-right'}`}>
+          <div class="flex shrink-0 items-center gap-3 border-b border-slate-800/80 px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
             <button
               class="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
               onclick={closeSubSessionPanel}
@@ -8236,63 +9158,26 @@ import X from 'lucide-svelte/icons/x';
                 <LiveDots inline={true} size="sm" tone={subSessionUserScrolledUp ? 'slate' : 'sky'} label={subSessionUserScrolledUp ? 'Live follow paused' : 'Following latest'} />
               </div>
             </div>
-            <button
-              class="flex items-center gap-1 text-xs text-slate-500 transition hover:text-sky-300"
-              onclick={() => { subSessionInfoOpen = !subSessionInfoOpen; if (subSessionInfoOpen && !subSessionInfo) void loadSubSessionInfo(); }}
-              type="button"
-              title="Session details"
-            >
-              <Info class="h-3.5 w-3.5" />
-            </button>
+            <SessionDetailsButton open={subSessionInfoOpen} onclick={() => { subSessionInfoOpen = !subSessionInfoOpen; }} />
           </div>
 
-          <!-- Sub-session info popover -->
           {#if subSessionInfoOpen}
-            <div class="border-b border-slate-800/60 px-4 py-3 text-sm">
-              {#if subSessionInfoLoading}
-                <p class="text-xs text-slate-500">Loading session details...</p>
-              {:else if subSessionInfo}
-                {@const subIntention = extractIntentionDisplay(subSessionInfo.intention)}
-                {#if subSessionInfo.summary || subIntention.title || subIntention.intention}
-                  <div class="mb-2">
-                    <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{subSessionInfo.summary ? 'Summary' : 'Intention'}</p>
-                    {#if !subSessionInfo.summary && subIntention.title}
-                      <p class="mt-0.5 text-sm font-medium text-white">{subIntention.title}</p>
-                    {/if}
-                    {#if subSessionInfo.summary}
-                      <p class="mt-0.5 whitespace-pre-wrap text-sm text-slate-200">{subSessionInfo.summary}</p>
-                    {:else if subIntention.intention}
-                      <p class="mt-0.5 whitespace-pre-wrap text-sm text-slate-200">{subIntention.intention}</p>
-                    {/if}
-                  </div>
-                {/if}
-                <div class="flex flex-wrap items-center justify-between gap-3">
-                  <div class="flex flex-wrap gap-3 text-xs text-slate-400">
-                    <span>Status: <span class="text-slate-200">{subSessionInfo.status}</span></span>
-                    <span>Calls: <span class="text-slate-200">{subSessionInfo.total_calls}</span></span>
-                    <span class="text-emerald-400">{subSessionInfo.approved_count} approved</span>
-                    <span class="text-rose-400">{subSessionInfo.denied_count} denied</span>
-                    <span class="text-sky-400">{subSessionInfo.escalated_count} escalated</span>
-                  </div>
-                  <Button size="sm" variant="secondary" onclick={() => void openIntarisSession(subSessionInfo?.intaris_session_id ?? '')}>Open in Intaris</Button>
-                </div>
-              {:else}
-                <p class="text-xs text-slate-500">Unable to load session details.</p>
-              {/if}
-            </div>
+            <SessionDetailsPanel sessionId={subSessionId} onOpenIntaris={openIntarisSession} />
           {/if}
 
-          <TimelineViewport
-            items={subSessionTimeline}
+          <ScopedChatV2Timeline
+            scope={{
+              key: `session:${subSessionId}`,
+              kind: 'session',
+              conversation_id: currentConversation?.conversation_id ?? null,
+              session_id: subSessionId,
+              label: subSessionId
+            }}
             agent={subSessionAgent() ?? null}
-            loading={subSessionLoading}
-            error={subSessionError}
-            emptyLabel="No events recorded yet."
-            live={!subSessionLoading && !subSessionError}
-            bind:viewportElement={subSessionTimelineEl}
-            bind:contentElement={subSessionTimelineContentEl}
+            preferences={$userPreferences}
             bind:userScrolledUp={subSessionUserScrolledUp}
             onViewSession={handleViewSession}
+            emptyLabel="No events recorded yet."
           />
         </aside>
       {/if}
@@ -8307,10 +9192,7 @@ import X from 'lucide-svelte/icons/x';
   onclose={() => { conversationModeOpen = false; }}
   sendEnableTts={(voice) => wsClient.enableTts(voice)}
   sendDisableTts={() => wsClient.disableTts()}
-  submitText={(text) => {
-    if (!currentConversation) return;
-    wsClient.sendMessage(currentConversation.conversation_id, text, []);
-  }}
+  submitText={(text) => { void sendConversationModeText(text); }}
   subscribeSentenceReady={(handler) => {
     return wsClient.subscribe((event) => {
       if (event.type === 'tts_sentence_ready' && currentConversation && event.conversation_id === currentConversation.conversation_id) {

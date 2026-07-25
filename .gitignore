@@ -11,7 +11,10 @@ cognis.db
 ui/node_modules/
 ui/.svelte-kit/
 ui/build/
+ui/standalone-build/
 ui/coverage/
+ui/playwright-report/
+ui/test-results/
 cognis/ui_dist/
 .playwright-mcp/
 .worktrees

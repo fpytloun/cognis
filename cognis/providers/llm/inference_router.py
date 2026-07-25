@@ -4,21 +4,87 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
+
+from sqlalchemy import or_, select
 
 from cognis.core.executor_resolution import labels_match
 from cognis.json_stream import merge_incremental_json_fragment
 from cognis.models.config import ImageGenerationResult, SpeechToTextResult, TextToSpeechResult
-from cognis.ownership import is_shared_owner_email
+from cognis.models.executor_inference import executor_local_inference_routable
+from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
 from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
+from cognis.providers.llm.ollama import ollama_model_name
+from cognis.store.models import (
+    ExecutorRow,
+    LocalModelDeployment,
+    LocalModelTargetStatus,
+    User,
+)
+
+
+class LocalModelRolloutUnavailableError(RuntimeError):
+    """A managed model has no ready executor target."""
+
+    def __init__(self, summary: dict[str, Any]) -> None:
+        super().__init__("Managed local model rollout has no ready executor")
+        self.summary = summary
 
 
 class InferenceRouter:
     """Proxy provider calls through a selected executor."""
 
-    def __init__(self, ws_provider: WebSocketExecutorProvider) -> None:
+    def __init__(
+        self,
+        ws_provider: WebSocketExecutorProvider,
+        session_factory: Any | None = None,
+    ) -> None:
         self._ws_provider = ws_provider
+        self._session_factory = session_factory
         self.last_backend_metadata: dict[str, Any] | None = None
+
+    async def discover_models(
+        self,
+        *,
+        preset: str,
+        base_url: str,
+        api_key: str = "",
+        executor_id: str | None = None,
+        executor_labels: dict[str, str] | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Run read-only model discovery from a selected executor."""
+
+        if not executor_id and not executor_labels:
+            raise RuntimeError("No executor selector was provided for executor-routed discovery")
+        conn = await self._find_executor(
+            executor_id,
+            executor_labels,
+            readiness_aware=False,
+        )
+        if conn is None:
+            if executor_id:
+                raise RuntimeError(
+                    f"No active executor matches executor_id {executor_id!r}; "
+                    "ensure the executor is connected, ready, and visible to this provider"
+                )
+            if executor_labels:
+                raise RuntimeError(
+                    f"No active executor matches executor_labels {executor_labels!r}; "
+                    "ensure a connected executor has matching labels and is visible to this provider"
+                )
+            raise RuntimeError("No executor selector was provided for executor-routed discovery")
+        return cast(
+            list[dict[str, Any]],
+            await conn.llm_discover_models(
+                preset=preset,
+                base_url=base_url,
+                api_key=api_key,
+                provider_id=provider_id,
+                owner_email=owner_email,
+            ),
+        )
 
     async def route_stream(
         self,
@@ -31,8 +97,29 @@ class InferenceRouter:
         backend: str | None = None,
         provider_id: str | None = None,
         owner_email: str | None = None,
+        backend_metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        conn = await self._find_executor(executor_id, executor_labels)
+        try:
+            selection = await self._find_executor_selection(
+                executor_id,
+                executor_labels,
+                model=model,
+                provider_id=provider_id,
+                owner_email=owner_email,
+            )
+            conn = selection[0] if selection is not None else None
+            handle = selection[1] if selection is not None else None
+        except LocalModelRolloutUnavailableError as exc:
+            yield {
+                "error": str(exc),
+                "mid_stream_failure": True,
+                "response_error": {
+                    "category": "local_model_rollout_unavailable",
+                    "message": str(exc),
+                    "rollout": exc.summary,
+                },
+            }
+            return
         self.last_backend_metadata = None
         if conn is None:
             yield {
@@ -40,6 +127,7 @@ class InferenceRouter:
                 "mid_stream_failure": True,
             }
             return
+        assert handle is not None
 
         try:
             async for chunk in conn.llm_complete_stream(
@@ -50,6 +138,7 @@ class InferenceRouter:
                 backend=backend,
                 provider_id=provider_id,
                 owner_email=owner_email,
+                backend_metadata=backend_metadata or {},
             ):
                 if chunk.get("error"):
                     error_chunk = {
@@ -64,13 +153,39 @@ class InferenceRouter:
                 if chunk.get("done"):
                     metadata = chunk.get("backend_metadata")
                     self.last_backend_metadata = metadata if isinstance(metadata, dict) else None
-                    yield {
+                    final_chunk = {
                         "choices": [
                             {"delta": {}, "finish_reason": chunk.get("finish_reason", "stop")}
                         ],
                         "usage": chunk.get("usage", {}),
                         "response_status": chunk.get("response_status", "completed"),
+                        "anthropic_native_envelope": (
+                            metadata.get("anthropic_native_envelope")
+                            if isinstance(metadata, dict)
+                            else None
+                        ),
                     }
+                    performance = (
+                        metadata.get("performance") if isinstance(metadata, dict) else None
+                    )
+                    if isinstance(performance, dict):
+                        performance = dict(performance)
+                        if not performance.get("executor_id"):
+                            performance["executor_id"] = handle.executor_id
+                        handle_metadata = handle.metadata or {}
+                        executor_name = (
+                            handle_metadata.get("display_name")
+                            or handle_metadata.get("name")
+                            or handle_metadata.get("hostname")
+                        )
+                        if (
+                            isinstance(executor_name, str)
+                            and executor_name
+                            and not performance.get("executor_name")
+                        ):
+                            performance["executor_name"] = executor_name
+                        final_chunk["performance"] = performance
+                    yield final_chunk
                     return
                 delta: dict[str, Any] = {
                     "content": chunk.get("content"),
@@ -89,7 +204,16 @@ class InferenceRouter:
                 tool_progress = chunk.get("tool_progress")
                 if isinstance(tool_progress, dict):
                     delta["tool_progress"] = tool_progress
+                thinking_blocks = chunk.get("provider_thinking_blocks")
+                if isinstance(thinking_blocks, list):
+                    delta["provider_thinking_blocks"] = thinking_blocks
                 out_chunk: dict[str, Any] = {"choices": [{"delta": delta}]}
+                native_events = chunk.get("anthropic_native_events")
+                if isinstance(native_events, list):
+                    # Native Anthropic events are continuation metadata, not
+                    # compatibility text.  Preserve them unchanged for the
+                    # controller-side native accumulator.
+                    out_chunk["anthropic_native_events"] = native_events
                 output_item = chunk.get("responses_output_item")
                 if isinstance(output_item, dict):
                     out_chunk["responses_output_item"] = output_item
@@ -120,6 +244,7 @@ class InferenceRouter:
         backend: str | None = None,
         provider_id: str | None = None,
         owner_email: str | None = None,
+        backend_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
@@ -129,7 +254,8 @@ class InferenceRouter:
         usage: dict[str, Any] = {}
         finish_reason = "stop"
         response_status = "completed"
-        backend_metadata: dict[str, Any] | None = None
+        response_backend_metadata: dict[str, Any] | None = None
+        anthropic_native_envelope: dict[str, Any] | None = None
         async for chunk in self.route_stream(
             messages=messages,
             model=model,
@@ -139,11 +265,13 @@ class InferenceRouter:
             backend=backend,
             provider_id=provider_id,
             owner_email=owner_email,
+            backend_metadata=backend_metadata,
         ):
             if chunk.get("mid_stream_failure"):
                 from cognis.providers.llm.errors import (
                     LLMStreamProviderError,
                     MidStreamErrorCategory,
+                    MidStreamErrorPayload,
                 )
 
                 details = chunk.get("response_error")
@@ -154,7 +282,7 @@ class InferenceRouter:
                     }
                 raise LLMStreamProviderError(
                     str(chunk.get("error") or details.get("message") or "Inference failed"),
-                    payload=details,
+                    payload=cast(MidStreamErrorPayload, details),
                 )
             for choice in chunk.get("choices", []):
                 delta = choice.get("delta", {})
@@ -202,10 +330,13 @@ class InferenceRouter:
                 usage = chunk["usage"]
             if chunk.get("response_status"):
                 response_status = str(chunk["response_status"])
+            envelope = chunk.get("anthropic_native_envelope")
+            if isinstance(envelope, dict):
+                anthropic_native_envelope = envelope
             metadata = chunk.get("backend_metadata")
             if isinstance(metadata, dict):
-                backend_metadata = metadata
-        self.last_backend_metadata = backend_metadata
+                response_backend_metadata = metadata
+        self.last_backend_metadata = response_backend_metadata
         normalized_tool_calls = [
             tool_call
             for _index, tool_call in sorted(tool_calls.items())
@@ -227,6 +358,11 @@ class InferenceRouter:
             ],
             "usage": usage,
             "response_status": response_status,
+            **(
+                {"anthropic_native_envelope": anthropic_native_envelope}
+                if anthropic_native_envelope is not None
+                else {}
+            ),
         }
 
     async def route_image_generate(
@@ -365,25 +501,242 @@ class InferenceRouter:
         )
 
     async def _find_executor(
-        self, executor_id: str | None, executor_labels: dict[str, str] | None
+        self,
+        executor_id: str | None,
+        executor_labels: dict[str, str] | None,
+        *,
+        model: str | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
+        readiness_aware: bool = True,
     ) -> Any | None:
+        selection = await self._find_executor_selection(
+            executor_id,
+            executor_labels,
+            model=model,
+            provider_id=provider_id,
+            owner_email=owner_email,
+            readiness_aware=readiness_aware,
+        )
+        return selection[0] if selection is not None else None
+
+    async def _find_executor_selection(
+        self,
+        executor_id: str | None,
+        executor_labels: dict[str, str] | None,
+        *,
+        model: str | None = None,
+        provider_id: str | None = None,
+        owner_email: str | None = None,
+        readiness_aware: bool = True,
+    ) -> tuple[Any, Any] | None:
+        ready_executor_ids: set[str] | None = None
+        rollout_summary: dict[str, Any] | None = None
+        if readiness_aware and model is not None and provider_id is not None:
+            readiness = await self._managed_readiness(
+                provider_id=provider_id,
+                model=model,
+                owner_email=owner_email,
+            )
+            if readiness is not None:
+                ready_executor_ids, rollout_summary = readiness
         active = await self._ws_provider.list_active()
+        persisted_executors: dict[str, ExecutorRow] | None = None
+        if self._session_factory is not None:
+            async with self._session_factory() as session:
+                persisted_executors = {
+                    row.executor_id: row
+                    for row in (
+                        await session.execute(
+                            select(ExecutorRow).where(ExecutorRow.status == "active")
+                        )
+                    )
+                    .scalars()
+                    .all()
+                }
         for handle in active:
             if executor_id and handle.executor_id != executor_id:
                 continue
+            if ready_executor_ids is not None and handle.executor_id not in ready_executor_ids:
+                continue
+            persisted = (
+                persisted_executors.get(handle.executor_id)
+                if persisted_executors is not None
+                else None
+            )
+            if persisted_executors is not None and persisted is None:
+                continue
+            live_capabilities = getattr(handle, "capabilities", None)
+            advertised = getattr(live_capabilities, "local_inference", None) is True
+            if persisted is not None:
+                if not executor_local_inference_routable(persisted, advertised=advertised):
+                    continue
+            elif not advertised:
+                continue
             metadata = handle.metadata or {}
-            if not bool(metadata.get("shared")) and not is_shared_owner_email(
-                metadata.get("owner_email")
+            if (
+                ready_executor_ids is None
+                and not bool(metadata.get("shared"))
+                and not is_shared_owner_email(metadata.get("owner_email"))
             ):
                 continue
             labels = metadata.get("labels", {}) if isinstance(metadata, dict) else {}
             if executor_labels and not labels_match(labels, executor_labels):
                 continue
             try:
-                return await self._ws_provider.get_executor(handle)
+                return await self._ws_provider.get_executor(handle), handle
             except Exception:
                 continue
+        if rollout_summary is not None:
+            summary = dict(rollout_summary)
+            summary["selector"] = {
+                "executor_id": executor_id,
+                "executor_labels": executor_labels or {},
+            }
+            summary["reason"] = (
+                "selector_has_no_ready_target" if ready_executor_ids else "no_ready_target"
+            )
+            summary["action"] = {
+                "type": "open_executor_settings",
+                "path": "/settings?tab=executors",
+                "label": "Review executor local inference settings",
+            }
+            raise LocalModelRolloutUnavailableError(summary)
         return None
+
+    async def _managed_readiness(
+        self,
+        *,
+        provider_id: str,
+        model: str,
+        owner_email: str | None,
+    ) -> tuple[set[str], dict[str, Any] | None] | None:
+        """Return ready exact targets, or None for unmanaged/override routing."""
+
+        if self._session_factory is None:
+            return None
+        runtime_name = ollama_model_name(model)
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(LocalModelDeployment, LocalModelTargetStatus)
+                    .join(
+                        LocalModelTargetStatus,
+                        LocalModelTargetStatus.deployment_id == LocalModelDeployment.deployment_id,
+                    )
+                    .where(
+                        LocalModelDeployment.provider_id == provider_id,
+                        (
+                            LocalModelDeployment.owner_email == SYSTEM_USER_EMAIL
+                            if owner_email is None
+                            else or_(
+                                LocalModelDeployment.owner_email == owner_email,
+                                LocalModelDeployment.owner_email == SYSTEM_USER_EMAIL,
+                            )
+                        ),
+                        LocalModelDeployment.runtime_name == runtime_name,
+                        LocalModelDeployment.desired_state == "present",
+                    )
+                    .order_by(
+                        LocalModelDeployment.deployment_id.asc(),
+                        LocalModelTargetStatus.executor_id.asc(),
+                    )
+                )
+            ).all()
+            executor_ids = {target.executor_id for _deployment, target in rows}
+            executors = {
+                executor.executor_id: executor
+                for executor in (
+                    await session.execute(
+                        select(ExecutorRow).where(
+                            ExecutorRow.executor_id.in_(executor_ids),
+                            ExecutorRow.status == "active",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            }
+            actor = await session.get(User, owner_email) if owner_email is not None else None
+        if not rows:
+            return None
+        authorized_rows = [
+            (deployment, target)
+            for deployment, target in rows
+            if (
+                (executor := executors.get(target.executor_id)) is not None
+                and executor_local_inference_routable(executor)
+                and (
+                    (
+                        is_shared_owner_email(deployment.owner_email)
+                        and is_shared_owner_email(executor.owner_email)
+                    )
+                    or (
+                        deployment.owner_email == owner_email
+                        and (
+                            executor.owner_email == owner_email
+                            or (
+                                actor is not None
+                                and actor.role == "admin"
+                                and is_shared_owner_email(executor.owner_email)
+                            )
+                        )
+                    )
+                )
+            )
+        ]
+        if not authorized_rows:
+            unauthorized_deployment_ids = {deployment.deployment_id for deployment, _target in rows}
+            return set(), {
+                "provider_id": provider_id,
+                "model": runtime_name,
+                "deployment_ids": sorted(unauthorized_deployment_ids),
+                "total_targets": len(rows),
+                "state_counts": {"unauthorized": len(rows)},
+                "ready_executor_ids": [],
+                "targets": [],
+            }
+        rows = authorized_rows
+        deployments = {deployment.deployment_id: deployment for deployment, _target in rows}
+        overridden_executor_ids = {
+            target.executor_id
+            for deployment, target in rows
+            if deployment.capacity_override_acknowledged
+        }
+        state_counts: dict[str, int] = {}
+        ready_executor_ids: set[str] = set()
+        targets: list[dict[str, Any]] = []
+        for deployment, target in rows:
+            state_counts[target.state] = state_counts.get(target.state, 0) + 1
+            ready = (
+                target.state == "ready"
+                and target.generation == deployment.generation
+                and target.observed_generation == deployment.generation
+            )
+            if ready:
+                ready_executor_ids.add(target.executor_id)
+            targets.append(
+                {
+                    "deployment_id": deployment.deployment_id,
+                    "executor_id": target.executor_id,
+                    "generation": deployment.generation,
+                    "observed_generation": target.observed_generation,
+                    "state": target.state,
+                    "ready": ready,
+                }
+            )
+        if overridden_executor_ids:
+            return ready_executor_ids | overridden_executor_ids, None
+        summary = {
+            "provider_id": provider_id,
+            "model": runtime_name,
+            "deployment_ids": sorted(deployments),
+            "total_targets": len(targets),
+            "state_counts": state_counts,
+            "ready_executor_ids": sorted(ready_executor_ids),
+            "targets": targets[:100],
+        }
+        return ready_executor_ids, summary
 
 
 def _coerce_text_field(value: Any) -> str:

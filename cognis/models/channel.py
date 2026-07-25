@@ -43,7 +43,11 @@ class ChannelCapabilities(BaseModel):
     supports_typing: bool = False
     supports_read_receipts: bool = False
     supports_markdown: bool = False
+    supports_unicode: bool = True
+    supports_sanitized_html: bool = False
+    supports_inline_media: bool = False
     supports_buttons: bool = False
+    supports_idempotent_send: bool = False
     max_message_length: int = 4096
 
 
@@ -95,6 +99,7 @@ class ChannelAccountConfig(BaseModel):
 
     # Agent binding
     agent_id: str
+    default_agent_profile_id: str | None = None
     user_email: str
 
     # Channel-specific settings (non-sensitive)
@@ -152,6 +157,7 @@ class MediaAttachment(BaseModel):
     filename: str | None = None
     size_bytes: int | None = None
     content_b64: str | None = None
+    disposition: Literal["attachment", "inline"] = "attachment"
 
 
 class InboundMessage(BaseModel):

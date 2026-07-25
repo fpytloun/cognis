@@ -9,12 +9,26 @@ SYSTEM_SKILL_DEFAULTS: Final[dict[str, dict[str, object]]] = {
         "skill_id": "cognis-orchestrator",
         "content": """---
 name: Cognis Orchestrator
-description: Guidance for deciding when to answer inline, when to use general-task, and when to compose a workflow.
+description: Route bounded work across direct execution, delegates, managed conversations, tasks, and explicit durable workflows.
 tags:
   - cognis
   - orchestration
+  - bounded-delivery
+  - managed-conversations
+  - tasks
   - workflows
 linked_tool_ids:
+  - builtin:manage_agents
+  - builtin:delegate
+  - builtin:follow_up_subsession
+  - builtin:fork_subsession
+  - builtin:agent_conversation_create
+  - builtin:agent_conversation_send
+  - builtin:agent_conversation_fork
+  - builtin:agent_conversation_wait
+  - builtin:agent_conversation_get
+  - builtin:agent_conversation_list
+  - builtin:agent_conversation_set_profile
   - builtin:create_task
   - builtin:manage_schedules
   - builtin:compose_and_run_workflow
@@ -24,14 +38,60 @@ linked_tool_ids:
 
 # Purpose
 
-Use this skill when deciding how to execute non-trivial work in Cognis.
+Use this skill when choosing and coordinating the least costly safe execution
+shape for work in Cognis.
 
 # Routing Rules
 
-- Keep clearly trivial work inline.
-- Use `create_task` with `system:general-task` when the work is substantial but does not justify explicit step structure.
-- Use `manage_schedules` when the user wants normal task work to run later, at a specific time, or on a recurrence. Prefer this for reminders, timed automations, and recurring general-task work.
-- Use `compose_and_run_workflow` only when the work needs a custom persistent multi-step workflow, strict deliverables, or an adapted reusable workflow definition before it can run safely.
+- Work directly when one agent can safely inspect, act, validate, and report
+  without a durable background boundary.
+- Use a delegate for one bounded terminal result such as independent
+  exploration, specialist advice, or scope-locked review.
+- Before starting a fresh delegate, inspect existing child sessions. For the same
+  problem, use `follow_up_subsession` to continue with full prior context or
+  `fork_subsession` for an independent branch from that context. Start fresh
+  only for genuinely new scope, deliberate independence, incompatible execution
+  requirements, or demonstrably stale/polluted context.
+- Use a managed conversation for visible, inspectable, iterative work that may
+  need follow-up. Reuse a relevant managed conversation with
+  `agent_conversation_get` and `agent_conversation_send` instead of creating a
+  duplicate; use `agent_conversation_fork` when the new work should branch from
+  that context.
+- Use a task when work needs durable background ownership, status, pause/resume,
+  or later retrieval but not a custom workflow definition.
+- Use a workflow only when an explicit durable step, deliverable, evaluation, or
+  gate contract is needed. Tasks and workflows are options, not defaults for
+  substantial work.
+- Use `manage_schedules` for ordinary delayed or recurring work. Do not compose
+  a workflow merely because the user supplied a time.
+
+# Bounded Coordination
+
+- The coordinator retains end-to-end ownership for decomposition, integration,
+  acceptance evidence, and final delivery.
+- Decompose large scope into proportional observable workstreams when that
+  materially improves safety or elapsed time. Give each implementation worker
+  one bounded scope with stable inputs and acceptance criteria; workers do not
+  delegate implementation further.
+- Architect Todos track durable workstreams or milestones. Keep the parent Todo
+  current across turns, and update it when each child result changes the state
+  of the parent workstream. Plain proportional names are sufficient.
+- Select each worker's profile explicitly from discovered eligible profiles
+  when profile choice matters. Do not guess profile IDs.
+
+# Managed Conversations and Profiles
+
+- Respect the current surface. On synchronous/joined surfaces, create, send, or
+  retry joins before returning. Where asynchronous managed turns are exposed,
+  use them only for truly independent or follow-up work, stop duplicating that
+  scope in the parent, and rely on completion notification.
+- Change an idle managed conversation's profile with
+  `agent_conversation_set_profile` before sending the next turn. Never race a
+  profile change with send/admission, and never change a profile while work is
+  active or queued.
+- For one critical consultation, switch an idle managed conversation to the
+  needed profile, run exactly that turn, inspect the result, and restore the
+  previous profile only after the conversation is idle again.
 
 # Workflow Composition Rules
 
@@ -50,6 +110,9 @@ Use this skill when deciding how to execute non-trivial work in Cognis.
 
 # Do Not Do
 
+- Do not default substantial work to a task or workflow when direct, delegated,
+  or managed execution provides the required contract.
+- Do not duplicate a managed workstream or continue its same scope in parallel.
 - Do not mutate system workflows in place.
 - Do not create a custom workflow when an existing one already fits unchanged.
 - Do not use `compose_and_run_workflow` merely because the user gave a time. Use `manage_schedules` for ordinary timed tasks.
@@ -60,11 +123,12 @@ Use this skill when deciding how to execute non-trivial work in Cognis.
         "skill_id": "cognis-coding",
         "content": """---
 name: Cognis Coding
-description: Coding discipline for careful implementation work inside Cognis conversations and tasks.
+description: Bounded software delivery discipline for implementation, validation, review, and coordination in Cognis.
 tags:
   - cognis
   - coding
   - implementation
+  - bounded-delivery
 linked_tool_ids:
   - builtin:read
   - builtin:write
@@ -85,6 +149,12 @@ Workflow step objectives and controller completion contracts override this skill
 
 # Working Style
 
+- Create and maintain proportional Todos for genuine multistep work. Do not
+  create todos for work that can be completed in a single response. Created
+  todos persist across turns until terminal completion; complete or cancel every
+  item before finishing. Plain names are sufficient, hierarchy is optional when
+  useful, and multiple in_progress items are allowed only for genuinely parallel
+  work.
 - Inspect first. Read only the files, code paths, and repo guidance needed to act correctly.
 - Start by understanding the project instructions and conventions already present in the repo.
 - Prefer `AGENTS.md` first, then `README.md` or compatible instruction files when AGENTS is absent or insufficient.
@@ -105,22 +175,45 @@ Workflow step objectives and controller completion contracts override this skill
 - You may be in a dirty workspace. Never revert, overwrite, or clean up changes you did not make unless the user explicitly asks.
 - If unexpected changes overlap with your intended edits, inspect them and preserve the user's work; ask one targeted question only if they directly conflict with the task.
 - Do not run destructive commands such as `git reset --hard`, `git checkout --`, or broad deletes unless the user explicitly requests or approves them.
-- Do not create, amend, or push git commits unless the user explicitly asks.
+- Before implementation, inspect the repository state and configured remotes. When the task should start from current upstream and network access is available, fetch the relevant remote, normally `origin`, then compare the intended base with its upstream revision before writing.
+- Do not update, rebase, reset, or otherwise move the user's current branch merely to catch up. For substantial, parallel, risky, or workflow-owned implementation, create or reuse an isolated worktree from the verified target revision. Do not create another worktree when the current workspace is already isolated and based on that verified revision.
+- If an assigned worktree is stale but still clean, create or recreate a separate worktree from the intended upstream revision rather than silently implementing on the stale base. If it already contains task work, preserve it and report the divergence before any integration; never discard work to catch up.
+- Leave completed implementation reviewable and transferable. A committed result should have no task-owned uncommitted residue. When the request explicitly asks for uncommitted changes, the worktree may remain dirty with task-owned changes, but remove unrelated or generated residue you created.
+- An explicit implementation request, or an implementation workflow step whose completion contract expects a finished change, authorizes local commits when the agent owns an isolated worktree, unless the request says to leave changes uncommitted. Commit only task-owned changes. For patch-only, review-only, exploratory, or explicitly uncommitted work, do not create a commit.
+- Do not amend, rebase, merge into a user-owned branch, push, open or update a pull request, or deploy unless the user request or workflow contract authorizes that integration step.
 - Prefer non-interactive git commands when git is needed.
 - Never commit secrets, credentials, or local environment files.
 
-# Routing
+# Execution Contract
 
-- In direct chat, implement when the user asks for implementation and the next action is clear.
-- In general tasks, follow the requested task scope and stop at the requested artifact.
-- In coding workflows, complete only the current workflow step artifact; later workflow steps handle later lifecycle actions such as implementation, verification, commit, pull request, and final summary.
-- Keep small, clear edits inline when you can finish them immediately.
-- When the code path is unclear, use `system:explore` first to trace the implementation before editing.
-- For larger implementation, refactor, or multi-step debugging work, prefer delegation or a task with the software-development workflow instead of forcing everything inline.
-- For focused coding work that does not need the current agent identity, prefer `system:implement`.
-- For findings-first review, prefer `system:code-review`.
-- For a second set of eyes on an implementation plan, prefer `system:architect`, but do not turn small coding tasks into architecture theater.
-- Use existing Cognis workflows for heavier engineering process instead of inventing a custom long-form process inside one chat turn.
+- Follow the current role, user request, and workflow contract.
+- A coordinator retains end-to-end ownership for decomposition, integration,
+  acceptance evidence, correction decisions, and final delivery.
+- If explicitly assigned as a coordinator, plan, split genuinely independent work, and integrate the results while retaining that ownership.
+- Decompose large scope into proportional observable workstreams when useful.
+  Architect Todos track those durable workstreams or milestones; developer
+  Todos track granular implementation, test, and acceptance steps.
+- If directly assigned as the implementer, own one bounded scope and inspect, implement, and test it yourself. Do not delegate that same implementation scope, delegate implementation further, or redelegate the same scope.
+- Prefer delegation for bounded independent exploration or review. Parallel implementation is appropriate only when the plan and integration contracts are stable, workstreams have separate ownership, dependencies are not sequential, each worker has clear acceptance criteria and an isolated workspace, and one coordinator owns final integration and review.
+- Keep work direct when workers would touch the same hotspots, interfaces are still evolving, one slice depends on decisions from another, or coordination costs more than the implementation.
+- After a failed check or concrete review finding, make one evidence-based
+  correction when the cause and fix are clear. If it still fails or uncertainty
+  remains, stop repeating fixes and replan or escalate to a more suitable
+  profile.
+- Reuse context generically, not only for review. Before any fresh delegation,
+  check whether an existing child context already owns the same problem. Continue
+  it for the same line of work or branch from it for an independent alternative.
+  Start fresh only for genuinely new scope, deliberate independence,
+  incompatible execution requirements, or demonstrably stale/polluted context.
+- Keep implementation fixes with the original implementer. For review, start the
+  first genuinely independent review fresh, then continue or fork that reviewer
+  context after fixes instead of rebuilding review context from scratch.
+- Keep reviews scope-locked. Reviewers block only for concrete bugs,
+  regressions, security or data-loss risks, or approved acceptance violations.
+- Use a workflow only when an explicit durable step, deliverable, evaluation, or
+  gate contract is needed; substantial software work does not default to a
+  software-development workflow.
+- Use only execution mechanisms and tools visible in the current context.
 
 # Tool Use
 
@@ -134,12 +227,16 @@ Workflow step objectives and controller completion contracts override this skill
 
 # Verification
 
-- Run the narrowest checks that prove the change works.
+- Make validation proportional to scope and risk. Start with the narrowest checks that exercise the changed behavior, then expand to affected-module checks when interfaces or shared behavior changed.
+- When feasible, obtain acceptance evidence beyond tests written by the same
+  implementation author: an independent review, an existing regression suite,
+  a build/type/lint check, or an external behavior check.
+- Run the full suite only when required by repository instructions, release policy, broad cross-cutting impact, migration risk, or an explicit request. Do not reflexively run a 30–60 minute suite when focused checks provide sufficient evidence. Run intentionally long checks asynchronously when the execution context supports it.
 - If the task affects tests, lint, typing, or build behavior, run the relevant command when feasible.
+- Do not delete, skip, weaken, or rewrite tests merely to obtain a green result. Test changes are valid when the intended behavior or contract actually changed.
 - Update directly affected docs when behavior, usage, or contributor workflow actually changed.
 - If no documentation changes are needed, say so plainly.
-- If you delegate substantial coding work, explain that to the user and keep the main thread responsive when possible.
-- Report verification performed and any remaining risks.
+- Report the exact verification commands and outcomes, checks not run and why, and any remaining risks.
 
 # Do Not Do
 
@@ -307,7 +404,7 @@ Use this skill when the user asks the current primary agent to inspect, create, 
 # Safety Rules
 
 - Inspect before mutating. Use `manage_agents` with `action="list"` or `action="get"` before editing an existing agent.
-- For tool changes, prefer the explicit tool CRUD actions over raw settings: call `tools_list_available` or `tools_get`, validate with `tools_validate`, then use `tools_set`, `tools_add`, or `tools_remove`.
+- For tool changes, prefer explicit CRUD over raw settings: inspect the current assignment with `tools_get`, use `search_tools`/`describe_tool` for authorized tool IDs and semantics, optionally check a proposed mutation with `validate_tool_call`, then use `tools_set`, `tools_add`, or `tools_remove`.
 - Prefer curated `tool_groups` for normal access and use `allow_tools` / `deny_tools` only for granular exceptions. Do not invent tool or group IDs.
 - Manage knowledgebase data access separately with `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove`; tool assignment controls what the agent can do, knowledgebase assignment controls which KBs it can access.
 - Do not confuse tool exposure (`tool_groups`, `allow_tools`, `deny_tools`) with guardrail permissions (`tool_permissions`).
@@ -322,7 +419,7 @@ Use this skill when the user asks the current primary agent to inspect, create, 
 - `list` and `get` for inspection.
 - `create` for new agents. Include full profile fields when the user provided them.
 - `update` for targeted edits to profile, tools, permissions, skills, LLM config, execution, and avatar fields.
-- `tools_list_available`, `tools_get`, `tools_validate`, `tools_set`, `tools_add`, and `tools_remove` for explicit tool assignment CRUD.
+- `tools_get`, `tools_set`, `tools_add`, and `tools_remove` for explicit tool assignment CRUD; `describe_tool` and `validate_tool_call` are the unified discovery and preflight path.
 - `knowledgebases_get`, `knowledgebases_set`, `knowledgebases_add`, and `knowledgebases_remove` for explicit assigned knowledgebase CRUD.
 - `bindings_get` and `bindings_set` for primary-to-secondary agent bindings.
 - `shares_list`, `share_create`, `share_update`, and `share_revoke` for owner-only share management.
@@ -415,6 +512,118 @@ over this skill for paid users who want a turnkey multi-source report.
 - Do not call `web_research` when it isn't exposed in your tool list -
   it requires Tavily and is unavailable on direct/SearXNG-only setups.
 - Do not silently ignore disagreements between sources.
+""",
+    },
+    "cognis-pulse-deliverable": {
+        "skill_id": "cognis-pulse-deliverable",
+        "content": """---
+name: Cognis Pulse Deliverable
+description: Author validated decision-oriented Pulse Rich Deliverables using the server-owned composition contract.
+tags:
+  - cognis
+  - deliverable
+  - pulse
+linked_tool_ids:
+  - builtin:describe_tool
+  - builtin:validate_tool_call
+  - builtin:write_deliverable
+---
+
+# Purpose
+
+Use this skill when the requested artifact is a Pulse presentation.
+
+# Authoring Contract
+
+1. Before composing content, call `describe_tool` for `write_deliverable`.
+2. Select the registered `rich:pulse` operation from the returned descriptor. New writes must use `cognis.rich.pulse.v2` and `metadata.pulse_version=2`; persisted v1 payloads remain renderer-compatible but are not an authoring template.
+3. Copy the returned v2 skeleton for the requested Pulse variant and set `action` to `rich:pulse`. Replace its sample values while preserving required block types, slot order, and bounds. Titles and prose are content-specific; do not copy user-specific language from another Pulse.
+4. Compose the existing generic blocks into: hero; icon signal dashboard; compact agenda; editorial feature (`research_answer` or `card`) plus actions; cited News and AI accordions; visual monitoring; closing callout; numbered sources.
+   - Pulse is visual-first: give every metric a relevant icon, use a strong hero image when it adds meaning, and use `card.variant="visual"` for one or two decision-relevant stories when appropriate media is available.
+   - A visual editorial card is an image-led, rounded story tile with a readable overlay. It requires a relevant media reference, specific alt text, and provenance. Use generated images only when a real/authorized source image is unavailable and generation adds editorial value; otherwise use a normal `feature`/`editorial` card.
+   - Do not add decorative images merely to fill space. Each visual must illuminate the story, status, place, or decision. Favor one strong image over a gallery of weak ones.
+5. Keep collector and synthesis data renderer-neutral. Do not add a giant top-level markdown block, a table of contents, academic numbering, a source/sample/count chart, or an unavailable card for every failed source.
+6. Pass the measurable quality gate: at least one non-agenda renderer-safe figure/artifact image, visual editorial card, or meaningful chart; line charts have at least three usable observations; every chart has source and an ISO-8601 timestamp with offset; every News/AI story is a leaf item linked to and citing a declared source; every image has alt text and provenance; multiple stories use progressive disclosure; at most one compact unavailable signal explicitly marked with `status: "unavailable"` or `degraded_data: true`.
+7. Call `validate_tool_call` with the complete proposed `write_deliverable` arguments before writing. A `valid=true` result confirms the hard Pulse quality gate passed; the detailed authoritative quality counts are produced in render metadata when the deliverable is written and are then consumed by the evaluator.
+8. Call `write_deliverable` only with the validated payload and a concise accessible fallback in `content`.
+9. If the server rejects the payload, fix every JSON-path issue using the returned retry guidance and valid skeleton, then retry Pulse.
+10. If Pulse remains unsuitable, author a new generic rich payload with `action` set to `write_deliverable` and neither `metadata.presentation`, `metadata.pulse_variant`, nor `metadata.pulse_version`; do not relabel or reuse the rejected Pulse payload, and never label an unvalidated payload as Pulse.
+
+# Safety
+
+- Never persist or claim success for a rejected Pulse payload.
+- Never infer the grammar from a prior example when `describe_tool` is available.
+- Keep this procedure portable. User-specific sources, titles, locations, preferences, and data belong in the calling task, not this skill.
+""",
+    },
+    "cognis-rich-deliverable": {
+        "skill_id": "cognis-rich-deliverable",
+        "content": """---
+name: Cognis Rich Deliverable
+description: Compose excellent use-case-neutral Rich Deliverables (generic write_deliverable format='rich') for any archetype -- RCA, research, newsletters, comparisons, technical reports, and more.
+tags:
+  - cognis
+  - deliverable
+  - rich
+linked_tool_ids:
+  - builtin:describe_tool
+  - builtin:write_deliverable
+---
+
+# Purpose
+
+Use this skill when writing a `format='rich'` generic deliverable (not Pulse) and the archetype is not obvious, or when the composition needs review before writing. Rich Deliverables are use-case-neutral: there is no preset for most content. Compose the block vocabulary the way a human editor or designer would for the specific reader and content in front of you.
+
+# Core Principle
+
+Compose for a reader, not a form. One clear focal point per deliverable. Prose stays prose -- do not wrap plain narrative in card/status/metric blocks just to look "rich". Use hierarchy (headings, section grouping, a genuine focal block) instead of a wall of same-weight tiles.
+
+# Block Families
+
+- **Status at a glance**: `dashboard`, `metric`, `status`, `status_grid`, `card_grid` -- numeric/state summaries meant to be scanned in seconds. Not for narrative content.
+- **Visual editorial stories**: `card` with `variant: "visual"` for an image-led story that benefits from a strong, relevant visual. Supply media with specific alt text and provenance; do not use it for filler or plain prose. Without suitable media, use `feature` or `editorial`.
+- **Narrative with evidence**: `research_answer` (direct answer + key_points + citations), `evidence_report`/`claim_cards` (multiple weighed claims, each with its own evidence and confidence), `quote`.
+- **Comparison and decision**: `comparison_matrix`, `decision_matrix`, `table` -- options weighed against shared criteria.
+- **Sequence and process**: `timeline`, `steps`, `day_agenda`, `incident_timeline`, `checklist` -- anything with inherent order.
+- **Prose and structure**: `markdown`, `section`, `stack`, `columns`, `grid`, `hero` -- real paragraphs, long-form reading, layout grouping. Prefer these over `card` for reflective or explanatory prose.
+- **Visual evidence**: `chart` (only for genuinely multi-point quantitative series with `source` and `observed_at`; never a 1-2 point or purely categorical fact), `figure`/`gallery` (images with alt text and provenance), `mermaid` (diagrams).
+- **Reference and code**: `code`, `kv`/`key_value`, `source_list`, `link`/`link_preview`.
+- **Emphasis, sparingly**: `callout` for exactly one true highlight per deliverable (not every fact), `action` for a single explicit next step (not a menu), `divider` to separate real sections (not decoration).
+- **Containers**: `tabs`, `accordion`, `modal` for progressive disclosure once there is genuinely more than one story or detail to browse.
+
+# Archetype Recipes
+
+- **RCA / incident dashboard**: hero/title -> `dashboard` or `status_grid` for current impact -> `incident_timeline` for chronology -> `evidence_report` or `research_answer` for root cause -> `table` for affected systems -> `checklist` for remediation actions.
+- **Research answer / deep dive**: `research_answer` for the direct answer with key_points and citations -> `evidence_report`/`claim_cards` for supporting claims -> `comparison_matrix` if alternatives were weighed -> `source_list`.
+- **Newsletter / digest**: hero -> `card_grid` or `accordion` of story cards (each cited) -> closing `callout` -> `source_list`. Use progressive disclosure (`accordion`/`tabs`) once there is more than a few stories.
+- **Product / option comparison**: hero/markdown framing the decision -> a cited `comparison_matrix` or `decision_matrix` as the centerpiece, with exactly one `recommended: true` row when recommending an option -> `callout` for the recommendation -> `research_answer` for reasoning. When individual product imagery or detail is useful, follow the matrix immediately with a `card_grid` containing one `card` per compared product; each card must repeat the exact product name from its matrix row, include its verified media and source links, and summarize only the product-specific trade-offs. Do not emit a detached image-only gallery that forces the reader to map pictures back to rows.
+- **Scientific / technical report**: `markdown`/`section` for abstract and prose -> `figure` for diagrams with captions -> `table` for data -> `evidence_report` for claims -> `source_list` for references. Favor real paragraphs over cards.
+- **Architecture / design deck**: hero -> `section` per concern with markdown prose -> `mermaid` or `figure` per diagram -> `table` for tradeoffs -> `decision_matrix` if choosing between designs.
+- **Notes / freeform visualization**: let the content shape the layout -- `markdown`/`section` for prose, `timeline`/`steps` only if there is a real sequence, `metric`/`dashboard` only if there are real numbers to scan. Do not force structure that is not in the content.
+- **Daily pulse / briefing**: use the registered `rich:pulse` operation instead of generic rich for this specific archetype; it is an optional preset, not a quality requirement for anything else.
+
+# Anti-Patterns
+
+- **widget_salad**: many small unrelated card/metric/status tiles with no hierarchy or grouping, forcing the reader to scan everything equally.
+- **nested_cards**: a card block containing another card block for no structural reason; prefer a single card or a section/grid of siblings.
+- **two_point_chart**: a chart block with only one or two data points or a single category; use `metric`, `status`, or a sentence instead.
+- **thesis_as_status_pill**: compressing a substantive claim or finding into a status/metric label instead of a paragraph or `research_answer`.
+- **everything_is_a_card**: wrapping plain narrative prose in card/callout blocks purely to look "rich"; use `markdown`/`section` for prose.
+- **chart_without_provenance**: a chart with no `source` or `observed_at`.
+
+# Workflow
+
+1. Identify the archetype (or the closest match) from the recipes above; if none fit, let the content shape the layout rather than forcing a recipe.
+2. Call `describe_tool` for `write_deliverable` if you need the full block schema, the composition guide, or a worked example.
+3. Compose blocks following the block-family guidance, keeping one clear focal point.
+4. Write a concise, accessible fallback in `content` alongside the rich payload.
+5. Call `write_deliverable` with `format='rich'`.
+
+# Safety
+
+- Presentation presets (like Pulse) are optional fill-in templates for their specific archetype, never a prerequisite for a good generic deliverable elsewhere.
+- Do not invent block types outside the registered vocabulary; use `describe_tool` to confirm the current set.
+- User-specific sources, titles, and data belong in the calling task, not this skill.
 """,
     },
     "office-documents": {

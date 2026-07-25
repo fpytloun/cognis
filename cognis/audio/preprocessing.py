@@ -83,14 +83,16 @@ def _stt_passthrough_target(
     supported_mime_types: list[str] | None = None,
 ) -> tuple[str, str] | None:
     supported = {item.strip().lower() for item in (supported_mime_types or []) if item.strip()}
-    supported_map = (
-        {
+    if supported:
+        supported_map = {
             mime: _STT_AUDIO_EXTENSION_BY_MIME.get(mime, (mime, Path(filename).suffix or ".bin"))
             for mime in supported
         }
-        if supported
-        else STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES
-    )
+        for alias, target in _STT_AUDIO_EXTENSION_BY_MIME.items():
+            if target[0] in supported:
+                supported_map.setdefault(alias, target)
+    else:
+        supported_map = STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES
     normalized = supported_map.get(normalize_audio_mime_type(mime_type))
     if normalized is None:
         return None

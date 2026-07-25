@@ -135,15 +135,21 @@ implicit dependency on DB insert order.
 
 ### P1. Reasoning Effort Correctness
 
-1. Never emit literal `reasoning_effort="default"`. For the
-   `anthropic_adaptive` family it translates to `thinking={"type":"adaptive"}`;
-   for every other family the key is removed so the provider's native default
-   applies.
+1. Never emit literal `reasoning_effort="default"`. Omitted effort and
+   `"default"` both mean the concrete model/provider default. For documented
+   adaptive Claude models Cognis sends `thinking={"type":"adaptive"}` without
+   `output_config.effort`, leaving Anthropic's effort default in control. Other
+   providers continue receiving no reasoning control unless their contract
+   requires one.
 2. Implement `"none"` semantics per family:
-   - Anthropic: omit `thinking` or `thinking={"type":"disabled"}` when
-     supported.
+   - Adaptive Anthropic models: send `thinking={"type":"disabled"}` only on
+     models that support disabling. Claude Fable 5, Claude Mythos 5, and Claude
+     Mythos Preview reject `"none"` because thinking is always on.
+   - Older Anthropic models retain manual `budget_tokens` behavior and omit
+     thinking when disabled.
    - Gemini: `thinking_config={"thinking_budget": 0}`.
-   - OpenAI/Groq: `reasoning_effort="minimal"` as the closest native value.
+   - OpenAI and other providers use only model-supported native values; default
+     never implies or forces `"none"`.
 3. Strip `temperature`, `top_p`, and `top_k` in the provider layer when
    the target model has `supports_reasoning=True`. Call sites no longer
    need to know.
@@ -162,6 +168,9 @@ implicit dependency on DB insert order.
    remove the field. Wire the remaining budget-floor logic to it.
 9. Validate workflow-step `reasoning_effort` overrides against
    `NORMALIZED_REASONING_LEVELS` and reject unknown values clearly.
+10. Adaptive effort availability is model-specific. `xhigh` is exposed only
+    for Claude Fable 5, Claude Mythos 5, Claude Opus 4.8/4.7, and Claude
+    Sonnet 5; `max` is available on every documented adaptive model.
 
 ### P2. Health, Test, and Agent Bootstrap
 

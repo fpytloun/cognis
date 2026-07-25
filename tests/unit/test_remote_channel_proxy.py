@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+from datetime import UTC, datetime
+
 import pytest
 
 from cognis.channels.remote import RemoteChannelAdapterProxy
@@ -7,8 +10,11 @@ from cognis.models.channel import (
     ChannelAccountConfig,
     ChannelCapabilities,
     ChannelStatus,
+    InboundMessage,
+    MediaAttachment,
     OutboundMessage,
 )
+from cognis.providers.executor.websocket import ExecutorDisconnectedError
 
 
 class FakeConnection:
@@ -183,3 +189,85 @@ async def test_get_status_returns_current_state() -> None:
     assert status.account_id == "acct-1"
     assert status.channel_type == "signal"
     assert status.status == ChannelStatus.DISCONNECTED
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_retries_once_on_reconnected_executor() -> None:
+    disconnected = FakeConnection(error=ExecutorDisconnectedError("disconnected"))
+    replacement = FakeConnection(
+        {
+            "content_b64": base64.b64encode(b"audio").decode("ascii"),
+            "content_type": "audio/mp4",
+            "filename": "voice.m4a",
+        }
+    )
+    reconnect_calls = 0
+
+    async def reconnect() -> FakeConnection:
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        return replacement
+
+    proxy = RemoteChannelAdapterProxy(
+        connection=disconnected,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+        reconnect_connection=reconnect,
+    )
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=datetime.now(UTC),
+    )
+
+    result = await proxy.download_attachment_for_stt(
+        message,
+        MediaAttachment(mime_type="audio/mp4", filename="voice.m4a"),
+    )
+
+    assert result == (b"audio", "audio/mp4", "voice.m4a")
+    assert reconnect_calls == 1
+    assert len(disconnected.calls) == 1
+    assert len(replacement.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_does_not_retry_non_disconnect_failure() -> None:
+    connection = FakeConnection(error=RuntimeError("platform failed"))
+    reconnect_calls = 0
+
+    async def reconnect() -> FakeConnection:
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        return connection
+
+    proxy = RemoteChannelAdapterProxy(
+        connection=connection,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+        reconnect_connection=reconnect,
+    )
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="",
+        timestamp=datetime.now(UTC),
+    )
+
+    result = await proxy.download_attachment(
+        message,
+        MediaAttachment(mime_type="audio/mp4", filename="voice.m4a"),
+    )
+
+    assert result is None
+    assert reconnect_calls == 0
+    assert len(connection.calls) == 1

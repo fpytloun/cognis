@@ -209,7 +209,7 @@ cognis/
 
  12. **Compaction creates new sessions**: When context reaches the configured hard-pressure band (currently about 92% of the selected model budget) or a user runs manual `/compact`, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) runs compact→rotate immediately under the agent-loop per-session lock; concurrent turns wait and re-resolve the new active session before recording. Long-lived ambient chats (web agent-direct and external channel conversations) can also idle-checkpoint before the next user message after `session.long_lived_chat_idle_compaction_seconds` (default 6h) if at least `session.long_lived_chat_idle_compaction_min_events` uncompacted events exist. The old session is marked completed with `completion_reason="compacted"`. Compaction input is assembled using a three-band strategy with exact token checks, middle-band user messages preserved verbatim, and a preserved tail walked backwards on user-turn boundaries up to 30% of the session model prompt budget; `session.compaction_preserve_turns` is a maximum cap, not a target. The LLM retries transient errors including 429 before falling back to a sliding-window mechanical summary that prepends the prior anchored summary and original request. The mechanical fallback is a last resort — the `cognis_compaction_fallback_used_total` counter is alert-worthy. Compaction recursion is bounded at `session.compaction_max_recursion` (default 2); exceeding it surfaces a `compaction_recursion_exhausted` classified failure and starts a short auto-compaction cooldown. The deferred-rotation path is crash-recovery only: it re-fetches preserved tail events from the old session's Intaris stream (using `tail_start_seq` from the `compaction_summary` event) and seeds them into the new session so continuity is preserved.
 
- 13. **Prompt caching via provider breakpoints**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary), optional frozen project-context messages, then a mutable suffix (stable environment → history → recalled memories → delegations → current user/tool loop transcript → volatile tail reminders). Follow-up guidance is suffix-only and does not rewrite the immutable prefix. Anthropic requests use up to four `cache_control` breakpoints, recomputed for every LLM cycle: the last tool schema, the last cached prefix/project-context message, the end of prior-turn history, and the current request tail. `session.anthropic_cache_ttl` defaults to `5m`; when set to `1h`, only tools and cached prefix/project context use `1h`, while moving breakpoints stay `5m`, and the extended-cache-ttl beta is sent. OpenAI/ChatGPT uses automatic prefix caching unless explicit prompt cache keys are opted in. Refresh of the immutable prefix is still triggered only by explicit repair signals: Mnemory session adoption, missing entries after a cold load, or post-compaction prefix repair. Within-turn re-projection now occurs when real context pressure exists (≥ 92% of available tokens, exact-pressure projection trigger, or an oversized tool result was appended); ordinary turns skip re-projection. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
+ 13. **Prompt caching via provider breakpoints**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary), optional frozen project-context messages, then a mutable suffix (stable environment → history → recalled memories → delegations → current user/tool loop transcript → volatile tail reminders). Follow-up guidance is suffix-only and does not rewrite the immutable prefix. Anthropic requests use up to four `cache_control` breakpoints, recomputed for every LLM cycle: the last tool schema, the last cached prefix/project-context message, the end of prior-turn history, and the current request tail. `session.anthropic_cache_ttl` defaults to `5m`; when set to `1h`, only tools and cached prefix/project context use `1h`, while moving breakpoints stay `5m`, and the extended-cache-ttl beta is sent. OpenAI/ChatGPT uses automatic prefix caching unless explicit prompt cache keys are opted in. Refresh of the immutable prefix is still triggered only by explicit repair signals: Mnemory session adoption, missing entries after a cold load, or post-compaction prefix repair. Cross-turn history remains verbatim below the steady prompt target; above it, projection compacts only enough oldest fully recoverable tool groups to meet the required token savings. Within-turn re-projection now occurs when real context pressure exists (≥ 92% of available tokens, exact-pressure projection trigger, or an oversized tool result was appended); ordinary turns skip re-projection. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
 
 14. **External channel senders must be verifiable**: Channel accounts should default to `pairing` so unknown remote senders cannot talk to an agent until they redeem a short-lived verification code in the Cognis UI.
 
@@ -309,21 +309,19 @@ provider and a self-contained stack. See `docs/specs/33-e2e-test-harness.md`
 for the full design.
 
 **IMPORTANT — current chat protocol (Chat v2):** the backend no longer emits
-`timeline_patch` / `conversation_view_refresh` (removed with the legacy
-timeline projection). The live protocol is `chat_v2_frame` (runtime overlay
+legacy rendering events (removed with the legacy timeline projection). The live protocol is `chat_v2_frame` (runtime overlay
 frames coalesced ~60 ms) + `conversation_runtime_snapshot` + REST
 snapshot/sync/backfill (`cognis/api/chat_v2/`). Production chat renders from
 `ChatV2Store` (`ui/src/lib/chat-v2/store.svelte.ts` over the pure
-`sync-engine.ts`). The legacy `ChatTimeline` store is used only by its own
-tests and legacy golden replays; the sub-session detail panel uses
-`session-log.ts` + `chat.ts` builders.
+`sync-engine.ts`). Session and task-step detail panels use the same scoped
+ ChatV2 store; there is no second legacy timeline path.
 
 **Three test layers:**
 
 | Layer | Command | Speed | What it tests |
 |---|---|---|---|
-| L1 unit | `cd ui && npm test` | ms | ChatV2 sync-engine + invariant scenarios (`src/lib/chat-v2/`) and legacy ChatTimeline store logic |
-| L2 golden replay | `uv run pytest tests/e2e/ -v` then `cd ui && npm test src/lib/chat-timeline.golden.test.ts` | ~2 min + ms | Backend event stream + legacy client store invariants |
+| L1 unit | `cd ui && npm test` | ms | ChatV2 sync-engine + invariant scenarios (`src/lib/chat-v2/`) |
+| L2 event capture/replay | `uv run pytest tests/e2e/ -v` then `make e2e-events-replay` | ~2 min + ms | Scoped ChatV2 backend frames and canonical client invariants |
 | L3 browser | `cd ui && npx playwright test e2e/` | ~1 min | Rendered DOM (spinner, no flicker, scroll stability) |
 
 **Chat v2 invariant suite (primary for ordering/grouping bugs):**
@@ -337,14 +335,14 @@ never flips), INV-FINAL-PRESENCE, INV-REFRESH-NO-DROP. Backend counterpart:
 item id is byte-identical to the canonical projector id for the same event —
 an id mismatch is the #1 source of streaming-vs-reload duplicates.
 
-**L2 feedback loop (legacy golden replay):**
+**L2 feedback loop (canonical scoped ChatV2):**
 
 ```bash
 # Step 1: Capture golden event streams from live stack (starts everything automatically)
 uv run pytest tests/e2e/ -v
 
-# Step 2: Replay through the legacy ChatTimeline store (fast, no stack needed)
-cd ui && npm test src/lib/chat-timeline.golden.test.ts
+# Step 2: Run the canonical scoped ChatV2 invariant suite
+make e2e-events-replay
 ```
 
 Step 1 starts: mock-llm (deterministic OpenAI-compatible server) + Mnemory +
@@ -352,17 +350,9 @@ Intaris (`ANALYSIS_ENABLED=false`, no LLM needed) + Cognis, seeds a
 capability-off e2e agent (`memory_backend=none, guardrails_backend=none`),
 runs each scenario, and writes `tests/e2e/golden/<scenario>.jsonl`.
 
-Step 2 replays the golden files through the legacy `ChatTimeline` store and
-asserts: INV-NO-HANG (no streaming/started after message_complete), INV-NO-DUP,
-INV-MONOTONIC-PRESENCE, INV-STABLE-ORDERKEY, INV-FIELD-PRESERVE, INV-FINAL-PRESENCE
-(streaming items must survive to final state — catches "message disappears" bug),
-INV-RECONNECT-NO-HANG (no streaming/started after a `has_active_turn:false` runtime
-snapshot — catches reconnect re-injection), and INV-REFRESH-NO-DROP (a refresh /
-`replaceAll` must not evict an unconfirmed-live item present just before it — catches
-"message disappears after refresh"). NOTE: this replay exercises the LEGACY
-store, not the production ChatV2 path — treat green legacy goldens as
-necessary but not sufficient; the ChatV2 invariant suite is authoritative for
-production behavior.
+The canonical ChatV2 invariant suite asserts no hangs or duplicates, stable
+ordering, final presence, refresh safety, and reconnect behavior against the
+same pure sync engine used by production.
 
 Chat v2 ordering contracts the fixes rely on: canonical sort keys are
 `lineage:seq:phase:kind_rank:local`; active-turn runtime items live in the
@@ -430,10 +420,10 @@ If frames are PRESENT but mis-rendered, the bug is client-side (store/order).
 3. Reproduce the bug in the browser at `http://localhost:8080`
 4. Save the scenario YAML to `tests/e2e/scenarios/my-scenario.yaml`
 5. Run `uv run pytest tests/e2e/ -v` to capture the golden file
-6. Run `cd ui && npm test src/lib/chat-timeline.golden.test.ts` — it will fail
-   if the bug is present in the client store
+6. Run `make e2e-events-replay` — it will fail if the bug is present in the
+   canonical ChatV2 sync engine
 7. Fix the code, re-run step 6 (fast, no stack needed)
-8. Re-run step 5 to update the golden file with the fixed behavior
+8. Re-run step 5 to update the captured event stream with the fixed behavior
 
 **Interactive debugging with Playwright MCP** (see `docs/specs/33-e2e-test-harness.md`):
 ```bash
@@ -485,6 +475,8 @@ Cognis uses **two complementary schema evolution mechanisms**:
 **IMPORTANT: When adding or modifying columns on an existing table, you MUST do BOTH:**
 - Create an Alembic migration file in `cognis/store/migrations/versions/`
 - Add a corresponding `_ensure_*` function in `cognis/bootstrap.py` and register it in `run_schema_bootstrap()`
+- Add a regression test that creates the previous table shape, runs
+  `run_schema_bootstrap()` twice, and verifies columns, backfills, and indexes
 
 If you only create the Alembic migration, the schema change will NOT be applied automatically on startup — the app will crash with `UndefinedColumnError` until someone manually runs `alembic upgrade head`.
 

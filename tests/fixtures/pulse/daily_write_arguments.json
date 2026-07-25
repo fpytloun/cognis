@@ -1,0 +1,113 @@
+{
+  "action": "rich:pulse",
+  "content": "Daily pulse: protect the 08:00–09:30 focus window. Conditions are cool and dry. Sources: calendar and hourly forecast.",
+  "format": "rich",
+  "title": "Daily pulse",
+  "rich": {
+    "blocks": [
+      {"type": "hero", "title": "Daily pulse", "subtitle": "Thursday 15 January"},
+      {
+        "type": "grid",
+        "blocks": [
+          {"type": "metric", "label": "Focus window", "value": "90 min"},
+          {"type": "metric", "label": "Temperature", "value": "7 °C"},
+          {"type": "metric", "label": "Sources", "value": "2"}
+        ]
+      },
+      {
+        "type": "day_agenda",
+        "title": "Today",
+        "date": "2026-01-15",
+        "timezone": "UTC",
+        "now": "2026-01-15T07:00:00+00:00",
+        "items": [
+          {
+            "title": "Focus window",
+            "start": "2026-01-15T08:00:00+00:00",
+            "end": "2026-01-15T09:30:00+00:00"
+          }
+        ],
+        "tasks": []
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "section",
+            "title": "Primary context",
+            "content": "The first open window is the strongest uninterrupted period."
+          },
+          {
+            "type": "stack",
+            "title": "Actions",
+            "blocks": [
+              {
+                "type": "card",
+                "title": "Protect the window",
+                "content": "Start the highest-value work at 08:00."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Know",
+        "blocks": [
+          {
+            "type": "card_grid",
+            "blocks": [
+              {"type": "card", "title": "Conditions", "content": "Cool and dry."}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Monitor",
+        "blocks": [
+          {
+            "type": "chart",
+            "title": "Hourly temperature",
+            "description": "Temperature rises through the morning.",
+            "spec_version": "cognis.chart.v1",
+            "chart_type": "line",
+            "series": [
+              {
+                "id": "temperature",
+                "label": "Temperature",
+                "points": [
+                  {"x": "07:00", "y": 7},
+                  {"x": "08:00", "y": 7.5},
+                  {"x": "09:00", "y": 8}
+                ]
+              }
+            ],
+            "x_axis": {"type": "category", "label": "Time"},
+            "y_axis": {"type": "linear", "label": "Temperature", "unit": "°C"},
+            "legend_position": "bottom",
+            "palette_token": "cool",
+            "source_ids": ["forecast"],
+            "source": "Hourly forecast",
+            "source_url": "https://weather.example.org/hourly",
+            "observed_at": "2026-01-15T07:00:00Z"
+          }
+        ]
+      },
+      {
+        "type": "callout",
+        "title": "Closing signal",
+        "content": "Protect the 08:00–09:30 focus window."
+      },
+      {"type": "source_list", "title": "Sources"}
+    ],
+    "assets": [],
+    "sources": [
+      {"id": "calendar", "title": "Calendar", "url": "https://calendar.example.org/day"},
+      {"id": "forecast", "title": "Hourly forecast", "url": "https://weather.example.org/hourly"}
+    ],
+    "datasets": [],
+    "exports": [],
+    "metadata": {"presentation": "pulse", "pulse_variant": "daily"}
+  }
+}

@@ -18,15 +18,13 @@
 //     still boots offline.
 //
 // Update UX:
-//   - New SW versions activate themselves. The service worker is the only
-//     update actor that can rescue already-stale clients reliably; relying on
-//     stale page JS to run a perfect update protocol creates persistent update
-//     loops in installed PWAs.
+//   - New SW versions activate themselves and notify clients. The page is the
+//     single reload owner so activation cannot race a service-worker-driven
+//     navigation against a page-side reload.
 //   - `clients.claim()` is called on activate so the newly-activated SW takes
 //     control of already-open tabs immediately.
 //   - When this is an update over a previous Cognis app-shell cache, controlled
-//     windows are notified and navigated to their current URL so they cross to
-//     the new JS runtime without depending on an old page bundle.
+//     windows are notified so they cross to the new JS runtime.
 
 import { build, files, prerendered, version } from '$service-worker';
 
@@ -35,6 +33,8 @@ const sw = self as unknown as ServiceWorkerGlobalScope;
 const PRECACHE = `cognis-precache-${version}`;
 const RUNTIME = `cognis-runtime-${version}`;
 const COGNIS_CACHE_PREFIX = 'cognis-';
+const CACHE_OPERATION_TIMEOUT_MS = 3_000;
+const NAVIGATION_FETCH_TIMEOUT_MS = 8_000;
 
 const PRECACHE_URLS = [
   ...build,
@@ -80,10 +80,9 @@ async function reloadControlledWindowClients(): Promise<void> {
         const url = new URL(windowClient.url);
         if (url.origin !== sw.location.origin) return;
         windowClient.postMessage({ type: 'COGNIS_SW_UPDATED', version });
-        await windowClient.navigate(windowClient.url);
       } catch {
-        // The client may close or reject navigation during activation. Other
-        // clients should still update, and a future navigation will use this SW.
+        // The client may close during activation. Other clients should still
+        // update, and a future navigation will use this SW.
       }
     })
   );
@@ -384,15 +383,40 @@ function isPrecached(url: URL): boolean {
   return PRECACHE_URLS.includes(url.pathname);
 }
 
+function rejectAfter<T>(timeoutMs: number, label: string): Promise<T> {
+  return new Promise((_resolve, reject) => {
+    setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)} seconds.`)), timeoutMs);
+  });
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return Promise.race([promise, rejectAfter<T>(timeoutMs, label)]);
+}
+
+async function openCacheWithTimeout(cacheName: string): Promise<Cache> {
+  return withTimeout(caches.open(cacheName), CACHE_OPERATION_TIMEOUT_MS, `Opening ${cacheName}`);
+}
+
+async function matchCacheWithTimeout(cache: Cache, request: Request | string): Promise<Response | undefined> {
+  return withTimeout(cache.match(request), CACHE_OPERATION_TIMEOUT_MS, 'Cache match');
+}
+
 async function cacheFirst(request: Request): Promise<Response> {
-  const cache = await caches.open(PRECACHE);
-  const cached = await cache.match(request);
-  if (cached) return cached;
+  try {
+    const cache = await openCacheWithTimeout(PRECACHE);
+    const cached = await matchCacheWithTimeout(cache, request);
+    if (cached) return cached;
+  } catch {
+    // WebKit PWAs can leave CacheStorage operations pending indefinitely after
+    // process resume. Treat cache lookup failure/timeout as a miss and try the
+    // network rather than hanging the fetch event.
+  }
   try {
     const response = await fetch(request);
     if (response.ok) {
-      const runtime = await caches.open(RUNTIME);
-      void runtime.put(request, response.clone()).catch(() => {});
+      void openCacheWithTimeout(RUNTIME)
+        .then((runtime) => runtime.put(request, response.clone()))
+        .catch(() => {});
     }
     return response;
   } catch {
@@ -403,11 +427,18 @@ async function cacheFirst(request: Request): Promise<Response> {
 }
 
 async function staleWhileRevalidate(request: Request): Promise<Response> {
-  const cache = await caches.open(RUNTIME);
-  const cached = await cache.match(request);
+  let cache: Cache | null = null;
+  let cached: Response | undefined;
+  try {
+    cache = await openCacheWithTimeout(RUNTIME);
+    cached = await matchCacheWithTimeout(cache, request);
+  } catch {
+    cache = null;
+    cached = undefined;
+  }
   const fetchPromise = fetch(request)
     .then((response) => {
-      if (response.ok) void cache.put(request, response.clone()).catch(() => {});
+      if (response.ok && cache) void cache.put(request, response.clone()).catch(() => {});
       return response;
     })
     .catch(() => cached);
@@ -437,14 +468,19 @@ sw.addEventListener('fetch', (event) => {
     event.respondWith(
       (async () => {
         try {
-          return await fetch(event.request);
+          return await withTimeout(fetch(event.request), NAVIGATION_FETCH_TIMEOUT_MS, 'Navigation fetch');
         } catch {
-          const cache = await caches.open(PRECACHE);
-          const shell =
-            (await cache.match('/index.html')) ??
-            (await cache.match('/')) ??
-            (await caches.match('/index.html'));
-          if (shell) return shell;
+          try {
+            const cache = await openCacheWithTimeout(PRECACHE);
+            const shell =
+              (await matchCacheWithTimeout(cache, '/index.html')) ??
+              (await matchCacheWithTimeout(cache, '/')) ??
+              (await withTimeout(caches.match('/index.html'), CACHE_OPERATION_TIMEOUT_MS, 'Global shell cache match'));
+            if (shell) return shell;
+          } catch {
+            // If CacheStorage itself is wedged, do not keep the navigation
+            // request pending; return an explicit offline response.
+          }
           return new Response('Offline', { status: 503 });
         }
       })()

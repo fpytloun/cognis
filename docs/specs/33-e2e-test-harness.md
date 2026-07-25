@@ -238,11 +238,10 @@ services:
 
 ### C2. Render-layer test hooks
 
-Add `data-testid` / `data-streaming` / `data-kind` / `data-tool-status` attributes to:
-- `TimelineItemRenderer.svelte` — `data-kind={item.kind}` on the wrapper div.
-- `ChatMessage.svelte` — `data-streaming={item.streaming}` on the message container.
-- `ThinkingBlock.svelte` — `data-streaming={live}` on the block container.
-- `ToolCallBlock.svelte` — `data-tool-status={item.status}` on the block container.
+The ChatV2 renderer exposes the hooks used by browser tests directly:
+- `ChatV2TimelineItemRenderer.svelte` — `data-kind={item.kind}` on each rendered item.
+- message items also expose `data-streaming` and `data-role`.
+- tool and thinking groups expose their `data-tool-group-status` lifecycle hook.
 
 ### C3. `scripts/seed_e2e.py`
 
@@ -257,7 +256,7 @@ Extends `local_compose_seed.py` pattern:
 
 ## Part D — Static tests (CI feedback loop)
 
-### D1. L2 golden event-stream tests
+### D1. L2 canonical scoped ChatV2 tests
 
 **pytest** (`tests/e2e/test_timeline_streaming.py`):
 - `e2e_stack` fixture: `live_stack` + mock-llm subprocess + seeded e2e agent.
@@ -265,38 +264,36 @@ Extends `local_compose_seed.py` pattern:
 - Assert backend-contract invariants (Python).
 - Write `tests/e2e/golden/<scenario>.jsonl`.
 
-**vitest** (`ui/src/lib/chat-timeline.golden.test.ts`):
-- Load each golden `.jsonl`.
-- Replay every event through a real `ChatTimeline` instance.
-- Assert client-store invariants:
+**vitest** (`ui/src/lib/chat-v2/sync-engine.invariants.test.ts`):
+- Replay canonical snapshots, sync responses, backfills, and realtime frames.
+- Assert the same invariants through the pure sync engine used by production:
   - `INV-NO-HANG`: at and after `message_complete`, no item for that turn has `streaming:true`
     or tool_call `status:started`. Checks the snapshot AT `message_complete` (after
     `_finalizeStreamingForTurn` runs synchronously) and all subsequent snapshots.
   - `INV-NO-DUP`: no two items share an `id` at any snapshot.
   - `INV-MONOTONIC-PRESENCE`: an id, once present, never disappears then reappears.
   - `INV-STABLE-ORDERKEY`: `orderKey` for a given id never increases.
-  - `INV-FIELD-PRESERVE`: tool_call `arguments`/`evaluation` survive follow-up patches.
+   - `INV-FIELD-PRESERVE`: tool_call `arguments`/`evaluation` survive follow-up frames.
   - `INV-FINAL-PRESENCE`: every assistant message and tool_call present during streaming
     must still be present in the final store state after `message_complete`. Catches the
     "message disappears after streaming" bug.
   - `INV-RECONNECT-NO-HANG`: after a `conversation_runtime_snapshot` with
     `has_active_turn:false` is applied, no `streaming:true` / `status:started` items remain.
     Catches the reconnect re-injection bug (stale `active_thinking` re-emitted on reconnect).
-  - `INV-REFRESH-NO-DROP`: a refresh (synthetic `conversation_view_refresh` →
-    `ChatTimeline.replaceAll`) must not evict an item that was present and unconfirmed-live
-    immediately before it. Catches the "message disappears after refresh" bug — `replaceAll`
-    preserves streaming / non-terminal-tool / no-seq-sentinel items absent from a refresh
-    projection that races event persistence. The e2e capture appends the synthetic refresh
-    (full turn items minus the final assistant message) so the golden replay exercises it.
+   - `INV-REFRESH-NO-DROP`: a canonical snapshot refresh must not evict an item that was
+     present and unconfirmed-live immediately before it.
 
-**Routing-faithful golden replay**: the replay's `dispatchEvent` mirrors the page router —
-`conversation_runtime_snapshot` → `ChatTimeline.applyRuntimeSnapshot`,
-`conversation_view_refresh` → `ChatTimeline.replaceAll`, everything else →
-`ChatTimeline.applyEvent`. This catches bugs in paths `applyEvent` alone does not handle.
+**Routing-faithful scoped replay**: `make e2e-events-replay` discovers every
+`ui/src/lib/chat-v2/captures/promoted-*.jsonl` file and replays canonical
+ChatV2 responses through the pure `sync-engine` functions used by
+`ChatV2Store`; no legacy mutable timeline store or one-off hand-authored
+capture is involved. Promoted captures cover conversation, session, and
+task-step scopes, including tool lifecycle, reconnect/reset, deduplication,
+ordering, and field preservation.
 
 **Shared invariant libraries**:
 - `tests/e2e/invariants.py` — Python backend-contract assertions.
-- `ui/src/lib/test-support/timeline-invariants.ts` — TypeScript client-store assertions.
+- `ui/src/lib/chat-v2/sync-engine.invariants.test.ts` — TypeScript canonical client assertions.
 
 ### D2. L3 Playwright browser tests (`ui/e2e/`)
 
@@ -356,8 +353,10 @@ browser automation. It exposes click/type/snapshot/console/network tools via MCP
 5. Agent sends the trigger message in the chat UI.
 6. Agent reads accessibility tree + `data-*` hooks + console logs to observe the bug.
 7. Agent edits code, rebuilds (`npm run build` or `vite dev`), re-tests.
-8. When bug is reproduced, agent saves the injected scenario to `tests/e2e/scenarios/`
-   and the captured WS stream to `tests/e2e/golden/` → permanent regression test.
+8. When bug is reproduced, agent saves the injected scenario to
+   `tests/e2e/scenarios/`; the live capture test writes the raw WS stream to
+   `tests/e2e/golden/` and promotes its canonical `chat_v2_frame` records to
+   `ui/src/lib/chat-v2/captures/promoted-*.jsonl` → permanent regression test.
 
 ### E3. Fast UI iteration
 
@@ -372,8 +371,9 @@ Two modes (both documented):
 # After interactive reproduction:
 make e2e-promote SCENARIO=my-new-bug
 # Copies /__mock/history last scenario to tests/e2e/scenarios/my-new-bug.yaml
-# Copies captured WS stream to tests/e2e/golden/my-new-bug.jsonl
-# Adds to the static test suite automatically
+# Copies captured WS stream to tests/e2e/golden/my-new-bug.jsonl and promotes
+# canonical chat_v2_frame records to ui/src/lib/chat-v2/captures/
+# The replay target discovers the promoted file automatically.
 ```
 
 ---
@@ -466,7 +466,7 @@ window.__cognisWsRecorder.count       // number of events recorded
 ```
 
 The downloaded JSONL file can be placed in `tests/e2e/golden/` and replayed through
-`chat-timeline.golden.test.ts` to reproduce production bugs deterministically.
+`chat-v2/sync-engine.invariants.test.ts` to reproduce production bugs deterministically.
 
 ## Post-completion event capture
 
@@ -527,8 +527,8 @@ tests/e2e/
 ui/
   src/lib/
     test-support/
-      timeline-invariants.ts # Client-store invariant assertions (6 invariants)
-    chat-timeline.golden.test.ts  # L2 vitest replay
+      sync-engine.invariants.test.ts # Client-store invariant assertions (6 invariants)
+    chat-v2/sync-engine.invariants.test.ts  # L2 vitest replay
     ws/
       client.ts              # WS client + dev WsFrameRecorder
   e2e/

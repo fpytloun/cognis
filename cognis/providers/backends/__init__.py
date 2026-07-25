@@ -37,12 +37,15 @@ logger = logging.getLogger(__name__)
 # Registry internals
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class BackendDescriptor:
     kind: str  # "memory" | "guardrails"
-    id: str    # e.g. "mnemory", "none", "native"
+    id: str  # e.g. "mnemory", "none", "native"
     factory: Callable[..., Any]
     display_name: str = ""
+    description: str = ""
+    memory_options: Any | None = None
 
 
 _registry: dict[tuple[str, str], BackendDescriptor] = {}
@@ -52,6 +55,8 @@ def register_backend(
     kind: str,
     id: str,
     display_name: str = "",
+    description: str = "",
+    memory_options: Any | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator that registers a backend factory.
 
@@ -61,20 +66,26 @@ def register_backend(
         def _factory(config: CognisConfig, registry: ProviderRegistry):
             return NullMemoryProvider()
     """
+
     def decorator(factory: Callable[..., Any]) -> Callable[..., Any]:
         key = (kind, id)
         if key in _registry:
             logger.warning(
                 "Backend %s/%s already registered — overwriting with %s",
-                kind, id, factory,
+                kind,
+                id,
+                factory,
             )
         _registry[key] = BackendDescriptor(
             kind=kind,
             id=id,
             factory=factory,
             display_name=display_name or id,
+            description=description,
+            memory_options=memory_options,
         )
         return factory
+
     return decorator
 
 
@@ -129,6 +140,7 @@ def _ensure_loaded() -> None:
 # Per-turn backend resolution
 # ---------------------------------------------------------------------------
 
+
 def resolve_agent_backends(
     agent: Any,
     config: CognisConfig,
@@ -156,7 +168,15 @@ def resolve_agent_backends(
         else config.default_guardrails_backend
     )
 
-    memory_backend = get_backend("memory", memory_id)
+    try:
+        memory_backend = get_backend("memory", memory_id)
+    except ValueError:
+        logger.warning(
+            "Agent %s references unavailable memory backend %s; failing closed",
+            getattr(agent, "agent_id", "?"),
+            memory_id,
+        )
+        memory_backend = get_backend("memory", "none")
     guardrails_backend = get_backend("guardrails", guardrails_id)
 
     memory = memory_backend.factory(config, registry)

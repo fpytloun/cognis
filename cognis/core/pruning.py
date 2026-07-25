@@ -27,6 +27,8 @@ def prune_tool_outputs(
     token_counter: Callable[[str], int] | None = None,
     pressure_mode: ProjectionPressureMode = "normal",
     policy: ProjectionPolicy | None = None,
+    recovery_result_call_ids: set[str] | None = None,
+    recovery_pin_budget_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fallback pruning for the mutable tail of a projected transcript."""
 
@@ -44,4 +46,6 @@ def prune_tool_outputs(
         arg_clear_threshold=arg_clear_threshold,
         token_counter=token_counter or default_token_estimate,
         pressure_mode=pressure_mode,
+        recovery_result_call_ids=recovery_result_call_ids,
+        recovery_pin_budget_tokens=recovery_pin_budget_tokens,
     )

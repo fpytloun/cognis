@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 import httpx
 import pytest
@@ -10,6 +11,7 @@ from cognis.providers.llm.codex_transport import (
     DEFAULT_CODEX_HTTP_TIMEOUT,
     DEFAULT_CODEX_STREAM_HTTP_TIMEOUT,
     DirectCodexResponsesStream,
+    DirectCodexTransport,
     _codex_headers,
     _codex_payload,
     _raise_for_status,
@@ -34,6 +36,10 @@ def test_codex_headers_merge_auth_extra_headers_and_stream_accept() -> None:
     assert headers["Accept"] == "text/event-stream"
     assert headers["x-session-affinity"] == "session-123"
     assert headers["session_id"] == "session-123"
+    assert str(uuid.UUID(headers["x-client-request-id"])) == headers["x-client-request-id"]
+
+    next_headers = _codex_headers(auth, {"stream": True})
+    assert next_headers["x-client-request-id"] != headers["x-client-request-id"]
 
 
 def test_codex_payload_strips_transport_kwargs() -> None:
@@ -152,10 +158,6 @@ async def test_direct_codex_5xx_errors_remain_retryable() -> None:
 async def test_direct_codex_stream_parses_sse_and_closes_resources() -> None:
     closed: list[str] = []
 
-    class _Client:
-        async def aclose(self) -> None:
-            closed.append("client")
-
     class _Response:
         async def aiter_lines(self):  # type: ignore[no-untyped-def]
             yield "event: response.output_text.delta"
@@ -165,34 +167,85 @@ async def test_direct_codex_stream_parses_sse_and_closes_resources() -> None:
         async def aclose(self) -> None:
             closed.append("response")
 
-    stream = DirectCodexResponsesStream(
-        _Client(),  # type: ignore[arg-type]
-        _Response(),  # type: ignore[arg-type]
-    )
+    stream = DirectCodexResponsesStream(_Response())  # type: ignore[arg-type]
 
     events = [event async for event in stream]
 
     assert events == [{"type": "response.output_text.delta", "delta": "hi"}]
-    assert closed == ["response", "client"]
+    assert closed == ["response"]
 
 
 @pytest.mark.asyncio
 async def test_direct_codex_stream_closes_real_httpx_response() -> None:
     closed: list[str] = []
 
-    class _Client:
-        async def aclose(self) -> None:
-            closed.append("client")
-
     response = httpx.Response(
         200,
         content=b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
         request=httpx.Request("POST", "https://example.invalid"),
     )
-    stream = DirectCodexResponsesStream(_Client(), response)  # type: ignore[arg-type]
+    stream = DirectCodexResponsesStream(response)
 
     events = [event async for event in stream]
 
     assert events == [{"type": "response.completed", "response": {"status": "completed"}}]
     assert response.is_closed
-    assert closed == ["client"]
+    assert closed == []
+
+
+@pytest.mark.asyncio
+async def test_direct_codex_transport_reuses_client_and_closes_explicitly() -> None:
+    requests: list[httpx.Request] = []
+    clients: list[httpx.AsyncClient] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": f"response-{len(requests)}"})
+
+    def _client_factory() -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        clients.append(client)
+        return client
+
+    transport = DirectCodexTransport(
+        CodexAuth(access_token="token", account_id="account"),
+        client_factory=_client_factory,
+    )
+    kwargs = {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "hi"}]}
+
+    assert await transport.responses(**kwargs) == {"id": "response-1"}
+    assert await transport.responses(**kwargs) == {"id": "response-2"}
+    assert len(clients) == 1
+    assert not clients[0].is_closed
+    request_ids = [request.headers["x-client-request-id"] for request in requests]
+    assert len(set(request_ids)) == 2
+    assert all(str(uuid.UUID(request_id)) == request_id for request_id in request_ids)
+
+    await transport.aclose()
+
+    assert clients[0].is_closed
+    await transport.aclose()
+
+
+@pytest.mark.asyncio
+async def test_direct_codex_transport_preserves_per_request_timeout() -> None:
+    observed_timeouts: list[dict[str, float | None]] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        observed_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"id": "response"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+    transport = DirectCodexTransport(
+        CodexAuth(access_token="token", account_id="account"),
+        client_factory=lambda: client,
+    )
+
+    await transport.responses(
+        model="gpt-5.6-sol",
+        input=[],
+        timeout=httpx.Timeout(17.0),
+    )
+    await transport.aclose()
+
+    assert observed_timeouts == [{"connect": 17.0, "read": 17.0, "write": 17.0, "pool": 17.0}]

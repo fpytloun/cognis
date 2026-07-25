@@ -10,13 +10,11 @@ from urllib.parse import quote
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sa_event
 
 from cognis.api.app import create_app
 from cognis.api.middleware import AuthenticatedUser
-from cognis.api.models import MessageEventResponse, TaskCreateRequest
-from cognis.api.routes.conversations import (
-    _project_timeline_events,
-)
+from cognis.api.models import TaskCreateRequest
 from cognis.api.routes.tasks import task_create
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
@@ -26,7 +24,6 @@ from cognis.api.websocket import (
 )
 from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_loop import PendingPause
-from cognis.core.decision import DecisionResult
 from cognis.core.task_queue import TaskRerunResult
 from cognis.models.search import SearchMatch, SearchSessionMatch, SearchSessionsResponse
 from cognis.models.session import (
@@ -82,1457 +79,6 @@ def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
 def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, str]:
     token = app.state.auth_provider.sign_access_token(email, email.split("@")[0].title(), role)  # type: ignore[attr-defined]
     return {"Authorization": f"Bearer {token}"}
-
-
-def _event(
-    event_type: str,
-    event_id: str,
-    *,
-    seq: int,
-    ts: str,
-    data: dict[str, object],
-) -> MessageEventResponse:
-    return MessageEventResponse(
-        seq=seq,
-        type=event_type,
-        event_id=event_id,
-        data=data,
-        timestamp=ts,
-    )
-
-
-def test_timeline_projection_keeps_tool_delimited_assistant_phases() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={"session_id": "sess_a", "turn_id": "turn_1", "content": "First"},
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="tool_call",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "call_id": "call_1",
-                    "name": "read",
-                    "visible_name": "cat_file",
-                    "canonical_name": "read",
-                    "arguments": '{"file_path":"README.md"}',
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="tool_result",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "call_id": "call_1",
-                    "result": "ok",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-            MessageEventResponse(
-                seq=4,
-                type="assistant_message",
-                data={"session_id": "sess_a", "turn_id": "turn_1", "content": "Second"},
-                timestamp="2026-01-01T00:00:04Z",
-            ),
-        ]
-    )
-
-    assistant_messages = [
-        item for item in items if item.get("kind") == "message" and item.get("role") == "assistant"
-    ]
-
-    assert [item["content"] for item in assistant_messages] == ["First", "Second"]
-    assert [item["assistantPhaseIndex"] for item in assistant_messages] == [0, 1]
-    assert items[1]["arguments"] == {"file_path": "README.md"}
-    assert items[1]["sessionId"] == "sess_a"
-    assert items[1]["toolName"] == "read"
-    assert items[1]["displayToolName"] == "cat_file"
-    assert items[1]["canonicalToolName"] == "read"
-
-
-def test_timeline_projection_collapses_large_repeated_assistant_body() -> None:
-    unit = (
-        ("Reviewed read-only. No edits made. " * 12)
-        + "\n\n## Immediate root cause\n"
-        + "ImageLightbox uses a hardcoded toolbar layout over the image stage."
-    )
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": unit * 3,
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-        ]
-    )
-
-    assert len(items) == 1
-    assert items[0]["kind"] == "message"
-    assert items[0]["role"] == "assistant"
-    assert items[0]["content"] == unit
-
-
-def test_timeline_projection_replaces_repeated_assistant_frames_for_same_message() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "First paragraph.",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "First paragraph.\n\nSecond paragraph.",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "First paragraph.\n\nSecond paragraph.",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert len(items) == 1
-    assert items[0]["kind"] == "message"
-    assert items[0]["content"] == "First paragraph.\n\nSecond paragraph."
-
-
-def test_timeline_projection_appends_non_overlapping_same_id_assistant_segments() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "First segment.",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "Second segment.",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert len(items) == 1
-    assert items[0]["content"] == "First segment.\n\nSecond segment."
-
-
-def test_timeline_projection_does_not_merge_tiny_overlap_between_assistant_segments() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "Alpha",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "assistant beta",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert len(items) == 1
-    assert items[0]["content"] == "Alpha\n\nassistant beta"
-
-
-def test_timeline_projection_orders_assistant_text_before_delegate_card_when_final_persists_late() -> (
-    None
-):
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="tool_call",
-                data={
-                    "call_id": "call_delegate",
-                    "name": "delegate",
-                    "turn_id": "turn_1",
-                    "arguments": {"task": "Inspect UI renderer"},
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="delegation",
-                data={
-                    "child_session_id": "child_1",
-                    "task": "Inspect UI renderer",
-                    "agent_id": "system:explore",
-                    "status": "started",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "I'll inspect the current UI rendering path first.",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items[:2]] == ["message", "delegation"]
-    assert items[0]["content"] == "I'll inspect the current UI rendering path first."
-    assert items[1]["taskLabel"] == "Inspect UI renderer"
-
-
-def test_timeline_projection_does_not_pull_later_assistant_phase_before_delegate() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_phase_0",
-                    "turn_id": "turn_1",
-                    "content": "I'll inspect the current UI rendering path first.",
-                    "assistant_phase_index": 0,
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="tool_call",
-                data={
-                    "call_id": "call_delegate",
-                    "name": "delegate",
-                    "turn_id": "turn_1",
-                    "arguments": {"task": "Inspect UI renderer"},
-                },
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="delegation",
-                data={
-                    "child_session_id": "child_1",
-                    "task": "Inspect UI renderer",
-                    "agent_id": "system:explore",
-                    "status": "started",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=4,
-                type="assistant_message",
-                data={
-                    "message_id": "msg_phase_1",
-                    "turn_id": "turn_1",
-                    "content": "The relevant renderer is in TimelineList.",
-                    "assistant_phase_index": 1,
-                },
-                timestamp="2026-01-01T00:00:04Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items[:3]] == ["message", "delegation", "message"]
-
-
-def test_timeline_projection_exposes_user_client_message_id() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="user_message",
-                data={
-                    "content": "hello",
-                    "message_id": "user_msg_1",
-                    "client_message_id": "cmsg_1",
-                },
-                timestamp="2026-01-01T00:00:00Z",
-                session_id="sess_1",
-            )
-        ]
-    )
-
-    assert len(items) == 1
-    assert items[0]["kind"] == "message"
-    assert items[0]["role"] == "user"
-    assert items[0]["content"] == "hello"
-    assert items[0]["clientMessageId"] == "cmsg_1"
-
-
-def test_timeline_projection_infers_post_tool_assistant_phase_for_legacy_events() -> None:
-    items = _project_timeline_events(
-        [
-            _event(
-                "tool_call",
-                "tool-1",
-                seq=1,
-                ts="2026-01-01T00:00:01Z",
-                data={
-                    "call_id": "call_1",
-                    "tool_name": "read",
-                    "arguments": "{}",
-                    "status": "running",
-                    "turn_id": "turn_1",
-                },
-            ),
-            _event(
-                "assistant_thinking",
-                "thinking-1",
-                seq=2,
-                ts="2026-01-01T00:00:02Z",
-                data={
-                    "message_id": "msg_after_tool",
-                    "turn_id": "turn_1",
-                    "block_id": "think_1",
-                    "content": "reviewing tool output",
-                },
-            ),
-            _event(
-                "assistant_message",
-                "assistant-1",
-                seq=3,
-                ts="2026-01-01T00:00:03Z",
-                data={
-                    "message_id": "msg_after_tool",
-                    "turn_id": "turn_1",
-                    "content": "done",
-                },
-            ),
-        ]
-    )
-
-    thinking = next(item for item in items if item["kind"] == "thinking")
-    assistant = next(item for item in items if item["kind"] == "message")
-    assert thinking["assistantPhaseIndex"] == 1
-    assert thinking["id"] == "thinking:msg_after_tool:phase:1:think_1"
-    assert assistant["assistantPhaseIndex"] == 1
-    assert assistant["id"] == "message:msg_after_tool:phase:1"
-
-
-def test_projected_items_carry_order_key() -> None:
-    """Every projected item must carry an orderKey so the client can sort."""
-    items = _project_timeline_events(
-        [
-            _event(
-                "user_message",
-                "u-1",
-                seq=1,
-                ts="2026-01-01T00:00:01Z",
-                data={"content": "hi", "turn_id": "turn_1"},
-            ),
-            _event(
-                "assistant_thinking",
-                "think-1",
-                seq=2,
-                ts="2026-01-01T00:00:02Z",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "block_id": "blk_1",
-                    "content": "thinking",
-                },
-            ),
-            _event(
-                "assistant_message",
-                "a-1",
-                seq=3,
-                ts="2026-01-01T00:00:03Z",
-                data={"message_id": "msg_1", "turn_id": "turn_1", "content": "done"},
-            ),
-            _event(
-                "tool_call",
-                "tc-1",
-                seq=4,
-                ts="2026-01-01T00:00:04Z",
-                data={"call_id": "call_1", "tool_name": "bash", "turn_id": "turn_1"},
-            ),
-        ]
-    )
-
-    for item in items:
-        assert "orderKey" in item, f"Missing orderKey on {item.get('kind')} item"
-        assert isinstance(item["orderKey"], str) and item["orderKey"], (
-            f"Empty orderKey on {item.get('kind')} item"
-        )
-
-    # Items must be sorted by their own orderKey
-    keys = [item["orderKey"] for item in items]
-    assert keys == sorted(keys), f"Items not sorted by orderKey: {keys}"
-
-
-def test_projected_items_order_key_stable_across_arrival_order() -> None:
-    """Delegation arriving before assistant must still sort after it."""
-    # Simulate: user_message (seq=1), delegation_started (seq=2), assistant_message (seq=3)
-    # The delegation tool_call event arrives before the assistant_message in the event stream.
-    items = _project_timeline_events(
-        [
-            _event(
-                "user_message",
-                "u-1",
-                seq=1,
-                ts="2026-01-01T00:00:01Z",
-                data={"content": "delegate this", "turn_id": "turn_1"},
-            ),
-            _event(
-                "assistant_message",
-                "a-1",
-                seq=2,
-                ts="2026-01-01T00:00:02Z",
-                data={"message_id": "msg_1", "turn_id": "turn_1", "content": "I will delegate"},
-            ),
-            _event(
-                "tool_call",
-                "tc-1",
-                seq=3,
-                ts="2026-01-01T00:00:03Z",
-                data={
-                    "call_id": "call_1",
-                    "tool_name": "delegate",
-                    "turn_id": "turn_1",
-                    "arguments": '{"task": "do the thing"}',
-                },
-            ),
-            _event(
-                "delegation",
-                "del-1",
-                seq=4,
-                ts="2026-01-01T00:00:04Z",
-                data={
-                    "child_session_id": "child_sess_1",
-                    "title": "do the thing",
-                    "status": "started",
-                    "turn_id": "turn_1",
-                },
-            ),
-        ]
-    )
-
-    kinds = [item["kind"] for item in items]
-    # user → assistant → delegation (delegate tool_call is consumed, not projected)
-    assert kinds[0] == "message" and items[0]["role"] == "user"
-    assert kinds[1] == "message" and items[1]["role"] == "assistant"
-    assert kinds[2] == "delegation"
-
-    keys = [item["orderKey"] for item in items]
-    assert keys == sorted(keys), f"Items not sorted by orderKey: {keys}"
-
-
-def test_persisted_assistant_message_phase_matches_runtime_stream_phase() -> None:
-    """When assistant_phase_index is explicit in the event, projection uses it.
-
-    This ensures that a persisted assistant_message event carrying
-    assistant_phase_index=1 (set by the scheduler on the normal completion
-    path) produces the same stable id as the runtime stream snapshot that
-    also used phase=1, preventing a duplicate 'in progress' bubble.
-    """
-    from cognis.api.routes.conversations import _stable_assistant_timeline_id
-
-    # Simulate: tool_call (seq=1) → assistant_message (seq=2, phase=1 explicit)
-    items = _project_timeline_events(
-        [
-            _event(
-                "tool_call",
-                "tc-1",
-                seq=1,
-                ts="2026-01-01T00:00:01Z",
-                data={"call_id": "call_1", "tool_name": "bash", "turn_id": "turn_1"},
-            ),
-            _event(
-                "assistant_message",
-                "a-1",
-                seq=2,
-                ts="2026-01-01T00:00:02Z",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "content": "done",
-                    "assistant_phase_index": 1,  # explicit — set by scheduler
-                },
-            ),
-        ]
-    )
-
-    assistant = next(item for item in items if item.get("kind") == "message")
-    assert assistant["assistantPhaseIndex"] == 1
-    # The stable id must match what the runtime stream would produce
-    expected_id = _stable_assistant_timeline_id("msg_1", 1, "msg_1")
-    assert assistant["id"] == expected_id
-
-
-def test_cross_session_lineage_orderkey_sorts_older_session_before_newer() -> None:
-    """Post-compaction: session B (seq restarts at 1) must sort AFTER session A.
-
-    Without the lineage_index dimension, session B seq=1 would sort before
-    session A seq=40 because orderKey was seq-primary with no session field.
-    """
-    from cognis.api.routes.conversations import _tag_session_events
-
-    # Session A (older, lineage_index=0): one user message at seq=40
-    session_a = SimpleNamespace(session_id="sess_a")
-    events_a = [
-        {
-            "seq": 40,
-            "type": "user_message",
-            "timestamp": "2026-01-01T00:00:40Z",
-            "data": {"content": "old message", "turn_id": "turn_a"},
-        }
-    ]
-    _tag_session_events(session_a, events_a, lineage_index=0)
-
-    # Session B (newer, lineage_index=1): user message at seq=1 (restarted)
-    session_b = SimpleNamespace(session_id="sess_b")
-    events_b = [
-        {
-            "seq": 1,
-            "type": "user_message",
-            "timestamp": "2026-01-01T00:01:00Z",
-            "data": {"content": "new message after compaction", "turn_id": "turn_b"},
-        }
-    ]
-    _tag_session_events(session_b, events_b, lineage_index=1)
-
-    # Merge and project (simulating the full-load path)
-    all_events_raw = events_a + events_b
-    all_events = [
-        MessageEventResponse(
-            seq=e["seq"],
-            type=e["type"],
-            data=e["data"],
-            timestamp=e["timestamp"],
-        )
-        for e in all_events_raw
-    ]
-    items = _project_timeline_events(all_events)
-
-    assert len(items) == 2
-    # Session A (lineage=0, seq=40) must come before session B (lineage=1, seq=1)
-    assert items[0]["content"] == "old message", (
-        f"Expected old message first, got: {[i.get('content') for i in items]}"
-    )
-    assert items[1]["content"] == "new message after compaction"
-    # orderKeys must be sorted
-    keys = [item["orderKey"] for item in items]
-    assert keys == sorted(keys), f"Items not sorted by orderKey: {keys}"
-    # Session B's orderKey must be larger despite lower seq
-    assert items[0]["orderKey"] < items[1]["orderKey"]
-
-
-def test_live_bus_patches_get_distinct_order_keys() -> None:
-    """Two concurrent live delegation patches must get distinct orderKeys.
-
-    This covers both the multi-event (one projection call) and separate
-    single-event (two separate projection calls) scenarios.
-    """
-    from cognis.api.routes.conversations import _project_timeline_events
-
-    # Scenario A: two events in one projection call with distinct counters
-    events_together = [
-        MessageEventResponse(
-            seq=None,
-            type="delegation",
-            data={
-                "child_session_id": "child_1",
-                "title": "First task",
-                "status": "started",
-                "_live_patch_counter": 1,
-            },
-            timestamp="2026-01-01T00:00:01Z",
-        ),
-        MessageEventResponse(
-            seq=None,
-            type="delegation",
-            data={
-                "child_session_id": "child_2",
-                "title": "Second task",
-                "status": "started",
-                "_live_patch_counter": 2,
-            },
-            timestamp="2026-01-01T00:00:02Z",
-        ),
-    ]
-    items_together = _project_timeline_events(events_together)
-    assert len(items_together) == 2
-    keys_together = [item["orderKey"] for item in items_together]
-    assert keys_together[0] != keys_together[1], (
-        f"Multi-event projection got identical orderKeys: {keys_together}"
-    )
-    assert keys_together == sorted(keys_together)
-
-    # Scenario B: two separate single-event projection calls (the real live path)
-    items_a = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=None,
-                type="delegation",
-                data={
-                    "child_session_id": "child_3",
-                    "title": "Third task",
-                    "status": "started",
-                    "_live_patch_counter": 3,
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            )
-        ]
-    )
-    items_b = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=None,
-                type="delegation",
-                data={
-                    "child_session_id": "child_4",
-                    "title": "Fourth task",
-                    "status": "started",
-                    "_live_patch_counter": 4,
-                },
-                timestamp="2026-01-01T00:00:04Z",
-            )
-        ]
-    )
-    assert len(items_a) == 1
-    assert len(items_b) == 1
-    key_a = items_a[0]["orderKey"]
-    key_b = items_b[0]["orderKey"]
-    assert key_a != key_b, (
-        f"Separate single-event projections got identical orderKeys: {key_a!r} == {key_b!r}"
-    )
-    # Counter 3 < counter 4, so key_a < key_b
-    assert key_a < key_b, f"Expected key_a < key_b but got {key_a!r} >= {key_b!r}"
-
-
-def test_orderkey_sentinel_fits_in_format_field() -> None:
-    """Sentinel values must fit exactly in their format fields without widening."""
-    from cognis.api.routes.conversations import (
-        _ORDER_KEY_NO_LINEAGE,
-        _ORDER_KEY_NO_SEQ,
-        _encode_order_key,
-    )
-
-    sentinel_key = _encode_order_key(lineage=None, seq=None, phase=None, kind_rank=0, local=0)
-    # Sentinel lineage (9999) must be 4 digits
-    assert sentinel_key.startswith(f"{_ORDER_KEY_NO_LINEAGE:04d}:"), (
-        f"Sentinel lineage widened: {sentinel_key}"
-    )
-    # Sentinel seq (10**15-1) must be 15 digits
-    seq_part = sentinel_key.split(":")[1]
-    assert len(seq_part) == 15, f"Sentinel seq is {len(seq_part)} digits, expected 15: {seq_part}"
-    assert int(seq_part) == _ORDER_KEY_NO_SEQ
-
-    # A real persisted key must be lexicographically smaller than the sentinel
-    real_key = _encode_order_key(lineage=0, seq=999_999_999_999_999, phase=0, kind_rank=0, local=0)
-    assert real_key < sentinel_key, f"Real key {real_key!r} should be < sentinel {sentinel_key!r}"
-
-
-def test_timeline_projection_hides_lifecycle_compaction_start_notice() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="lifecycle",
-                data={
-                    "event": "system_notice",
-                    "message": (
-                        "The model provider rejected the request because the context window is full. "
-                        "Cognis is compacting the saved conversation and will retry the turn in a fresh compacted session."
-                    ),
-                    "status": "started",
-                    "notice_id": "provider-overflow",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            )
-        ]
-    )
-
-    assert items == []
-
-
-def test_timeline_projection_keeps_repeated_same_task_delegations_in_call_order() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="tool_call",
-                data={
-                    "call_id": "call_a",
-                    "name": "delegate",
-                    "arguments": {"task": "Inspect same task"},
-                    "turn_id": "turn_1",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="tool_call",
-                data={
-                    "call_id": "call_b",
-                    "name": "delegate",
-                    "arguments": {"task": "Inspect same task"},
-                    "turn_id": "turn_1",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="delegation",
-                data={
-                    "child_session_id": "child_a",
-                    "task": "Inspect same task",
-                    "agent_id": "system:explore",
-                    "status": "started",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=4,
-                type="delegation",
-                data={
-                    "child_session_id": "child_b",
-                    "task": "Inspect same task",
-                    "agent_id": "system:explore",
-                    "status": "started",
-                },
-                timestamp="2026-01-01T00:00:04Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    delegations = [item for item in items if item["kind"] == "delegation"]
-
-    assert [item["taskId"] for item in delegations] == ["child_a", "child_b"]
-
-
-def test_timeline_projection_missing_sequence_orders_after_sequenced_events_by_timestamp() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="user_message",
-                data={"content": "First", "message_id": "user_1"},
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=None,
-                type="assistant_message",
-                data={"content": "Unsequenced", "message_id": "assistant_missing"},
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_message",
-                data={"content": "Second", "message_id": "assistant_2"},
-                timestamp="2026-01-01T00:00:03Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert [item["content"] for item in items] == ["First", "Second", "Unsequenced"]
-
-
-def test_timeline_projection_missing_tool_sequence_does_not_sort_before_sequenced_events() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={"content": "Sequenced", "message_id": "assistant_1"},
-                timestamp="2026-01-01T00:00:02Z",
-                session_id="sess_1",
-            ),
-            MessageEventResponse(
-                seq=None,
-                type="tool_call",
-                data={
-                    "call_id": "call_1",
-                    "name": "bash",
-                    "arguments": {"command": "true"},
-                    "status": "running",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-                session_id="sess_1",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message", "tool_call"]
-
-
-def test_timeline_projection_replaces_duplicate_system_notices() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="system_message",
-                data={
-                    "session_id": "sess_a",
-                    "notice_id": "turn-start",
-                    "kind": "turn_initiated",
-                    "content": "Starting",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="system_message",
-                data={
-                    "session_id": "sess_a",
-                    "notice_id": "turn-start",
-                    "kind": "turn_initiated",
-                    "content": "Started",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-        ]
-    )
-
-    assert [_strip_order_key(item) for item in items] == [
-        {
-            "id": "system:turn-start",
-            "kind": "system_message",
-            "text": "Started",
-            "noticeId": "turn-start",
-            "noticeKind": "turn_initiated",
-            "timestamp": "2026-01-01T00:00:02Z",
-        }
-    ]
-
-
-def test_timeline_projection_preserves_assistant_thinking_event_order() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "Answer",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_thinking",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "block_1",
-                    "content": "first",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_thinking",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "block_2",
-                    "content": "second",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message", "thinking", "thinking"]
-    assert items[0]["content"] == "Answer"
-    assert items[0]["assistantPhaseIndex"] == 0
-    assert items[1]["messageId"] == "msg_1"
-    assert items[1]["sessionId"] == "sess_a"
-    assert items[1]["assistantPhaseIndex"] == 1
-    assert items[1]["blocks"][0]["content"] == "first"
-    assert items[2]["messageId"] == "msg_1"
-    assert items[2]["sessionId"] == "sess_a"
-    assert items[2]["assistantPhaseIndex"] == 1
-    assert items[2]["blocks"][0]["content"] == "second"
-
-
-def test_timeline_projection_collapses_legacy_repeated_thinking_content() -> None:
-    body = "Addressing footer and signature layout. This repeated body came from cumulative snapshots. "
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                session_id="sess_a",
-                type="assistant_thinking",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "block_id": "thk_1",
-                    "title": "Addressing footer and signature layout",
-                    "content": body * 3,
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            )
-        ]
-    )
-
-    assert items[0]["blocks"][0]["content"] == body.strip()
-
-
-def test_timeline_projection_collapses_repeated_thinking_with_derived_title_ellipsis() -> None:
-    body = "Addressing footer and signature layout with a long title that may be truncated before matching the body. "
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                session_id="sess_a",
-                type="assistant_thinking",
-                data={
-                    "message_id": "msg_1",
-                    "turn_id": "turn_1",
-                    "block_id": "thk_1",
-                    "title": "Addressing footer and signature layout with a long title that may be…",
-                    "content": body * 3,
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            )
-        ]
-    )
-
-    assert items[0]["blocks"][0]["content"] == body.strip()
-
-
-def test_timeline_projection_does_not_merge_assistant_messages_across_thinking() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "Before thinking",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_thinking",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "block_1",
-                    "content": "intervening thought",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "After thinking",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message", "thinking", "message"]
-    assert [item.get("assistantPhaseIndex") for item in items] == [0, 1, 1]
-    assert items[0]["content"] == "Before thinking"
-    assert items[1]["blocks"][0]["content"] == "intervening thought"
-    assert items[2]["content"] == "After thinking"
-
-
-def test_timeline_projection_hides_user_message_reasoning_echo() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_thinking",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "block_1",
-                    "title": "Reasoning",
-                    "content": "User message: check current repo state",
-                    "reasoning_source": "reasoning",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "Answer",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message"]
-    assert items[0]["content"] == "Answer"
-
-
-def test_timeline_projection_uses_unique_thinking_ids_across_tool_boundaries() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_thinking",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "block_1",
-                    "content": "Before tool",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="tool_call",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "call_id": "call_1",
-                    "tool_name": "read",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_thinking",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "block_2",
-                    "content": "After tool",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-        ]
-    )
-
-    thinking_items = [item for item in items if item["kind"] == "thinking"]
-    assert len(thinking_items) == 2
-    assert thinking_items[0]["id"] != thinking_items[1]["id"]
-
-
-def test_timeline_projection_hides_generic_reasoning_diagnostics() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                session_id="sess_a",
-                type="reasoning",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "block_id": "reason_1",
-                    "summary": "The model considered alternatives.",
-                    "source": "summary",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                session_id="sess_a",
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "Final answer",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message"]
-    assert items[0]["content"] == "Final answer"
-
-
-def test_timeline_projection_hides_internal_audit_events() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                session_id="sess_a",
-                type="developer_message",
-                data={"content": "Internal context only"},
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                session_id="sess_a",
-                type="lifecycle",
-                data={"event": "intention_updated", "intention": "debug issue"},
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                session_id="sess_a",
-                type="lifecycle",
-                data={"event": "session_status_changed", "status": "completed"},
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-            MessageEventResponse(
-                seq=4,
-                session_id="sess_a",
-                type="lifecycle",
-                data={"event": "session_created", "session_id": "sess_child"},
-                timestamp="2026-01-01T00:00:04Z",
-            ),
-            MessageEventResponse(
-                seq=5,
-                session_id="sess_a",
-                type="context_snapshot",
-                data={"event": "context_snapshot", "summary": "internal context"},
-                timestamp="2026-01-01T00:00:05Z",
-            ),
-            MessageEventResponse(
-                seq=6,
-                session_id="sess_a",
-                type="evaluation",
-                data={},
-                timestamp="2026-01-01T00:00:06Z",
-            ),
-            MessageEventResponse(
-                seq=7,
-                session_id="sess_a",
-                type="lifecycle",
-                data={"event": "tool_discovery", "session_id": "sess_a"},
-                timestamp="2026-01-01T00:00:07Z",
-            ),
-        ]
-    )
-
-    assert items == []
-
-
-def test_timeline_projection_closes_assistant_phase_before_lifecycle_notice() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "Before",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="lifecycle",
-                data={
-                    "session_id": "sess_a",
-                    "event": "system_notice",
-                    "message": "Notice",
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "After",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message", "system_message", "message"]
-    assert items[0]["content"] == "Before"
-    assert items[2]["content"] == "After"
-
-
-def test_timeline_projection_closes_assistant_phase_before_session_recovery() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "Before",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="session_recovered",
-                data={"session_id": "sess_a"},
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-            MessageEventResponse(
-                seq=3,
-                type="assistant_message",
-                data={
-                    "session_id": "sess_a",
-                    "turn_id": "turn_1",
-                    "message_id": "msg_1",
-                    "content": "After",
-                },
-                timestamp="2026-01-01T00:00:03Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message", "system_message", "message"]
-    assert items[0]["content"] == "Before"
-    assert items[2]["content"] == "After"
-
-
-def test_timeline_projection_projects_delegation_without_fallback() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="user_message",
-                data={"session_id": "sess_a", "content": "Hi"},
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="delegation",
-                data={"session_id": "sess_a", "child_session_id": "sess_child"},
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-        ]
-    )
-
-    assert [item["kind"] for item in items] == ["message", "delegation"]
-    assert _strip_order_key(items[1]) == {
-        "id": "delegation:sess_child",
-        "kind": "delegation",
-        "taskId": "sess_child",
-        "taskLabel": "Sub-session",
-        "status": "started",
-        "timestamp": "2026-01-01T00:00:02Z",
-    }
-
-
-def test_timeline_projection_uses_persisted_delegation_title() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="delegation",
-                data={
-                    "session_id": "sess_a",
-                    "child_session_id": "sess_child",
-                    "title": "Explore project",
-                    "status": "completed",
-                    "result_summary": "done",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-        ]
-    )
-
-    assert items[0]["taskLabel"] == "Explore project"
-
-
-def test_timeline_projection_preserves_terminal_delegation_state() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="delegation",
-                data={
-                    "session_id": "sess_a",
-                    "child_session_id": "sess_child",
-                    "title": "Explore project",
-                    "status": "completed",
-                    "result_summary": "done",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-            MessageEventResponse(
-                seq=2,
-                type="delegation",
-                data={
-                    "session_id": "sess_a",
-                    "child_session_id": "sess_child",
-                    "status": "running",
-                    "todos": [{"content": "stale", "status": "pending"}],
-                },
-                timestamp="2026-01-01T00:00:02Z",
-            ),
-        ]
-    )
-
-    assert len(items) == 1
-    assert items[0]["taskLabel"] == "Explore project"
-    assert items[0]["status"] == "completed"
-    assert items[0]["result"] == "done"
-    assert items[0]["timestamp"] == "2026-01-01T00:00:01Z"
-    assert "todos" not in items[0]
-
-
-def test_timeline_projection_projects_lifecycle_workflow_composed() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="lifecycle",
-                data={
-                    "session_id": "sess_a",
-                    "event": "workflow_composed",
-                    "workflow_id": "wf_1",
-                    "workflow_name": "Workflow",
-                    "steps": ["plan", "build"],
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-        ]
-    )
-
-    assert [_strip_order_key(item) for item in items] == [
-        {
-            "id": "workflow-composed:sess_a:1",
-            "kind": "workflow_composed",
-            "workflowId": "wf_1",
-            "workflowName": "Workflow",
-            "lifecycle": "ephemeral",
-            "steps": ["plan", "build"],
-            "timestamp": "2026-01-01T00:00:01Z",
-        }
-    ]
-
-
-def test_timeline_projection_uses_lifecycle_task_title() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="lifecycle",
-                data={
-                    "session_id": "sess_a",
-                    "event": "task_result",
-                    "task_id": "task_1",
-                    "task_title": "Build projection",
-                    "result_summary": "done",
-                },
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-        ]
-    )
-
-    assert items[0]["kind"] == "delegation"
-    assert items[0]["taskLabel"] == "Build projection"
-    assert items[0]["status"] == "completed"
-
-
-def test_timeline_projection_projects_unknown_events_as_notices() -> None:
-    items = _project_timeline_events(
-        [
-            MessageEventResponse(
-                seq=1,
-                type="future_event",
-                data={"session_id": "sess_a", "value": 1},
-                timestamp="2026-01-01T00:00:01Z",
-            ),
-        ]
-    )
-
-    assert [_strip_order_key(item) for item in items] == [
-        {
-            "id": "event-notice:sess_a:1",
-            "kind": "notice",
-            "title": "Conversation event",
-            "description": "Unsupported persisted event: future_event",
-            "tone": "info",
-            "timestamp": "2026-01-01T00:00:01Z",
-        }
-    ]
 
 
 def test_viewer_cannot_create_task(monkeypatch: object, tmp_path: Path) -> None:
@@ -1827,12 +373,14 @@ def test_managed_conversation_retry_preserves_one_shot_mode(
         )
 
         assert response.status_code == 200
-        submit_turn.assert_awaited_once_with(
+        submit_turn.assert_awaited_once()
+        assert submit_turn.await_args.args == (
             conversation_id,
             "retry this in build mode",
-            user_email="owner@example.com",
-            one_shot_chat_mode="build",
         )
+        assert submit_turn.await_args.kwargs["user_email"] == "owner@example.com"
+        assert submit_turn.await_args.kwargs["one_shot_chat_mode"] == "build"
+        assert submit_turn.await_args.kwargs["turn_id"].startswith("turn_")
 
 
 def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
@@ -1942,11 +490,19 @@ def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
                 await session.commit()
 
         asyncio.run(_mark_idle())
+
+        async def _submit_managed_turn(
+            _conversation_id: str,
+            _message: str,
+            **kwargs: object,
+        ) -> None:
+            await kwargs["admission_observer"](str(kwargs["turn_id"]), False)
+
         client.app.state.turn_scheduler = SimpleNamespace(
             has_active_turn=lambda _conversation_id: False,
             running_turn_state=lambda _conversation_id: None,
             active_turn_id=lambda _conversation_id: None,
-            submit_turn=AsyncMock(return_value=None),
+            submit_turn=AsyncMock(side_effect=_submit_managed_turn),
         )
 
         send_response = client.post(
@@ -2109,37 +665,6 @@ def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
         assert follow_up_context_type == "web"
 
 
-def test_timeline_projection_includes_managed_takeover_follow_up_link() -> None:
-    event = MessageEventResponse(
-        type="system_message",
-        seq=1,
-        timestamp="2026-01-01T00:00:00+00:00",
-        data={
-            "session_id": "sess_1",
-            "content": "User took control in a follow-up conversation.",
-            "kind": "managed_takeover",
-            "notice_id": "managed_takeover:mconv_1",
-            "follow_up_conversation_id": "conv_followup",
-            "follow_up_session_id": "sess_followup",
-        },
-    )
-
-    items = _project_timeline_events([event])
-
-    assert [_strip_order_key(item) for item in items] == [
-        {
-            "id": "system:managed_takeover:mconv_1",
-            "kind": "system_message",
-            "text": "User took control in a follow-up conversation.",
-            "noticeId": "managed_takeover:mconv_1",
-            "noticeKind": "managed_takeover",
-            "followUpConversationId": "conv_followup",
-            "followUpSessionId": "sess_followup",
-            "timestamp": "2026-01-01T00:00:00+00:00",
-        }
-    ]
-
-
 def test_session_intaris_detail_prefers_intaris_summary(
     monkeypatch: object,
     tmp_path: Path,
@@ -2231,6 +756,13 @@ def test_session_intaris_detail_prefers_intaris_summary(
                 )
 
         app.state.providers.guardrails = _Guardrails()
+        app.state.session_cache.get_last_generation_performance = lambda requested_id: {
+            "is_local": True,
+            "model": "qwen3:8b",
+            "runtime": "Ollama",
+            "generation_tokens_per_second": 25,
+            "measured_at": "2026-07-13T12:00:00Z",
+        }
         response = client.get(
             f"/api/v1/sessions/{session_id}/intaris",
             headers=_auth_headers(app, email="user@example.com"),
@@ -2241,6 +773,8 @@ def test_session_intaris_detail_prefers_intaris_summary(
         assert body["intaris_session_id"] == "intaris-session-1"
         assert body["intention"] == "Intaris intention"
         assert body["summary"] == "Latest Intaris summary"
+        assert body["last_generation"]["model"] == "qwen3:8b"
+        assert body["last_generation"]["generation_tokens_per_second"] == 25
 
 
 def test_session_intaris_detail_falls_back_without_summary(
@@ -2595,6 +1129,7 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
                     deliverable_id="projection-deliverable",
                     title="Projection deliverable",
                     content="heavy deliverable content",
+                    artifact_store=app.state.artifact_store,
                 )
                 await session.commit()
                 return task.task_id
@@ -2631,8 +1166,15 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
         full_body = full_step.json()
         assert full_body["output"]["content"] == "heavy second content"
         assert full_body["runtime_info"]["large"].startswith("y")
-        assert full_body["deliverables"][0]["content"] == "heavy deliverable content"
+        assert full_body["deliverables"][0]["content"] == ""
         assert full_body["is_projection"] is False
+
+        hydrated = client.get(
+            "/api/v1/step-runs/projection-step-2/deliverables/projection-deliverable",
+            headers=headers,
+        )
+        assert hydrated.status_code == 200
+        assert hydrated.json()["content"] == "heavy deliverable content"
 
 
 def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_path: Path) -> None:
@@ -3210,98 +1752,6 @@ def test_step_response_resumes_recovered_step_input(monkeypatch: object, tmp_pat
         assert called["resume"] is True
 
 
-def test_websocket_step_response_surfaces_resume_conflict(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> str:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                task = await create_task(
-                    session,
-                    created_by="user@example.com",
-                    agent_id="agent-1",
-                    title="Paused question",
-                    status="paused",
-                    workflow_state={
-                        "current_step_index": 0,
-                        "status": "paused",
-                        "pending_pause_type": "step_input",
-                        "pending_pause_payload": {
-                            "pause_id": "input_ws_conflict",
-                            "step_name": "plan",
-                            "questions": [
-                                {
-                                    "id": "q1",
-                                    "question": "Need input",
-                                    "options": [
-                                        {"id": "A", "label": "A"},
-                                        {"id": "B", "label": "B"},
-                                    ],
-                                    "multiple": False,
-                                    "allow_custom": True,
-                                    "required": True,
-                                }
-                            ],
-                        },
-                    },
-                )
-                await session.commit()
-                return task.task_id
-
-        task_id = asyncio.run(_seed())
-        asyncio.run(app.state.task_queue.recover_paused_tasks())
-
-        async def _resume_conflict(task_id: str) -> TaskModel:
-            raise ValueError("No execution capacity available to resume the task")
-
-        app.state.task_queue.resume_task = _resume_conflict
-
-        with client.websocket_connect("/api/ws") as ws:
-            ws.send_json(
-                {
-                    "type": "auth",
-                    "token": _auth_headers(app, email="user@example.com")[
-                        "Authorization"
-                    ].removeprefix("Bearer "),
-                }
-            )
-            assert ws.receive_json()["type"] == "authenticated"
-            ws.send_json(
-                {
-                    "type": "step_response",
-                    "task_id": task_id,
-                    "step_name": "plan",
-                    "mode": "structured",
-                    "answers": [
-                        {
-                            "question_id": "q1",
-                            "selected_option_ids": ["A"],
-                            "custom_answer": None,
-                        }
-                    ],
-                }
-            )
-            payload = ws.receive_json()
-            assert payload["type"] == "error"
-            assert payload["code"] == "conflict"
-
-
 def test_websocket_direct_chat_step_response_resolves_notification(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -3777,80 +2227,6 @@ def test_websocket_step_response_rejects_mismatched_task_and_notification(
             )
         )
         assert manager.errors[-1]["code"] == "conflict"
-
-
-def test_session_events_are_proxied(monkeypatch: object, tmp_path: Path) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> str:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                conversation = await create_conversation(
-                    session,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                    context_type="web",
-                    title="Conversation",
-                )
-                session_row = await create_session(
-                    session,
-                    conversation_id=conversation.conversation_id,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                )
-                await set_session_intaris_session_id(
-                    session, session_row.session_id, session_row.session_id
-                )
-                await update_conversation_active_session(
-                    session, conversation.conversation_id, session_row.session_id
-                )
-                await session.commit()
-                return session_row.session_id
-
-        session_id = asyncio.run(_seed())
-
-        async def _fake_read_events(
-            session_id: str, after_seq: int = 0, limit: int = 0, **_: object
-        ) -> EventReadResult:
-            assert after_seq == 0
-            assert limit == 50
-            return EventReadResult(
-                events=[
-                    {
-                        "seq": 1,
-                        "type": "assistant_message",
-                        "data": {"content": "hello"},
-                        "ts": "2026-03-28T00:00:00Z",
-                    }
-                ],
-                last_seq=1,
-                has_more=False,
-            )
-
-        app.state.providers.guardrails.read_events = _fake_read_events
-
-        response = client.get(
-            f"/api/v1/sessions/{session_id}/events",
-            headers=_auth_headers(app, email="user@example.com"),
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["session_id"] == session_id
-        assert body["items"][0]["type"] == "assistant_message"
 
 
 def test_conversation_list_filters_by_agent(monkeypatch: object, tmp_path: Path) -> None:
@@ -4871,6 +3247,177 @@ def test_conversation_sidebar_projection_returns_shaped_sidebar_payload(
         assert signal_response.json()["agent_direct_chats"] == []
 
 
+def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombstones(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str, datetime]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                since = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+                unchanged = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Before",
+                )
+                changed = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Changed",
+                )
+                archived = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Archived",
+                )
+                deleted = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Deleted",
+                )
+                unchanged.updated_at = since - timedelta(seconds=1)
+                changed.updated_at = since + timedelta(seconds=1)
+                archived.updated_at = since + timedelta(seconds=2)
+                archived.status = "archived"
+                deleted.updated_at = since + timedelta(seconds=3)
+                deleted.status = "deleted"
+                await session.commit()
+                return (
+                    changed.conversation_id,
+                    archived.conversation_id,
+                    deleted.conversation_id,
+                    since,
+                )
+
+        changed_id, archived_id, deleted_id, since = asyncio.run(_seed())
+
+        response = client.get(
+            f"/api/v1/conversations/sidebar?context_type=web&changed_since={quote(since.isoformat())}",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert [item["conversation_id"] for item in body["conversations"]["items"]] == [changed_id]
+        assert body["removed_conversation_ids"] == [archived_id, deleted_id]
+        assert body["agents"] == []
+        assert body["context_types"] == []
+        assert body["full_resync_required"] is False
+        assert isinstance(body["sync_timestamp"], str)
+
+        all_response = client.get(
+            f"/api/v1/conversations/sidebar?context_type=web&status=all&changed_since={quote(since.isoformat())}",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert all_response.status_code == 200
+        all_body = all_response.json()
+        assert {item["conversation_id"] for item in all_body["conversations"]["items"]} == {
+            changed_id,
+            archived_id,
+        }
+        assert all_body["removed_conversation_ids"] == [deleted_id]
+
+
+def test_conversation_sidebar_projection_query_count_is_bounded(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                for index in range(12):
+                    agent_id = f"agent-{index}"
+                    await create_agent(
+                        session,
+                        agent_id=agent_id,
+                        owner_email="user@example.com",
+                        name=f"Agent {index}",
+                        status="active",
+                    )
+                    await create_conversation(
+                        session,
+                        user_email="user@example.com",
+                        agent_id=agent_id,
+                        context_type="web",
+                        context_ref=agent_direct_context_ref("user@example.com", agent_id),
+                        context_data={"kind": AGENT_DIRECT_KIND},
+                        title=f"Direct {index}",
+                        title_source="agent_direct",
+                    )
+                for index in range(24):
+                    await create_conversation(
+                        session,
+                        user_email="user@example.com",
+                        agent_id=f"agent-{index % 12}",
+                        context_type="web" if index % 2 == 0 else "signal",
+                        title=f"Conversation {index}",
+                    )
+                await session.commit()
+
+        asyncio.run(_seed())
+        statements: list[str] = []
+
+        def _count_statement(
+            _conn: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            statements.append(statement)
+
+        sa_event.listen(app.state.engine.sync_engine, "before_cursor_execute", _count_statement)
+        try:
+            response = client.get(
+                "/api/v1/conversations/sidebar?context_type=web&limit=20",
+                headers=_auth_headers(app, email="user@example.com"),
+            )
+        finally:
+            sa_event.remove(
+                app.state.engine.sync_engine,
+                "before_cursor_execute",
+                _count_statement,
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["conversations"]["items"]) == 12
+        assert len(body["agent_direct_chats"]) == 12
+        assert len(statements) <= 25
+
+
 def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
@@ -5031,6 +3578,15 @@ def test_conversation_list_defaults_to_active_and_supports_starred_and_archived_
         assert deleted_id not in [
             item["conversation_id"] for item in archived_response.json()["items"]
         ]
+
+        all_response = client.get(
+            "/api/v1/conversations?status=all",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert all_response.status_code == 200
+        all_ids = {item["conversation_id"] for item in all_response.json()["items"]}
+        assert {active_id, archived_id, starred_id} <= all_ids
+        assert deleted_id not in all_ids
 
 
 def test_conversation_update_sets_and_clears_starred_at(
@@ -5477,257 +4033,7 @@ def test_websocket_replay_includes_user_messages(monkeypatch: object, tmp_path: 
 
         asyncio.run(manager.replay(connection, conversation_id=conversation_id, last_seq=3))
 
-        assert not any(payload.get("type") == "timeline_patch" for payload in socket.sent)
         assert conversation_id in connection.subscriptions
-
-
-def test_conversation_session_events_skip_malformed_rows(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> tuple[str, str]:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                conversation = await create_conversation(
-                    session,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                    context_type="web",
-                    title="Conversation",
-                )
-                session_row = await create_session(
-                    session,
-                    conversation_id=conversation.conversation_id,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                )
-                await set_session_intaris_session_id(
-                    session, session_row.session_id, session_row.session_id
-                )
-                await update_conversation_active_session(
-                    session, conversation.conversation_id, session_row.session_id
-                )
-                await session.commit()
-                return conversation.conversation_id, session_row.session_id
-
-        conversation_id, session_id = asyncio.run(_seed())
-
-        async def _fake_read_events(
-            session_id: str,
-            after_seq: int = 0,
-            limit: int = 0,
-            allow_missing_stream: bool = False,
-            **_: object,
-        ) -> object:
-            assert session_id
-            assert allow_missing_stream is True
-            return type(
-                "EventRead",
-                (),
-                {
-                    "events": [
-                        {
-                            "seq": 1,
-                            "type": "assistant_message",
-                            "data": {"content": "hello"},
-                            "ts": "2026-03-28T00:00:00Z",
-                        },
-                        ["broken"],
-                    ],
-                    "last_seq": 1,
-                    "has_more": False,
-                    "missing_stream_fallback_used": False,
-                },
-            )()
-
-        app.state.providers.guardrails.read_events = _fake_read_events
-
-        response = client.get(
-            f"/api/v1/conversations/{conversation_id}/sessions/{session_id}/events",
-            headers=_auth_headers(app, email="user@example.com"),
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["session_id"] == session_id
-        assert len(body["items"]) == 1
-        assert body["items"][0]["type"] == "assistant_message"
-
-
-def test_conversation_session_events_return_empty_when_stream_missing(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> tuple[str, str]:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                conversation = await create_conversation(
-                    session,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                    context_type="web",
-                    title="Conversation",
-                )
-                session_row = await create_session(
-                    session,
-                    conversation_id=conversation.conversation_id,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                )
-                await set_session_intaris_session_id(
-                    session, session_row.session_id, session_row.session_id
-                )
-                await update_conversation_active_session(
-                    session, conversation.conversation_id, session_row.session_id
-                )
-                await session.commit()
-                return conversation.conversation_id, session_row.session_id
-
-        conversation_id, session_id = asyncio.run(_seed())
-
-        async def _fake_read_events(
-            session_id: str,
-            after_seq: int = 0,
-            limit: int = 0,
-            allow_missing_stream: bool = False,
-            **_: object,
-        ) -> EventReadResult:
-            assert session_id
-            assert after_seq == 3
-            assert limit == 17
-            assert allow_missing_stream is True
-            return EventReadResult(
-                events=[],
-                last_seq=0,
-                has_more=False,
-                missing_stream_fallback_used=True,
-            )
-
-        app.state.providers.guardrails.read_events = _fake_read_events
-
-        response = client.get(
-            f"/api/v1/conversations/{conversation_id}/sessions/{session_id}/events?after_seq=3&limit=17",
-            headers=_auth_headers(app, email="user@example.com"),
-        )
-        assert response.status_code == 200
-        assert response.json() == {
-            "session_id": session_id,
-            "items": [],
-            "timeline_items": [],
-            "last_seq": 0,
-            "has_more": False,
-            "active_thinking": [],
-        }
-
-
-def test_session_events_route_returns_empty_when_stream_missing(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> str:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                conversation = await create_conversation(
-                    session,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                    context_type="web",
-                    title="Conversation",
-                )
-                session_row = await create_session(
-                    session,
-                    conversation_id=conversation.conversation_id,
-                    user_email="user@example.com",
-                    agent_id="agent-1",
-                )
-                await set_session_intaris_session_id(
-                    session, session_row.session_id, session_row.session_id
-                )
-                await update_conversation_active_session(
-                    session, conversation.conversation_id, session_row.session_id
-                )
-                await session.commit()
-                return session_row.session_id
-
-        session_id = asyncio.run(_seed())
-
-        async def _fake_read_events(
-            session_id: str,
-            after_seq: int = 0,
-            limit: int = 0,
-            allow_missing_stream: bool = False,
-            **_: object,
-        ) -> EventReadResult:
-            assert session_id
-            assert after_seq == 9
-            assert limit == 11
-            assert allow_missing_stream is True
-            return EventReadResult(
-                events=[],
-                last_seq=0,
-                has_more=False,
-                missing_stream_fallback_used=True,
-            )
-
-        app.state.providers.guardrails.read_events = _fake_read_events
-
-        response = client.get(
-            f"/api/v1/sessions/{session_id}/events?after_seq=9&limit=11",
-            headers=_auth_headers(app, email="user@example.com"),
-        )
-        assert response.status_code == 200
-        assert response.json() == {
-            "session_id": session_id,
-            "items": [],
-            "timeline_items": [],
-            "last_seq": 0,
-            "has_more": False,
-            "active_thinking": [],
-        }
 
 
 def test_signed_artifact_route_serves_skill_assets_without_artifact_record(
@@ -6028,6 +4334,7 @@ def test_signed_virtual_deliverable_route_serves_exact_content(
                     title="Virtual URL",
                     content="# Virtual\n\nExact content.",
                     format="markdown",
+                    artifact_store=app.state.artifact_store,
                 )
                 await session.commit()
 
@@ -6038,7 +4345,10 @@ def test_signed_virtual_deliverable_route_serves_exact_content(
 
                 async with app.state.session_factory() as session:
                     ref = await get_accessible_deliverable_ref(
-                        session, "dlv_virtual_url", "user@example.com"
+                        session,
+                        app.state.artifact_store,
+                        "dlv_virtual_url",
+                        "user@example.com",
                     )
                 assert ref is not None
                 return build_deliverable_public_url(
@@ -6054,107 +4364,3 @@ def test_signed_virtual_deliverable_route_serves_exact_content(
         assert response.content == b"# Virtual\n\nExact content."
         assert response.headers["content-type"].startswith("text/markdown")
         assert "Virtual-URL.md" in response.headers["content-disposition"]
-
-
-def test_websocket_queues_second_message_while_turn_active(
-    monkeypatch: object, tmp_path: Path
-) -> None:
-    with _create_test_client(monkeypatch, tmp_path) as client:
-        app = client.app
-
-        async def _seed() -> str:
-            async with app.state.session_factory() as session:
-                await create_user(
-                    session,
-                    email="user@example.com",
-                    name="User",
-                    password_hash=app.state.password_hasher.hash("password123"),
-                    role="user",
-                )
-                agent = await create_agent(
-                    session,
-                    agent_id="agent-1",
-                    owner_email="user@example.com",
-                    name="Agent 1",
-                    status="active",
-                )
-                conversation = await create_conversation(
-                    session,
-                    user_email="user@example.com",
-                    agent_id=agent.agent_id,
-                    context_type="web",
-                    title="Conversation",
-                )
-                session_row = await create_session(
-                    session,
-                    conversation_id=conversation.conversation_id,
-                    user_email="user@example.com",
-                    agent_id=agent.agent_id,
-                )
-                await set_session_intaris_session_id(
-                    session, session_row.session_id, session_row.session_id
-                )
-                await update_conversation_active_session(
-                    session, conversation.conversation_id, session_row.session_id
-                )
-                await session.commit()
-                return conversation.conversation_id
-
-        conversation_id = asyncio.run(_seed())
-
-        captured_direct_turn_kwargs: dict[str, object] = {}
-
-        async def _fake_direct_turn(**kwargs: object) -> None:
-            captured_direct_turn_kwargs.update(kwargs)
-            await asyncio.sleep(0.2)
-            return None
-
-        async def _fake_decide(**_: object) -> DecisionResult:
-            return DecisionResult(
-                decision="inline",
-                reason="test",
-                confidence=1.0,
-                predicted_tool_intensity="low",
-            )
-
-        app.state.workflow_engine.run_direct_turn = _fake_direct_turn
-        app.state.decision_engine.decide = _fake_decide
-
-        class _Entry:
-            last_event_seq = 1
-
-        async def _fake_refresh(session: object) -> object:
-            return _Entry()
-
-        app.state.session_cache.refresh = _fake_refresh
-
-        with client.websocket_connect("/api/ws") as ws:
-            ws.send_json(
-                {
-                    "type": "auth",
-                    "token": _auth_headers(app, email="user@example.com")[
-                        "Authorization"
-                    ].removeprefix("Bearer "),
-                }
-            )
-            assert ws.receive_json()["type"] == "authenticated"
-            ws.send_json(
-                {"type": "message", "conversation_id": conversation_id, "content": "First"}
-            )
-            ws.send_json(
-                {"type": "message", "conversation_id": conversation_id, "content": "Second"}
-            )
-
-            seen_types: set[str] = set()
-            for _ in range(5):
-                payload = ws.receive_json()
-                seen_types.add(payload["type"])
-                if payload["type"] in {"queued", "queued_messages_updated"}:
-                    break
-
-            assert seen_types & {"queued", "queued_messages_updated"}
-            for _ in range(5):
-                payload = ws.receive_json()
-                if payload["type"] == "message_complete":
-                    assert captured_direct_turn_kwargs["bootstrap_wait_for_intention"] is False
-                    break

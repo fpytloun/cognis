@@ -42,6 +42,7 @@ export interface UserDisplayPreferences {
 export interface UserChatPreferences {
   show_thinking_blocks: boolean;
   group_tool_calls: boolean;
+  keep_assistant_messages_separate: boolean;
   show_internal_tool_calls: boolean;
 }
 
@@ -288,12 +289,16 @@ export interface SidebarProjection {
   agent_direct_chats: AgentDirectChat[];
   conversations: CursorPage<Conversation>;
   context_types: string[];
+  removed_conversation_ids?: string[];
+  full_resync_required?: boolean;
+  sync_timestamp?: string | null;
 }
 
 export interface ConversationOpenRequest {
   agent_id: string;
   agent_profile_id?: string | null;
   context_type?: string;
+  include_state?: boolean;
   candidate_conversation_ids?: string[];
   candidate_conversations?: LastOpenedConversationCandidate[];
 }
@@ -431,6 +436,7 @@ export interface MessageRuntimeMetadata {
   provider_id?: string | null;
   model?: string | null;
   reasoning_effort?: string | null;
+  reasoning_mode?: string | null;
 }
 
 export interface ToolOutputPresentationMetadata {
@@ -509,11 +515,6 @@ export interface ActiveThinkingSnapshot {
   blocks: ActiveThinkingBlockSnapshot[];
   updated_at?: string | null;
 }
-
-export type TimelineProjectionItem = Record<string, unknown> & {
-  id: string;
-  kind: string;
-};
 
 export type SearchKind = 'reasoning' | 'intention' | 'summary';
 export type SearchMode = 'auto' | 'lexical' | 'vector' | 'hybrid';
@@ -632,15 +633,6 @@ export interface Session {
   updated_at: string | null;
 }
 
-export interface SessionEventsResponse {
-  session_id: string;
-  items: MessageEvent[];
-  timeline_items?: TimelineProjectionItem[];
-  last_seq: number;
-  has_more: boolean;
-  active_thinking?: ActiveThinkingSnapshot[];
-}
-
 export interface IntarisSessionDetail {
   session_id: string;
   intaris_session_id: string;
@@ -653,6 +645,7 @@ export interface IntarisSessionDetail {
   denied_count: number;
   escalated_count: number;
   context_usage?: ContextUsage | null;
+  last_generation?: GenerationPerformanceSnapshot | null;
 }
 
 export interface AgentRuntimeProfile {
@@ -662,14 +655,41 @@ export interface AgentRuntimeProfile {
   model?: string | null;
   reasoning_effort?: string | null;
   system_prompt_extra?: string | null;
+  memory_enabled?: boolean | null;
+  memory_backend_options?: Record<string, unknown>;
   enabled?: boolean;
+  agent_switchable?: boolean;
 }
 
 export interface AgentCapabilities {
-  /** Memory backend: "mnemory" (default) | "none" */
+  /** Provider-owned memory backend id. */
   memory_backend: string;
+  memory_backend_options?: Record<string, unknown>;
   /** Guardrails backend: "intaris" (default) | "none" */
   guardrails_backend: string;
+}
+
+export interface MemoryModeDescriptor {
+  id: string;
+  label: string;
+  description: string;
+  recommended_for: string;
+  tooltip: string;
+  behavior: {
+    core_bootstrap: boolean;
+    auto_recall: boolean;
+    auto_remember: boolean;
+    tools: boolean;
+  };
+}
+
+export interface MemoryBackendDescriptor {
+  id: string;
+  display_name: string;
+  description: string;
+  defaults: Record<string, unknown>;
+  merge_semantics: 'shallow_field_override';
+  modes: MemoryModeDescriptor[];
 }
 
 export interface Agent {
@@ -1004,6 +1024,7 @@ export interface ChannelAccount {
   display_name: string;
   enabled: boolean;
   agent_id: string;
+  default_agent_profile_id?: string | null;
   config: Record<string, unknown>;
   credential_refs: Record<string, string>;
   default_conversation_id?: string | null;
@@ -1065,6 +1086,68 @@ export interface ExecutorStatus {
   native_tools: string[];
 }
 
+export interface ResourceSnapshotFreshness {
+  age_seconds: number;
+  stale_after_seconds: number;
+  stale: boolean;
+}
+
+export interface CPUResourceSnapshot {
+  model: string | null;
+  physical_cores: number | null;
+  logical_cores: number | null;
+  utilization_percent: number | null;
+}
+
+export interface MemoryResourceSnapshot {
+  total_bytes: number | null;
+  available_bytes: number | null;
+  used_bytes: number | null;
+  unified: boolean | null;
+}
+
+export interface AcceleratorResourceSnapshot {
+  backend: 'metal' | 'nvidia';
+  name: string | null;
+  total_memory_bytes: number | null;
+  used_memory_bytes: number | null;
+  utilization_percent: number | null;
+}
+
+export interface DiskResourceSnapshot {
+  total_bytes: number | null;
+  free_bytes: number | null;
+}
+
+export interface OllamaResourceSnapshot {
+  status: 'reachable' | 'unreachable' | 'unknown';
+  version: string | null;
+  installed_model_count: number | null;
+  running_model_count: number | null;
+  running_models: string[] | null;
+}
+
+export interface ExecutorRuntimeResourceSnapshot {
+  uptime_seconds: number | null;
+  active_calls: number | null;
+  configured: boolean | null;
+  state: string | null;
+}
+
+export interface ExecutorResourceSnapshot {
+  schema_version: number;
+  observed_at: string;
+  freshness: ResourceSnapshotFreshness | null;
+  os: string | null;
+  arch: string | null;
+  cpu: CPUResourceSnapshot | null;
+  memory: MemoryResourceSnapshot | null;
+  accelerators: AcceleratorResourceSnapshot[] | null;
+  ollama_model_store: DiskResourceSnapshot | null;
+  ollama: OllamaResourceSnapshot | null;
+  runtime: ExecutorRuntimeResourceSnapshot | null;
+}
+
 export interface ExecutorConfig {
   executor_id: string;
   name: string;
@@ -1073,11 +1156,17 @@ export interface ExecutorConfig {
   enabled_tools: string[];
   enabled_tool_groups: string[];
   config: ExecutorRuntimeConfig;
+  local_inference_enabled: boolean;
+  ollama_management_enabled: boolean;
+  ollama_port: number;
+  ollama_endpoint: string;
+  local_inference_config_status: 'applying' | 'confirmed' | 'unconfirmed';
   status: string;
   runtime_state: string;
   desired_config_version: number;
   applied_config_version: number;
   runtime_metadata: ExecutorRuntimeMetadata;
+  resource_snapshot: ExecutorResourceSnapshot | null;
   last_observed_at: string | null;
   observed_tools?: ToolDefinitionSummary[];
   is_default: boolean;
@@ -1100,6 +1189,7 @@ export interface ExecutorCreateRequest {
 }
 
 export interface ExecutorUpdateRequest {
+  expected_config_version?: number;
   name?: string;
   labels?: Record<string, string>;
   enabled_tools?: string[];
@@ -1108,6 +1198,271 @@ export interface ExecutorUpdateRequest {
   status?: string;
   is_default?: boolean;
   shared?: boolean;
+}
+
+export type LocalModelCatalogSource = 'installed' | 'ollama' | 'huggingface';
+export type LocalModelCapability = 'chat' | 'tools' | 'vision' | 'embeddings' | 'reasoning';
+
+export interface LocalModelQuantization {
+  name: string;
+  requested_ref: string;
+  file_name: string | null;
+  size_bytes: number | null;
+  bits_per_weight: number | null;
+}
+
+export interface LocalModelCatalogItem {
+  catalog_id: string;
+  source: LocalModelCatalogSource;
+  requested_ref: string;
+  title: string;
+  publisher: string | null;
+  repository_url: string | null;
+  model_card_url: string | null;
+  revision_sha: string | null;
+  license: string | null;
+  description: string | null;
+  downloads: number | null;
+  likes: number | null;
+  last_modified: string | null;
+  pipeline_tag: string | null;
+  tags: string[];
+  base_models: string[];
+  capabilities: LocalModelCapability[];
+  parameter_count: number | null;
+  quantizations: LocalModelQuantization[];
+  file_size_bytes: number | null;
+  advertised_max_context: number | null;
+  architecture: Record<string, number>;
+  architecture_name: string | null;
+  metadata_status: 'basic' | 'complete' | 'error';
+  metadata_confidence: 'low' | 'medium' | 'high';
+  metadata_diagnostics: string[];
+  reference_integrity: 'pinned' | 'floating' | 'unknown';
+  warnings: string[];
+}
+
+export interface LocalModelCatalogSourceStatus {
+  source: LocalModelCatalogSource;
+  available: boolean;
+  detail: string | null;
+  retry_after_seconds: number | null;
+}
+
+export interface LocalModelCatalogResponse {
+  items: LocalModelCatalogItem[];
+  next_cursor: string | null;
+  sources: LocalModelCatalogSourceStatus[];
+  cached: boolean;
+  pagination_note: string | null;
+}
+
+export interface LocalModelSelector {
+  executor_ids?: string[];
+  match_labels?: Record<string, string>;
+}
+
+export interface LocalModelDeployment {
+  deployment_id: string;
+  owner_email: string;
+  shared: boolean;
+  runtime_type: 'ollama';
+  requested_ref: string;
+  canonical_name: string;
+  runtime_name: string;
+  source: 'ollama' | 'huggingface';
+  digest: string | null;
+  revision: string | null;
+  selector: LocalModelSelector;
+  desired_state: 'present' | 'absent';
+  update_policy: 'if_changed' | 'always' | 'manual';
+  prune_policy: 'retain' | 'delete';
+  max_parallel: number;
+  generation: number;
+  provider_id: string | null;
+  lifecycle_state: 'managed' | 'needs_provider';
+  capacity_override_acknowledged: boolean;
+  capacity_assessment_generation: number | null;
+  reconcile_requested_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LocalModelDeploymentCreate {
+  requested_ref: string;
+  selector: LocalModelSelector;
+  provider_id: string;
+  desired_state?: 'present' | 'absent';
+  update_policy?: 'if_changed' | 'always' | 'manual';
+  prune_policy?: 'retain' | 'delete';
+  max_parallel?: number;
+  capacity_override_acknowledged?: boolean;
+  capacity_assessment_generation?: number | null;
+  shared?: boolean;
+}
+
+export interface LocalModelManagedDeploymentCreate {
+  requested_ref: string;
+  selector: LocalModelSelector;
+  desired_state?: 'present' | 'absent';
+  update_policy?: 'if_changed' | 'always' | 'manual';
+  prune_policy?: 'retain' | 'delete';
+  max_parallel?: number;
+  capacity_override_acknowledged?: boolean;
+  capacity_assessment_generation?: number | null;
+  shared?: boolean;
+  force_create_provider?: boolean;
+}
+
+export interface LocalModelManagedDeploymentCreateResponse {
+  deployment: LocalModelDeployment;
+  provider_id: string;
+  provider_created: boolean;
+  provider_reason_code: string;
+}
+
+export interface LocalModelDeploymentUpdate {
+  requested_ref?: string;
+  digest?: string | null;
+  provider_id?: string;
+  selector?: LocalModelSelector;
+  desired_state?: 'present' | 'absent';
+  update_policy?: 'if_changed' | 'always' | 'manual';
+  prune_policy?: 'retain' | 'delete';
+  max_parallel?: number;
+  capacity_override_acknowledged?: boolean;
+  capacity_assessment_generation?: number | null;
+}
+
+export interface LocalModelProviderCandidate {
+  provider_id: string;
+  display_name: string;
+  owner_email: string;
+  executor_ids: string[];
+  contains_model: boolean;
+  managed_local: boolean;
+  healthy_host_count: number;
+  reason_codes: string[];
+}
+
+export interface LocalModelProviderRecommendation {
+  requested_ref: string;
+  runtime_name: string;
+  recommended_provider_id: string | null;
+  candidates: LocalModelProviderCandidate[];
+}
+
+export interface LocalModelProviderFindOrCreateResponse {
+  provider_id: string;
+  created: boolean;
+  reason_code: string;
+}
+
+export interface LocalModelTargetStatus {
+  target_id: string;
+  deployment_id: string;
+  executor_id: string;
+  generation: number;
+  observed_generation: number;
+  state: 'pending' | 'reconciling' | 'ready' | 'absent' | 'blocked' | 'error';
+  observed_digest: string | null;
+  observed_size_bytes: number | null;
+  current_operation_id: string | null;
+  last_error: string | null;
+  reconcile_requested_at: string | null;
+  reconcile_started_at: string | null;
+  reconciled_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LocalModelOperation {
+  operation_id: string;
+  deployment_id: string;
+  executor_id: string;
+  generation: number;
+  action: 'pull' | 'delete';
+  state: 'queued' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  progress_seq: number;
+  progress_bytes: number;
+  phase: string | null;
+  sanitized_error: string | null;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  cancel_requested_at: string | null;
+  finished_at: string | null;
+}
+
+export interface LocalModelFitMetadata {
+  requested_ref: string;
+  weights_bytes?: number | null;
+  file_size_bytes?: number | null;
+  parameter_count?: number | null;
+  quantization?: string | null;
+  bits_per_weight?: number | null;
+  layer_count?: number | null;
+  kv_head_count?: number | null;
+  head_dimension?: number | null;
+  advertised_max_context?: number | null;
+}
+
+export interface LocalModelFitPlanRequest {
+  model: LocalModelFitMetadata;
+  selector: LocalModelSelector;
+  provider_id?: string;
+  context_tokens: number;
+}
+
+export type LocalModelFitStatus = 'FIT' | 'FIT_WITH_OFFLOAD' | 'NO_FIT' | 'UNKNOWN';
+
+export interface LocalModelFitAssessment {
+  status: LocalModelFitStatus;
+  confidence: 'high' | 'medium' | 'low';
+  available_bytes: number | null;
+  accelerator_available_bytes: number | null;
+  host_available_bytes: number | null;
+  reason_codes: string[];
+}
+
+export interface LocalModelFitBreakdown {
+  weights_bytes: number | null;
+  kv_cache_min_bytes: number | null;
+  kv_cache_max_bytes: number | null;
+  runtime_buffer_bytes: number | null;
+  reserved_headroom_bytes: number | null;
+  required_min_bytes: number | null;
+  required_max_bytes: number | null;
+}
+
+export interface LocalModelExecutorFit {
+  executor_id: string;
+  executor_name: string;
+  context_tokens: number;
+  static: LocalModelFitAssessment;
+  admission: LocalModelFitAssessment;
+  breakdown: LocalModelFitBreakdown;
+  unified_memory: boolean | null;
+  snapshot_age_seconds: number | null;
+  advertised_max_exceeded: boolean;
+  assumptions: string[];
+}
+
+export interface LocalModelContextOption {
+  context_tokens: number;
+  zone: 'green' | 'yellow' | 'red' | 'unknown';
+  limiting_executor_ids: string[];
+}
+
+export interface LocalModelFitPlan {
+  assessment_generation: number;
+  advisory_only: true;
+  requested_context_tokens: number;
+  advertised_max_context: number | null;
+  advertised_max_exceeded: boolean;
+  recommended_context_tokens: number | null;
+  context_options: LocalModelContextOption[];
+  executors: LocalModelExecutorFit[];
 }
 
 export interface ExecutorSignalConfig {
@@ -1156,6 +1511,16 @@ export interface ExecutorOfficeCliConfig {
 
 export interface ExecutorRuntimeConfig {
   mcp_server_ids?: string[];
+  local_inference_enabled?: boolean;
+  ollama_runtime?: {
+    port?: number;
+    endpoint?: string;
+    management_enabled?: boolean;
+    max_concurrent_pulls?: number;
+    disk_headroom_bytes?: number;
+    request_timeout_seconds?: number;
+    model_store_path?: string | null;
+  };
   lsp_enabled?: boolean;
   lsp_auto_install?: boolean;
   lsp_diagnostics_timeout_ms?: number;
@@ -1199,6 +1564,15 @@ export interface ExecutorRuntimeMetadata {
   mcp_servers?: ExecutorMCPServerRuntimeStatus[];
   environment?: Record<string, string>;
   platform?: Record<string, unknown>;
+  local_inference_enabled?: boolean;
+  ollama_runtime?: {
+    runtime_type: 'ollama';
+    port: number;
+    endpoint: string;
+    management_enabled: boolean;
+    max_concurrent_pulls: number;
+    disk_headroom_bytes: number;
+  };
   [key: string]: unknown;
 }
 
@@ -1411,18 +1785,30 @@ export interface QuestionSetReply {
 
 export interface Deliverable {
   deliverable_id: string;
-  step_run_id: string;
+  step_run_id: string | null;
+  conversation_id?: string | null;
+  session_id?: string | null;
+  turn_id?: string | null;
   version: number;
   attempt_number: number;
   content: string;
-  format: 'markdown' | 'plain' | 'html' | string;
+  format: 'markdown' | 'plain' | 'html' | 'rich' | string;
   title: string | null;
   target: 'channel' | 'none' | string | null;
   outputs: Record<string, unknown>;
+  rich_payload?: Record<string, unknown> | null;
+  validation_warnings?: string[];
+  render_metadata?: Record<string, unknown>;
+  export_metadata?: Record<string, unknown>;
   status: string;
   evaluator_feedback: string | null;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export interface DeliverableShareLink {
+  url: string;
+  expires_at: string;
 }
 
 export interface StepRun {
@@ -1695,6 +2081,17 @@ export interface Setting {
   key: string;
   value: unknown;
   category: string;
+  section: string;
+  label: string;
+  description: string;
+  default_value: unknown;
+  value_type: string;
+  options: unknown[] | null;
+  minimum: number | null;
+  maximum: number | null;
+  unit: string | null;
+  is_overridden: boolean;
+  apply_scope: string;
   updated_by: string | null;
   updated_at: string | null;
 }
@@ -1729,6 +2126,7 @@ export interface ModelEntry {
   supports_responses_api: boolean;
   supports_extended_thinking: boolean;
   supports_image_generation: boolean;
+  supported_image_mime_types: string[];
   supported_audio_mime_types: string[];
   supported_openai_params: string[];
   max_tools?: number;
@@ -1741,6 +2139,8 @@ export interface ModelEntry {
   visibility?: string;
   supported_in_api?: boolean;
   available_in_plans?: string[];
+  provider_metadata?: Record<string, unknown>;
+  runtime_metadata?: Record<string, unknown>;
 }
 
 export function defaultModelEntry(modelId: string): ModelEntry {
@@ -1768,8 +2168,11 @@ export function defaultModelEntry(modelId: string): ModelEntry {
     supports_responses_api: false,
     supports_extended_thinking: false,
     supports_image_generation: false,
+    supported_image_mime_types: [],
     supported_audio_mime_types: [],
     supported_openai_params: [],
+    provider_metadata: {},
+    runtime_metadata: {},
     tier: 'standard'
   };
 }
@@ -1930,12 +2333,28 @@ export interface WebConfigStatus {
   browser_fetch_network_idle_after_dom_seconds: number;
   browser_fetch_headed_fallback_enabled: boolean;
   tavily_configured: boolean;
+  tavily_enabled: boolean;
   brave_configured: boolean;
+  brave_enabled: boolean;
   searxng_url: string;
+  searxng_engines: string;
+  searxng_categories: string;
+  searxng_language: string;
   searxng_configured: boolean;
+  searxng_enabled: boolean;
   available_backends: string[];
   available_search_backends: string[];
   available_fetch_backends: string[];
+}
+
+export interface WebBackendUpdatePayload {
+  enabled: boolean;
+  api_key?: string | null;
+  remove_configuration?: boolean;
+  searxng_url?: string;
+  searxng_engines?: string;
+  searxng_categories?: string;
+  searxng_language?: string;
 }
 
 export interface ProviderHealth {
@@ -2077,6 +2496,30 @@ export interface ContextUsage {
   projection_policy?: ProjectionPolicyUsage | null;
 }
 
+export interface GenerationPerformanceSnapshot {
+  is_local: boolean;
+  provider_id: string | null;
+  provider_name: string | null;
+  runtime: string | null;
+  location: string | null;
+  executor_id: string | null;
+  executor_name: string | null;
+  model: string;
+  digest: string | null;
+  quantization: string | null;
+  configured_context_tokens: number | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  prompt_tokens_per_second: number | null;
+  generation_tokens_per_second: number | null;
+  time_to_first_token_seconds: number | null;
+  load_duration_seconds: number | null;
+  total_duration_seconds: number | null;
+  processor: string | null;
+  gpu_residency: string | null;
+  measured_at: string;
+}
+
 export interface ProjectionPolicyUsage {
   phase?: string;
   pressure_mode?: string;
@@ -2105,6 +2548,7 @@ export interface WebSocketMessageCompleteEvent {
   seq: number;
   token_usage: Record<string, unknown> | null;
   context_usage: ContextUsage | null;
+  last_generation?: GenerationPerformanceSnapshot | null;
   queued_count: number;
   messages?: QueuedMessage[];
   completed_at?: string | null;
@@ -2422,15 +2866,6 @@ export interface WebSocketConversationStateDeltaEvent extends ConversationStateD
   conversation_id: string;
 }
 
-export interface WebSocketTimelinePatchEvent {
-  type: 'timeline_patch';
-  conversation_id: string;
-  source?: string | null;
-  last_seq?: number | null;
-  remove_ids?: string[] | null;
-  items: TimelineProjectionItem[];
-}
-
 export interface WebSocketConversationRuntimeSnapshotEvent {
   type: 'conversation_runtime_snapshot';
   conversation_id: string;
@@ -2442,10 +2877,10 @@ export interface WebSocketConversationRuntimeSnapshotEvent {
   active_streams: ActiveStreamSnapshot[];
   active_tool_outputs: ActiveToolOutputSnapshot[];
   active_thinking: ActiveThinkingSnapshot[];
-  timeline_items?: TimelineProjectionItem[];
   runtime_generation?: string;
   server_time?: string;
   build_id?: string;
+  last_generation?: GenerationPerformanceSnapshot | null;
 }
 
 export interface WebSocketToolResultEvent {
@@ -2557,6 +2992,18 @@ export interface WebSocketSystemMessageEvent {
   kind?: string | null;
   scope?: string | null;
   turn_id?: string | null;
+  reason_class?: string | null;
+  provider_id?: string | null;
+  model?: string | null;
+  retry_after_seconds?: number | null;
+  provider_retry_after_seconds?: number | null;
+  retry_at?: string | null;
+  attempt?: number | null;
+  max_attempts?: number | null;
+  attempts?: number | null;
+  attempts_per_cycle?: number | null;
+  continuation_attempts?: number | null;
+  recoverable?: boolean | null;
   follow_up_conversation_id?: string | null;
   follow_up_session_id?: string | null;
   text: string;
@@ -2713,12 +3160,18 @@ export interface WebSocketMcpOAuthStatusChangedEvent {
 }
 
 /**
- * Lightweight sidebar refresh hint sent to all owner connections when a new
- * conversation is created (e.g. on another device or via /new). The client
- * should reload the sidebar projection to pick up the new row.
+ * Lightweight sidebar upsert sent to owner connections when a conversation is
+ * created. Newer servers include the sidebar row; clients can fall back to a
+ * full sidebar reload when the row is absent.
  */
 export interface WebSocketSidebarConversationUpsertEvent {
   type: 'sidebar_conversation_upsert';
+  conversation_id: string;
+  conversation?: Conversation;
+}
+
+export interface WebSocketSidebarConversationRemovedEvent {
+  type: 'sidebar_conversation_removed';
   conversation_id: string;
 }
 
@@ -2739,7 +3192,6 @@ export type CognisWebSocketEvent =
   | WebSocketConversationUpdatedEvent
   | WebSocketConversationStateSnapshotEvent
   | WebSocketConversationStateDeltaEvent
-  | WebSocketTimelinePatchEvent
   | WebSocketConversationRuntimeSnapshotEvent
   | WebSocketDelegationStartedEvent
   | WebSocketDelegationProgressEvent
@@ -2778,6 +3230,7 @@ export type CognisWebSocketEvent =
   | WebSocketSessionRecoveredEvent
   | WebSocketTtsSentenceReadyEvent
   | WebSocketSidebarConversationUpsertEvent
+  | WebSocketSidebarConversationRemovedEvent
   | WebSocketErrorEvent
   | WebSocketPongEvent;
 

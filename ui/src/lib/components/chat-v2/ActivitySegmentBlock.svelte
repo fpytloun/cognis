@@ -1,11 +1,10 @@
 <script lang="ts">
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
-  import ChevronUp from 'lucide-svelte/icons/chevron-up';
 
   import ActivityGroupIcon from '$lib/components/chat-v2/ActivityGroupIcon.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
-  import type { ToolCallTimelineItem as LegacyToolCallTimelineItem } from '$lib/chat';
-  import type { ToolCallTimelineItem } from '$lib/chat-v2/types';
+  import type { ToolCallTimelineItem as RenderToolCallTimelineItem } from '$lib/timeline-render-model';
+  import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
   import type { ActivitySegmentEntry, ActivitySegmentRow, ToolGroupRow } from '$lib/chat-v2/tool-groups';
   import type { Agent } from '$lib/types/api';
 
@@ -16,8 +15,9 @@
     searchQuery = '',
     searchMatchedIds = new Set<string>(),
     searchSelectedId = null,
-    toolCallsByCallId = new Map<string, LegacyToolCallTimelineItem>(),
-    onViewSession
+    getToolCall = () => null,
+    onViewSession,
+    scope
   } = $props<{
     row: ActivitySegmentRow;
     agent?: Agent | null;
@@ -25,13 +25,26 @@
     searchQuery?: string;
     searchMatchedIds?: Set<string>;
     searchSelectedId?: string | null;
-    toolCallsByCallId?: Map<string, LegacyToolCallTimelineItem>;
+    getToolCall?: (callId: string) => RenderToolCallTimelineItem | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    scope?: TimelineScope | undefined;
   }>();
 
   let expanded = $state(false);
   let initializedGroupId = $state<string | null>(null);
+  // Tracks whether the user has manually toggled this segment. Until they do,
+  // expansion follows `row.defaultExpanded` — expanded while the assistant text
+  // is live (so streamed content stays visible through the fold), then collapsed
+  // when it completes. A manual toggle pins the state and stops auto-follow, so
+  // the tidy-up never overrides a deliberate user choice.
+  let userToggled = $state(false);
+  let lastDefaultExpanded = $state<boolean | null>(null);
   let liveNow = $state(Date.now());
+
+  function toggleExpanded(): void {
+    expanded = !expanded;
+    userToggled = true;
+  }
 
   function groupItems(group: ToolGroupRow): ToolCallTimelineItem[] {
     return group.items;
@@ -58,8 +71,18 @@
     if (initializedGroupId !== row.id) {
       expanded = row.defaultExpanded;
       initializedGroupId = row.id;
+      userToggled = false;
+      lastDefaultExpanded = row.defaultExpanded;
+    } else if (!userToggled && row.defaultExpanded !== lastDefaultExpanded) {
+      // Auto-follow defaultExpanded transitions while the user hasn't taken
+      // control. This is what collapses a segment when its live assistant text
+      // completes (defaultExpanded true -> false) even though the segment id is
+      // now stable across that transition.
+      expanded = row.defaultExpanded;
+      lastDefaultExpanded = row.defaultExpanded;
     }
-    if (selectedChildVisible || row.defaultExpanded) {
+    // A selected search hit always forces the segment open regardless of state.
+    if (selectedChildVisible) {
       expanded = true;
     }
   });
@@ -113,7 +136,7 @@
 >
   <button
     type="button"
-    onclick={() => (expanded = !expanded)}
+    onclick={toggleExpanded}
     class={`flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm transition hover:bg-slate-500/5 focus:outline-none ${row.summary.accentClass}`}
     aria-expanded={expanded}
   >
@@ -137,16 +160,14 @@
     {#if durationLabel}
       <span class="shrink-0 text-xs tabular-nums text-slate-500">{durationLabel}</span>
     {/if}
-    {#if expanded}
-      <ChevronUp class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-    {:else}
-      <ChevronDown class="h-3.5 w-3.5 shrink-0 text-slate-500" />
-    {/if}
+    <ChevronDown
+      class="h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform duration-150 ease-out {expanded ? 'rotate-180' : ''}"
+    />
   </button>
 
   {#if expanded}
-    <div class="mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-slate-700/60 bg-slate-950/20 px-2 py-2">
-      {#each row.entries as entry (entry.kind === 'assistant' ? entry.item.id : entry.group.id)}
+    <div class="mx-3 mb-2 space-y-10 overflow-hidden rounded-lg border border-slate-700/60 bg-slate-950/20 px-2 py-2">
+      {#each row.entries as entry (entry.kind === 'assistant' ? `message:assistant:${entry.item.id}` : entry.group.id)}
         {#if entry.kind === 'assistant'}
           {@const assistantSearchMatched = searchMatchedIds.has(entry.item.id)}
           <div data-kind="activity_segment_assistant" data-message-id={entry.item.id}>
@@ -157,8 +178,9 @@
               {searchQuery}
               searchMatched={assistantSearchMatched}
               searchSelected={assistantSearchMatched && searchSelectedId === entry.item.id}
-              {toolCallsByCallId}
+              {getToolCall}
               {onViewSession}
+              {scope}
             />
           </div>
         {:else}
@@ -171,8 +193,9 @@
             {searchQuery}
             {searchMatched}
             searchSelected={searchMatched && searchSelectedId === item.id}
-            {toolCallsByCallId}
-            {onViewSession}
+            {getToolCall}
+              {onViewSession}
+              {scope}
           />
           {/each}
         {/if}

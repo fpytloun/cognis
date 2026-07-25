@@ -38,10 +38,11 @@ logger = get_logger(__name__)
 WEB_CONCURRENCY_KEY = "web_concurrency_controller"
 
 # Defaults — see docs/guide/configuring-providers.md for tuning guidance.
-DEFAULT_GLOBAL_CAP = 32
+DEFAULT_GLOBAL_CAP = 16
 DEFAULT_PER_HOST_CAP = 4
 DEFAULT_BACKEND_CAPS: dict[str, int] = {
-    "direct": 16,
+    # Direct web operations use synchronous libraries in worker threads.
+    "direct": 4,
     "tavily": 8,
     "brave": 2,
     "searxng": 4,

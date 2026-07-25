@@ -12,6 +12,7 @@ import zipfile
 from dataclasses import dataclass
 from typing import Any
 
+from cognis.logging import get_logger
 from cognis.models.skill import SkillAssetRef, SkillExportData, SkillToolSpec
 from cognis.models.workflow import StepDefinition
 from cognis.store.queries import (
@@ -22,6 +23,8 @@ from cognis.store.queries import (
     list_skill_assets,
 )
 from cognis.tools.skill_parser import compute_content_hash, export_cognis_yaml
+
+logger = get_logger(__name__)
 
 _TEXT_ASSET_EXTENSIONS = {
     ".c",
@@ -359,10 +362,6 @@ async def prepare_skill_assets(
             version_row = await get_skill_version(session, asset_row.skill_version_id)
             if version_row is None or version_row.skill_id != skill_id:
                 raise ValueError("existing_asset_id must belong to the same skill")
-            if not allow_binary and not is_text_like_skill_asset(filename, asset_row.content_type):
-                raise ValueError(
-                    f"Agent-managed skill assets must be text or script files: {filename}"
-                )
             prepared.append(
                 PreparedSkillAsset(
                     filename=filename,
@@ -457,6 +456,7 @@ async def create_skill_version_with_assets(
         allow_binary=allow_binary_assets,
     )
 
+    created_object_keys: set[tuple[str, str]] = set()
     for asset in prepared_assets:
         if asset.content is None:
             continue
@@ -468,6 +468,7 @@ async def create_skill_version_with_assets(
             asset.content_type,
             owner_email=owner_email,
         )
+        created_object_keys.add((asset.artifact_namespace, asset.artifact_object_id))
 
     asset_manifest = [
         SkillAssetRef(
@@ -533,7 +534,39 @@ async def create_skill_version_with_assets(
             size_bytes=asset.size_bytes,
             content_type=asset.content_type,
         )
+    version_row._created_asset_object_keys = created_object_keys
     return version_row
+
+
+async def cleanup_unpublished_skill_assets(
+    artifact_store: Any,
+    version_row: Any,
+) -> None:
+    """Delete blobs created for a version that failed optimistic publication."""
+
+    created_object_keys = getattr(version_row, "_created_asset_object_keys", set())
+    for raw in version_row.asset_manifest or []:
+        asset = SkillAssetRef.model_validate(raw)
+        object_key = (asset.artifact_namespace, asset.artifact_object_id)
+        if object_key not in created_object_keys:
+            continue
+        try:
+            await artifact_store.async_delete_object(
+                asset.artifact_namespace,
+                asset.artifact_object_id,
+            )
+        except Exception:
+            logger.warning(
+                "skills: failed to clean unpublished asset",
+                exc_info=True,
+                extra={
+                    "extra_data": {
+                        "skill_id": version_row.skill_id,
+                        "version_id": version_row.version_id,
+                        "asset_id": asset.asset_id,
+                    }
+                },
+            )
 
 
 def asset_refs_to_inputs(refs: list[SkillAssetRef]) -> list[dict[str, Any]]:
@@ -544,6 +577,45 @@ def asset_refs_to_inputs(refs: list[SkillAssetRef]) -> list[dict[str, Any]]:
         }
         for ref in refs
     ]
+
+
+def apply_mapping_patch(
+    current: dict[str, Any] | None,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply explicit set/remove operations to a mapping."""
+
+    result = dict(current or {})
+    for key in patch.get("remove") or []:
+        result.pop(str(key), None)
+    for key, value in (patch.get("set") or {}).items():
+        result[str(key)] = value
+    return result
+
+
+def apply_named_list_patch(
+    current: list[dict[str, Any]] | None,
+    patch: dict[str, Any],
+    *,
+    key: str,
+) -> list[dict[str, Any]]:
+    """Apply explicit upsert/remove operations to a keyed list."""
+
+    result = [dict(item) for item in (current or [])]
+    remove = {str(value) for value in (patch.get("remove") or [])}
+    if remove:
+        result = [item for item in result if str(item.get(key, "")) not in remove]
+    positions = {str(item.get(key, "")): index for index, item in enumerate(result)}
+    for item in patch.get("upsert") or []:
+        value = str(item.get(key, "")).strip()
+        if not value:
+            raise ValueError(f"Patched items require a non-empty '{key}'")
+        if value in positions:
+            result[positions[value]] = dict(item)
+        else:
+            positions[value] = len(result)
+            result.append(dict(item))
+    return result
 
 
 async def load_export_assets(

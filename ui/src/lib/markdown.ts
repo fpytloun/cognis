@@ -13,6 +13,17 @@ const genericEnclosingFenceLanguages = new Set(['', 'md', 'markdown', 'plain', '
 const markdownCacheLimit = 500;
 const markdownCache = new Map<string, string>();
 
+export interface MarkdownHeading {
+  id: string;
+  level: number;
+  text: string;
+}
+
+export interface MarkdownDocumentRender {
+  html: string;
+  headings: MarkdownHeading[];
+}
+
 interface FenceLine {
   indent: string;
   char: '`' | '~';
@@ -107,6 +118,151 @@ function normalizeEnclosingFence(markdown: string): string {
   }
 
   return lines.join('\n');
+}
+
+function pipeCells(line: string): string[] {
+  const trimmed = line.trim();
+  const withoutLeadingPipe = trimmed.startsWith('|') ? trimmed.slice(1) : trimmed;
+  const withoutOuterPipes = withoutLeadingPipe.endsWith('|') ? withoutLeadingPipe.slice(0, -1) : withoutLeadingPipe;
+  return withoutOuterPipes.split('|').map((cell) => cell.trim());
+}
+
+function isLikelyTableSeparator(line: string): boolean {
+  if (!line.includes('|')) return false;
+  const cells = pipeCells(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{2,}:?$/.test(cell));
+}
+
+function padTableSeparator(line: string, targetCells: number): string {
+  const trimmed = line.trim();
+  const hasLeadingPipe = trimmed.startsWith('|');
+  const hasTrailingPipe = trimmed.endsWith('|');
+  const cells = pipeCells(line);
+  while (cells.length < targetCells) cells.push('---');
+  return `${hasLeadingPipe ? '|' : ''}${cells.join('|')}${hasTrailingPipe ? '|' : ''}`;
+}
+
+function normalizeMalformedTableSeparators(markdown: string): string {
+  if (!markdown.includes('|')) return markdown;
+
+  const lines = markdown.split('\n');
+  let inFence = false;
+  let fenceChar: '`' | '~' = '`';
+  let fenceLength = 0;
+
+  for (let i = 0; i < lines.length - 1; i += 1) {
+    const line = lines[i];
+    if (!inFence) {
+      const opener = parseFenceOpener(line);
+      if (opener) {
+        inFence = true;
+        fenceChar = opener.char;
+        fenceLength = opener.length;
+        continue;
+      }
+
+      const separator = lines[i + 1];
+      if (!line.includes('|') || !isLikelyTableSeparator(separator)) continue;
+
+      const headerCellCount = pipeCells(line).length;
+      const separatorCellCount = pipeCells(separator).length;
+      if (headerCellCount > separatorCellCount) {
+        lines[i + 1] = padTableSeparator(separator, headerCellCount);
+      }
+      continue;
+    }
+
+    if (parseClosingFence(line, fenceChar, fenceLength)) {
+      inFence = false;
+      fenceLength = 0;
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function normalizeMarkdownForRender(markdown: string): string {
+  return normalizeMalformedTableSeparators(normalizeEnclosingFence(markdown));
+}
+
+function slugifyHeading(value: string): string {
+  return value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[`*_~()[\]{}.!?:;"'<>/\\|+=,@#$%^&]+/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64) || 'section';
+}
+
+function uniqueHeadingId(base: string, seen: Map<string, number>): string {
+  const count = seen.get(base) ?? 0;
+  seen.set(base, count + 1);
+  return count === 0 ? base : `${base}-${count + 1}`;
+}
+
+function stripInlineHeadingMarkdown(value: string): string {
+  return stripMarkdown(value)
+    .replace(/\s+#*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function extractMarkdownHeadings(markdown: string, idPrefix = 'deliverable-section'): MarkdownHeading[] {
+  const normalized = normalizeMarkdownForRender(markdown);
+  const lines = normalized.split('\n');
+  const headings: MarkdownHeading[] = [];
+  const seen = new Map<string, number>();
+  let inFence = false;
+  let fenceChar: '`' | '~' = '`';
+  let fenceLength = 0;
+
+  for (const line of lines) {
+    if (!inFence) {
+      const opener = parseFenceOpener(line);
+      if (opener) {
+        inFence = true;
+        fenceChar = opener.char;
+        fenceLength = opener.length;
+        continue;
+      }
+
+      const match = line.match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (!match) continue;
+      const text = stripInlineHeadingMarkdown(match[2] ?? '');
+      if (!text) continue;
+      const base = `${idPrefix}-${slugifyHeading(text)}`;
+      headings.push({
+        id: uniqueHeadingId(base, seen),
+        level: match[1].length,
+        text,
+      });
+      continue;
+    }
+
+    if (parseClosingFence(line, fenceChar, fenceLength)) {
+      inFence = false;
+      fenceLength = 0;
+    }
+  }
+
+  return headings;
+}
+
+function addHeadingIds(html: string, headings: MarkdownHeading[]): string {
+  if (headings.length === 0 || typeof document === 'undefined') return html;
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const headingNodes = Array.from(template.content.querySelectorAll<HTMLHeadingElement>('h1, h2, h3, h4, h5, h6'));
+  headingNodes.forEach((heading, index) => {
+    const item = headings[index];
+    if (!item) return;
+    heading.id = item.id;
+    heading.tabIndex = -1;
+  });
+  return template.innerHTML;
 }
 
 function isOutgoingHref(href: string | null | undefined): boolean {
@@ -265,6 +421,7 @@ function postProcessMarkdownHtml(html: string): string {
 function createLinkRenderer(): Renderer {
   const renderer = new Renderer();
   const baseLink = renderer.link.bind(renderer);
+  const baseTable = renderer.table.bind(renderer);
 
   renderer.code = (token) => {
     const lang = languageClass(token.lang ?? '');
@@ -285,6 +442,9 @@ function createLinkRenderer(): Renderer {
     const html = baseLink(token);
     return isOutgoingHref(token.href) && typeof html === 'string' ? markOutgoingLinks(html) : html;
   };
+
+  renderer.html = (token) => escapeHtml(token.text);
+  renderer.table = (...args) => `<div class="markdown-table-wrap">${baseTable(...args)}</div>`;
 
   return renderer;
 }
@@ -316,7 +476,7 @@ export function sanitizeHtml(html: string): string {
 }
 
 export function renderMarkdown(markdown: string): string {
-  const normalized = normalizeEnclosingFence(markdown);
+  const normalized = normalizeMarkdownForRender(markdown);
   const cacheKey = `${typeof document === 'undefined' ? 'ssr' : 'dom'}\0${normalized}`;
   const cached = cacheGet(cacheKey);
   if (cached !== undefined) return cached;
@@ -324,6 +484,104 @@ export function renderMarkdown(markdown: string): string {
   const html = postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
   cacheSet(cacheKey, html);
   return html;
+}
+
+const inlineMarkdownCacheLimit = 1000;
+const inlineMarkdownCache = new Map<string, string>();
+
+function inlineCacheGet(key: string): string | undefined {
+  const value = inlineMarkdownCache.get(key);
+  if (value === undefined) return undefined;
+  inlineMarkdownCache.delete(key);
+  inlineMarkdownCache.set(key, value);
+  return value;
+}
+
+function inlineCacheSet(key: string, value: string): void {
+  inlineMarkdownCache.set(key, value);
+  if (inlineMarkdownCache.size <= inlineMarkdownCacheLimit) return;
+  const oldest = inlineMarkdownCache.keys().next().value;
+  if (oldest !== undefined) inlineMarkdownCache.delete(oldest);
+}
+
+/**
+ * Renders INLINE markdown only -- links, bold/italic, inline code, images --
+ * without wrapping the result in block elements (`<p>`, lists, headings).
+ * `renderMarkdown` always produces block-level HTML, which is wrong for a
+ * `<span>`, `<td>`, `<dd>`, `<figcaption>`, `<h4>`, or single-line `<p>` that
+ * should render inline emphasis/links but must not gain a nested block
+ * wrapper. Most rich-deliverable block components render short prose
+ * fields (descriptions, summaries, captions, table/key-value cell text,
+ * quotes, list items) as raw `{value}` Svelte interpolation, which leaves
+ * authored `[label](url)`, `**bold**`, or `` `code` `` visible verbatim
+ * instead of rendered -- this is the purpose-built helper for those call
+ * sites: `{@html renderInlineMarkdown(value)}`.
+ *
+ * Safe to use anywhere plain text was previously interpolated: sanitizes
+ * output the same way `renderMarkdown` does, marks outgoing links
+ * `target="_blank" rel="noopener noreferrer"`, and linkifies bare URLs.
+ */
+export function renderInlineMarkdown(markdown: string): string {
+  if (!markdown) return '';
+  const normalized = normalizeMarkdownForRender(markdown);
+  const cacheKey = `${typeof document === 'undefined' ? 'ssr' : 'dom'}\0${normalized}`;
+  const cached = inlineCacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+  const parsed = marked.parseInline(normalized, { async: false, renderer: defaultLinkRenderer });
+  const html = postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
+  inlineCacheSet(cacheKey, html);
+  return html;
+}
+
+function createNoLinkInlineRenderer(): Renderer {
+  const renderer = new Renderer();
+  const baseLink = renderer.link.bind(renderer);
+  // Drop the anchor wrapper but keep its rendered inner label (so nested
+  // `**bold**`/`` `code` `` inside the link text is preserved) -- reuse
+  // marked's own default link rendering (which correctly renders the
+  // link's child tokens to HTML, unlike the token's raw `.text`/`.tokens`
+  // fields) and strip the outer `<a ...>...</a>` textually. Used for prose
+  // that is itself rendered inside an existing interactive element (an
+  // outer `<a>`/`<button>`/`<summary>`) -- e.g. a card title that is
+  // already a link, or a source label inside a source list item's own
+  // anchor -- where a markdown link in the authored text would otherwise
+  // produce invalid nested interactive markup and let a click follow the
+  // wrong (inner) URL instead of the block's own intended target.
+  renderer.link = (token) => {
+    const html = baseLink(token);
+    return typeof html === 'string'
+      ? html.replace(/^<a\b[^>]*>/i, '').replace(/<\/a>\s*$/i, '')
+      : html;
+  };
+  renderer.html = (token) => escapeHtml(token.text);
+  return renderer;
+}
+
+const noLinkInlineRenderer = createNoLinkInlineRenderer();
+
+/**
+ * Same as `renderInlineMarkdown`, but markdown links render as their label
+ * only (no `<a>`), for prose fields rendered inside an already-interactive
+ * element. See `createNoLinkInlineRenderer` for why this exists.
+ */
+export function renderInlineMarkdownNoLinks(markdown: string): string {
+  if (!markdown) return '';
+  const normalized = normalizeMarkdownForRender(markdown);
+  const cacheKey = `nolink\0${normalized}`;
+  const cached = inlineCacheGet(cacheKey);
+  if (cached !== undefined) return cached;
+  const parsed = marked.parseInline(normalized, { async: false, renderer: noLinkInlineRenderer });
+  const html = sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  inlineCacheSet(cacheKey, html);
+  return html;
+}
+
+export function renderMarkdownDocument(markdown: string, idPrefix = 'deliverable-section'): MarkdownDocumentRender {
+  const headings = extractMarkdownHeadings(markdown, idPrefix);
+  return {
+    html: addHeadingIds(renderMarkdown(markdown), headings),
+    headings,
+  };
 }
 
 export function stripMarkdown(markdown: string): string {
@@ -343,16 +601,14 @@ export function stripMarkdown(markdown: string): string {
 function createDocsRenderer(): Renderer {
   const renderer = createLinkRenderer();
   const baseCode = renderer.code.bind(renderer);
-  const baseTable = renderer.table.bind(renderer);
 
   renderer.code = (...args) => `<div class="markdown-code-wrap">${baseCode(...args)}</div>`;
-  renderer.table = (...args) => `<div class="markdown-table-wrap">${baseTable(...args)}</div>`;
 
   return renderer;
 }
 
 export function renderDocsMarkdown(markdown: string): string {
-  const parsed = marked.parse(normalizeEnclosingFence(markdown), {
+  const parsed = marked.parse(normalizeMarkdownForRender(markdown), {
     async: false,
     renderer: docsRenderer
   });

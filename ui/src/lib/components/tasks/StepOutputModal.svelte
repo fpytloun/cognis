@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  import type { StepRun } from '$lib/types/api';
+  import { api } from '$lib/api/client';
+  import type { Deliverable, StepRun } from '$lib/types/api';
   import { renderMarkdown, sanitizeHtml } from '$lib/markdown';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
   import Button from '$lib/components/ui/Button.svelte';
 
   let {
@@ -24,6 +26,9 @@
   let container: HTMLDivElement | null = null;
   let previousFocus: HTMLElement | null = null;
   let overlayId = $state<string | null>(null);
+  let hydratedDeliverable = $state<Deliverable | null>(null);
+  let deliverableLoadError = $state('');
+  let loadingDeliverable = $state(false);
 
   function stepOutputSummary(stepRun: StepRun): string {
     const val = stepRun.output?.summary;
@@ -39,17 +44,15 @@
     return stepRun.deliverables[0] ?? null;
   }
 
-  function renderDeliverableContent(stepRun: StepRun): string {
-    const deliverable = latestDeliverable(stepRun);
+  function renderDeliverableContent(deliverable: Deliverable | null): string {
     if (!deliverable?.content) return '';
     return deliverable.format === 'html'
       ? sanitizeHtml(deliverable.content)
       : renderMarkdown(deliverable.content);
   }
 
-  function stepReasoningContent(stepRun: StepRun): string {
+  function stepReasoningContent(stepRun: StepRun, deliverable: Deliverable | null): string {
     const content = stepOutputContent(stepRun);
-    const deliverable = latestDeliverable(stepRun);
     if (!content) return '';
     if (deliverable && content.trim() === deliverable.content.trim()) return '';
     return content;
@@ -144,9 +147,9 @@
   }
 
   const summary = $derived(stepOutputSummary(stepRun));
-  const latestDeliverableVersion = $derived(latestDeliverable(stepRun));
-  const deliverableHtml = $derived(renderDeliverableContent(stepRun));
-  const reasoningContent = $derived(stepReasoningContent(stepRun));
+  const latestDeliverableVersion = $derived(hydratedDeliverable ?? latestDeliverable(stepRun));
+  const deliverableHtml = $derived(renderDeliverableContent(latestDeliverableVersion));
+  const reasoningContent = $derived(stepReasoningContent(stepRun, latestDeliverableVersion));
   const claims = $derived(stepOutputClaims(stepRun));
   const stepError = $derived(stepOutputError(stepRun));
   const outcomeStatus = $derived(stepOutcomeStatus(stepRun));
@@ -161,6 +164,22 @@
       focusableElements()[0]?.focus();
     });
     document.addEventListener('keydown', trapFocus);
+    const projectedDeliverable = latestDeliverable(stepRun);
+    if (projectedDeliverable?.deliverable_id) {
+      loadingDeliverable = true;
+      void api.deliverables
+        .getForStepRun(stepRun.step_run_id, projectedDeliverable.deliverable_id)
+        .then((deliverable: Deliverable) => {
+          hydratedDeliverable = deliverable;
+          deliverableLoadError = '';
+        })
+        .catch(() => {
+          deliverableLoadError = 'Full deliverable content could not be loaded.';
+        })
+        .finally(() => {
+          loadingDeliverable = false;
+        });
+    }
     return () => {
       handle.unregister();
       overlayId = null;
@@ -233,7 +252,22 @@
               {/each}
             </div>
           </div>
-          {#if deliverableHtml}
+          {#if loadingDeliverable}
+            <p class="mt-4 text-sm text-slate-400">Loading full deliverable…</p>
+          {:else if deliverableLoadError}
+            <p class="mt-4 text-sm text-amber-200">{deliverableLoadError}</p>
+          {/if}
+          {#if latestDeliverableVersion?.format === 'rich'}
+            <div class="mt-4">
+              <RichDeliverable
+                payload={latestDeliverableVersion.rich_payload}
+                content={latestDeliverableVersion.content}
+                 title={latestDeliverableVersion.title ?? 'Deliverable'}
+                 instanceId={latestDeliverableVersion.deliverable_id}
+                 surface="standalone"
+              />
+            </div>
+          {:else if deliverableHtml}
             <div class="prose prose-sm prose-invert mt-4 max-w-none text-slate-300">{@html deliverableHtml}</div>
           {/if}
           {#if latestDeliverableVersion?.evaluator_feedback}

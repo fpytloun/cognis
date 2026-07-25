@@ -2,42 +2,83 @@
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
 from cognis.core.chat_modes import CHAT_MODES, ChatMode
 from cognis.logging import get_logger
+from cognis.models.workflow import normalize_session_policy
 from cognis.store import queries
 
 logger = get_logger(__name__)
 
 
-_SYSTEM_AGENT_PREFIX = "system:"
+class ManagedConversationAdmissionConflict(RuntimeError):
+    """Raised when a managed link already owns a different queued admission."""
+
+
+def new_managed_turn_id() -> str:
+    """Return a scheduler-compatible identity for a managed turn admission."""
+
+    return f"turn_{uuid.uuid4().hex[:12]}"
 
 
 def is_allowed_managed_conversation_target(agent_id: str | None) -> bool:
-    """Return whether an agent may own a managed conversation.
+    """Return whether a non-blank target was supplied.
 
-    Managed conversations are durable, visible main conversations owned by a
-    target agent. System agents are specialist secondary agents and must be
-    used via delegate() instead of owning managed conversations.
+    This is syntactic validation only. Typed eligibility is resolved through
+    ``OrchestrationTargetService`` immediately before work is created.
     """
 
     normalized = str(agent_id or "").strip()
-    return bool(normalized) and not normalized.startswith(_SYSTEM_AGENT_PREFIX)
+    return bool(normalized)
 
 
 def managed_conversation_target_error(agent_id: str | None) -> str:
     """Return the user-facing rejection message for invalid managed targets."""
 
-    normalized = str(agent_id or "").strip()
-    if normalized.startswith(_SYSTEM_AGENT_PREFIX):
-        return (
-            "Managed conversations require a primary/user agent. Use delegate() "
-            "for system specialist agents (`system:*`) available in this agent session."
-        )
-    return "Managed conversations require a primary/user agent."
+    return (
+        "Managed conversations require an active, accessible primary, non-system agent. "
+        "Use delegate() for secondary or system specialists."
+    )
+
+
+def managed_link_owned_by_controller(
+    link: Any,
+    *,
+    controller_agent_id: str,
+    controller_conversation_id: str,
+) -> bool:
+    """Return whether a control-plane link belongs to the invoking controller."""
+
+    return (
+        getattr(link, "controller_agent_id", None) == controller_agent_id
+        and getattr(link, "controller_conversation_id", None) == controller_conversation_id
+    )
+
+
+def managed_target_repeats_ancestry(target_agent_id: str, ancestry: list[Any]) -> bool:
+    """Return whether a nested target repeats an agent in durable link ancestry."""
+
+    agent_ids = {str(getattr(link, "target_agent_id", "")) for link in ancestry}
+    if ancestry:
+        agent_ids.add(str(getattr(ancestry[-1], "controller_agent_id", "")))
+    return target_agent_id in agent_ids
+
+
+def inherited_managed_session_policy(
+    platform_data: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the explicitly inherited policy, never a broader ambient fallback."""
+
+    inherited = platform_data.get("managed_session_policy")
+    if isinstance(inherited, dict):
+        return normalize_session_policy(inherited)
+    return normalize_session_policy(fallback)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +93,189 @@ class ManagedConversationRetryMessage:
 
     content: str
     one_shot_chat_mode: ChatMode | None = None
+    turn_id: str | None = None
+
+
+class ManagedConversationTurnObserver:
+    """No-op observer that keeps managed admissions turn-distinct."""
+
+    supports_mid_turn_absorb = False
+
+    async def on_turn_complete(self, result: Any) -> None:
+        return None
+
+    async def on_turn_error(self, conversation_id: str, error: Any) -> None:
+        return None
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("on_"):
+
+            async def _noop(*args: Any, **kwargs: Any) -> None:
+                return None
+
+            return _noop
+        raise AttributeError(name)
+
+
+class ManagedConversationProgressObserver(ManagedConversationTurnObserver):
+    """Forward bounded child-turn activity to a joined controller tool call."""
+
+    def __init__(self, publish: Callable[..., Awaitable[None]]) -> None:
+        self._publish = publish
+        self._seen_tool_calls: set[str] = set()
+        self._tool_call_count = 0
+        self._todos: list[dict[str, Any]] = []
+
+    async def _emit(self, *, last_tool: str | None = None) -> None:
+        try:
+            await self._publish(
+                tool_call_count=self._tool_call_count,
+                last_tool=last_tool,
+                todos=self._todos,
+            )
+        except Exception:
+            logger.exception("managed conversation progress publication failed")
+
+    async def on_tool_call(
+        self,
+        _conversation_id: str,
+        _session_id: str,
+        call_id: str,
+        tool_name: str,
+        _arguments: dict[str, Any] | None,
+        _turn_id: str | None,
+        **_kwargs: Any,
+    ) -> None:
+        if call_id not in self._seen_tool_calls:
+            self._seen_tool_calls.add(call_id)
+            self._tool_call_count += 1
+        await self._emit(last_tool=tool_name)
+
+    async def on_tool_result(
+        self,
+        _conversation_id: str,
+        _session_id: str,
+        call_id: str,
+        tool_name: str,
+        result: str,
+        _is_error: bool,
+        _duration_ms: int | None,
+        _evaluation: dict[str, Any] | None,
+        **_kwargs: Any,
+    ) -> None:
+        if call_id not in self._seen_tool_calls:
+            self._seen_tool_calls.add(call_id)
+            self._tool_call_count += 1
+        if tool_name in {"todo_write", "todo_list", "step_todo_write", "step_todo_list"}:
+            try:
+                payload = json.loads(result)
+            except (TypeError, ValueError):
+                payload = None
+            todos = payload.get("todos") if isinstance(payload, dict) else None
+            if isinstance(todos, list):
+                self._todos = [
+                    {
+                        "content": str(todo.get("content") or "")[:280],
+                        "status": str(todo.get("status") or "pending"),
+                    }
+                    for todo in todos
+                    if isinstance(todo, dict) and str(todo.get("content") or "").strip()
+                ]
+        await self._emit(last_tool=tool_name)
+
+    async def on_turn_complete(self, _result: Any) -> None:
+        """Refresh the controller card after the child reaches a terminal state."""
+        await self._emit()
+
+    async def on_turn_error(self, _conversation_id: str, _error: Any) -> None:
+        """Refresh the controller card after the child fails or is interrupted."""
+        await self._emit()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedConversationProjection:
+    """Scheduler-aware lifecycle projection for one managed conversation link."""
+
+    conversation_state: str
+    turn_state: str
+    active_turn_id: str | None
+    last_result_summary: str | None
+    last_result_turn_id: str | None
+    last_error: str | None
+    completed_at: Any | None
+    consistency_warnings: tuple[str, ...]
+
+    @property
+    def last_settlement_is_current(self) -> bool:
+        if not self.last_result_turn_id:
+            return False
+        if self.active_turn_id:
+            return self.active_turn_id == self.last_result_turn_id
+        return self.turn_state in {"completed", "failed", "interrupted"}
+
+
+def project_managed_conversation_state(
+    link: Any,
+    *,
+    scheduler_active_turn_id: str | None = None,
+) -> ManagedConversationProjection:
+    """Project durable state without presenting live scheduler work as terminal.
+
+    A queued managed admission intentionally owns a different turn ID than the
+    scheduler turn ahead of it, so queued link identity remains authoritative.
+    Durable inconsistencies remain visible to invariant and warning code
+    through the original ORM row.
+    """
+
+    durable_conversation_state = str(getattr(link, "conversation_state", "") or "")
+    durable_turn_state = str(getattr(link, "turn_state", "") or "")
+    durable_active_turn_id = getattr(link, "active_turn_id", None)
+    durable_completed_at = getattr(link, "completed_at", None)
+    conversation_state = durable_conversation_state
+    turn_state = durable_turn_state
+    active_turn_id = durable_active_turn_id
+    completed_at = durable_completed_at
+    warnings: list[str] = []
+    if durable_turn_state in {"queued", "running"} and durable_completed_at is not None:
+        warnings.append("running+completed_at")
+    if scheduler_active_turn_id and turn_state != "queued":
+        conversation_state = "open"
+        turn_state = "running"
+        active_turn_id = scheduler_active_turn_id
+        completed_at = None
+        if (
+            durable_conversation_state != conversation_state
+            or durable_turn_state != turn_state
+            or durable_active_turn_id != active_turn_id
+            or durable_completed_at is not None
+        ):
+            warnings.append("scheduler-projection-overrode-durable-state")
+            logger.warning(
+                "managed conversation projection overrode inconsistent durable state",
+                extra={
+                    "extra_data": {
+                        "link_id": getattr(link, "link_id", None),
+                        "target_conversation_id": getattr(link, "target_conversation_id", None),
+                        "durable_conversation_state": durable_conversation_state,
+                        "durable_turn_state": durable_turn_state,
+                        "durable_active_turn_id": durable_active_turn_id,
+                        "scheduler_active_turn_id": scheduler_active_turn_id,
+                        "durable_completed_at": (
+                            str(durable_completed_at) if durable_completed_at else None
+                        ),
+                    }
+                },
+            )
+    return ManagedConversationProjection(
+        conversation_state=conversation_state,
+        turn_state=turn_state,
+        active_turn_id=active_turn_id,
+        last_result_summary=getattr(link, "last_result_summary", None),
+        last_result_turn_id=getattr(link, "last_result_turn_id", None),
+        last_error=getattr(link, "last_error", None),
+        completed_at=completed_at,
+        consistency_warnings=tuple(dict.fromkeys(warnings)),
+    )
 
 
 def _event_type(event: Any) -> str | None:
@@ -88,6 +312,7 @@ def _last_user_message_from_events(events: list[Any]) -> ManagedConversationRetr
             return ManagedConversationRetryMessage(
                 content=content,
                 one_shot_chat_mode=_one_shot_chat_mode_from_event_data(data),
+                turn_id=str(data.get("turn_id") or "").strip() or None,
             )
     return None
 

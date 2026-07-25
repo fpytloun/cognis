@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from cognis.channels.markdown_rendering import markdown_to_slack_mrkdwn
 from cognis.channels.protocol import BaseChannelAdapter
 from cognis.channels.registry import SLACK_META
 from cognis.logging import get_logger
@@ -137,7 +138,8 @@ class SlackAdapter(BaseChannelAdapter):
                 message.chat_id, media, thread_ts=message.thread_id or message.reply_to_id
             )
 
-        payload: dict[str, Any] = {"channel": message.chat_id, "text": message.content}
+        rendered = markdown_to_slack_mrkdwn(message.content)
+        payload: dict[str, Any] = {"channel": message.chat_id, "text": rendered}
         if self._agent_name:
             payload["username"] = self._agent_name
         if self._agent_avatar_url:

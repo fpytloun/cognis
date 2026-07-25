@@ -110,6 +110,7 @@ class _StubLLMProvider:
         task_type: str = "speech_to_text",
         prompt: str | None = None,
         language: str | None = None,
+        acting_user_email: str | None = None,
     ) -> SpeechToTextResult:
         self.transcribe_calls.append(
             {
@@ -117,6 +118,7 @@ class _StubLLMProvider:
                 "mime_type": mime_type,
                 "filename": filename,
                 "language": language,
+                "acting_user_email": acting_user_email,
             }
         )
         return SpeechToTextResult(
@@ -125,6 +127,9 @@ class _StubLLMProvider:
             language="en",
             duration_seconds=1.0,
         )
+
+    async def aclose(self) -> None:
+        pass
 
 
 async def _seed_stub_provider(client: TestClient) -> None:
@@ -326,6 +331,9 @@ def test_tts_synthesize_no_routing_returns_503(
             async def resolve_model_target(self, _explicit: str | None, *, task_type: str):
                 raise RuntimeError("no routing")
 
+            async def aclose(self) -> None:
+                pass
+
         client.app.state.providers.llm = _NoRoutingProvider()  # type: ignore[attr-defined]
 
         response = client.post(
@@ -361,6 +369,7 @@ def test_stt_transcribe_multipart_file(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert body["model"] == "whisper-1"
         assert len(stub.transcribe_calls) == 1
         assert stub.transcribe_calls[0]["mime_type"].startswith("audio/")
+        assert stub.transcribe_calls[0]["acting_user_email"] == "user@example.com"
 
 
 def test_stt_transcribe_requires_file_or_artifact_id(

@@ -123,9 +123,9 @@ The current web chat path combines:
 - Intaris session events as durable source.
 - Cognis SQL conversation/session metadata.
 - REST `/messages`, `/timeline`, `/view` projections.
-- WebSocket `timeline_patch`, runtime snapshots, state snapshots, and legacy
-  events.
-- Frontend `ChatTimeline` merge heuristics and local spinner/progress state.
+- WebSocket `chat_v2_frame`, runtime snapshots, state snapshots, and generic
+  lifecycle/notification events.
+- Frontend `ChatV2Store` scoped reconciliation and pure sync-engine invariants.
 
 Known problem classes:
 
@@ -133,7 +133,7 @@ Known problem classes:
   synthetic lineage/sentinel ordering.
 - Public timeline item shape is loose and contract-critical fields are not
   schema-enforced.
-- `timeline_patch.last_seq` is not a durable transport sequence.
+- `legacy timeline event.last_seq` is not a durable transport sequence.
 - Active turn state comes from multiple payloads and local inference.
 - Runtime/live ordering can rely on process-local counters.
 - Legacy WebSocket events and canonical patches can both mutate frontend state.
@@ -783,8 +783,8 @@ Client rules:
 4. Runtime overlay is checked by epoch/revision and may still be applied if
    newer, but it must not advance canonical cursor.
 
-Old events such as `timeline_patch`, `message_complete`, `conversation_updated`,
-and legacy workflow/delegation events may continue for old clients during
+Generic lifecycle events such as `message_complete` and `conversation_updated` may
+continue for notification/sidebar consumers; renderable timeline state is canonical ChatV2.
 migration. Chat v2 frontend must not use them to mutate timeline state.
 
 ---
@@ -990,6 +990,10 @@ ID rules:
 - user message: `message:user:{message_id}` when authoritative
 - optimistic outbox item: `outbox:{client_txn_id}` until reconciled
 - assistant message: `message:assistant:{message_id}:phase:{assistant_phase_index}`
+- Runtime stream snapshots carry the scheduler-stamped
+  `assistant_phase_index` as authoritative (`assistant_phase_authoritative:
+  true`); phase inference is only a compatibility fallback for older or
+  externally supplied snapshots.
 
 ### Thinking item
 
@@ -1012,6 +1016,10 @@ ThinkingBlock {
 ```
 
 Runtime thinking items may be volatile. Final thinking items must be canonical.
+If a persisted provider thinking event lacks `block_id`, both canonical and
+runtime projection fall back to `seq-{source_seq}` when source sequence metadata
+is available. The normal live agent loop should synthesize stable block ids
+before persistence so reload and runtime overlays merge by the same item id.
 
 ### Tool call item
 
@@ -1387,10 +1395,8 @@ However, implementation happens safely in parallel:
 Old backend routes may remain temporarily if other clients use them, but web chat
 must stop consuming:
 
-- `timeline_patch`
-- loose `TimelineProjectionItem`
-- legacy WebSocket rendering events
-- current `ChatTimeline` merge-preserve heuristics
+- legacy rendering events and loose projection items
+- mutable `scoped ChatV2 store` merge-preserve heuristics
 - multi-source active-turn inference
 
 ---
@@ -1603,8 +1609,8 @@ Phase cannot proceed with unresolved high/critical review findings.
 
 ### Phase 9 — Decommission
 
-- [ ] Remove old active frontend `timeline_patch` usage.
-- [ ] Remove active old `ChatTimeline` merge heuristics from chat route.
+- [x] Remove old active frontend timeline rendering usage.
+- [x] Remove active old mutable timeline merge path from chat route.
 - [ ] Remove old spinner state machine.
 - [ ] Keep old backend routes only if still used outside v2 chat.
 

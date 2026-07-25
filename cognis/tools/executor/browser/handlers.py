@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,10 @@ from cognis.tools.executor.browser.manager import (
     BROWSER_DEFAULT_MAX_SESSIONS,
     BROWSER_MANAGER_KEY,
     SUPPORTED_AUTO_CONSENT_ACTIONS,
+    BrowserLifecycleError,
     BrowserManager,
     BrowserSession,
+    BrowserSessionOwner,
 )
 from cognis.tools.executor.paths import resolve_path
 from cognis.tools.registry import ToolExecutionContext
@@ -454,6 +457,144 @@ def _get_manager(context: ToolExecutionContext) -> BrowserManager:
     )
 
 
+def _owner_from_context(context: ToolExecutionContext) -> BrowserSessionOwner:
+    metadata = context.runtime_metadata or {}
+    runtime_access = metadata.get("runtime_access")
+    ownership = runtime_access if isinstance(runtime_access, dict) else metadata
+    scope_id = str(context.execution_scope_id or "").strip()
+    if not scope_id:
+        raise BrowserLifecycleError(
+            "browser_unauthenticated",
+            "Browser lifecycle ownership is unavailable for this execution.",
+        )
+    return BrowserSessionOwner(
+        execution_scope_id=scope_id,
+        session_id=str(ownership.get("session_id") or "") or None,
+        conversation_id=str(ownership.get("conversation_id") or "") or None,
+        user_email=str(ownership.get("user_email") or "") or None,
+        agent_id=str(ownership.get("agent_id") or "") or None,
+        parent_session_id=str(ownership.get("parent_session_id") or "") or None,
+        delegation_mode=str(ownership.get("delegation_mode") or "") or None,
+    )
+
+
+async def _get_owned_session(
+    manager: BrowserManager, context: ToolExecutionContext, session_id: str
+) -> BrowserSession:
+    return await manager.get_live_session(session_id, owner=_owner_from_context(context))
+
+
+def _lifecycle_error_result(exc: BrowserLifecycleError) -> ToolResult:
+    return ToolResult(
+        output=str(exc),
+        is_error=True,
+        metadata={"browser_lifecycle_error": exc.code},
+    )
+
+
+def _site_attribution_url(*candidates: str) -> str:
+    for candidate in candidates:
+        parsed = urlparse(candidate)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.hostname != "patchright-init-script-inject.internal"
+        ):
+            return candidate
+    return candidates[-1] if candidates else ""
+
+
+def _sanitize_navigation_error(exc: Exception) -> str:
+    message = re.sub(
+        r"https?://patchright-init-script-inject\.internal(?:/[^\s]*)?",
+        "[browser init script]",
+        str(exc),
+        flags=re.IGNORECASE,
+    )
+    return message[:1000]
+
+
+def _selected_executor_owner(context: ToolExecutionContext) -> str | None:
+    value = context.runtime_metadata.get("selected_executor_owner_email")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    value = context.executor_handle.metadata.get("owner_email")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _looks_like_navigation_failure(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "page.goto",
+            "navigation",
+            "net::err_",
+            "patchright-init-script-inject.internal",
+        )
+    )
+
+
+async def _browser_block_diagnostic(
+    session: BrowserSession | Any,
+    *,
+    requested_url: str,
+    title: str,
+    headless: bool,
+) -> dict[str, Any] | None:
+    status = getattr(session, "navigation_status", None)
+    if not isinstance(status, int) or status < 400:
+        return None
+    page = session.page
+    body = ""
+    content = getattr(page, "content", None)
+    if callable(content):
+        try:
+            body = str(await content())[:200_000]
+        except Exception:
+            body = ""
+    evidence = f"{title}\n{body}".lower()
+    strong_waf_markers = (
+        "attack id",
+        "web application firewall",
+        " waf ",
+        "imperva",
+        "incapsula",
+    )
+    rejected_with_vendor_reference = "request rejected" in evidence and any(
+        marker in evidence for marker in ("attack id", "incident id", "reference id")
+    )
+    if not (
+        any(marker in evidence for marker in strong_waf_markers) or rejected_with_vendor_reference
+    ):
+        return None
+    final_url = _site_attribution_url(
+        str(getattr(page, "url", "") or ""),
+        str(getattr(session, "navigation_url", "") or ""),
+        requested_url,
+    )
+    diagnostic: dict[str, Any] = {
+        "category": "vendor_waf_block",
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "http_status": status,
+        "headless": headless,
+        "attribution": "requested_site",
+    }
+    if headless:
+        diagnostic.update(
+            {
+                "headed_retry_recommended": True,
+                "hint": (
+                    "The requested site appears to reject this headless browser. Close this "
+                    "session, then retry browser_open with headless=false on an executor "
+                    "where headed mode is allowed."
+                ),
+            }
+        )
+    return diagnostic
+
+
 def _validate_css_selector(tool_name: str, selector: str) -> None:
     normalized = selector.strip().lower()
     if normalized.startswith(_PLAYWRIGHT_LOCATOR_PREFIXES):
@@ -881,31 +1022,87 @@ async def handle_browser_open(
         return result_or_manager
     manager = result_or_manager
     browser_settings = _parse_browser_settings(arguments)
-    session = await manager.open_session(
-        session_id=str(arguments.get("session_id", "")),
-        url=str(arguments.get("url", "")),
-        headless=bool(arguments.get("headless", True)),
-        auth_state=(
-            arguments.get("auth_state") if isinstance(arguments.get("auth_state"), dict) else None
-        ),
-        profile_mode=str(arguments.get("profile_mode", "default") or "default"),
-        profile_id=(str(arguments.get("profile_id")) if arguments.get("profile_id") else None),
-        browser_settings=browser_settings,
-    )
+    requested_url = str(arguments.get("url", ""))
+    headless = bool(arguments.get("headless", True))
+    try:
+        session = await manager.open_session(
+            session_id=str(arguments.get("session_id", "")),
+            url=requested_url,
+            headless=headless,
+            auth_state=(
+                arguments.get("auth_state")
+                if isinstance(arguments.get("auth_state"), dict)
+                else None
+            ),
+            profile_mode=str(arguments.get("profile_mode", "default") or "default"),
+            profile_id=(str(arguments.get("profile_id")) if arguments.get("profile_id") else None),
+            browser_settings=browser_settings,
+            owner=_owner_from_context(context),
+        )
+    except BrowserLifecycleError as exc:
+        return _lifecycle_error_result(exc)
+    except Exception as exc:
+        message = _sanitize_navigation_error(exc)
+        if not _looks_like_navigation_failure(exc):
+            return ToolResult(
+                output=f"Browser open failed before site navigation: {message}",
+                is_error=True,
+                metadata={
+                    "browser_runtime_error": True,
+                    "attribution": "executor_runtime",
+                    "headless": headless,
+                },
+            )
+        final_url = _site_attribution_url(requested_url)
+        return ToolResult(
+            output=f"Browser navigation to {final_url} failed: {message}",
+            is_error=True,
+            metadata={
+                "browser_navigation_error": True,
+                "requested_url": requested_url,
+                "final_url": final_url,
+                "attribution": "requested_site",
+                "headless": headless,
+            },
+        )
     session_settings = getattr(session, "browser_settings", None)
     resolved_settings = session_settings.as_dict() if session_settings is not None else None
+    title = await session.page.title()
+    diagnostic = await _browser_block_diagnostic(
+        session,
+        requested_url=requested_url,
+        title=title,
+        headless=headless,
+    )
+    navigation_url = _site_attribution_url(
+        str(getattr(session, "navigation_url", "") or ""),
+        str(getattr(session.page, "url", "") or ""),
+        requested_url,
+    )
+    payload = {
+        "session_id": session.session_id,
+        "url": session.page.url,
+        "title": title,
+        "headless": headless,
+        "navigation_url": navigation_url,
+        "navigation_status": getattr(session, "navigation_status", None),
+        "navigation_ok": getattr(session, "navigation_ok", None),
+        "profile_mode": session.profile_mode,
+        "profile_id": session.profile_id,
+        "browser_settings": resolved_settings,
+        "diagnostic": diagnostic,
+    }
     return ToolResult(
-        output=json.dumps(
+        output=json.dumps(payload),
+        is_error=diagnostic is not None,
+        metadata=(
             {
-                "session_id": session.session_id,
-                "url": session.page.url,
-                "title": await session.page.title(),
-                "headless": bool(arguments.get("headless", True)),
-                "profile_mode": session.profile_mode,
-                "profile_id": session.profile_id,
-                "browser_settings": resolved_settings,
+                "browser_blocked": True,
+                **diagnostic,
             }
-        )
+            if diagnostic is not None
+            else {}
+        ),
     )
 
 
@@ -914,24 +1111,68 @@ async def handle_browser_list_sessions(
 ) -> ToolResult:
     del arguments
     manager = _get_manager(context)
-    sessions = await manager.list_sessions()
+    try:
+        sessions = await manager.list_sessions(owner=_owner_from_context(context))
+    except BrowserLifecycleError as exc:
+        return _lifecycle_error_result(exc)
     return ToolResult(output=json.dumps({"sessions": sessions}))
+
+
+async def handle_browser_inspect_session(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    try:
+        session = await manager.inspect_session(
+            str(arguments.get("session_id", "")),
+            owner=_owner_from_context(context),
+        )
+    except BrowserLifecycleError as exc:
+        return _lifecycle_error_result(exc)
+    return ToolResult(output=json.dumps({"session": session}))
 
 
 async def handle_browser_list_profiles(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
-    del arguments
     manager = _get_manager(context)
-    profiles = await manager.list_profiles()
+    try:
+        profiles = await manager.list_profiles(
+            owner=_owner_from_context(context),
+            reclaim_stale=bool(arguments.get("reclaim_stale", False)),
+            include_unclaimed=bool(arguments.get("include_unclaimed", False)),
+            executor_owner_email=_selected_executor_owner(context),
+        )
+    except BrowserLifecycleError as exc:
+        return _lifecycle_error_result(exc)
     return ToolResult(output=json.dumps({"profiles": profiles}))
+
+
+async def handle_browser_claim_profile(
+    arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult:
+    manager = _get_manager(context)
+    try:
+        profile = await manager.claim_legacy_profile(
+            str(arguments.get("profile_id", "")),
+            owner=_owner_from_context(context),
+            confirm_profile_id=str(arguments.get("confirm_profile_id", "")),
+            reclaim_stale=bool(arguments.get("reclaim_stale", False)),
+            executor_owner_email=_selected_executor_owner(context),
+        )
+    except BrowserLifecycleError as exc:
+        return _lifecycle_error_result(exc)
+    return ToolResult(
+        output=json.dumps({"profile": profile}),
+        metadata={"browser_profile_claimed": bool(profile["claimed"])},
+    )
 
 
 async def handle_browser_query(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     selector = str(arguments.get("selector", ""))
     if not selector:
         raise ValueError("browser_query requires a selector")
@@ -952,7 +1193,7 @@ async def handle_browser_eval(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     script = arguments.get("script")
     if not isinstance(script, str) or not script.strip():
         raise ValueError("browser_eval requires a script")
@@ -980,6 +1221,7 @@ async def handle_browser_get_console(
         str(arguments.get("session_id", "")),
         level=str(arguments.get("level", "all") or "all"),
         limit=int(arguments.get("limit", 100) or 100),
+        owner=_owner_from_context(context),
     )
     return ToolResult(output=json.dumps({"events": events}, ensure_ascii=False))
 
@@ -993,6 +1235,7 @@ async def handle_browser_get_network(
         str(arguments.get("session_id", "")),
         limit=int(arguments.get("limit", 100) or 100),
         resource_types=resource_types if isinstance(resource_types, list) else None,
+        owner=_owner_from_context(context),
     )
     return ToolResult(output=json.dumps({"events": events}, ensure_ascii=False))
 
@@ -1001,7 +1244,7 @@ async def handle_browser_snapshot(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     max_elements = max(1, min(int(arguments.get("max_elements", 40) or 40), 80))
     elements = await _discover_candidates(
         session,
@@ -1028,7 +1271,7 @@ async def handle_browser_get_text(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     max_chars = int(arguments.get("max_chars", 4000) or 4000)
     text = await session.page.evaluate("() => (document.body?.innerText || '').trim()")
     return ToolResult(output=str(text)[:max_chars])
@@ -1038,7 +1281,7 @@ async def handle_browser_get_focus(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     active: dict[str, Any] | None = None
     active_frame_index: int | None = None
     active_frame: Any = session.page
@@ -1071,7 +1314,7 @@ async def handle_browser_click(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     ref = arguments.get("ref")
     selector = arguments.get("selector")
     if isinstance(ref, str) and ref:
@@ -1102,7 +1345,7 @@ async def handle_browser_fill(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     value = arguments.get("value")
     if not isinstance(value, str):
         raise ValueError("browser_fill requires a resolved string value")
@@ -1136,7 +1379,7 @@ async def handle_browser_focus(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     ref = arguments.get("ref")
     selector = arguments.get("selector")
     if isinstance(ref, str) and ref:
@@ -1161,7 +1404,7 @@ async def handle_browser_type(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     text = arguments.get("text")
     if not isinstance(text, str) and isinstance(arguments.get("value"), str):
         text = arguments.get("value")
@@ -1207,7 +1450,7 @@ async def handle_browser_submit_form(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     mode = str(arguments.get("mode", "native") or "native").lower()
     ref = arguments.get("ref")
     selector = arguments.get("selector")
@@ -1265,7 +1508,7 @@ async def handle_browser_select(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     ref = arguments.get("ref")
     selector = arguments.get("selector")
     if isinstance(ref, str) and ref:
@@ -1302,7 +1545,7 @@ async def handle_browser_upload(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     mode = str(arguments.get("mode", "input") or "input").lower()
     if mode not in {"input", "file_chooser"}:
         raise ValueError("browser_upload mode must be 'input' or 'file_chooser'")
@@ -1341,7 +1584,7 @@ async def handle_browser_download_wait(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     ref = arguments.get("ref")
     selector = arguments.get("selector")
     if isinstance(ref, str) and ref:
@@ -1401,7 +1644,7 @@ async def handle_browser_scroll(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     delta_x = int(arguments.get("delta_x", 0) or 0)
     delta_y = int(arguments.get("delta_y", 600) or 600)
     ref = arguments.get("ref")
@@ -1445,7 +1688,7 @@ async def handle_browser_hover(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     ref = arguments.get("ref")
     selector = arguments.get("selector")
     if isinstance(ref, str) and ref:
@@ -1482,7 +1725,7 @@ async def handle_browser_drag_drop(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     source_locator, source_info, source_kind = await _resolve_drag_endpoint(
         session,
         arguments.get("source_ref"),
@@ -1515,7 +1758,7 @@ async def handle_browser_press(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     text = arguments.get("text")
     if not isinstance(text, str) and isinstance(arguments.get("value"), str):
         text = arguments.get("value")
@@ -1539,7 +1782,7 @@ async def handle_browser_wait_for(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     selector = arguments.get("selector")
     timeout_ms = int(arguments.get("timeout_ms", 10000) or 10000)
     state = str(arguments.get("state") or "visible")
@@ -1583,7 +1826,7 @@ async def handle_browser_screenshot(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    session = await manager.get_live_session(str(arguments.get("session_id", "")))
+    session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
     content = await session.page.screenshot(type="png")
     return ToolResult(
         output="Captured screenshot.",
@@ -1602,8 +1845,22 @@ async def handle_browser_close(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     manager = _get_manager(context)
-    await manager.close_session(str(arguments.get("session_id", "")))
-    return ToolResult(output="Closed browser session.")
+    try:
+        closed = await manager.close_session(
+            str(arguments.get("session_id", "")),
+            owner=_owner_from_context(context),
+            allow_managed_descendant=bool(arguments.get("release_managed_descendant", False)),
+        )
+    except BrowserLifecycleError as exc:
+        return _lifecycle_error_result(exc)
+    return ToolResult(
+        output=(
+            "Closed browser session."
+            if closed
+            else "Browser session was already closed or does not exist."
+        ),
+        metadata={"closed": closed, "idempotent": not closed},
+    )
 
 
 async def handle_browser_save_auth_state(
@@ -1611,8 +1868,8 @@ async def handle_browser_save_auth_state(
 ) -> ToolResult:
     manager = _get_manager(context)
     session_id = str(arguments.get("session_id", ""))
-    storage_state = await manager.storage_state(session_id)
-    session = await manager.get_live_session(session_id)
+    storage_state = await manager.storage_state(session_id, owner=_owner_from_context(context))
+    session = await _get_owned_session(manager, context, session_id)
     current_url = getattr(session.page, "url", "")
     parsed = urlparse(str(current_url))
     origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""

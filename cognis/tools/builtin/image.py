@@ -14,7 +14,8 @@ from typing import Any
 import httpx
 
 from cognis.models.config import ImageGenerationResult
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolResult, ToolSource
 from cognis.runtime_context import current_user_email
 from cognis.store.queries import create_artifact_record
 from cognis.tools.argument_normalization import strip_empty_optional_values

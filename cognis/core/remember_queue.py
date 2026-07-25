@@ -20,9 +20,17 @@ from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, with_session_events_turn_id
 from cognis.runtime_context import scoped_runtime_context
-from cognis.store.models import RememberQueueRow, Session
+from cognis.store.models import Agent, RememberQueueRow, Session
 
 logger = get_logger(__name__)
+
+_QUEUE_ONLY_PAYLOAD_FIELDS = frozenset(
+    {
+        "originating_memory_backend",
+        "originating_agent_profile_id",
+        "memory_policy_fingerprint",
+    }
+)
 
 QUEUE_DEPTH = Gauge("cognis_remember_queue_depth", "Current remember queue depth")
 QUEUE_DROPPED = Counter("cognis_remember_queue_dropped_total", "Dropped remember queue items")
@@ -281,6 +289,21 @@ class RememberRetryQueue:
     async def _process(self, item: RememberQueueItem, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
             try:
+                if await self._hard_memory_disable_applies(item.payload):
+                    QUEUE_SUCCESS.inc()
+                    if self._session_factory is not None and item.item_id is not None:
+                        async with self._session_factory() as session:
+                            await session.execute(
+                                sa.delete(RememberQueueRow)
+                                .where(
+                                    RememberQueueRow.item_id == item.item_id,
+                                    RememberQueueRow.lease_token == item.lease_token,
+                                )
+                                .execution_options(synchronize_session=False)
+                            )
+                            await session.commit()
+                            await self._update_durable_depth_metric(session)
+                    return
                 resolved_payload = await self._resolve_payload(item.payload)
                 await self.worker.remember(**resolved_payload)
                 QUEUE_SUCCESS.inc()
@@ -365,6 +388,37 @@ class RememberRetryQueue:
                 if status == "failed":
                     await self._record_failure_notice(item, last_error)
 
+    async def _hard_memory_disable_applies(self, payload: dict[str, Any]) -> bool:
+        """Recheck current hard backend/profile vetoes before queued execution."""
+
+        if self._session_factory is None:
+            return False
+        agent_id = payload.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            return False
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(sa.select(Agent).where(Agent.agent_id == agent_id).limit(1))
+            ).scalar_one_or_none()
+        if row is None:
+            return False
+        capabilities = row.capabilities if isinstance(row.capabilities, dict) else {}
+        backend_id = capabilities.get("memory_backend", "mnemory")
+        if backend_id == "none":
+            return True
+        if not isinstance(backend_id, str):
+            return True
+        from cognis.providers.backends import get_backend
+
+        try:
+            get_backend("memory", backend_id)
+        except ValueError:
+            return True
+        profile_id = payload.get("originating_agent_profile_id")
+        profiles = row.agent_profiles if isinstance(row.agent_profiles, dict) else {}
+        profile = profiles.get(profile_id) if isinstance(profile_id, str) else None
+        return isinstance(profile, dict) and profile.get("memory_enabled") is False
+
     async def _has_durable_work(self) -> bool:
         if self._session_factory is None:
             return False
@@ -394,7 +448,11 @@ class RememberRetryQueue:
 
     async def _resolve_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if "messages" in payload:
-            return payload
+            return {
+                key: value
+                for key, value in payload.items()
+                if key not in _QUEUE_ONLY_PAYLOAD_FIELDS
+            }
         if self._event_reader is None:
             raise RuntimeError("Remember queue replay requires an Intaris event reader")
 

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from cognis.core.workflow_engine import WorkflowEngine
+from cognis.models.deliverable import Deliverable, DeliverableFormat, DeliverableStatus
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.models.workflow import (
     CompletionConfig,
@@ -69,6 +72,55 @@ def test_workflow_state_tracks_loop_iterations() -> None:
     assert state.loop_iterations[loop_key] == 1
     state.loop_iterations[loop_key] += 1
     assert state.loop_iterations[loop_key] == 2
+
+
+@pytest.mark.asyncio
+async def test_build_result_data_for_deliverable_omits_full_channel_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = object.__new__(WorkflowEngine)
+    large_tail = "hidden full deliverable tail"
+    deliverable = Deliverable(
+        deliverable_id="dlv_result",
+        step_run_id="step_run",
+        session_id="session",
+        conversation_id="conversation",
+        task_id="task",
+        owner_email="user@test.com",
+        content="Summary " + ("x" * 2500) + large_tail,
+        format=DeliverableFormat.MARKDOWN,
+        status=DeliverableStatus.APPROVED,
+        title="Result",
+        version=1,
+    )
+
+    async def _resolve_final_deliverable(*_: object) -> Deliverable:
+        return deliverable
+
+    monkeypatch.setattr(engine, "_resolve_final_deliverable", _resolve_final_deliverable)
+
+    result = await engine._build_result_data(  # noqa: SLF001
+        TaskModel(
+            task_id="task",
+            title="Task",
+            created_by="user@test.com",
+            agent_id="agent-1",
+            status=TaskStatus.COMPLETED,
+        ),
+        WorkflowState(),
+        Workflow(
+            workflow_id="wf",
+            name="Workflow",
+            steps=[StepDefinition(name="deliver", type="run", prompt="")],
+        ),
+    )
+
+    assert result is not None
+    assert result["final_deliverable_id"] == "dlv_result"
+    assert result["final_format"] == DeliverableFormat.MARKDOWN
+    assert "final_channel_content" not in result
+    assert len(str(result["final_content"])) <= 2000
+    assert large_tail not in str(result["final_content"])
 
 
 def test_evaluation_retry_reopens_terminal_todos() -> None:

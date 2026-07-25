@@ -75,8 +75,10 @@ const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
   'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
   'supports_openai_namespace_tools', 'supports_openai_allowed_tools',
-  'supports_responses_api', 'supports_extended_thinking', 'supports_image_generation',
-  'supported_openai_params', 'max_tools', 'input_cost_per_mtok', 'output_cost_per_mtok', 'tier'
+  'supports_openai_apply_patch', 'supports_responses_api', 'supports_extended_thinking',
+  'supports_image_generation', 'supported_image_mime_types', 'supported_audio_mime_types',
+  'supported_openai_params', 'max_tools', 'input_cost_per_mtok', 'output_cost_per_mtok', 'tier',
+  'provider_metadata', 'runtime_metadata'
 ];
 
 /** Parse a raw model dict from the DB into a typed ModelEntry. */
@@ -263,7 +265,7 @@ export function providerExecutorTargetError(form: ProviderFormState): string | n
   return null;
 }
 
-function parseExecutorSelector(raw: string): Record<string, string> | null {
+export function parseExecutorSelector(raw: string): Record<string, string> | null {
   const entries = raw
     .split(',')
     .map((value) => value.trim())

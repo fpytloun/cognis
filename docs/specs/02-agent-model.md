@@ -20,6 +20,22 @@ Primary agents are the main assistants users interact with directly. They
 have full personality, long-term memory via Mnemory, and can orchestrate
 work by delegating to secondary agents or spawning tasks.
 
+#### Provider-owned memory modes
+
+`AgentCapabilities.memory_backend` selects the agent-wide provider.
+`memory_backend_options` is a strictly validated provider-owned object; for
+Mnemory it contains `mode`. Runtime profiles cannot select a backend. They may
+set nullable `memory_enabled` and a shallow field-level
+`memory_backend_options` override. Resolution is backend defaults → agent
+options → profile options, with `memory_backend=none` and profile disablement
+as hard vetoes.
+
+Mnemory exposes `full_auto` (legacy automatic behavior), `proactive` (core
+bootstrap plus explicit tools), and `on_demand` (compact guidance and explicit
+tools without core bootstrap). Cognis freezes the generic policy at logical-turn
+admission. Agent-initiated profile switches therefore affect memory only on the
+next logical turn.
+
 | Property | Value |
 |---|---|
 | Memory | Full Mnemory integration (auto recall + remember) |

@@ -1,0 +1,41 @@
+id: grouped-navigation
+description: Synthetic grouped activity with short and long assistant messages separated by tools.
+trigger: "scenario:grouped-navigation"
+turns:
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["Short assistant before tools."]
+      - type: tool_call
+        call_id: call_grouped_navigation_1
+        name: memory_search
+        arguments: {query: "grouped navigation fixture"}
+  - role: assistant
+    steps:
+      - type: text
+        chunks:
+          - |
+            Long semantic assistant target.
+
+            This message is deliberately taller than the mobile viewport. It verifies exact semantic targeting rather than grouped-row targeting.
+
+            Section 1. Tool cards and sibling messages must not affect its measured height or start.
+            Section 2. Tool cards and sibling messages must not affect its measured height or start.
+            Section 3. Tool cards and sibling messages must not affect its measured height or start.
+            Section 4. Tool cards and sibling messages must not affect its measured height or start.
+            Section 5. Tool cards and sibling messages must not affect its measured height or start.
+            Section 6. Tool cards and sibling messages must not affect its measured height or start.
+            Section 7. Tool cards and sibling messages must not affect its measured height or start.
+            Section 8. Tool cards and sibling messages must not affect its measured height or start.
+            Section 9. Tool cards and sibling messages must not affect its measured height or start.
+            Section 10. Tool cards and sibling messages must not affect its measured height or start.
+            Section 11. Tool cards and sibling messages must not affect its measured height or start.
+            Section 12. Tool cards and sibling messages must not affect its measured height or start.
+      - type: tool_call
+        call_id: call_grouped_navigation_2
+        name: memory_search
+        arguments: {query: "second grouped navigation fixture"}
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["Short final assistant after tools."]

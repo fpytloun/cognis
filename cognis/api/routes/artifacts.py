@@ -176,7 +176,12 @@ async def get_signed_url(
     artifact_store = request.app.state.artifact_store
     if is_deliverable_ref(artifact_id):
         async with request.app.state.session_factory() as session:
-            ref = await get_accessible_deliverable_ref(session, artifact_id, user.email)
+            ref = await get_accessible_deliverable_ref(
+                session,
+                artifact_store,
+                artifact_id,
+                user.email,
+            )
         if ref is None:
             raise api_exception(404, "not_found", "Artifact not found")
         if mode == "view":
@@ -279,7 +284,7 @@ async def _serve_signed_deliverable(
     ):
         raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
     async with request.app.state.session_factory() as session:
-        ref = await get_deliverable_ref_unscoped(session, deliverable_id)
+        ref = await get_deliverable_ref_unscoped(session, artifact_store, deliverable_id)
     if ref is None or ref.filename != filename:
         raise api_exception(404, "not_found", "Artifact not found")
     headers = _artifact_response_headers(

@@ -27,6 +27,10 @@ const internal = writable<AudioPlayerState>(initialState);
 
 let activeAudio: HTMLAudioElement | null = null;
 let activeKey: string | null = null;
+let primedAudio: HTMLAudioElement | null = null;
+
+const silentDataUrl =
+  'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
 
 function detachActive(): void {
   if (activeAudio) {
@@ -55,7 +59,9 @@ export const audioPlayer = {
    */
   async play(key: string, url: string): Promise<HTMLAudioElement> {
     detachActive();
-    const audio = new Audio(url);
+    const audio = primedAudio ?? new Audio();
+    primedAudio = null;
+    audio.src = url;
     audio.preload = 'auto';
     activeAudio = audio;
     activeKey = key;
@@ -96,6 +102,29 @@ export const audioPlayer = {
       throw err;
     }
     return audio;
+  },
+
+  /**
+   * Prime an audio element from a user gesture so a later synthesis request
+   * can start playback after its network round-trip on browsers with strict
+   * autoplay policies.
+   */
+  async unlock(): Promise<boolean> {
+    if (typeof Audio === 'undefined') return false;
+    if (primedAudio) return true;
+
+    const audio = new Audio(silentDataUrl);
+    audio.preload = 'auto';
+    try {
+      await audio.play();
+      audio.pause();
+      audio.currentTime = 0;
+      primedAudio = audio;
+      return true;
+    } catch {
+      audio.src = '';
+      return false;
+    }
   },
 
   /** Stop and reset the current playback (no-op if nothing is playing). */

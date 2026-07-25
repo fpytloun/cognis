@@ -16,6 +16,7 @@ checked by both pytest (backend invariants) and vitest (client-store invariants)
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -30,6 +31,7 @@ except ImportError:
 MOCK_LLM_URL = os.environ.get("MOCK_LLM_URL", "http://localhost:8090")
 SCENARIOS_DIR = Path(__file__).parent.parent / "tests" / "e2e" / "scenarios"
 GOLDEN_DIR = Path(__file__).parent.parent / "tests" / "e2e" / "golden"
+CANONICAL_CAPTURE_DIR = Path(__file__).parent.parent / "ui" / "src" / "lib" / "chat-v2" / "captures"
 
 
 def main() -> int:
@@ -96,24 +98,42 @@ def main() -> int:
     print(f"Saved scenario: {scenario_path}")
     print("  Note: Edit the YAML to add the full step sequence.")
 
-    # Save golden JSONL (if available from the WS capture)
-    # The WS events are captured by the pytest e2e tests, not the mock-llm.
-    # We create a placeholder golden file.
+    # Promote the canonical ChatV2 records from the live WS golden.  The
+    # replay target discovers every JSONL file in this directory, so promotion
+    # must write the corpus consumed by production sync-engine replay rather
+    # than a disconnected placeholder.
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
     golden_path = GOLDEN_DIR / f"{scenario_name}.jsonl"
 
-    if not golden_path.exists():
-        print(f"\nNo golden file found at {golden_path}.")
-        print("Run the e2e tests to capture the golden stream:")
-        print(f"  uv run pytest tests/e2e/ -m e2e -k {scenario_name}")
+    if golden_path.exists():
+        events = [json.loads(line) for line in golden_path.read_text().splitlines() if line.strip()]
+        canonical = [
+            event
+            for event in events
+            if event.get("type") == "chat_v2_frame"
+            or event.get("type") in {"snapshot", "sync", "frame"}
+        ]
+        if not any(event.get("type") == "chat_v2_frame" for event in canonical):
+            print(f"\nGolden file has no canonical chat_v2_frame records: {golden_path}")
+            print("Run the live ChatV2 capture first; no replay capture was promoted.")
+            return 1
+        CANONICAL_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        capture_path = CANONICAL_CAPTURE_DIR / f"promoted-{scenario_name}.jsonl"
+        with capture_path.open("w") as f:
+            for event in canonical:
+                f.write(json.dumps(event) + "\n")
+        print(f"Promoted canonical capture: {capture_path}")
     else:
-        print(f"Golden file already exists: {golden_path}")
+        print(f"\nNo golden file found at {golden_path}.")
+        print("Run the live e2e tests to capture the canonical stream:")
+        print(f"  uv run pytest tests/e2e/ -m e2e -k {scenario_name}")
+        return 1
 
     print(f"\nScenario {scenario_name!r} promoted successfully.")
     print("Next steps:")
     print(f"  1. Edit {scenario_path} to add the full step sequence.")
     print(f"  2. Run: uv run pytest tests/e2e/ -m e2e -k {scenario_name}")
-    print("  3. Run: cd ui && npm test -- src/lib/chat-timeline.golden.test.ts")
+    print("  3. Run: make e2e-events-replay")
 
     return 0
 

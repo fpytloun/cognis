@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from cognis.models.tool import ToolCapability, stable_tool_id
+from cognis.providers.memory.mnemory import MnemoryHTTPStatusError
 from cognis.tools.builtin.memory import (
     ALL_MEMORY_TOOLS,
     MEMORY_DELETE_TOOL,
@@ -301,6 +304,50 @@ class TestMemoryToolHandlers:
         assert result.is_error
         assert "failed" in result.output.lower()
 
+    @pytest.mark.asyncio()
+    async def test_validation_error_instructs_agent_to_correct_and_retry(self) -> None:
+        provider = self._mock_provider()
+        request = httpx.Request("POST", "https://mnemory.test/api/memories")
+        response = httpx.Response(
+            422,
+            json={"detail": "Unknown category 'technology'. Valid categories: technical, home"},
+            request=request,
+        )
+        provider.add_memory_tool = AsyncMock(
+            side_effect=MnemoryHTTPStatusError(
+                httpx.HTTPStatusError(
+                    "unprocessable",
+                    request=request,
+                    response=response,
+                )
+            )
+        )
+
+        result = await handle_memory_tool(
+            "memory_add",
+            {"content": "test fact", "categories": ["technology"]},
+            provider,
+            "agent1",
+            "user@test.com",
+        )
+
+        assert result.is_error
+        assert json.loads(result.output) == {
+            "error": {
+                "code": "memory_validation_error",
+                "status_code": 422,
+                "detail": "Unknown category 'technology'. Valid categories: technical, home",
+                "retry": {
+                    "automatic": False,
+                    "action": "correct_arguments_then_retry",
+                    "guidance": (
+                        "Correct the invalid argument values described in detail, then retry the "
+                        "same memory tool call."
+                    ),
+                },
+            }
+        }
+
 
 class TestWorkflowToolDefinitions:
     """Test workflow tool definitions."""
@@ -309,8 +356,21 @@ class TestWorkflowToolDefinitions:
         from cognis.tools.builtin.workflow import workflow_tools
 
         defs = workflow_tools()
-        # Stage 36 added switch_executor, bringing the count to 9.
-        assert len(defs) == 9
+        names = {tool.name for tool in defs}
+        assert len(defs) == len(names)
+        assert {
+            "write_deliverable",
+            "attach_artifact",
+            "step_complete",
+            "step_request_questions",
+            "request_credential",
+            "request_auth_challenge",
+            "list_credentials",
+            "step_todo_write",
+            "step_todo_list",
+            "switch_executor",
+            "switch_agent_profile",
+        } == names
 
     def test_workflow_tool_names(self) -> None:
         from cognis.tools.builtin.workflow import workflow_tools

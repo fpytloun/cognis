@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,10 +17,12 @@ from sqlalchemy import select
 
 import cognis.providers.llm.codex as codex_support  # type: ignore[import-not-found]
 import cognis.providers.llm.litellm as litellm_provider_module
-from cognis.models.config import DEFAULT_MODEL_INFO, ModelInfo
+from cognis.core.tool_exposure import ToolDiscoveryMode
+from cognis.models.config import DEFAULT_MODEL_INFO, ModelInfo, normalize_reasoning_level
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm import retry as llm_retry
 from cognis.providers.llm.errors import (
+    LLMStreamProviderError,
     MidStreamErrorCategory,
     classify_llm_exception,
     classify_response_failure,
@@ -106,6 +109,29 @@ def test_classify_llm_exception_artifact_fetch_payload() -> None:
 
     assert payload["category"] == MidStreamErrorCategory.ARTIFACT_FETCH.value
     assert payload["artifact_urls"] == ["https://cognis.fpy.cz/api/v1/artifacts/content/a/b.png"]
+
+
+def test_classify_llm_exception_codex_attachment_download_timeout() -> None:
+    exc = _ProviderError(
+        "Direct Codex request failed: HTTP 400; Unable to download content from "
+        "the provided URL before the timeout.",
+        status_code=400,
+    )
+
+    payload = classify_llm_exception(exc)
+
+    assert payload["category"] == MidStreamErrorCategory.ARTIFACT_FETCH.value
+
+
+def test_classify_stream_provider_error_codex_attachment_download_timeout() -> None:
+    exc = LLMStreamProviderError(
+        "Direct Codex request failed: HTTP 400; Unable to download content from "
+        "the provided URL before the timeout."
+    )
+
+    payload = classify_llm_exception(exc)
+
+    assert payload["category"] == MidStreamErrorCategory.ARTIFACT_FETCH.value
 
 
 def test_classify_response_failure_invalid_image_as_attachment_input() -> None:
@@ -223,7 +249,11 @@ def test_chatgpt_responses_defaults_allow_explicit_prompt_cache_key_opt_in() -> 
         display_name="Codex",
         location="controller",
         backend="litellm",
-        config={"preset": "chatgpt", "use_prompt_cache_key": True},
+        config={
+            "preset": "chatgpt",
+            "codex_transport": "litellm",
+            "use_prompt_cache_key": True,
+        },
         status="active",
     )
 
@@ -245,17 +275,112 @@ def test_chatgpt_affinity_headers_merge_session_id() -> None:
         status="active",
     )
 
-    result = _apply_chatgpt_affinity_headers(
+    session_id = "sess_9f1c6a485c5d4f98ae5782bd54017773"
+    stable_uuid = "9f1c6a48-5c5d-4f98-ae57-82bd54017773"
+    first = _apply_chatgpt_affinity_headers(
         {"extra_headers": {"User-Agent": "cognis-test", "x-session-affinity": "old"}},
         provider=provider,
-        session_id="sess_123",
+        session_id=session_id,
+    )
+    second = _apply_chatgpt_affinity_headers({}, provider=provider, session_id=session_id)
+
+    headers = first["extra_headers"]
+    assert headers["User-Agent"] == "cognis-test"
+    assert headers["x-session-affinity"] == session_id
+    assert headers["session_id"] == session_id
+    assert headers["session-id"] == stable_uuid
+    assert headers["thread-id"] == stable_uuid
+    assert str(uuid.UUID(headers["x-client-request-id"])) == headers["x-client-request-id"]
+    assert second["extra_headers"]["x-client-request-id"] != headers["x-client-request-id"]
+
+
+def test_chatgpt_affinity_headers_keep_legacy_headers_for_non_uuid_session() -> None:
+    provider = LLMProvider(
+        provider_id="codex",
+        display_name="Codex",
+        location="controller",
+        backend="litellm",
+        config={"preset": "chatgpt"},
+        status="active",
     )
 
+    result = _apply_chatgpt_affinity_headers({}, provider=provider, session_id="sess_123")
+
     assert result["extra_headers"] == {
-        "User-Agent": "cognis-test",
         "x-session-affinity": "sess_123",
         "session_id": "sess_123",
     }
+
+
+def test_direct_codex_prompt_cache_key_uses_opted_in_stable_session_uuid() -> None:
+    session_id = "sess_9f1c6a485c5d4f98ae5782bd54017773"
+    stable_uuid = "9f1c6a48-5c5d-4f98-ae57-82bd54017773"
+    provider = LLMProvider(
+        provider_id="codex",
+        display_name="Codex",
+        location="controller",
+        backend="litellm",
+        config={
+            "preset": "chatgpt",
+            "codex_transport": "direct",
+            "use_prompt_cache_key": True,
+        },
+        status="active",
+    )
+
+    first = _apply_responses_request_defaults(
+        {},
+        provider=provider,
+        resolved_model="gpt-5.6-sol",
+        instructions="stable prefix",
+        session_id=session_id,
+    )
+    second = _apply_responses_request_defaults(
+        {},
+        provider=provider,
+        resolved_model="gpt-5.6-sol",
+        instructions="changed prefix",
+        session_id=session_id,
+    )
+
+    assert first["prompt_cache_key"] == stable_uuid
+    assert second["prompt_cache_key"] == stable_uuid
+    assert "prompt_cache_retention" not in first
+
+
+def test_direct_codex_prompt_cache_key_disabled_and_rejection_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED", raising=False)
+    session_id = "sess_9f1c6a485c5d4f98ae5782bd54017773"
+    provider = LLMProvider(
+        provider_id="codex",
+        display_name="Codex",
+        location="controller",
+        backend="litellm",
+        config={"preset": "chatgpt", "codex_transport": "direct"},
+        status="active",
+    )
+
+    disabled = _apply_responses_request_defaults(
+        {},
+        provider=provider,
+        resolved_model="gpt-5.6-sol",
+        instructions="stable prefix",
+        session_id=session_id,
+    )
+    provider.config["use_prompt_cache_key"] = True
+    rejected = _apply_responses_request_defaults(
+        {},
+        provider=provider,
+        resolved_model="gpt-5.6-sol",
+        instructions="stable prefix",
+        session_id=session_id,
+        prompt_cache_key_broken_keys={("codex", "gpt-5.6-sol")},
+    )
+
+    assert "prompt_cache_key" not in disabled
+    assert "prompt_cache_key" not in rejected
 
 
 def _jwt_with_claims(claims: Mapping[str, object]) -> str:
@@ -634,6 +759,69 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
     assert captured["input"] == [{"role": "user", "content": "hi"}]
     assert result["choices"][0]["message"]["content"] == "hello"
     assert result["usage"]["prompt_tokens"] == 2
+    await provider.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_direct_codex_prompt_cache_key_rejection_retries_and_caches_fallback(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="chatgpt",
+                display_name="ChatGPT Subscription",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "chatgpt",
+                    "default_model": "gpt-5.6-sol",
+                    "codex_transport": "direct",
+                    "use_prompt_cache_key": True,
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    calls: list[dict[str, object]] = []
+
+    async def _fake_auth(self: LiteLLMProvider, row: LLMProvider) -> codex_support.CodexAuth:
+        return codex_support.CodexAuth(access_token="token", account_id="account")
+
+    async def _completed_stream() -> object:
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "ok"}
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+    async def _fake_responses(self: Any, **kwargs: object) -> object:
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise _ProviderError("Unknown parameter: 'prompt_cache_key'", status_code=400)
+        return _completed_stream()
+
+    monkeypatch.setattr(LLMService, "_chatgpt_codex_auth", _fake_auth)
+    monkeypatch.setattr(litellm_provider_module.DirectCodexTransport, "responses", _fake_responses)
+
+    provider = LLMService(session_factory)
+    session_id = "sess_9f1c6a485c5d4f98ae5782bd54017773"
+    result = await provider.generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.6-sol",
+        provider_id="chatgpt",
+        cognis_session_id=session_id,
+    )
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert calls[0]["prompt_cache_key"] == "9f1c6a48-5c5d-4f98-ae57-82bd54017773"
+    assert "prompt_cache_key" not in calls[1]
+    assert ("chatgpt", "gpt-5.6-sol") in provider._prompt_cache_key_broken_keys
+    await provider.aclose()
     await engine.dispose()
 
 
@@ -961,6 +1149,65 @@ async def test_chatgpt_discovery_uses_codex_catalog_fallback(tmp_path: object) -
     assert by_id["gpt-5.5"]["max_input_tokens"] == 272_000
     assert by_id["gpt-5.5"]["max_output_tokens"] == 128_000
     assert by_id["future-codex"]["source"] == "configured"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_discovery_merges_live_codex_models(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        provider_row = LLMProvider(
+            provider_id="chatgpt",
+            display_name="ChatGPT Subscription",
+            location="controller",
+            backend="litellm",
+            config={"preset": "chatgpt", "default_model": "gpt-5.5"},
+            status="active",
+        )
+        session.add(provider_row)
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory, secrets_provider=_MemorySecrets())
+
+    async def fake_auth(_provider: LLMProvider) -> codex_support.CodexAuth:
+        return codex_support.CodexAuth(access_token="token", account_id="account")
+
+    async def fake_fetch(auth: codex_support.CodexAuth) -> list[dict[str, Any]]:
+        assert auth.access_token == "token"
+        assert auth.account_id == "account"
+        return [
+            {
+                "model_id": "gpt-5.6-sol",
+                "display_name": "GPT-5.6 Sol",
+                "context_window": 500_000,
+                "max_context_window": 500_000,
+                "max_input_tokens": 372_000,
+                "max_output_tokens": 128_000,
+                "supports_reasoning": True,
+                "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "source": "codex_remote",
+                "confidence": "live",
+            },
+            {
+                "model_id": "gpt-5.5",
+                "context_window": 401_000,
+                "source": "codex_remote",
+                "confidence": "live",
+            },
+        ]
+
+    monkeypatch.setattr(provider, "_chatgpt_codex_auth", fake_auth)
+    monkeypatch.setattr(litellm_provider_module, "fetch_codex_models", fake_fetch)
+
+    models = await provider.discover_models("chatgpt")
+    by_id = {model["model_id"]: model for model in models}
+
+    assert by_id["gpt-5.6-sol"]["source"] == "codex_remote"
+    assert by_id["gpt-5.6-sol"]["reasoning_efforts"][-1] == "ultra"
+    assert by_id["gpt-5.5"]["source"] == "codex_remote"
+    assert by_id["gpt-5.5"]["context_window"] == 401_000
     await engine.dispose()
 
 
@@ -2406,6 +2653,26 @@ def test_reasoning_translation_maps_openai_max_to_xhigh() -> None:
     assert prepared.effective_effort == "xhigh"
 
 
+def test_reasoning_translation_preserves_catalog_native_openai_ultra() -> None:
+    model_info = DEFAULT_MODEL_INFO.model_copy(
+        update={
+            "model_id": "gpt-5.6-sol",
+            "supports_reasoning": True,
+            "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        }
+    )
+
+    prepared = apply_reasoning_config(
+        {"reasoning_effort": "ultra"},
+        model_id="gpt-5.6-sol",
+        provider_preset="chatgpt",
+        model_info=model_info,
+    )
+
+    assert prepared.request_kwargs["reasoning_effort"] == "ultra"
+    assert prepared.effective_effort == "ultra"
+
+
 def test_reasoning_translation_uses_adaptive_default_for_claude_46() -> None:
     prepared = apply_reasoning_config(
         {"reasoning_effort": "default"},
@@ -2604,6 +2871,27 @@ def test_reasoning_efforts_for_reasoning_model_return_normalized_levels() -> Non
     assert reasoning_efforts_for_model(
         "gpt-5.4", provider_preset="openai", supports_reasoning=True
     ) == ["default", "none", "low", "medium", "high", "xhigh"]
+
+
+def test_reasoning_efforts_for_openai_model_use_catalog_native_levels() -> None:
+    model_info = DEFAULT_MODEL_INFO.model_copy(
+        update={
+            "model_id": "gpt-5.6-sol",
+            "supports_reasoning": True,
+            "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        }
+    )
+
+    assert reasoning_efforts_for_model(
+        "gpt-5.6-sol",
+        provider_preset="chatgpt",
+        model_info=model_info,
+        supports_reasoning=True,
+    ) == ["default", "none", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+
+def test_normalized_reasoning_levels_include_ultra() -> None:
+    assert normalize_reasoning_level("ultra") == "ultra"
 
 
 def test_reasoning_efforts_for_claude_46_exclude_xhigh() -> None:
@@ -3065,6 +3353,209 @@ async def test_litellm_provider_routes_executor_location_via_inference_router(
         model="gpt-4o-mini",
     )
     assert result["choices"][0]["message"]["content"] == "hello"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_maps_ollama_context_window_to_num_ctx(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Ollama",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={
+                    "preset": "ollama",
+                    "default_model": "llama3.2",
+                    "models": [
+                        {
+                            "model_id": "llama3.2",
+                            "context_window": 32768,
+                            "max_context_window": 16384,
+                        }
+                    ],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    async def _fake_executor_generate(
+        model: str,
+        messages: list[dict[str, object]],
+        provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        del messages, provider_row
+        captured["model"] = model
+        captured.update(request_kwargs)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_executor_generate)
+
+    result = await provider.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert captured["model"] == "ollama/llama3.2"
+    assert captured["num_ctx"] == 16384
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_maps_provider_ollama_num_ctx_to_model_info(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Ollama",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={
+                    "preset": "ollama",
+                    "default_model": "llama3.2",
+                    "num_ctx": 8192,
+                    "models": [{"model_id": "llama3.2", "max_context_window": 4096}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    async def _fake_executor_generate(
+        model: str,
+        messages: list[dict[str, object]],
+        provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        del model, messages, provider_row
+        captured.update(request_kwargs)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_executor_generate)
+
+    model_info = await provider.get_model_info("llama3.2", provider_id="ollama")
+    await provider.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert model_info.context_window == 4096
+    assert model_info.max_input_tokens == 4096
+    assert model_info.runtime_metadata["num_ctx"] == 4096
+    assert model_info.runtime_metadata["context_source"] == "provider.num_ctx"
+    assert captured["num_ctx"] == 4096
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_preserves_explicit_ollama_num_ctx(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Ollama",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={
+                    "preset": "ollama",
+                    "default_model": "llama3.2",
+                    "models": [{"model_id": "llama3.2", "context_window": 32768}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    async def _fake_executor_generate(
+        model: str,
+        messages: list[dict[str, object]],
+        provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        del model, messages, provider_row
+        captured.update(request_kwargs)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_executor_generate)
+
+    await provider.generate(messages=[{"role": "user", "content": "hi"}], num_ctx=4096)
+
+    assert captured["num_ctx"] == 4096
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_does_not_add_num_ctx_for_non_ollama(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                is_default=True,
+                config={
+                    "preset": "openai",
+                    "default_model": "gpt-4o-mini",
+                    "models": [{"model_id": "gpt-4o-mini", "context_window": 32768}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(provider, "_should_route_to_executor", lambda *_args: True)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    async def _fake_executor_generate(
+        model: str,
+        messages: list[dict[str, object]],
+        provider_row: LLMProvider,
+        *,
+        request_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        del model, messages, provider_row
+        captured.update(request_kwargs)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(provider, "_executor_generate", _fake_executor_generate)
+
+    await provider.generate(messages=[{"role": "user", "content": "hi"}])
+
+    assert "num_ctx" not in captured
     await engine.dispose()
 
 
@@ -3630,6 +4121,49 @@ async def test_litellm_tool_exposure_contract_enables_anthropic_defer_loading_fo
     )
 
     assert contract.anthropic_defer_loading is True
+    assert contract.discovery_mode is ToolDiscoveryMode.CONTROLLER_SEARCH
+    assert contract.anthropic_native_tool_search is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_exposure_contract_requires_both_native_search_capabilities(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="anthropic",
+                display_name="Anthropic",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "anthropic",
+                    "default_model": "claude-sonnet-4-6",
+                    "base_url": "https://api.anthropic.com",
+                    "api_base": "https://api.anthropic.com",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    provider = LiteLLMProvider(session_factory)
+    contract = await provider.resolve_tool_exposure_contract(
+        model_id="claude-sonnet-4-6",
+        model_info=ModelInfo(
+            model_id="claude-sonnet-4-6",
+            supports_tool_search=True,
+            supports_native_tool_search=True,
+            supports_defer_loading=True,
+        ),
+        provider_id="anthropic",
+        allow_tool_search=True,
+    )
+
+    assert contract.discovery_mode is ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH
+    assert contract.anthropic_native_tool_search is True
     await engine.dispose()
 
 
@@ -5167,7 +5701,59 @@ async def test_litellm_provider_logs_do_not_include_header_values(
 
 
 @pytest.mark.asyncio
-async def test_litellm_provider_discover_models_rejects_executor_location(
+async def test_litellm_provider_discover_models_routes_ollama_to_executor(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Executor Ollama",
+                location="executor",
+                backend="litellm",
+                owner_email="owner@example.com",
+                config={
+                    "preset": "ollama",
+                    "base_url": "http://localhost:11434",
+                    "api_base": "http://localhost:11434",
+                    "executor_id": "olorin",
+                    "default_model": "ornith:9b",
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def discover_models(self, **kwargs: object) -> list[dict[str, object]]:
+            self.calls.append(kwargs)
+            return [{"model_id": "ollama/ornith:9b", "name": "ornith:9b"}]
+
+    router = FakeRouter()
+    provider = LiteLLMProvider(session_factory, inference_router=router)
+    models = await provider.discover_models("ollama")
+
+    assert models == [{"model_id": "ollama/ornith:9b", "name": "ornith:9b"}]
+    assert router.calls == [
+        {
+            "preset": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "executor_id": "olorin",
+            "executor_labels": None,
+            "provider_id": "ollama",
+            "owner_email": "owner@example.com",
+        }
+    ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_discover_models_rejects_non_ollama_executor(
     tmp_path: object,
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
@@ -5178,15 +5764,59 @@ async def test_litellm_provider_discover_models_rejects_executor_location(
                 display_name="Remote OpenAI",
                 location="executor",
                 backend="litellm",
-                config={"default_model": "gpt-4o-mini"},
+                config={
+                    "preset": "openai",
+                    "base_url": "http://ollama-compatible.example.test",
+                    "api_base": "http://ollama-compatible.example.test",
+                    "default_model": "gpt-4o-mini",
+                    "executor_id": "olorin",
+                },
                 status="active",
             )
         )
         await session.commit()
 
-    provider = LiteLLMProvider(session_factory)
-    with pytest.raises(ValueError, match="controller-side providers"):
+    provider = LiteLLMProvider(session_factory, inference_router=object())
+    with pytest.raises(ValueError, match="supports Ollama providers only"):
         await provider.discover_models("remote")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_discover_models_preview_routes_ollama_to_executor(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+
+    class FakeRouter:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def discover_models(self, **kwargs: object) -> list[dict[str, object]]:
+            self.calls.append(kwargs)
+            return [{"model_id": "ollama/llama3.2", "name": "llama3.2"}]
+
+    router = FakeRouter()
+    provider = LiteLLMProvider(session_factory, inference_router=router)
+    models = await provider.discover_models_preview(
+        preset="ollama",
+        base_url="http://localhost:11434",
+        location="executor",
+        executor_labels={"host": "mac"},
+    )
+
+    assert models == [{"model_id": "ollama/llama3.2", "name": "llama3.2"}]
+    assert router.calls == [
+        {
+            "preset": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "executor_id": None,
+            "executor_labels": {"host": "mac"},
+            "provider_id": None,
+            "owner_email": None,
+        }
+    ]
     await engine.dispose()
 
 
@@ -5658,6 +6288,278 @@ async def test_anthropic_custom_base_url_discovers_openai_compatible_models(
 
     assert requested_urls == ["http://localhost:4000/v1/models"]
     assert models[0]["model_id"] == "claude-opus-4-7"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ollama_discovery_enriches_tags_with_show(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+    requested_urls: list[str] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    async def _fake_get(self, url, **kwargs):
+        del self, kwargs
+        requested_urls.append(str(url))
+        return FakeResponse(
+            {
+                "models": [
+                    {
+                        "name": "llama3.2:latest",
+                        "digest": "sha256:abc",
+                        "size": 1234,
+                        "modified_at": "2026-01-01T00:00:00Z",
+                    }
+                ]
+            }
+        )
+
+    async def _fake_post(self, url, **kwargs):
+        del self
+        requested_urls.append(str(url))
+        assert kwargs["json"] == {"model": "llama3.2:latest"}
+        return FakeResponse(
+            {
+                "parameters": "temperature 0.7\nnum_ctx 4096",
+                "capabilities": ["completion", "tools"],
+                "details": {
+                    "family": "llama",
+                    "parameter_size": "3.2B",
+                    "quantization_level": "Q4_K_M",
+                },
+                "model_info": {"llama.context_length": 131072},
+            }
+        )
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    models = await provider._discover_models_remote("ollama", "http://localhost:11434", "")
+
+    assert requested_urls == [
+        "http://localhost:11434/api/tags",
+        "http://localhost:11434/api/show",
+    ]
+    assert models == [
+        {
+            "model_id": "ollama/llama3.2:latest",
+            "name": "llama3.2:latest",
+            "display_name": "llama3.2:latest",
+            "source": "ollama",
+            "confidence": "live",
+            "context_window": 4096,
+            "max_context_window": 131072,
+            "max_input_tokens": 4096,
+            "runtime_metadata": {
+                "provider": "ollama",
+                "model_name": "llama3.2:latest",
+                "num_ctx": 4096,
+                "context_source": "parameters.num_ctx",
+            },
+            "supports_tools": True,
+            "supports_vision": False,
+            "supports_embedding": False,
+            "supports_streaming": True,
+            "provider_metadata": {
+                "provider": "ollama",
+                "source": "ollama:/api/tags+show",
+                "name": "llama3.2:latest",
+                "digest": "sha256:abc",
+                "size": 1234,
+                "modified_at": "2026-01-01T00:00:00Z",
+                "details": {
+                    "family": "llama",
+                    "parameter_size": "3.2B",
+                    "quantization_level": "Q4_K_M",
+                },
+                "parameters": "temperature 0.7\nnum_ctx 4096",
+                "capabilities": ["completion", "tools"],
+                "model_info": {"llama.context_length": 131072},
+                "max_context_source": "model_info.llama.context_length",
+            },
+        }
+    ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ollama_discovery_tag_only_does_not_synthesize_num_ctx(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    provider = LiteLLMProvider(session_factory)
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict[str, object]:
+            return {
+                "models": [
+                    {
+                        "name": "llama3.2:latest",
+                        "digest": "sha256:abc",
+                    }
+                ]
+            }
+
+    async def _fake_get(self, url, **kwargs):
+        del self, url, kwargs
+        return FakeResponse()
+
+    async def _fake_post(self, url, **kwargs):
+        del self, url, kwargs
+        raise RuntimeError("show unavailable")
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _fake_get)
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+
+    models = await provider._discover_models_remote("ollama", "http://localhost:11434", "")
+
+    assert models == [
+        {
+            "model_id": "ollama/llama3.2:latest",
+            "name": "llama3.2:latest",
+            "display_name": "llama3.2:latest",
+            "source": "ollama",
+            "confidence": "discovered",
+            "provider_metadata": {
+                "provider": "ollama",
+                "source": "ollama:/api/tags",
+                "name": "llama3.2:latest",
+                "digest": "sha256:abc",
+            },
+        }
+    ]
+    await engine.dispose()
+
+
+def test_ollama_preset_prefixes_manual_model_ids() -> None:
+    row = LLMProvider(
+        provider_id="ollama",
+        display_name="Ollama",
+        location="controller",
+        backend="litellm",
+        config={"preset": "ollama"},
+        status="active",
+    )
+
+    assert LiteLLMProvider._apply_model_prefix("llama3.2:latest", row) == "ollama/llama3.2:latest"
+    assert LiteLLMProvider._apply_model_prefix("hf.co/acme/custom-llama", row) == (
+        "ollama/hf.co/acme/custom-llama"
+    )
+    assert LiteLLMProvider._apply_model_prefix("ollama/llama3.2:latest", row) == (
+        "ollama/llama3.2:latest"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ollama_enrich_uses_show_and_preserves_user_context_override(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama",
+                display_name="Ollama",
+                location="controller",
+                backend="litellm",
+                config={
+                    "preset": "ollama",
+                    "default_model": "llama3.2:latest",
+                    "base_url": "http://localhost:11434",
+                    "models": [{"model_id": "llama3.2:latest", "context_window": 4096}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _fake_post(self, url, **kwargs):
+        del self, url, kwargs
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, object]:
+                return {
+                    "capabilities": ["completion", "tools"],
+                    "model_info": {"llama.context_length": 8192},
+                }
+
+        return FakeResponse()
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("llama3.2:latest", provider_id="ollama")
+
+    assert model_info.context_window == 4096
+    assert model_info.max_context_window == 8192
+    assert model_info.supports_tools is True
+    assert model_info.provider_metadata["provider"] == "ollama"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ollama_executor_model_info_does_not_probe_controller(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="ollama-executor",
+                display_name="Ollama Executor",
+                location="executor",
+                backend="litellm",
+                config={
+                    "preset": "ollama",
+                    "default_model": "llama3.2",
+                    "models": [{"model_id": "llama3.2", "context_window": 4096}],
+                },
+                status="active",
+            )
+        )
+        await session.commit()
+
+    async def _unexpected_post(*_args, **_kwargs):
+        raise AssertionError("executor-routed Ollama metadata must not use controller HTTP")
+
+    import httpx
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _unexpected_post)
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.get_model_info", lambda **_: {})
+
+    provider = LiteLLMProvider(session_factory)
+    model_info = await provider.get_model_info("llama3.2", provider_id="ollama-executor")
+
+    assert model_info.context_window == 4096
+    assert model_info.runtime_metadata["num_ctx"] == 4096
     await engine.dispose()
 
 

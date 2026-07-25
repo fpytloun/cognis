@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from cognis.api.common import require_current_user
+from cognis.api.common import forbid_mutation_for_viewer, require_current_user
 from cognis.api.models import CredentialUpsertRequest
 from cognis.core.credential_grants import grant_credential_to_agent
 from cognis.core.notification_resolution import (
@@ -115,6 +115,7 @@ async def resolve_notification(
     For step questions: ``decision`` is ``continue`` or ``cancel``, ``response`` is the answer.
     """
     user = require_current_user(request)
+    forbid_mutation_for_viewer(request)
     svc = _get_service(request)
 
     # Verify ownership before resolving
@@ -173,6 +174,8 @@ async def resolve_notification(
         data["feedback"] = payload.feedback
     if payload.response_payload:
         data["response_payload"] = payload.response_payload
+    if notification.notification_type == "step_question" and payload.response_payload is not None:
+        data = dict(payload.response_payload)
 
     if notification.notification_type == "credential_request" and payload.decision != "approve":
         data = {}

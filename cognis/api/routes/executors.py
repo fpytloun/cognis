@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -22,18 +23,26 @@ from cognis.core.executor_policy import (
     validate_executor_mcp_scope,
 )
 from cognis.core.executor_token_locks import executor_token_lock
+from cognis.logging import get_logger
+from cognis.models.executor_inference import (
+    executor_local_inference_config_status,
+    resolve_executor_local_inference_config,
+)
+from cognis.models.executor_resources import normalize_executor_resource_snapshot
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
+from cognis.store.local_models import lock_local_model_dispatch_guard
 from cognis.store.models import ExecutorRow
 from cognis.store.queries import (
+    bump_executor_reconfigure_generation,
     create_executor,
     delete_executor,
     get_executor_row,
     list_executors,
     update_executor,
-    update_executor_runtime_state,
 )
 
 router = APIRouter(tags=["executors"])
+_logger = get_logger(__name__)
 LOCAL_EXECUTOR_TYPES = {"in_process", "subprocess"}
 
 
@@ -68,6 +77,20 @@ def _require_executor_mutation_access(request: Request, row: Any) -> None:
 
 
 def _executor_to_response(row: Any) -> ExecutorConfigResponse:
+    inference_config = resolve_executor_local_inference_config(row.config or {})
+    normalized_config = dict(row.config or {})
+    normalized_config["local_inference_enabled"] = inference_config.local_inference_enabled
+    normalized_config["ollama_runtime"] = inference_config.ollama_runtime.model_dump(
+        mode="json",
+        exclude={"endpoint"},
+    )
+    runtime_metadata = dict(getattr(row, "runtime_metadata", None) or {})
+    resource_snapshot = normalize_executor_resource_snapshot(
+        runtime_metadata.get("resource_snapshot")
+    )
+    received_at = _resource_snapshot_received_at(runtime_metadata, row)
+    runtime_metadata.pop("resource_snapshot", None)
+    runtime_metadata.pop("resource_snapshot_received_at", None)
     return ExecutorConfigResponse(
         executor_id=row.executor_id,
         name=row.name,
@@ -75,12 +98,22 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
         labels=row.labels or {},
         enabled_tools=row.enabled_tools or [],
         enabled_tool_groups=row.enabled_tool_groups or [],
-        config=row.config or {},
+        config=normalized_config,
+        local_inference_enabled=inference_config.local_inference_enabled,
+        ollama_management_enabled=inference_config.ollama_management_enabled,
+        ollama_port=inference_config.ollama_runtime.port,
+        ollama_endpoint=inference_config.ollama_runtime.endpoint,
+        local_inference_config_status=executor_local_inference_config_status(row),
         status=row.status,
         runtime_state=getattr(row, "runtime_state", "offline"),
         desired_config_version=getattr(row, "desired_config_version", 0),
         applied_config_version=getattr(row, "applied_config_version", 0),
-        runtime_metadata=getattr(row, "runtime_metadata", None) or {},
+        runtime_metadata=runtime_metadata,
+        resource_snapshot=(
+            resource_snapshot.with_current_freshness(received_at=received_at)
+            if resource_snapshot is not None
+            else None
+        ),
         last_observed_at=getattr(row, "last_observed_at", None),
         is_default=row.is_default,
         shared=_executor_is_shared(row),
@@ -88,6 +121,22 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def _resource_snapshot_received_at(
+    runtime_metadata: dict[str, Any],
+    row: Any,
+) -> datetime | None:
+    value = runtime_metadata.get("resource_snapshot_received_at")
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+    last_observed_at = getattr(row, "last_observed_at", None)
+    return last_observed_at if isinstance(last_observed_at, datetime) else None
 
 
 async def _clear_executor_defaults(session: Any, owner_email: str) -> None:
@@ -122,6 +171,10 @@ async def create_executor_route(
     request: Request, body: ExecutorCreateRequest
 ) -> ExecutorConfigResponse:
     user = require_current_user(request)
+    try:
+        resolve_executor_local_inference_config(body.config)
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     _enforce_executor_creation_rules(user, executor_type=body.executor_type, shared=body.shared)
     policy = await load_executor_policy(request.app.state.session_factory)
     try:
@@ -156,6 +209,9 @@ async def create_executor_route(
         if row.executor_type == "websocket":
             row.desired_config_version = 1
         await session.commit()
+    local_model_reconciler = getattr(request.app.state, "local_model_reconciler", None)
+    if local_model_reconciler is not None:
+        local_model_reconciler.trigger(executor_id=row.executor_id)
     return _executor_to_response(row)
 
 
@@ -204,16 +260,32 @@ async def update_executor_route(
 ) -> ExecutorConfigResponse:
     user = require_current_user(request)
     updates = body.model_dump(exclude_none=True)
+    expected_config_version = updates.pop("expected_config_version", None)
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
     policy = await load_executor_policy(request.app.state.session_factory)
     async with request.app.state.session_factory() as session:
+        await lock_local_model_dispatch_guard(session)
         existing = await get_executor_row(
             session, executor_id, owner_email=user.email, include_shared=True
         )
         if existing is None:
             raise api_exception(404, "not_found", "Executor not found")
         _require_executor_mutation_access(request, existing)
+        if (
+            expected_config_version is not None
+            and int(existing.desired_config_version or 0) != expected_config_version
+        ):
+            raise api_exception(
+                409,
+                "executor_config_conflict",
+                "Executor configuration changed; reload it before saving",
+            )
+        previous_inference = resolve_executor_local_inference_config(existing.config or {})
+        try:
+            resolve_executor_local_inference_config(updates.get("config", existing.config or {}))
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         executor_type = str(updates.get("executor_type", existing.executor_type))
         next_shared = bool(updates.get("shared", _executor_is_shared(existing)))
         executor_owner = _resolve_executor_owner(user, next_shared)
@@ -244,16 +316,46 @@ async def update_executor_route(
         )
         if runtime_affecting:
             connected = request.app.state.providers.executor.websocket.get_connection(executor_id)
-            desired_version = max(int(getattr(row, "desired_config_version", 0) or 0), 0) + 1
-            await update_executor_runtime_state(
+            await bump_executor_reconfigure_generation(
                 session,
                 executor_id,
-                desired_config_version=desired_version,
                 runtime_state="reconfiguring" if connected is not None else "stale",
             )
+            await session.refresh(row)
         await session.commit()
+        current_inference = resolve_executor_local_inference_config(row.config or {})
     if runtime_affecting:
         schedule_executor_reconfigure(request.app, executor_id)
+    inference_changed = previous_inference != current_inference
+    if any(key in updates for key in {"labels", "status", "shared"}) or inference_changed:
+        local_model_reconciler = getattr(
+            request.app.state,
+            "local_model_reconciler",
+            None,
+        )
+        if local_model_reconciler is not None:
+            local_model_reconciler.trigger(executor_id=executor_id)
+    if inference_changed:
+        _logger.info(
+            "executor local inference capability updated",
+            extra={
+                "extra_data": {
+                    "action": "executor.local_inference.update",
+                    "actor_email": user.email,
+                    "actor_role": user.role,
+                    "executor_id": executor_id,
+                    "owner_email": row.owner_email,
+                    "previous": {
+                        "local_inference_enabled": previous_inference.local_inference_enabled,
+                        "ollama_management_enabled": previous_inference.ollama_management_enabled,
+                    },
+                    "current": {
+                        "local_inference_enabled": current_inference.local_inference_enabled,
+                        "ollama_management_enabled": current_inference.ollama_management_enabled,
+                    },
+                }
+            },
+        )
     return _executor_to_response(row)
 
 
@@ -261,6 +363,7 @@ async def update_executor_route(
 async def delete_executor_route(request: Request, executor_id: str) -> None:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
+        await lock_local_model_dispatch_guard(session)
         row = await get_executor_row(
             session, executor_id, owner_email=user.email, include_shared=True
         )

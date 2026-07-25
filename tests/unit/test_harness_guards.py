@@ -8,12 +8,14 @@ import pytest
 
 from cognis.core.harness_guards import (
     LoopGuardState,
+    SameTurnToolCallLedger,
     argument_sanity_rejection_payload,
     check_argument_sanity,
     check_loop_guard,
     loop_guard_rejection_payload,
     record_tool_call,
     record_tool_result,
+    same_turn_duplicate_rejection_payload,
 )
 
 
@@ -112,6 +114,33 @@ class TestLoopGuard:
         assert data["reason"] == "loop_detected"
         assert data["tool"] == "foo"
         assert data["message"] == "teach back"
+
+
+class TestSameTurnToolCallLedger:
+    def test_record_matches_canonical_argument_order(self) -> None:
+        ledger = SameTurnToolCallLedger()
+        ledger.record("bash", {"b": 2, "a": 1})
+
+        assert ledger.already_executed("bash", {"a": 1, "b": 2}) is True
+        assert ledger.already_executed("bash", {"a": 2, "b": 1}) is False
+
+    def test_seed_from_copies_retry_lineage(self) -> None:
+        source = SameTurnToolCallLedger()
+        source.record("agent_conversation_create", {"agent_id": "laforge"})
+        retry = SameTurnToolCallLedger()
+
+        retry.seed_from(source)
+
+        assert retry.already_executed(
+            "agent_conversation_create", {"agent_id": "laforge"}
+        )
+
+    def test_rejection_payload_is_stable(self) -> None:
+        payload = json.loads(same_turn_duplicate_rejection_payload("bash", {"command": "x"}))
+
+        assert payload["status"] == "skipped"
+        assert payload["reason"] == "duplicate_tool_call_same_turn_lineage"
+        assert payload["tool"] == "bash"
 
 
 class TestArgumentSanity:

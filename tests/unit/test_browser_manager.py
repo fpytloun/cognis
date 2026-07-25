@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,10 +12,28 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.tools.executor.browser.manager import (
+    BrowserLifecycleError,
     BrowserManager,
     BrowserSession,
+    BrowserSessionOwner,
     BrowserSessionSettings,
 )
+
+
+def _browser_owner(
+    scope_id: str,
+    *,
+    parent_session_id: str | None = None,
+    user_email: str = "user@example.com",
+) -> BrowserSessionOwner:
+    return BrowserSessionOwner(
+        execution_scope_id=scope_id,
+        session_id=scope_id,
+        conversation_id=f"conversation-{scope_id}",
+        user_email=user_email,
+        agent_id="agent-1",
+        parent_session_id=parent_session_id,
+    )
 
 
 def test_browser_manager_derives_persistent_profile_from_origin() -> None:
@@ -25,6 +45,849 @@ def test_browser_manager_derives_persistent_profile_from_origin() -> None:
     )
     assert mode == "persistent_local"
     assert profile_id == "www-reddit-com"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_scopes_inspect_and_close_to_owner() -> None:
+    manager = BrowserManager()
+    closed: list[bool] = []
+
+    class _Context:
+        async def close(self) -> None:
+            closed.append(True)
+
+    owner = _browser_owner("scope-owner")
+    unrelated = _browser_owner("scope-other")
+    session = BrowserSession(
+        session_id="owned-session",
+        context=_Context(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+    manager._sessions[session.session_id] = session  # noqa: SLF001
+
+    assert [item["session_id"] for item in await manager.list_sessions(owner=owner)] == [
+        "owned-session"
+    ]
+    assert await manager.list_sessions(owner=unrelated) == []
+    last_used_at = session.last_used_at
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.get_live_session(session.session_id, owner=unrelated)
+    assert exc_info.value.code == "browser_unauthorized"
+    assert session.last_used_at == last_used_at
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.close_session(session.session_id, owner=unrelated)
+    assert exc_info.value.code == "browser_unauthorized"
+    assert closed == []
+
+    assert await manager.close_session(session.session_id, owner=owner) is True
+    assert await manager.close_session(session.session_id, owner=owner) is False
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_parent_can_release_only_managed_descendant() -> None:
+    manager = BrowserManager()
+
+    class _Context:
+        async def close(self) -> None:
+            return None
+
+    controller = _browser_owner("controller")
+    descendant = BrowserSession(
+        session_id="descendant",
+        context=_Context(),
+        page=SimpleNamespace(url=""),
+        owner=_browser_owner("child", parent_session_id="controller"),
+    )
+    unrelated = BrowserSession(
+        session_id="unrelated",
+        context=_Context(),
+        page=SimpleNamespace(url=""),
+        owner=_browser_owner("peer", parent_session_id="different-controller"),
+    )
+    manager._sessions = {  # noqa: SLF001
+        descendant.session_id: descendant,
+        unrelated.session_id: unrelated,
+    }
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.close_session(
+            descendant.session_id,
+            owner=controller,
+            allow_managed_descendant=True,
+        )
+    assert exc_info.value.code == "browser_session_active"
+
+    manager._terminal_owners["child"] = descendant.owner  # type: ignore[assignment]  # noqa: SLF001
+    assert (
+        await manager.close_session(
+            descendant.session_id,
+            owner=controller,
+            allow_managed_descendant=True,
+        )
+        is True
+    )
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.close_session(
+            unrelated.session_id,
+            owner=controller,
+            allow_managed_descendant=True,
+        )
+    assert exc_info.value.code == "browser_unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_terminal_cleanup_is_automatic_and_idempotent() -> None:
+    manager = BrowserManager()
+    closed: list[str] = []
+
+    class _Context:
+        async def close(self) -> None:
+            closed.append("closed")
+
+    owner = _browser_owner("child", parent_session_id="controller")
+    manager._sessions["child-browser"] = BrowserSession(  # noqa: SLF001
+        session_id="child-browser",
+        context=_Context(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+
+    assert await manager.mark_owner_terminal(owner) == 1
+    assert await manager.mark_owner_terminal(owner) == 0
+    assert closed == ["closed"]
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_rejects_registration_after_terminal_notification() -> None:
+    manager = BrowserManager()
+    owner = _browser_owner("child", parent_session_id="controller")
+    manager._terminal_owners[owner.execution_scope_id] = owner  # noqa: SLF001
+
+    class _Context:
+        async def close(self) -> None:
+            return None
+
+    session = BrowserSession(
+        session_id="late-browser",
+        context=_Context(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        manager._register_session_locked(session)  # noqa: SLF001
+
+    assert exc_info.value.code == "browser_session_terminal"
+    assert manager.active_session_count == 0
+    await manager._session_close_tasks["late-browser"]  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_rejects_public_open_after_terminal_notification() -> None:
+    manager = BrowserManager()
+    owner = _browser_owner("child", parent_session_id="controller")
+    await manager.mark_owner_terminal(owner)
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.open_session(
+            session_id="late-browser",
+            url="https://example.com",
+            owner=owner,
+        )
+
+    assert exc_info.value.code == "browser_session_terminal"
+    assert manager.active_session_count == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_retries_failed_terminal_close() -> None:
+    manager = BrowserManager()
+
+    class _Context:
+        attempts = 0
+
+        async def close(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("transient close failure")
+
+    context = _Context()
+    owner = _browser_owner("child", parent_session_id="controller")
+    manager._sessions["child-browser"] = BrowserSession(  # noqa: SLF001
+        session_id="child-browser",
+        context=context,
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.mark_owner_terminal(owner)
+    assert exc_info.value.code == "browser_session_close_failed"
+    assert (await manager.list_sessions(owner=_browser_owner("controller")))[0]["state"] == (
+        "terminal_cleanup_pending"
+    )
+    assert await manager.mark_owner_terminal(owner) == 1
+    assert context.attempts == 2
+    assert await manager.list_sessions(owner=_browser_owner("controller")) == []
+
+
+@pytest.mark.asyncio
+async def test_pending_close_retains_capacity_and_profile_lock(tmp_path: Path) -> None:
+    manager = BrowserManager(max_sessions=1, profile_base_dir=str(tmp_path))
+    owner = _browser_owner("child", parent_session_id="controller")
+    manager._ensure_profile_owner("profile", owner)  # noqa: SLF001
+    pending = BrowserSession(
+        session_id="pending-browser",
+        context=SimpleNamespace(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+        profile_mode="persistent_local",
+        profile_id="profile",
+        idle_timeout_seconds=1,
+        last_used_at=datetime.now(UTC) - timedelta(seconds=60),
+    )
+    manager._closing_sessions[pending.session_id] = pending  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="limit exceeded"):
+        await manager._reserve_open_slot(  # noqa: SLF001
+            headless=True,
+            wait_for_slot=False,
+            wait_timeout_seconds=0,
+        )
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager._reserve_profile_id("profile", owner=owner)  # noqa: SLF001
+    assert exc_info.value.code == "browser_profile_locked"
+    assert (
+        await manager.inspect_session("pending-browser", owner=owner)
+        == (await manager.list_sessions(owner=owner))[0]
+    )
+    profiles = await manager.list_profiles(owner=owner)
+    assert profiles[0]["currently_in_use"] is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_calls_close_context_once() -> None:
+    manager = BrowserManager()
+    owner = _browser_owner("owner")
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    attempts = 0
+
+    class _Context:
+        async def close(self) -> None:
+            nonlocal attempts
+            attempts += 1
+            close_started.set()
+            await release_close.wait()
+
+    manager._sessions["browser"] = BrowserSession(  # noqa: SLF001
+        session_id="browser",
+        context=_Context(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+
+    first = asyncio.create_task(manager.close_session("browser", owner=owner))
+    await close_started.wait()
+    second = asyncio.create_task(manager.close_session("browser", owner=owner))
+    await asyncio.sleep(0)
+    assert attempts == 1
+
+    release_close.set()
+    assert await asyncio.gather(first, second) == [True, True]
+    assert attempts == 1
+    assert manager._closing_sessions == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_concurrent_terminal_cleanup_closes_context_once() -> None:
+    manager = BrowserManager()
+    owner = _browser_owner("child", parent_session_id="controller")
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    attempts = 0
+
+    class _Context:
+        async def close(self) -> None:
+            nonlocal attempts
+            attempts += 1
+            close_started.set()
+            await release_close.wait()
+
+    manager._sessions["browser"] = BrowserSession(  # noqa: SLF001
+        session_id="browser",
+        context=_Context(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+
+    first = asyncio.create_task(manager.mark_owner_terminal(owner))
+    await close_started.wait()
+    second = asyncio.create_task(manager.mark_owner_terminal(owner))
+    await asyncio.sleep(0)
+    assert attempts == 1
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await second
+    assert exc_info.value.code == "browser_session_close_failed"
+    release_close.set()
+    assert await first == 1
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_in_progress_terminal_close_does_not_block_sibling_cleanup() -> None:
+    manager = BrowserManager()
+    owner = _browser_owner("child", parent_session_id="controller")
+    blocked_started = asyncio.Event()
+    release_blocked = asyncio.Event()
+    sibling_closed = asyncio.Event()
+
+    class _BlockedContext:
+        async def close(self) -> None:
+            blocked_started.set()
+            await release_blocked.wait()
+
+    class _SiblingContext:
+        async def close(self) -> None:
+            sibling_closed.set()
+
+    manager._sessions["blocked"] = BrowserSession(  # noqa: SLF001
+        session_id="blocked",
+        context=_BlockedContext(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+    manager._sessions["sibling"] = BrowserSession(  # noqa: SLF001
+        session_id="sibling",
+        context=_SiblingContext(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=owner,
+    )
+    blocked_close = asyncio.create_task(manager.close_session("blocked", owner=owner))
+    await blocked_started.wait()
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.mark_owner_terminal(owner)
+
+    assert exc_info.value.code == "browser_session_close_failed"
+    assert sibling_closed.is_set()
+    assert "sibling" not in manager._sessions  # noqa: SLF001
+    release_blocked.set()
+    assert await blocked_close is True
+
+
+@pytest.mark.asyncio
+async def test_manager_cleanup_attempts_all_sessions_after_first_close_failure() -> None:
+    manager = BrowserManager()
+    calls: list[str] = []
+
+    class _RetryContext:
+        attempts = 0
+
+        async def close(self) -> None:
+            self.attempts += 1
+            calls.append(f"retry-{self.attempts}")
+            if self.attempts == 1:
+                raise RuntimeError("first close failed")
+
+    class _SiblingContext:
+        async def close(self) -> None:
+            calls.append("sibling")
+
+    retry_context = _RetryContext()
+    manager._sessions["retry"] = BrowserSession(  # noqa: SLF001
+        session_id="retry",
+        context=retry_context,
+        page=SimpleNamespace(url="https://example.com"),
+    )
+    manager._sessions["sibling"] = BrowserSession(  # noqa: SLF001
+        session_id="sibling",
+        context=_SiblingContext(),
+        page=SimpleNamespace(url="https://example.com"),
+    )
+
+    await manager.cleanup()
+
+    assert calls[:2] == ["retry-1", "sibling"]
+    assert retry_context.attempts == 2
+    assert manager._sessions == {}  # noqa: SLF001
+    assert manager._closing_sessions == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_terminal_open_race_retains_rejected_context_until_close_succeeds(
+    tmp_path: Path,
+) -> None:
+    manager = BrowserManager(profile_base_dir=str(tmp_path))
+    owner = _browser_owner("child", parent_session_id="controller")
+    open_started = asyncio.Event()
+    release_open = asyncio.Event()
+
+    class _Context:
+        attempts = 0
+
+        async def close(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("late close failed")
+
+    context = _Context()
+    page = SimpleNamespace(url="https://example.com")
+
+    async def _open_context(**_: object) -> tuple[object, object, Path, None, int]:
+        open_started.set()
+        await release_open.wait()
+        return context, page, tmp_path / "profile", None, 1
+
+    manager._open_persistent_context = _open_context  # type: ignore[method-assign]  # noqa: SLF001
+    open_task = asyncio.create_task(
+        manager.open_session(
+            session_id="late-browser",
+            url="https://example.com",
+            profile_mode="persistent_local",
+            profile_id="profile",
+            owner=owner,
+        )
+    )
+    await open_started.wait()
+
+    with pytest.raises(BrowserLifecycleError) as terminal_exc:
+        await manager.mark_owner_terminal(owner)
+    assert terminal_exc.value.code == "browser_session_close_failed"
+    release_open.set()
+    with pytest.raises(BrowserLifecycleError) as open_exc:
+        await open_task
+    assert open_exc.value.code == "browser_session_terminal"
+    assert manager._closing_sessions["late-browser"].context is context  # noqa: SLF001
+
+    assert await manager.mark_owner_terminal(owner) == 1
+    assert context.attempts == 2
+    assert manager._closing_sessions == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_manager_cleanup_waits_for_and_closes_in_progress_open(tmp_path: Path) -> None:
+    manager = BrowserManager(profile_base_dir=str(tmp_path))
+    owner = _browser_owner("child", parent_session_id="controller")
+    open_started = asyncio.Event()
+    release_open = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _Context:
+        async def close(self) -> None:
+            closed.set()
+
+    async def _open_context(**_: object) -> tuple[object, object, Path, None, int]:
+        open_started.set()
+        await release_open.wait()
+        return (
+            _Context(),
+            SimpleNamespace(url="https://example.com"),
+            tmp_path / "profile",
+            None,
+            1,
+        )
+
+    manager._open_persistent_context = _open_context  # type: ignore[method-assign]  # noqa: SLF001
+    open_task = asyncio.create_task(
+        manager.open_session(
+            session_id="late-browser",
+            url="https://example.com",
+            profile_mode="persistent_local",
+            profile_id="profile",
+            owner=owner,
+        )
+    )
+    await open_started.wait()
+    cleanup_task = asyncio.create_task(manager.cleanup())
+    await asyncio.sleep(0)
+    release_open.set()
+
+    with pytest.raises(BrowserLifecycleError) as open_exc:
+        await open_task
+    assert open_exc.value.code == "browser_session_terminal"
+    await cleanup_task
+
+    assert closed.is_set()
+    assert manager._open_in_flight == 0  # noqa: SLF001
+    assert manager._sessions == {}  # noqa: SLF001
+    assert manager._closing_sessions == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_inspect_exposes_safe_managed_metadata() -> None:
+    manager = BrowserManager()
+    parent = _browser_owner("controller")
+    child_owner = _browser_owner("child", parent_session_id="controller")
+    manager._sessions["child-browser"] = BrowserSession(  # noqa: SLF001
+        session_id="child-browser",
+        context=SimpleNamespace(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=child_owner,
+    )
+    last_used_at = manager._sessions["child-browser"].last_used_at  # noqa: SLF001
+
+    metadata = await manager.inspect_session("child-browser", owner=parent)
+
+    assert metadata["owner"] == {
+        "scope_id": "child",
+        "session_id": "child",
+        "conversation_id": "conversation-child",
+        "agent_id": "agent-1",
+        "relationship": "managed_descendant",
+    }
+    assert "user_email" not in metadata["owner"]
+    assert manager._sessions["child-browser"].last_used_at == last_used_at  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_inspect_is_indistinguishable_from_missing() -> None:
+    manager = BrowserManager()
+    manager._sessions["hidden"] = BrowserSession(  # noqa: SLF001
+        session_id="hidden",
+        context=SimpleNamespace(),
+        page=SimpleNamespace(url="https://example.com"),
+        owner=_browser_owner("owner"),
+    )
+
+    errors: list[BrowserLifecycleError] = []
+    for session_id in ("hidden", "missing"):
+        with pytest.raises(BrowserLifecycleError) as exc_info:
+            await manager.inspect_session(session_id, owner=_browser_owner("unrelated"))
+        errors.append(exc_info.value)
+
+    assert [(error.code, str(error)) for error in errors] == [
+        (errors[1].code, str(errors[1])),
+        (errors[1].code, str(errors[1])),
+    ]
+    assert errors[0].code == "browser_session_missing"
+
+
+@pytest.mark.asyncio
+async def test_browser_manager_distinguishes_missing_expired_and_locked() -> None:
+    manager = BrowserManager()
+    owner = _browser_owner("scope-owner")
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.get_live_session("missing", owner=owner)
+    assert exc_info.value.code == "browser_session_missing"
+
+    manager._expired_session_ids["expired"] = 0  # noqa: SLF001
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.get_live_session("expired", owner=owner)
+    assert exc_info.value.code == "browser_session_expired"
+
+    await manager._reserve_profile_id("profile", owner=owner)  # noqa: SLF001
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager._reserve_profile_id("profile", owner=owner)  # noqa: SLF001
+    assert exc_info.value.code == "browser_profile_locked"
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.list_sessions(owner=None)
+    assert exc_info.value.code == "browser_unauthenticated"
+
+
+def test_browser_manager_classifies_only_persistent_profile_lock_errors() -> None:
+    assert (
+        BrowserManager._persistent_profile_is_locked(  # noqa: SLF001
+            RuntimeError("Failed to create a ProcessSingleton for your profile directory")
+        )
+        is True
+    )
+    assert (
+        BrowserManager._persistent_profile_is_locked(  # noqa: SLF001
+            RuntimeError("Executable doesn't exist at /missing/chromium")
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_duplicate_open_does_not_release_existing_profile_reservation() -> None:
+    manager = BrowserManager(profile_mode_default="persistent_local")
+    first = _browser_owner("first")
+    second = _browser_owner("second")
+    await manager._reserve_profile_id("shared", owner=first)  # noqa: SLF001
+
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.open_session(
+            session_id="second",
+            url="https://example.com",
+            profile_mode="persistent_local",
+            profile_id="shared",
+            owner=second,
+        )
+    assert exc_info.value.code == "browser_profile_locked"
+    assert manager._reserved_profile_ids["shared"] == first  # noqa: SLF001
+    await manager.cleanup()
+
+
+def test_ephemeral_sessions_use_ephemeral_timeout_default() -> None:
+    manager = BrowserManager(idle_timeout_seconds=1800)
+    session = SimpleNamespace(lifecycle="ephemeral", idle_timeout_seconds=None)
+    assert manager._session_idle_timeout_seconds(session) == 60  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_reaping_works_when_explicit_timeout_is_disabled() -> None:
+    manager = BrowserManager(idle_timeout_seconds=0)
+
+    class _Context:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    session = BrowserSession(
+        session_id="ephemeral",
+        context=_Context(),
+        page=SimpleNamespace(url=""),
+        lifecycle="ephemeral",
+        last_used_at=datetime.now(UTC) - timedelta(seconds=61),
+    )
+    manager._sessions[session.session_id] = session  # noqa: SLF001
+    await manager._cleanup_idle_sessions()  # noqa: SLF001
+    assert session.context.closed is True
+
+
+@pytest.mark.asyncio
+async def test_idle_cleanup_does_not_close_concurrent_same_id_replacement() -> None:
+    manager = BrowserManager(idle_timeout_seconds=1)
+    stale_seen = asyncio.Event()
+
+    class _Context:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    stale = BrowserSession(
+        session_id="replaceable",
+        context=_Context(),
+        page=SimpleNamespace(url=""),
+        last_used_at=datetime.now(UTC) - timedelta(seconds=2),
+    )
+    replacement = BrowserSession(
+        session_id="replaceable",
+        context=_Context(),
+        page=SimpleNamespace(url=""),
+    )
+    manager._sessions[stale.session_id] = stale  # noqa: SLF001
+    original_is_idle = manager._session_is_idle  # noqa: SLF001
+
+    def _is_idle(session: BrowserSession) -> bool:
+        result = original_is_idle(session)
+        if session is stale:
+            stale_seen.set()
+        return result
+
+    manager._session_is_idle = _is_idle  # type: ignore[method-assign]  # noqa: SLF001
+
+    async def _replace() -> None:
+        await stale_seen.wait()
+        async with manager._lock:  # noqa: SLF001
+            manager._sessions[replacement.session_id] = replacement  # noqa: SLF001
+
+    cleanup_task = asyncio.create_task(manager._cleanup_idle_sessions())  # noqa: SLF001
+    replace_task = asyncio.create_task(_replace())
+    await asyncio.gather(cleanup_task, replace_task)
+
+    assert manager._sessions[replacement.session_id] is replacement  # noqa: SLF001
+    assert replacement.context.closed is False
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_is_hidden_and_rejected_for_another_user() -> None:
+    with TemporaryDirectory() as tmpdir:
+        manager = BrowserManager(profile_base_dir=tmpdir)
+        owner = _browser_owner("owner", user_email="owner@example.com")
+        other = _browser_owner("other", user_email="other@example.com")
+        manager._ensure_profile_owner("account", owner)  # noqa: SLF001
+
+        assert [item["profile_id"] for item in await manager.list_profiles(owner=owner)] == [
+            "account"
+        ]
+        assert await manager.list_profiles(owner=other) == []
+        with pytest.raises(BrowserLifecycleError) as exc_info:
+            manager._ensure_profile_owner("account", other)  # noqa: SLF001
+        assert exc_info.value.code == "browser_unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_requires_explicit_claim_and_preserves_user_isolation(
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "www-cocky-kontaktni-cz"
+    profile_dir.mkdir()
+    (profile_dir / "Default").mkdir()
+    (profile_dir / "Default" / "Cookies").write_text("legacy")
+    manager = BrowserManager(profile_base_dir=str(tmp_path))
+    owner = _browser_owner("owner", user_email="owner@example.com")
+    other = _browser_owner("other", user_email="other@example.com")
+
+    assert await manager.list_profiles(owner=owner) == []
+    unclaimed = await manager.list_profiles(
+        owner=owner,
+        include_unclaimed=True,
+        executor_owner_email=owner.user_email,
+    )
+    assert unclaimed == [
+        {
+            "profile_id": "www-cocky-kontaktni-cz",
+            "currently_in_use": False,
+            "last_used_at": unclaimed[0]["last_used_at"],
+            "ownership_status": "legacy_unclaimed",
+            "claimable": True,
+        }
+    ]
+
+    claimed = await manager.claim_legacy_profile(
+        "www-cocky-kontaktni-cz",
+        owner=owner,
+        confirm_profile_id="www-cocky-kontaktni-cz",
+        executor_owner_email=owner.user_email,
+    )
+
+    assert claimed["claimed"] is True
+    assert [item["profile_id"] for item in await manager.list_profiles(owner=owner)] == [
+        "www-cocky-kontaktni-cz"
+    ]
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.list_profiles(
+            owner=other,
+            include_unclaimed=True,
+            executor_owner_email=owner.user_email,
+        )
+    assert exc_info.value.code == "browser_unauthorized"
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.claim_legacy_profile(
+            "www-cocky-kontaktni-cz",
+            owner=other,
+            confirm_profile_id="www-cocky-kontaktni-cz",
+            executor_owner_email=owner.user_email,
+        )
+    assert exc_info.value.code == "browser_unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_legacy_profile_claim_rejects_live_lock_and_confirmation_mismatch(
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "account"
+    profile_dir.mkdir()
+    (profile_dir / "Default").mkdir()
+    (profile_dir / "SingletonLock").symlink_to("host-12345")
+    manager = BrowserManager(profile_base_dir=str(tmp_path))
+    owner = _browser_owner("owner", user_email="owner@example.com")
+
+    with pytest.raises(ValueError, match="exactly match"):
+        await manager.claim_legacy_profile(
+            "account",
+            owner=owner,
+            confirm_profile_id="different",
+            executor_owner_email=owner.user_email,
+        )
+    with pytest.raises(BrowserLifecycleError) as exc_info:
+        await manager.claim_legacy_profile(
+            "account",
+            owner=owner,
+            confirm_profile_id="account",
+            executor_owner_email=owner.user_email,
+        )
+    assert exc_info.value.code == "browser_profile_locked"
+    assert not (profile_dir / ".cognis-owner.json").exists()
+
+
+def test_profile_lock_parser_uses_trailing_chromium_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TemporaryDirectory() as tmpdir:
+        manager = BrowserManager(profile_base_dir=tmpdir)
+        lock_path = Path(tmpdir) / "SingletonLock"
+        lock_path.symlink_to("runner99-12345")
+        seen: list[int] = []
+        monkeypatch.setattr(
+            manager,
+            "_pid_is_alive",
+            lambda pid: seen.append(pid) is None or True,
+        )
+        assert manager._profile_lock_looks_orphaned(lock_path) is False  # noqa: SLF001
+        assert seen == [12345]
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_orphan_lock_reaper_preserves_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    symlink: bool,
+) -> None:
+    with TemporaryDirectory() as tmpdir:
+        manager = BrowserManager(profile_base_dir=tmpdir)
+        lock_path = Path(tmpdir) / "SingletonLock"
+        if symlink:
+            lock_path.symlink_to("stale-99999")
+        else:
+            lock_path.write_text("stale 99999")
+            stale_time = time.time() - 25 * 60 * 60
+            os.utime(lock_path, (stale_time, stale_time))
+        monkeypatch.setattr(manager, "_pid_is_alive", lambda _pid: False)
+        original_rename = Path.rename
+        replaced = False
+
+        def _replace_before_claim(path: Path, target: Path):
+            nonlocal replaced
+            if path == lock_path and not replaced:
+                replaced = True
+                path.unlink()
+                if symlink:
+                    path.symlink_to("replacement-12345")
+                else:
+                    path.write_text("replacement 12345")
+            return original_rename(path, target)
+
+        monkeypatch.setattr(Path, "rename", _replace_before_claim)
+
+        manager._reap_orphan_profile_locks()  # noqa: SLF001
+
+        if symlink:
+            assert lock_path.is_symlink()
+            assert os.readlink(lock_path) == "replacement-12345"
+        else:
+            assert lock_path.read_text() == "replacement 12345"
+
+
+def test_profile_lock_restore_never_overwrites_newer_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TemporaryDirectory() as tmpdir:
+        manager = BrowserManager(profile_base_dir=tmpdir)
+        lock_path = Path(tmpdir) / "SingletonLock"
+        lock_path.write_text("stale 99999")
+        expected = manager._profile_lock_identity(lock_path)  # noqa: SLF001
+        assert expected is not None
+        lock_path.unlink()
+        lock_path.write_text("replacement 12345")
+        original_link = os.link
+
+        def _create_newer_before_restore(source, destination, *, follow_symlinks=True):
+            Path(destination).write_text("newer 67890")
+            return original_link(
+                source,
+                destination,
+                follow_symlinks=follow_symlinks,
+            )
+
+        monkeypatch.setattr(os, "link", _create_newer_before_restore)
+
+        assert manager._remove_profile_lock_if_same(lock_path, expected) is False  # noqa: SLF001
+        assert lock_path.read_text() == "newer 67890"
+        quarantined = list(Path(tmpdir).glob(".SingletonLock.stale-*"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_text() == "replacement 12345"
 
 
 def test_browser_manager_ephemeral_mode_discards_profile_id() -> None:
@@ -223,8 +1086,9 @@ async def test_browser_manager_waits_for_virtual_display_socket(
 
 
 @pytest.mark.asyncio
-async def test_browser_manager_list_sessions_hides_idle_without_closing() -> None:
+async def test_browser_manager_list_sessions_reaps_idle_sessions() -> None:
     manager = BrowserManager(idle_timeout_seconds=60)
+    owner = BrowserSessionOwner(execution_scope_id="scope-1", user_email="user@example.com")
 
     class _Context:
         closed = False
@@ -243,6 +1107,7 @@ async def test_browser_manager_list_sessions_hides_idle_without_closing() -> Non
         display=None,
         last_used_at=datetime.now(UTC) - timedelta(minutes=10),
         auth_origin=None,
+        owner=owner,
     )
     fresh_session = SimpleNamespace(
         session_id="sess-new",
@@ -254,14 +1119,16 @@ async def test_browser_manager_list_sessions_hides_idle_without_closing() -> Non
         display=":99",
         last_used_at=datetime.now(UTC),
         auth_origin="https://reddit.com",
+        owner=owner,
     )
     manager._sessions = {"sess-old": stale_session, "sess-new": fresh_session}  # noqa: SLF001
 
-    sessions = await manager.list_sessions()
+    sessions = await manager.list_sessions(owner=owner)
 
     assert [session["session_id"] for session in sessions] == ["sess-new"]
     assert sessions[0]["profile_id"] == "www-reddit-com"
-    assert stale_session.context.closed is False
+    assert stale_session.context.closed is True
+    assert "sess-old" not in manager._sessions  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -303,18 +1170,23 @@ async def test_browser_manager_lists_profiles_from_disk() -> None:
         (base / "www-reddit-com").mkdir()
         (base / "github-com").mkdir()
         manager = BrowserManager(profile_base_dir=str(base))
+        owner = BrowserSessionOwner(execution_scope_id="scope-1", user_email="user@example.com")
+        manager._ensure_profile_owner("www-reddit-com", owner)  # noqa: SLF001
+        manager._ensure_profile_owner("github-com", owner)  # noqa: SLF001
         manager._sessions = {  # noqa: SLF001
             "sess-1": SimpleNamespace(
                 profile_id="www-reddit-com",
                 last_used_at=datetime.now(UTC),
+                owner=owner,
             ),
             "sess-2": SimpleNamespace(
                 profile_id="github-com",
                 last_used_at=datetime.now(UTC) - timedelta(days=1),
+                owner=owner,
             ),
         }
 
-        profiles = await manager.list_profiles()
+        profiles = await manager.list_profiles(owner=owner)
 
         assert [profile["profile_id"] for profile in profiles] == ["github-com", "www-reddit-com"]
         assert profiles[0]["currently_in_use"] is False

@@ -559,3 +559,178 @@ def test_reject_nonexistent_pairing_request(monkeypatch: object, tmp_path: Path)
             headers=_auth_headers(app, email="user@example.com"),
         )
         assert response.status_code == 404
+
+
+def test_channel_default_profile_round_trip_and_agent_change_clear(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                for agent_id in ("agent-1", "agent-2"):
+                    await create_agent(
+                        session,
+                        agent_id=agent_id,
+                        owner_email="user@example.com",
+                        name=agent_id,
+                        status="active",
+                        agent_profiles={
+                            "chat": {
+                                "profile_id": "chat",
+                                "description": "Interactive chat",
+                                "enabled": True,
+                            }
+                        },
+                    )
+                await session.commit()
+
+        asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+        created = client.post(
+            "/api/v1/channels/accounts",
+            headers=headers,
+            json={
+                "channel_type": "telegram",
+                "agent_id": "agent-1",
+                "display_name": "Telegram",
+                "default_agent_profile_id": "chat",
+            },
+        )
+        assert created.status_code == 200, created.text
+        account_id = created.json()["account_id"]
+
+        fetched = client.get(f"/api/v1/channels/accounts/{account_id}", headers=headers)
+        assert fetched.status_code == 200
+        assert fetched.json()["default_agent_profile_id"] == "chat"
+
+        updated = client.patch(
+            f"/api/v1/channels/accounts/{account_id}",
+            headers=headers,
+            json={"agent_id": "agent-2"},
+        )
+        assert updated.status_code == 200, updated.text
+
+        fetched = client.get(f"/api/v1/channels/accounts/{account_id}", headers=headers)
+        assert fetched.json()["agent_id"] == "agent-2"
+        assert fetched.json()["default_agent_profile_id"] is None
+
+
+def test_channel_default_profile_rejects_missing_disabled_or_foreign_agent(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                for email in ("user@example.com", "other@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email,
+                        password_hash=app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                    agent_profiles={
+                        "disabled": {
+                            "profile_id": "disabled",
+                            "description": "Disabled",
+                            "enabled": False,
+                        }
+                    },
+                )
+                await create_agent(
+                    session,
+                    agent_id="foreign-agent",
+                    owner_email="other@example.com",
+                    name="Foreign",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+        for agent_id, profile_id, status in (
+            ("agent-1", "missing", 400),
+            ("agent-1", "disabled", 400),
+            ("foreign-agent", None, 404),
+        ):
+            response = client.post(
+                "/api/v1/channels/accounts",
+                headers=headers,
+                json={
+                    "channel_type": "telegram",
+                    "agent_id": agent_id,
+                    "display_name": "Telegram",
+                    "default_agent_profile_id": profile_id,
+                },
+            )
+            assert response.status_code == status, response.text
+
+
+def test_channel_account_detail_mutations_are_owner_scoped(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                for email in ("owner@example.com", "viewer@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email,
+                        password_hash=app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+                await create_agent(
+                    session,
+                    agent_id="owner-agent",
+                    owner_email="owner@example.com",
+                    name="Owner agent",
+                    status="active",
+                )
+                account = await create_channel_account(
+                    session,
+                    channel_type="telegram",
+                    display_name="Private",
+                    agent_id="owner-agent",
+                    user_email="owner@example.com",
+                )
+                await session.commit()
+                return account.account_id
+
+        account_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="viewer@example.com")
+        assert (
+            client.get(f"/api/v1/channels/accounts/{account_id}", headers=headers).status_code
+            == 404
+        )
+        assert (
+            client.patch(
+                f"/api/v1/channels/accounts/{account_id}",
+                headers=headers,
+                json={"display_name": "Changed"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.delete(f"/api/v1/channels/accounts/{account_id}", headers=headers).status_code
+            == 404
+        )

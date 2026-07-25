@@ -2,6 +2,7 @@ import { browser } from '$app/environment';
 import { get, writable } from 'svelte/store';
 
 import { apiUrl } from '$lib/config';
+import { fetchWithTimeout } from '$lib/api/fetch';
 import { reportError } from '$lib/errors';
 import type { ApiErrorResponse, AuthSessionResponse, AuthStatus, UserSummary } from '$lib/types/api';
 import { toErrorMessage } from '$lib/utils';
@@ -27,6 +28,7 @@ const store = writable<AuthState>(initialState);
 let bootstrapPromise: Promise<void> | null = null;
 let refreshPromise: Promise<boolean> | null = null;
 const WEB_PUSH_ENABLED_KEY = 'cognis_web_push_enabled';
+const AUTH_REQUEST_TIMEOUT_MS = 15_000;
 
 async function clearWebPushSubscription(notifyServer: boolean): Promise<void> {
   if (!browser || !('serviceWorker' in navigator) || !('PushManager' in window)) {
@@ -37,12 +39,12 @@ async function clearWebPushSubscription(notifyServer: boolean): Promise<void> {
     if (!registration) return;
     const subscription = await registration.pushManager.getSubscription();
     if (subscription?.endpoint && notifyServer) {
-      await fetch(apiUrl('/api/v1/push/subscriptions/unsubscribe'), {
+      await fetchWithTimeout(apiUrl('/api/v1/push/subscriptions/unsubscribe'), {
         method: 'POST',
         credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ endpoint: subscription.endpoint })
-      }).catch((error: unknown) => {
+      }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS }).catch((error: unknown) => {
         reportError('Push unsubscribe request failed', error);
       });
     }
@@ -98,9 +100,9 @@ async function readApiMessage(response: Response, fallback: string): Promise<str
 async function fetchMe(): Promise<UserSummary | null> {
   let response: Response;
   try {
-    response = await fetch(apiUrl('/api/auth/me'), {
+    response = await fetchWithTimeout(apiUrl('/api/auth/me'), {
       credentials: 'include'
-    });
+    }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
   } catch (error) {
     throw new Error(toErrorMessage(error, 'Unable to reach the server.'));
   }
@@ -123,10 +125,10 @@ async function parseAuthSessionResponse(response: Response): Promise<AuthSession
 async function refreshBrowserSession(): Promise<boolean> {
   let response: Response;
   try {
-    response = await fetch(apiUrl('/api/auth/refresh'), {
+    response = await fetchWithTimeout(apiUrl('/api/auth/refresh'), {
       method: 'POST',
       credentials: 'include'
-    });
+    }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
   } catch (error) {
     reportError('Session refresh failed', error);
     return false;
@@ -191,14 +193,14 @@ export const auth = {
     store.update((state) => ({ ...state, status: 'loading', error: null }));
 
     try {
-      const response = await fetch(apiUrl('/api/auth/login'), {
+      const response = await fetchWithTimeout(apiUrl('/api/auth/login'), {
         method: 'POST',
         credentials: 'include',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({ email, password })
-      });
+      }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
 
       if (!response.ok) {
         throw new Error(await readApiMessage(response, 'Unable to log in.'));
@@ -216,10 +218,10 @@ export const auth = {
   async logout(): Promise<void> {
     try {
       await clearWebPushSubscription(true);
-      await fetch(apiUrl('/api/auth/logout'), {
+      await fetchWithTimeout(apiUrl('/api/auth/logout'), {
         method: 'POST',
         credentials: 'include'
-      });
+      }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
     } catch (error) {
       reportError('Logout request failed', error);
     } finally {

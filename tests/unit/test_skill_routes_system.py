@@ -46,6 +46,7 @@ def test_list_skills_marks_system_skills(monkeypatch: object, tmp_path: Path) ->
         skills = {item["skill_id"]: item for item in response.json()}
         assert skills["cognis-task-manager"]["is_system"] is True
         assert skills["cognis-workflow-manager"]["is_system"] is True
+        assert skills["cognis-pulse-deliverable"]["is_system"] is True
         assert "attach_to_all_agents" in skills["cognis-task-manager"]
 
 

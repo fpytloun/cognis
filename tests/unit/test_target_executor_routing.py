@@ -55,7 +55,8 @@ def loop_with_pool():
 
 def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
     """Build a minimal StepContext-like object."""
-    from cognis.models.tool import ToolDefinition, ToolSource
+    from cognis.models.tool import NativeToolDefinition as ToolDefinition
+    from cognis.models.tool import ToolSource
     from cognis.tools.registry import RegisteredTool, ToolRegistry
 
     registry = ToolRegistry()
@@ -220,7 +221,8 @@ async def test_target_executor_same_as_active_uses_active_connection(loop_with_p
 @pytest.mark.asyncio
 async def test_target_executor_rejected_on_non_executor_tool(loop_with_pool) -> None:
     """Defensive: target_executor on a builtin/memory tool returns a factual error."""
-    from cognis.models.tool import ToolDefinition, ToolSource
+    from cognis.models.tool import NativeToolDefinition as ToolDefinition
+    from cognis.models.tool import ToolSource
     from cognis.tools.registry import RegisteredTool, ToolRegistry
 
     registry = ToolRegistry()

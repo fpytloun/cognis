@@ -7,7 +7,12 @@ from fastapi.testclient import TestClient
 from cognis.api.app import create_app
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import ModelRouting
-from cognis.store.queries import create_llm_provider, create_user, list_model_routing
+from cognis.store.queries import (
+    create_executor,
+    create_llm_provider,
+    create_user,
+    list_model_routing,
+)
 
 
 class _ChatGptOAuthStub:
@@ -256,6 +261,13 @@ def test_non_admin_can_create_and_manage_user_owned_anthropic_executor_provider(
                     password_hash=app.state.password_hasher.hash("password123"),
                     role="user",
                 )
+                await create_executor(
+                    session,
+                    executor_id="maitrea",
+                    name="Maitrea",
+                    executor_type="websocket",
+                    owner_email="owner@example.com",
+                )
                 await session.commit()
 
         client.portal.call(_seed)
@@ -303,6 +315,18 @@ def test_executor_provider_requires_explicit_executor_target(
         app = client.app
         headers = _auth_headers(app, email="admin@example.com", role="admin")
 
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_executor(
+                    session,
+                    executor_id="maitrea",
+                    name="Maitrea",
+                    executor_type="websocket",
+                    shared=True,
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
         payload = {
             "provider_id": "remote-openai",
             "display_name": "Remote OpenAI",

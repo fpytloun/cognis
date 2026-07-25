@@ -11,7 +11,8 @@ from cognis.core.executor_resolution import (
     labels_match,
     select_executor_for_agent,
 )
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 
 
 def _tool(name: str, category: str = "general") -> ToolDefinition:

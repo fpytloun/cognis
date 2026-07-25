@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -12,8 +13,8 @@ import pytest
 from cognis.tools.executor.browser.manager import (
     BROWSER_DEFAULT_ACCEPT_LANGUAGE,
     BROWSER_DEFAULT_TIMEZONE_ID,
-    BROWSER_DEFAULT_USER_AGENT,
     BrowserManager,
+    _coherent_chromium_user_agent,
 )
 
 # ---------------------------------------------------------------------------
@@ -23,8 +24,19 @@ from cognis.tools.executor.browser.manager import (
 
 def test_context_kwargs_includes_stealth_defaults_when_enabled() -> None:
     manager = BrowserManager()  # defaults: playwright runtime, stealth on
-    kwargs = manager._context_kwargs()  # noqa: SLF001
-    assert kwargs["user_agent"] == BROWSER_DEFAULT_USER_AGENT
+    manager._browser_user_agents[False] = _coherent_chromium_user_agent(  # noqa: SLF001
+        "145.0.7632.6"
+    )
+    kwargs = manager._context_kwargs(headless=False)  # noqa: SLF001
+    assert kwargs["user_agent"].endswith("Chrome/145.0.7632.6 Safari/537.36")
+    expected_platform = (
+        "Macintosh"
+        if sys.platform == "darwin"
+        else "Windows NT"
+        if sys.platform == "win32"
+        else "X11; Linux x86_64"
+    )
+    assert expected_platform in kwargs["user_agent"]
     assert kwargs["extra_http_headers"] == {"Accept-Language": BROWSER_DEFAULT_ACCEPT_LANGUAGE}
     assert kwargs["timezone_id"] == BROWSER_DEFAULT_TIMEZONE_ID
     assert kwargs["locale"] == "en-US"
@@ -46,11 +58,54 @@ def test_context_kwargs_respects_explicit_timezone_override() -> None:
 
 def test_context_kwargs_skips_user_agent_when_realistic_ua_disabled() -> None:
     manager = BrowserManager(realistic_user_agent=False)
-    kwargs = manager._context_kwargs()  # noqa: SLF001
+    manager._browser_user_agents[False] = "unused"  # noqa: SLF001
+    kwargs = manager._context_kwargs(headless=False)  # noqa: SLF001
     assert "user_agent" not in kwargs
     # Accept-Language and timezone still applied because stealth is on.
     assert kwargs["extra_http_headers"] == {"Accept-Language": BROWSER_DEFAULT_ACCEPT_LANGUAGE}
     assert kwargs["timezone_id"] == BROWSER_DEFAULT_TIMEZONE_ID
+
+
+def test_context_kwargs_preserves_native_ua_when_version_is_not_probed() -> None:
+    manager = BrowserManager(channel="chrome")
+    manager._browser_user_agents[False] = "bundled-browser-ua"  # noqa: SLF001
+
+    kwargs = manager._context_kwargs(headless=None)  # noqa: SLF001
+
+    assert "user_agent" not in kwargs
+
+
+def test_shared_browser_channel_does_not_cache_chrome_ua_override() -> None:
+    manager = BrowserManager(channel="msedge")
+
+    manager._cache_browser_user_agent(  # noqa: SLF001
+        headless=False,
+        browser=SimpleNamespace(version="145.0.7632.6"),
+    )
+
+    assert False not in manager._browser_user_agents  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_probe_browser_user_agent_uses_runtime_version_and_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Process:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"Chromium 145.0.7632.6\n", b""
+
+    async def _create_subprocess_exec(*_args: Any, **_kwargs: Any) -> _Process:
+        return _Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _create_subprocess_exec)
+
+    user_agent = await BrowserManager._probe_browser_user_agent("/browser")  # noqa: SLF001
+
+    assert user_agent is not None
+    assert "Chrome/145.0.7632.6" in user_agent
+    assert "Windows NT" not in user_agent or sys.platform == "win32"
 
 
 # ---------------------------------------------------------------------------

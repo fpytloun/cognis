@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import secrets
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -90,7 +91,7 @@ class LoginRateLimiter:
 
 
 class RequestRateLimiter:
-    """In-memory aggregate per-user read/write request rate limiter."""
+    """Bounded in-memory aggregate per-user read/write request rate limiter."""
 
     def __init__(
         self,
@@ -98,11 +99,15 @@ class RequestRateLimiter:
         read_requests_per_minute: int = 600,
         write_requests_per_minute: int = 200,
         window_seconds: int = 60,
+        max_state_entries: int = 10_000,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.read_requests_per_minute = read_requests_per_minute
         self.write_requests_per_minute = write_requests_per_minute
         self.window = timedelta(seconds=window_seconds)
-        self._state: dict[str, ApiRateLimitState] = {}
+        self.max_state_entries = max(1, max_state_entries)
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._state: OrderedDict[str, ApiRateLimitState] = OrderedDict()
         self._lock = asyncio.Lock()
 
     def update_limits(
@@ -119,21 +124,37 @@ class RequestRateLimiter:
     async def allow(self, *, user_key: str, path: str, method: str) -> bool:
         del path
         async with self._lock:
-            now = datetime.now(UTC)
+            now = self._clock()
             bucket_name = "read" if method.upper() in {"GET", "HEAD", "OPTIONS"} else "write"
             state_key = f"{user_key}:{bucket_name}"
-            bucket = self._state.setdefault(state_key, ApiRateLimitState(requests=deque()))
-            while bucket.requests and now - bucket.requests[0] >= self.window:
-                bucket.requests.popleft()
-            if not bucket.requests:
-                self._state.pop(state_key, None)
-                bucket = self._state.setdefault(state_key, ApiRateLimitState(requests=deque()))
             limit = (
                 self.read_requests_per_minute
                 if method.upper() in {"GET", "HEAD", "OPTIONS"}
                 else self.write_requests_per_minute
             )
+            bucket = self._state.get(state_key)
+            if bucket is not None:
+                while bucket.requests and now - bucket.requests[0] >= self.window:
+                    bucket.requests.popleft()
+                if not bucket.requests:
+                    self._state.pop(state_key, None)
+                    bucket = None
+            if limit <= 0:
+                return False
+            if bucket is None and len(self._state) >= self.max_state_entries:
+                # Successful requests keep this mapping ordered by latest activity.
+                # Therefore only the first bucket can be reclaimable, and checking it
+                # is O(1). Active buckets are never evicted to admit an unseen key.
+                oldest_key, oldest_bucket = next(iter(self._state.items()))
+                if now - oldest_bucket.requests[-1] >= self.window:
+                    self._state.pop(oldest_key)
+                else:
+                    return False
+            if bucket is None:
+                bucket = ApiRateLimitState(requests=deque())
+                self._state[state_key] = bucket
             if len(bucket.requests) >= limit:
                 return False
             bucket.requests.append(now)
+            self._state.move_to_end(state_key)
             return True

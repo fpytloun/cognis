@@ -12,6 +12,7 @@ import litellm
 from cognis.executor.inference_types import CognisInferenceRequest, json_safe_inference_payload
 from cognis.logging import get_logger
 from cognis.providers.llm.errors import build_mid_stream_error_chunk
+from cognis.providers.llm.performance import LocalGenerationPerformanceObserver
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
     response_model_dump,
@@ -60,6 +61,16 @@ class LiteLLMExecutorBackend:
         messages = request.messages
         request_kwargs = dict(request.request_kwargs)
         llm_api = str(request_kwargs.pop("cognis_llm_api", "chat_completions"))
+        performance = (
+            LocalGenerationPerformanceObserver(
+                model=model,
+                runtime="Ollama",
+                location="executor",
+                configured_context_tokens=request_kwargs.get("num_ctx"),
+            )
+            if model.lower().startswith("ollama/")
+            else None
+        )
         usage: dict[str, Any] = {}
         finish_reason = "stop"
         response_status = "completed"
@@ -164,8 +175,12 @@ class LiteLLMExecutorBackend:
                     **request_kwargs,
                 )
                 async for chunk in stream:
+                    if performance is not None:
+                        performance.observe_raw(chunk)
                     payload_raw = json_safe_inference_payload(chunk)
                     payload = payload_raw if isinstance(payload_raw, dict) else {}
+                    if performance is not None:
+                        performance.observe_chunk(payload)
                     if payload.get("usage"):
                         usage = payload["usage"]
                     choices = payload.get("choices") or []
@@ -212,6 +227,11 @@ class LiteLLMExecutorBackend:
             "usage": usage,
             "finish_reason": finish_reason,
             "response_status": response_status,
+            "backend_metadata": (
+                {"performance": performance.snapshot().model_dump(mode="json")}
+                if performance is not None
+                else None
+            ),
         }
 
     async def generate(self, request: CognisInferenceRequest) -> dict[str, Any]:

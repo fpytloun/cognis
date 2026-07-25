@@ -140,6 +140,46 @@ export const embeddedDocsMeta: DocMeta[] = [
     relatedSlugs: ['settings', 'creating-agents', 'executors']
   },
   {
+    slug: 'content-and-sharing',
+    title: 'Content and Temporary Sharing',
+    description: 'Understand artifact retention, temporary signed links, documents, HTML viewing, and expired-link recovery.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/content-and-sharing.md',
+    relatedSlugs: ['rich-deliverables', 'tools-and-skills', 'using-chat']
+  },
+  {
+    slug: 'rich-deliverables',
+    title: 'Rich Deliverables',
+    description: 'Create structured, durable Cognis outputs with interactive and fallback renderers.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/rich-deliverables.md',
+    relatedSlugs: ['content-and-sharing', 'rich-deliverable-composition', 'tools-and-skills']
+  },
+  {
+    slug: 'rich-deliverable-composition',
+    title: 'Rich Deliverable Composition',
+    description: 'Compose renderer-neutral rich deliverables with blocks, evidence, assets, and fallbacks.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/rich-deliverable-composition.md',
+    relatedSlugs: ['rich-deliverables', 'rich-deliverable-blocks-layout', 'rich-deliverable-blocks-data']
+  },
+  {
+    slug: 'rich-deliverable-blocks-layout',
+    title: 'Rich Deliverable Layout Blocks',
+    description: 'Reference layout, narrative, status, and action blocks with generated examples.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/rich-deliverable-blocks-layout.md',
+    relatedSlugs: ['rich-deliverable-composition', 'rich-deliverable-blocks-data']
+  },
+  {
+    slug: 'rich-deliverable-blocks-data',
+    title: 'Rich Deliverable Data Blocks',
+    description: 'Reference data, evidence, media, and utility blocks with generated examples.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/rich-deliverable-blocks-data.md',
+    relatedSlugs: ['rich-deliverable-composition', 'rich-deliverable-blocks-layout']
+  },
+  {
     slug: 'channels',
     title: 'Channels',
     description: 'Connect agents to external platforms and understand pairing and trust.',
@@ -190,6 +230,11 @@ export const ONBOARDING_DOC_SLUGS = [
   'executors',
   'deployment',
   'tools-and-skills',
+  'content-and-sharing',
+  'rich-deliverables',
+  'rich-deliverable-composition',
+  'rich-deliverable-blocks-layout',
+  'rich-deliverable-blocks-data',
   'troubleshooting'
 ] as const;
 

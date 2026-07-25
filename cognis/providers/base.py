@@ -312,6 +312,7 @@ class LLMProvider(Protocol):
         task_type: str = "speech_to_text",
         prompt: str | None = None,
         language: str | None = None,
+        acting_user_email: str | None = None,
     ) -> SpeechToTextResult: ...
     async def synthesize(
         self,

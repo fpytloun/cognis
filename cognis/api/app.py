@@ -18,8 +18,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from cognis.api.chat_v2.e2e_control import router as chat_v2_e2e_control_router
 from cognis.api.chat_v2.routes import router as chat_v2_router
 from cognis.api.common import error_response
+from cognis.api.executor_runtime import schedule_executor_reconfigure
+from cognis.api.mcp_reconfigure import (
+    schedule_mcp_server_executor_reconfigure_for_app,
+)
 from cognis.api.middleware import AuthenticationMiddleware
 from cognis.api.routes.agents import router as agents_router
 from cognis.api.routes.artifacts import router as artifacts_router
@@ -27,15 +32,20 @@ from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.channels import router as channels_router
 from cognis.api.routes.conversations import router as conversations_router
 from cognis.api.routes.credentials import router as credentials_router
+from cognis.api.routes.deliverables import router as deliverables_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
 from cognis.api.routes.images import router as images_router
 from cognis.api.routes.knowledgebases import router as knowledgebases_router
+from cognis.api.routes.local_models import router as local_models_router
 from cognis.api.routes.mcp_oauth import (
-    router as mcp_oauth_router,
+    _mcp_oauth_status_payload_for_user,
+    disconnect_mcp_oauth_for_user,
+    emit_mcp_oauth_status_changed_for_app,
+    schedule_mcp_executor_reconfigure_for_app,
 )
 from cognis.api.routes.mcp_oauth import (
-    schedule_mcp_executor_reconfigure_for_app,
+    router as mcp_oauth_router,
 )
 from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.projects import router as projects_router
@@ -63,6 +73,9 @@ from cognis.core.compaction import CompactionStrategy
 from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
 from cognis.core.events import EventBus
+from cognis.core.local_model_catalog import LocalModelCatalog
+from cognis.core.local_model_reconciler import LocalModelReconciler
+from cognis.core.local_model_runtime import LocalModelRuntimeManager
 from cognis.core.mcp_oauth import MCPOAuthError, MCPOAuthService
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
@@ -230,6 +243,7 @@ def create_app() -> FastAPI:
             config_runtime.jwt_private_key_path, config_runtime.jwt_public_key_path
         )
         providers = build_provider_registry(config_runtime, session_factory, auth_provider)
+        local_model_catalog = LocalModelCatalog()
         event_bus = EventBus()
         remember_queue = RememberRetryQueue(
             providers.memory,
@@ -342,7 +356,9 @@ def create_app() -> FastAPI:
             max_size_mb=config_runtime.tool_output_max_size_mb,
         )
         tool_output_spool = ToolOutputSpool()
-        await tool_output_store.cleanup_expired()
+        from cognis.core.tool_output_maintenance import ToolOutputMaintenanceService
+
+        tool_output_maintenance = ToolOutputMaintenanceService(tool_output_store)
 
         # Artifact store for images and other binary content
         from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
@@ -369,8 +385,16 @@ def create_app() -> FastAPI:
         context_assembler.set_artifact_store(artifact_store)
 
         from cognis.core.artifact_maintenance import ArtifactMaintenanceService
+        from cognis.store.deliverable_chart_migration import (
+            DeliverableChartPayloadMigration,
+        )
         from cognis.store.queries import get_model_routing, get_setting_value
 
+        deliverable_chart_migration = DeliverableChartPayloadMigration(
+            session_factory=session_factory,
+            artifact_store=artifact_store,
+        )
+        await deliverable_chart_migration.start()
         artifact_maintenance = ArtifactMaintenanceService(
             session_factory=session_factory,
             artifact_store=artifact_store,
@@ -467,7 +491,12 @@ def create_app() -> FastAPI:
             step_timeout_seconds = await get_setting_value(
                 session,
                 "session.step_timeout_seconds",
-                3600,
+                14400,
+            )
+            max_tool_calls_per_turn = await get_setting_value(
+                session,
+                "session.max_tool_calls_per_turn",
+                500,
             )
             llm_stream_idle_timeout_seconds = await get_setting_value(
                 session,
@@ -499,7 +528,10 @@ def create_app() -> FastAPI:
             tool_classification_queue=tool_classification_queue,
             step_profile_registry=step_profile_registry,
             default_step_timeout_seconds=(
-                int(step_timeout_seconds) if isinstance(step_timeout_seconds, int) else 3600
+                int(step_timeout_seconds) if isinstance(step_timeout_seconds, int) else 14400
+            ),
+            default_max_tool_calls_per_turn=(
+                int(max_tool_calls_per_turn) if isinstance(max_tool_calls_per_turn, int) else 500
             ),
             default_llm_stream_idle_timeout_seconds=(
                 int(llm_stream_idle_timeout_seconds)
@@ -554,18 +586,58 @@ def create_app() -> FastAPI:
         async def _on_mcp_oauth_completed(transaction_id: str) -> None:
             await schedule_mcp_executor_reconfigure_for_app(app, transaction_id=transaction_id)
 
+        async def _on_mcp_oauth_token_state_changed(
+            user_email: str,
+            server_id: str,
+            reason: str,
+        ) -> None:
+            await schedule_mcp_server_executor_reconfigure_for_app(
+                app,
+                server_id=server_id,
+                reason=f"mcp_oauth_{reason}",
+            )
+            await emit_mcp_oauth_status_changed_for_app(
+                app,
+                user_email=user_email,
+                server_id=server_id,
+            )
+
         mcp_oauth_service = MCPOAuthService(
             session_factory=session_factory,
             key_path=str(config_runtime.secrets_key_path),
             public_base_url=config_runtime.public_base_url,
             notification_service=notification_service,
             on_authorization_completed=_on_mcp_oauth_completed,
+            on_token_state_changed=_on_mcp_oauth_token_state_changed,
             executor_provider=providers.executor.websocket
             if hasattr(providers.executor, "websocket")
             else None,
+            refresh_timeout_seconds=config_runtime.mcp_oauth_refresh_timeout_seconds,
         )
         providers.mcp_oauth_service = mcp_oauth_service  # type: ignore[attr-defined]
         tool_router._mcp_oauth_service = mcp_oauth_service  # noqa: SLF001
+
+        async def _reconfigure_managed_mcp_server(server_id: str, reason: str) -> None:
+            await schedule_mcp_server_executor_reconfigure_for_app(
+                app, server_id=server_id, reason=reason
+            )
+
+        tool_router._mcp_reconfigure_server = _reconfigure_managed_mcp_server  # noqa: SLF001
+
+        async def _reconfigure_managed_executor(executor_id: str, _reason: str) -> None:
+            schedule_executor_reconfigure(app, executor_id)
+
+        tool_router._mcp_reconfigure_executor = _reconfigure_managed_executor  # noqa: SLF001
+        tool_router._mcp_oauth_status = (  # noqa: SLF001
+            lambda user_email, server_id: _mcp_oauth_status_payload_for_user(
+                app, user_email=user_email, server_id=server_id
+            )
+        )
+        tool_router._mcp_oauth_disconnect = (  # noqa: SLF001
+            lambda user_email, server_id: disconnect_mcp_oauth_for_user(
+                app, user_email=user_email, server_id=server_id
+            )
+        )
         if hasattr(providers.executor, "websocket"):
 
             async def _on_mcp_oauth_loopback_callback(
@@ -668,6 +740,15 @@ def create_app() -> FastAPI:
                 await get_setting_value(session, "session.stale_after_seconds", 300),
                 300,
             )
+            follow_up_recovery_interval_seconds = max(
+                1,
+                _as_int(
+                    await get_setting_value(
+                        session, "follow_up_intents.recovery_interval_seconds", 30
+                    ),
+                    30,
+                ),
+            )
 
         recovered_sessions = await session_manager.recover_stale_sessions(
             stale_after_seconds=session_stale_after_seconds
@@ -684,7 +765,10 @@ def create_app() -> FastAPI:
         from cognis.core.invariants import reconcile_invariants
 
         async with session_factory() as recon_session:
-            invariant_reports = await reconcile_invariants(recon_session)
+            invariant_reports = await reconcile_invariants(
+                recon_session,
+                recover_restart_stale_managed_turns=True,
+            )
         reconciled_invariant_counts = {
             report.category: report.reconciled_count
             for report in invariant_reports
@@ -695,6 +779,18 @@ def create_app() -> FastAPI:
                 "startup: reconciled invariant violations",
                 extra={"extra_data": {"counts": reconciled_invariant_counts}},
             )
+        # Drain intents that predate this process before creating handoffs for
+        # links interrupted by startup reconciliation. Reversing this order
+        # would replay each newly admitted handoff in the same startup pass.
+        turn_scheduler.configure_follow_up_recovery(
+            interval_seconds=follow_up_recovery_interval_seconds
+        )
+        recovered_follow_up_intents = await turn_scheduler.recover_follow_up_intents(
+            reclaim_processing=True
+        )
+        recovered_managed_notifications = (
+            await turn_scheduler.recover_managed_conversation_notifications()
+        )
 
         logger.info(
             "startup: recovery summary",
@@ -704,6 +800,8 @@ def create_app() -> FastAPI:
                     "recovered_tasks": len(recovered_tasks),
                     "recovered_paused_tasks": len(recovered_paused_tasks),
                     "recovered_orphaned_step_runs": recovered_orphaned_step_runs,
+                    "recovered_follow_up_intents": recovered_follow_up_intents,
+                    "recovered_managed_notifications": recovered_managed_notifications,
                     "invariant_reports": [report.as_dict() for report in invariant_reports],
                 }
             },
@@ -720,25 +818,41 @@ def create_app() -> FastAPI:
         )
         await scheduler.start()
         tool_router._scheduler = scheduler
+        await turn_scheduler.start_follow_up_recovery(
+            interval_seconds=follow_up_recovery_interval_seconds
+        )
         await managed_conversation_maintenance.start()
 
         app.state.config = config_runtime
         app.state.engine = engine
         app.state.session_factory = session_factory
+        app.state.settings_update_lock = asyncio.Lock()
         app.state.setup_token_manager = setup_token_manager
         app.state.password_hasher = password_hasher
         app.state.auth_provider = auth_provider
         app.state.providers = providers
+        app.state.local_model_catalog = local_model_catalog
         app.state.login_rate_limiter = LoginRateLimiter()
         app.state.api_rate_limiter = RequestRateLimiter(
             read_requests_per_minute=api_read_requests_per_minute,
             write_requests_per_minute=api_write_requests_per_minute,
+        )
+        app.state.public_share_rate_limiter = RequestRateLimiter(
+            read_requests_per_minute=60,
+            write_requests_per_minute=0,
+            max_state_entries=10_000,
+        )
+        app.state.public_share_client_rate_limiter = RequestRateLimiter(
+            read_requests_per_minute=120,
+            write_requests_per_minute=0,
+            max_state_entries=10_000,
         )
         app.state.provider_test_results = {}
         app.state.provider_test_cooldowns = {}
         app.state.remember_queue = remember_queue
         app.state.tool_classification_queue = tool_classification_queue
         app.state.artifact_store = artifact_store
+        app.state.deliverable_chart_migration = deliverable_chart_migration
         app.state.chat_v2_cursor_secret = f"chat-v2:{artifact_signing_secret}"
         app.state.artifact_maintenance = artifact_maintenance
         app.state.managed_conversation_maintenance = managed_conversation_maintenance
@@ -782,7 +896,21 @@ def create_app() -> FastAPI:
         app.state.turn_scheduler = turn_scheduler
         app.state.tool_output_store = tool_output_store
         app.state.tool_output_spool = tool_output_spool
+        app.state.tool_output_maintenance = tool_output_maintenance
         app.state.command_dispatcher = command_dispatcher
+
+        local_model_runtime_manager = LocalModelRuntimeManager(
+            session_factory,
+            providers.executor.websocket,
+        )
+        local_model_reconciler = LocalModelReconciler(
+            session_factory,
+            local_model_runtime_manager,
+        )
+        app.state.local_model_runtime_manager = local_model_runtime_manager
+        app.state.local_model_reconciler = local_model_reconciler
+        await local_model_runtime_manager.start()
+        await local_model_reconciler.start()
 
         # Channel manager — lifecycle orchestration for channel adapters.
         from cognis.channels.delivery import ChannelDeliveryService
@@ -861,6 +989,8 @@ def create_app() -> FastAPI:
                     session_lock.evict(session_id, reason="sweeper")
 
         session_lock_sweeper_task = asyncio.create_task(_session_lock_sweeper())
+        mcp_oauth_service.start_refresh_maintenance()
+        await tool_output_maintenance.start()
 
         yield
 
@@ -868,8 +998,13 @@ def create_app() -> FastAPI:
             session_lock_sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await session_lock_sweeper_task
+        await local_model_reconciler.stop()
+        await local_model_runtime_manager.stop()
+        await turn_scheduler.stop_follow_up_recovery()
+        await tool_output_maintenance.stop()
         await managed_conversation_maintenance.stop()
         await knowledgebase_indexer.stop()
+        await deliverable_chart_migration.stop()
         await artifact_maintenance.stop()
         await channel_delivery.stop()
         await mcp_oauth_service.shutdown()
@@ -880,12 +1015,14 @@ def create_app() -> FastAPI:
         await remember_queue.stop()
         await tool_classification_queue.stop()
         await providers.executor.cleanup()
+        await providers.llm.aclose()
         await session_cache.aclose()
         await providers.memory.client.aclose()
         await providers.guardrails.client.aclose()
+        await local_model_catalog.aclose()
         await engine.dispose()
 
-    app = FastAPI(title="Cognis", version="0.11.2", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.12.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -906,11 +1043,15 @@ def create_app() -> FastAPI:
     app.include_router(artifacts_router)
     app.include_router(channels_router)
     app.include_router(chat_v2_router)
+    if config.e2e_mode:
+        app.include_router(chat_v2_e2e_control_router)
     app.include_router(conversations_router)
     app.include_router(credentials_router)
+    app.include_router(deliverables_router)
     app.include_router(agents_router)
     app.include_router(images_router)
     app.include_router(knowledgebases_router)
+    app.include_router(local_models_router)
     app.include_router(sessions_router)
     app.include_router(settings_router)
     app.include_router(tasks_router)

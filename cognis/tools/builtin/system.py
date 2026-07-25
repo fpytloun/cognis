@@ -6,9 +6,14 @@ from typing import Any, Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.store.queries import list_active_agents_summary
-from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
+from cognis.tools.builtin.tool_search import (
+    DESCRIBE_TOOL_TOOL,
+    SEARCH_TOOLS_TOOL,
+    VALIDATE_TOOL_CALL_TOOL,
+)
 from cognis.tools.registry import ToolExecutionContext
 
 
@@ -40,7 +45,13 @@ GET_STATUS_TOOL = ToolDefinition(
 def system_tools() -> list[ToolDefinition]:
     """Return built-in system tool definitions."""
 
-    return [LIST_AGENTS_TOOL, GET_STATUS_TOOL, SEARCH_TOOLS_TOOL]
+    return [
+        LIST_AGENTS_TOOL,
+        GET_STATUS_TOOL,
+        SEARCH_TOOLS_TOOL,
+        DESCRIBE_TOOL_TOOL,
+        VALIDATE_TOOL_CALL_TOOL,
+    ]
 
 
 def build_system_tool_handlers(

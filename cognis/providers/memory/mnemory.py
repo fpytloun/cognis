@@ -27,6 +27,41 @@ MNEMORY_SESSION_FORGED_TOTAL = Counter(
 
 T = TypeVar("T")
 
+
+class MnemoryHTTPStatusError(httpx.HTTPStatusError):
+    """HTTP error from Mnemory that preserves its machine-readable detail."""
+
+    def __init__(self, error: httpx.HTTPStatusError) -> None:
+        response = error.response
+        self.status_code = response.status_code
+        self.detail = _response_error_detail(response)
+        super().__init__(
+            f"Mnemory request failed with HTTP {self.status_code}: {_detail_text(self.detail)}",
+            request=error.request,
+            response=response,
+        )
+
+
+def _response_error_detail(response: httpx.Response) -> Any:
+    """Extract Mnemory's structured error detail without losing plain-text failures."""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and "detail" in payload:
+        return payload["detail"]
+    if payload is not None:
+        return payload
+    return response.text.strip() or f"HTTP {response.status_code}"
+
+
+def _detail_text(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    return repr(detail)
+
+
 # Mnemory's RecallRequest schema enforces max_length=10_000 on both
 # ``query`` and ``context``.  Keep a small safety margin below that limit
 # so we never hit a 422 Unprocessable Content from the server.
@@ -129,7 +164,10 @@ class MnemoryProvider:
                 params=params,
                 headers=self._headers(agent_id=agent_id, user_email=user_email),
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise MnemoryHTTPStatusError(exc) from exc
             return response.json()
 
         return await self._call_with_retry(
@@ -158,7 +196,10 @@ class MnemoryProvider:
                 params=params,
                 headers=self._headers(agent_id=agent_id, user_email=user_email),
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise MnemoryHTTPStatusError(exc) from exc
 
         await self._call_with_retry(
             _do,

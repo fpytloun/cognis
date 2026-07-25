@@ -15,6 +15,7 @@ import type {
   TurnCycleState
 } from './types';
 import type { AttachmentRef } from '$lib/types/api';
+import { conversationTimelineScope, type TimelineScope } from './types';
 
 export type ChatV2SyncOutcome =
   | 'applied'
@@ -29,9 +30,13 @@ export interface ChatV2SyncResult {
 }
 
 export interface ChatV2ClientState {
+  scopeKey: string | null;
+  scope: import('./types').TimelineScope | null;
   conversationId: string | null;
   projectionVersion: string | null;
   cursor: string | null;
+  hasMoreBefore: boolean;
+  beforeCursor: string | null;
   conversation: ConversationSummary | null;
   timelineItems: TimelineItem[];
   state: ConversationStateView | null;
@@ -43,11 +48,39 @@ export interface ChatV2ClientState {
   lastError: string | null;
 }
 
+function responseScope(scope: TimelineScope | undefined, conversationId: string): TimelineScope {
+  return scope ?? conversationTimelineScope(conversationId);
+}
+
+interface ChatV2DerivedState {
+  timelineById: Map<string, TimelineItem>;
+  visibleItems?: TimelineItem[];
+}
+
+const derivedStateByState = new WeakMap<ChatV2ClientState, ChatV2DerivedState>();
+
+const testCounters = {
+  reconcileLocalItemsCalls: 0
+};
+
+export const __chatV2SyncEngineTestHooks = {
+  resetCounters(): void {
+    testCounters.reconcileLocalItemsCalls = 0;
+  },
+  counters(): { reconcileLocalItemsCalls: number } {
+    return { ...testCounters };
+  }
+};
+
 export function emptyChatV2State(): ChatV2ClientState {
-  return {
+  return cacheClientState({
+    scopeKey: null,
+    scope: null,
     conversationId: null,
     projectionVersion: null,
     cursor: null,
+    hasMoreBefore: false,
+    beforeCursor: null,
     conversation: null,
     timelineItems: [],
     state: null,
@@ -57,7 +90,32 @@ export function emptyChatV2State(): ChatV2ClientState {
     localItems: [],
     syncStatus: 'empty',
     lastError: null
-  };
+  }, new Map());
+}
+
+function cacheClientState(
+  state: ChatV2ClientState,
+  timelineById: Map<string, TimelineItem> = buildTimelineById(state.timelineItems)
+): ChatV2ClientState {
+  derivedStateByState.set(state, { timelineById });
+  return state;
+}
+
+function getDerivedState(state: ChatV2ClientState): ChatV2DerivedState {
+  let derived = derivedStateByState.get(state);
+  if (!derived) {
+    derived = { timelineById: buildTimelineById(state.timelineItems) };
+    derivedStateByState.set(state, derived);
+  }
+  return derived;
+}
+
+function getTimelineById(state: ChatV2ClientState): Map<string, TimelineItem> {
+  return getDerivedState(state).timelineById;
+}
+
+function buildTimelineById(items: readonly TimelineItem[]): Map<string, TimelineItem> {
+  return new Map(items.map((item) => [item.id, item]));
 }
 
 function cycleStateKey(state: TurnCycleState): string {
@@ -113,6 +171,8 @@ function mergeResponseCycleStates(
 }
 
 export function applySnapshot(snapshot: ChatSnapshot, previous?: ChatV2ClientState): ChatV2ClientState {
+  const conversationId = snapshot.scope?.conversation_id ?? snapshot.conversation?.conversation_id ?? '';
+  const scope = responseScope(snapshot.scope, conversationId);
   const timelineItems = mergeBackfilledHistory(
     mergeSnapshotWithExisting(sortTimelineItems(snapshot.timeline.items), snapshot, previous),
     snapshot,
@@ -138,10 +198,14 @@ export function applySnapshot(snapshot: ChatSnapshot, previous?: ChatV2ClientSta
   const previousCycleStates = shouldDropPreviousActiveTurn
     ? dropCycleStatesForTurn(previous?.cycleStates ?? [], previous?.runtime?.active_turn?.turn_id ?? null)
     : (previous?.cycleStates ?? []);
-  return {
-    conversationId: snapshot.conversation.conversation_id,
+  return cacheClientState({
+    scopeKey: scope.key,
+    scope,
+    conversationId: scope.conversation_id ?? snapshot.conversation?.conversation_id ?? null,
     projectionVersion: snapshot.projection_version,
     cursor: snapshot.cursor,
+    hasMoreBefore: snapshot.timeline.has_more_before && Boolean(snapshot.timeline.before_cursor),
+    beforeCursor: snapshot.timeline.before_cursor ?? null,
     conversation: snapshot.conversation,
     timelineItems,
     state: snapshot.state,
@@ -151,7 +215,7 @@ export function applySnapshot(snapshot: ChatSnapshot, previous?: ChatV2ClientSta
     localItems,
     syncStatus: 'ready',
     lastError: null
-  };
+  });
 }
 
 /**
@@ -172,7 +236,7 @@ function mergeBackfilledHistory(
   previous?: ChatV2ClientState
 ): TimelineItem[] {
   if (!previous || previous.timelineItems.length === 0) return snapshotItems;
-  if (previous.conversationId !== snapshot.conversation.conversation_id) return snapshotItems;
+  if (previous.scopeKey !== responseScope(snapshot.scope, snapshot.scope?.conversation_id ?? snapshot.conversation?.conversation_id ?? '').key) return snapshotItems;
   if (previous.projectionVersion !== snapshot.projection_version) return snapshotItems;
   if (snapshotItems.length === 0 || !snapshot.timeline.has_more_before) return snapshotItems;
   const earliest = snapshotItems[0];
@@ -202,9 +266,9 @@ function mergeSnapshotWithExisting(
   previous?: ChatV2ClientState
 ): TimelineItem[] {
   if (!previous || previous.timelineItems.length === 0) return snapshotItems;
-  if (previous.conversationId !== snapshot.conversation.conversation_id) return snapshotItems;
+  if (previous.scopeKey !== responseScope(snapshot.scope, snapshot.scope?.conversation_id ?? snapshot.conversation?.conversation_id ?? '').key) return snapshotItems;
   if (previous.projectionVersion !== snapshot.projection_version) return snapshotItems;
-  const previousById = new Map(previous.timelineItems.map((item) => [item.id, item]));
+  const previousById = getTimelineById(previous);
   return snapshotItems.map((item) => {
     const existing = previousById.get(item.id);
     return existing ? mergeTimelineItem(existing, item) : item;
@@ -212,31 +276,41 @@ function mergeSnapshotWithExisting(
 }
 
 export function applyBackfill(state: ChatV2ClientState, response: TimelineBackfillResponse): ChatV2ClientState {
-  if (state.conversationId !== response.conversation_id) {
+  if (state.scopeKey !== responseScope(response.scope, response.conversation_id).key) {
     return markGapped(state, 'lineage_changed', 'Backfill conversation does not match local state');
   }
   if (state.projectionVersion !== response.projection_version) {
     return markGapped(state, 'projection_version_changed', 'Backfill projection version does not match local state');
   }
-  const byId = new Map(state.timelineItems.map((item) => [item.id, item]));
+  const byId = new Map(getTimelineById(state));
+  const timelineItems = [...state.timelineItems];
   for (const item of response.items) {
     const existing = byId.get(item.id);
-    byId.set(item.id, existing ? mergeTimelineItem(existing, item) : item);
+    const nextItem = existing ? mergeTimelineItem(existing, item) : item;
+    upsertSortedTimelineItem(timelineItems, byId, nextItem);
   }
-  return {
+  return cacheClientState({
     ...state,
-    timelineItems: sortTimelineItems([...byId.values()]),
+    timelineItems,
+    hasMoreBefore: response.has_more_before && Boolean(response.before_cursor),
+    beforeCursor: response.before_cursor ?? null,
     cycleStates: mergeCycleStates(state.cycleStates ?? [], response.cycle_states ?? []),
-    localItems: reconcileLocalItems(state.localItems, [...byId.values()]),
+    localItems: reconcileLocalItems(state.localItems, timelineItems),
     lastError: null
-  };
+  }, byId);
 }
 
 export function applySyncResponse(state: ChatV2ClientState, response: ChatSyncResponse): ChatV2SyncResult {
+  if (state.scopeKey !== responseScope(response.scope, response.conversation_id).key) {
+    return { outcome: 'cursor_mismatch', state: markGapped(state, 'lineage_changed', 'Sync scope does not match local state') };
+  }
   return applySyncLike(state, response);
 }
 
 export function applyRealtimeFrame(state: ChatV2ClientState, frame: ChatRealtimeFrame): ChatV2SyncResult {
+  if (state.scopeKey !== responseScope(frame.scope, frame.conversation_id).key) {
+    return { outcome: 'cursor_mismatch', state: markGapped(state, 'lineage_changed', 'Realtime scope does not match local state') };
+  }
   return applySyncLike(state, frame);
 }
 
@@ -244,11 +318,11 @@ export function applySendResponse(state: ChatV2ClientState, response: SendMessag
   if (state.conversationId !== response.conversation_id) {
     return markGapped(state, 'lineage_changed', 'Send response conversation does not match local state');
   }
-  return {
+  return cacheClientState({
     ...state,
     cursor: response.cursor ?? state.cursor,
     lastError: null
-  };
+  }, getTimelineById(state));
 }
 
 export function addOptimisticUserMessage(
@@ -280,10 +354,22 @@ export function addOptimisticUserMessage(
     attachments: input.attachments ?? [],
     partial: false
   };
-  return {
+  return cacheClientState({
     ...state,
     localItems: reconcileLocalItems([...state.localItems, item], state.timelineItems)
-  };
+  }, getTimelineById(state));
+}
+
+export function markOptimisticUserMessageFailed(
+  state: ChatV2ClientState,
+  clientMessageId: string,
+): ChatV2ClientState {
+  const localItems = state.localItems.map((item) => (
+    item.kind === 'message' && item.client_message_id === clientMessageId
+      ? { ...item, status: 'failed' as const, stable: true, updated_at: new Date().toISOString() }
+      : item
+  ));
+  return cacheClientState({ ...state, localItems }, getTimelineById(state));
 }
 
 export function addLocalSystemMessage(
@@ -291,6 +377,7 @@ export function addLocalSystemMessage(
   input: {
     id: string;
     content: string;
+    noticeId?: string | null;
     createdAt?: string;
   }
 ): ChatV2ClientState {
@@ -299,7 +386,7 @@ export function addLocalSystemMessage(
   const item: TimelineItem = {
     id: input.id,
     kind: 'message',
-    sort_key: nextLocalSortKey(state),
+    sort_key: nextLocalSystemSortKey(state),
     source_refs: [],
     created_at: createdAt,
     updated_at: createdAt,
@@ -308,26 +395,36 @@ export function addLocalSystemMessage(
     role: 'system',
     content: input.content,
     message_id: input.id,
+    notice_id: input.noticeId ?? (input.id.startsWith('system:') ? input.id.slice('system:'.length) : undefined),
     attachments: [],
     partial: false
   };
-  return {
+  return cacheClientState({
     ...state,
     localItems: reconcileLocalItems([...state.localItems, item], state.timelineItems)
-  };
+  }, getTimelineById(state));
 }
 
 export function applyCancelResponse(state: ChatV2ClientState, response: CancelTurnV2Response): ChatV2ClientState {
   if (state.conversationId !== response.conversation_id) {
     return markGapped(state, 'lineage_changed', 'Cancel response conversation does not match local state');
   }
-  const runtime = maybeApplyRuntime(state.runtime, response.runtime ?? null);
-  return {
+  const previousRuntime = state.runtime;
+  const runtime = maybeApplyRuntime(previousRuntime, response.runtime ?? null);
+  // Carry settled runtime items: a cancel response can flip the overlay to
+  // inactive, which would otherwise drop the in-flight volatile items (already
+  // streamed assistant text / tool cards) until the next canonical sync.
+  const carriedLocalItems = carrySettledRuntimeItems(state.localItems, previousRuntime, runtime);
+  const localItems = carriedLocalItems === state.localItems
+    ? state.localItems
+    : reconcileLocalItems(carriedLocalItems, state.timelineItems);
+  return cacheClientState({
     ...state,
     runtime,
     cycleStates: mergeResponseCycleStates(state, [], runtime),
+    localItems,
     lastError: null
-  };
+  }, getTimelineById(state));
 }
 
 export function applyQueueMutationResponse(
@@ -337,15 +434,24 @@ export function applyQueueMutationResponse(
   if (state.conversationId !== response.conversation_id) {
     return markGapped(state, 'lineage_changed', 'Queue response conversation does not match local state');
   }
-  const runtime = maybeApplyRuntime(state.runtime, response.runtime ?? null);
-  return {
+  const previousRuntime = state.runtime;
+  const runtime = maybeApplyRuntime(previousRuntime, response.runtime ?? null);
+  // Carry settled runtime items (this path also advances the cursor, which is
+  // what later skews WS runtime frames): an inactive overlay here must not drop
+  // the in-flight volatile items before canonical confirmation.
+  const carriedLocalItems = carrySettledRuntimeItems(state.localItems, previousRuntime, runtime);
+  const localItems = carriedLocalItems === state.localItems
+    ? state.localItems
+    : reconcileLocalItems(carriedLocalItems, state.timelineItems);
+  return cacheClientState({
     ...state,
     queue: response.queue,
     cursor: response.cursor ?? state.cursor,
     runtime,
     cycleStates: mergeResponseCycleStates(state, [], runtime),
+    localItems,
     lastError: null
-  };
+  }, getTimelineById(state));
 }
 
 function applySyncLike(
@@ -355,6 +461,12 @@ function applySyncLike(
   if (state.conversationId !== response.conversation_id) {
     const next = markGapped(state, 'lineage_changed', 'Frame conversation does not match local state');
     return { outcome: 'cursor_mismatch', state: next, resetReason: 'lineage_changed' };
+  }
+
+  if ('reset_required' in response && response.reset_required) {
+    const resetReason = response.reset_reason ?? 'cursor_invalid';
+    const next = markGapped(state, resetReason, `Server requested reset: ${resetReason}`);
+    return { outcome: 'reset_required', state: next, resetReason };
   }
 
   if (state.projectionVersion !== response.projection_version) {
@@ -372,18 +484,32 @@ function applySyncLike(
     response.cursor_before === response.cursor_after &&
     response.cursor_before !== state.cursor
   ) {
-    const runtime = maybeApplyRuntime(state.runtime, response.runtime ?? null);
+    const previousRuntime = state.runtime;
+    const runtime = maybeApplyRuntime(previousRuntime, response.runtime ?? null);
     if (runtime === state.runtime) {
       return { outcome: 'duplicate', state };
     }
+    // CRITICAL: carry settled runtime items here too. This branch handles every
+    // WS runtime frame once the client cursor has advanced past the subscribe
+    // -time server cursor (which happens after the first REST sync, because the
+    // server never updates its per-connection cursor). The settle frame arrives
+    // via this path, so without the carry the just-streamed final assistant
+    // message — a runtime-only volatile item never present in localItems — drops
+    // out of visibleTimelineItems the instant has_active_turn flips false, and
+    // stays gone until a canonical sync re-adds it (which can be swallowed).
+    const carriedLocalItems = carrySettledRuntimeItems(state.localItems, previousRuntime, runtime);
+    const localItems = carriedLocalItems === state.localItems
+      ? state.localItems
+      : reconcileLocalItems(carriedLocalItems, state.timelineItems);
     return {
       outcome: 'applied',
-      state: {
+      state: cacheClientState({
         ...state,
         runtime,
         cycleStates: mergeResponseCycleStates(state, response.cycle_states ?? [], runtime),
+        localItems,
         lastError: null
-      }
+      }, getTimelineById(state))
     };
   }
 
@@ -412,7 +538,11 @@ function applySyncLike(
   let next = applyOps(state, response.ops);
   const previousRuntime = next.runtime;
   const runtime = maybeApplyRuntime(previousRuntime, response.runtime ?? null);
-  next = {
+  const carriedLocalItems = carrySettledRuntimeItems(next.localItems, previousRuntime, runtime);
+  const localItems = carriedLocalItems === next.localItems
+    ? next.localItems
+    : reconcileLocalItems(carriedLocalItems, next.timelineItems);
+  next = cacheClientState({
     ...next,
     cursor: response.cursor_after,
     runtime,
@@ -421,13 +551,10 @@ function applySyncLike(
     // a real active->inactive settle. Passing the accepted `runtime` (not the
     // raw incoming frame) ensures a stale inactive frame that maybeApplyRuntime
     // rejected does not terminalize the still-active overlay's items.
-    localItems: reconcileLocalItems(
-      carrySettledRuntimeItems(next.localItems, previousRuntime, runtime),
-      next.timelineItems
-    ),
+    localItems,
     syncStatus: 'ready',
     lastError: null
-  };
+  }, getTimelineById(next));
   return { outcome: 'applied', state: next };
 }
 
@@ -436,21 +563,37 @@ function isRealtimeFrame(response: ChatSyncResponse | ChatRealtimeFrame): respon
 }
 
 function applyOps(state: ChatV2ClientState, ops: ChatSyncResponse['ops']): ChatV2ClientState {
+  if (ops.length === 0) return state;
+
   let conversation = state.conversation;
   let conversationState = state.state;
   let queue = state.queue;
-  const timelineById = new Map(state.timelineItems.map((item) => [item.id, item]));
+  const previousTimelineById = getTimelineById(state);
+  let timelineById = previousTimelineById;
+  let timelineItems = state.timelineItems;
+  let timelineChanged = false;
+
+  const ensureTimelineMutable = (): void => {
+    if (timelineChanged) return;
+    timelineChanged = true;
+    timelineItems = [...state.timelineItems];
+    timelineById = new Map(previousTimelineById);
+  };
 
   for (const op of ops) {
     switch (op.op) {
       case 'upsert_item':
         {
           const existing = timelineById.get(op.item.id);
-          timelineById.set(op.item.id, existing ? mergeTimelineItem(existing, op.item) : op.item);
+          const nextItem = existing ? mergeTimelineItem(existing, op.item) : op.item;
+          ensureTimelineMutable();
+          upsertSortedTimelineItem(timelineItems, timelineById, nextItem);
         }
         break;
       case 'remove_item':
-        timelineById.delete(op.id);
+        if (!timelineById.has(op.id)) break;
+        ensureTimelineMutable();
+        removeSortedTimelineItem(timelineItems, timelineById, op.id);
         break;
       case 'replace_conversation':
         conversation = op.conversation;
@@ -466,15 +609,14 @@ function applyOps(state: ChatV2ClientState, ops: ChatSyncResponse['ops']): ChatV
     }
   }
 
-  const timelineItems = sortTimelineItems([...timelineById.values()]);
-  return {
+  return cacheClientState({
     ...state,
     conversation,
     state: conversationState,
     queue,
     timelineItems,
-    localItems: reconcileLocalItems(state.localItems, timelineItems)
-  };
+    localItems: timelineChanged ? reconcileLocalItems(state.localItems, timelineItems) : state.localItems
+  }, timelineById);
 }
 
 /**
@@ -487,39 +629,116 @@ function compareCodepoints(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function compareTimelineItems(a: TimelineItem, b: TimelineItem): number {
+  return compareCodepoints(a.sort_key, b.sort_key) || compareCodepoints(a.id, b.id);
+}
+
 export function sortTimelineItems(items: TimelineItem[]): TimelineItem[] {
-  return [...items].sort(
-    (a, b) => compareCodepoints(a.sort_key, b.sort_key) || compareCodepoints(a.id, b.id)
-  );
+  return [...items].sort(compareTimelineItems);
+}
+
+function sortedInsertionIndex(items: readonly TimelineItem[], item: TimelineItem): number {
+  let low = 0;
+  let high = items.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (compareTimelineItems(items[mid], item) <= 0) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+function removeSortedTimelineItem(
+  items: TimelineItem[],
+  byId: Map<string, TimelineItem>,
+  id: string
+): void {
+  const index = items.findIndex((item) => item.id === id);
+  if (index >= 0) items.splice(index, 1);
+  byId.delete(id);
+}
+
+function upsertSortedTimelineItem(
+  items: TimelineItem[],
+  byId: Map<string, TimelineItem>,
+  item: TimelineItem
+): void {
+  if (byId.has(item.id)) {
+    removeSortedTimelineItem(items, byId, item.id);
+  }
+  const insertAt = sortedInsertionIndex(items, item);
+  items.splice(insertAt, 0, item);
+  byId.set(item.id, item);
 }
 
 export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
+  const derived = getDerivedState(state);
+  if (derived.visibleItems) return derived.visibleItems;
+
+  const baseItems = runtimeAdjustedCanonicalItems(state);
   const runtimeItems = state.runtime?.has_active_turn ? state.runtime.volatile_items : [];
-  const activeTurnId = state.runtime?.has_active_turn
-    ? (state.runtime.active_turn?.turn_id ?? null)
-    : null;
-  const baseItems = state.runtime
-    ? state.timelineItems.map((item) => {
-        if (!state.runtime?.has_active_turn) return terminalizeSettledItem(item);
-        // A turn is active: canonical items stuck in a running state from a
-        // PRIOR turn (e.g. a crashed turn) must not render as active spinners
-        // for the whole new turn. Items of the active turn stay untouched.
-        const itemTurnId = itemTurnIdOf(item);
-        if (itemTurnId && activeTurnId && itemTurnId !== activeTurnId) {
-          return terminalizeSettledItem(item);
-        }
-        return item;
-      })
-    : state.timelineItems;
-  const byId = new Map(baseItems.map((item) => [item.id, item]));
-  for (const item of reconcileLocalItems(state.localItems, baseItems)) {
-    byId.set(item.id, item);
+  if (state.localItems.length === 0 && runtimeItems.length === 0) {
+    derived.visibleItems = baseItems;
+    return baseItems;
+  }
+
+  const visible = [...baseItems];
+  const visibleById = baseItems === state.timelineItems
+    ? new Map(derived.timelineById)
+    : buildTimelineById(baseItems);
+
+  // state.localItems is reconciled at transition sites; the visible derive
+  // trusts it and only merges it into the already-sorted canonical array.
+  for (const item of state.localItems) {
+    upsertVisibleTimelineItem(visible, visibleById, item);
   }
   for (const item of runtimeItems) {
-    const existing = byId.get(item.id);
-    byId.set(item.id, existing ? mergeTimelineItem(existing, item) : item);
+    upsertVisibleTimelineItem(visible, visibleById, item);
   }
-  return sortTimelineItems([...byId.values()]);
+  derived.visibleItems = visible;
+  return visible;
+}
+
+function runtimeAdjustedCanonicalItems(state: ChatV2ClientState): TimelineItem[] {
+  if (!state.runtime) return state.timelineItems;
+  const activeTurnId = state.runtime.has_active_turn
+    ? (state.runtime.active_turn?.turn_id ?? null)
+    : null;
+  let adjusted: TimelineItem[] | null = null;
+
+  for (let index = 0; index < state.timelineItems.length; index += 1) {
+    const item = state.timelineItems[index];
+    let nextItem = item;
+    if (!state.runtime.has_active_turn) {
+      nextItem = terminalizeSettledItem(item);
+    } else {
+      // A turn is active: canonical items stuck in a running state from a
+      // PRIOR turn (e.g. a crashed turn) must not render as active spinners
+      // for the whole new turn. Items of the active turn stay untouched.
+      const itemTurnId = itemTurnIdOf(item);
+      if (itemTurnId && activeTurnId && itemTurnId !== activeTurnId) {
+        nextItem = terminalizeSettledItem(item);
+      }
+    }
+    if (nextItem !== item && !adjusted) {
+      adjusted = state.timelineItems.slice(0, index);
+    }
+    adjusted?.push(nextItem);
+  }
+
+  return adjusted ?? state.timelineItems;
+}
+
+function upsertVisibleTimelineItem(
+  items: TimelineItem[],
+  byId: Map<string, TimelineItem>,
+  item: TimelineItem
+): void {
+  const existing = byId.get(item.id);
+  upsertSortedTimelineItem(items, byId, existing ? mergeTimelineItem(existing, item) : item);
 }
 
 function itemTurnIdOf(item: TimelineItem): string | null {
@@ -563,6 +782,7 @@ function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): Time
       progress_phase: incoming.progress_phase ?? existing.progress_phase,
       progress_input_chars: incoming.progress_input_chars ?? existing.progress_input_chars,
       progress_input_lines: incoming.progress_input_lines ?? existing.progress_input_lines,
+      managed_conversation: incoming.managed_conversation ?? existing.managed_conversation,
       progress_complete: incoming.progress_complete ?? existing.progress_complete,
       delegation: mergeDelegationRuntime(existing.delegation, incoming.delegation),
       created_at: existing.created_at ?? incoming.created_at,
@@ -606,14 +826,26 @@ function mergeTimelineItem(existing: TimelineItem, incoming: TimelineItem): Time
 
 function terminalizeSettledItem(item: TimelineItem): TimelineItem {
   if (item.kind === 'thinking') {
+    const needsTerminalStatus = item.status !== 'complete';
+    const needsBlockStatus = item.blocks.some((block) => block.status !== 'complete');
+    if (!needsTerminalStatus && !needsBlockStatus) return item;
     return {
       ...item,
       status: 'complete',
       blocks: item.blocks.map((block) => ({ ...block, status: 'complete' }))
     };
   }
-  if (item.kind === 'message' && item.role === 'assistant' && item.status === 'running') {
-    return { ...item, status: 'complete' };
+  if (
+    item.kind === 'message'
+    && item.role === 'assistant'
+    && (item.status === 'running' || item.partial)
+  ) {
+    // Clear `partial` on settle. The activity-fold gate treats a `partial`
+    // assistant message as "live" and then requires backend cycle-state
+    // confirmation to fold it; at settle the turn's cycle states are dropped,
+    // so a retained `partial` flag deadlocks folding until a full canonical
+    // sync replaces the item. A settled assistant message is never live.
+    return { ...item, status: 'complete', partial: false };
   }
   if (item.kind === 'tool_call' && (item.status === 'running' || item.status === 'pending')) {
     return { ...item, status: 'complete' };
@@ -748,12 +980,19 @@ function mergeRuntimeOverlay(
 }
 
 function reconcileLocalItems(localItems: TimelineItem[], canonicalItems: TimelineItem[]): TimelineItem[] {
+  testCounters.reconcileLocalItemsCalls += 1;
+  if (localItems.length === 0) return localItems;
   const canonicalIds = new Set(canonicalItems.map((item) => item.id));
   const canonicalClientMessageIds = new Set(
     canonicalItems
       .filter((item) => item.kind === 'message' && item.role === 'user' && item.client_message_id)
       .map((item) => (item.kind === 'message' ? item.client_message_id : null))
       .filter((value): value is string => typeof value === 'string')
+  );
+  const canonicalSystemIds = new Set(
+    canonicalItems
+      .filter((item) => item.kind === 'message' && item.role === 'system')
+      .map((item) => item.id)
   );
   // Phase-guess eviction inputs: a runtime item minted with a GUESSED phase
   // (message:{mid}:phase:{guess}) never matches the canonical id when the
@@ -777,8 +1016,11 @@ function reconcileLocalItems(localItems: TimelineItem[], canonicalItems: Timelin
       }
     }
   }
-  return localItems.filter((item) => {
+  const reconciled = localItems.filter((item) => {
     if (canonicalIds.has(item.id)) return false;
+    if (item.kind === 'message' && item.role === 'system' && canonicalSystemIds.has(item.id)) {
+      return false;
+    }
     if (item.kind === 'message' && item.role === 'assistant' && item.message_id) {
       const maxPhase = canonicalAssistantMaxPhase.get(item.message_id);
       const localPhase =
@@ -803,14 +1045,17 @@ function reconcileLocalItems(localItems: TimelineItem[], canonicalItems: Timelin
     if (!item.client_message_id) return true;
     return !canonicalClientMessageIds.has(item.client_message_id);
   });
+  return reconciled.length === localItems.length ? localItems : reconciled;
 }
 
 /** Sentinel band for carried (settled-but-unconfirmed) prior-turn items. */
-const CARRIED_LINEAGE_PREFIX = '9997:';
+const CARRIED_LINEAGE_PREFIX = '9996:';
 const ACTIVE_LINEAGE_PREFIX = '9998:';
 
 /**
- * Rekey a carried runtime item below the active-turn band (9998 → 9997).
+ * Rekey a carried runtime item below the pre-turn and active-turn bands
+ * (9998 → 9996). The backend reserves 9997 for idle-checkpoint compaction,
+ * which must render after the previous turn but before the next user message.
  *
  * Carried items belong to a FINISHED turn; the next turn's runtime items and
  * new optimistic user messages live in the 9998 band and must sort AFTER
@@ -869,7 +1114,10 @@ function nextLocalSortKey(state: ChatV2ClientState): string {
   let maxLocal = 0;
   for (const item of state.localItems) {
     const parts = item.sort_key.split(':');
-    if (parts.length === 5 && (parts[0] === '9997' || parts[0] === '9998')) {
+    if (
+      parts.length === 5
+      && (parts[0] === '9996' || parts[0] === '9997' || parts[0] === '9998')
+    ) {
       const local = Number(parts[4]);
       if (Number.isFinite(local) && local > maxLocal) maxLocal = local;
     }
@@ -877,7 +1125,7 @@ function nextLocalSortKey(state: ChatV2ClientState): string {
   // The message must sort AFTER everything the active turn has streamed so
   // far (its reply precedes the next question). Runtime items carry their
   // per-item phase in the key; minting at maxPhase+1 places the optimistic
-  // message after them now, and the carry rekey (9998 → 9997, suffix kept)
+  // message after them now, and the carry rekey (9998 → 9996, suffix kept)
   // preserves that order when the next turn starts.
   let phase = 0;
   if (state.runtime?.has_active_turn) {
@@ -890,14 +1138,33 @@ function nextLocalSortKey(state: ChatV2ClientState): string {
   return `9998:999999999999999:${String(phase).padStart(6, '0')}:00:${String(maxLocal + 1).padStart(9, '0')}`;
 }
 
+function nextLocalSystemSortKey(state: ChatV2ClientState): string {
+  const maxCanonical = state.timelineItems.reduce<string | null>(
+    (max, item) => (max === null || compareCodepoints(max, item.sort_key) < 0 ? item.sort_key : max),
+    null
+  );
+  if (!maxCanonical) return nextLocalSortKey(state);
+  const parts = maxCanonical.split(':');
+  if (parts.length !== 5) return nextLocalSortKey(state);
+  const prefix = parts.slice(0, 4).join(':');
+  let maxLocal = Number(parts[4]);
+  for (const item of state.localItems) {
+    const localParts = item.sort_key.split(':');
+    if (localParts.length !== 5 || localParts.slice(0, 4).join(':') !== prefix) continue;
+    const local = Number(localParts[4]);
+    if (Number.isFinite(local) && local > maxLocal) maxLocal = local;
+  }
+  return `${prefix}:${String(maxLocal + 1).padStart(9, '0')}`;
+}
+
 function isTerminalStatus(status: TimelineItem['status'] | undefined | null): boolean {
   return status === 'complete' || status === 'failed' || status === 'cancelled';
 }
 
 function markGapped(state: ChatV2ClientState, reason: ChatResetReason, message: string): ChatV2ClientState {
-  return {
+  return cacheClientState({
     ...state,
     syncStatus: 'gapped',
     lastError: `${reason}: ${message}`
-  };
+  }, getTimelineById(state));
 }

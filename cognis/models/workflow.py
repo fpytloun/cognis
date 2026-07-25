@@ -411,7 +411,7 @@ class StepOutput(BaseModel):
     notification: StepCompletionNotification | None = None
     deliverable_id: str | None = None
     deliverable_version: int | None = None
-    deliverable_format: Literal["markdown", "plain", "html"] | None = None
+    deliverable_format: Literal["markdown", "plain", "html", "rich"] | None = None
     deliverable_title: str | None = None
     execution_evidence: dict[str, Any] | None = None
     error: str | None = None  # Set when the step failed with an exception

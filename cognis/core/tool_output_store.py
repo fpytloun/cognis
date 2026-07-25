@@ -68,9 +68,17 @@ class OutputAnchor:
     anchor: str
     label: str | None
     kind: str
-    start_line: int
-    end_line: int
+    start_line: int | None
+    end_line: int | None
     artifact_candidate: dict[str, Any] | None = None
+    anchor_id: str | None = None
+    format: str = "text"
+    summary: str | None = None
+    locator: dict[str, Any] | None = None
+    recovery_op: str = "read_lines"
+    priority: int = 50
+    promote: bool = False
+    lazy_artifact_ref: str | None = None
 
 
 @dataclass(slots=True)
@@ -185,9 +193,9 @@ class ToolOutputBackend(Protocol):
     """Protocol for tool output storage backends."""
 
     async def save(self, call_id: str, output: str) -> None: ...
-    async def save_anchors(self, call_id: str, anchors: list[dict[str, Any]]) -> None: ...
+    async def save_anchors(self, call_id: str, anchors: object) -> None: ...
     async def load(self, call_id: str) -> str | None: ...
-    async def load_anchors(self, call_id: str) -> list[dict[str, Any]] | None: ...
+    async def load_anchors(self, call_id: str) -> object | None: ...
     async def exists(self, call_id: str) -> bool: ...
     async def delete(self, call_id: str) -> None: ...
     async def cleanup_expired(self, ttl_seconds: int) -> int: ...
@@ -225,7 +233,7 @@ class FilesystemToolOutputBackend:
                 exc_info=True,
             )
 
-    async def save_anchors(self, call_id: str, anchors: list[dict[str, Any]]) -> None:
+    async def save_anchors(self, call_id: str, anchors: object) -> None:
         path = self._anchors_path(call_id)
         try:
             if anchors:
@@ -248,7 +256,7 @@ class FilesystemToolOutputBackend:
         except OSError:
             return None
 
-    async def load_anchors(self, call_id: str) -> list[dict[str, Any]] | None:
+    async def load_anchors(self, call_id: str) -> object | None:
         path = self._anchors_path(call_id)
         if not path.exists():
             return None
@@ -256,7 +264,7 @@ class FilesystemToolOutputBackend:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        return raw if isinstance(raw, list) else None
+        return raw if isinstance(raw, (list, dict)) else None
 
     async def exists(self, call_id: str) -> bool:
         return self._path(call_id).exists()
@@ -271,42 +279,53 @@ class FilesystemToolOutputBackend:
         with contextlib.suppress(OSError):
             anchors_path.unlink(missing_ok=True)
 
-    async def cleanup_expired(self, ttl_seconds: int) -> int:
+    def _sync_cleanup_expired(self, ttl_seconds: int) -> int:
         deleted = 0
         now = time.time()
         try:
             for path in self._base_dir.iterdir():
-                if not path.is_file() or not path.name.endswith(".txt"):
+                try:
+                    if not path.is_file() or not path.name.endswith(".txt"):
+                        continue
+                    if (now - path.stat().st_mtime) > ttl_seconds:
+                        path.unlink(missing_ok=True)
+                        deleted += 1
+                        self._base_dir.joinpath(path.stem + ".anchors.json").unlink(missing_ok=True)
+                except OSError:
                     continue
-                if (now - path.stat().st_mtime) > ttl_seconds:
-                    path.unlink(missing_ok=True)
-                    deleted += 1
-                    self._base_dir.joinpath(path.stem + ".anchors.json").unlink(missing_ok=True)
         except OSError:
             logger.warning("tool_output_store: cleanup_expired failed", exc_info=True)
         return deleted
 
-    async def enforce_size_cap(self, max_size_bytes: int) -> int:
+    async def cleanup_expired(self, ttl_seconds: int) -> int:
+        return await asyncio.to_thread(self._sync_cleanup_expired, ttl_seconds)
+
+    def _sync_enforce_size_cap(self, max_size_bytes: int) -> int:
+        files: list[tuple[float, Path]] = []
         try:
-            files = sorted(
-                [
-                    path
-                    for path in self._base_dir.iterdir()
-                    if path.is_file() and path.name.endswith(".txt")
-                ],
-                key=lambda p: p.stat().st_mtime,
-            )
+            for path in self._base_dir.iterdir():
+                try:
+                    if path.is_file() and path.name.endswith(".txt"):
+                        files.append((path.stat().st_mtime, path))
+                except OSError:
+                    continue
         except OSError:
             return 0
+        files.sort(key=lambda item: item[0])
 
         total_size = 0
-        for path in files:
-            total_size += path.stat().st_size
-            anchors_path = self._base_dir / f"{path.stem}.anchors.json"
-            if anchors_path.exists():
-                total_size += anchors_path.stat().st_size
+        existing_files: list[Path] = []
+        for _, path in files:
+            try:
+                total_size += path.stat().st_size
+                anchors_path = self._base_dir / f"{path.stem}.anchors.json"
+                if anchors_path.exists():
+                    total_size += anchors_path.stat().st_size
+                existing_files.append(path)
+            except OSError:
+                continue
         deleted = 0
-        for path in files:
+        for path in existing_files:
             if total_size <= max_size_bytes:
                 break
             try:
@@ -322,6 +341,9 @@ class FilesystemToolOutputBackend:
             except OSError:
                 pass
         return deleted
+
+    async def enforce_size_cap(self, max_size_bytes: int) -> int:
+        return await asyncio.to_thread(self._sync_enforce_size_cap, max_size_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +427,7 @@ class S3ToolOutputBackend:
                 exc_info=True,
             )
 
-    def _sync_save_anchors(self, call_id: str, anchors: list[dict[str, Any]]) -> None:
+    def _sync_save_anchors(self, call_id: str, anchors: object) -> None:
         if not anchors:
             self._client.delete_object(Bucket=self._bucket, Key=self._anchors_key(call_id))
             return
@@ -416,7 +438,7 @@ class S3ToolOutputBackend:
             ContentType="application/json",
         )
 
-    async def save_anchors(self, call_id: str, anchors: list[dict[str, Any]]) -> None:
+    async def save_anchors(self, call_id: str, anchors: object) -> None:
         try:
             await asyncio.to_thread(self._sync_save_anchors, call_id, anchors)
         except Exception:
@@ -444,15 +466,15 @@ class S3ToolOutputBackend:
             )
             return None
 
-    def _sync_load_anchors(self, call_id: str) -> list[dict[str, Any]] | None:
+    def _sync_load_anchors(self, call_id: str) -> object | None:
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=self._anchors_key(call_id))
             raw = json.loads(response["Body"].read().decode("utf-8"))
         except self._client.exceptions.NoSuchKey:
             return None
-        return raw if isinstance(raw, list) else None
+        return raw if isinstance(raw, (list, dict)) else None
 
-    async def load_anchors(self, call_id: str) -> list[dict[str, Any]] | None:
+    async def load_anchors(self, call_id: str) -> object | None:
         try:
             return await asyncio.to_thread(self._sync_load_anchors, call_id)
         except Exception:
@@ -590,10 +612,24 @@ class ToolOutputStore:
         output: str,
         *,
         anchors: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """Save full output.  Overwrites if exists."""
+        anchor_manifest: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Save output and return the anchor manifest confirmed by round trip."""
         await self._backend.save(call_id, output)
-        await self._backend.save_anchors(call_id, anchors or [])
+        persisted_payload: object = (
+            anchor_manifest if anchor_manifest is not None else anchors or []
+        )
+        await self._backend.save_anchors(call_id, persisted_payload)
+        if not await self._backend.exists(call_id):
+            return []
+        if not anchors:
+            return []
+        persisted = await self._backend.load_anchors(call_id)
+        if persisted != persisted_payload:
+            return []
+        if isinstance(persisted, dict) and isinstance(persisted.get("anchors"), list):
+            return persisted["anchors"]
+        return persisted if isinstance(persisted, list) else []
 
     # ------------------------------------------------------------------
     # Read
@@ -701,6 +737,10 @@ class ToolOutputStore:
         raw = await self._backend.load_anchors(call_id)
         if raw is None:
             return _augment_with_markdown_heading_anchors(content, _parse_inline_anchors(content))
+        if isinstance(raw, dict):
+            raw = raw.get("anchors")
+        if not isinstance(raw, list):
+            return _augment_with_markdown_heading_anchors(content, _parse_inline_anchors(content))
         anchors: list[OutputAnchor] = []
         for item in raw:
             if not isinstance(item, dict):
@@ -711,18 +751,35 @@ class ToolOutputStore:
             end_line = item.get("end_line")
             if not isinstance(anchor, str) or not isinstance(kind, str):
                 continue
-            if not isinstance(start_line, int) or not isinstance(end_line, int):
+            locator = item.get("locator")
+            valid_lines = isinstance(start_line, int) and isinstance(end_line, int)
+            if not valid_lines and not isinstance(locator, dict):
                 continue
             label = item.get("label")
+            format_name = item.get("format")
+            recovery_op = item.get("recovery_op")
+            priority = item.get("priority")
             anchors.append(
                 OutputAnchor(
                     anchor=anchor,
                     label=label if isinstance(label, str) else None,
                     kind=kind,
-                    start_line=start_line,
-                    end_line=end_line,
+                    start_line=start_line if isinstance(start_line, int) else None,
+                    end_line=end_line if isinstance(end_line, int) else None,
                     artifact_candidate=item.get("artifact_candidate")
                     if isinstance(item.get("artifact_candidate"), dict)
+                    else None,
+                    anchor_id=item.get("anchor_id")
+                    if isinstance(item.get("anchor_id"), str)
+                    else None,
+                    format=format_name if isinstance(format_name, str) else "text",
+                    summary=item.get("summary") if isinstance(item.get("summary"), str) else None,
+                    locator=item.get("locator") if isinstance(item.get("locator"), dict) else None,
+                    recovery_op=recovery_op if isinstance(recovery_op, str) else "read_lines",
+                    priority=priority if isinstance(priority, int) else 50,
+                    promote=item.get("promote") is True,
+                    lazy_artifact_ref=item.get("lazy_artifact_ref")
+                    if isinstance(item.get("lazy_artifact_ref"), str)
                     else None,
                 )
             )
@@ -749,7 +806,31 @@ class ToolOutputStore:
         if content is None:
             return None
 
+        locator = selected.locator or {}
+        locator_type = locator.get("type")
+        if locator_type == "stored_json":
+            try:
+                value: Any = json.loads(content)
+                for token in str(locator.get("pointer") or "").lstrip("/").split("/"):
+                    token = token.replace("~1", "/").replace("~0", "~")
+                    value = value[int(token)] if isinstance(value, list) else value[token]
+                rendered = json.dumps(value, indent=2, ensure_ascii=False)
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError):
+                return None
+            return AnchorReadResult(anchor=selected, content=rendered)
+        if locator_type == "artifact_part":
+            return AnchorReadResult(
+                anchor=selected,
+                content=json.dumps({"artifact_part": locator}, ensure_ascii=False),
+            )
         all_lines = content.splitlines()
+        if locator_type == "stored_rows":
+            start_row = int(locator.get("start_row") or 1)
+            end_row = int(locator.get("end_row") or start_row)
+            selected_lines = all_lines[start_row - 1 : end_row]
+            return AnchorReadResult(anchor=selected, content="\n".join(selected_lines))
+        if selected.start_line is None or selected.end_line is None:
+            return None
         start_idx = max(0, selected.start_line - 1 - before_lines)
         end_idx = min(len(all_lines), selected.end_line + after_lines)
         numbered: list[str] = []

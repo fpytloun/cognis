@@ -829,6 +829,11 @@ class CompactionStrategy:
                 "method": method,
                 "tail_start_seq": (preserved_tail_events[0].seq if preserved_tail_events else None),
                 "tail_event_count": len(preserved_tail_events),
+                # This source-session checkpoint is a durable fallback if the
+                # subsequent rotation fails. The rotated marker shares its
+                # stable timeline ID, so a successful rotation replaces this
+                # provisional card instead of creating a duplicate.
+                "timeline_visible": True,
             },
         )
         # Retry is handled by the Intaris provider (exponential backoff).

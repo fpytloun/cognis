@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
@@ -15,13 +16,27 @@ import pytest
 
 from cognis.cli import executor as cli_executor
 from cognis.executor import __main__ as executor_main
-from cognis.executor.runner import ExecutorRunner, _normalize_result
+from cognis.executor.runner import (
+    _LOCAL_INFERENCE_START_METHODS,
+    ExecutorRunner,
+    _EventLoopWatchdog,
+    _normalize_result,
+    _same_turn_tool_call_identity,
+    _same_turn_tool_call_key,
+    _SameTurnToolCallDeduplicator,
+)
+from cognis.models.executor_resources import ExecutorResourceSnapshot
 from cognis.models.tool import (
     ExecutorConfig,
     MCPServerConfig,
-    ToolDefinition,
     ToolResult,
     ToolSource,
+)
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.tools.executor.browser.manager import (
+    BROWSER_MANAGER_KEY,
+    BrowserManager,
+    BrowserSession,
 )
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
 from cognis.tools.executor.shell import set_background_shell_completion_callback
@@ -34,6 +49,63 @@ class DummyWebSocket:
 
     async def send(self, raw: str) -> None:
         self.sent.append(json.loads(raw))
+
+
+def test_same_turn_tool_call_key_is_provider_neutral_and_cycle_scoped() -> None:
+    first = {
+        "execution_scope_id": "scope",
+        "tool_name": "bash",
+        "arguments": {"command": "true", "timeout": 1},
+        "runtime_metadata": {"turn_id": "turn", "tool_contract_hash": "contract"},
+    }
+    reordered = {
+        **first,
+        "arguments": {"timeout": 1, "command": "true"},
+    }
+    next_turn = {
+        **first,
+        "runtime_metadata": {"turn_id": "next-turn", "tool_contract_hash": "contract"},
+    }
+
+    assert _same_turn_tool_call_key(first) == _same_turn_tool_call_key(reordered)
+    assert _same_turn_tool_call_key(first) != _same_turn_tool_call_key(next_turn)
+    assert _same_turn_tool_call_identity(first)[0] != _same_turn_tool_call_identity(next_turn)[0]
+    assert _same_turn_tool_call_key(first) == _same_turn_tool_call_key(
+        {
+            **first,
+            "runtime_metadata": {"turn_id": "turn", "tool_contract_hash": "changed-contract"},
+        }
+    )
+
+
+def test_same_turn_tool_call_deduplicator_rejects_serial_siblings_and_allows_next_turn() -> None:
+    deduplicator = _SameTurnToolCallDeduplicator()
+    first = {
+        "call_id": "call-first",
+        "execution_scope_id": "scope",
+        "tool_name": "bash",
+        "arguments": {"command": "true"},
+        "runtime_metadata": {"turn_id": "turn-one"},
+    }
+    duplicate = {**first, "call_id": "call-duplicate"}
+    next_turn = {
+        **first,
+        "call_id": "call-next-turn",
+        "runtime_metadata": {"turn_id": "turn-two"},
+    }
+
+    assert deduplicator.original_call_id(first) is None
+    assert deduplicator.original_call_id(duplicate) == "call-first"
+    assert deduplicator.original_call_id(next_turn) is None
+    assert deduplicator.original_call_id(duplicate) == "call-first"
+
+
+def _contract_metadata(runner: ExecutorRunner, tool_name: str) -> dict[str, str]:
+    definition = next(
+        tool for tool in runner._configured_tool_definitions if tool.name == tool_name
+    )
+    assert definition.descriptor is not None
+    return {"tool_contract_hash": definition.descriptor.schema_hash}
 
 
 class DummyMessageWebSocket(DummyWebSocket):
@@ -56,6 +128,135 @@ class ClosingWebSocket(DummyWebSocket):
         from websockets.frames import Close
 
         raise ConnectionClosedError(Close(1011, "test"), Close(1011, "test"), True)
+
+
+class BlockingWebSocket(DummyWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls: list[tuple[int, str]] = []
+
+    async def close(self, *, code: int, reason: str) -> None:
+        self.close_calls.append((code, reason))
+
+
+def test_event_loop_watchdog_acknowledges_responsive_loop() -> None:
+    callbacks: list[object] = []
+    exits: list[int] = []
+
+    class _Loop:
+        def call_soon_threadsafe(self, callback: object) -> None:
+            callbacks.append(callback)
+
+    watchdog = _EventLoopWatchdog(
+        _Loop(),  # type: ignore[arg-type]
+        interval_seconds=1.0,
+        timeout_seconds=5.0,
+        exit_process=exits.append,
+        clock=lambda: 10.0,
+    )
+
+    assert watchdog.poll_once() is True
+    assert len(callbacks) == 1
+    assert exits == []
+
+
+def test_event_loop_watchdog_forces_restart_after_timeout() -> None:
+    exits: list[int] = []
+    clock_values = iter((10.0, 16.0))
+    watchdog = _EventLoopWatchdog(
+        SimpleNamespace(call_soon_threadsafe=lambda _: None),
+        interval_seconds=1.0,
+        timeout_seconds=5.0,
+        exit_process=exits.append,
+        clock=lambda: next(clock_values),
+    )
+
+    assert watchdog.poll_once() is False
+    assert exits == [70]
+
+
+@pytest.mark.asyncio
+async def test_local_inference_disabled_is_advertised_and_enforced_at_dispatch() -> None:
+    expected_methods = {
+        "llm.complete",
+        "llm.discover_models",
+        "llm.image_generate",
+        "llm.transcribe",
+        "llm.synthesize",
+        "local_model.show",
+        "local_model.operation.start",
+    }
+    assert expected_methods == _LOCAL_INFERENCE_START_METHODS
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    configure_ws = DummyWebSocket()
+    await runner._handle_configure(
+        configure_ws,
+        "cfg-disabled",
+        {
+            "enabled_tools": [],
+            "config": {"local_inference_enabled": False},
+        },
+    )
+
+    capabilities = configure_ws.sent[-1]["result"]["capabilities"]
+    assert capabilities["inference"] is False
+    assert capabilities["local_inference"] is False
+    assert capabilities["local_model_runtime"] is None
+
+    ws = DummyMessageWebSocket(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": f"disabled-{index}",
+                "method": method,
+                "params": {},
+            }
+            for index, method in enumerate(sorted(_LOCAL_INFERENCE_START_METHODS))
+        ]
+    )
+    await runner._message_loop(ws)
+
+    assert len(ws.sent) == len(_LOCAL_INFERENCE_START_METHODS)
+    assert "local_model.status" not in _LOCAL_INFERENCE_START_METHODS
+    assert "local_model.operation.status" not in _LOCAL_INFERENCE_START_METHODS
+    assert "local_model.operation.cancel" not in _LOCAL_INFERENCE_START_METHODS
+    assert {item["error"]["code"] for item in ws.sent} == {-32045}
+    assert {item["error"]["message"] for item in ws.sent} == {
+        "Local inference is disabled on this executor"
+    }
+
+
+@pytest.mark.asyncio
+async def test_custom_ollama_port_reaches_runner_capability_and_resource_probe() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._resource_collector.collect = AsyncMock(
+        return_value=ExecutorResourceSnapshot(observed_at="2026-07-14T10:00:00Z")
+    )
+    ws = DummyWebSocket()
+
+    await runner._handle_configure(
+        ws,
+        "cfg-custom-port",
+        {
+            "enabled_tools": [],
+            "config": {
+                "ollama_runtime": {
+                    "port": 22434,
+                    "management_enabled": True,
+                }
+            },
+        },
+    )
+
+    capability = ws.sent[-1]["result"]["capabilities"]["local_model_runtime"]
+    assert capability["port"] == 22434
+    assert capability["endpoint"] == "http://127.0.0.1:22434"
+    runner._resource_collector.collect.assert_awaited_once()
+    assert (
+        runner._resource_collector.collect.await_args.kwargs["ollama_endpoint"]
+        == "http://127.0.0.1:22434"
+    )
+    await runner._ollama_runtime_handler.close()
 
 
 @pytest.mark.asyncio
@@ -127,6 +328,191 @@ async def test_runner_retries_immediately_after_clean_disconnect(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_send_failure_is_not_swallowed() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    with pytest.raises(Exception, match="received 1011"):
+        await runner._heartbeat_loop(ClosingWebSocket())
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_closes_connection_and_cancels_message_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = BlockingWebSocket()
+    message_started = asyncio.Event()
+    message_cancelled = asyncio.Event()
+
+    async def _message_loop(_ws: object) -> None:
+        message_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            message_cancelled.set()
+            raise
+
+    async def _heartbeat_loop(_ws: object) -> None:
+        await message_started.wait()
+        raise ConnectionError("test heartbeat failure")
+
+    monkeypatch.setattr(runner, "_message_loop", _message_loop)
+    monkeypatch.setattr(runner, "_heartbeat_loop", _heartbeat_loop)
+    caplog.set_level(logging.WARNING, logger="cognis.executor.runner")
+
+    with pytest.raises(ConnectionError, match="test heartbeat failure"):
+        await runner._run_connection_loops(ws)
+
+    assert message_cancelled.is_set()
+    assert ws.close_calls == [(1011, "executor heartbeat failure")]
+    assert "Executor heartbeat failed" in caplog.text
+    assert "ConnectionError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_cancels_and_drains_connection_owned_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def _handler() -> None:
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    handler_task = runner._create_background_handler_task(
+        _handler(),
+        "tool.execute",
+        msg_id="rpc-1",
+    )
+    runner._active_calls["call-1"] = handler_task
+
+    async def _message_loop(_ws: object) -> None:
+        await asyncio.Event().wait()
+
+    async def _heartbeat_loop(_ws: object) -> None:
+        await handler_started.wait()
+        raise ConnectionError("heartbeat disconnected")
+
+    monkeypatch.setattr(runner, "_message_loop", _message_loop)
+    monkeypatch.setattr(runner, "_heartbeat_loop", _heartbeat_loop)
+
+    with pytest.raises(ConnectionError):
+        await runner._run_connection_loops(BlockingWebSocket())
+
+    assert handler_cancelled.is_set()
+    assert runner._connection_handler_tasks == set()
+    assert runner._active_calls == {}
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_receive_close_does_not_hide_heartbeat_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+
+    async def _message_loop(_ws: object) -> None:
+        return
+
+    async def _heartbeat_loop(_ws: object) -> None:
+        raise ConnectionError("simultaneous heartbeat failure")
+
+    monkeypatch.setattr(runner, "_message_loop", _message_loop)
+    monkeypatch.setattr(runner, "_heartbeat_loop", _heartbeat_loop)
+    caplog.set_level(logging.WARNING, logger="cognis.executor.runner")
+
+    with pytest.raises(ConnectionError, match="simultaneous heartbeat failure"):
+        await runner._run_connection_loops(BlockingWebSocket())
+
+    assert "Executor heartbeat failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_clean_controller_close_cancels_heartbeat_without_false_error_or_leak(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    heartbeat_cancelled = asyncio.Event()
+
+    async def _message_loop(_ws: object) -> None:
+        return
+
+    async def _heartbeat_loop(_ws: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            raise
+
+    monkeypatch.setattr(runner, "_message_loop", _message_loop)
+    monkeypatch.setattr(runner, "_heartbeat_loop", _heartbeat_loop)
+    caplog.set_level(logging.INFO, logger="cognis.executor.runner")
+
+    await runner._run_connection_loops(BlockingWebSocket())
+
+    assert heartbeat_cancelled.is_set()
+    assert "Controller connection closed" in caplog.text
+    assert "Executor heartbeat failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_reaches_existing_reconnect_loop_without_duplicate_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    attempts = 0
+    active_message_loops = 0
+    max_active_message_loops = 0
+    sleeps: list[float] = []
+    message_started = asyncio.Event()
+
+    async def _connect_and_serve() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            runner._running = False
+            return
+        await runner._run_connection_loops(BlockingWebSocket())
+
+    async def _message_loop(_ws: object) -> None:
+        nonlocal active_message_loops, max_active_message_loops
+        active_message_loops += 1
+        max_active_message_loops = max(max_active_message_loops, active_message_loops)
+        message_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active_message_loops -= 1
+
+    async def _heartbeat_loop(_ws: object) -> None:
+        await message_started.wait()
+        raise ConnectionError("heartbeat disconnected")
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runner, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(runner, "_message_loop", _message_loop)
+    monkeypatch.setattr(runner, "_heartbeat_loop", _heartbeat_loop)
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+
+    await runner.run()
+
+    assert attempts == 2
+    assert sleeps == [1.0]
+    assert active_message_loops == 0
+    assert max_active_message_loops == 1
+
+
+@pytest.mark.asyncio
 async def test_runner_logs_cancellation(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -164,6 +550,37 @@ def test_normalize_result_from_tool_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_llm_discover_models_returns_models() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+
+    class FakeInferenceHandler:
+        async def discover_models(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs == {
+                "preset": "ollama",
+                "base_url": "http://localhost:11434",
+                "api_key": "",
+            }
+            return [{"model_id": "ollama/ornith:9b", "name": "ornith:9b"}]
+
+    runner._inference_handler = FakeInferenceHandler()  # type: ignore[assignment]
+
+    await runner._handle_llm_discover_models(
+        ws,
+        "disc-1",
+        {"preset": "ollama", "base_url": "http://localhost:11434"},
+    )
+
+    assert ws.sent == [
+        {
+            "jsonrpc": "2.0",
+            "id": "disc-1",
+            "result": {"models": [{"model_id": "ollama/ornith:9b", "name": "ornith:9b"}]},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_configure_filters_tools() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
@@ -183,6 +600,44 @@ async def test_handle_configure_filters_tools() -> None:
     assert "read" in caps_tools
     assert "glob" in caps_tools
     assert "environment" in ws.sent[-1]["result"]
+
+
+@pytest.mark.asyncio
+async def test_handle_configure_preserves_platform_and_resource_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    cached = ExecutorResourceSnapshot(
+        observed_at="2026-07-13T10:00:00Z",
+        os="darwin",
+        arch="arm64",
+    ).model_dump(mode="json", exclude={"freshness"})
+    runner._resource_snapshot = cached
+    runner._resource_snapshot_collected_at = runner._started_at
+    collect = AsyncMock()
+    monkeypatch.setattr(runner._resource_collector, "collect", collect)
+    monkeypatch.setattr(
+        "cognis.executor.runner._build_platform_payload",
+        lambda: {"os": "darwin", "arch": "arm64", "python": "3.12.10"},
+    )
+
+    await runner._handle_configure(
+        ws,
+        "cfg-platform",
+        {"enabled_tools": [], "enabled_tool_groups": [], "config": {}},
+    )
+
+    metadata = ws.sent[-1]["result"]["runtime_metadata"]
+    assert metadata["platform"] == {
+        "os": "darwin",
+        "arch": "arm64",
+        "python": "3.12.10",
+    }
+    assert metadata["resource_snapshot"]["os"] == "darwin"
+    assert metadata["resource_snapshot"]["runtime"]["configured"] is True
+    assert metadata["resource_snapshot"]["runtime"]["state"] == "active"
+    collect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -218,6 +673,7 @@ async def test_handle_configure_preserves_background_shell_completion_callback()
                 "timeout": 1,
                 "run_in_background": True,
             },
+            "runtime_metadata": _contract_metadata(runner, "bash"),
         },
     )
 
@@ -268,6 +724,7 @@ async def test_handle_configure_retries_pending_background_shell_completion() ->
                 "timeout": 1,
                 "run_in_background": True,
             },
+            "runtime_metadata": _contract_metadata(runner, "bash"),
         },
     )
 
@@ -338,6 +795,7 @@ async def test_handle_configure_exposes_skill_assets_to_materialize_tool(
                 "asset_id": "sa-script",
                 "target_path": str(target),
             },
+            "runtime_metadata": _contract_metadata(runner, "skill_asset_materialize"),
         },
     )
 
@@ -367,11 +825,60 @@ async def test_handle_tool_execute_requires_configuration() -> None:
     await runner._handle_tool_execute(
         ws,
         "call-1",
-        {"call_id": "call-1", "tool_name": "read", "arguments": {}},
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {"file_path": "/tmp/file", "offset": 1, "limit": 1},
+        },
     )
 
     assert ws.sent[-1]["result"]["is_error"] is True
     assert "not configured" in ws.sent[-1]["result"]["output"].lower()
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_execute_rejects_controller_executor_contract_skew() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+    ws.sent.clear()
+
+    await runner._handle_tool_execute(
+        ws,
+        "call-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {"file_path": "/tmp/file", "offset": 1, "limit": 1},
+            "runtime_metadata": {"tool_contract_hash": "sha256:stale"},
+        },
+    )
+
+    result = ws.sent[-1]["result"]
+    assert result["is_error"] is True
+    assert result["metadata"]["code"] == "tool_contract_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_execute_rejects_missing_contract_hash() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+    ws.sent.clear()
+
+    await runner._handle_tool_execute(
+        ws,
+        "call-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {"file_path": "/tmp/file", "offset": 1, "limit": 1},
+        },
+    )
+
+    result = ws.sent[-1]["result"]
+    assert result["is_error"] is True
+    assert result["metadata"]["code"] == "tool_contract_mismatch"
 
 
 @pytest.mark.asyncio
@@ -434,6 +941,39 @@ async def test_handle_llm_complete_streams_chunks() -> None:
 
     assert ws.sent[0]["result"]["status"] == "streaming"
     assert ws.sent[1]["method"] == "llm.chunk"
+    assert ws.sent[2]["method"] == "llm.done"
+
+
+@pytest.mark.asyncio
+async def test_handle_llm_complete_forwards_anthropic_native_events() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": [], "config": {}})
+
+    runner._inference_handler = AsyncMock()
+    native_events = [
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"query":"docs"}'},
+        }
+    ]
+
+    async def _stream_complete(**_: object):
+        yield {"anthropic_native_events": native_events}
+        yield {"done": True, "finish_reason": "pause_turn"}
+
+    runner._inference_handler.stream_complete = _stream_complete
+    ws.sent.clear()
+
+    await runner._handle_llm_complete(
+        ws,
+        "rpc-1",
+        {"request_id": "req-1", "model": "claude-opus-4-7", "messages": []},
+    )
+
+    assert ws.sent[1]["method"] == "llm.chunk"
+    assert ws.sent[1]["params"]["anthropic_native_events"] == native_events
     assert ws.sent[2]["method"] == "llm.done"
 
 
@@ -663,6 +1203,12 @@ async def test_prepare_mcp_runtime_reports_authorization_required_warning(
                 status_code=401,
                 auth_error="authorization_required",
                 www_authenticate='Bearer resource_metadata="https://mfg.example/.well-known/oauth-protected-resource/mcp"',
+                authorization_challenge={
+                    "resource_metadata": (
+                        "https://mfg.example/.well-known/oauth-protected-resource/mcp"
+                    ),
+                    "scope": "tools.read",
+                },
             )
 
         async def list_tools(self) -> list[dict[str, object]]:
@@ -695,6 +1241,10 @@ async def test_prepare_mcp_runtime_reports_authorization_required_warning(
     assert statuses[0]["authorization_required"] is True
     assert statuses[0]["status_code"] == 401
     assert statuses[0]["auth_error"] == "authorization_required"
+    assert statuses[0]["authorization_challenge"] == {
+        "resource_metadata": "https://mfg.example/.well-known/oauth-protected-resource/mcp",
+        "scope": "tools.read",
+    }
 
 
 @pytest.mark.asyncio
@@ -803,7 +1353,12 @@ async def test_handle_tool_execute_allows_degraded_runtime() -> None:
     await runner._handle_tool_execute(
         ws,
         "tool-1",
-        {"call_id": "call-1", "tool_name": "read", "arguments": {}},
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {"file_path": "/tmp/file", "offset": 1, "limit": 1},
+            "runtime_metadata": _contract_metadata(runner, "read"),
+        },
     )
 
     assert ws.sent[-1]["result"]["is_error"] is False
@@ -958,8 +1513,9 @@ async def test_tool_execute_passes_execution_scope_id() -> None:
         {
             "call_id": "call-1",
             "tool_name": "read",
-            "arguments": {},
+            "arguments": {"file_path": "/tmp/file", "offset": 1, "limit": 1},
             "execution_scope_id": "session-123",
+            "runtime_metadata": _contract_metadata(runner, "read"),
         },
     )
 
@@ -1278,3 +1834,222 @@ async def test_reconfigure_closes_stale_clients_inline() -> None:
     assert runner._running is True  # critical: runner must not exit
     assert ws.sent[-1]["result"]["applied_version"] == 2
     assert closed_in_task == [configure_task]
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_retains_manager_after_permanent_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {
+            "enabled_tools": [],
+            "config": {"browser": {"enabled": True}},
+        },
+    )
+    old_manager = runner._runtime_metadata[BROWSER_MANAGER_KEY]
+    assert isinstance(old_manager, BrowserManager)
+    old_manager._reserved_profile_ids["profile"] = None  # noqa: SLF001
+
+    async def _permanent_teardown_failure() -> list[BaseException]:
+        return [RuntimeError("forced teardown failed")]
+
+    monkeypatch.setattr(old_manager, "_force_runtime_teardown", _permanent_teardown_failure)
+
+    await runner._handle_configure(
+        ws,
+        "cfg-2",
+        {
+            "enabled_tools": [],
+            "config": {"browser": {"enabled": True}},
+        },
+    )
+
+    assert old_manager is not runner._runtime_metadata[BROWSER_MANAGER_KEY]
+    assert old_manager in runner._browser_cleanup_retainer.managers  # noqa: SLF001
+    assert old_manager._reserved_profile_ids == {"profile": None}  # noqa: SLF001
+    tasks = list(runner._browser_cleanup_retainer._tasks.values())  # noqa: SLF001
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reconfigure_restores_old_manager_and_retains_staged_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {
+            "enabled_tools": [],
+            "config": {"browser": {"enabled": True}},
+        },
+    )
+    old_manager = runner._runtime_metadata[BROWSER_MANAGER_KEY]
+    staged_manager = BrowserManager()
+    staged_manager._reserved_profile_ids["staged-profile"] = None  # noqa: SLF001
+    staged_client_closed = False
+    staged_lsp_manager = object()
+    cleaned_lsp_managers: list[object] = []
+
+    class _StagedClient:
+        async def close(self, *, suppress_cancelled: bool = False) -> None:
+            nonlocal staged_client_closed
+            del suppress_cancelled
+            staged_client_closed = True
+
+    async def _permanent_teardown_failure() -> list[BaseException]:
+        return [RuntimeError("forced teardown failed")]
+
+    monkeypatch.setattr(
+        staged_manager,
+        "_force_runtime_teardown",
+        _permanent_teardown_failure,
+    )
+    monkeypatch.setattr(
+        "cognis.executor.runner._build_browser_manager",
+        lambda _: staged_manager,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_prepare_mcp_runtime",
+        lambda *_: asyncio.sleep(0, result=({"staged": _StagedClient()}, [], [], [])),
+    )
+    monkeypatch.setattr(
+        "cognis.executor.runner.build_lsp_manager",
+        lambda _: staged_lsp_manager,
+    )
+
+    async def _cleanup_lsp_manager(manager: object, **_: object) -> None:
+        cleaned_lsp_managers.append(manager)
+
+    monkeypatch.setattr(
+        "cognis.executor.runner.cleanup_lsp_manager",
+        _cleanup_lsp_manager,
+    )
+
+    async def _cancel_configure(*_: object) -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(runner, "_register_skill_handlers", _cancel_configure)
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._handle_configure(
+            ws,
+            "cfg-2",
+            {
+                "enabled_tools": [],
+                "config": {"browser": {"enabled": True}},
+            },
+        )
+
+    assert runner._runtime_metadata[BROWSER_MANAGER_KEY] is old_manager
+    assert staged_manager in runner._browser_cleanup_retainer.managers  # noqa: SLF001
+    assert staged_manager._reserved_profile_ids == {"staged-profile": None}  # noqa: SLF001
+    assert staged_client_closed is True
+    assert cleaned_lsp_managers == [staged_lsp_manager]
+    tasks = list(runner._browser_cleanup_retainer._tasks.values())  # noqa: SLF001
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runner_shutdown_drains_retainer_without_current_browser_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._running = False
+    manager = BrowserManager()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def _cleanup() -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    monkeypatch.setattr(manager, "cleanup", _cleanup)
+    runner._browser_cleanup_retainer.retain(manager)  # noqa: SLF001
+    await cleanup_started.wait()
+    assert BROWSER_MANAGER_KEY not in runner._runtime_metadata  # noqa: SLF001
+
+    run_task = asyncio.create_task(runner.run())
+    await asyncio.sleep(0)
+    assert not run_task.done()
+
+    release_cleanup.set()
+    await run_task
+
+    assert runner._browser_cleanup_retainer.managers == ()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_old_cleanup_point_restores_usable_previous_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(
+        ws,
+        "cfg-1",
+        {
+            "enabled_tools": [],
+            "config": {"browser": {"enabled": True}},
+        },
+    )
+    old_manager = runner._runtime_metadata[BROWSER_MANAGER_KEY]
+    assert isinstance(old_manager, BrowserManager)
+    close_calls = 0
+
+    class _Context:
+        async def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    old_manager._sessions["existing"] = BrowserSession(  # noqa: SLF001
+        session_id="existing",
+        context=_Context(),
+        page=SimpleNamespace(url="https://example.com"),
+    )
+    staged_manager = BrowserManager()
+    monkeypatch.setattr(
+        "cognis.executor.runner._build_browser_manager",
+        lambda _: staged_manager,
+    )
+    monkeypatch.setattr(
+        "cognis.executor.runner.build_lsp_manager",
+        lambda _: object(),
+    )
+
+    async def _cancel_during_previous_lsp_cleanup(*_: object, **__: object) -> None:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "cognis.executor.runner.cleanup_lsp_manager",
+        _cancel_during_previous_lsp_cleanup,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._handle_configure(
+            ws,
+            "cfg-2",
+            {
+                "enabled_tools": [],
+                "config": {"browser": {"enabled": True}},
+            },
+        )
+
+    assert runner._runtime_metadata[BROWSER_MANAGER_KEY] is old_manager
+    assert old_manager not in runner._browser_cleanup_retainer.managers  # noqa: SLF001
+    assert "existing" in old_manager._sessions  # noqa: SLF001
+    assert close_calls == 0
+    tasks = list(runner._browser_cleanup_retainer._tasks.values())  # noqa: SLF001
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)

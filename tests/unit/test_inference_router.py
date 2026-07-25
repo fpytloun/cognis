@@ -9,7 +9,18 @@ from cognis.providers.llm.errors import LLMStreamProviderError
 from cognis.providers.llm.inference_router import InferenceRouter
 
 
+def _handle(executor_id: str, metadata: dict[str, object]) -> SimpleNamespace:
+    return SimpleNamespace(
+        executor_id=executor_id,
+        metadata=metadata,
+        capabilities=SimpleNamespace(local_inference=True),
+    )
+
+
 class _Connection:
+    def __init__(self) -> None:
+        self.discover_calls: list[dict[str, object]] = []
+
     async def llm_complete_stream(self, **_: object):
         yield {"content": "Hello", "tool_calls": None, "reasoning_content": None, "index": 0}
         yield {
@@ -45,13 +56,54 @@ class _Connection:
             return {"text": "hello from audio", "model": "whisper-1"}
         raise AssertionError(f"unexpected method {method}")
 
+    async def llm_discover_models(self, **kwargs: object):
+        self.discover_calls.append(kwargs)
+        return [{"model_id": "ollama/llama3.2", "name": "llama3.2"}]
+
 
 class _Provider:
     def __init__(self) -> None:
         self.connection = _Connection()
 
     async def list_active(self):
-        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+        return [_handle("exec-1", {"labels": {"location": "local"}})]
+
+    async def get_executor(self, handle: SimpleNamespace):
+        assert handle.executor_id == "exec-1"
+        return self.connection
+
+
+class _PerformanceConnection:
+    async def llm_complete_stream(self, **_: object):
+        yield {"content": "Hello", "tool_calls": None, "reasoning_content": None, "index": 0}
+        yield {
+            "done": True,
+            "usage": {"total_tokens": 9},
+            "finish_reason": "stop",
+            "backend_metadata": {
+                "performance": {
+                    "is_local": True,
+                    "model": "qwen3:8b",
+                    "runtime": "Ollama",
+                    "executor_id": None,
+                    "executor_name": None,
+                    "measured_at": "2026-07-13T12:00:00Z",
+                }
+            },
+        }
+
+
+class _PerformanceProvider:
+    def __init__(self) -> None:
+        self.connection = _PerformanceConnection()
+
+    async def list_active(self):
+        return [
+            _handle(
+                "exec-1",
+                {"labels": {"location": "local"}, "display_name": "Workstation"},
+            )
+        ]
 
     async def get_executor(self, handle: SimpleNamespace):
         assert handle.executor_id == "exec-1"
@@ -65,8 +117,8 @@ class _MultiProvider:
 
     async def list_active(self):
         return [
-            SimpleNamespace(executor_id="empty-labels", metadata={"labels": {}}),
-            SimpleNamespace(executor_id="labeled", metadata={"labels": {"location": "local"}}),
+            _handle("empty-labels", {"labels": {}}),
+            _handle("labeled", {"labels": {"location": "local"}}),
         ]
 
     async def get_executor(self, handle: SimpleNamespace):
@@ -90,6 +142,85 @@ async def test_inference_router_route_generate_reconstructs_normalized_response(
     assert result["choices"][0]["message"]["reasoning"] == "Need tests"
     assert result["choices"][0]["message"]["tool_calls"][0]["id"] == "call_1"
     assert result["usage"]["total_tokens"] == 9
+
+
+@pytest.mark.asyncio
+async def test_inference_router_adds_selected_executor_to_performance_snapshot() -> None:
+    router = InferenceRouter(_PerformanceProvider())
+
+    chunks = [
+        chunk
+        async for chunk in router.route_stream(
+            messages=[{"role": "user", "content": "hi"}],
+            model="ollama/qwen3:8b",
+            executor_labels={"location": "local"},
+        )
+    ]
+
+    performance = chunks[-1]["performance"]
+    assert performance["executor_id"] == "exec-1"
+    assert performance["executor_name"] == "Workstation"
+
+
+@pytest.mark.asyncio
+async def test_inference_router_discover_models_routes_to_selected_executor() -> None:
+    provider = _Provider()
+    router = InferenceRouter(provider)
+
+    result = await router.discover_models(
+        preset="ollama",
+        base_url="http://localhost:11434",
+        api_key="",
+        executor_labels={"location": "local"},
+        provider_id="ollama",
+        owner_email="owner@example.com",
+    )
+
+    assert result == [{"model_id": "ollama/llama3.2", "name": "llama3.2"}]
+    assert provider.connection.discover_calls == [
+        {
+            "preset": "ollama",
+            "base_url": "http://localhost:11434",
+            "api_key": "",
+            "provider_id": "ollama",
+            "owner_email": "owner@example.com",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inference_router_discover_models_reports_unmatched_executor_id() -> None:
+    router = InferenceRouter(_Provider())
+
+    with pytest.raises(RuntimeError, match="executor_id 'missing'"):
+        await router.discover_models(
+            preset="ollama",
+            base_url="http://localhost:11434",
+            executor_id="missing",
+        )
+
+
+@pytest.mark.asyncio
+async def test_inference_router_discover_models_rejects_missing_selector() -> None:
+    router = InferenceRouter(_Provider())
+
+    with pytest.raises(RuntimeError, match="No executor selector"):
+        await router.discover_models(
+            preset="ollama",
+            base_url="http://localhost:11434",
+        )
+
+
+@pytest.mark.asyncio
+async def test_inference_router_discover_models_reports_unmatched_executor_labels() -> None:
+    router = InferenceRouter(_Provider())
+
+    with pytest.raises(RuntimeError, match="executor_labels"):
+        await router.discover_models(
+            preset="ollama",
+            base_url="http://localhost:11434",
+            executor_labels={"location": "other"},
+        )
 
 
 @pytest.mark.asyncio
@@ -133,7 +264,7 @@ class _StructuredProvider:
         self.connection = _StructuredConnection()
 
     async def list_active(self):
-        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+        return [_handle("exec-1", {"labels": {"location": "local"}})]
 
     async def get_executor(self, handle: SimpleNamespace):
         assert handle.executor_id == "exec-1"
@@ -159,7 +290,7 @@ class _ResponseItemMetadataProvider:
         self.connection = _ResponseItemMetadataConnection()
 
     async def list_active(self):
-        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+        return [_handle("exec-1", {"labels": {"location": "local"}})]
 
     async def get_executor(self, handle: SimpleNamespace):
         assert handle.executor_id == "exec-1"
@@ -217,7 +348,7 @@ class _ErrorProvider:
         self.connection = _ErrorConnection()
 
     async def list_active(self):
-        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+        return [_handle("exec-1", {"labels": {"location": "local"}})]
 
     async def get_executor(self, handle: SimpleNamespace):
         assert handle.executor_id == "exec-1"
@@ -307,7 +438,7 @@ class _FragmentedToolProvider:
         self.connection = _FragmentedToolConnection()
 
     async def list_active(self):
-        return [SimpleNamespace(executor_id="exec-1", metadata={"labels": {"location": "local"}})]
+        return [_handle("exec-1", {"labels": {"location": "local"}})]
 
     async def get_executor(self, handle: SimpleNamespace):
         return self.connection

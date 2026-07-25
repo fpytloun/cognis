@@ -12,9 +12,11 @@ from io import BytesIO
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
+from cognis.audio.transcription import transcribe_audio_bytes
 from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.content_refs import (
     build_deliverable_public_url,
@@ -22,14 +24,17 @@ from cognis.core.content_refs import (
     deliverable_metadata_item,
     get_accessible_deliverable_ref,
     is_deliverable_ref,
+    record_deliverable_access,
 )
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolResult, ToolSource
 from cognis.store.queries import (
     create_artifact_record,
     find_tool_artifact_record,
+    find_tool_output_artifact_record,
     get_artifact_record,
     get_model_routing,
     list_recent_artifact_records,
@@ -62,6 +67,7 @@ _MAX_READ_LINES = 2000
 _MAX_LINE_LENGTH = 2000
 _TOOL_ARTIFACT_PREFIX = "tool_artifact:"
 _MAX_REMOTE_ARTIFACT_BYTES = 25 * 1024 * 1024
+_MAX_AUDIO_TRANSCRIPT_OUTPUT_CHARS = 100_000
 # Tool artifact materialization intentionally avoids a new per-candidate table.
 # Only selected candidates become normal artifacts. Until artifact metadata has a
 # generic JSON provenance field, the materialized-artifact lookup stores stable
@@ -99,7 +105,8 @@ ARTIFACT_READ_TOOL = ToolDefinition(
     name="artifact_read",
     description=(
         "Read an artifact-compatible content ref by artifact_id, including saved Cognis "
-        "artifact IDs, task deliverable IDs (dlv_*), and lazy tool artifact refs "
+        "artifact IDs, authorized task or managed-descendant deliverable IDs (dlv_*), "
+        "and lazy tool artifact refs "
         "(tool_artifact:<call_id>:<anchor>). Text content returns line-numbered content. "
         "Images, PDFs, audio, and supported saved artifacts are analyzed with the current model "
         "when possible and fall back to the configured attachment_analysis route."
@@ -229,7 +236,8 @@ ARTIFACT_GET_METADATA_TOOL = ToolDefinition(
     name="artifact_get_metadata",
     description=(
         "Get metadata for one artifact-compatible content ref by artifact_id, including saved "
-        "Cognis artifact IDs and task deliverable IDs (dlv_*). Use this after artifact_search "
+        "Cognis artifact IDs and authorized task or managed-descendant deliverable IDs (dlv_*). "
+        "Use this after artifact_search "
         "or artifact_list_recent when you need full stored metadata before reading a saved "
         "artifact. Call artifact_get_url when the user asks for a download URL or wants to view the content."
     ),
@@ -254,7 +262,8 @@ ARTIFACT_GET_URL_TOOL = ToolDefinition(
     name="artifact_get_url",
     description=(
         "Generate a short-lived download URL for an artifact-compatible content ref by "
-        "artifact_id, including saved Cognis artifact IDs and task deliverable IDs (dlv_*). "
+        "artifact_id, including saved Cognis artifact IDs and authorized task or "
+        "managed-descendant deliverable IDs (dlv_*). "
         "Use this when the user asks for download links, wants to view artifacts, or wants "
         "images/files returned as direct UI attachments. When another tool needs an artifact "
         "URL directly in its arguments, use an exact artifact value ref such as "
@@ -340,6 +349,19 @@ def attachment_supports_model(attachment: AttachmentRef, model_info: Any) -> boo
     return bool(getattr(model_info, "supports_file_input", False))
 
 
+def _deliverable_accessor(
+    runtime_metadata: dict[str, Any] | None,
+) -> tuple[str | None, str | None]:
+    if not isinstance(runtime_metadata, dict):
+        return None, None
+    conversation_id = runtime_metadata.get("conversation_id")
+    agent_id = runtime_metadata.get("agent_id")
+    return (
+        conversation_id if isinstance(conversation_id, str) and conversation_id else None,
+        agent_id if isinstance(agent_id, str) and agent_id else None,
+    )
+
+
 async def handle_artifact_tool(
     tool_name: str,
     arguments: dict[str, Any],
@@ -356,6 +378,7 @@ async def handle_artifact_tool(
     """Handle artifact inspection tools."""
 
     scope_task_id = continuation_scope_task_id(runtime_metadata)
+    accessor_conversation_id, accessor_agent_id = _deliverable_accessor(runtime_metadata)
     if tool_name == ARTIFACT_READ_TOOL.name:
         return await _handle_artifact_read(
             arguments,
@@ -367,6 +390,8 @@ async def handle_artifact_tool(
             current_provider_id=current_provider_id,
             owner_email=owner_email or user_email,
             scope_task_id=scope_task_id,
+            accessor_conversation_id=accessor_conversation_id,
+            accessor_agent_id=accessor_agent_id,
             runtime_metadata=runtime_metadata,
         )
     if tool_name == ARTIFACT_LIST_RECENT_TOOL.name:
@@ -384,9 +409,12 @@ async def handle_artifact_tool(
     if tool_name == ARTIFACT_GET_METADATA_TOOL.name:
         return await _handle_artifact_get_metadata(
             arguments,
+            artifact_store=artifact_store,
             session_factory=session_factory,
             user_email=user_email,
             scope_task_id=scope_task_id,
+            accessor_conversation_id=accessor_conversation_id,
+            accessor_agent_id=accessor_agent_id,
         )
     if tool_name == ARTIFACT_GET_URL_TOOL.name:
         return await _handle_artifact_get_url(
@@ -395,6 +423,8 @@ async def handle_artifact_tool(
             session_factory=session_factory,
             user_email=user_email,
             scope_task_id=scope_task_id,
+            accessor_conversation_id=accessor_conversation_id,
+            accessor_agent_id=accessor_agent_id,
         )
     return ToolResult(output=f"Unknown artifact tool: {tool_name}", is_error=True)
 
@@ -410,6 +440,8 @@ async def _handle_artifact_read(
     current_provider_id: str | None,
     owner_email: str | None = None,
     scope_task_id: str | None = None,
+    accessor_conversation_id: str | None = None,
+    accessor_agent_id: str | None = None,
     runtime_metadata: dict[str, Any] | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
@@ -444,9 +476,12 @@ async def _handle_artifact_read(
             current_provider_id=current_provider_id,
             owner_email=owner_email,
             scope_task_id=scope_task_id,
+            accessor_conversation_id=accessor_conversation_id,
+            accessor_agent_id=accessor_agent_id,
             runtime_metadata=runtime_metadata,
         )
-        metadata = dict(nested.metadata or {})
+        metadata = dict(resolved.metadata or {})
+        metadata.update(nested.metadata or {})
         metadata["tool_artifact_ref"] = artifact_id
         metadata["materialized_artifact_id"] = resolved_id
         output = f"Materialized {artifact_id} as artifact {resolved_id}.\n\n{nested.output}"
@@ -459,10 +494,17 @@ async def _handle_artifact_read(
     if is_deliverable_ref(artifact_id):
         async with session_factory() as session:
             ref = await get_accessible_deliverable_ref(
-                session, artifact_id, user_email, scope_task_id=scope_task_id
+                session,
+                artifact_store,
+                artifact_id,
+                user_email,
+                scope_task_id=scope_task_id,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        await record_deliverable_access(session_factory, ref)
         return ToolResult(
             output=_render_text_excerpt(ref.deliverable.content, offset, limit),
             metadata={
@@ -683,11 +725,14 @@ async def _handle_artifact_search(
 async def _handle_artifact_get_metadata(
     arguments: dict[str, Any],
     *,
+    artifact_store: Any | None,
     session_factory: Any | None,
     user_email: str | None,
     scope_task_id: str | None = None,
+    accessor_conversation_id: str | None = None,
+    accessor_agent_id: str | None = None,
 ) -> ToolResult:
-    if session_factory is None:
+    if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
 
     artifact_id = str(arguments.get("artifact_id") or "").strip()
@@ -697,10 +742,17 @@ async def _handle_artifact_get_metadata(
     if is_deliverable_ref(artifact_id):
         async with session_factory() as session:
             ref = await get_accessible_deliverable_ref(
-                session, artifact_id, user_email, scope_task_id=scope_task_id
+                session,
+                artifact_store,
+                artifact_id,
+                user_email,
+                scope_task_id=scope_task_id,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        await record_deliverable_access(session_factory, ref)
         item = deliverable_metadata_item(ref)
         item["download_url_tool"] = ARTIFACT_GET_URL_TOOL.name
         return ToolResult(output=json.dumps(item, indent=2, sort_keys=True), metadata=item)
@@ -724,6 +776,8 @@ async def _handle_artifact_get_url(
     session_factory: Any | None,
     user_email: str | None,
     scope_task_id: str | None = None,
+    accessor_conversation_id: str | None = None,
+    accessor_agent_id: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -740,10 +794,17 @@ async def _handle_artifact_get_url(
     if is_deliverable_ref(artifact_id):
         async with session_factory() as session:
             ref = await get_accessible_deliverable_ref(
-                session, artifact_id, user_email, scope_task_id=scope_task_id
+                session,
+                artifact_store,
+                artifact_id,
+                user_email,
+                scope_task_id=scope_task_id,
+                accessor_conversation_id=accessor_conversation_id,
+                accessor_agent_id=accessor_agent_id,
             )
         if ref is None:
             return ToolResult(output=f"Artifact not found: {artifact_id}", is_error=True)
+        await record_deliverable_access(session_factory, ref)
         if mode == "view" and not _is_html_content_type(ref.mime_type):
             return ToolResult(
                 output=f"Artifact view is only supported for HTML artifacts: {artifact_id}",
@@ -838,6 +899,68 @@ async def analyze_attachment_ref(
     if llm is None:
         return ToolResult(
             output="LLM provider not available for attachment analysis.", is_error=True
+        )
+
+    if attachment.kind == ArtifactKind.AUDIO:
+        try:
+            transcript = await transcribe_audio_bytes(
+                llm,
+                content,
+                mime_type=attachment.mime_type,
+                filename=attachment.filename,
+                acting_user_email=owner_email,
+            )
+        except Exception as exc:
+            detail = _safe_analysis_error(exc)
+            logger.warning(
+                "Audio artifact transcription failed",
+                extra={
+                    "extra_data": {
+                        "artifact_id": attachment.artifact_id,
+                        "filename": attachment.filename,
+                        "error": detail,
+                    }
+                },
+            )
+            return ToolResult(
+                output=f"Audio transcription failed for {attachment.filename}: {detail}",
+                is_error=True,
+                metadata={
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind.value,
+                    "analysis_task_type": "speech_to_text",
+                    "analysis_error": detail,
+                },
+            )
+        if not transcript:
+            return ToolResult(
+                output=f"Audio transcription returned no text for {attachment.filename}.",
+                is_error=True,
+                metadata={
+                    "artifact_id": attachment.artifact_id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "kind": attachment.kind.value,
+                    "analysis_task_type": "speech_to_text",
+                },
+            )
+        output = transcript[:_MAX_AUDIO_TRANSCRIPT_OUTPUT_CHARS]
+        truncated = len(transcript) > _MAX_AUDIO_TRANSCRIPT_OUTPUT_CHARS
+        if truncated:
+            output += "\n[Transcript truncated at 100,000 characters.]"
+        return ToolResult(
+            output=output,
+            metadata={
+                "artifact_id": attachment.artifact_id,
+                "filename": attachment.filename,
+                "mime_type": attachment.mime_type,
+                "kind": attachment.kind.value,
+                "analysis_task_type": "speech_to_text",
+                "fallback": "audio_transcription",
+                "truncated": truncated,
+            },
         )
 
     model_info: Any | None = None
@@ -1570,6 +1693,23 @@ async def _materialize_tool_artifact_ref(
     if parsed is None:
         return ToolResult(output=f"Invalid tool artifact ref: {tool_artifact_ref}", is_error=True)
     call_id, anchor_name = parsed
+    authorized_refs = _runtime_authorized_lazy_artifact_refs(runtime_metadata)
+    runtime_authorized = tool_artifact_ref in (authorized_refs or set())
+    persisted_authorized = False
+    if not runtime_authorized:
+        conversation_id = _runtime_conversation_id(runtime_metadata)
+        if conversation_id is not None:
+            async with session_factory() as session:
+                source_row = await find_tool_output_artifact_record(
+                    session,
+                    owner_email=owner_email,
+                    source_tool_call_id=call_id,
+                )
+            persisted_authorized = (
+                source_row is not None and source_row.conversation_id == conversation_id
+            )
+    if not runtime_authorized and not persisted_authorized:
+        return ToolResult(output=f"Tool artifact access denied: {tool_artifact_ref}", is_error=True)
     tool_output_store = _runtime_tool_output_store(runtime_metadata)
     if tool_output_store is None:
         return ToolResult(output="Tool output store is not available.", is_error=True)
@@ -1623,20 +1763,33 @@ async def _materialize_tool_artifact_ref(
         return ToolResult(
             output=f"Tool artifact source URL missing: {tool_artifact_ref}", is_error=True
         )
+    candidate_metadata = candidate.get("metadata")
+    source_page_url = (
+        _optional_string(candidate_metadata.get("source_page_url"))
+        if isinstance(candidate_metadata, dict)
+        else None
+    )
+    evidence_source_url = source_page_url or url
 
-    source_hash = hashlib.sha256(f"{call_id}\n{anchor_name}\n{url}".encode()).hexdigest()
     async with session_factory() as session:
         existing = await find_tool_artifact_record(
             session,
             owner_email=owner_email,
             source_tool_call_id=call_id,
             source_anchor=anchor_name,
-            source_hash=source_hash,
         )
     if existing is not None:
+        metadata = _artifact_metadata_item(existing)
+        metadata.update(
+            {
+                "tool_artifact_ref": tool_artifact_ref,
+                "source_url": evidence_source_url,
+                "asset_url": url,
+            }
+        )
         return ToolResult(
             output=f"Resolved {tool_artifact_ref} to existing artifact {existing.artifact_id}.",
-            metadata=_artifact_metadata_item(existing),
+            metadata=metadata,
         )
 
     fetched = await _fetch_remote_artifact_candidate(url)
@@ -1653,6 +1806,9 @@ async def _materialize_tool_artifact_ref(
         str(candidate.get("filename_hint") or fetch_meta.get("filename") or "remote-artifact")
     )
     kind = _kind_for_mime_type(mime_type)
+    content_hash = hashlib.sha256(content).hexdigest()
+    conversation_id = _runtime_conversation_id(runtime_metadata)
+    session_id = _runtime_session_id(runtime_metadata)
     artifact_id = artifact_store.generate_id("doc" if kind is ArtifactKind.PDF else "att")
     namespace = "documents" if kind is ArtifactKind.PDF else "attachments"
     await artifact_store.async_save(
@@ -1677,14 +1833,22 @@ async def _materialize_tool_artifact_ref(
             size_bytes=len(content),
             status="attached",
             expires_at=None,
-            conversation_id=call_id,
-            session_id=anchor_name,
+            conversation_id=conversation_id,
+            session_id=session_id,
             message_role="assistant",
-            content_hash=source_hash,
+            content_hash=content_hash,
+            source_tool_call_id=call_id,
+            source_anchor=anchor_name,
         )
         await session.commit()
     metadata = _artifact_metadata_item(row)
-    metadata.update({"tool_artifact_ref": tool_artifact_ref, "source_url": url})
+    metadata.update(
+        {
+            "tool_artifact_ref": tool_artifact_ref,
+            "source_url": evidence_source_url,
+            "asset_url": url,
+        }
+    )
     return ToolResult(
         output=f"Materialized {tool_artifact_ref} as artifact {artifact_id}.",
         metadata=metadata,
@@ -1693,10 +1857,19 @@ async def _materialize_tool_artifact_ref(
 
 async def _fetch_remote_artifact_candidate(url: str) -> ToolResult:
     try:
-        current_url = _validate_remote_artifact_url(url)
-        response: httpx.Response | None = None
-        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
-            for _hop in range(_REMOTE_ARTIFACT_MAX_REDIRECTS + 1):
+        current_url, pinned_ip = _resolve_remote_artifact_url(url)
+        for _hop in range(_REMOTE_ARTIFACT_MAX_REDIRECTS + 1):
+            transport = httpx.AsyncHTTPTransport(retries=0)
+            transport._pool._network_backend = _PinnedNetworkBackend(  # type: ignore[attr-defined]
+                host=urlparse(current_url).hostname or "",
+                ip_address=pinned_ip,
+            )
+            async with httpx.AsyncClient(
+                timeout=30,
+                follow_redirects=False,
+                transport=transport,
+                trust_env=False,
+            ) as client:
                 request = client.build_request(
                     "GET",
                     current_url,
@@ -1711,93 +1884,137 @@ async def _fetch_remote_artifact_candidate(url: str) -> ToolResult:
                             output="Remote artifact candidate redirected without Location.",
                             is_error=True,
                         )
-                    current_url = _validate_remote_artifact_url(
+                    current_url, pinned_ip = _resolve_remote_artifact_url(
                         urljoin(str(response.request.url), redirect_url)
                     )
                     continue
 
                 response.raise_for_status()
-                break
-            else:
-                return ToolResult(
-                    output="Remote artifact candidate exceeded redirect limit.",
-                    is_error=True,
+                mime_type = (
+                    response.headers.get("content-type", "application/octet-stream")
+                    .split(";", 1)[0]
+                    .strip()
                 )
-
-            if response is None:
-                return ToolResult(
-                    output="Remote artifact candidate returned no response.", is_error=True
-                )
-
-            mime_type = (
-                response.headers.get("content-type", "application/octet-stream")
-                .split(";", 1)[0]
-                .strip()
-            )
-            if not mime_type.startswith("image/") and mime_type != "application/pdf":
-                await response.aclose()
-                return ToolResult(
-                    output=f"Remote artifact candidate has unsupported content type: {mime_type}",
-                    is_error=True,
-                )
-
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > _MAX_REMOTE_ARTIFACT_BYTES:
+                if not mime_type.startswith("image/") and mime_type != "application/pdf":
                     await response.aclose()
                     return ToolResult(
-                        output="Remote artifact candidate exceeds maximum size.",
+                        output=(
+                            f"Remote artifact candidate has unsupported content type: {mime_type}"
+                        ),
                         is_error=True,
                     )
-                chunks.append(chunk)
-            final_url = str(response.url)
-            await response.aclose()
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > _MAX_REMOTE_ARTIFACT_BYTES:
+                        await response.aclose()
+                        return ToolResult(
+                            output="Remote artifact candidate exceeds maximum size.",
+                            is_error=True,
+                        )
+                    chunks.append(chunk)
+                final_url = str(response.url)
+                await response.aclose()
+                content = b"".join(chunks)
+                filename = (
+                    urlparse(final_url).path.rstrip("/").rsplit("/", 1)[-1] or "remote-artifact"
+                )
+                return ToolResult(
+                    output="Fetched remote artifact candidate.",
+                    metadata={
+                        "content": content,
+                        "mime_type": mime_type,
+                        "filename": filename,
+                    },
+                )
+        else:
+            return ToolResult(
+                output="Remote artifact candidate exceeded redirect limit.",
+                is_error=True,
+            )
     except (httpx.HTTPError, ValueError) as exc:
         return ToolResult(output=f"Failed to fetch remote artifact candidate: {exc}", is_error=True)
-    content = b"".join(chunks)
-    filename = urlparse(final_url).path.rstrip("/").rsplit("/", 1)[-1] or "remote-artifact"
-    return ToolResult(
-        output="Fetched remote artifact candidate.",
-        metadata={"content": content, "mime_type": mime_type, "filename": filename},
-    )
+    return ToolResult(output="Remote artifact candidate returned no response.", is_error=True)
 
 
 def _validate_remote_artifact_url(url: str) -> str:
+    validated, _ip_address = _resolve_remote_artifact_url(url)
+    return validated
+
+
+def _resolve_remote_artifact_url(url: str) -> tuple[str, str]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("Only HTTP and HTTPS URLs are supported")
     host = parsed.hostname
     if not host:
         raise ValueError("URL must have a hostname")
-    if _host_resolves_to_blocked_address(host):
+    addresses = _resolved_host_addresses(host)
+    if not addresses:
+        raise ValueError("URL hostname did not resolve")
+    if any(_is_blocked_ip_address(address) for address in addresses):
         raise ValueError("URL resolves to a blocked network address")
-    return url
+    return url, sorted(addresses)[0]
+
+
+class _PinnedNetworkBackend(httpcore.AnyIOBackend):
+    """Connect one validated hostname to its controller-resolved public IP."""
+
+    def __init__(self, *, host: str, ip_address: str) -> None:
+        self._host = host
+        self._ip_address = ip_address
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        if host != self._host:
+            raise OSError("Unexpected hostname for pinned remote artifact transport")
+        return await super().connect_tcp(
+            self._ip_address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
 
 
 def _host_resolves_to_blocked_address(host: str) -> bool:
+    addresses = _resolved_host_addresses(host)
+    return not addresses or any(_is_blocked_ip_address(address) for address in addresses)
+
+
+def _resolved_host_addresses(host: str) -> set[str]:
     try:
         infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
     except socket.gaierror:
-        return True
+        return set()
     if not infos:
-        return True
+        return set()
+    addresses: set[str] = set()
     for info in infos:
         try:
-            ip = ipaddress.ip_address(info[4][0])
+            addresses.add(str(ipaddress.ip_address(info[4][0])))
         except ValueError:
-            return True
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
-            return True
-    return False
+            return set()
+    return addresses
+
+
+def _is_blocked_ip_address(raw: str) -> bool:
+    ip = ipaddress.ip_address(raw)
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
 
 
 def _runtime_tool_output_store(runtime_metadata: dict[str, Any] | None) -> Any | None:
@@ -1810,6 +2027,62 @@ def _runtime_tool_output_store(runtime_metadata: dict[str, Any] | None) -> Any |
     if isinstance(shared, dict):
         return shared.get("tool_output_store")
     return None
+
+
+def _runtime_authorized_lazy_artifact_refs(
+    runtime_metadata: dict[str, Any] | None,
+) -> set[str] | None:
+    """Return controller-authorized lazy refs, or None for legacy callers."""
+
+    if not isinstance(runtime_metadata, dict):
+        return None
+    value = runtime_metadata.get("authorized_lazy_artifact_refs")
+    if value is None:
+        shared = runtime_metadata.get("shared_runtime_metadata")
+        if isinstance(shared, dict):
+            value = shared.get("authorized_lazy_artifact_refs")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return set()
+    return {ref for ref in value if isinstance(ref, str) and ref.strip()}
+
+
+def _runtime_conversation_id(runtime_metadata: dict[str, Any] | None) -> str | None:
+    if not isinstance(runtime_metadata, dict):
+        return None
+    access = runtime_metadata.get("runtime_access")
+    if not isinstance(access, dict):
+        shared = runtime_metadata.get("shared_runtime_metadata")
+        if isinstance(shared, dict):
+            access = shared.get("runtime_access")
+    if isinstance(access, dict):
+        value = access.get("conversation_id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    context = runtime_metadata.get("conversation_context")
+    if not isinstance(context, dict):
+        shared = runtime_metadata.get("shared_runtime_metadata")
+        if isinstance(shared, dict):
+            context = shared.get("conversation_context")
+    if not isinstance(context, dict):
+        return None
+    value = context.get("conversation_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _runtime_session_id(runtime_metadata: dict[str, Any] | None) -> str | None:
+    if not isinstance(runtime_metadata, dict):
+        return None
+    access = runtime_metadata.get("runtime_access")
+    if not isinstance(access, dict):
+        shared = runtime_metadata.get("shared_runtime_metadata")
+        if isinstance(shared, dict):
+            access = shared.get("runtime_access")
+    if not isinstance(access, dict):
+        return None
+    value = access.get("session_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def sanitize_tool_artifact_filename(filename: str) -> str:

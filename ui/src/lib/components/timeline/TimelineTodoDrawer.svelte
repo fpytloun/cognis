@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
-  import type { TodoSnapshotItem } from '$lib/chat';
+  import type { TodoSnapshotItem } from '$lib/timeline-render-model';
 
   let {
     todos,

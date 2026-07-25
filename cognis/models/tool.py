@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -10,6 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_core import PydanticCustomError
+
+from cognis.models.local_models import OllamaRuntimeCapability
 
 
 class Permission(StrEnum):
@@ -41,6 +44,65 @@ class ToolSource(BaseModel):
     skill_content_hash: str | None = None
 
 
+class ToolMutationKind(StrEnum):
+    """Stable operation mutation classification used by introspection."""
+
+    READ = "read"
+    CREATE = "create"
+    UPDATE = "update"
+    DELETE = "delete"
+    EXECUTE = "execute"
+
+
+class ToolValueSemantics(BaseModel):
+    """Behavior not expressible precisely in portable JSON Schema."""
+
+    omitted: str
+    null: str
+    arrays: str
+    concurrency: str
+
+
+class ToolDynamicOption(BaseModel):
+    """A runtime-populated or schema-declared option set."""
+
+    path: str
+    source: str
+    values: list[Any] = Field(default_factory=list)
+    authoritative: bool = True
+
+
+class NativeToolOperation(BaseModel):
+    """Declared authoritative contract for one native tool operation."""
+
+    operation: str
+    summary: str
+    mutation_kind: ToolMutationKind
+    input_schema: dict[str, Any]
+    semantics: ToolValueSemantics
+    dynamic_options: list[ToolDynamicOption] = Field(default_factory=list)
+    examples: list[dict[str, Any]] = Field(default_factory=list)
+    side_effects: list[str] = Field(default_factory=list)
+    validator_ids: list[str] = Field(default_factory=list)
+
+
+# Public descriptor payloads intentionally use the same shape as native declarations.
+ToolOperationDescriptor = NativeToolOperation
+
+
+class ToolDescriptor(BaseModel):
+    """Versioned, hash-addressed contract used for exposure and validation."""
+
+    schema_version: str = "cognis.tool.v2"
+    schema_hash: str = ""
+    authority: Literal["native", "external"] = "native"
+    input_schema: dict[str, Any]
+    operations: list[NativeToolOperation]
+    annotations: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] | None = None
+    extensions: dict[str, Any] = Field(default_factory=dict)
+
+
 class ToolDefinition(BaseModel):
     """Tool metadata exposed to the LLM and executor."""
 
@@ -66,9 +128,350 @@ class ToolDefinition(BaseModel):
     primary_name: str | None = None
     configurable: bool = True
     surfaces: dict[str, str] = Field(default_factory=dict)
+    descriptor: ToolDescriptor | None = None
+    annotations: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] | None = None
+    descriptor_extensions: dict[str, Any] = Field(default_factory=dict)
+    native_operations: list[NativeToolOperation] | None = None
     # Runtime-only metadata for executable skill tools (recipe, assets, etc.)
     # Not sent to the LLM — used by executor handlers for execution.
     execution_metadata: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _build_authoritative_descriptor(self) -> ToolDefinition:
+        """Ensure every tool has one schema authority before registry entry."""
+
+        authority: Literal["native", "external"] = (
+            "native" if self.source.type in {"builtin", "controller", "executor"} else "external"
+        )
+        if authority == "native":
+            if not self.native_operations:
+                raise ValueError(f"native tool {self.name!r} must declare native_operations")
+            if self.read_only and any(
+                operation.mutation_kind is not ToolMutationKind.READ
+                for operation in self.native_operations
+            ):
+                raise ValueError(
+                    f"read-only native tool {self.name!r} declares a mutating operation"
+                )
+            if not self.read_only and all(
+                operation.mutation_kind is ToolMutationKind.READ
+                for operation in self.native_operations
+            ):
+                raise ValueError(
+                    f"native tool {self.name!r} contains only reads but read_only is false"
+                )
+            schema = derive_native_input_schema(self.native_operations)
+            self.descriptor = finalize_tool_descriptor(
+                ToolDescriptor(
+                    authority="native",
+                    input_schema=schema,
+                    operations=self.native_operations,
+                    annotations=self.annotations,
+                    output_schema=self.output_schema,
+                    extensions=self.descriptor_extensions,
+                )
+            )
+        else:
+            self.native_operations = None
+            self.descriptor = build_external_tool_descriptor(
+                name=self.name,
+                description=self.description,
+                parameters=self.parameters,
+                annotations=self.annotations,
+                output_schema=self.output_schema,
+                extensions=self.descriptor_extensions,
+            )
+        # ``parameters`` remains on the wire for compatibility with executor RPC,
+        # but the versioned descriptor is authoritative and cannot diverge.
+        self.parameters = self.descriptor.input_schema
+        self.annotations = self.descriptor.annotations
+        self.output_schema = self.descriptor.output_schema
+        return self
+
+
+class NativeToolDefinition(ToolDefinition):
+    """Concise declaration for a native tool with one explicit operation."""
+
+    mutation_kind: ToolMutationKind | None = None
+    semantics: ToolValueSemantics | None = None
+    dynamic_options: list[ToolDynamicOption] = Field(default_factory=list)
+    examples: list[dict[str, Any]] = Field(default_factory=list)
+    side_effects: list[str] = Field(default_factory=list)
+    validator_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _declare_single_operation(cls, value: Any) -> Any:
+        if not isinstance(value, dict) or value.get("native_operations"):
+            return value
+        payload = dict(value)
+        read_only = bool(payload.get("read_only", False))
+        mutation_kind = payload.get("mutation_kind")
+        if mutation_kind is None:
+            mutation_kind = ToolMutationKind.READ if read_only else ToolMutationKind.EXECUTE
+        schema = json.loads(
+            json.dumps(payload.get("parameters") or {"type": "object", "properties": {}})
+        )
+        semantics = payload.get("semantics") or declared_default_semantics(
+            ToolMutationKind(mutation_kind)
+        )
+        examples = payload.get("examples") or [_minimal_schema_example(schema)]
+        payload["native_operations"] = [
+            NativeToolOperation(
+                operation=str(payload.get("name", "")),
+                summary=str(payload.get("description", "")).strip().split(".", 1)[0],
+                mutation_kind=ToolMutationKind(mutation_kind),
+                input_schema=schema,
+                semantics=semantics,
+                dynamic_options=list(payload.get("dynamic_options") or []),
+                examples=examples,
+                side_effects=list(payload.get("side_effects") or []),
+                validator_ids=list(payload.get("validator_ids") or []),
+            )
+        ]
+        return payload
+
+
+def declared_default_semantics(mutation_kind: ToolMutationKind) -> ToolValueSemantics:
+    """Defaults derived only from an explicitly declared mutation kind."""
+
+    return ToolValueSemantics(
+        omitted="use the operation default or leave the value absent",
+        null="accepted only where the operation schema explicitly permits null",
+        arrays="replace the array unless this operation explicitly declares add/remove semantics",
+        concurrency=(
+            "may run concurrently with other reads"
+            if mutation_kind is ToolMutationKind.READ
+            else "may conflict with concurrent mutations; use current resource state"
+        ),
+    )
+
+
+def derive_native_input_schema(operations: list[NativeToolOperation]) -> dict[str, Any]:
+    """Derive the sole model/runtime schema from declared native operations."""
+
+    if not operations:
+        raise ValueError("native tool must declare at least one operation")
+    names = [operation.operation for operation in operations]
+    if len(set(names)) != len(names):
+        raise ValueError("native operation names must be unique")
+    schemas = [json.loads(json.dumps(operation.input_schema)) for operation in operations]
+    if len(schemas) == 1:
+        return dict(schemas[0])
+    for name, schema in zip(names, schemas, strict=True):
+        action = (schema.get("properties") or {}).get("action")
+        if not isinstance(action, dict) or action.get("const") != name:
+            raise ValueError(
+                f"native operation {name!r} must declare properties.action.const={name!r}"
+            )
+        required = schema.get("required")
+        if not isinstance(required, list) or "action" not in required:
+            raise ValueError(f"native operation {name!r} must require action")
+    definitions: dict[str, Any] = {}
+    for schema in schemas:
+        raw_definitions = schema.get("definitions")
+        if not isinstance(raw_definitions, dict):
+            continue
+        for definition_name, definition in raw_definitions.items():
+            existing = definitions.get(definition_name)
+            if existing is not None and existing != definition:
+                raise ValueError(
+                    f"native operations declare conflicting schema definition {definition_name!r}"
+                )
+            definitions[definition_name] = definition
+    derived: dict[str, Any] = {"oneOf": schemas}
+    if definitions:
+        derived["definitions"] = definitions
+    return derived
+
+
+def tool_input_schema(tool: ToolDefinition) -> dict[str, Any]:
+    """Return the sole schema used for model exposure and runtime validation."""
+
+    assert tool.descriptor is not None
+    return tool.descriptor.input_schema
+
+
+def tool_with_input_schema(
+    tool: ToolDefinition,
+    schema: dict[str, Any],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    dynamic_options: list[ToolDynamicOption] | None = None,
+    extensions: dict[str, Any] | None = None,
+) -> ToolDefinition:
+    """Return a revalidated tool copy after runtime schema enrichment."""
+
+    payload = tool.model_dump(mode="python")
+    payload["parameters"] = schema
+    payload["descriptor"] = None
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if tool.native_operations:
+        operation_schemas = schema.get("oneOf") if len(tool.native_operations) > 1 else [schema]
+        if not isinstance(operation_schemas, list) or len(operation_schemas) != len(
+            tool.native_operations
+        ):
+            raise ValueError("runtime schema overlay does not match native operation count")
+        payload["native_operations"] = [
+            operation.model_copy(update={"input_schema": operation_schema})
+            for operation, operation_schema in zip(
+                tool.native_operations, operation_schemas, strict=True
+            )
+            if isinstance(operation_schema, dict)
+        ]
+    enriched = ToolDefinition.model_validate(payload)
+    if dynamic_options is None and extensions is None:
+        return enriched
+    operations = [
+        operation.model_copy(
+            update={
+                "dynamic_options": [
+                    *operation.dynamic_options,
+                    *(dynamic_options or []),
+                ]
+            }
+        )
+        for operation in enriched.native_operations or []
+    ]
+    if operations:
+        enriched_payload = enriched.model_dump(mode="python")
+        enriched_payload["descriptor"] = None
+        enriched_payload["native_operations"] = operations
+        enriched_payload["descriptor_extensions"] = {
+            **enriched.descriptor_extensions,
+            **(extensions or {}),
+        }
+        return ToolDefinition.model_validate(enriched_payload)
+    assert enriched.descriptor is not None
+    descriptor = finalize_tool_descriptor(
+        enriched.descriptor.model_copy(
+            update={
+                "operations": [
+                    operation.model_copy(
+                        update={
+                            "dynamic_options": [
+                                *operation.dynamic_options,
+                                *(dynamic_options or []),
+                            ]
+                        }
+                    )
+                    for operation in enriched.descriptor.operations
+                ],
+                "extensions": {
+                    **enriched.descriptor.extensions,
+                    **(extensions or {}),
+                },
+            }
+        )
+    )
+    return enriched.model_copy(update={"descriptor": descriptor})
+
+
+def finalize_tool_descriptor(descriptor: ToolDescriptor) -> ToolDescriptor:
+    """Return a descriptor with a deterministic hash over its public contract."""
+
+    payload = descriptor.model_dump(mode="json", exclude={"schema_hash"})
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+    return descriptor.model_copy(update={"schema_hash": f"sha256:{digest}"})
+
+
+def build_external_tool_descriptor(
+    *,
+    name: str,
+    description: str,
+    parameters: dict[str, Any],
+    annotations: dict[str, Any] | None = None,
+    output_schema: dict[str, Any] | None = None,
+    extensions: dict[str, Any] | None = None,
+) -> ToolDescriptor:
+    """Build an advisory baseline descriptor from an external live schema."""
+
+    schema = json.loads(json.dumps(parameters or {"type": "object", "properties": {}}))
+    operation = NativeToolOperation(
+        operation=name,
+        summary=description.strip().split(".", 1)[0] or name,
+        mutation_kind=ToolMutationKind.EXECUTE,
+        input_schema=schema,
+        semantics=declared_default_semantics(ToolMutationKind.EXECUTE),
+        dynamic_options=_enum_options(schema),
+        examples=[_minimal_schema_example(schema)],
+        side_effects=["External annotations are advisory; execution policy is enforced by Cognis."],
+    )
+    return finalize_tool_descriptor(
+        ToolDescriptor(
+            authority="external",
+            input_schema=schema,
+            operations=[operation],
+            annotations=dict(annotations or {}),
+            output_schema=output_schema,
+            extensions=dict(extensions or {}),
+        )
+    )
+
+
+def _enum_options(schema: dict[str, Any]) -> list[ToolDynamicOption]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    return [
+        ToolDynamicOption(path=f"$.{name}", source="schema.enum", values=list(field["enum"]))
+        for name, field in properties.items()
+        if isinstance(field, dict) and isinstance(field.get("enum"), list)
+    ]
+
+
+def _minimal_schema_example(schema: dict[str, Any]) -> dict[str, Any]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return {}
+    required = schema.get("required")
+    required_names = required if isinstance(required, list) else []
+    example = {
+        str(name): _example_value(properties[name])
+        for name in required_names
+        if isinstance(properties.get(name), dict)
+    }
+    example.update(
+        {
+            str(name): field["const"]
+            for name, field in properties.items()
+            if isinstance(field, dict) and "const" in field
+        }
+    )
+    return example
+
+
+def _example_value(schema: dict[str, Any]) -> Any:
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next((item for item in schema_type if item != "null"), "null")
+    if schema_type == "string":
+        return "value"
+    if schema_type in {"integer", "number"}:
+        return schema.get("minimum", 0)
+    if schema_type == "boolean":
+        return False
+    if schema_type == "array":
+        minimum = schema.get("minItems", 0)
+        item_schema = schema.get("items")
+        if isinstance(minimum, int) and minimum > 0 and isinstance(item_schema, dict):
+            return [_example_value(item_schema) for _ in range(minimum)]
+        return []
+    if schema_type == "object":
+        return _minimal_schema_example(schema)
+    return None
 
 
 def tool_capabilities(tool: ToolDefinition) -> set[ToolCapability]:
@@ -365,9 +768,11 @@ class ExecutorCapabilities(BaseModel):
 
     tools: list[str] = Field(default_factory=list)
     inference: bool = False
+    local_inference: bool = False
     inference_models: list[str] = Field(default_factory=list)
     inference_type: str | None = None
     channels: bool = False  # Can host channel adapters
+    local_model_runtime: OllamaRuntimeCapability | None = None
 
 
 class InferenceConfig(BaseModel):

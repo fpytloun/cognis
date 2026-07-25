@@ -58,6 +58,7 @@ COGNIS_HOST=0.0.0.0                    # Bind address (default)
 COGNIS_PORT=8080                       # Port (default)
 COGNIS_MNEMORY_URL=http://localhost:8050  # Mnemory URL (default)
 COGNIS_INTARIS_URL=http://localhost:8060  # Intaris URL (default)
+COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS=30  # OAuth refresh wall-clock timeout (5-120s)
 ```
 
 #### Keys (auto-generated if missing)
@@ -121,7 +122,15 @@ COGNIS_LOG_FORMAT=json                 # json or text
 COGNIS_SERVE_UI=true                   # Serve bundled UI assets
 COGNIS_CORS_ORIGINS=http://localhost:5173  # CORS allowlist
 COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=false  # Enable ChatGPT prompt-cache key support
+# Comma-separated proxy CIDRs allowed to supply X-Forwarded-For.
+# Empty by default: forwarded client addresses are not trusted.
+COGNIS_TRUSTED_PROXY_CIDRS=
 ```
+
+Only configure `COGNIS_TRUSTED_PROXY_CIDRS` for reverse proxies that sanitize
+and append `X-Forwarded-For`. Cognis walks the forwarded chain from the trusted
+direct peer toward the client and uses the first untrusted address for public
+share abuse limits. Headers from direct peers outside these CIDRs are ignored.
 
 ### Mnemory/Intaris JWT Configuration
 
@@ -317,6 +326,8 @@ Settings page (`Settings → Executors`):
 Only WebSocket (remote) executors are permitted. These settings are
 DB-backed and persist across restarts. Default settings are seeded only
 when missing (non-destructive), so manual changes are never overwritten.
+Policy changes take effect for subsequent executor spawns. Existing local
+runtimes are not terminated by a settings update.
 
 #### WebSocket Executor Manifest Example
 
@@ -472,8 +483,12 @@ Variables" above for the full reference.
 
 ### Database Settings (Application)
 
-Managed via the UI Settings page or `GET/PUT /api/v1/settings`. Seeded
-with sensible defaults on first start.
+Managed via the UI Settings page or `GET/PUT/DELETE /api/v1/settings`.
+Settings are described by the backend registry and seeded with sensible
+defaults on first start. `DELETE` resets a value to its registry default.
+Exposed values apply without a process restart: either immediately in the
+current worker or at the next request, turn, step, connection, or runtime
+construction boundary declared by the API metadata.
 
 ### UI Environment Variables
 
@@ -487,7 +502,6 @@ The SvelteKit UI reads browser-visible environment variables:
 
 | Category | Key | Default | Description |
 |----------|-----|---------|-------------|
-| session | `session.max_context_tokens` | 128000 | Context window budget |
 | session | `session.compaction_threshold` | 0.85 | Trigger compaction at this ratio (valid 0.3-0.99) |
 | session | `session.compaction_preserve_turns` | 10 | Maximum user turns to keep uncompacted; actual tail is also token-budgeted |
 | session | `session.compaction_max_input_tokens` | 0 | Override compaction-model input budget; `0` uses provider metadata |
@@ -496,9 +510,8 @@ The SvelteKit UI reads browser-visible environment variables:
 | session | `session.compaction_fallback_enabled` | true | Enable last-resort mechanical compaction fallback |
 | session | `session.long_lived_chat_idle_compaction_seconds` | 21600 | Idle age before ambient web direct/channel chats checkpoint into a fresh session; `0` disables |
 | session | `session.long_lived_chat_idle_compaction_min_events` | 20 | Minimum uncompacted events before idle checkpoint compaction can run |
-| session | `session.max_tool_calls_per_turn` | 200 | Max tool calls per turn |
-| session | `session.idle_timeout_seconds` | 1800 | 30 min idle → mark idle |
-| session | `session.max_session_age_seconds` | 86400 | 24h max session age |
+| session | `session.step_timeout_seconds` | 14400 | Default four-hour step timeout; explicit per-agent execution settings take precedence |
+| session | `session.max_tool_calls_per_turn` | 500 | Default tool-call ceiling for normal turns; explicit per-agent execution settings take precedence and secondary delegated agents remain unlimited |
 | session | `session.max_delegation_depth` | 5 | Max delegation chain depth |
 | session | `session.max_active_turns_per_user` | 20 | Max active non-system turns per user |
 | session | `session.max_queued_messages` | 20 | Max queued messages per session |
@@ -512,15 +525,19 @@ The SvelteKit UI reads browser-visible environment variables:
 | session | `session.step_request_questions_timeout_seconds` | 3600 | Default wait for workflow `step_request_questions` answers before returning a timeout tool result with prescribed next action |
 | evaluator | `evaluator.timeout_ms` | 180000 | Step evaluator LLM timeout |
 | decision_engine | `decision_engine.inline_max_length` | 200 | Short messages → inline |
-| decision_engine | `decision_engine.classifier_timeout_ms` | 500 | Classifier timeout |
-| decision_engine | `decision_engine.classifier_fallback` | "inline" | Fallback on classifier failure |
 | security | `security.non_bypassable_tools` | ["shell","bash","write_file","delete_file"] | Always go through guardrails |
 | security | `security.token_ttl_seconds` | 3600 | JWT TTL |
-| security | `security.max_connections` | 100 | Max WebSocket connections |
 | security | `security.ws_auth_timeout_seconds` | 10 | Close unauthenticated WS connections after this timeout |
 
 LLM providers and model routing are managed via their own API endpoints
 (see [10-api-spec.md](10-api-spec.md)).
+
+Legacy keys `session.idle_timeout_seconds`,
+`session.max_session_age_seconds`, `session.stale_after_seconds`, and
+`security.max_connections` remain stored for compatibility but are hidden
+because they do not have restartless runtime semantics. The legacy
+`web.backend` aggregate key is also hidden; use `web.search_backend` and
+`web.fetch_backend`.
 
 ### Production Deployment Patterns
 

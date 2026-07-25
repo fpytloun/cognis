@@ -8,6 +8,7 @@ from time import monotonic
 
 import pytest
 
+from cognis.core.agent_profiles import resolve_conversation_agent_profile
 from cognis.core.context import (
     ContextAssembler,
     _build_agent_work_context_info,
@@ -49,11 +50,18 @@ from cognis.core.step_profiles import (
     step_profile_allows_tool,
     step_profile_visible_by_default,
 )
-from cognis.models.agent import AgentDefinition, AgentLLMConfig
+from cognis.models.agent import (
+    AgentCapabilities,
+    AgentDefinition,
+    AgentLLMConfig,
+    AgentRuntimeProfile,
+)
 from cognis.models.config import ModelInfo
 from cognis.models.session import ConversationContext, ConversationModel, SessionModel
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.models.workflow import StepDefinition, StepProfileMode
+from cognis.providers.memory.policy import resolve_memory_policy
 
 
 class _CacheEntry:
@@ -63,6 +71,8 @@ class _CacheEntry:
         self.events = []
         self.initialized = True
         self.last_event_seq = 0
+        self.memory_policy_fingerprint: str | None = None
+        self.memory_policy_mode: str | None = None
 
 
 class _SessionCache:
@@ -81,6 +91,7 @@ class _SessionCache:
         self.refresh_calls = 0
         self.prefix_entries: list[ImmutablePrefixEntry] = []
         self.prefix_entries_after_refresh: list[ImmutablePrefixEntry] = []
+        self.policy_fingerprint_after_refresh: str | None = None
         self.history_events: list[dict[str, object]] = []
         self.prefix_repair_needed = False
         self.last_repair_attempt_at: float | None = None
@@ -96,6 +107,8 @@ class _SessionCache:
         self.entry = self.entry or _CacheEntry()
         if self.prefix_entries_after_refresh:
             self.prefix_entries = list(self.prefix_entries_after_refresh)
+        if self.policy_fingerprint_after_refresh is not None:
+            self.entry.memory_policy_fingerprint = self.policy_fingerprint_after_refresh
         return self.entry
 
     def get_entry(self, session_id: str) -> object | None:
@@ -177,10 +190,15 @@ class _SessionCache:
         *,
         snapshot_seq: int,
         snapshot_source: str,
+        memory_policy_fingerprint: str | None = None,
+        memory_policy_mode: str | None = None,
     ) -> None:
         del session_id, snapshot_seq, snapshot_source
         self.prefix_entries = list(entries)
         self.prefix_repair_needed = False
+        if self.entry is not None:
+            self.entry.memory_policy_fingerprint = memory_policy_fingerprint
+            self.entry.memory_policy_mode = memory_policy_mode
 
     async def mark_prefix_repair_needed(self, session_id: str) -> None:
         del session_id
@@ -459,6 +477,14 @@ def _agent() -> AgentDefinition:
     )
 
 
+def _default_memory_policy_fingerprint() -> str:
+    agent = _agent()
+    return resolve_memory_policy(
+        agent,
+        resolve_conversation_agent_profile(agent, _session(), _conversation()),
+    ).policy_fingerprint
+
+
 def _agent_with_personality() -> AgentDefinition:
     return AgentDefinition(
         agent_id="agent-1",
@@ -625,6 +651,12 @@ async def test_context_assembler_does_not_sync_child_session_title() -> None:
 
 def test_build_channel_context_info_is_channel_only() -> None:
     assert _build_channel_context_info(ConversationContext(type="web")) is None
+    assert (
+        _build_channel_context_info(
+            ConversationContext(type="web", platform_data={"assistant_delivery_mode": "final_only"})
+        )
+        is None
+    )
     assert _build_channel_context_info(ConversationContext(type="task", ref="task-1")) is None
     assert _build_channel_context_info(ConversationContext(type="direct")) is None
 
@@ -647,22 +679,53 @@ def test_build_channel_context_info_is_channel_only() -> None:
     assert "- Chat type: group" in content
     assert "- Chat name: Ops" in content
     assert "- Thread-bound: yes" in content
-    assert "Do not optimize for finishing the whole job inside the parent turn" in content
-    assert "parent chat as the command bridge" in content
-    assert "delegate(wait=false) for bounded, non-interactive worker-style lookup" in content
-    assert "prefer reusing an existing relevant managed conversation" in content
-    assert "Use agent_conversation_send(wait=false) to continue it" in content
-    assert (
-        "agent_conversation_create(wait=false) only for a new visible iterative work loop"
-        in content
+    assert "Keep the channel unblocked" in content
+    assert "asynchronous action" in content
+    assert "delegate" not in content
+    assert "agent_conversation" not in content
+    assert "create_task" not in content
+
+
+def test_build_channel_context_info_includes_final_only_delivery_guidance() -> None:
+    content = _build_channel_context_info(
+        ConversationContext(
+            type="signal",
+            ref="signal:acct:+420",
+            platform_data={
+                "channel_type": "signal",
+                "assistant_delivery_mode": "final_only",
+            },
+        )
     )
-    assert "continue the same managed conversation" in content
-    assert "instead of creating a duplicate" in content
-    assert 'chat_mode="plan"' in content
-    assert 'chat_mode="build"' in content
-    assert "wait=false means fire-and-follow-up, not fire-and-duplicate" in content
-    assert "follow-up/resume notification" in content
-    assert "create_task for durable workflow-shaped work with lifecycle" in content
+
+    assert content is not None
+    assert "Assistant delivery mode:" in content
+    assert "- Mode: final_only." in content
+    assert "only the final assistant message" in content
+    assert "Intermediate assistant messages" in content
+    assert "self-contained enough for the request" in content
+    assert "Do not replay routine progress or filler" in content
+
+
+def test_build_channel_context_info_includes_concatenated_delivery_guidance() -> None:
+    content = _build_channel_context_info(
+        ConversationContext(
+            type="signal",
+            ref="signal:acct:+420",
+            platform_data={
+                "channel_type": "signal",
+                "assistant_delivery_mode": "concatenated",
+            },
+        )
+    )
+
+    assert content is not None
+    assert "Assistant delivery mode:" in content
+    assert "- Mode: concatenated." in content
+    assert "batched together at the end, not as live progress" in content
+    assert "Treat the delivered batch as one final channel reply" in content
+    assert "avoid repetitive status notes and pre-tool filler" in content
+    assert "Use judgment" in content
 
 
 def test_build_web_main_chat_context_info_is_web_main_only() -> None:
@@ -682,19 +745,11 @@ def test_build_web_main_chat_context_info_is_web_main_only() -> None:
     assert "- Channel: web" in content
     assert "- Main web chat: yes" in content
     assert "DM-like main chat" in content
-    assert "delegate(wait=false)" in content
-    assert "delegate(wait=true)" in content
-    assert "prefer reusing an existing relevant managed conversation" in content
-    assert "Use agent_conversation_send(wait=false) to continue it" in content
-    assert "agent_conversation_create(wait=false)" in content
-    assert "only for a new visible implementation" in content
-    assert "continue the same managed conversation" in content
-    assert "instead of creating a duplicate" in content
-    assert 'chat_mode="plan"' in content
-    assert 'chat_mode="build"' in content
-    assert "fire-and-follow-up" in content
-    assert "stop the parent turn" in content
-    assert "create_task" in content
+    assert "Keep this chat responsive" in content
+    assert "asynchronous action" in content
+    assert "delegate" not in content
+    assert "agent_conversation" not in content
+    assert "create_task" not in content
 
     web_main_content = _build_web_main_chat_context_info(
         ConversationContext(type="web", ref="web:user:user@example.com:default")
@@ -728,10 +783,11 @@ def test_build_web_topic_context_info_is_topic_only() -> None:
     assert "Web topic chat context:" in content
     assert "- Main web chat: no" in content
     assert "normal topic chat, not the DM-like main chat" in content
-    assert "Do not start background managed conversations" in content
-    assert "managed-conversation tools are available without a wait parameter" in content
-    assert "agent_conversation_create(wait=false)" in content
-    assert "reserved for main/channel chat surfaces" in content
+    assert "Do not apply responsiveness or nonblocking guidance" in content
+    assert "Joined execution and proportionate waiting are normal" in content
+    assert "delegate" not in content
+    assert "managed conversation" not in content
+    assert "wait=false" not in content
     assert "Keep this chat responsive" not in content
 
 
@@ -752,10 +808,8 @@ def test_build_agent_work_context_info_lists_only_valid_managed_options() -> Non
     assert "Agent work context:" in content
     assert "delegate(wait=false)" not in content
     assert "agent_conversation_create(wait=false)" not in content
-    assert "Use delegate for specialist child work" in content
-    assert "Avoid asynchronous delegation from managed conversations" in content
-    assert "Do not create tasks or workflows" in content
-    assert "Implement assigned coding/debugging work directly" in content
+    assert "delegate" not in content
+    assert "tasks or workflows" not in content
 
 
 @pytest.mark.asyncio
@@ -780,32 +834,9 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     signal_messages = [str(message.get("content", "")) for message in signal_result.messages]
 
     assert any("Conversation channel context:" in message for message in signal_messages)
-    assert any(
-        "Do not optimize for finishing the whole job inside the parent turn" in message
-        for message in signal_messages
-    )
-    assert any("parent chat as the command bridge" in message for message in signal_messages)
-    assert any(
-        "delegate(wait=false) for bounded, non-interactive worker-style lookup" in message
-        for message in signal_messages
-    )
-    assert any(
-        "agent_conversation_create(wait=false) only for a new visible iterative work loop"
-        in message
-        for message in signal_messages
-    )
-    assert any(
-        "Use agent_conversation_send(wait=false) to continue it" in message
-        for message in signal_messages
-    )
-    assert any(
-        'chat_mode="plan"' in message and 'chat_mode="build"' in message
-        for message in signal_messages
-    )
-    assert any(
-        "create_task for durable workflow-shaped work with lifecycle" in message
-        for message in signal_messages
-    )
+    assert any("Keep the channel unblocked" in message for message in signal_messages)
+    assert not any("delegate(wait=" in message for message in signal_messages)
+    assert not any("agent_conversation_create" in message for message in signal_messages)
 
     direct_result = await assembler.assemble(
         session=_session(),
@@ -820,8 +851,8 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     ]
 
     assert any("Web main chat context:" in message for message in direct_messages)
-    assert any("delegate(wait=false)" in message for message in direct_context_messages)
-    assert any("delegate(wait=true)" in message for message in direct_context_messages)
+    assert any("Keep this chat responsive" in message for message in direct_context_messages)
+    assert not any("delegate(wait=" in message for message in direct_context_messages)
     assert not any("Conversation channel context:" in message for message in direct_messages)
 
     web_main_result = await assembler.assemble(
@@ -834,11 +865,7 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     web_main_messages = [str(message.get("content", "")) for message in web_main_result.messages]
     assert any("Web main chat context:" in message for message in web_main_messages)
     assert any("Keep this chat responsive" in message for message in web_main_messages)
-    assert any("agent_conversation_create(wait=false)" in message for message in web_main_messages)
-    assert any(
-        "Use agent_conversation_send(wait=false) to continue it" in message
-        for message in web_main_messages
-    )
+    assert not any("agent_conversation_create" in message for message in web_main_messages)
 
     web_result = await assembler.assemble(
         session=_session(),
@@ -852,8 +879,13 @@ async def test_context_assembler_injects_channel_context_only_for_channel_conver
     assert not any("Conversation channel context:" in message for message in web_messages)
     assert not any("Web main chat context:" in message for message in web_messages)
     assert any("Web topic chat context:" in message for message in web_messages)
+    assert any("normal topic chat" in message for message in web_messages)
     assert any(
-        "Do not start background managed conversations" in message for message in web_messages
+        "Do not apply responsiveness or nonblocking guidance" in message for message in web_messages
+    )
+    assert any(
+        "Joined execution and proportionate waiting are normal" in message
+        for message in web_messages
     )
     assert not any("Keep the channel unblocked" in message for message in web_messages)
     assert not any("Keep this direct chat responsive" in message for message in web_messages)
@@ -1246,6 +1278,7 @@ async def test_context_assembler_uses_search_mode_for_follow_up_turns() -> None:
             seq=1,
         )
     ]
+    cache.entry.memory_policy_fingerprint = _default_memory_policy_fingerprint()
     assembler = ContextAssembler(
         memory=memory,
         guardrails=_Guardrails(),
@@ -1286,6 +1319,7 @@ async def test_context_assembler_rebuilds_prefix_from_refresh_before_retry_boots
             seq=3,
         ),
     ]
+    cache.policy_fingerprint_after_refresh = _default_memory_policy_fingerprint()
     assembler = ContextAssembler(
         memory=memory,
         guardrails=_Guardrails(),
@@ -1393,6 +1427,7 @@ async def test_context_assembler_adopts_forged_per_turn_mnemory_session_and_mark
     cache.prefix_entries = [
         ImmutablePrefixEntry(role="system", source="identity", content="Agent identity", seq=1)
     ]
+    cache.entry.memory_policy_fingerprint = _default_memory_policy_fingerprint()
     session_manager = _SessionManager()
     assembler = ContextAssembler(
         memory=memory,
@@ -1571,6 +1606,126 @@ def test_events_to_messages_replays_only_marked_developer_context_injections() -
     assert (
         messages[0]["content"]
         == '<memory_context trust="untrusted">\nRecalled memories:\n- Uses pytest\n</memory_context>'
+    )
+
+
+def test_events_to_messages_uses_agent_context_for_visible_system_notice() -> None:
+    messages = events_to_messages(
+        [
+            {
+                "type": "lifecycle",
+                "data": {
+                    "event": "system_notice",
+                    "kind": "agent_profile_changed",
+                    "notice_id": "agent-profile-switch:turn-1:call-1",
+                    "message": "Agent profile changed: developer → senior.",
+                    "agent_context": (
+                        "<agent_profile_change>\nActive profile: senior\n</agent_profile_change>"
+                    ),
+                },
+            }
+        ]
+    )
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": ("<agent_profile_change>\nActive profile: senior\n</agent_profile_change>"),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_profile_switch_preserves_immutable_prefix() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    agent = _agent().model_copy(
+        update={
+            "agent_profiles": {
+                "junior": AgentRuntimeProfile(
+                    profile_id="junior",
+                    description="Bounded routine work.",
+                    model="test-model",
+                    reasoning_effort="low",
+                    agent_switchable=True,
+                ),
+                "senior": AgentRuntimeProfile(
+                    profile_id="senior",
+                    description="Complex high-risk work.",
+                    model="test-model",
+                    reasoning_effort="high",
+                    agent_switchable=True,
+                ),
+            },
+            "default_agent_profile_id": "junior",
+        }
+    )
+    session = _session()
+    conversation = _conversation()
+    session.agent_profile_id = "junior"
+    conversation.agent_profile_id = "junior"
+
+    junior = await assembler.assemble(
+        session=session,
+        conversation=conversation,
+        agent=agent,
+        user_message="Implement the change.",
+        tool_definitions=[],
+    )
+    session.agent_profile_id = "senior"
+    conversation.agent_profile_id = "senior"
+    senior = await assembler.assemble(
+        session=session,
+        conversation=conversation,
+        agent=agent,
+        user_message="Implement the change.",
+        tool_definitions=[],
+    )
+    memoryless = await assembler.assemble(
+        session=session,
+        conversation=conversation,
+        agent=agent,
+        user_message="Implement the change.",
+        tool_definitions=[],
+        skip_memory=True,
+        skip_user_message=True,
+        attachment_notice="Attachment format required extraction.",
+        attachment_context="Extracted attachment content.",
+        routing_reminder="Continue the existing request under the new profile.",
+    )
+
+    assert junior.cache_breakpoint_index == senior.cache_breakpoint_index
+    assert junior.cache_breakpoint_index is not None
+    breakpoint = junior.cache_breakpoint_index
+    assert junior.messages[: breakpoint + 1] == senior.messages[: breakpoint + 1]
+    junior_suffix = junior.messages[breakpoint + 1 :]
+    senior_suffix = senior.messages[breakpoint + 1 :]
+    assert any("Profile: junior" in str(message.get("content")) for message in junior_suffix)
+    assert any("Profile: senior" in str(message.get("content")) for message in senior_suffix)
+    assert any(
+        "senior (current): Complex high-risk work." in str(message.get("content"))
+        for message in memoryless.messages
+    )
+    assert any(
+        message.get("content") == "Extracted attachment content." for message in memoryless.messages
+    )
+    assert any(
+        message.get("content") == "Attachment format required extraction."
+        for message in memoryless.messages
+    )
+    assert any(
+        message.get("content") == "Continue the existing request under the new profile."
+        for message in memoryless.messages
+    )
+    assert not any(
+        message.get("role") == "user" and message.get("content") == "Implement the change."
+        for message in memoryless.messages
     )
 
 
@@ -2654,6 +2809,62 @@ async def test_context_assembler_preserves_current_turn_native_attachments_when_
 
 
 @pytest.mark.asyncio
+async def test_context_assembler_keeps_small_tool_groups_below_steady_target() -> None:
+    events: list[dict[str, object]] = []
+    for index in range(4):
+        call_id = f"call-{index}"
+        events.extend(
+            [
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "name": "read",
+                        "call_id": call_id,
+                        "arguments": {"path": f"{index}.py"},
+                    },
+                },
+                {
+                    "type": "tool_result",
+                    "data": {
+                        "call_id": call_id,
+                        "name": "read",
+                        "result": f"result-{index}",
+                        "output_size": 8,
+                        "recovery_call_id": call_id,
+                    },
+                },
+            ]
+        )
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_HistorySessionCache(events),
+        session_manager=_SessionManager(),
+        max_context_tokens=20_000,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="compare all four results",
+        tool_definitions=[],
+    )
+
+    tool_messages = [message for message in result.messages if message.get("role") == "tool"]
+    assert [message["content"] for message in tool_messages] == [
+        "result-0",
+        "result-1",
+        "result-2",
+        "result-3",
+    ]
+    assert result.projection_compacted_tool_group_anchors == []
+    assert result.projection_mutable_start_index == 0
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_projects_older_tool_groups_into_stable_placeholders() -> None:
     events = [
         {
@@ -2722,6 +2933,8 @@ async def test_context_assembler_projects_older_tool_groups_into_stable_placehol
     assert "call_id 'call-1'" in str(tool_messages[0]["content"])
     assert tool_messages[1]["content"] == "recent-1"
     assert tool_messages[2]["content"] == "recent-2"
+    assert len(result.projection_compacted_tool_group_anchors) == 1
+    assert result.projection_mutable_start_index > 0
 
 
 @pytest.mark.asyncio
@@ -2958,3 +3171,147 @@ async def test_immutable_prefix_stays_identical_across_turns_when_recall_changes
         "Dynamic recalled memory 2" in str(message.get("content", ""))
         for message in second.messages
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "identity_calls", "recall_calls", "has_core"),
+    [
+        ("full_auto", 1, 1, True),
+        ("proactive", 1, 0, True),
+        ("on_demand", 0, 0, False),
+    ],
+)
+async def test_context_assembler_applies_frozen_memory_mode_policy(
+    mode: str,
+    identity_calls: int,
+    recall_calls: int,
+    has_core: bool,
+) -> None:
+    memory = _Memory()
+    agent = _agent().model_copy(
+        update={
+            "capabilities": AgentCapabilities(
+                memory_backend_options={"mode": mode},
+            )
+        }
+    )
+    session = _session()
+    conversation = _conversation()
+    policy = resolve_memory_policy(
+        agent,
+        resolve_conversation_agent_profile(agent, session, conversation),
+    )
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=session,
+        conversation=conversation,
+        agent=agent,
+        user_message="remember this",
+        tool_definitions=[],
+        memory_policy=policy,
+    )
+
+    assert len(memory.identity_calls) == identity_calls
+    assert len(memory.recall_calls) == recall_calls
+    prompt = "\n".join(str(message.get("content") or "") for message in result.messages)
+    assert ("prefers Python" in prompt) is has_core
+    if mode == "proactive":
+        assert "core memories are already loaded" in prompt
+    if mode == "on_demand":
+        assert "available on demand" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cold", [False, True], ids=["warm-l1", "cold-reconstruction"])
+@pytest.mark.parametrize(
+    ("backend", "mode", "expected_instruction", "expects_core"),
+    [
+        ("mnemory", "proactive", "core memories are already loaded", True),
+        ("mnemory", "on_demand", "available on demand", False),
+        ("none", "", None, False),
+    ],
+)
+async def test_policy_fingerprint_transition_replaces_stale_memory_prefix(
+    cold: bool,
+    backend: str,
+    mode: str,
+    expected_instruction: str | None,
+    expects_core: bool,
+) -> None:
+    cache = _SessionCache(cold=cold)
+    stale_entries = [
+        ImmutablePrefixEntry(
+            role="developer",
+            source="memory_instructions",
+            content="STALE FULL AUTO MEMORY INSTRUCTIONS",
+            seq=10,
+        ),
+        ImmutablePrefixEntry(
+            role="developer",
+            source="core_memories",
+            content="STALE CORE MEMORY",
+            seq=11,
+        ),
+    ]
+    if cold:
+        cache.prefix_entries_after_refresh = stale_entries
+        cache.policy_fingerprint_after_refresh = "old-full-auto-fingerprint"
+    else:
+        cache.prefix_entries = stale_entries
+        assert cache.entry is not None
+        cache.entry.memory_policy_fingerprint = "old-full-auto-fingerprint"
+
+    options = {"mode": mode} if mode else {}
+    agent = _agent().model_copy(
+        update={
+            "capabilities": AgentCapabilities(
+                memory_backend=backend,
+                memory_backend_options=options,
+            )
+        }
+    )
+    session = _session("mem-1")
+    conversation = _conversation()
+    policy = resolve_memory_policy(
+        agent,
+        resolve_conversation_agent_profile(agent, session, conversation),
+    )
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=session,
+        conversation=conversation,
+        agent=agent,
+        user_message="hello",
+        tool_definitions=[],
+        memory_policy=policy,
+    )
+
+    prompt = "\n".join(str(message.get("content") or "") for message in result.messages)
+    assert "STALE FULL AUTO MEMORY INSTRUCTIONS" not in prompt
+    assert "STALE CORE MEMORY" not in prompt
+    if expected_instruction:
+        assert expected_instruction in prompt
+    else:
+        assert "Mnemory is" not in prompt
+    assert ("prefers Python" in prompt) is expects_core
+    assert cache.entry is not None
+    assert cache.entry.memory_policy_fingerprint == policy.policy_fingerprint

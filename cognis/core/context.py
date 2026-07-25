@@ -18,9 +18,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_profiles import (
+    agent_switch_eligible_profiles,
     render_agent_profile_context,
-    requested_agent_profile_id,
-    resolve_agent_profile,
+    resolve_conversation_agent_profile,
 )
 from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.attachment_utils import (
@@ -39,9 +39,12 @@ from cognis.core.context_budget import (
 )
 from cognis.core.context_projection import (
     ProjectionPolicy,
+    ProjectionResult,
     build_compacted_tool_result_placeholder,
     clear_large_tool_call_arguments,
+    compacted_tool_group_anchors,
     project_messages,
+    projection_result_from_messages,
 )
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.followups import (
@@ -59,6 +62,7 @@ from cognis.core.immutable_prefix import (
 from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES, is_web_main_chat_context
 from cognis.core.message_markers import (
     ALL_INTERNAL_MARKERS,
+    ANCHOR_NAMES,
     AUDIT_METADATA,
     AUDIT_ROLE,
     AUDIT_SOURCE,
@@ -82,6 +86,12 @@ from cognis.core.prompts import (
 )
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
+from cognis.core.tool_output_presentation import (
+    is_safe_lazy_artifact_ref,
+)
+from cognis.core.tool_output_presentation import (
+    lazy_artifact_refs as build_lazy_artifact_refs,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
@@ -92,6 +102,11 @@ from cognis.models.session import (
     with_session_events_turn_id,
 )
 from cognis.models.tool import Permission, ToolDefinition
+from cognis.providers.llm.anthropic.contracts import (
+    AnthropicContinuationStatus,
+    AnthropicNativeEnvelope,
+)
+from cognis.providers.memory.policy import MemoryRuntimePolicy, resolve_memory_policy
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import get_setting_value
 
@@ -196,6 +211,8 @@ class ContextAssemblyResult(BaseModel):
     compaction_threshold: float = 0.0
     recommend_compaction: bool = False
     cache_breakpoint_index: int | None = None
+    projection_mutable_start_index: int = 0
+    projection_compacted_tool_group_anchors: list[str] = Field(default_factory=list)
 
 
 def _audit_hash(role: str, content: str, source: str) -> str:
@@ -298,10 +315,7 @@ def _native_attachment_blocks(
         ):
             blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
             continue
-        if kind == ArtifactKind.AUDIO.value and (
-            getattr(model_info, "supports_audio_input", False)
-            or getattr(model_info, "supports_file_input", False)
-        ):
+        if kind == ArtifactKind.AUDIO.value and getattr(model_info, "supports_audio_input", False):
             blocks.append({"type": "file", "file": {"file_url": url, "filename": filename}})
             continue
         if kind in {ArtifactKind.FILE.value, ArtifactKind.VIDEO.value} and getattr(
@@ -520,45 +534,49 @@ def _build_channel_context_info(context: ConversationContext | None) -> str | No
         lines.append("- Thread-bound: yes")
     elif "thread_id" in platform_data:
         lines.append("- Thread-bound: no")
+    assistant_delivery_mode = _string_value(platform_data.get("assistant_delivery_mode"))
+    if assistant_delivery_mode == "final_only":
+        lines.extend(
+            [
+                "",
+                "Assistant delivery mode:",
+                "- Mode: final_only.",
+                "- The channel user will receive only the final assistant message for this "
+                "turn. Intermediate assistant messages, progress notes, and pre-tool "
+                "explanations are not delivered.",
+                "- Make the final message self-contained enough for the request: include "
+                "the answer or result, important actions taken, relevant findings, "
+                "blockers or errors, and concrete next steps when useful.",
+                "- Use judgment. Do not replay routine progress or filler; simple turns "
+                "should stay concise.",
+            ]
+        )
+    elif assistant_delivery_mode == "concatenated":
+        lines.extend(
+            [
+                "",
+                "Assistant delivery mode:",
+                "- Mode: concatenated.",
+                "- The channel user receives assistant messages from this turn batched "
+                "together at the end, not as live progress.",
+                "- Treat the delivered batch as one final channel reply. Write "
+                "intermediate assistant messages only when they would still be useful in "
+                "that final batch; avoid repetitive status notes and pre-tool filler.",
+                "- Ensure the delivered batch contains what the user needs to understand "
+                "the turn: the answer or result, important actions taken, relevant "
+                "findings, blockers or errors, and concrete next steps when useful.",
+                "- Use judgment. Simple turns should stay short; complex turns may briefly "
+                "summarize what happened during the turn.",
+            ]
+        )
 
     lines.extend(
         [
             "",
             "Channel behavior:",
             "- This guidance applies only because the current conversation is channel-bound.",
-            "- Keep the channel unblocked. Do not optimize for finishing the whole job "
-            "inside the parent turn. Optimize for correct work routing. In a live "
-            "channel, blocking the channel is worse than returning later with a "
-            "completed result.",
-            "- Move the work loop out of the live channel and keep the parent chat as "
-            "the command bridge.",
-            "- Use delegate(wait=true) only when the current answer depends on the child result.",
-            "- Use delegate(wait=false) for bounded, non-interactive worker-style lookup "
-            "or analysis with clear output and one final report.",
-            "- Before starting a managed work loop, prefer reusing an existing relevant "
-            "managed conversation for the same problem. Use agent_conversation_send"
-            "(wait=false) to continue it, including plan/debug to implementation "
-            'handoffs with chat_mode="build".',
-            "- Use agent_conversation_create(wait=false) only for a new visible iterative "
-            "work loop outside the live channel, or when intentionally separating "
-            "unrelated work. This is especially for CI/build/deploy/debug/browser/"
-            "external-system/polling workflows where the user may need to inspect or "
-            "interact.",
-            "- For new implementation/debugging managed conversations, prefer starting "
-            'with chat_mode="plan"; after user or main-agent review, continue the '
-            'same managed conversation with chat_mode="build" instead of creating a '
-            "duplicate. For clearly small read-only diagnostics, default mode is "
-            "acceptable. Build mode is acceptable when explicitly requested or "
-            "obviously safe.",
-            "- Use create_task for durable workflow-shaped work with lifecycle, "
-            "deliverables, review/evaluation, or longer background persistence.",
-            "- wait=false means fire-and-follow-up, not fire-and-duplicate. After "
-            "starting async child work, stop the parent turn unless independent "
-            "parent-side work can safely continue without the child result.",
-            "- The conversation will receive a follow-up/resume notification when "
-            "async child work finishes.",
-            "- Use inline work only for quick answers or very small actions that can "
-            "finish without noticeably blocking the channel.",
+            "- Keep the channel unblocked; prefer work that can report back later when "
+            "the current capability guidance exposes an asynchronous action.",
             "- Keep channel replies concise and suitable for the channel medium.",
         ]
     )
@@ -580,32 +598,8 @@ def _build_web_main_chat_context_info(context: ConversationContext | None) -> st
             "Web main chat behavior:",
             "- This guidance applies only because the current web conversation is the "
             "DM-like main chat, analogous to a Signal/channel conversation.",
-            "- Keep this chat responsive. Do not optimize for finishing the whole job "
-            "inside the parent turn when a worker can report back later.",
-            "- Use inline work only for quick answers or small actions.",
-            "- Use delegate(wait=true) only for specialist exploration, review, or "
-            "research that must finish before you can continue.",
-            "- Use delegate(wait=false) for bounded, non-interactive worker-style "
-            "lookup or analysis with clear output and one final report.",
-            "- Before starting a managed work loop, prefer reusing an existing relevant "
-            "managed conversation for the same problem. Use agent_conversation_send"
-            "(wait=false) to continue it, including plan/debug to implementation "
-            'handoffs with chat_mode="build".',
-            "- Use agent_conversation_create(wait=false) only for a new visible "
-            "implementation, debugging, CI/build/deploy/browser/external-system, or "
-            "polling work loop, or when intentionally separating unrelated work.",
-            "- For new implementation/debugging managed conversations, prefer starting "
-            'with chat_mode="plan"; after user or main-agent review, continue the '
-            'same managed conversation with chat_mode="build" instead of creating a '
-            "duplicate. Default mode is acceptable for clearly small read-only "
-            "diagnostics, and build mode is acceptable when explicitly requested or "
-            "obviously safe.",
-            "- Use create_task for durable workflow-shaped work with lifecycle, "
-            "deliverables, review/evaluation, or longer background persistence.",
-            "- wait=false means fire-and-follow-up, not fire-and-duplicate. After "
-            "starting async child work, stop the parent turn unless independent "
-            "parent-side work can safely continue without the child result.",
-            "- Use wait=true when the current turn must synthesize the result before replying.",
+            "- Keep this chat responsive; prefer work that can report back later when "
+            "the current capability guidance exposes an asynchronous action.",
         ]
     )
 
@@ -624,21 +618,11 @@ def _build_web_topic_context_info(context: ConversationContext | None) -> str | 
             "Web topic chat context:",
             "- Channel: web",
             "- Main web chat: no",
-            "",
-            "Web topic chat behavior:",
-            "- This guidance applies because the current web conversation is a "
-            "normal topic chat, not the DM-like main chat.",
-            "- Do not start background managed conversations merely to keep this "
-            "topic chat responsive.",
-            "- Prefer inline work for quick answers or small actions.",
-            "- Use delegate(wait=true) for specialist exploration, review, or "
-            "research that must finish before you can continue.",
-            "- If managed-conversation tools are available without a wait parameter, "
-            "the started managed turn is joined before returning.",
-            "- Do not use or mention agent_conversation_create(wait=false) in topic "
-            "chats; that async affordance is reserved for main/channel chat surfaces.",
-            "- Use create_task for durable workflow-shaped work with lifecycle, "
-            "deliverables, review/evaluation, or longer background persistence.",
+            "- This is a normal topic chat, not the DM-like main chat.",
+            "- Do not apply responsiveness or nonblocking guidance intended for external "
+            "channels or the DM-like web main chat.",
+            "- Joined execution and proportionate waiting are normal on this surface when "
+            "provided by the current orchestration tools.",
         ]
     )
 
@@ -663,12 +647,6 @@ def _build_agent_work_context_info(context: ConversationContext | None) -> str |
         f"- This session is managed by Cognis agent `{controller_agent_id}` on behalf of the user.",
         "- Treat user messages in this session as instructions from that authenticated internal agent.",
         "- Do not mention this management context unless it is operationally relevant.",
-        "- Use inline work for small actions.",
-        "- Implement assigned coding/debugging work directly when it is safe and within scope.",
-        "- Use delegate for specialist child work that must finish before this managed turn can continue.",
-        "- Avoid asynchronous delegation from managed conversations; prefer wait=true for joined child work.",
-        "- Do not create tasks or workflows to complete this assigned work. If the work is too broad for this managed conversation, report that limitation to the controller.",
-        "- If the controller must decide or start visible asynchronous work, return a concise blocking issue or recommendation.",
     ]
     if controller_conversation_id:
         lines.append(f"- Controller conversation: {controller_conversation_id}")
@@ -1038,6 +1016,7 @@ class ContextAssembler:
         disabled_artifact_urls: set[str] | None = None,
         disabled_artifact_ids: set[str] | None = None,
         tool_schema_tokens_override: int | None = None,
+        memory_policy: MemoryRuntimePolicy | None = None,
     ) -> ContextAssemblyResult:
         """Build the LLM message list for a single turn.
 
@@ -1061,10 +1040,12 @@ class ContextAssembler:
             extra={"extra_data": {"session_id": session.session_id, "agent_id": agent.agent_id}},
         )
 
-        # --- Capability-disabled memory or secondary agents: skip memory ---
-        # Also skip when agent.capabilities.memory_backend == "none".
-        capabilities = getattr(agent, "capabilities", None)
-        if capabilities is not None and not capabilities.memory_enabled:
+        if memory_policy is None:
+            memory_policy = resolve_memory_policy(
+                agent,
+                resolve_conversation_agent_profile(agent, session, conversation),
+            )
+        if not memory_policy.enabled:
             skip_memory = True
         if skip_memory:
             return await self._assemble_without_memory(
@@ -1092,6 +1073,7 @@ class ContextAssembler:
                 disabled_artifact_urls=disabled_artifact_urls,
                 disabled_artifact_ids=disabled_artifact_ids,
                 tool_schema_tokens_override=tool_schema_tokens_override,
+                memory_policy=memory_policy,
             )
 
         cached_intention = self.session_cache.get_intention(session.session_id)
@@ -1111,6 +1093,7 @@ class ContextAssembler:
             project_instructions=[],
             memory_labels=conversation.context.memory_labels,
             context=cached_intention,
+            memory_policy=memory_policy,
         )
 
         with scoped_runtime_context(
@@ -1118,17 +1101,20 @@ class ContextAssembler:
             agent_id=session.agent_id,
             agent_owner_email=agent.owner_email,
         ):
-            recall_task = self.memory.recall(
-                query=user_message,
-                session_id=session.mnemory_session_id,
-                labels=conversation.context.memory_labels,
-                context=cached_intention,
-                search_mode="search",
-                include_instructions=False,
-                managed=True,
-                instruction_mode=None,
-                ttl=self.recall_ttl_seconds,
-            )
+            if memory_policy.auto_recall:
+                recall_task = self.memory.recall(
+                    query=user_message,
+                    session_id=session.mnemory_session_id,
+                    labels=conversation.context.memory_labels,
+                    context=cached_intention,
+                    search_mode="search",
+                    include_instructions=False,
+                    managed=True,
+                    instruction_mode=None,
+                    ttl=self.recall_ttl_seconds,
+                )
+            else:
+                recall_task = asyncio.sleep(0, result={"search_results": []})
             intention_task = self.guardrails.get_session(
                 session.intaris_session_id or session.session_id
             )
@@ -1268,11 +1254,7 @@ class ContextAssembler:
         # Format mutable search results
         mutable_search_results = _format_search_results(recall_payload.get("search_results"))
 
-        resolved_agent_profile = resolve_agent_profile(
-            agent,
-            requested_agent_profile_id(session, conversation),
-            source="conversation",
-        )
+        resolved_agent_profile = resolve_conversation_agent_profile(agent, session, conversation)
 
         # Model resolution chain: session override → agent profile → agent config → system default
         model_override = self.session_cache.get_model_override(session.session_id)
@@ -1425,7 +1407,10 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
-        if agent_profile_context := render_agent_profile_context(resolved_agent_profile):
+        if agent_profile_context := render_agent_profile_context(
+            resolved_agent_profile,
+            switch_eligible_profiles=agent_switch_eligible_profiles(agent),
+        ):
             messages.append(
                 {
                     "role": "system",
@@ -1590,7 +1575,7 @@ class ContextAssembler:
                 disabled_artifact_ids=disabled_artifact_ids,
             )
             messages.extend(current_turn_messages)
-        elif already_in_history:
+        elif already_in_history or skip_user_message:
             # Prompt already recorded in history; still surface any
             # turn-local signals that were meant to accompany it. The
             # prompt-replay side does not carry these because they are
@@ -1644,21 +1629,15 @@ class ContextAssembler:
             active_executor_id=active_executor_id,
         )
 
-        projection = project_messages(
-            messages,
-            policy=ProjectionPolicy.from_budget(
-                max_context_tokens=max_context_tokens,
-                available_prompt_tokens=budget.available_prompt_tokens,
-                phase="cross_turn",
-                pressure_mode="normal",
-            ),
-        )
-        messages = self._prune_messages(
-            messages=projection.messages,
+        messages, projection = self._project_cross_turn_messages(
+            messages=messages,
             resolved_model=resolved_model,
+            max_context_tokens=max_context_tokens,
+            available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
         )
+        projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
 
         audit_messages = self._collect_audit_messages(messages)
 
@@ -1717,6 +1696,8 @@ class ContextAssembler:
             compaction_threshold=self.compaction_threshold,
             recommend_compaction=recommend_compaction,
             cache_breakpoint_index=cache_breakpoint_index,
+            projection_mutable_start_index=projection.mutable_start_index,
+            projection_compacted_tool_group_anchors=projection_compacted_anchors,
         )
 
     async def _assemble_without_memory(
@@ -1746,6 +1727,7 @@ class ContextAssembler:
         disabled_artifact_urls: set[str] | None = None,
         disabled_artifact_ids: set[str] | None = None,
         tool_schema_tokens_override: int | None = None,
+        memory_policy: MemoryRuntimePolicy | None = None,
     ) -> ContextAssemblyResult:
         """Assemble context without Mnemory calls — for secondary agents.
 
@@ -1753,6 +1735,11 @@ class ContextAssembler:
         recalled memories, intention fetch. Keeps: system prompt,
         system instructions, compaction summary, history, prior step context.
         """
+        if memory_policy is None:
+            memory_policy = resolve_memory_policy(
+                agent,
+                resolve_conversation_agent_profile(agent, session, conversation),
+            )
         degraded_sources: list[str] = []
 
         # Still need Intaris event refresh for history
@@ -1768,11 +1755,7 @@ class ContextAssembler:
         else:
             cache_entry = cache_result
 
-        resolved_agent_profile = resolve_agent_profile(
-            agent,
-            requested_agent_profile_id(session, conversation),
-            source="conversation",
-        )
+        resolved_agent_profile = resolve_conversation_agent_profile(agent, session, conversation)
 
         # Model resolution
         model_override = self.session_cache.get_model_override(session.session_id)
@@ -1853,6 +1836,7 @@ class ContextAssembler:
             memory_labels=conversation.context.memory_labels,
             context=None,
             allow_empty_memory=True,
+            memory_policy=memory_policy,
         )
         immutable_prefix = self._compose_immutable_prefix(
             agent=agent,
@@ -1931,7 +1915,10 @@ class ContextAssembler:
                     "_audit_role": "developer",
                 }
             )
-        if agent_profile_context := render_agent_profile_context(resolved_agent_profile):
+        if agent_profile_context := render_agent_profile_context(
+            resolved_agent_profile,
+            switch_eligible_profiles=agent_switch_eligible_profiles(agent),
+        ):
             messages.append(
                 {
                     "role": "system",
@@ -2055,7 +2042,7 @@ class ContextAssembler:
                 disabled_artifact_ids=disabled_artifact_ids,
             )
             messages.extend(current_turn_messages)
-        elif already_in_history:
+        elif already_in_history or skip_user_message:
             if routing_reminder:
                 messages.append(
                     {
@@ -2102,21 +2089,15 @@ class ContextAssembler:
             active_executor_id=active_executor_id,
         )
 
-        projection = project_messages(
-            messages,
-            policy=ProjectionPolicy.from_budget(
-                max_context_tokens=max_context_tokens,
-                available_prompt_tokens=budget.available_prompt_tokens,
-                phase="cross_turn",
-                pressure_mode="normal",
-            ),
-        )
-        messages = self._prune_messages(
-            messages=projection.messages,
+        messages, projection = self._project_cross_turn_messages(
+            messages=messages,
             resolved_model=resolved_model,
+            max_context_tokens=max_context_tokens,
+            available_prompt_tokens=budget.available_prompt_tokens,
             max_prompt_tokens=max_prompt_tokens,
             tool_schema_tokens=tool_schema_tokens,
         )
+        projection_compacted_anchors = sorted(compacted_tool_group_anchors(messages))
 
         audit_messages = self._collect_audit_messages(messages)
         cache_breakpoint_index = _find_cache_breakpoint(messages)
@@ -2164,6 +2145,8 @@ class ContextAssembler:
             compaction_threshold=self.compaction_threshold,
             recommend_compaction=recommend_compaction,
             cache_breakpoint_index=cache_breakpoint_index,
+            projection_mutable_start_index=projection.mutable_start_index,
+            projection_compacted_tool_group_anchors=projection_compacted_anchors,
         )
 
     def _get_available_skills_metadata(self, agent: AgentDefinition) -> str | None:
@@ -2206,8 +2189,23 @@ class ContextAssembler:
         memory_labels: dict[str, str],
         context: str | None,
         allow_empty_memory: bool = False,
+        memory_policy: MemoryRuntimePolicy,
     ) -> list[ImmutablePrefixEntry]:
         cached_entries = self.session_cache.get_prefix_entries(session.session_id)
+        cache_entry = self.session_cache.get_entry(session.session_id)
+        cache_tracks_policy = cache_entry is not None and hasattr(
+            cache_entry, "memory_policy_fingerprint"
+        )
+        cached_policy_fingerprint = (
+            getattr(cache_entry, "memory_policy_fingerprint", None)
+            if cache_entry is not None
+            else None
+        )
+        policy_changed = cache_tracks_policy and (
+            cached_policy_fingerprint != memory_policy.policy_fingerprint
+        )
+        if policy_changed:
+            cached_entries = []
         if allow_empty_memory:
             cached_entries = [
                 entry
@@ -2221,12 +2219,17 @@ class ContextAssembler:
         if (
             cached_entries
             and not self.session_cache.needs_prefix_repair(session.session_id)
+            and not policy_changed
             and (allow_empty_memory or session.mnemory_session_id is not None)
         ):
             return list(cached_entries)
 
         repair_needed = self.session_cache.needs_prefix_repair(session.session_id)
-        snapshot_source = "repair" if repair_needed else "bootstrap"
+        snapshot_source = (
+            "policy_change"
+            if policy_changed and cached_policy_fingerprint is not None
+            else ("repair" if repair_needed else "bootstrap")
+        )
         if snapshot_source == "repair":
             last_attempt = self.session_cache.get_last_repair_attempt_at(session.session_id)
             if (
@@ -2239,13 +2242,13 @@ class ContextAssembler:
                 )
 
         try:
-            instructions: str | None = None
+            instructions: str | None = memory_policy.instructions
             core_memories: str | None = None
             repair_reason: str | None = None
             requested_session_id = session.mnemory_session_id
             previous_mnemory_session_id = session.mnemory_session_id
             recall_session_id = session.mnemory_session_id
-            if not allow_empty_memory:
+            if not allow_empty_memory and memory_policy.bootstrap_core:
                 identity_payload = await self._load_identity_payload(
                     session_id=session.mnemory_session_id,
                     session=session,
@@ -2278,7 +2281,12 @@ class ContextAssembler:
                 elif session.mnemory_session_id is None and recall_session_id:
                     await self._adopt_mnemory_session(session, recall_session_id)
 
-                if isinstance(raw_instructions, str) and raw_instructions.strip():
+                if (
+                    memory_policy.instructions is None
+                    and memory_policy.bootstrap_instructions
+                    and isinstance(raw_instructions, str)
+                    and raw_instructions.strip()
+                ):
                     instructions = _adapt_memory_instructions(raw_instructions.strip())
                 if isinstance(raw_core, str) and raw_core.strip():
                     core_memories = raw_core.strip()
@@ -2307,11 +2315,12 @@ class ContextAssembler:
                     recall_session_id = str(identity_payload.get("session_id") or "").strip()
                     if recall_session_id:
                         await self._adopt_mnemory_session(session, recall_session_id)
-                    instructions = (
-                        _adapt_memory_instructions(raw_instructions.strip())
-                        if isinstance(raw_instructions, str) and raw_instructions.strip()
-                        else None
-                    )
+                    if memory_policy.instructions is None and memory_policy.bootstrap_instructions:
+                        instructions = (
+                            _adapt_memory_instructions(raw_instructions.strip())
+                            if isinstance(raw_instructions, str) and raw_instructions.strip()
+                            else None
+                        )
                     core_memories = (
                         raw_core.strip() if isinstance(raw_core, str) and raw_core.strip() else None
                     )
@@ -2377,6 +2386,9 @@ class ContextAssembler:
                     "agent_id": agent.agent_id,
                     "old_mnemory_session_id": previous_mnemory_session_id,
                     "repair_reason": repair_reason,
+                    "memory_backend": memory_policy.backend_id,
+                    "memory_mode": memory_policy.mode_id,
+                    "memory_policy_fingerprint": memory_policy.policy_fingerprint,
                 },
             )
             snapshot_events = with_session_events_turn_id([snapshot_event], None)
@@ -2402,12 +2414,26 @@ class ContextAssembler:
             await self.session_cache.append_recorded_events(
                 session, snapshot_events, snapshot_result
             )
-            await self.session_cache.store_prefix_snapshot(
-                session.session_id,
-                resolved_entries,
-                snapshot_seq=snapshot_result.last_seq,
-                snapshot_source=snapshot_source,
-            )
+            try:
+                await self.session_cache.store_prefix_snapshot(
+                    session.session_id,
+                    resolved_entries,
+                    snapshot_seq=snapshot_result.last_seq,
+                    snapshot_source=snapshot_source,
+                    memory_policy_fingerprint=memory_policy.policy_fingerprint,
+                    memory_policy_mode=memory_policy.mode_id,
+                )
+            except TypeError as exc:
+                if "memory_policy_" not in str(exc):
+                    raise
+                # Compatibility for narrow cache test doubles and external
+                # implementations compiled against the previous signature.
+                await self.session_cache.store_prefix_snapshot(
+                    session.session_id,
+                    resolved_entries,
+                    snapshot_seq=snapshot_result.last_seq,
+                    snapshot_source=snapshot_source,
+                )
             if snapshot_source == "repair":
                 MNEMORY_SESSION_REPAIRED_TOTAL.labels(
                     reason=repair_reason or "intaris_snapshot_missing"
@@ -2889,6 +2915,44 @@ class ContextAssembler:
             hydrated_events.append(next_event)
         return hydrated_events
 
+    def _project_cross_turn_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        resolved_model: str,
+        max_context_tokens: int,
+        available_prompt_tokens: int,
+        max_prompt_tokens: int,
+        tool_schema_tokens: int,
+    ) -> tuple[list[dict[str, Any]], ProjectionResult]:
+        """Project only enough history to return to the steady prompt target."""
+
+        policy = ProjectionPolicy.from_budget(
+            max_context_tokens=max_context_tokens,
+            available_prompt_tokens=available_prompt_tokens,
+            phase="cross_turn",
+            pressure_mode="normal",
+        )
+        raw_prompt_tokens = (
+            self.llm.count_messages_tokens(messages, resolved_model) + tool_schema_tokens
+        )
+        if raw_prompt_tokens <= policy.steady_target_tokens:
+            projection = ProjectionResult(messages=list(messages), mutable_start_index=0)
+        else:
+            projection = project_messages(
+                messages,
+                policy=policy,
+                token_counter=lambda text: self.llm.count_tokens(text, resolved_model),
+                required_savings_tokens=raw_prompt_tokens - policy.steady_target_tokens,
+            )
+        pruned_messages = self._prune_messages(
+            messages=projection.messages,
+            resolved_model=resolved_model,
+            max_prompt_tokens=max_prompt_tokens,
+            tool_schema_tokens=tool_schema_tokens,
+        )
+        return pruned_messages, projection_result_from_messages(pruned_messages)
+
     def _prune_messages(
         self,
         *,
@@ -3070,16 +3134,22 @@ def events_to_messages(
     # Buffer for consecutive tool_call events (flushed on non-tool_call)
     pending_tool_calls: list[dict[str, Any]] = []
     pending_responses_output_items: list[dict[str, Any]] = []
+    pending_anthropic_native_envelope: dict[str, Any] | None = None
     open_tool_call_ids: list[str] = []
+    native_open_tool_call_ids: set[str] = set()
+    native_tool_batch_by_call_id: dict[str, set[str]] = {}
 
     def _flush_tool_calls() -> None:
         """Flush buffered tool_call events into an assistant message."""
+        nonlocal pending_anthropic_native_envelope
         if not pending_tool_calls:
             return
         tc_array = list(pending_tool_calls)
         responses_output_items = list(pending_responses_output_items)
+        native_envelope = pending_anthropic_native_envelope
         pending_tool_calls.clear()
         pending_responses_output_items.clear()
+        pending_anthropic_native_envelope = None
         open_tool_call_ids.extend(
             tc.get("id", "") for tc in tc_array if isinstance(tc.get("id", ""), str)
         )
@@ -3101,14 +3171,45 @@ def events_to_messages(
                     messages[-1]["_responses_output_items"] = [
                         dict(item) for item in responses_output_items
                     ]
+            if native_envelope is not None:
+                messages[-1]["_anthropic_native_envelope"] = native_envelope
             # OpenAI requires content to be null (not absent) when tool_calls present
             if not messages[-1].get("content"):
                 messages[-1]["content"] = None
         else:
-            message = {"role": "assistant", "content": None, "tool_calls": tc_array}
+            message: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": tc_array}
             if responses_output_items:
                 message["_responses_output_items"] = [dict(item) for item in responses_output_items]
+            if native_envelope is not None:
+                message["_anthropic_native_envelope"] = native_envelope
             messages.append(message)
+
+    def _discard_native_tool_batch(call_id: str) -> None:
+        """Remove one incomplete native turn instead of inventing tool results."""
+
+        discarded_call_ids = native_tool_batch_by_call_id.get(call_id, {call_id})
+        native_open_tool_call_ids.difference_update(discarded_call_ids)
+        for discarded_id in discarded_call_ids:
+            native_tool_batch_by_call_id.pop(discarded_id, None)
+        open_tool_call_ids[:] = [
+            open_id for open_id in open_tool_call_ids if open_id not in discarded_call_ids
+        ]
+        retained: list[dict[str, Any]] = []
+        for message in messages:
+            if (
+                message.get("role") == "assistant"
+                and "_anthropic_native_envelope" in message
+                and isinstance(message.get("tool_calls"), list)
+                and any(
+                    isinstance(tool_call, dict) and tool_call.get("id") in discarded_call_ids
+                    for tool_call in message["tool_calls"]
+                )
+            ):
+                continue
+            if message.get("role") == "tool" and message.get("tool_call_id") in discarded_call_ids:
+                continue
+            retained.append(message)
+        messages[:] = retained
 
     def _append_orphan_placeholders() -> None:
         """Close unresolved tool calls with synthetic tool messages."""
@@ -3116,6 +3217,9 @@ def events_to_messages(
         while open_tool_call_ids:
             tc_id = open_tool_call_ids.pop(0)
             if not tc_id:
+                continue
+            if tc_id in native_open_tool_call_ids:
+                _discard_native_tool_batch(tc_id)
                 continue
             messages.append(
                 {
@@ -3161,6 +3265,26 @@ def events_to_messages(
                     pending_responses_output_items.extend(
                         dict(item) for item in responses_output_items if isinstance(item, dict)
                     )
+                native_envelope = event_data.get("anthropic_native_envelope")
+                if isinstance(native_envelope, dict):
+                    try:
+                        envelope = AnthropicNativeEnvelope.from_dict(native_envelope)
+                    except (TypeError, ValueError, KeyError):
+                        envelope = None
+                    if (
+                        envelope is not None
+                        and envelope.continuation_status is AnthropicContinuationStatus.CONTINUABLE
+                    ):
+                        pending_anthropic_native_envelope = envelope.to_dict()
+                        native_call_ids = {
+                            str(block["id"])
+                            for block in envelope.native_blocks
+                            if block.get("type") == "tool_use" and isinstance(block.get("id"), str)
+                        }
+                        native_open_tool_call_ids.update(native_call_ids)
+                        native_tool_batch_by_call_id.update(
+                            {native_call_id: native_call_ids for native_call_id in native_call_ids}
+                        )
             continue
 
         # Any non-tool_call event flushes the pending buffer
@@ -3200,6 +3324,17 @@ def events_to_messages(
                     msg["_responses_output_items"] = [
                         dict(item) for item in responses_output_items if isinstance(item, dict)
                     ]
+                native_envelope = event_data.get("anthropic_native_envelope")
+                if isinstance(native_envelope, dict):
+                    try:
+                        envelope = AnthropicNativeEnvelope.from_dict(native_envelope)
+                    except (TypeError, ValueError, KeyError):
+                        envelope = None
+                    if (
+                        envelope is not None
+                        and envelope.continuation_status is AnthropicContinuationStatus.CONTINUABLE
+                    ):
+                        msg["_anthropic_native_envelope"] = envelope.to_dict()
                 messages.append(msg)
         elif event_type == "developer_message":
             _append_orphan_placeholders()
@@ -3247,19 +3382,51 @@ def events_to_messages(
                 if (
                     pruned_call_ids
                     and call_id in pruned_call_ids
+                    and isinstance(event_data.get("recovery_call_id"), str)
+                    and bool(event_data["recovery_call_id"].strip())
                     and not bool(event_data.get("protect_from_pruning"))
                 ):
                     from cognis.core.tool_output_prune import cleared_tool_result_marker
 
-                    rendered_output = cleared_tool_result_marker(call_id)
+                    rendered_output = cleared_tool_result_marker(event_data["recovery_call_id"])
                     pruned_view = True
                 presentation = event_data.get("tool_output_presentation")
                 if not isinstance(presentation, dict):
                     presentation = {}
-                anchors_available = event_data.get(
-                    "anchors_available", presentation.get("anchors_available")
+                anchor_names = presentation.get("anchors")
+                if not isinstance(anchor_names, list):
+                    anchor_names = []
+                anchor_names = [
+                    name for name in anchor_names if isinstance(name, str) and name.strip()
+                ]
+                lazy_artifact_refs = presentation.get("lazy_artifact_refs")
+                if not isinstance(lazy_artifact_refs, list):
+                    lazy_artifact_refs = []
+                lazy_artifact_refs = [
+                    ref for ref in lazy_artifact_refs if isinstance(ref, str) and ref.strip()
+                ]
+                allowed_lazy_refs = set(
+                    build_lazy_artifact_refs(event_data.get("recovery_call_id"), anchor_names)
                 )
-                anchor_count = event_data.get("anchor_count", presentation.get("anchor_count"))
+                lazy_artifact_refs = [ref for ref in lazy_artifact_refs if ref in allowed_lazy_refs]
+                recovered_lazy_refs = presentation.get("recovered_lazy_artifact_refs")
+                if (
+                    event_data.get("name") == "get_task_step_logs"
+                    and presentation.get("controller_recovered_lazy_refs") is True
+                    and isinstance(recovered_lazy_refs, list)
+                ):
+                    lazy_artifact_refs.extend(
+                        ref
+                        for ref in recovered_lazy_refs
+                        if is_safe_lazy_artifact_ref(ref) and ref not in lazy_artifact_refs
+                    )
+                legacy_anchor_count = event_data.get("anchor_count")
+                legacy_anchors_available = (
+                    not anchor_names
+                    and event_data.get("anchors_available") is True
+                    and isinstance(legacy_anchor_count, int)
+                    and legacy_anchor_count > 0
+                )
                 messages.append(
                     {
                         "role": "tool",
@@ -3275,8 +3442,21 @@ def events_to_messages(
                         "_output_size": event_data.get("output_size"),
                         "_agent_visible_truncated": bool(event_data.get("agent_visible_truncated")),
                         "_tool_output_presentation": presentation,
-                        "_anchors_available": bool(anchors_available),
-                        "_anchor_count": anchor_count if isinstance(anchor_count, int) else None,
+                        "_anchors_available": bool(anchor_names) or legacy_anchors_available,
+                        "_anchor_count": (
+                            len(anchor_names)
+                            if anchor_names
+                            else legacy_anchor_count
+                            if legacy_anchors_available
+                            else 0
+                        ),
+                        ANCHOR_NAMES: anchor_names,
+                        "_lazy_artifact_refs": lazy_artifact_refs,
+                        "_materialized_artifact_evidence": (
+                            event_data.get("materialized_artifact_evidence")
+                            if isinstance(event_data.get("materialized_artifact_evidence"), dict)
+                            else {}
+                        ),
                         "_pruned_view": pruned_view,
                     }
                 )
@@ -3350,7 +3530,7 @@ def events_to_messages(
                         }
                     )
             elif lifecycle_event == "system_notice":
-                notice_msg = event_data.get("message", "")
+                notice_msg = event_data.get("agent_context") or event_data.get("message", "")
                 if notice_msg:
                     messages.append({"role": "system", "content": notice_msg})
             # Other lifecycle events (task_status, etc.) are informational — skip

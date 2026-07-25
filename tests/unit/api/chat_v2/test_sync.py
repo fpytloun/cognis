@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Coroutine
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
@@ -16,6 +17,7 @@ from cognis.api.chat_v2.schemas import (
     ConversationStateView,
     ConversationSummary,
     MessageTimelineItem,
+    TimelineScope,
     ToolCallTimelineItem,
     UpsertTimelineItemOp,
 )
@@ -36,16 +38,51 @@ NOW = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
 SECRET = "test-secret"
 
 
+def _scope() -> TimelineScope:
+    return TimelineScope(key="conversation:conv_1", kind="conversation", conversation_id="conv_1")
+
+
+# Keep the historical orchestration cases focused on projection behavior while
+# supplying the now-required first-class scope contract.
+_build_chat_snapshot = build_chat_snapshot
+_build_chat_sync_response = build_chat_sync_response
+_build_timeline_backfill_response = build_timeline_backfill_response
+
+
+async def build_chat_snapshot(**kwargs: Any) -> Any:
+    kwargs.setdefault("scope", _scope())
+    return await _build_chat_snapshot(**kwargs)
+
+
+async def build_chat_sync_response(**kwargs: Any) -> Any:
+    kwargs.pop("conversation_id", None)
+    kwargs.setdefault("scope", _scope())
+    return await _build_chat_sync_response(**kwargs)
+
+
+async def build_timeline_backfill_response(**kwargs: Any) -> Any:
+    kwargs.pop("conversation_id", None)
+    kwargs.setdefault("scope", _scope())
+    return await _build_timeline_backfill_response(**kwargs)
+
+
 class FakeEventStore:
     def __init__(
         self,
         events_by_session: dict[str, list[RawSessionEvent]],
         *,
         page_cap: int | None = None,
+        read_delay: float = 0,
     ) -> None:
         self.events_by_session = events_by_session
         self.page_cap = page_cap
+        self.read_delay = read_delay
         self.calls: list[dict[str, Any]] = []
+        self.watermark_calls: list[str] = []
+        self.in_flight_reads = 0
+        self.max_concurrent_reads = 0
+        self.in_flight_watermarks = 0
+        self.max_concurrent_watermarks = 0
 
     async def read_session_events(
         self,
@@ -65,6 +102,11 @@ class FakeEventStore:
                 "direction": direction,
             }
         )
+        self.in_flight_reads += 1
+        self.max_concurrent_reads = max(self.max_concurrent_reads, self.in_flight_reads)
+        if self.read_delay:
+            await asyncio.sleep(self.read_delay)
+        self.in_flight_reads -= 1
         source_events = self.events_by_session.get(session_id, [])
         effective_limit = min(limit, self.page_cap) if self.page_cap is not None else limit
         if direction == "backward":
@@ -93,12 +135,26 @@ class FakeEventStore:
         )
 
     async def read_session_high_watermark(self, *, session_id: str) -> SessionWatermark:
+        self.watermark_calls.append(session_id)
+        self.in_flight_watermarks += 1
+        self.max_concurrent_watermarks = max(
+            self.max_concurrent_watermarks,
+            self.in_flight_watermarks,
+        )
+        if self.read_delay:
+            await asyncio.sleep(self.read_delay)
+        self.in_flight_watermarks -= 1
         events = self.events_by_session.get(session_id, [])
         return SessionWatermark(
             store_id="intaris",
             session_id=session_id,
             last_seq=max((event.seq for event in events), default=0),
         )
+
+
+@pytest.fixture(autouse=True)
+def _clear_chat_v2_read_caches() -> None:
+    sync_module.clear_chat_v2_read_caches()
 
 
 def test_snapshot_builds_projection_and_cursor() -> None:
@@ -161,6 +217,230 @@ def test_snapshot_hydrates_legacy_attachment_refs_before_projection() -> None:
     assert item.attachments[0].artifact_id == "art_1"
     assert item.attachments[0].filename == "hydrated-art_1.txt"
     assert item.attachments[0].url == "https://artifacts.test/art_1"
+
+
+def test_snapshot_parallelizes_watermark_and_window_reads() -> None:
+    store = FakeEventStore(
+        {
+            "intaris_old": [
+                _event_for(
+                    "intaris_old", 1, "user_message", {"content": "old", "client_message_id": "old"}
+                )
+            ],
+            "intaris_1": [
+                _event(1, "user_message", {"content": "active", "client_message_id": "c1"})
+            ],
+        },
+        read_delay=0.01,
+    )
+
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage_with_compacted_parent(),
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+
+    assert [item.id for item in snapshot.timeline.items] == ["user:old", "user:c1"]
+    assert store.max_concurrent_watermarks == 2
+    assert store.max_concurrent_reads == 2
+
+
+def test_snapshot_reuses_immutable_session_reads_and_projection_cache() -> None:
+    store = FakeEventStore(
+        {
+            "intaris_old": [
+                _event_for(
+                    "intaris_old", 1, "user_message", {"content": "old", "client_message_id": "old"}
+                )
+            ]
+        }
+    )
+    session_refs = [
+        ConversationSessionRef(
+            session_id="sess_old",
+            event_store_session_id="intaris_old",
+            ordinal=0,
+            status="completed",
+            completion_reason="compacted",
+        )
+    ]
+
+    first = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=session_refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+    store.calls.clear()
+    store.watermark_calls.clear()
+    second = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=session_refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+
+    assert second.timeline.model_dump(mode="json") == first.timeline.model_dump(mode="json")
+    assert store.watermark_calls == []
+    assert store.calls == []
+
+    rotated_refs = [
+        *session_refs,
+        ConversationSessionRef(
+            session_id="sess_1",
+            event_store_session_id="intaris_1",
+            ordinal=1,
+            status="active",
+        ),
+    ]
+    store.events_by_session["intaris_1"] = [
+        _event(1, "user_message", {"content": "new active", "client_message_id": "c1"})
+    ]
+    rotated = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=rotated_refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+
+    assert [item.id for item in rotated.timeline.items] == ["user:old", "user:c1"]
+    assert store.watermark_calls == ["intaris_1"]
+    assert [call["session_id"] for call in store.calls] == ["intaris_1"]
+
+
+def test_snapshot_projection_cache_invalidates_when_active_watermark_changes() -> None:
+    store = FakeEventStore(
+        {"intaris_1": [_event(1, "user_message", {"content": "one", "client_message_id": "c1"})]}
+    )
+    first = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+    store.calls.clear()
+
+    second = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+
+    assert second.timeline.model_dump(mode="json") == first.timeline.model_dump(mode="json")
+    assert store.calls == []
+
+    store.events_by_session["intaris_1"].append(
+        _event(2, "user_message", {"content": "two", "client_message_id": "c2"})
+    )
+    changed = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+
+    assert [item.id for item in changed.timeline.items] == ["user:c1", "user:c2"]
+    assert [call["session_id"] for call in store.calls] == ["intaris_1"]
+
+
+def test_active_session_snapshot_reads_from_warm_session_cache() -> None:
+    store = FakeEventStore({"intaris_1": []})
+    session_cache = SimpleNamespace(
+        get_entry=lambda session_id: SimpleNamespace(
+            session_id=session_id,
+            intaris_session_id="intaris_1",
+            initialized=True,
+            last_event_seq=1,
+            events=[
+                SimpleNamespace(
+                    seq=1,
+                    type="user_message",
+                    data={"content": "cached", "client_message_id": "cached"},
+                )
+            ],
+        )
+    )
+
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            session_cache=session_cache,
+            now=NOW,
+        )
+    )
+
+    assert [item.id for item in snapshot.timeline.items] == ["user:cached"]
+    assert store.watermark_calls == []
+    assert store.calls == []
+
+
+def test_active_session_snapshot_falls_back_when_session_cache_is_pruned() -> None:
+    store = FakeEventStore(
+        {
+            "intaris_1": [
+                _event(1, "user_message", {"content": "one", "client_message_id": "c1"}),
+                _event(2, "assistant_message", {"content": "two", "message_id": "a1"}),
+                _event(3, "user_message", {"content": "three", "client_message_id": "c2"}),
+            ]
+        }
+    )
+    session_cache = SimpleNamespace(
+        get_entry=lambda session_id: SimpleNamespace(
+            session_id=session_id,
+            intaris_session_id="intaris_1",
+            initialized=True,
+            last_event_seq=3,
+            last_compaction_seq=2,
+            events=[
+                SimpleNamespace(
+                    seq=3,
+                    type="user_message",
+                    data={"content": "cached-after-compaction", "client_message_id": "cached"},
+                )
+            ],
+        )
+    )
+
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            session_cache=session_cache,
+            now=NOW,
+        )
+    )
+
+    assert [item.id for item in snapshot.timeline.items] == ["user:c1", "message:a1", "user:c2"]
+    assert store.watermark_calls == ["intaris_1"]
+    assert [call["session_id"] for call in store.calls] == ["intaris_1"]
 
 
 def test_sync_reads_only_events_after_cursor_watermark() -> None:
@@ -805,10 +1085,37 @@ def _lineage() -> list[ConversationSessionRef]:
     ]
 
 
+def _lineage_with_compacted_parent() -> list[ConversationSessionRef]:
+    return [
+        ConversationSessionRef(
+            session_id="sess_old",
+            event_store_session_id="intaris_old",
+            ordinal=0,
+            status="completed",
+            completion_reason="compacted",
+        ),
+        ConversationSessionRef(
+            session_id="sess_1",
+            event_store_session_id="intaris_1",
+            ordinal=1,
+            status="active",
+        ),
+    ]
+
+
 def _event(seq: int, event_type: str, data: dict[str, object]) -> RawSessionEvent:
+    return _event_for("intaris_1", seq, event_type, data)
+
+
+def _event_for(
+    session_id: str,
+    seq: int,
+    event_type: str,
+    data: dict[str, object],
+) -> RawSessionEvent:
     return RawSessionEvent(
         store_id="intaris",
-        session_id="intaris_1",
+        session_id=session_id,
         seq=seq,
         type=event_type,
         data=data,
@@ -835,9 +1142,7 @@ async def _attachment_processor(events: list[RawSessionEvent]) -> list[RawSessio
             for attachment in attachments
             if isinstance(attachment, dict) and isinstance(attachment.get("artifact_id"), str)
         ]
-        processed.append(
-            event.model_copy(update={"data": {**event.data, "attachments": hydrated}})
-        )
+        processed.append(event.model_copy(update={"data": {**event.data, "attachments": hydrated}}))
     return processed
 
 

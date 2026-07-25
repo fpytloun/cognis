@@ -61,6 +61,13 @@ class ToolRegistry:
     def register(self, tool: RegisteredTool) -> None:
         """Register a tool by its fully-qualified name."""
 
+        from cognis.tools.introspection import audit_tool_descriptors
+
+        failures = audit_tool_descriptors([tool.definition])
+        if failures:
+            raise ValueError(
+                f"Invalid native tool contract for {tool.definition.name}: " + "; ".join(failures)
+            )
         if tool.definition.name in self._tools:
             raise ValueError(f"Duplicate tool registration: {tool.definition.name}")
         self._tools[tool.definition.name] = tool

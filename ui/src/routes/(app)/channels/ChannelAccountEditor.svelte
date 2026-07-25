@@ -2,6 +2,8 @@
   import ArrowLeft from 'lucide-svelte/icons/arrow-left';
 
   import { policyOptions, type ChannelEditorDraft, type ChannelEditorMode, type SetupGuide } from '$lib/channels';
+  import { normalizeSelectedAgentProfileId } from '$lib/agents';
+  import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
@@ -33,6 +35,18 @@
 
   function primaryAgents(): Agent[] {
     return agents.filter((agent) => agent.agent_type === 'primary');
+  }
+
+  function selectedAgent(): Agent | undefined {
+    return primaryAgents().find((agent) => agent.agent_id === draft.agent_id);
+  }
+
+  function selectAgent(agentId: string): void {
+    draft.agent_id = agentId;
+    draft.default_agent_profile_id = normalizeSelectedAgentProfileId(
+      selectedAgent(),
+      draft.default_agent_profile_id,
+    );
   }
 
   function compatibleExecutors(): ExecutorConfig[] {
@@ -87,12 +101,20 @@
           <AgentSelect
             agents={primaryAgents()}
             value={draft.agent_id}
-            onchange={(next) => { draft.agent_id = next; }}
+            onchange={selectAgent}
             placeholder="Select an agent"
             emptyLabel="No primary agents"
           />
           <span class="text-xs text-slate-500">Only primary agents can own channel accounts.</span>
         </div>
+
+        <AgentProfileSelect
+          agents={primaryAgents()}
+          agentId={draft.agent_id}
+          bind:value={draft.default_agent_profile_id}
+          label="Default runtime profile"
+          help="Used by interactive conversations on this channel unless the conversation or session selects an explicit profile."
+        />
 
         <label class="grid gap-2 text-sm text-slate-300">
           Adapter location

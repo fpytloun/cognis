@@ -6,6 +6,7 @@ tool is enabled on that executor.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from cognis.core.executor_policy import ExecutorPolicy, is_executor_row_usable
@@ -40,11 +41,11 @@ def is_tool_enabled(
     )
 
 
-def filter_tools_by_executor(
-    tools: list[ToolDefinition],
+def filter_tools_by_executor[ToolDefinitionT: ToolDefinition](
+    tools: Sequence[ToolDefinitionT],
     enabled_tools: list[str] | None,
     enabled_tool_groups: list[str] | None,
-) -> list[ToolDefinition]:
+) -> list[ToolDefinitionT]:
     """Filter tool definitions to only those enabled on an executor."""
     return [t for t in tools if is_tool_enabled(t, enabled_tools, enabled_tool_groups)]
 

@@ -47,5 +47,6 @@ def assistant_message_runtime_metadata(
             or info.get("current_reasoning_effort")
             or info.get("agent_profile_reasoning_effort")
         ),
+        "reasoning_mode": _string_value(info.get("reasoning_mode")),
     }
     return {key: value for key, value in metadata.items() if value is not None}

@@ -15,6 +15,7 @@ SENSITIVE_INFERENCE_KEYS = {
     "refresh_token",
     "credentials_json",
     "settings_json",
+    "x-api-key",
 }
 
 

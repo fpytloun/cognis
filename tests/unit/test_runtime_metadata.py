@@ -22,6 +22,7 @@ def test_assistant_message_runtime_metadata_uses_resolved_turn_values() -> None:
             "resolved_provider_id": "openai",
             "resolved_model": "gpt-5.1",
             "reasoning_effort": "high",
+            "reasoning_mode": "adaptive",
         },
     )
 
@@ -36,6 +37,7 @@ def test_assistant_message_runtime_metadata_uses_resolved_turn_values() -> None:
         "provider_id": "openai",
         "model": "gpt-5.1",
         "reasoning_effort": "high",
+        "reasoning_mode": "adaptive",
     }
 
 

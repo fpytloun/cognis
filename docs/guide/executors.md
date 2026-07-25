@@ -287,8 +287,10 @@ context (override per-evasion via the *Disable specific evasions* field in the
 UI, or disable globally with `stealth_enabled = false`). When stealth is on the
 context also gets:
 
-- a current Chrome desktop `User-Agent` (turn off with `realistic_user_agent =
-  false`)
+- a Chrome desktop `User-Agent` derived from the running bundled Chromium build
+  and host platform; configured browser channels retain the selected browser's
+  native coherent UA (turn the bundled-browser override off with
+  `realistic_user_agent = false`)
 - `Accept-Language: en-US,en;q=0.9` (override via `default_accept_language`)
 - `timezone_id = "UTC"` when no `timezone_id` is configured (override via
   `default_timezone_id`)

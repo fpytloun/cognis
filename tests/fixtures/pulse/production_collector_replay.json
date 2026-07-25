@@ -1,0 +1,128 @@
+{
+  "task_id": "task_8c6b6f20f11344feadf8d253a4ea8854",
+  "observed_at": "2026-07-14T08:00:00+02:00",
+  "collectors": [
+    {
+      "collector": "agenda",
+      "status": "partial",
+      "observed_at": "2026-07-14T08:00:00+02:00",
+      "items": [
+        {
+          "id": "calendar-exercise",
+          "kind": "agenda",
+          "title": "Cvičení individuál",
+          "summary": "Potvrzená událost v 09:00.",
+          "value": null,
+          "unit": null,
+          "timestamp": "2026-07-14T09:00:00+02:00",
+          "source_id": "calendar",
+          "source_url": "https://calendar.google.com/calendar/u/0/r/day/2026/7/14",
+          "media_ids": [],
+          "metadata": {"end": "2026-07-14T10:00:00+02:00"}
+        },
+        {
+          "id": "calendar-zero-duration",
+          "kind": "agenda",
+          "title": "Malformed zero-duration candidate",
+          "summary": "Collector returned equal start and end.",
+          "value": null,
+          "unit": null,
+          "timestamp": "2026-07-14T11:00:00+02:00",
+          "source_id": "calendar",
+          "source_url": "https://calendar.google.com/calendar/u/0/r/day/2026/7/14",
+          "media_ids": [],
+          "metadata": {"end": "2026-07-14T11:00:00+02:00"}
+        }
+      ],
+      "sources": [
+        {
+          "id": "calendar",
+          "title": "Google Calendar",
+          "url": "https://calendar.google.com/calendar/u/0/r/day/2026/7/14",
+          "publisher": "Google",
+          "observed_at": "2026-07-14T08:00:00+02:00"
+        }
+      ],
+      "media": [],
+      "errors": []
+    },
+    {
+      "collector": "todoist",
+      "status": "unavailable",
+      "observed_at": "2026-07-14T08:00:00+02:00",
+      "items": [],
+      "sources": [],
+      "media": [],
+      "errors": [
+        {
+          "kind": "infrastructure_error",
+          "message": "Assigned executor disconnected before Todoist collection.",
+          "retryable": true
+        }
+      ]
+    },
+    {
+      "collector": "gmail",
+      "status": "ok",
+      "observed_at": "2026-07-14T08:00:00+02:00",
+      "items": [
+        {"id": "mail-01", "kind": "inbox", "title": "Review unused OAuth clients", "summary": "Security action recommended for unused clients.", "value": null, "unit": null, "timestamp": "2026-07-14T06:30:00+02:00", "source_id": "gmail-oauth", "source_url": "https://mail.google.com/mail/u/0/#all/mail-01", "media_ids": [], "metadata": {"actionable": true, "category": "security"}},
+        {"id": "mail-02", "kind": "inbox", "title": "T-Mobile payment confirmed", "summary": "Payment confirmation; no action required.", "value": null, "unit": null, "timestamp": "2026-07-14T06:20:00+02:00", "source_id": "gmail-payment", "source_url": "https://mail.google.com/mail/u/0/#all/mail-02", "media_ids": [], "metadata": {"actionable": false, "category": "payment"}},
+        {"id": "mail-03", "kind": "inbox", "title": "Summer promotion", "summary": "Marketing offer.", "value": null, "unit": null, "timestamp": "2026-07-14T06:10:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-03", "media_ids": [], "metadata": {"actionable": false, "category": "promotion"}},
+        {"id": "mail-04", "kind": "inbox", "title": "Renovate dependency update", "summary": "Automated notification.", "value": null, "unit": null, "timestamp": "2026-07-14T06:00:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-04", "media_ids": [], "metadata": {"actionable": false, "category": "automation"}},
+        {"id": "mail-05", "kind": "inbox", "title": "Order receipt", "summary": "Automated receipt.", "value": null, "unit": null, "timestamp": "2026-07-14T05:50:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-05", "media_ids": [], "metadata": {"actionable": false, "category": "receipt"}},
+        {"id": "mail-06", "kind": "inbox", "title": "Newsletter six", "summary": "Newsletter.", "value": null, "unit": null, "timestamp": "2026-07-14T05:40:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-06", "media_ids": [], "metadata": {"actionable": false, "category": "newsletter"}},
+        {"id": "mail-07", "kind": "inbox", "title": "Newsletter seven", "summary": "Newsletter.", "value": null, "unit": null, "timestamp": "2026-07-14T05:30:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-07", "media_ids": [], "metadata": {"actionable": false, "category": "newsletter"}},
+        {"id": "mail-08", "kind": "inbox", "title": "Promotion eight", "summary": "Marketing offer.", "value": null, "unit": null, "timestamp": "2026-07-14T05:20:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-08", "media_ids": [], "metadata": {"actionable": false, "category": "promotion"}},
+        {"id": "mail-09", "kind": "inbox", "title": "Receipt nine", "summary": "Automated receipt.", "value": null, "unit": null, "timestamp": "2026-07-14T05:10:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-09", "media_ids": [], "metadata": {"actionable": false, "category": "receipt"}},
+        {"id": "mail-10", "kind": "inbox", "title": "Automation ten", "summary": "Automated notification.", "value": null, "unit": null, "timestamp": "2026-07-14T05:00:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-10", "media_ids": [], "metadata": {"actionable": false, "category": "automation"}},
+        {"id": "mail-11", "kind": "inbox", "title": "Promotion eleven", "summary": "Marketing offer.", "value": null, "unit": null, "timestamp": "2026-07-14T04:50:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-11", "media_ids": [], "metadata": {"actionable": false, "category": "promotion"}},
+        {"id": "mail-12", "kind": "inbox", "title": "Newsletter twelve", "summary": "Newsletter.", "value": null, "unit": null, "timestamp": "2026-07-14T04:40:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-12", "media_ids": [], "metadata": {"actionable": false, "category": "newsletter"}},
+        {"id": "mail-13", "kind": "inbox", "title": "Receipt thirteen", "summary": "Automated receipt.", "value": null, "unit": null, "timestamp": "2026-07-14T04:30:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-13", "media_ids": [], "metadata": {"actionable": false, "category": "receipt"}},
+        {"id": "mail-14", "kind": "inbox", "title": "Automation fourteen", "summary": "Automated notification.", "value": null, "unit": null, "timestamp": "2026-07-14T04:20:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-14", "media_ids": [], "metadata": {"actionable": false, "category": "automation"}},
+        {"id": "mail-15", "kind": "inbox", "title": "Promotion fifteen", "summary": "Marketing offer.", "value": null, "unit": null, "timestamp": "2026-07-14T04:10:00+02:00", "source_id": "gmail-sample", "source_url": "https://mail.google.com/mail/u/0/#all/mail-15", "media_ids": [], "metadata": {"actionable": false, "category": "promotion"}}
+      ],
+      "sources": [
+        {"id": "gmail-oauth", "title": "Google Developers security notice", "url": "https://mail.google.com/mail/u/0/#all/mail-01", "publisher": "Google", "observed_at": "2026-07-14T08:00:00+02:00"},
+        {"id": "gmail-payment", "title": "T-Mobile payment confirmation", "url": "https://mail.google.com/mail/u/0/#all/mail-02", "publisher": "T-Mobile", "observed_at": "2026-07-14T08:00:00+02:00"},
+        {"id": "gmail-sample", "title": "Gmail candidate window", "url": "https://mail.google.com/mail/u/0/#inbox", "publisher": "Gmail", "observed_at": "2026-07-14T08:00:00+02:00"}
+      ],
+      "media": [],
+      "errors": []
+    },
+    {
+      "collector": "news-ai",
+      "status": "ok",
+      "observed_at": "2026-07-14T08:00:00+02:00",
+      "items": [
+        {"id": "news-1", "kind": "news", "title": "Energy shipping risk rises", "summary": "Shipping disruption raises near-term energy volatility.", "value": null, "unit": null, "timestamp": "2026-07-14T07:20:00+02:00", "source_id": "news-energy", "source_url": "https://news.example.org/energy-risk", "media_ids": [], "metadata": {}},
+        {"id": "news-2", "kind": "news", "title": "Road vignette price freeze debated", "summary": "The proposal would pause automatic annual price increases.", "value": null, "unit": null, "timestamp": "2026-07-14T07:10:00+02:00", "source_id": "news-road", "source_url": "https://news.example.org/road-vignette", "media_ids": [], "metadata": {}},
+        {"id": "ai-1", "kind": "ai", "title": "Code quality pricing preview", "summary": "Developers can estimate monthly cost before paid activation.", "value": null, "unit": null, "timestamp": "2026-07-13T18:00:00+02:00", "source_id": "ai-code-quality", "source_url": "https://ai.example.org/code-quality", "media_ids": [], "metadata": {}},
+        {"id": "ai-2", "kind": "ai", "title": "Agent guardrails gain focus", "summary": "Operational controls are becoming a primary deployment concern.", "value": null, "unit": null, "timestamp": "2026-07-13T16:00:00+02:00", "source_id": "ai-guardrails", "source_url": "https://ai.example.org/agent-guardrails", "media_ids": [], "metadata": {}}
+      ],
+      "sources": [
+        {"id": "news-energy", "title": "Energy risk report", "url": "https://news.example.org/energy-risk", "publisher": "Example News", "observed_at": "2026-07-14T07:20:00+02:00"},
+        {"id": "news-road", "title": "Road vignette report", "url": "https://news.example.org/road-vignette", "publisher": "Example News", "observed_at": "2026-07-14T07:10:00+02:00"},
+        {"id": "ai-code-quality", "title": "Code quality pricing preview", "url": "https://ai.example.org/code-quality", "publisher": "Example AI", "observed_at": "2026-07-13T18:00:00+02:00"},
+        {"id": "ai-guardrails", "title": "Agent guardrails report", "url": "https://ai.example.org/agent-guardrails", "publisher": "Example AI", "observed_at": "2026-07-13T16:00:00+02:00"}
+      ],
+      "media": [],
+      "errors": []
+    },
+    {
+      "collector": "weather",
+      "status": "ok",
+      "observed_at": "2026-07-14T08:00:00+02:00",
+      "items": [
+        {"id": "weather-08", "kind": "weather", "title": "08:00", "summary": "Hourly temperature.", "value": 18, "unit": "°C", "timestamp": "2026-07-14T08:00:00+02:00", "source_id": "weather-hourly", "source_url": "https://weather.example.org/lovosice", "media_ids": [], "metadata": {}},
+        {"id": "weather-11", "kind": "weather", "title": "11:00", "summary": "Hourly temperature.", "value": 22, "unit": "°C", "timestamp": "2026-07-14T11:00:00+02:00", "source_id": "weather-hourly", "source_url": "https://weather.example.org/lovosice", "media_ids": [], "metadata": {}},
+        {"id": "weather-14", "kind": "weather", "title": "14:00", "summary": "Hourly temperature.", "value": 25, "unit": "°C", "timestamp": "2026-07-14T14:00:00+02:00", "source_id": "weather-hourly", "source_url": "https://weather.example.org/lovosice", "media_ids": [], "metadata": {}}
+      ],
+      "sources": [
+        {"id": "weather-hourly", "title": "Lovosice hourly forecast", "url": "https://weather.example.org/lovosice", "publisher": "Example Weather", "observed_at": "2026-07-14T08:00:00+02:00"}
+      ],
+      "media": [],
+      "errors": []
+    }
+  ]
+}

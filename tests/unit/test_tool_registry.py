@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 

@@ -16,6 +16,7 @@ opt-in on ``BrowserManager.open_session``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from contextlib import suppress
@@ -30,6 +31,7 @@ from cognis.tools.executor.web.headers import (
     sanitise_url,
     truncate_content,
 )
+from cognis.tools.executor.web.quality import classify_provider_error_page
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,14 @@ class BrowserFetchBackend:
                 navigation_timeout_seconds=self._navigation_timeout_seconds,
                 wait_until=self._wait_until,
                 network_idle_after_dom_seconds=self._network_idle_after_dom_seconds,
+                browser_settings=(
+                    {
+                        "stealth_enabled": False,
+                        "fingerprint_hardening": False,
+                    }
+                    if self._headed
+                    else None
+                ),
             )
         except TimeoutError:
             return ToolResult(
@@ -131,6 +141,9 @@ class BrowserFetchBackend:
 
         try:
             try:
+                navigation_error = self._navigation_http_error(session, requested_url=url)
+                if navigation_error is not None:
+                    return navigation_error
                 await self._wait_for_rendered_body(session.page)
                 recovered_consent_redirect = await self._recover_consent_redirect(
                     session,
@@ -138,6 +151,9 @@ class BrowserFetchBackend:
                 )
                 if recovered_consent_redirect:
                     await self._wait_for_rendered_body(session.page)
+                    navigation_error = self._navigation_http_error(session, requested_url=url)
+                    if navigation_error is not None:
+                        return navigation_error
                 final_url = str(getattr(session.page, "url", "") or url)
                 content, metadata = await self._extract(
                     session,
@@ -151,6 +167,24 @@ class BrowserFetchBackend:
                     if isinstance(extracted, dict):
                         extracted["browser_consent_redirect_recovered"] = True
                         extracted["requested_url"] = url
+                extracted = metadata.get("extracted_document")
+                block_signal = (
+                    extracted.get("browser_block_signal") if isinstance(extracted, dict) else None
+                )
+                if isinstance(block_signal, str) and block_signal:
+                    return ToolResult(
+                        output=(
+                            "Browser fetch loaded a blocked or provider-generated error page "
+                            f"({block_signal}, {self.mode})."
+                        ),
+                        is_error=True,
+                        metadata={
+                            "browser_fetch": True,
+                            "browser_fetch_mode": self.mode,
+                            "browser_block_signal": block_signal,
+                            **metadata,
+                        },
+                    )
             except Exception as exc:
                 logger.warning(
                     "web: browser fetch extraction failed (%s, mode=%s)",
@@ -173,6 +207,30 @@ class BrowserFetchBackend:
             metadata={"browser_fetch": True, "browser_fetch_mode": self.mode, **metadata},
         )
 
+    def _navigation_http_error(
+        self,
+        session: Any,
+        *,
+        requested_url: str,
+    ) -> ToolResult | None:
+        navigation_status = getattr(session, "navigation_status", None)
+        if not isinstance(navigation_status, int) or navigation_status < 400:
+            return None
+        return ToolResult(
+            output=(
+                f"Browser fetch received HTTP {navigation_status} "
+                f"for {getattr(session, 'navigation_url', None) or requested_url} "
+                f"({self.mode})."
+            ),
+            is_error=True,
+            metadata={
+                "browser_fetch": True,
+                "browser_fetch_mode": self.mode,
+                "browser_block_signal": f"http_status_{navigation_status}",
+                "browser_navigation_status": navigation_status,
+            },
+        )
+
     async def _extract(
         self,
         session: Any,
@@ -191,13 +249,15 @@ class BrowserFetchBackend:
         html = truncate_content(html)
         from cognis.tools.executor.web.extraction import extract_document
 
-        document = extract_document(
+        document = await asyncio.to_thread(
+            extract_document,
             html,
             url=url,
             output_format=output_format,
             options=options,
         )
         document_data = document.as_dict()
+        document_data["browser_fetch_mode"] = self.mode
         block_signal = _classify_browser_extract_quality(
             document_data,
             document.content,
@@ -244,10 +304,15 @@ class BrowserFetchBackend:
             with suppress(Exception):
                 await page.wait_for_load_state("networkidle", timeout=3000)
         try:
-            await page.goto(
+            response = await page.goto(
                 requested_url,
                 timeout=int(self._navigation_timeout_seconds * 1000),
                 wait_until=self._wait_until,
+            )
+            self._manager.record_navigation_response(
+                session,
+                response,
+                requested_url=requested_url,
             )
             if self._network_idle_after_dom_seconds > 0 and self._wait_until != "networkidle":
                 with suppress(Exception):
@@ -276,6 +341,10 @@ def _classify_browser_extract_quality(
     )
     if signals.consent_redirect_score >= 2:
         return "consent_redirect"
+
+    provider_error = classify_provider_error_page(document, content)
+    if provider_error:
+        return provider_error
 
     # Real page evidence wins over provider asset noise. Modern commerce pages
     # commonly include Turnstile/CMP scripts even when they are not blocking us.

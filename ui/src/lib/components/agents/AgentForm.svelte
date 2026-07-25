@@ -21,7 +21,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     type AgentRuntimeProfileFormState,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, MemoryModeDescriptor, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
   type McpServerToolGroup = {
@@ -37,6 +37,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     tools,
     workflows,
     providers,
+    memoryBackends = [],
     executors = [],
     secrets = [],
     credentials = [],
@@ -58,6 +59,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     tools: AgentToolOption[];
     workflows: Workflow[];
     providers: LLMProvider[];
+    memoryBackends?: MemoryBackendDescriptor[];
     executors?: ExecutorConfig[];
     secrets?: SecretMetadata[];
     credentials?: CredentialMetadata[];
@@ -83,6 +85,17 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   let fileInput: HTMLInputElement | undefined = $state();
   const editableFieldSet = $derived(new Set(editableFields));
   const selectedSkillDetail = $derived(skills.find((skill: Skill) => skill.skill_id === skillDetailId) ?? null);
+  const selectedMemoryBackend = $derived(
+    memoryBackends.find((backend: MemoryBackendDescriptor) => backend.id === form.memoryBackend) ?? null
+  );
+  const selectedMemoryMode = $derived(
+    selectedMemoryBackend?.modes.find((item: MemoryModeDescriptor) => item.id === form.memoryMode)
+      ?? (!form.memoryMode ? selectedMemoryBackend?.modes[0] : null)
+      ?? null
+  );
+  const memoryToolsAvailable = $derived(
+    tools.some((tool: AgentToolOption) => tool.category === 'memory' && (!('enabled' in tool) || tool.enabled))
+  );
 
   $effect(() => {
     localBindings = [...secondaryBindings];
@@ -99,6 +112,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   function canEditPermissions(): boolean {
     return canEditField('permissions');
+  }
+
+  function canEditProfiles(): boolean {
+    return canEditField('agent_profiles');
   }
 
   function handleAvatarAccept(imageId: string, avatarUrl: string) {
@@ -293,6 +310,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         errors.agentProfiles = `Runtime profile ID "${profileId}" is duplicated.`;
         break;
       }
+      if (profile.agentSwitchable && !profile.description.trim()) {
+        errors.agentProfiles =
+          `Runtime profile "${profileId}" needs description routing guidance before agents can switch to it.`;
+        break;
+      }
       seenProfileIds.add(profileId);
     }
     const stepJsonError = validateJson(form.stepAgentOverridesJson, 'Step agent overrides');
@@ -480,12 +502,33 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       model: '',
       reasoningEffort: '',
       systemPromptExtra: '',
-      enabled: true
+      memoryAvailability: 'inherit',
+      memoryMode: '',
+      memoryBackendOptions: {},
+      enabled: true,
+      agentSwitchable: false
     };
     form.agentProfiles = [...form.agentProfiles, nextProfile];
     if (!form.defaultAgentProfileId) {
       form.defaultAgentProfileId = profileId;
     }
+  }
+
+  function selectMemoryBackend(event: Event): void {
+    const backendId = (event.currentTarget as HTMLSelectElement).value;
+    form.memoryBackend = backendId;
+    const descriptor = memoryBackends.find(
+      (backend: MemoryBackendDescriptor) => backend.id === backendId
+    );
+    const defaultMode = descriptor?.defaults.mode;
+    form.memoryMode =
+      typeof defaultMode === 'string' ? defaultMode : (descriptor?.modes[0]?.id ?? '');
+    form.memoryBackendOptions = {};
+    form.agentProfiles = form.agentProfiles.map((profile: AgentRuntimeProfileFormState) => ({
+      ...profile,
+      memoryMode: '',
+      memoryBackendOptions: {}
+    }));
   }
 
   function removeRuntimeProfile(profileId: string): void {
@@ -703,19 +746,42 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               Select the per-agent memory and guardrails providers. Defaults keep the standard Mnemory + Intaris runtime.
             </p>
           </div>
-          <div class="grid gap-4 md:grid-cols-2">
+          <div class="grid gap-4 md:grid-cols-3">
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Memory backend</span>
               <select
                 bind:value={form.memoryBackend}
+                onchange={selectMemoryBackend}
                 class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
                 disabled={readonly || isSystemAsset}
               >
-                <option value="mnemory">Mnemory</option>
-                <option value="none">None</option>
+                {#if !selectedMemoryBackend}
+                  <option value={form.memoryBackend}>{form.memoryBackend}</option>
+                {/if}
+                {#each memoryBackends as backend}
+                  <option value={backend.id}>{backend.display_name}</option>
+                {/each}
               </select>
               <span class="block text-xs text-slate-400">
-                None disables memory recall and remember calls for this agent.
+                {selectedMemoryBackend?.description ?? 'Provider-owned memory backend.'}
+              </span>
+            </label>
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span title="Mode behavior and copy come from the selected backend.">Memory mode</span>
+              <select
+                bind:value={form.memoryMode}
+                class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                disabled={readonly || isSystemAsset || form.memoryBackend === 'none' || !selectedMemoryBackend?.modes.length}
+              >
+                {#if form.memoryMode && !selectedMemoryMode}
+                  <option value={form.memoryMode}>{form.memoryMode}</option>
+                {/if}
+                {#each selectedMemoryBackend?.modes ?? [] as memoryMode}
+                  <option value={memoryMode.id}>{memoryMode.label}</option>
+                {/each}
+              </select>
+              <span class="block text-xs text-slate-400" title={selectedMemoryMode?.tooltip}>
+                {selectedMemoryMode?.description ?? 'No memory mode applies.'}
               </span>
             </label>
             <label class="space-y-2 text-sm font-medium text-slate-200">
@@ -733,6 +799,22 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               </span>
             </label>
           </div>
+          {#if selectedMemoryMode}
+            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/60 px-4 py-3">
+              <p class="text-xs text-slate-300"><strong>Recommended for:</strong> {selectedMemoryMode.recommended_for}</p>
+              <div class="mt-2 grid gap-2 text-xs text-slate-400 sm:grid-cols-4">
+                <span>Core bootstrap: {selectedMemoryMode.behavior.core_bootstrap ? 'On' : 'Off'}</span>
+                <span>Auto recall: {selectedMemoryMode.behavior.auto_recall ? 'On' : 'Off'}</span>
+                <span>Auto remember: {selectedMemoryMode.behavior.auto_remember ? 'On' : 'Off'}</span>
+                <span>Tools: {selectedMemoryMode.behavior.tools ? 'On' : 'Off'}</span>
+              </div>
+            </div>
+          {/if}
+          {#if form.memoryBackend !== 'none' && selectedMemoryMode?.behavior.tools && !memoryToolsAvailable}
+            <div class="mt-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-xs text-amber-100">
+              This mode expects memory tools, but the current tool allowlist excludes them.
+            </div>
+          {/if}
           {#if mode === 'edit' && form.guardrailsBackend === 'none'}
             <div class="mt-4 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
               <p class="font-medium">Guardrails are disabled for this agent.</p>
@@ -1210,18 +1292,18 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         </div>
       </Card>
 
-      {#if !isSystemAsset}
+      {#if !isSystemAsset || editableFieldSet.has('agent_profiles')}
       <Card class="p-5">
         <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Runtime profiles</p>
             <h2 class="mt-1 text-lg font-semibold text-white">Per-agent execution profiles</h2>
             <p class="mt-1 text-sm text-slate-400">
-              Profiles tune provider, model, thinking effort, and an extra prompt snippet for this agent only.
-              They do not change identity, memory scope, ownership, permissions, tools, or workflow step profiles.
+               Profiles tune provider, model, thinking effort, memory availability/mode, and an extra prompt snippet.
+               The memory backend remains agent-wide. Profile memory changes apply on the next logical turn and cannot loosen the frozen policy mid-turn.
             </p>
           </div>
-          <Button type="button" variant="secondary" disabled={readonly} onclick={addRuntimeProfile}>Add profile</Button>
+          <Button type="button" variant="secondary" disabled={!canEditProfiles()} onclick={addRuntimeProfile}>Add profile</Button>
         </div>
 
         {#if form.agentProfiles.length > 0}
@@ -1230,7 +1312,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <select
               bind:value={form.defaultAgentProfileId}
               class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-              disabled={readonly}
+              disabled={!canEditField('default_agent_profile_id')}
             >
               {#each form.agentProfiles as profile}
                 {#if profile.profileId.trim()}
@@ -1255,24 +1337,65 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                         type="checkbox"
                         bind:checked={profile.enabled}
                         class="h-4 w-4 rounded border-slate-600 bg-slate-950"
-                        disabled={readonly}
+                        disabled={!canEditProfiles()}
                       />
                       Enabled
                     </label>
-                    <Button type="button" variant="ghost" disabled={readonly} onclick={() => removeRuntimeProfile(profile.profileId)}>Remove</Button>
+                    <label class="flex items-center gap-2 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        bind:checked={profile.agentSwitchable}
+                        class="h-4 w-4 rounded border-slate-600 bg-slate-950"
+                        disabled={!canEditProfiles()}
+                      />
+                      Agent can switch to this profile
+                    </label>
+                    <Button type="button" variant="ghost" disabled={!canEditProfiles()} onclick={() => removeRuntimeProfile(profile.profileId)}>Remove</Button>
                   </div>
                 </div>
 
                 <div class="mt-4 grid gap-4 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Profile ID</span>
-                    <Input bind:value={profile.profileId} placeholder="fast" disabled={readonly} />
+                    <Input bind:value={profile.profileId} placeholder="fast" disabled={!canEditProfiles()} />
                     <span class="block text-xs text-slate-400">Agent-local ID used as <code>agent_profile_id</code>; do not include <code>/</code>.</span>
                   </label>
 
                   <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Memory availability</span>
+                    <select
+                      bind:value={profile.memoryAvailability}
+                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      disabled={!canEditProfiles() || form.memoryBackend === 'none'}
+                    >
+                      <option value="inherit">Inherit</option>
+                      <option value="enabled">Enabled</option>
+                      <option value="disabled">Disabled</option>
+                    </select>
+                    <span class="block text-xs text-slate-400">Effective: {form.memoryBackend === 'none' || profile.memoryAvailability === 'disabled' ? 'Disabled' : 'Enabled'}</span>
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Memory mode</span>
+                    <select
+                      bind:value={profile.memoryMode}
+                      class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                      disabled={!canEditProfiles() || form.memoryBackend === 'none' || profile.memoryAvailability === 'disabled'}
+                    >
+                      <option value="">Inherit agent setting ({selectedMemoryMode?.label ?? form.memoryMode})</option>
+                      {#if profile.memoryMode && !selectedMemoryBackend?.modes.some((mode: MemoryModeDescriptor) => mode.id === profile.memoryMode)}
+                        <option value={profile.memoryMode}>{profile.memoryMode}</option>
+                      {/if}
+                      {#each selectedMemoryBackend?.modes ?? [] as memoryMode}
+                        <option value={memoryMode.id}>{memoryMode.label}</option>
+                      {/each}
+                    </select>
+                    <span class="block text-xs text-slate-400">Backend is agent-wide; this override takes effect next logical turn.</span>
+                  </label>
+
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Description / routing guidance</span>
-                    <Input bind:value={profile.description} placeholder="Low-latency responses for simple tasks" disabled={readonly} />
+                    <Input bind:value={profile.description} placeholder="Low-latency responses for simple tasks" disabled={!canEditProfiles()} />
                     <span class="block text-xs text-slate-400">Used later by automatic routing to choose this profile.</span>
                   </label>
 
@@ -1281,7 +1404,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     <select
                       bind:value={profile.providerId}
                       class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-                      disabled={readonly}
+                      disabled={!canEditProfiles()}
                     >
                       <option value="">Use agent/default provider</option>
                       {#each providers as provider}
@@ -1296,7 +1419,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                       <select
                         bind:value={profile.model}
                         class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-                        disabled={readonly}
+                        disabled={!canEditProfiles()}
                       >
                         <option value="">Use provider/agent default</option>
                         {#each modelsForProvider(profile.providerId) as modelId}
@@ -1304,7 +1427,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                         {/each}
                       </select>
                     {:else}
-                      <Input bind:value={profile.model} placeholder="Use provider/agent default" disabled={readonly} />
+                      <Input bind:value={profile.model} placeholder="Use provider/agent default" disabled={!canEditProfiles()} />
                     {/if}
                   </label>
 
@@ -1313,7 +1436,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                     <select
                       bind:value={profile.reasoningEffort}
                       class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
-                      disabled={readonly}
+                      disabled={!canEditProfiles()}
                     >
                       <option value="">Default</option>
                       {#each availableThinkingEffortsForProfile(profile).filter((value: string) => value !== 'default') as value}
@@ -1328,7 +1451,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                       bind:value={profile.systemPromptExtra}
                       class="min-h-28 w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
                       placeholder="Extra behavior tuning injected only when this profile is active."
-                      disabled={readonly}
+                      disabled={!canEditProfiles()}
                     ></textarea>
                     <span class="block text-xs text-slate-400">This snippet tunes runtime behavior only; it must not redefine identity, memory scope, ownership, permissions, or tool rights.</span>
                   </label>

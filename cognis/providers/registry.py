@@ -64,7 +64,9 @@ def build_provider_registry(
         session_factory=session_factory,
         guardrails_provider=guardrails_provider,
     )
-    ws_provider = WebSocketExecutorProvider()
+    ws_provider = WebSocketExecutorProvider(
+        browser_terminal_state_path=config.data_dir / "browser_terminal_pending.json"
+    )
     subprocess_provider = SubprocessExecutorProvider(
         ws_provider=ws_provider,
         auth_provider=auth_provider,
@@ -78,7 +80,7 @@ def build_provider_registry(
     )
 
     # Build inference router (decouples LLM from executor)
-    inference_router = InferenceRouter(ws_provider)
+    inference_router = InferenceRouter(ws_provider, session_factory)
 
     llm_provider = LLMService(
         session_factory,

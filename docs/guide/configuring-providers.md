@@ -35,13 +35,25 @@ Use this for vLLM, TGI, local gateways, or other services that expose an OpenAI-
 
 Use this when Cognis should call Anthropic directly for chat or routing tasks.
 
-Anthropic-compatible endpoints can also use this preset with a custom base URL.
-This keeps LiteLLM on its Anthropic transport, so Claude-specific options such
-as extended thinking are sent using the Anthropic wire format instead of being
-filtered as unsupported OpenAI-compatible parameters. For example, a Meridian
-endpoint that exposes the Anthropic Messages API should be configured as an
-Anthropic provider with its Meridian base URL, not as an OpenAI Compatible
-provider.
+The `protocol` setting controls transport selection:
+
+- `auto` uses Cognis' native Anthropic Messages transport for the official
+  `api.anthropic.com` endpoint and LiteLLM for custom endpoints.
+- `anthropic_messages` explicitly selects the native Messages transport,
+  including for a compatible custom endpoint.
+- `litellm` explicitly retains the LiteLLM transport.
+
+Claude subscription OAuth always uses the native Messages transport on the
+controller; OAuth credentials are never sent to executors. API-key providers
+can use the native transport on either the controller or an executor. Custom
+endpoints default to LiteLLM unless native Messages compatibility is explicitly
+selected.
+
+Native strict tool schemas are emitted only for models with the
+`supports_strict_tools` capability. Native tool search and `defer_loading` are
+enabled only when the model advertises tool search, native search,
+`defer_loading`, and `pause_turn`; otherwise Cognis falls back to controller
+tool discovery. Prompt-cache controls remain capability-gated.
 
 For a local Meridian endpoint, run Meridian on or near the executor, then create
 an **Anthropic** provider with:
@@ -58,6 +70,31 @@ network-local LiteLLM inference call and tool execution boundary.
 ### Ollama
 
 Use this for local models exposed through Ollama. Make sure the selected model is already installed and reachable from the Cognis host or executor.
+
+For a WebSocket executor, configure Ollama in **Settings → Executors → Local
+inference**. Cognis accepts only an integer port from 1 through 65535 and
+derives `http://127.0.0.1:<port>` internally. Hostnames, arbitrary URLs,
+credentials, paths, queries, and redirects are not supported. Start Ollama on
+the executor with the matching loopback listener, for example:
+
+```bash
+OLLAMA_HOST=127.0.0.1:22434 ollama serve
+```
+
+After saving, the executor is unavailable for local routing and model
+management until the requested generation is applied and the executor
+advertises the same flags and effective endpoint. The executor card reports
+**Applying**, **Executor confirmed**, detected reachability, and the Ollama
+version.
+
+After an Ollama generation, Conversation Info and `/info` show the latest
+provider-reported prompt/generation rates and durations plus client-measured
+streaming time to first token. Cognis keeps only the latest observation for the
+active session. `/benchmark quick` and `/benchmark full` are reserved explicit
+commands; they currently return a clear unavailable result rather than calling
+the provider outside normal accounting. Enabling them requires a bounded local
+runtime benchmark operation that reports usage through the standard generation
+path.
 
 ### LiteLLM Proxy
 
@@ -189,13 +226,16 @@ use through the `web_search`, `web_fetch`, `web_crawl`, `web_map`, and
 When the direct fetch backend hits a Cloudflare/5xx/connection error and
 `web.fetch_fallback_browser` is enabled (default `true`), the request is
 automatically retried through the executor's browser. If
-`web.browser_fetch.headed_fallback_enabled` is enabled and the executor also sets
-`browser.headed_allowed=true`, Cognis uses headed browser fetch first. Otherwise
-it uses headless browser fetch. Browser fetch navigation defaults to
+`web.browser_fetch.headed_fallback_enabled` is enabled (default `true`) and the
+executor also sets `browser.headed_allowed=true`, Cognis uses headed browser fetch.
+Executors without headed-session support use headless browser fetch instead. Browser
+fetch navigation defaults to
 `wait_until=domcontentloaded`, a 60 second navigation timeout, and a short
 best-effort `networkidle` soft wait. Hard cases (Cloudflare managed challenge,
-Turnstile) can still fail; the agent should treat that as a real signal rather
-than retrying mechanically.
+Turnstile) can still fail; HTTP error documents and short provider-generated
+error pages are reported as failures rather than successful extractions.
+Upgraded installations retain an explicitly stored headed-fallback choice;
+new installations default it to enabled.
 
 ### `web_crawl` / `web_map` / `web_research` availability
 

@@ -14,7 +14,9 @@ import json
 from typing import Any
 
 from cognis.logging import get_logger
-from cognis.models.tool import ToolCapability, ToolDefinition, ToolResult, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolCapability, ToolResult, ToolSource
+from cognis.providers.memory.mnemory import MnemoryHTTPStatusError
 
 logger = get_logger(__name__)
 
@@ -497,12 +499,45 @@ async def handle_memory_tool(
     """
     try:
         return await _dispatch(tool_name, arguments, memory_provider, agent_id, user_email)
+    except MnemoryHTTPStatusError as exc:
+        return _mnemory_http_error_result(exc)
     except Exception as exc:
         logger.warning(
             "memory tool failed",
             extra={"extra_data": {"tool": tool_name, "error": str(exc)[:200]}},
         )
         return ToolResult(output=f"Memory operation failed: {exc}", is_error=True)
+
+
+def _mnemory_http_error_result(error: MnemoryHTTPStatusError) -> ToolResult:
+    """Return Mnemory client errors in a form an agent can correct and retry."""
+
+    is_validation_error = error.status_code == 422
+    payload: dict[str, Any] = {
+        "error": {
+            "code": "memory_validation_error" if is_validation_error else "memory_api_error",
+            "status_code": error.status_code,
+            "detail": error.detail,
+            "retry": {
+                "automatic": False,
+                "action": (
+                    "correct_arguments_then_retry"
+                    if is_validation_error
+                    else "retry_after_resolving_error"
+                ),
+                "guidance": (
+                    "Correct the invalid argument values described in detail, then retry the "
+                    "same memory tool call."
+                    if is_validation_error
+                    else "Resolve the reported Mnemory API error before retrying."
+                ),
+            },
+        }
+    }
+    return ToolResult(
+        output=json.dumps(payload, ensure_ascii=False, default=str),
+        is_error=True,
+    )
 
 
 async def _dispatch(

@@ -1,0 +1,229 @@
+{
+  "spec_version": "cognis.chart.v1",
+  "cases": [
+    {
+      "name": "temporal_multi_series",
+      "spec": {
+        "type": "chart",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "description": "Request and error rate over time.",
+        "series": [
+          {
+            "id": "requests",
+            "label": "Requests",
+            "stack": "traffic",
+            "points": [
+              { "x": "2026-07-10T09:00:00Z", "y": 120 },
+              { "x": "2026-07-08T09:00:00Z", "y": 80 },
+              { "x": "2026-07-09T09:00:00Z", "y": 100 }
+            ]
+          },
+          {
+            "id": "errors",
+            "label": "Errors",
+            "stack": "traffic",
+            "points": [
+              { "x": "2026-07-09T09:00:00Z", "y": 5 },
+              { "x": "2026-07-08T09:00:00Z", "y": 2 },
+              { "x": "2026-07-10T09:00:00Z", "y": 3 }
+            ]
+          }
+        ],
+        "x_axis": { "type": "time", "label": "Time", "unit": "UTC" },
+        "y_axis": { "type": "linear", "label": "Rate", "unit": "req/s", "min": 0, "max": 150 },
+        "stack": false,
+        "legend_position": "right",
+        "palette_token": "warm"
+      },
+      "expected": {
+        "chart_type": "line",
+        "chartjs_type": "line",
+        "ordered_x": [
+          "2026-07-08T09:00:00Z",
+          "2026-07-09T09:00:00Z",
+          "2026-07-10T09:00:00Z"
+        ],
+        "series": [
+          { "id": "requests", "label": "Requests", "stack": "traffic", "values": [80, 100, 120] },
+          { "id": "errors", "label": "Errors", "stack": "traffic", "values": [2, 5, 3] }
+        ],
+        "x_axis": { "type": "time", "label": "Time", "unit": "UTC", "min": null, "max": null },
+        "y_axis": { "type": "linear", "label": "Rate", "unit": "req/s", "min": 0, "max": 150 },
+        "chartjs_x_type": "category",
+        "chartjs_y_type": "linear",
+        "stack": false,
+        "legend_position": "right",
+        "palette_token": "warm",
+        "python_palette": ["#c2410c", "#dc2626"],
+        "typescript_palette": ["#fb7185", "#fb923c"],
+        "svg_selector": "polyline.chart-line",
+        "svg_element_count": 2,
+        "trend_text": "Requests: 80 → 120 (up 40); Errors: 2 → 3 (up 1)"
+      }
+    },
+    {
+      "name": "range_bounds",
+      "spec": {
+        "type": "chart",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "range",
+        "description": "Latency confidence ranges.",
+        "series": [
+          {
+            "id": "latency",
+            "label": "Latency",
+            "points": [
+              { "x": "p95", "y": [30, 10] },
+              { "x": "p99", "y": [60, 90] }
+            ]
+          }
+        ],
+        "x_axis": { "type": "category", "label": "Percentile" },
+        "y_axis": { "type": "linear", "label": "Latency", "unit": "ms", "min": 0, "max": 100 },
+        "stack": false,
+        "legend_position": "bottom",
+        "palette_token": "cool"
+      },
+      "expected": {
+        "chart_type": "range",
+        "chartjs_type": "bar",
+        "ordered_x": ["p95", "p99"],
+        "series": [
+          { "id": "latency", "label": "Latency", "stack": null, "values": [[10, 30], [60, 90]] }
+        ],
+        "x_axis": { "type": "category", "label": "Percentile", "unit": null, "min": null, "max": null },
+        "y_axis": { "type": "linear", "label": "Latency", "unit": "ms", "min": 0, "max": 100 },
+        "chartjs_x_type": "category",
+        "chartjs_y_type": "linear",
+        "stack": false,
+        "legend_position": "bottom",
+        "palette_token": "cool",
+        "python_palette": ["#0369a1"],
+        "typescript_palette": ["#38bdf8"],
+        "svg_selector": "g.chart-range-mark",
+        "svg_element_count": 2,
+        "trend_text": "Latency: 10–30 → 60–90 (up 50–60)"
+      }
+    },
+    {
+      "name": "donut_categories",
+      "spec": {
+        "type": "chart",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "donut",
+        "description": "Browser share.",
+        "series": [
+          {
+            "id": "share",
+            "label": "Share",
+            "points": [
+              { "x": "Chrome", "y": 55 },
+              { "x": "Safari", "y": 30 },
+              { "x": "Firefox", "y": 15 }
+            ]
+          },
+          {
+            "id": "forecast",
+            "label": "Forecast",
+            "points": [
+              { "x": "Firefox", "y": 20 },
+              { "x": "Chrome", "y": 60 }
+            ]
+          }
+        ],
+        "x_axis": { "type": "category", "label": "Browser" },
+        "y_axis": { "type": "linear", "label": "Share", "unit": "%", "min": 0, "max": 100 },
+        "stack": false,
+        "legend_position": "bottom",
+        "palette_token": "categorical"
+      },
+      "expected": {
+        "chart_type": "donut",
+        "chartjs_type": "doughnut",
+        "ordered_x": ["Chrome", "Safari", "Firefox"],
+        "series": [
+          { "id": "share", "label": "Share", "stack": null, "values": [55, 30, 15] },
+          { "id": "forecast", "label": "Forecast", "stack": null, "values": [60, null, 20] }
+        ],
+        "x_axis": { "type": "category", "label": "Browser", "unit": null, "min": null, "max": null },
+        "y_axis": { "type": "linear", "label": "Share", "unit": "%", "min": 0, "max": 100 },
+        "chartjs_x_type": null,
+        "chartjs_y_type": null,
+        "stack": false,
+        "legend_position": "bottom",
+        "palette_token": "categorical",
+        "python_palette": ["#2563eb", "#dc2626"],
+        "typescript_palette": ["#38bdf8", "#34d399"],
+        "python_point_palette": ["#2563eb", "#dc2626", "#16a34a", "#2563eb", "#16a34a"],
+        "typescript_point_palette": ["#38bdf8", "#34d399", "#fbbf24"],
+        "svg_selector": "path.chart-donut-segment",
+        "svg_element_count": 5,
+        "trend_text": "Share: 55 → 15 (down 40); Forecast: 20 → 60 (up 40)"
+      }
+    },
+    {
+      "name": "stacked_groups",
+      "spec": {
+        "type": "chart",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "stacked_bar",
+        "description": "Planned and actual revenue.",
+        "series": [
+          {
+            "id": "planned-core",
+            "label": "Planned core",
+            "stack": "planned",
+            "points": [{ "x": "Q1", "y": 80 }, { "x": "Q2", "y": 90 }]
+          },
+          {
+            "id": "planned-addon",
+            "label": "Planned add-on",
+            "stack": "planned",
+            "points": [{ "x": "Q1", "y": 20 }, { "x": "Q2", "y": 30 }]
+          },
+          {
+            "id": "actual-core",
+            "label": "Actual core",
+            "stack": "actual",
+            "points": [{ "x": "Q1", "y": 75 }, { "x": "Q2", "y": 95 }]
+          },
+          {
+            "id": "actual-addon",
+            "label": "Actual add-on",
+            "stack": "actual",
+            "points": [{ "x": "Q1", "y": 15 }, { "x": "Q2", "y": 25 }]
+          }
+        ],
+        "x_axis": { "type": "category", "label": "Quarter" },
+        "y_axis": { "type": "linear", "label": "Revenue", "unit": "USD", "min": -20, "max": 200 },
+        "stack": true,
+        "legend_position": "top",
+        "palette_token": "default"
+      },
+      "expected": {
+        "chart_type": "stacked_bar",
+        "chartjs_type": "bar",
+        "ordered_x": ["Q1", "Q2"],
+        "series": [
+          { "id": "planned-core", "label": "Planned core", "stack": "planned", "values": [80, 90] },
+          { "id": "planned-addon", "label": "Planned add-on", "stack": "planned", "values": [20, 30] },
+          { "id": "actual-core", "label": "Actual core", "stack": "actual", "values": [75, 95] },
+          { "id": "actual-addon", "label": "Actual add-on", "stack": "actual", "values": [15, 25] }
+        ],
+        "x_axis": { "type": "category", "label": "Quarter", "unit": null, "min": null, "max": null },
+        "y_axis": { "type": "linear", "label": "Revenue", "unit": "USD", "min": -20, "max": 200 },
+        "chartjs_x_type": "category",
+        "chartjs_y_type": "linear",
+        "stack": true,
+        "legend_position": "top",
+        "palette_token": "default",
+        "python_palette": ["#0e7490", "#7c3aed", "#db2777", "#15803d"],
+        "typescript_palette": ["#38bdf8", "#34d399", "#fbbf24", "#f472b6"],
+        "svg_selector": "rect.chart-stack-segment",
+        "svg_element_count": 8,
+        "trend_text": "Planned core: 80 → 90 (up 10); Planned add-on: 20 → 30 (up 10); Actual core: 75 → 95 (up 20)"
+      }
+    }
+  ]
+}

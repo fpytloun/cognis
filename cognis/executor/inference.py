@@ -13,6 +13,7 @@ from cognis.executor.backends.registry import ExecutorBackendRegistry, resolve_b
 from cognis.executor.inference_types import CognisInferenceRequest
 from cognis.logging import get_logger
 from cognis.providers.llm.errors import build_mid_stream_error_chunk
+from cognis.providers.llm.ollama import discover_ollama_models
 
 logger = get_logger(__name__)
 
@@ -99,6 +100,24 @@ class InferenceHandler:
             backend_metadata=backend_metadata or {},
         )
         return await self._registry.select(request).generate(request)
+
+    async def discover_models(
+        self,
+        *,
+        preset: str,
+        base_url: str,
+        api_key: str = "",
+    ) -> list[dict[str, Any]]:
+        """Discover executor-local provider models.
+
+        This is deliberately narrower than a generic HTTP probe.  For now it
+        supports only Ollama's read-only ``/api/tags`` and ``/api/show``
+        metadata endpoints from the executor host perspective.
+        """
+
+        if preset.strip().lower() != "ollama":
+            raise ValueError("Executor-side model discovery currently supports Ollama only")
+        return await discover_ollama_models(base_url=base_url, api_key=api_key, logger=logger)
 
     async def image_generate(
         self,

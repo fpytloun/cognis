@@ -69,7 +69,7 @@ e2e-status:
 	$(COMPOSE_E2E) ps
 
 # ---------------------------------------------------------------------------
-# L2: Golden event-stream tests (fast, no browser)
+# L2: Canonical Chat v2 event-stream tests (fast, no browser)
 # ---------------------------------------------------------------------------
 
 .PHONY: e2e-events
@@ -82,8 +82,10 @@ e2e-events-capture:
 
 .PHONY: e2e-events-replay
 e2e-events-replay:
-	@echo "Replaying golden streams through ChatTimeline store..."
-	cd ui && npm test -- --reporter=verbose --run src/lib/chat-timeline.golden.test.ts
+	@echo "Replaying every promoted canonical Chat v2 capture through the production sync engine..."
+	cd ui && npm test -- --reporter=verbose --run \
+		src/lib/chat-v2/capture-replay.invariants.test.ts \
+		src/lib/chat-v2/sync-engine.invariants.test.ts
 
 # ---------------------------------------------------------------------------
 # L3: Playwright browser tests

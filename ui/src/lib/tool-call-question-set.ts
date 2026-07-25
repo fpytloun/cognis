@@ -1,4 +1,4 @@
-import type { ToolCallTimelineItem } from '$lib/chat';
+import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
 
 export type StepQuestionOption = { id: string; label: string; description?: string };
 export type StepQuestion = {

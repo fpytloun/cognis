@@ -13,6 +13,14 @@
 | **Execution** | One active run/attempt within a runtime session. |
 | **Projection** | Normalized Cognis-visible session history derived from raw runtime trace plus Cognis overlay events. |
 
+At turn admission Cognis resolves one immutable `MemoryRuntimePolicy`. The same
+policy gates bootstrap, recall, memory tool exposure/execution, final and
+compaction remembering, and queued remember metadata. Immutable-prefix
+snapshots persist its fingerprint and provider mode metadata. A fingerprint
+change writes an authoritative replacement snapshot, so stale memory
+instructions/core cannot return through L1, Redis hydration, cold reconstruction,
+eviction, or restart.
+
 ## Data Ownership
 
 Session **metadata** (status, IDs, correlation refs) is in Cognis DB.
@@ -25,6 +33,11 @@ For events that belong to a concrete turn, `turn_id` is that turn's stable
 correlation key across persisted history, replay, and live transport frames.
 Out-of-band events that are not part of a specific turn still include the field
 with a `null` value so the event schema stays uniform.
+
+Retrying a failed chat turn reuses the original persisted user message as model
+input with retry semantics. It does not append another `user_message`; Cognis
+records a `model_recovery` system notice (`Retrying turn…`) before the new
+assistant attempt. Retry is allowed only for failed, inactive turns.
 
 Session events also carry a context-lane envelope in their event data. Historical
 pre-lane events are interpreted as `lane="main"`.

@@ -167,7 +167,7 @@ def _prefer_headed_browser_fetch(metadata: dict[str, Any]) -> bool:
     return bool(
         metadata.get(
             "web_browser_fetch_prefer_headed",
-            metadata.get("web_browser_fetch_headed_fallback_enabled", False),
+            metadata.get("web_browser_fetch_headed_fallback_enabled", True),
         )
     )
 
@@ -307,7 +307,7 @@ def get_preferred_browser_fetch_backend(metadata: dict[str, Any]) -> BrowserFetc
 
 def headed_fallback_enabled(metadata: dict[str, Any]) -> bool:
     """Return True when both the manager and settings permit a headed retry."""
-    if not bool(metadata.get("web_browser_fetch_headed_fallback_enabled", False)):
+    if not bool(metadata.get("web_browser_fetch_headed_fallback_enabled", True)):
         return False
     manager = metadata.get(BROWSER_MANAGER_KEY)
     return bool(manager is not None and getattr(manager, "headed_allowed", False))

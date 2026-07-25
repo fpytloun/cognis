@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/chat';
+  import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/timeline-render-model';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import { displayToolName } from '$lib/tools-display';
 

@@ -4,17 +4,33 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
 from cognis.api.chat_v2 import routes as chat_v2_routes
+from cognis.api.chat_v2.cursors import (
+    CursorLineageEntry,
+    CursorSessionWatermark,
+    InternalChatCursorPayload,
+    encode_cursor,
+)
 from cognis.api.chat_v2.routes import (
     _cursor_secret,
+    _load_session_context,
+    _load_task_step_context,
+    _scoped_tool_output_page,
     chat_v2_cancel_turn,
     chat_v2_delete_queued_message,
     chat_v2_send_message,
+    chat_v2_session_snapshot,
+    chat_v2_session_sync,
+    chat_v2_session_timeline,
+    chat_v2_task_step_snapshot,
+    chat_v2_task_step_sync,
+    chat_v2_task_step_timeline,
     chat_v2_update_queued_message,
     router,
 )
@@ -23,6 +39,8 @@ from cognis.api.chat_v2.schemas import (
     QueueUpdateV2Request,
     SendMessageV2Request,
 )
+from cognis.api.chat_v2.sync import PROJECTION_VERSION
+from cognis.api.common import AuthenticatedUser
 from cognis.core.turn_scheduler import TurnError
 
 
@@ -37,8 +55,18 @@ def test_chat_v2_read_routes_are_registered() -> None:
     assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/sync") in routes
     assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/timeline") in routes
     assert (
+        "GET",
+        "/api/v1/chat/v2/conversations/{conversation_id}/tool-outputs/{call_id}",
+    ) in routes
+    assert ("GET", "/api/v1/chat/v2/sessions/{session_id}/tool-outputs/{call_id}") in routes
+    assert ("GET", "/api/v1/chat/v2/task-steps/{step_run_id}/tool-outputs/{call_id}") in routes
+    assert (
         "PUT",
         "/api/v1/chat/v2/conversations/{conversation_id}/messages/{client_txn_id}",
+    ) in routes
+    assert (
+        "PUT",
+        "/api/v1/chat/v2/conversations/{conversation_id}/commands/{client_txn_id}",
     ) in routes
     assert ("POST", "/api/v1/chat/v2/conversations/{conversation_id}/cancel") in routes
     assert (
@@ -49,6 +77,13 @@ def test_chat_v2_read_routes_are_registered() -> None:
         "PATCH",
         "/api/v1/chat/v2/conversations/{conversation_id}/queue/{queue_id}",
     ) in routes
+    assert not any("/e2e/" in route.path for route in router.routes)
+    for route in router.routes:
+        if isinstance(route, APIRoute) and route.path.endswith("/sync"):
+            assert {parameter.name for parameter in route.dependant.query_params} == {
+                "cursor",
+                "limit",
+            }
 
 
 def test_cursor_secret_uses_app_state_secret() -> None:
@@ -66,6 +101,20 @@ def test_cursor_secret_fails_closed_when_missing() -> None:
     assert exc_info.value.status_code == 500
     detail = cast(dict[str, Any], exc_info.value.detail)
     assert detail["code"] == "cursor_secret_unavailable"
+
+
+def test_retry_completion_marker_ignores_unrelated_completed_events() -> None:
+    tool_event = SimpleNamespace(
+        type="tool_result",
+        data={"turn_id": "turn-1", "status": "completed"},
+    )
+    turn_event = SimpleNamespace(
+        type="lifecycle",
+        data={"turn_id": "turn-1", "event": "turn_completed"},
+    )
+
+    assert chat_v2_routes._is_completed_turn_marker(cast(Any, tool_event)) is False
+    assert chat_v2_routes._is_completed_turn_marker(cast(Any, turn_event)) is True
 
 
 @pytest.mark.asyncio
@@ -670,8 +719,550 @@ async def test_update_queued_message_returns_not_found(
     assert scheduler.updated == [("conv-1", "missing", "updated")]
 
 
+@pytest.mark.asyncio
+async def test_session_snapshot_route_denies_cross_user_and_preserves_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    session_row = _session("session-1", owner="bob@example.com", conversation_id="conv-1")
+    conversation_row = _conversation("conv-1", owner="bob@example.com")
+    _patch_scope_queries(monkeypatch, session_row=session_row, conversation_row=conversation_row)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat_v2_session_snapshot(request, "session-1")
+
+    assert exc_info.value.status_code == 403
+
+    monkeypatch.setattr(chat_v2_routes, "_build_scoped_snapshot", _return_context_scope)
+    request = _scoped_request("bob@example.com")
+    result = await chat_v2_session_snapshot(request, "session-1")
+    assert result.key == "session:session-1"
+    assert result.conversation_id == "conv-1"
+    assert result.session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_session_context_rejects_session_conversation_owner_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    session_row = _session("session-1", owner="alice@example.com", conversation_id="conv-1")
+    conversation_row = _conversation("conv-1", owner="bob@example.com")
+    _patch_scope_queries(monkeypatch, session_row=session_row, conversation_row=conversation_row)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _load_session_context(request, "session-1")
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_task_step_route_denies_task_owner_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    step = SimpleNamespace(
+        step_run_id="step-1",
+        task_id="task-1",
+        session_id="session-1",
+        conversation_id="conv-1",
+        step_name="build",
+        attempt_number=1,
+        status="running",
+    )
+    _patch_scope_queries(
+        monkeypatch,
+        step_run=step,
+        task=SimpleNamespace(task_id="task-1", created_by="bob@example.com"),
+        session_row=_session("session-1", owner="alice@example.com", conversation_id="conv-1"),
+        conversation_row=_conversation("conv-1", owner="alice@example.com"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat_v2_task_step_snapshot(request, "step-1")
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_task_step_context_preserves_previous_session_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    step = SimpleNamespace(
+        step_run_id="step-1",
+        task_id="task-1",
+        session_id="session-1",
+        conversation_id="conv-1",
+        step_name="build",
+        attempt_number=2,
+        status="completed",
+    )
+    _patch_scope_queries(
+        monkeypatch,
+        step_run=step,
+        task=SimpleNamespace(task_id="task-1", created_by="alice@example.com"),
+        session_row=_session(
+            "session-1",
+            owner="alice@example.com",
+            conversation_id="conv-1",
+            parent_session_id="session-parent",
+        ),
+        conversation_row=_conversation("conv-1", owner="alice@example.com"),
+    )
+
+    context = await _load_task_step_context(request, "step-1")
+    assert context["scope"].parent_session_id == "session-parent"
+    assert context["scope"].session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_task_step_context_uses_linked_session_conversation_when_step_is_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    step = SimpleNamespace(
+        step_run_id="step-1",
+        task_id="task-1",
+        session_id="session-1",
+        conversation_id=None,
+        step_name="build",
+        attempt_number=1,
+        status="running",
+    )
+    _patch_scope_queries(
+        monkeypatch,
+        step_run=step,
+        task=SimpleNamespace(task_id="task-1", created_by="alice@example.com"),
+        session_row=_session("session-1", owner="alice@example.com", conversation_id="conv-1"),
+        conversation_row=_conversation("conv-1", owner="alice@example.com"),
+    )
+
+    context = await _load_task_step_context(request, "step-1")
+
+    assert context["scope"].conversation_id == "conv-1"
+    assert context["scope"].session_id == "session-1"
+
+
+@pytest.mark.asyncio
+async def test_task_step_context_allows_missing_stream_without_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    step = SimpleNamespace(
+        step_run_id="step-1",
+        task_id="task-1",
+        session_id=None,
+        conversation_id=None,
+        step_name="build",
+        attempt_number=1,
+        status="pending",
+    )
+    _patch_scope_queries(
+        monkeypatch,
+        step_run=step,
+        task=SimpleNamespace(task_id="task-1", created_by="alice@example.com"),
+    )
+
+    context = await _load_task_step_context(request, "step-1")
+
+    assert context["scope"].conversation_id is None
+    assert context["scope"].missing_stream is True
+    assert context["session_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_task_step_snapshot_explicitly_marks_missing_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    step = SimpleNamespace(
+        step_run_id="step-1",
+        task_id="task-1",
+        session_id=None,
+        conversation_id="conv-1",
+        step_name="build",
+        attempt_number=1,
+        status="pending",
+    )
+    _patch_scope_queries(
+        monkeypatch,
+        step_run=step,
+        task=SimpleNamespace(task_id="task-1", created_by="alice@example.com"),
+        conversation_row=_conversation("conv-1", owner="alice@example.com"),
+    )
+    monkeypatch.setattr(chat_v2_routes, "_build_scoped_snapshot", _return_context_scope)
+
+    result = await chat_v2_task_step_snapshot(request, "step-1")
+    assert result.missing_stream is True
+    assert result.kind == "task_step"
+
+
+@pytest.mark.asyncio
+async def test_task_step_tool_output_prefers_final_result_in_authorized_step_session() -> None:
+    request = _scoped_request("alice@example.com")
+    request.app.state.turn_scheduler = None
+    request.app.state.tool_output_store = None
+
+    class _EventStore:
+        async def read_session_events(self, **kwargs: Any) -> Any:
+            assert kwargs["session_id"] == "intaris-historical-step"
+            return SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        type="tool_call",
+                        data={
+                            "call_id": "call-historical",
+                            "result": "stale preview",
+                        },
+                    ),
+                    SimpleNamespace(
+                        type="tool_result",
+                        data={
+                            "call_id": "call-historical",
+                            "result": "historical full output",
+                            "status": "completed",
+                        },
+                    ),
+                ],
+                has_more_before=False,
+                first_seq=1,
+            )
+
+    context = {
+        "scope": SimpleNamespace(
+            kind="task_step",
+            conversation_id="conv-1",
+            session_id="session-historical-step",
+            step_run_id="step-historical",
+        ),
+        "session_refs": [
+            SimpleNamespace(
+                session_id="session-historical-step",
+                event_store_session_id="intaris-historical-step",
+            )
+        ],
+        "event_store": _EventStore(),
+    }
+    result = await _scoped_tool_output_page(
+        request,
+        context=context,
+        call_id="call-historical",
+        offset=0,
+        limit=200,
+        latest=False,
+    )
+
+    assert result.conversation_id == "conv-1"
+    assert result.session_id == "session-historical-step"
+    assert result.content == "historical full output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_kind", ["session", "task_step"])
+async def test_scoped_tool_output_finds_call_beyond_ten_thousand_events(
+    scope_kind: str,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    request.app.state.turn_scheduler = None
+    request.app.state.tool_output_store = None
+
+    class _LongEventStore:
+        pages = 0
+
+        async def read_session_events(self, **kwargs: Any) -> Any:
+            self.pages += 1
+            found = self.pages == 22
+            return SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        type="tool_result",
+                        data={
+                            "call_id": "call-old",
+                            "result": "older than 10k events",
+                            "status": "completed",
+                        },
+                    )
+                ]
+                if found
+                else [
+                    SimpleNamespace(
+                        type="message",
+                        data={"index": (self.pages - 1) * 500 + index},
+                    )
+                    for index in range(500)
+                ],
+                has_more_before=not found,
+                first_seq=max(1, 20_000 - self.pages * 500),
+            )
+
+    event_store = _LongEventStore()
+    context = {
+        "scope": SimpleNamespace(kind=scope_kind, conversation_id="conv-1"),
+        "session_refs": [
+            SimpleNamespace(session_id="session-old", event_store_session_id="intaris-old")
+        ],
+        "event_store": event_store,
+    }
+    result = await _scoped_tool_output_page(
+        request,
+        context=context,
+        call_id="call-old",
+        offset=0,
+        limit=1000,
+        latest=False,
+    )
+    assert result.content == "older than 10k events"
+    assert event_store.pages == 22
+
+
+@pytest.mark.asyncio
+async def test_scoped_tool_output_authorizes_recovery_id_and_reads_saved_key() -> None:
+    request = _scoped_request("alice@example.com")
+    request.app.state.turn_scheduler = None
+    request.app.state.tool_output_store = SimpleNamespace(
+        read=AsyncMock(
+            return_value=SimpleNamespace(
+                content="saved output",
+                offset=1,
+                limit=1000,
+                has_more=False,
+                total_lines=1,
+            )
+        )
+    )
+
+    class _EventStore:
+        async def read_session_events(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                events=[
+                    SimpleNamespace(
+                        type="tool_result",
+                        data={
+                            "call_id": "call_orig",
+                            "recovery_call_id": "call_saved",
+                            "result": "preview",
+                            "has_full_output": True,
+                        },
+                    )
+                ],
+                has_more_before=False,
+                first_seq=1,
+            )
+
+    context = {
+        "scope": SimpleNamespace(conversation_id="conv-1"),
+        "session_refs": [
+            SimpleNamespace(session_id="session-1", event_store_session_id="intaris-1")
+        ],
+        "event_store": _EventStore(),
+    }
+    result = await _scoped_tool_output_page(
+        request,
+        context=context,
+        call_id="call_saved",
+        offset=0,
+        limit=1000,
+        latest=False,
+    )
+    assert result.call_id == "call_saved"
+    assert result.content == "saved output"
+    request.app.state.tool_output_store.read.assert_awaited_once_with(
+        "call_saved", offset=1, limit=1000
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_tool_output_denies_call_from_other_session() -> None:
+    request = _scoped_request("alice@example.com")
+    request.app.state.turn_scheduler = None
+    request.app.state.tool_output_store = SimpleNamespace(read=AsyncMock())
+
+    class _EventStore:
+        async def read_session_events(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(events=[], has_more_before=False, first_seq=None)
+
+    context = {
+        "scope": SimpleNamespace(conversation_id="conv-1"),
+        "session_refs": [
+            SimpleNamespace(session_id="session-1", event_store_session_id="intaris-1")
+        ],
+        "event_store": _EventStore(),
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        await _scoped_tool_output_page(
+            request,
+            context=context,
+            call_id="call-other-session",
+            offset=0,
+            limit=1000,
+            latest=False,
+        )
+    assert exc_info.value.status_code == 404
+    request.app.state.tool_output_store.read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "argument"),
+    [
+        (chat_v2_session_sync, "session-1"),
+        (chat_v2_session_timeline, "session-1"),
+        (chat_v2_task_step_sync, "step-1"),
+        (chat_v2_task_step_timeline, "step-1"),
+    ],
+)
+async def test_scoped_route_rejects_cursor_from_different_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    route: Any,
+    argument: str,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    session_row = _session("session-1", owner="alice@example.com", conversation_id="conv-1")
+    conversation_row = _conversation("conv-1", owner="alice@example.com")
+    step = SimpleNamespace(
+        step_run_id="step-1",
+        task_id="task-1",
+        session_id="session-1",
+        conversation_id="conv-1",
+        step_name="build",
+        attempt_number=1,
+        status="running",
+    )
+    _patch_scope_queries(
+        monkeypatch,
+        session_row=session_row,
+        conversation_row=conversation_row,
+        step_run=step,
+        task=SimpleNamespace(task_id="task-1", created_by="alice@example.com"),
+    )
+
+    wrong_cursor = _cursor("conversation:other-conversation")
+    if route in (chat_v2_session_sync, chat_v2_task_step_sync):
+        with pytest.raises(HTTPException) as exc_info:
+            await route(request, argument, wrong_cursor, limit=1)
+    else:
+        with pytest.raises(HTTPException) as exc_info:
+            await route(request, argument, before=wrong_cursor, limit=1)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["code"] == "cursor_invalid"
+
+
 def _request(scheduler: object) -> SimpleNamespace:
     return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(turn_scheduler=scheduler)))
+
+
+def _scoped_request(email: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        state=SimpleNamespace(user=AuthenticatedUser(email=email, role="user")),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                chat_v2_cursor_secret="route-test-secret",
+                providers=SimpleNamespace(guardrails=SimpleNamespace()),
+                session_factory=lambda: _SessionContext(),
+                turn_scheduler=None,
+                session_cache=None,
+            )
+        ),
+    )
+
+
+def _session(
+    session_id: str,
+    *,
+    owner: str,
+    conversation_id: str,
+    parent_session_id: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        session_id=session_id,
+        user_email=owner,
+        conversation_id=conversation_id,
+        parent_session_id=parent_session_id,
+        intaris_session_id=session_id,
+        delegation_task="delegation",
+        agent_id="agent",
+        status="active",
+        completion_reason=None,
+    )
+
+
+def _conversation(conversation_id: str, *, owner: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        conversation_id=conversation_id,
+        user_email=owner,
+        agent_id="agent",
+        title="Conversation",
+        status="active",
+        active_session_id="session-1",
+    )
+
+
+def _patch_scope_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_row: Any | None = None,
+    conversation_row: Any | None = None,
+    step_run: Any | None = None,
+    task: Any | None = None,
+) -> None:
+    async def get_session(_session: Any, session_id: str) -> Any:
+        return (
+            session_row
+            if session_row is not None and session_row.session_id == session_id
+            else None
+        )
+
+    async def get_conversation(_session: Any, conversation_id: str) -> Any:
+        return (
+            conversation_row
+            if conversation_row is not None and conversation_row.conversation_id == conversation_id
+            else None
+        )
+
+    async def get_step(_session: Any, _step_run_id: str) -> Any:
+        return step_run
+
+    async def get_task(_session: Any, _task_id: str) -> Any:
+        return task
+
+    monkeypatch.setattr(chat_v2_routes, "get_session_row", get_session)
+    monkeypatch.setattr(chat_v2_routes, "get_conversation", get_conversation)
+    monkeypatch.setattr(chat_v2_routes, "get_step_run", get_step)
+    monkeypatch.setattr(chat_v2_routes, "get_task", get_task)
+
+
+async def _return_context_scope(_request: Any, context: dict[str, Any]) -> Any:
+    return context["scope"]
+
+
+def _cursor(scope_key: str) -> str:
+    return encode_cursor(
+        InternalChatCursorPayload(
+            scope_key=scope_key,
+            conversation_id=None,
+            projection_version=PROJECTION_VERSION,
+            session_watermarks=[
+                CursorSessionWatermark(store="intaris", session_id="session-1", last_seq=0)
+            ],
+            lineage=[
+                CursorLineageEntry(
+                    store="intaris", session_id="session-1", role="session", ordinal=0
+                )
+            ],
+            view_revision=0,
+            issued_at="2026-01-01T00:00:00Z",
+        ),
+        "route-test-secret",
+    )
+
+
+class _SessionContext:
+    async def __aenter__(self) -> Any:
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        return None
 
 
 def _tx(

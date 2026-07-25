@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.12.0] - 2026-07-25
+
+### Added
+
+- Added publication-grade rich deliverables with canonical charts, artifact-backed media, standalone exports, authenticated sharing, PDF rendering, and Pulse authoring contracts.
+- Added native Anthropic Messages support, subscription authentication, server-side tool search, recursive tool schemas, and preserved native response envelopes.
+- Added managed local-model discovery, provider-owned deployments, Ollama reconciliation, hardware capacity planning, and executor resource-health reporting.
+- Added runtime profile management and switching, unified tool introspection, managed-conversation lineage operations, and durable delegate follow-up recovery.
+
+### Changed
+
+- Migrated conversation, session, and task-step presentation to the scoped Chat v2 protocol with shared rendering, deterministic grouping, and improved streaming performance.
+- Improved context projection, idle compaction, executor reconnect handling, channel delivery, MCP OAuth lifecycle, and release validation coverage.
+- Expanded rich UI presentation, mobile/PWA resilience, channel formatting, and operational diagnostics.
+
+### Fixed
+
+- Fixed duplicate or missing tool activity, attachment and deliverable recovery, managed-conversation delivery, and stale Chat v2 state across reconnects and navigation.
+- Fixed executor retry and browser lifecycle races, provider routing edge cases, migration/bootstrap gaps, and local-model configuration consistency.
+- Removed obsolete legacy WebSocket transport tests that could block the complete backend suite and refreshed unit fixtures for current orchestration contracts.
+
 ## [0.11.2] - 2026-07-06
 
 ### Fixed
@@ -21,7 +42,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- Reworked chat rendering around native Chat v2 projection, grouped activity/tool segments, stable runtime ordering, scroll stability, and consolidated timeline/session-log rendering.
+- Reworked chat rendering around scoped Chat v2 projections, grouped activity/tool segments, stable runtime ordering, scroll stability, and shared session/task-step views.
 - Improved MCP OAuth, executor reconfiguration, provider routing, Responses/Anthropic request handling, prompt-cache assembly, and tool-call loop hygiene.
 - Improved task board/detail performance, PWA update handling, sidebar/conversation state reconciliation, structured question UX, and mobile chat controls.
 - Expanded backend and UI tests across Chat v2, channels, MCP OAuth, provider routing, notifications, executor runtime, and E2E streaming scenarios.

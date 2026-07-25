@@ -9,8 +9,10 @@ from cognis.api.chat_v2.realtime import (
     runtime_frame,
     runtime_items_from_snapshots,
     runtime_overlay_from_items,
+    scope_accepts_runtime,
     tool_call_runtime_item,
 )
+from cognis.api.chat_v2.schemas import TimelineScope
 
 
 def test_runtime_snapshots_become_strict_volatile_items() -> None:
@@ -40,6 +42,38 @@ def test_runtime_snapshots_become_strict_volatile_items() -> None:
     assert items[0].status == "running"
     assert items[1].status == "complete"
     assert items[0].source_refs[0].store == "runtime"
+
+
+def test_runtime_fanout_is_limited_to_the_subscribed_scope() -> None:
+    parent = TimelineScope(key="conversation:conv-1", kind="conversation", conversation_id="conv-1")
+    child = TimelineScope(
+        key="session:sess-child",
+        kind="session",
+        conversation_id="conv-1",
+        session_id="sess-child",
+    )
+    assert scope_accepts_runtime(parent, conversation_id="conv-1", active_session_id="sess-parent")
+    assert not scope_accepts_runtime(
+        child, conversation_id="conv-1", active_session_id="sess-parent"
+    )
+    assert scope_accepts_runtime(child, conversation_id="conv-1", active_session_id="sess-child")
+
+
+def test_scope_accepts_runtime_rejects_missing_stream_even_with_conversation() -> None:
+    scope = TimelineScope(
+        key="task_step:missing-step",
+        kind="task_step",
+        task_id="task-1",
+        step_run_id="missing-step",
+        conversation_id="conv-1",
+        missing_stream=True,
+    )
+
+    assert not scope_accepts_runtime(
+        scope,
+        conversation_id="conv-1",
+        active_session_id=None,
+    )
 
 
 def test_runtime_overlay_exposes_cycle_state_for_streaming_tool_transition() -> None:
@@ -189,6 +223,43 @@ def test_runtime_assistant_message_uses_tool_phase_hints_when_phase_missing() ->
     assert item.turn_cycle_index == 1
 
 
+def test_completion_item_preserves_none_cycle_instead_of_coercing_to_zero() -> None:
+    """An unknown final cycle must stay None, not become 0.
+
+    The completion frame shares the streamed item's id and the client merges
+    turn_cycle_index as ``incoming ?? existing``. Coercing None to 0 would
+    clobber the correct streamed cycle and fold the settled final answer into
+    the cycle-0 tool group. Passing None lets the client keep what streamed.
+    """
+    item = assistant_completion_runtime_item(
+        message_id="msg-1",
+        turn_id="turn-1",
+        session_id="sess-1",
+        phase=2,
+        content="final answer",
+        timestamp="2026-01-01T00:00:00+00:00",
+        partial=False,
+        turn_cycle_index=None,
+    )
+
+    assert item.turn_cycle_index is None
+
+
+def test_completion_item_preserves_explicit_cycle() -> None:
+    item = assistant_completion_runtime_item(
+        message_id="msg-1",
+        turn_id="turn-1",
+        session_id="sess-1",
+        phase=2,
+        content="final answer",
+        timestamp="2026-01-01T00:00:00+00:00",
+        partial=False,
+        turn_cycle_index=1,
+    )
+
+    assert item.turn_cycle_index == 1
+
+
 def test_runtime_tool_call_preserves_folded_delegation_payload() -> None:
     item = delegation_runtime_item(
         {
@@ -296,6 +367,10 @@ def test_runtime_frame_preserves_cursor_for_runtime_only_update() -> None:
     )
 
     assert frame.type == "chat_v2_frame"
+    assert frame.scope.key == "conversation:conv-1"
+    assert frame.scope.kind == "conversation"
+    assert frame.scope.conversation_id == "conv-1"
+    assert frame.conversation_id == frame.scope.conversation_id
     assert frame.cursor_before == "cursor-1"
     assert frame.cursor_after == "cursor-1"
     assert frame.ops == []

@@ -18,7 +18,14 @@ from cognis.core.executor_pool import (
     ExecutorPool,
     ResolvedExecutorTarget,
 )
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.agent import AgentRuntimeProfile
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
+from cognis.tools.introspection import (
+    audit_tool_descriptors,
+    describe_available_tool,
+    validate_available_tool_call,
+)
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 
@@ -76,6 +83,7 @@ def _ctx(
         step_definition=SimpleNamespace(allow_questions=False, metadata_contract=None),
         deliverable_step_run_id=None,
         post_deliverable_pending=False,
+        orchestration_target_snapshot=None,
     )
 
 
@@ -88,6 +96,13 @@ def _switch_tool(schemas: list[dict]) -> dict | None:
     for s in schemas:
         if s.get("function", {}).get("name") == "switch_executor":
             return s
+    return None
+
+
+def _profile_switch_tool(schemas: list[dict]) -> dict | None:
+    for schema in schemas:
+        if schema.get("function", {}).get("name") == "switch_agent_profile":
+            return schema
     return None
 
 
@@ -104,6 +119,67 @@ def test_switch_executor_hidden_with_one_usable() -> None:
     )
     schemas = loop._build_controller_tool_schemas(_ctx(pool, active_executor_id="exec-a"))
     assert _switch_tool(schemas) is None
+
+
+def test_switch_agent_profile_hidden_without_switch_eligible_profiles() -> None:
+    loop = _make_loop()
+    loop._deliverable_owner_step_run_id = lambda c: None
+    ctx = _ctx(ExecutorPool(primary=[_target("exec-a")]))
+    ctx.agent.agent_profiles = {
+        "restricted": AgentRuntimeProfile(
+            profile_id="restricted",
+            description="User-selected only.",
+        )
+    }
+
+    assert _profile_switch_tool(loop._build_controller_tool_schemas(ctx)) is None
+
+
+def test_switch_agent_profile_schema_is_stable_and_requires_reason() -> None:
+    loop = _make_loop()
+    loop._deliverable_owner_step_run_id = lambda c: None
+    ctx = _ctx(ExecutorPool(primary=[_target("exec-a")]))
+    ctx.agent.agent_profiles = {
+        "developer": AgentRuntimeProfile(
+            profile_id="developer",
+            description="Normal implementation.",
+            agent_switchable=True,
+        ),
+        "senior": AgentRuntimeProfile(
+            profile_id="senior",
+            description="Complex high-risk implementation.",
+            agent_switchable=True,
+        ),
+    }
+
+    first = _profile_switch_tool(loop._build_controller_tool_schemas(ctx))
+    ctx.session.agent_profile_id = "senior"
+    second = _profile_switch_tool(loop._build_controller_tool_schemas(ctx))
+
+    assert first == second
+    assert first is not None
+    parameters = first["function"]["parameters"]
+    assert parameters["required"] == ["profile_id", "reason"]
+    assert "enum" not in parameters["properties"]["profile_id"]
+    assert parameters["properties"]["reason"]["maxLength"] == 500
+
+
+def test_switch_agent_profile_rejects_missing_or_blank_reason() -> None:
+    loop = _make_loop()
+
+    missing = loop._validate_controller_tool_arguments(
+        "switch_agent_profile",
+        {"profile_id": "senior"},
+    )
+    blank = loop._validate_controller_tool_arguments(
+        "switch_agent_profile",
+        {"profile_id": "senior", "reason": "   "},
+    )
+
+    assert missing is not None
+    assert "reason" in " ".join([missing.message, *missing.errors])
+    assert blank is not None
+    assert "reason" in " ".join([blank.message, *blank.errors])
 
 
 def test_switch_executor_hidden_with_zero_usable() -> None:
@@ -243,6 +319,44 @@ def test_target_executor_overlay_two_websocket_executors() -> None:
     properties = bash["function"]["parameters"]["properties"]
     assert "target_executor" in properties
     assert properties["target_executor"]["enum"] == ["exec-a", "exec-b"]
+
+
+def test_target_executor_effective_definition_drives_introspection_and_hash() -> None:
+    loop = _make_loop()
+    pool = ExecutorPool(
+        primary=[
+            _target(
+                "exec-a",
+                executor_type="websocket",
+                observed_tools=[{"name": "bash"}],
+            ),
+            _target(
+                "exec-b",
+                executor_type="websocket",
+                observed_tools=[{"name": "bash"}],
+            ),
+        ]
+    )
+    registry = _build_registry_with_executor_tool("bash")
+    base = registry.get("bash").definition
+    effective = loop._effective_inventory_tool_definitions(
+        _exec_ctx(pool, registry, active_executor_id="exec-a"),
+        [base],
+    )
+
+    described = describe_available_tool(effective, "bash")
+    schema = described["descriptor"]["input_schema"]
+    assert schema["properties"]["target_executor"]["enum"] == ["exec-a", "exec-b"]
+    assert described["descriptor"]["schema_hash"] != base.descriptor.schema_hash
+    assert (
+        validate_available_tool_call(
+            effective,
+            "bash",
+            {"command": "pwd", "target_executor": "exec-b"},
+        )["valid"]
+        is True
+    )
+    assert audit_tool_descriptors(effective) == []
 
 
 def test_target_executor_overlay_single_executor_omitted() -> None:

@@ -7,6 +7,7 @@ from cognis.core.tool_output_prune import (
     PRUNE_PROTECTED_TOOL_NAMES,
     PruneCandidate,
     cleared_tool_result_marker,
+    prune_candidate_from_event_data,
     select_prune_call_ids,
 )
 
@@ -17,6 +18,32 @@ def _candidate(call_id: str, output: str, tool_name: str = "read") -> PruneCandi
 
 def _user_turn() -> PruneCandidate:
     return PruneCandidate(call_id="", tool_name="", output="", is_user_turn=True)
+
+
+def test_prune_candidate_requires_confirmed_recovery_metadata() -> None:
+    base = {
+        "call_id": "call-1",
+        "name": "read",
+        "result": "important evidence",
+    }
+
+    assert prune_candidate_from_event_data(base) is None
+    assert prune_candidate_from_event_data({**base, "has_full_output": True}) is None
+    assert (
+        prune_candidate_from_event_data(
+            {**base, "has_full_output": False, "recovery_call_id": "call-1"}
+        )
+        is None
+    )
+
+    candidate = prune_candidate_from_event_data(
+        {**base, "has_full_output": True, "recovery_call_id": "stored-call-1"}
+    )
+    assert candidate == PruneCandidate(
+        call_id="call-1",
+        tool_name="read",
+        output="important evidence",
+    )
 
 
 def test_prune_returns_empty_when_under_budget() -> None:
@@ -121,7 +148,13 @@ def test_events_to_messages_substitutes_clearance_marker_for_pruned_ids() -> Non
         },
         {
             "type": "tool_result",
-            "data": {"call_id": "old-1", "name": "read", "result": "ORIGINAL CONTENT"},
+            "data": {
+                "call_id": "old-1",
+                "name": "read",
+                "result": "ORIGINAL CONTENT",
+                "has_full_output": True,
+                "recovery_call_id": "stored-old-1",
+            },
         },
         {
             "type": "tool_call",
@@ -139,13 +172,34 @@ def test_events_to_messages_substitutes_clearance_marker_for_pruned_ids() -> Non
     by_id = {m["tool_call_id"]: m for m in tool_messages}
 
     assert "ORIGINAL CONTENT" not in by_id["old-1"]["content"]
-    assert "old-1" in by_id["old-1"]["content"]
+    assert "stored-old-1" in by_id["old-1"]["content"]
     assert "read_tool_output" in by_id["old-1"]["content"]
     assert by_id["old-1"].get("_pruned_view") is True
 
     # Untouched results must still render their original content.
     assert by_id["fresh-1"]["content"] == "FRESH CONTENT"
     assert by_id["fresh-1"].get("_pruned_view") is False
+
+
+def test_events_to_messages_keeps_unrecoverable_pruned_ids_inline() -> None:
+    from cognis.core.context import events_to_messages
+
+    events = [
+        {
+            "type": "tool_call",
+            "data": {"name": "read", "call_id": "old-1", "arguments": {"file_path": "a.py"}},
+        },
+        {
+            "type": "tool_result",
+            "data": {"call_id": "old-1", "name": "read", "result": "ORIGINAL CONTENT"},
+        },
+    ]
+
+    messages = events_to_messages(events, pruned_call_ids={"old-1"})
+    tool_message = next(message for message in messages if message.get("role") == "tool")
+
+    assert tool_message["content"] == "ORIGINAL CONTENT"
+    assert tool_message.get("_pruned_view") is False
 
 
 def test_events_to_messages_respects_protect_from_pruning_flag() -> None:

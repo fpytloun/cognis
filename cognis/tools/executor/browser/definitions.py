@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from cognis.models.tool import ToolDefinition, ToolSource
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolSource
 
 _SOURCE = ToolSource(type="executor")
 
@@ -15,6 +16,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
                 "Open or reuse a browser session and navigate to a URL. "
                 "Use profile_mode='default' unless you specifically need a fresh one-off session. "
                 "When persistent_local mode is used, you may omit profile_id and Cognis will derive a stable site profile automatically. "
+                "For sites that reject headless automation or return a WAF/vendor block, close the blocked session and retry with headless=false when headed mode is available. "
                 "Use browser_settings to override per-session behavior such as auto_consent='off' for fragile SSO/login flows."
             ),
             parameters={
@@ -91,7 +93,7 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_list_sessions",
-            description="List active browser sessions and their metadata so you can resume an existing session.",
+            description="List active browser sessions owned by the current execution or its directly managed descendants. Returns safe owner, conversation, relationship, and lifecycle state metadata.",
             parameters={"type": "object", "properties": {}},
             source=_SOURCE,
             category="browser",
@@ -99,12 +101,66 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             timeout_seconds=30,
         ),
         ToolDefinition(
-            name="browser_list_profiles",
-            description="List persistent local browser profiles available on this executor.",
-            parameters={"type": "object", "properties": {}},
+            name="browser_inspect_session",
+            description="Inspect one active browser session visible to the current execution. Unrelated sessions are never exposed.",
+            parameters={
+                "type": "object",
+                "properties": {"session_id": {"type": "string"}},
+                "required": ["session_id"],
+            },
             source=_SOURCE,
             category="browser",
             read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_list_profiles",
+            description="Inspect persistent local browser profiles visible to the current execution. On an executor privately owned by the current user, set include_unclaimed=true to discover legacy profiles that require an explicit verified claim. Optionally retry conservative stale SingletonLock recovery.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "reclaim_stale": {
+                        "type": "boolean",
+                        "description": "Retry conservative orphaned SingletonLock recovery before listing profiles.",
+                    },
+                    "include_unclaimed": {
+                        "type": "boolean",
+                        "description": "Include non-empty legacy profiles with no ownership metadata. These remain unusable until explicitly claimed.",
+                    },
+                },
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=True,
+            timeout_seconds=30,
+        ),
+        ToolDefinition(
+            name="browser_claim_profile",
+            description=(
+                "Claim a non-empty legacy persistent profile that has no ownership metadata. "
+                "Claims are allowed only on an executor privately owned by the current user. "
+                "Use only after the user or operator verifies that the profile belongs to the current Cognis user and Chromium is stopped. "
+                "This never transfers a profile already claimed by another user."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "profile_id": {"type": "string"},
+                    "confirm_profile_id": {
+                        "type": "string",
+                        "description": "Must exactly repeat profile_id as an explicit claim confirmation.",
+                    },
+                    "reclaim_stale": {
+                        "type": "boolean",
+                        "description": "Conservatively remove a confirmed orphaned SingletonLock before claiming.",
+                    },
+                },
+                "required": ["profile_id", "confirm_profile_id"],
+            },
+            source=_SOURCE,
+            category="browser",
+            read_only=False,
+            non_bypassable=True,
             timeout_seconds=30,
         ),
         ToolDefinition(
@@ -616,10 +672,16 @@ def browser_tool_definitions() -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="browser_close",
-            description="Close a browser session.",
+            description="Idempotently close a browser session owned by the current execution. A controlling parent may reclaim a directly managed descendant only after Cognis has verified that descendant is terminal; active descendants remain protected.",
             parameters={
                 "type": "object",
-                "properties": {"session_id": {"type": "string"}},
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "release_managed_descendant": {
+                        "type": "boolean",
+                        "description": "Allow reclaim of a directly managed terminal descendant session. Ownership lineage and terminal state are verified by the executor.",
+                    },
+                },
                 "required": ["session_id"],
             },
             source=_SOURCE,

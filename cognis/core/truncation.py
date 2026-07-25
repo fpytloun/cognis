@@ -10,6 +10,7 @@ result stays under an approximate token ceiling instead of only a char ceiling.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 
 # Minimum size below which middle-truncation is pointless — just
@@ -20,6 +21,7 @@ _MIN_TRUNCATION_SIZE = 500
 # More than this gets noisy and bloats the marker; the model can call
 # ``list_tool_output_anchors`` for the full set.
 _MAX_INLINE_ANCHORS = 5
+_SAFE_ANCHOR_RE = re.compile(r"[^A-Za-z0-9._:-]+")
 
 
 def middle_truncate(
@@ -183,10 +185,18 @@ def _build_marker(
 ) -> str:
     parts = [f"\n\n... [middle truncated: {total_chars:,} chars total"]
     if call_id:
-        anchor_names = [name for name in (anchors or []) if isinstance(name, str) and name.strip()]
-        has_anchors = bool(anchor_names) or bool(anchors_available)
+        anchor_names: list[str] = []
+        seen: set[str] = set()
+        for value in anchors or []:
+            if not isinstance(value, str):
+                continue
+            name = _SAFE_ANCHOR_RE.sub("-", value.strip()).strip("-")[:120].rstrip("-")
+            if name and name not in seen:
+                anchor_names.append(name)
+                seen.add(name)
+        has_anchors = bool(anchor_names)
         recovery_calls = []
-        if has_anchors or anchors_available is None:
+        if has_anchors:
             recovery_calls.append(f"list_tool_output_anchors(call_id='{call_id}')")
         if anchor_names:
             recovery_calls.append(

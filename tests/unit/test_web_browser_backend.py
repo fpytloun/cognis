@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -117,8 +118,17 @@ class _FakePage:
 
 
 class _FakeSession:
-    def __init__(self, html: str, *, url: str = "https://example.com") -> None:
+    def __init__(
+        self,
+        html: str,
+        *,
+        url: str = "https://example.com",
+        navigation_status: int | None = None,
+    ) -> None:
         self.page = _FakePage(html, url=url)
+        self.navigation_url = url
+        self.navigation_status = navigation_status
+        self.navigation_ok = navigation_status is None or navigation_status < 400
 
 
 class _FakeManager:
@@ -128,10 +138,12 @@ class _FakeManager:
         html: str = "<html><body><h1>OK</h1><p>content</p></body></html>",
         max_sessions: int = 4,
         raise_on_open: Exception | None = None,
+        navigation_status: int | None = None,
     ) -> None:
         self._html = html
         self.max_sessions = max_sessions
         self._raise = raise_on_open
+        self._navigation_status = navigation_status
         self.opened: list[dict[str, Any]] = []
         self.closed: list[str] = []
 
@@ -159,44 +171,65 @@ class _FakeManager:
         )
         if self._raise is not None:
             raise self._raise
-        return _FakeSession(self._html, url=url)
+        return _FakeSession(
+            self._html,
+            url=url,
+            navigation_status=self._navigation_status,
+        )
 
     async def close_session(self, session_id: str) -> None:
         self.closed.append(session_id)
 
+    def record_navigation_response(
+        self,
+        session: Any,
+        response: Any | None,
+        *,
+        requested_url: str,
+    ) -> None:
+        session.navigation_url = str(getattr(response, "url", "") or requested_url)
+        session.navigation_status = getattr(response, "status", None)
+        session.navigation_ok = getattr(response, "ok", None)
+
 
 class _ConsentRedirectPage(_FakePage):
-    def __init__(self) -> None:
+    def __init__(self, *, goto_status: int = 200) -> None:
         super().__init__(
             "<html><body><h1>Ochrana osobních údajů</h1>"
             "<button>Rozumím a souhlasím</button></body></html>",
             url="https://heureka.group/cs/podminky-pouzivani/ochrana-osobnich-udaju",
         )
+        self.goto_status = goto_status
 
     async def evaluate(self, *_args: Any, **_kwargs: Any) -> bool:
         self.evaluate_calls += 1
         return True
 
-    async def goto(self, url: str, **kwargs: Any) -> None:
+    async def goto(self, url: str, **kwargs: Any) -> Any:
         await super().goto(url, **kwargs)
         self._html = (
             "<html><body><h1>HiPP BIO Snackie</h1><p>Product content loaded.</p></body></html>"
         )
+        return SimpleNamespace(url=url, status=self.goto_status, ok=self.goto_status < 400)
 
 
 class _ConsentRedirectSession:
-    def __init__(self) -> None:
-        self.page = _ConsentRedirectPage()
+    def __init__(self, *, goto_status: int = 200) -> None:
+        self.page = _ConsentRedirectPage(goto_status=goto_status)
+        self.navigation_url: str | None = None
+        self.navigation_status: int | None = None
+        self.navigation_ok: bool | None = None
 
 
 class _ConsentRedirectManager(_FakeManager):
-    def __init__(self) -> None:
+    def __init__(self, *, goto_status: int = 200) -> None:
         super().__init__()
+        self.goto_status = goto_status
         self.session: _ConsentRedirectSession | None = None
 
     async def open_session(self, **kwargs: Any) -> Any:
         self.opened.append(kwargs)
-        self.session = _ConsentRedirectSession()
+        self.session = _ConsentRedirectSession(goto_status=self.goto_status)
         return self.session
 
 
@@ -248,6 +281,33 @@ def test_classify_browser_extract_quality_flags_interstitial() -> None:
         "Verify you are human before continuing. Cloudflare Turnstile challenge page.",
     )
     assert signal == "interstitial"
+
+
+def test_classify_browser_extract_quality_flags_ebay_error_page() -> None:
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "trafilatura_recall",
+            "extraction_score": 20.5,
+            "title": "Error Page | eBay",
+        },
+        (
+            "SORRY Something went wrong on our end. "
+            "Please go back and try again or go to eBay Homepage."
+        ),
+    )
+    assert signal == "provider_error_page"
+
+
+def test_classify_browser_extract_quality_allows_short_status_page() -> None:
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "trafilatura_precision",
+            "extraction_score": 50.0,
+            "title": "Service status",
+        },
+        "The reporting API is temporarily unavailable during scheduled maintenance.",
+    )
+    assert signal is None
 
 
 def test_classify_browser_extract_quality_flags_cloudflare_challenge() -> None:
@@ -457,6 +517,38 @@ async def test_browser_fetch_waits_for_rendered_body_before_extracting() -> None
 
 
 @pytest.mark.asyncio
+async def test_browser_fetch_returns_provider_error_page_as_error() -> None:
+    manager = _FakeManager(
+        html=(
+            "<html><head><title>Error Page | eBay</title></head><body>"
+            "<h1>SORRY</h1><p>Something went wrong on our end.</p>"
+            "<p>Please go back and try again.</p></body></html>"
+        )
+    )
+    backend = BrowserFetchBackend(manager, headed=True)  # type: ignore[arg-type]
+
+    result = await backend.fetch("https://www.ebay.com/itm/257616988765")
+
+    assert result.is_error
+    assert (result.metadata or {}).get("browser_block_signal") == "provider_error_page"
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_rejects_http_error_after_consent_recovery() -> None:
+    manager = _ConsentRedirectManager(goto_status=403)
+    backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
+
+    result = await backend.fetch(
+        "https://maso-zeleninove-prikrmy.heureka.cz/hipp-bio-snackie/",
+        output_format="markdown",
+    )
+
+    assert result.is_error
+    assert "HTTP 403" in result.output
+    assert (result.metadata or {}).get("browser_block_signal") == "http_status_403"
+
+
+@pytest.mark.asyncio
 async def test_browser_fetch_propagates_pool_timeout_as_error() -> None:
     manager = _FakeManager(raise_on_open=TimeoutError("no slot"))
     backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
@@ -465,6 +557,23 @@ async def test_browser_fetch_propagates_pool_timeout_as_error() -> None:
     assert "session slot" in result.output
     assert (result.metadata or {}).get("browser_pool_timeout") is True
     assert manager.closed == []
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_rejects_http_error_document_with_extractable_html() -> None:
+    manager = _FakeManager(
+        html="<html><body><h1>Error Page</h1><p>Something went wrong.</p></body></html>",
+        navigation_status=403,
+    )
+    backend = BrowserFetchBackend(manager, headed=True)  # type: ignore[arg-type]
+
+    result = await backend.fetch("https://www.ebay.com/itm/257616988765")
+
+    assert result.is_error
+    assert "HTTP 403" in result.output
+    assert (result.metadata or {}).get("browser_fetch_mode") == "headed"
+    assert (result.metadata or {}).get("browser_block_signal") == "http_status_403"
+    assert manager.closed == [manager.opened[0]["session_id"]]
 
 
 @pytest.mark.asyncio
@@ -511,10 +620,7 @@ def test_get_browser_fetch_backend_caches_per_manager() -> None:
 
 def test_preferred_browser_fetch_uses_headed_when_available() -> None:
     manager = BrowserManager(enabled=True, headed_allowed=True)
-    metadata = {
-        BROWSER_MANAGER_KEY: manager,
-        "web_browser_fetch_headed_fallback_enabled": True,
-    }
+    metadata = {BROWSER_MANAGER_KEY: manager}
 
     backend = get_preferred_browser_fetch_backend(metadata)
 
@@ -525,15 +631,28 @@ def test_preferred_browser_fetch_uses_headed_when_available() -> None:
 
 def test_resolve_browser_fetch_prefers_headed_when_available() -> None:
     manager = BrowserManager(enabled=True, headed_allowed=True)
-    metadata = {
-        BROWSER_MANAGER_KEY: manager,
-        "web_browser_fetch_headed_fallback_enabled": True,
-    }
+    metadata = {BROWSER_MANAGER_KEY: manager}
 
     backend = resolve_fetch_backend(metadata, "browser")
 
     assert isinstance(backend, BrowserFetchBackend)
     assert backend.headed is True
+
+
+@pytest.mark.asyncio
+async def test_headed_browser_fetch_uses_native_browser_identity() -> None:
+    manager = _FakeManager()
+    backend = BrowserFetchBackend(manager, headed=True)  # type: ignore[arg-type]
+
+    result = await backend.fetch("https://example.com")
+
+    assert not result.is_error
+    assert manager.opened[0]["browser_settings"] == {
+        "stealth_enabled": False,
+        "fingerprint_hardening": False,
+    }
+    extracted = (result.metadata or {}).get("extracted_document") or {}
+    assert extracted.get("browser_fetch_mode") == "headed"
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +1001,51 @@ async def test_handle_web_fetch_retries_401_through_browser(
     )
     assert not result.is_error
     assert browser_used is True
+
+
+@pytest.mark.asyncio
+async def test_handle_web_fetch_retries_provider_error_page_through_browser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Web fetch loaded a provider-generated error page.",
+                is_error=True,
+                metadata={
+                    "direct_fetch_blocked": True,
+                    "direct_fetch_block_signal": "provider_error_page",
+                },
+            )
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(output="rendered listing")
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_fetch_backend",
+        lambda *args, **kwargs: _FakePrimary(),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda metadata: _FakeBrowser(),
+    )
+
+    ctx = _FakeContext(
+        {
+            "web_fetch_backend": "direct",
+            "web_fetch_fallback_browser": True,
+            "web_browser_fetch_headed_fallback_enabled": False,
+        }
+    )
+    result = await handlers.handle_web_fetch({"url": "https://www.ebay.com/itm/1"}, ctx)
+
+    assert not result.is_error
+    assert "rendered listing" in result.output
 
 
 @pytest.mark.asyncio

@@ -11,21 +11,30 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.serializers import agent_to_response
+from cognis.core.agent_profiles import (
+    agent_profile_options,
+    resolve_agent_profile,
+    validate_agent_profile_configuration,
+)
 from cognis.core.agent_registry import SYSTEM_AGENTS, validate_agent_id
 from cognis.core.events import Event, EventType
 from cognis.logging import get_logger
-from cognis.models.agent import AgentDefinition
-from cognis.models.tool import (
-    ToolCapability,
-    stable_tool_id,
-    tool_capabilities,
-    tool_matches_identifier,
+from cognis.models.agent import AgentCapabilities, AgentDefinition, AgentRuntimeProfile
+from cognis.models.tool import stable_tool_id
+from cognis.providers.backends import get_backend
+from cognis.providers.memory.policy import memory_backend_descriptors
+from cognis.store.models import (
+    AuditLog,
+    ChannelAccountRow,
+    Conversation,
+    Schedule,
+    Session,
+    Task,
 )
-from cognis.store.models import AuditLog, Schedule, Task
 from cognis.store.queries import (
     create_agent,
     create_agent_grant,
@@ -46,6 +55,7 @@ from cognis.store.queries import (
     set_secondary_bindings,
     update_agent,
     update_agent_grant,
+    update_agent_if_updated_at,
 )
 from cognis.tools.builtin.image import _image_bytes
 from cognis.tools.builtin.knowledgebase import knowledgebase_tools
@@ -130,6 +140,9 @@ class AgentManagementDependencies:
     llm: Any | None = None
     task_queue: Any | None = None
     guardrails: Any | None = None
+    # Caller-effective, persistable tools. Mutations fail closed when absent.
+    assignable_tools: list[Any] | None = None
+    assignable_knowledgebase_ids: set[str] | None = None
 
 
 def slugify_agent_id(text: str) -> str:
@@ -168,16 +181,28 @@ async def handle_agent_management_action(
             return await _get_agent(deps, actor_email, current_agent_id, arguments)
         if action == "settings_get":
             return await _settings_get(deps, actor_email, current_agent_id, arguments)
-        if action == "settings_schema":
-            return await _settings_schema(deps, actor_email, current_agent_id, arguments)
         if action == "settings_update":
             return await _settings_update(deps, actor_email, current_agent_id, arguments)
-        if action == "tools_list_available":
-            return await _tools_list_available()
+        if action == "runtime_profiles_list":
+            return await _runtime_profiles_list(deps, actor_email, current_agent_id, arguments)
+        if action == "runtime_profiles_get":
+            return await _runtime_profiles_get(deps, actor_email, current_agent_id, arguments)
+        if action in {"runtime_profiles_create", "runtime_profiles_update"}:
+            return await _runtime_profiles_write(
+                deps,
+                actor_email,
+                current_agent_id,
+                arguments,
+                create=action == "runtime_profiles_create",
+            )
+        if action == "runtime_profiles_delete":
+            return await _runtime_profiles_delete(deps, actor_email, current_agent_id, arguments)
+        if action == "runtime_profiles_default_set":
+            return await _runtime_profiles_default_set(
+                deps, actor_email, current_agent_id, arguments
+            )
         if action == "tools_get":
             return await _tools_get(deps, actor_email, current_agent_id, arguments)
-        if action == "tools_validate":
-            return await _tools_validate(deps, actor_email, current_agent_id, arguments)
         if action in {"tools_set", "tools_add", "tools_remove"}:
             return await _tools_update(
                 deps, actor_email, current_agent_id, arguments, mode=action.removeprefix("tools_")
@@ -230,6 +255,11 @@ async def _list_agents(
 ) -> dict[str, Any]:
     async with deps.session_factory() as session:
         rows = await list_agents(session, owner_email=actor_email)
+    agent_definitions = {
+        row.agent_id: AgentDefinition.model_validate(agent_to_response(row).model_dump())
+        for row in rows
+        if not getattr(row, "is_system", False)
+    }
     return {
         "status": "ok",
         "agents": [
@@ -240,6 +270,10 @@ async def _list_agents(
                 "agent_type": row.agent_type,
                 "status": row.status,
                 "manageable": row.agent_id != current_agent_id and not row.is_system,
+                "default_agent_profile_id": resolve_agent_profile(
+                    agent_definitions[row.agent_id]
+                ).profile_id,
+                "agent_profiles": agent_profile_options(agent_definitions[row.agent_id]),
             }
             for row in rows
             if not getattr(row, "is_system", False)
@@ -255,7 +289,7 @@ async def _get_agent(
 ) -> dict[str, Any]:
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
     agent = agent_to_response(row).model_dump(mode="json")
-    agent["settings"] = _agent_settings_payload(row)
+    agent["settings"] = _agent_settings_payload(row, deps)
     return {"status": "ok", "agent": agent}
 
 
@@ -269,21 +303,7 @@ async def _settings_get(
     return {
         "status": "ok",
         "agent_id": row.agent_id,
-        "settings": _agent_settings_payload(row),
-    }
-
-
-async def _settings_schema(
-    deps: AgentManagementDependencies,
-    actor_email: str,
-    current_agent_id: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
-    return {
-        "status": "ok",
-        "agent_id": row.agent_id,
-        "fields": await _agent_settings_schema(deps, actor_email, row),
+        "settings": _agent_settings_payload(row, deps),
     }
 
 
@@ -313,17 +333,454 @@ async def _settings_update(
     return {
         "status": "updated",
         "agent_id": row.agent_id,
-        "settings": _agent_settings_payload(row),
+        "settings": _agent_settings_payload(row, deps),
         "agent": agent_to_response(row).model_dump(mode="json"),
     }
 
 
-async def _tools_list_available() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "tool_groups": [_tool_group_payload(group) for group in TOOL_GROUP_DEFINITIONS],
-        "tools": [_tool_descriptor(tool) for tool in _available_agent_tool_definitions()],
+def _runtime_profiles_payload(row: Any) -> dict[str, Any]:
+    definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+    profiles = {
+        profile_id: profile.model_dump(mode="json")
+        for profile_id, profile in definition.agent_profiles.items()
     }
+    return {
+        "agent_id": row.agent_id,
+        "profiles": profiles,
+        "configured_default_profile_id": definition.default_agent_profile_id,
+        "effective_default_profile_id": resolve_agent_profile(definition).profile_id,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+async def _runtime_profiles_list(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    return {"status": "ok", **_runtime_profiles_payload(row)}
+
+
+async def _runtime_profiles_get(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    profile_id = _required_profile_id(arguments)
+    payload = _runtime_profiles_payload(row)
+    profile = payload["profiles"].get(profile_id)
+    if profile is None:
+        raise AgentManagementError("Runtime profile not found")
+    return {"status": "ok", **payload, "profile_id": profile_id, "profile": profile}
+
+
+async def _runtime_profiles_write(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+    *,
+    create: bool,
+) -> dict[str, Any]:
+    await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    profile_id = _required_profile_id(arguments)
+    raw_profile = arguments.get("profile")
+    if not isinstance(raw_profile, dict):
+        raise AgentManagementError("profile must be an object")
+
+    async with deps.session_factory() as session:
+        row = await get_agent(session, str(arguments["agent_id"]))
+        assert row is not None
+        _check_expected_updated_at(row, arguments)
+        profiles = _profile_map(row)
+        existing = profiles.get(profile_id)
+        if create and existing is not None:
+            raise AgentManagementError("Runtime profile already exists")
+        if not create and existing is None:
+            raise AgentManagementError("Runtime profile not found")
+        if "profile_id" in raw_profile and raw_profile["profile_id"] not in {None, profile_id}:
+            raise AgentManagementError(
+                "profile.profile_id must match profile_id and cannot be changed"
+            )
+        candidate = dict(existing or {})
+        candidate.update(raw_profile)
+        candidate["profile_id"] = profile_id
+        if (
+            existing is not None
+            and bool(existing.get("enabled", True))
+            and not bool(candidate.get("enabled", True))
+        ):
+            references = await live_agent_profile_references(session, row.agent_id, profile_id)
+            if references:
+                details = ", ".join(f"{kind}={count}" for kind, count in sorted(references.items()))
+                raise AgentManagementError(f"Runtime profile is in use: {details}")
+        profiles[profile_id] = await _validated_runtime_profile(
+            session, row, profile_id, candidate, profiles
+        )
+        await _persist_runtime_profile_updates(
+            session, row, arguments, {"agent_profiles": profiles}
+        )
+        await session.commit()
+        row = await get_agent(session, row.agent_id)
+        assert row is not None
+
+    action = "runtime_profiles_create" if create else "runtime_profiles_update"
+    await _publish_profile_updated(deps, row.agent_id)
+    await _audit(deps, actor_email, row.agent_id, action, "success", arguments)
+    payload = _runtime_profiles_payload(row)
+    return {
+        "status": "created" if create else "updated",
+        **payload,
+        "profile_id": profile_id,
+        "profile": payload["profiles"][profile_id],
+    }
+
+
+async def _runtime_profiles_default_set(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    requested = arguments.get("default_profile_id")
+    if requested is not None and (not isinstance(requested, str) or not requested.strip()):
+        raise AgentManagementError("default_profile_id must be a non-empty string or null")
+    profile_id = requested.strip() if isinstance(requested, str) else None
+    async with deps.session_factory() as session:
+        row = await get_agent(session, str(arguments["agent_id"]))
+        assert row is not None
+        _check_expected_updated_at(row, arguments)
+        profiles = _profile_map(row)
+        if profile_id is not None:
+            profile = profiles.get(profile_id)
+            if profile is None:
+                raise AgentManagementError("Runtime profile not found")
+            if not bool(profile.get("enabled", True)):
+                raise AgentManagementError("Default runtime profile must be enabled")
+        await _validate_runtime_profile_map(row, profiles, profile_id)
+        await _persist_runtime_profile_updates(
+            session, row, arguments, {"default_agent_profile_id": profile_id}
+        )
+        await session.commit()
+        row = await get_agent(session, row.agent_id)
+        assert row is not None
+    await _publish_profile_updated(deps, row.agent_id)
+    await _audit(
+        deps, actor_email, row.agent_id, "runtime_profiles_default_set", "success", arguments
+    )
+    return {"status": "updated", **_runtime_profiles_payload(row)}
+
+
+async def _runtime_profiles_delete(
+    deps: AgentManagementDependencies,
+    actor_email: str,
+    current_agent_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    profile_id = _required_profile_id(arguments)
+    replacement_profile_id = _optional_replacement_profile_id(arguments)
+    migrated_references: dict[str, int] = {}
+    async with deps.session_factory() as session:
+        row = await get_agent(session, str(arguments["agent_id"]))
+        assert row is not None
+        _check_expected_updated_at(row, arguments)
+        profiles = _profile_map(row)
+        if profile_id not in profiles:
+            raise AgentManagementError("Runtime profile not found")
+        if row.default_agent_profile_id == profile_id:
+            raise AgentManagementError("Cannot delete the configured default runtime profile")
+        if replacement_profile_id == profile_id:
+            raise AgentManagementError("Replacement runtime profile must be different")
+        if replacement_profile_id is not None:
+            replacement = profiles.get(replacement_profile_id)
+            if replacement is None:
+                raise AgentManagementError(
+                    "Replacement runtime profile must exist on the same agent"
+                )
+            if not bool(replacement.get("enabled", True)):
+                raise AgentManagementError("Replacement runtime profile must be enabled")
+        references = await live_agent_profile_references(session, row.agent_id, profile_id)
+        if references and replacement_profile_id is None:
+            details = ", ".join(f"{kind}={count}" for kind, count in sorted(references.items()))
+            raise AgentManagementError(f"Runtime profile is in use: {details}")
+        if replacement_profile_id is not None:
+            migrated_references = await _replace_live_agent_profile_references(
+                session,
+                row.agent_id,
+                profile_id,
+                replacement_profile_id,
+            )
+        del profiles[profile_id]
+        await _validate_runtime_profile_map(row, profiles, row.default_agent_profile_id)
+        await _persist_runtime_profile_updates(
+            session, row, arguments, {"agent_profiles": profiles}
+        )
+        await session.commit()
+        row = await get_agent(session, row.agent_id)
+        assert row is not None
+    await _publish_profile_updated(deps, row.agent_id)
+    audit_arguments = {
+        **arguments,
+        "replacement_profile_id": replacement_profile_id,
+        "migrated_references": migrated_references,
+    }
+    await _audit(
+        deps,
+        actor_email,
+        row.agent_id,
+        "runtime_profiles_delete",
+        "success",
+        audit_arguments,
+    )
+    return {
+        "status": "deleted",
+        **_runtime_profiles_payload(row),
+        "profile_id": profile_id,
+        "replacement_profile_id": replacement_profile_id,
+        "migrated_references": migrated_references,
+    }
+
+
+def _required_profile_id(arguments: dict[str, Any]) -> str:
+    profile_id = arguments.get("profile_id")
+    if not isinstance(profile_id, str) or not profile_id.strip() or "/" in profile_id:
+        raise AgentManagementError("profile_id must be a non-empty string without '/'")
+    return profile_id.strip()
+
+
+def _optional_replacement_profile_id(arguments: dict[str, Any]) -> str | None:
+    replacement_profile_id = arguments.get("replacement_profile_id")
+    if replacement_profile_id is None:
+        return None
+    if (
+        not isinstance(replacement_profile_id, str)
+        or not replacement_profile_id.strip()
+        or "/" in replacement_profile_id
+    ):
+        raise AgentManagementError("replacement_profile_id must be a non-empty string without '/'")
+    return replacement_profile_id.strip()
+
+
+def _profile_map(row: Any) -> dict[str, dict[str, Any]]:
+    definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+    return {
+        profile_id: profile.model_dump(mode="json")
+        for profile_id, profile in definition.agent_profiles.items()
+    }
+
+
+def _check_expected_updated_at(row: Any, arguments: dict[str, Any]) -> None:
+    expected = arguments.get("expected_updated_at")
+    if expected is None:
+        return
+    if not isinstance(expected, str):
+        raise AgentManagementError("expected_updated_at must be an ISO-8601 string")
+    try:
+        expected_at = datetime.fromisoformat(expected)
+    except ValueError as exc:
+        raise AgentManagementError("expected_updated_at must be an ISO-8601 string") from exc
+    if expected_at.tzinfo is None:
+        expected_at = expected_at.replace(tzinfo=UTC)
+    actual = row.updated_at
+    if actual is None:
+        raise AgentManagementError("Runtime profile update conflict; re-read the agent and retry")
+    if actual.tzinfo is None:
+        actual = actual.replace(tzinfo=UTC)
+    if expected_at.astimezone(UTC) != actual.astimezone(UTC):
+        raise AgentManagementError("Runtime profile update conflict; re-read the agent and retry")
+
+
+async def _validated_runtime_profile(
+    session: Any,
+    row: Any,
+    profile_id: str,
+    candidate: dict[str, Any],
+    profiles: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    try:
+        profile = AgentRuntimeProfile.model_validate(candidate)
+    except ValueError as exc:
+        raise AgentManagementError(f"Invalid runtime profile: {exc}") from exc
+    profiles[profile_id] = profile.model_dump(mode="json")
+    await _validate_runtime_profile_map(row, profiles, row.default_agent_profile_id)
+
+    providers = await list_llm_providers(session)
+    provider_ids = {provider.provider_id for provider in providers}
+    effective_provider = profile.provider_id
+    if effective_provider is None and isinstance(row.llm_config, dict):
+        effective_provider = _optional_string(row.llm_config.get("provider_id"))
+    if profile.provider_id is not None and profile.provider_id not in provider_ids:
+        raise AgentManagementError(f"Invalid provider_id: {profile.provider_id}")
+    if profile.model is not None and effective_provider is not None:
+        configured_models = {
+            provider.provider_id: _configured_provider_models(provider) for provider in providers
+        }
+        allowed_models = configured_models.get(effective_provider, set())
+        if allowed_models and profile.model not in allowed_models:
+            raise AgentManagementError(
+                f"Invalid model for provider {effective_provider}: {profile.model}"
+            )
+    return profiles[profile_id]
+
+
+async def _validate_runtime_profile_map(
+    row: Any,
+    profiles: dict[str, dict[str, Any]],
+    default_profile_id: str | None,
+) -> None:
+    _validate_unavailable_profile_memory_options(row, profiles)
+    candidate = agent_to_response(row).model_dump()
+    candidate["agent_profiles"] = profiles
+    candidate["default_agent_profile_id"] = default_profile_id
+    try:
+        definition = AgentDefinition.model_validate(candidate)
+        validate_agent_profile_configuration(definition)
+    except ValueError as exc:
+        raise AgentManagementError(f"Invalid runtime profile configuration: {exc}") from exc
+    if default_profile_id is not None:
+        default = definition.agent_profiles.get(default_profile_id)
+        if default is None:
+            raise AgentManagementError("Default runtime profile must exist")
+        if not default.enabled:
+            raise AgentManagementError("Default runtime profile must be enabled")
+
+
+def _validate_unavailable_profile_memory_options(
+    row: Any,
+    candidate_profiles: dict[str, dict[str, Any]],
+) -> None:
+    capabilities = row.capabilities if isinstance(row.capabilities, dict) else {}
+    backend_id = capabilities.get("memory_backend", "mnemory")
+    if not isinstance(backend_id, str):
+        raise AgentManagementError("Invalid memory_backend configuration")
+    try:
+        get_backend("memory", backend_id)
+        return
+    except ValueError:
+        pass
+
+    current_profiles = row.agent_profiles if isinstance(row.agent_profiles, dict) else {}
+
+    def _options_snapshot(profiles: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        snapshot: dict[str, dict[str, Any]] = {}
+        for profile_id, profile in profiles.items():
+            if not isinstance(profile_id, str) or not isinstance(profile, dict):
+                continue
+            options = profile.get("memory_backend_options")
+            if isinstance(options, dict) and options:
+                snapshot[profile_id] = dict(options)
+        return snapshot
+
+    if _options_snapshot(candidate_profiles) != _options_snapshot(current_profiles):
+        raise AgentManagementError(
+            f"Memory profile options cannot change while backend {backend_id!r} is unavailable"
+        )
+
+
+async def live_agent_profile_references(
+    session: Any,
+    agent_id: str,
+    profile_id: str,
+) -> dict[str, int]:
+    """Return persisted runtime-profile references that block removal or disabling."""
+
+    checks = {
+        "conversations": select(Conversation.conversation_id).where(
+            Conversation.agent_id == agent_id,
+            Conversation.agent_profile_id == profile_id,
+        ),
+        "sessions": select(Session.session_id).where(
+            Session.agent_id == agent_id,
+            Session.agent_profile_id == profile_id,
+        ),
+        "tasks": select(Task.task_id).where(
+            Task.agent_id == agent_id,
+            Task.agent_profile_id == profile_id,
+        ),
+        "schedules": select(Schedule.schedule_id).where(
+            Schedule.agent_id == agent_id,
+            Schedule.agent_profile_id == profile_id,
+        ),
+        "channel_accounts": select(ChannelAccountRow.account_id).where(
+            ChannelAccountRow.agent_id == agent_id,
+            ChannelAccountRow.default_agent_profile_id == profile_id,
+        ),
+    }
+    references: dict[str, int] = {}
+    for name, query in checks.items():
+        count = len((await session.execute(query)).scalars().all())
+        if count:
+            references[name] = count
+    return references
+
+
+async def _replace_live_agent_profile_references(
+    session: Any,
+    agent_id: str,
+    source_profile_id: str,
+    replacement_profile_id: str,
+) -> dict[str, int]:
+    """Replace exact live profile references for one agent and return affected counts."""
+
+    replacements = {
+        "conversations": (
+            Conversation,
+            Conversation.agent_profile_id,
+        ),
+        "sessions": (
+            Session,
+            Session.agent_profile_id,
+        ),
+        "tasks": (
+            Task,
+            Task.agent_profile_id,
+        ),
+        "schedules": (
+            Schedule,
+            Schedule.agent_profile_id,
+        ),
+        "channel_accounts": (
+            ChannelAccountRow,
+            ChannelAccountRow.default_agent_profile_id,
+        ),
+    }
+    migrated: dict[str, int] = {}
+    for name, (model, profile_column) in replacements.items():
+        result = await session.execute(
+            update(model)
+            .where(
+                model.agent_id == agent_id,
+                profile_column == source_profile_id,
+            )
+            .values({profile_column.key: replacement_profile_id})
+        )
+        migrated[name] = result.rowcount
+    return migrated
+
+
+async def _persist_runtime_profile_updates(
+    session: Any,
+    row: Any,
+    arguments: dict[str, Any],
+    updates: dict[str, Any],
+) -> None:
+    if arguments.get("expected_updated_at") is None:
+        ok = await update_agent(session, row.agent_id, updates=updates)
+    else:
+        ok = await update_agent_if_updated_at(
+            session,
+            row.agent_id,
+            expected_updated_at=row.updated_at,
+            updates=updates,
+        )
+    if not ok:
+        raise AgentManagementError("Runtime profile update conflict; re-read the agent and retry")
 
 
 async def _tools_get(
@@ -336,24 +793,7 @@ async def _tools_get(
     return {
         "status": "ok",
         "agent_id": row.agent_id,
-        "tools": _agent_tool_assignment_payload(row),
-    }
-
-
-async def _tools_validate(
-    deps: AgentManagementDependencies,
-    actor_email: str,
-    current_agent_id: str,
-    arguments: dict[str, Any],
-) -> dict[str, Any]:
-    row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
-    proposed = _tool_assignment_from_arguments(arguments, row)
-    validation = _validate_tool_assignment(row, proposed)
-    return {
-        "status": "ok",
-        "agent_id": row.agent_id,
-        **validation,
-        "effective_tools": _effective_assignment_tools(proposed),
+        "tools": _agent_tool_assignment_payload(row, deps),
     }
 
 
@@ -377,13 +817,15 @@ async def _tools_update(
             )
             for key in ("tool_groups", "allow_tools", "deny_tools")
         }
-    validation = _validate_tool_assignment(row, proposed)
+    validation = _validate_tool_assignment(row, proposed, deps.assignable_tools)
     if not validation["valid"]:
         return {
             "status": "invalid",
             "agent_id": row.agent_id,
             **validation,
-            "effective_tools": _effective_assignment_tools(proposed),
+            "effective_tools": _effective_assignment_tools(
+                proposed, _available_tool_map(deps.assignable_tools)
+            ),
         }
 
     tools = dict(row.tools) if isinstance(row.tools, dict) else {}
@@ -399,7 +841,7 @@ async def _tools_update(
     return {
         "status": "updated",
         "agent_id": row.agent_id,
-        "tools": _agent_tool_assignment_payload(row),
+        "tools": _agent_tool_assignment_payload(row, deps),
     }
 
 
@@ -462,6 +904,18 @@ async def _create_agent(
     name = str(arguments.get("name") or "").strip()
     if not name:
         raise AgentManagementError("name is required for create")
+    if deps.assignable_tools is None:
+        raise AgentManagementError(
+            "Caller-effective assignable tool inventory is required for create"
+        )
+    from cognis.api.runtime_support import static_tool_definitions
+
+    assignable_ids = {stable_tool_id(tool) for tool in deps.assignable_tools}
+    denied_static_ids = sorted(
+        stable_tool_id(tool)
+        for tool in static_tool_definitions(knowledgebase_enabled=True)
+        if stable_tool_id(tool) not in assignable_ids
+    )
     agent_id = str(arguments.get("agent_id") or slugify_agent_id(name)).strip()
     try:
         validate_agent_id(agent_id)
@@ -471,10 +925,26 @@ async def _create_agent(
     avatar_image_id = arguments.get("avatar_image_id")
     if arguments.get("generate_avatar"):
         avatar_image_id = await _generate_avatar(deps, actor_email, arguments)
+    assigned_knowledgebases = _validated_string_list(
+        arguments.get("assigned_knowledgebases", []),
+        "assigned_knowledgebases",
+    )
 
     async with deps.session_factory() as session:
         if await get_agent(session, agent_id) is not None:
             raise AgentManagementError("Agent already exists")
+        available_knowledgebases = await list_knowledgebases(
+            session,
+            owner_email=actor_email,
+        )
+        available_knowledgebase_ids = {row.knowledgebase_id for row in available_knowledgebases}
+        if deps.assignable_knowledgebase_ids is not None:
+            available_knowledgebase_ids &= deps.assignable_knowledgebase_ids
+        invalid_knowledgebases = sorted(set(assigned_knowledgebases) - available_knowledgebase_ids)
+        if invalid_knowledgebases:
+            raise AgentManagementError(
+                "Invalid assigned_knowledgebases: " + ", ".join(invalid_knowledgebases)
+            )
         row = await create_agent(
             session,
             agent_id=agent_id,
@@ -484,11 +954,24 @@ async def _create_agent(
             description=_optional_string(arguments.get("description")),
             system_prompt=_optional_string(arguments.get("system_prompt")),
             personality=_optional_dict(arguments.get("personality")),
-            skills=_optional_dict(arguments.get("skills")),
-            tools=_optional_dict(arguments.get("tools")),
-            permissions=_optional_dict(arguments.get("permissions")),
-            llm_config=_optional_dict(arguments.get("llm_config")),
-            execution=_optional_dict(arguments.get("execution")),
+            skills=None,
+            tools={
+                "tool_groups": [],
+                "builtin_tools": sorted(
+                    stable_tool_id(tool)
+                    for tool in deps.assignable_tools
+                    if tool.source.type == "builtin"
+                ),
+                "allow_tools": sorted(assignable_ids),
+                "deny_tools": denied_static_ids,
+            },
+            permissions=(
+                {"allowed_knowledgebases": assigned_knowledgebases}
+                if assigned_knowledgebases
+                else None
+            ),
+            llm_config=None,
+            execution=None,
             avatar_image_id=_optional_string(avatar_image_id),
             agent_type=str(arguments.get("agent_type") or "primary"),
             status=str(arguments.get("status") or "draft"),
@@ -818,32 +1301,36 @@ def _agent_updates(arguments: dict[str, Any]) -> dict[str, Any]:
         "description",
         "system_prompt",
         "personality",
-        "skills",
-        "tools",
-        "permissions",
-        "llm_config",
-        "execution",
         "avatar_image_id",
         "status",
     }
     return {key: arguments[key] for key in allowed if key in arguments}
 
 
-def _agent_settings_payload(row: Any) -> dict[str, Any]:
+def _agent_settings_payload(
+    row: Any, deps: AgentManagementDependencies | None = None
+) -> dict[str, Any]:
     tools = row.tools if isinstance(row.tools, dict) else None
     skills = row.skills if isinstance(row.skills, dict) else None
     permissions = row.permissions if isinstance(row.permissions, dict) else None
     llm_config = row.llm_config if isinstance(row.llm_config, dict) else None
     execution = row.execution if isinstance(row.execution, dict) else None
+    capabilities = row.capabilities if isinstance(row.capabilities, dict) else {}
     return {
         "tools": tools,
         "tools_state": _tools_state(tools, raw_value=row.tools),
-        "tool_assignment": _agent_tool_assignment_payload(row),
+        "tool_assignment": _agent_tool_assignment_payload(row, deps),
         "skills": skills,
         "enabled_skills": _enabled_skill_ids(skills),
         "permissions": permissions,
         "llm_config": llm_config,
         "execution": execution,
+        "capabilities": capabilities,
+        "memory": {
+            "backend": capabilities.get("memory_backend", "mnemory"),
+            "options": capabilities.get("memory_backend_options", {}),
+            "backends": memory_backend_descriptors(),
+        },
         "workflow": {
             "available_workflow_ids": _string_list(execution.get("available_workflow_ids"))
             if execution
@@ -897,185 +1384,32 @@ def _tools_state(tools: dict[str, Any] | None, *, raw_value: Any) -> dict[str, A
     }
 
 
-async def _agent_settings_schema(
-    deps: AgentManagementDependencies, actor_email: str, row: Any
+def _validated_memory_capabilities(
+    capabilities: dict[str, Any],
+    settings: dict[str, Any],
 ) -> dict[str, Any]:
-    from cognis.api.runtime_support import static_tool_definitions
+    """Apply backend/options atomically and return normalized capabilities."""
 
-    async with deps.session_factory() as session:
-        workflows = await list_workflows(session, owner_email=actor_email)
-        skills = await list_skills(session, owner_email=actor_email)
-        executors = await list_executors(session, owner_email=actor_email, include_shared=True)
-        providers = await list_llm_providers(session)
-
-    tool_options = [
-        {
-            "id": stable_tool_id(tool),
-            "name": tool.name,
-            "label": tool.name,
-            "category": tool.category,
-            "source": tool.source.model_dump(mode="json"),
-        }
-        for tool in static_tool_definitions(knowledgebase_enabled=True)
-    ]
-    fields: dict[str, Any] = {
-        "available_workflow_ids": {
-            "type": "multi_select",
-            "storage": "execution.available_workflow_ids",
-            "options": [
-                {"id": item.workflow_id, "label": item.name, "is_system": item.is_system}
-                for item in workflows
-            ],
-        },
-        "default_workflow_id": {
-            "type": "enum",
-            "nullable": True,
-            "storage": "execution.default_workflow_id",
-            "options": [
-                {"id": item.workflow_id, "label": item.name, "is_system": item.is_system}
-                for item in workflows
-            ],
-        },
-        "workflow_selection_mode": {
-            "type": "enum",
-            "storage": "execution.workflow_selection_mode",
-            "options": [
-                {"id": "automatic", "label": "automatic"},
-                {"id": "always_ask", "label": "always_ask"},
-                {"id": "use_default", "label": "use_default"},
-            ],
-        },
-        "step_agent_overrides": {"type": "object", "storage": "execution.step_agent_overrides"},
-        "executor_id": {
-            "type": "enum",
-            "nullable": True,
-            "storage": "execution.executor_id",
-            "options": [
-                {
-                    "id": item.executor_id,
-                    "label": item.name,
-                    "executor_type": item.executor_type,
-                    "is_default": item.is_default,
-                    "labels": item.labels or {},
-                }
-                for item in executors
-            ],
-        },
-        "executor_selector": {"type": "object", "storage": "execution.executor_selector"},
-        "additional_executors": {"type": "list", "storage": "execution.additional_executors"},
-        "provider_id": {
-            "type": "enum",
-            "nullable": True,
-            "storage": "llm_config.provider_id",
-            "options": [
-                {"id": item.provider_id, "label": item.display_name, "location": item.location}
-                for item in providers
-            ],
-        },
-        "model": {"type": "string", "nullable": True, "storage": "llm_config.model"},
-        "temperature": {"type": "number", "nullable": True, "storage": "llm_config.temperature"},
-        "max_tokens": {"type": "integer", "nullable": True, "storage": "llm_config.max_tokens"},
-        "reasoning_effort": {
-            "type": "string",
-            "nullable": True,
-            "storage": "llm_config.reasoning_effort",
-        },
-        "voice": {"type": "string", "nullable": True, "storage": "llm_config.voice"},
-        "builtin_tools": {
-            "type": "multi_select",
-            "nullable": True,
-            "storage": "tools.builtin_tools",
-            "options": [{"id": "*", "label": "All non-default-off built-in tools"}, *tool_options],
-        },
-        "opt_in_builtin_tools": {
-            "type": "multi_select",
-            "storage": "tools.opt_in_builtin_tools",
-            "options": [
-                option for option in tool_options if option["id"] == "builtin:manage_agents"
-            ],
-        },
-        "disabled_categories": {
-            "type": "multi_select",
-            "storage": "tools.disabled_categories",
-            "options": [
-                {"id": category, "label": category}
-                for category in sorted({str(option["category"]) for option in tool_options})
-            ],
-        },
-        "disabled_tools": {
-            "type": "multi_select",
-            "storage": "tools.disabled_tools",
-            "options": tool_options,
-        },
-        "disabled_mcp_servers": {
-            "type": "multi_select",
-            "storage": "tools.disabled_mcp_servers",
-            "options": [],
-        },
-        "tool_groups": {
-            "type": "multi_select",
-            "storage": "tools.tool_groups",
-            "options": [
-                {
-                    "id": group.group_id,
-                    "label": group.name,
-                    "risk_level": group.risk_level,
-                    "mutating": group.mutating,
-                }
-                for group in TOOL_GROUP_DEFINITIONS
-            ],
-        },
-        "allow_tools": {
-            "type": "multi_select",
-            "storage": "tools.allow_tools",
-            "options": tool_options,
-        },
-        "deny_tools": {
-            "type": "multi_select",
-            "storage": "tools.deny_tools",
-            "options": tool_options,
-        },
-        "intaris_mcp_servers": {
-            "type": "multi_select",
-            "storage": "tools.intaris_mcp_servers",
-            "options": await _intaris_mcp_server_options(deps),
-        },
-        "mcp_servers": {"type": "list", "storage": "tools.mcp_servers"},
-        "enabled_skills": {
-            "type": "multi_select",
-            "storage": "skills.items",
-            "options": [
-                {
-                    "id": item.skill_id,
-                    "label": item.name,
-                    "is_system": item.is_system,
-                    "attach_to_all_agents": item.auto_load,
-                }
-                for item in skills
-            ],
-        },
-        "tool_permissions": {"type": "object", "storage": "permissions.tool_permissions"},
-        "allowed_knowledgebases": {
-            "type": "multi_select",
-            "storage": "permissions.allowed_knowledgebases",
-            "options": await _available_knowledgebase_options(deps, actor_email),
-        },
-        "allowed_secrets": {"type": "multi_select", "storage": "permissions.allowed_secrets"},
-        "allowed_credentials": {
-            "type": "multi_select",
-            "storage": "permissions.allowed_credentials",
-        },
-        "can_delegate": {"type": "boolean", "storage": "permissions.can_delegate"},
-        "max_delegation_depth": {"type": "integer", "storage": "permissions.max_delegation_depth"},
-        "tools": {"type": "object", "storage": "tools", "advanced": True},
-        "skills": {"type": "object", "storage": "skills", "advanced": True},
-        "permissions": {"type": "object", "storage": "permissions", "advanced": True},
-        "llm_config": {"type": "object", "storage": "llm_config", "advanced": True},
-        "execution": {"type": "object", "storage": "execution", "advanced": True},
-    }
-    if getattr(row, "agent_type", "primary") == "secondary":
-        fields["opt_in_builtin_tools"]["readonly_reason"] = "secondary agents cannot manage agents"
-    return fields
+    candidate = dict(capabilities)
+    if "memory_backend" in settings:
+        candidate["memory_backend"] = settings["memory_backend"]
+    if "memory_backend_options" in settings:
+        candidate["memory_backend_options"] = settings["memory_backend_options"]
+    elif candidate.get("memory_backend") == "none":
+        candidate["memory_backend_options"] = {}
+    try:
+        validated = AgentCapabilities.model_validate(candidate).model_dump(mode="json")
+    except ValueError as exc:
+        raise AgentManagementError(str(exc)) from exc
+    backend_id = validated["memory_backend"]
+    try:
+        get_backend("memory", backend_id)
+    except ValueError:
+        current_backend = capabilities.get("memory_backend")
+        current_options = capabilities.get("memory_backend_options", {})
+        if backend_id != current_backend or validated["memory_backend_options"] != current_options:
+            raise AgentManagementError(f"Unknown memory_backend {backend_id!r}") from None
+    return validated
 
 
 async def _settings_updates(
@@ -1089,7 +1423,7 @@ async def _settings_updates(
         raise AgentManagementError(
             "Unsupported settings field(s): "
             + ", ".join(unknown)
-            + ". Call settings_schema to discover valid fields."
+            + ". Call describe_tool for manage_agents to inspect supported operations."
         )
 
     async with deps.session_factory() as session:
@@ -1106,17 +1440,36 @@ async def _settings_updates(
                 session, owner_email=actor_email, include_shared=True
             )
         }
-        provider_ids = {provider.provider_id for provider in await list_llm_providers(session)}
+        providers = await list_llm_providers(session)
+        provider_ids = {provider.provider_id for provider in providers}
+        provider_models = {
+            provider.provider_id: _configured_provider_models(provider) for provider in providers
+        }
 
     tools = dict(row.tools) if isinstance(row.tools, dict) else {}
     skills = dict(row.skills) if isinstance(row.skills, dict) else {}
     permissions = dict(row.permissions) if isinstance(row.permissions, dict) else {}
     llm_config = dict(row.llm_config) if isinstance(row.llm_config, dict) else {}
     execution = dict(row.execution) if isinstance(row.execution, dict) else {}
-
+    capabilities = dict(row.capabilities) if isinstance(row.capabilities, dict) else {}
     updates: dict[str, Any] = {}
     raw_updates: dict[str, Any] = {}
-    for field, value in settings.items():
+    memory_fields = {"memory_backend", "memory_backend_options"}
+    if memory_fields.intersection(settings):
+        capabilities = _validated_memory_capabilities(capabilities, settings)
+        updates["capabilities"] = capabilities
+
+    ordered_settings = sorted(
+        settings.items(),
+        key=lambda item: (
+            0
+            if item[0] in {"provider_id", "available_workflow_ids"}
+            else 1
+            if item[0] in {"model", "default_workflow_id"}
+            else 2
+        ),
+    )
+    for field, value in ordered_settings:
         if field in {"tools", "skills", "permissions", "llm_config", "execution"}:
             raw_updates[field] = _nullable_object(value, field)
         elif field == "enabled_skills":
@@ -1142,8 +1495,18 @@ async def _settings_updates(
             "reasoning_effort",
             "voice",
         }:
-            _apply_llm_setting(llm_config, field, value, provider_ids)
+            _apply_llm_setting(
+                llm_config,
+                field,
+                value,
+                provider_ids,
+                provider_models,
+            )
             updates["llm_config"] = llm_config
+        elif field in {"memory_backend", "memory_backend_options"}:
+            # Validated atomically above so backend/options transitions do not
+            # depend on input field order.
+            continue
         elif field in {
             "builtin_tools",
             "opt_in_builtin_tools",
@@ -1156,7 +1519,7 @@ async def _settings_updates(
             "intaris_mcp_servers",
             "mcp_servers",
         }:
-            _apply_tools_setting(tools, field, value, row)
+            _apply_tools_setting(tools, field, value, row, deps.assignable_tools)
             updates["tools"] = tools
         elif field in {
             "tool_permissions",
@@ -1176,38 +1539,14 @@ def _settings_field_names() -> set[str]:
         "available_workflow_ids",
         "default_workflow_id",
         "workflow_selection_mode",
-        "step_agent_overrides",
-        "executor_id",
-        "executor_selector",
-        "additional_executors",
         "provider_id",
         "model",
         "temperature",
         "max_tokens",
         "reasoning_effort",
         "voice",
-        "builtin_tools",
-        "opt_in_builtin_tools",
-        "disabled_categories",
-        "disabled_tools",
-        "disabled_mcp_servers",
-        "tool_groups",
-        "allow_tools",
-        "deny_tools",
-        "intaris_mcp_servers",
-        "mcp_servers",
-        "enabled_skills",
-        "tool_permissions",
-        "allowed_knowledgebases",
-        "allowed_secrets",
-        "allowed_credentials",
-        "can_delegate",
-        "max_delegation_depth",
-        "tools",
-        "skills",
-        "permissions",
-        "llm_config",
-        "execution",
+        "memory_backend",
+        "memory_backend_options",
     }
 
 
@@ -1241,11 +1580,22 @@ def _apply_execution_setting(
 
 
 def _apply_llm_setting(
-    llm_config: dict[str, Any], field: str, value: Any, provider_ids: set[str]
+    llm_config: dict[str, Any],
+    field: str,
+    value: Any,
+    provider_ids: set[str],
+    provider_models: dict[str, set[str]],
 ) -> None:
     if field == "provider_id":
         llm_config[field] = _nullable_enum(value, field, valid=provider_ids)
-    elif field in {"model", "reasoning_effort", "voice"}:
+    elif field == "model":
+        model = _nullable_string(value, field)
+        provider_id = llm_config.get("provider_id")
+        allowed_models = provider_models.get(provider_id, set())
+        if model is not None and allowed_models and model not in allowed_models:
+            raise AgentManagementError(f"Invalid model for provider {provider_id}: {model}")
+        llm_config[field] = model
+    elif field in {"reasoning_effort", "voice"}:
         llm_config[field] = _nullable_string(value, field)
     elif field == "temperature":
         if value is not None and not isinstance(value, (int, float)):
@@ -1257,18 +1607,43 @@ def _apply_llm_setting(
         llm_config[field] = value
 
 
-def _apply_tools_setting(tools: dict[str, Any], field: str, value: Any, row: Any) -> None:
+def _configured_provider_models(provider: Any) -> set[str]:
+    config = provider.config if isinstance(provider.config, dict) else {}
+    raw_models = config.get("models")
+    if not isinstance(raw_models, list):
+        return set()
+    values = {str(item) for item in raw_models if isinstance(item, str) and item}
+    values.update(
+        str(item.get("model_id") or item.get("id") or item.get("model"))
+        for item in raw_models
+        if isinstance(item, dict) and (item.get("model_id") or item.get("id") or item.get("model"))
+    )
+    return values
+
+
+def _apply_tools_setting(
+    tools: dict[str, Any],
+    field: str,
+    value: Any,
+    row: Any,
+    assignable_tools: list[Any] | None,
+) -> None:
     if field == "builtin_tools":
         tools[field] = None if value is None else _validated_string_list(value, field)
     elif field == "opt_in_builtin_tools":
         selected = _validated_string_list(
-            value, field, valid={"manage_agents", "builtin:manage_agents"}
+            value,
+            field,
+            valid={
+                "manage_agents",
+                "builtin:manage_agents",
+                "manage_mcp",
+                "builtin:manage_mcp",
+            },
         )
         if selected and getattr(row, "agent_type", "primary") == "secondary":
-            raise AgentManagementError("secondary agents cannot opt into manage_agents")
-        tools[field] = [
-            "manage_agents" if item == "builtin:manage_agents" else item for item in selected
-        ]
+            raise AgentManagementError("secondary agents cannot opt into management tools")
+        tools[field] = [item.removeprefix("builtin:") for item in selected]
     elif field in {
         "disabled_categories",
         "disabled_tools",
@@ -1279,7 +1654,7 @@ def _apply_tools_setting(tools: dict[str, Any], field: str, value: Any, row: Any
     elif field == "tool_groups":
         tools[field] = _validated_string_list(value, field, valid=set(_tool_group_map()))
     elif field in {"allow_tools", "deny_tools"}:
-        valid_tools = set(_available_tool_map())
+        valid_tools = set(_available_tool_map(assignable_tools))
         tools[field] = _validated_string_list(value, field, valid=valid_tools)
     elif field == "mcp_servers":
         if not isinstance(value, list):
@@ -1382,24 +1757,22 @@ def _tool_assignment_from_arguments(
     }
 
 
-def _agent_tool_assignment_payload(row: Any) -> dict[str, Any]:
+def _agent_tool_assignment_payload(
+    row: Any, deps: AgentManagementDependencies | None = None
+) -> dict[str, Any]:
     configured = _configured_tool_assignment(row)
-    validation = _validate_tool_assignment(row, configured)
+    assignable_tools = deps.assignable_tools if deps is not None else None
+    validation = _validate_tool_assignment(row, configured, assignable_tools)
+    tool_map = _available_tool_map(assignable_tools)
     return {
         "configured": configured,
-        "effective_tools": _effective_assignment_tools(configured),
+        "effective_tools": _effective_assignment_tools(configured, tool_map),
         "validation": validation,
     }
 
 
-def _available_agent_tool_definitions() -> list[Any]:
-    from cognis.api.runtime_support import static_tool_definitions
-
-    return sorted(static_tool_definitions(knowledgebase_enabled=True), key=stable_tool_id)
-
-
-def _available_tool_map() -> dict[str, Any]:
-    tools = _available_agent_tool_definitions()
+def _available_tool_map(assignable_tools: list[Any] | None) -> dict[str, Any]:
+    tools = assignable_tools or []
     mapping: dict[str, Any] = {}
     for tool in tools:
         mapping[stable_tool_id(tool)] = tool
@@ -1411,75 +1784,59 @@ def _tool_group_map() -> dict[str, ToolGroupDefinition]:
     return {group.group_id: group for group in TOOL_GROUP_DEFINITIONS}
 
 
-def _tool_group_payload(group: ToolGroupDefinition) -> dict[str, Any]:
-    return {
-        "id": group.group_id,
-        "name": group.name,
-        "description": group.description,
-        "tools": list(group.tool_ids),
-        "risk_level": group.risk_level,
-        "mutating": group.mutating,
-        "requires_executor": group.requires_executor,
-    }
-
-
-def _tool_descriptor(tool: Any) -> dict[str, Any]:
-    capabilities = sorted(str(capability) for capability in tool_capabilities(tool))
-    group_ids = [
-        group.group_id
-        for group in TOOL_GROUP_DEFINITIONS
-        if any(tool_matches_identifier(tool, identifier) for identifier in group.tool_ids)
-    ]
-    mutating = not tool.read_only or any(
-        capability in tool_capabilities(tool)
-        for capability in {ToolCapability.WRITE, ToolCapability.DESTRUCTIVE}
-    )
-    return {
-        "id": stable_tool_id(tool),
-        "name": tool.name,
-        "description": tool.description,
-        "category": tool.category,
-        "profile_group": tool.profile_group,
-        "source": tool.source.type,
-        "read_only": tool.read_only,
-        "mutating": mutating,
-        "risk_level": tool.risk_level
-        or (
-            "high"
-            if ToolCapability.PRIVILEGED in tool_capabilities(tool)
-            else "medium"
-            if mutating
-            else "low"
-        ),
-        "capabilities": capabilities,
-        "requires_executor": tool.source.type == "executor",
-        "default_off": tool.name == "manage_agents",
-        "group_ids": group_ids,
-    }
-
-
-def _validate_tool_assignment(row: Any, configured: dict[str, list[str]]) -> dict[str, Any]:
+def _validate_tool_assignment(
+    row: Any,
+    configured: dict[str, list[str]],
+    assignable_tools: list[Any] | None,
+) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
-    tools = _available_tool_map()
+    tools = _available_tool_map(assignable_tools)
+    if assignable_tools is None:
+        return {
+            "valid": False,
+            "errors": [
+                {
+                    "field": "tools",
+                    "id": "",
+                    "reason": "Caller-effective assignable tool inventory is unavailable",
+                }
+            ],
+            "warnings": [],
+        }
     groups = _tool_group_map()
     for group_id in configured["tool_groups"]:
         if group_id not in groups:
             errors.append({"field": "tool_groups", "id": group_id, "reason": "Unknown tool group"})
+            continue
+        unavailable = sorted(
+            tool_id for tool_id in groups[group_id].tool_ids if tool_id not in tools
+        )
+        if unavailable:
+            errors.append(
+                {
+                    "field": "tool_groups",
+                    "id": group_id,
+                    "reason": (
+                        "Tool group exceeds caller-effective assignable inventory: "
+                        + ", ".join(unavailable)
+                    ),
+                }
+            )
     for field in ("allow_tools", "deny_tools"):
         for tool_id in configured[field]:
             if tool_id not in tools:
                 errors.append({"field": field, "id": tool_id, "reason": "Unknown tool"})
     overlap = sorted(
-        set(_normalize_tool_identifier(item) for item in configured["allow_tools"])
-        & set(_normalize_tool_identifier(item) for item in configured["deny_tools"])
+        set(_normalize_tool_identifier(item, tools) for item in configured["allow_tools"])
+        & set(_normalize_tool_identifier(item, tools) for item in configured["deny_tools"])
     )
     for tool_id in overlap:
         errors.append(
             {"field": "tools", "id": tool_id, "reason": "Tool cannot be both allowed and denied"}
         )
     if getattr(row, "agent_type", "primary") == "secondary":
-        for tool_id in _effective_assignment_tools(configured):
+        for tool_id in _effective_assignment_tools(configured, tools):
             tool = tools.get(tool_id)
             if tool and tool.name == "manage_agents":
                 errors.append(
@@ -1491,7 +1848,7 @@ def _validate_tool_assignment(row: Any, configured: dict[str, list[str]]) -> dic
                 )
     if any(
         tool_id.startswith("builtin:knowledgebase_")
-        for tool_id in _effective_assignment_tools(configured)
+        for tool_id in _effective_assignment_tools(configured, tools)
     ) and not _assigned_knowledgebase_ids(row):
         warnings.append(
             {
@@ -1502,7 +1859,9 @@ def _validate_tool_assignment(row: Any, configured: dict[str, list[str]]) -> dic
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
 
-def _effective_assignment_tools(configured: dict[str, list[str]]) -> list[str]:
+def _effective_assignment_tools(
+    configured: dict[str, list[str]], tools: dict[str, Any]
+) -> list[str]:
     groups = _tool_group_map()
     selected: list[str] = []
     for group_id in configured["tool_groups"]:
@@ -1510,17 +1869,17 @@ def _effective_assignment_tools(configured: dict[str, list[str]]) -> list[str]:
         if group:
             selected.extend(group.tool_ids)
     selected.extend(configured["allow_tools"])
-    denied = set(_normalize_tool_identifier(item) for item in configured["deny_tools"])
+    denied = set(_normalize_tool_identifier(item, tools) for item in configured["deny_tools"])
     normalized: list[str] = []
     for tool_id in selected:
-        stable_id = _normalize_tool_identifier(tool_id)
+        stable_id = _normalize_tool_identifier(tool_id, tools)
         if stable_id not in denied and stable_id not in normalized:
             normalized.append(stable_id)
     return normalized
 
 
-def _normalize_tool_identifier(identifier: str) -> str:
-    tool = _available_tool_map().get(identifier)
+def _normalize_tool_identifier(identifier: str, tools: dict[str, Any]) -> str:
+    tool = tools.get(identifier)
     return stable_tool_id(tool) if tool else identifier
 
 
@@ -1545,6 +1904,8 @@ async def _available_knowledgebase_options(
 ) -> list[dict[str, Any]]:
     async with deps.session_factory() as session:
         rows = await list_knowledgebases(session, owner_email=actor_email)
+    if deps.assignable_knowledgebase_ids is not None:
+        rows = [row for row in rows if row.knowledgebase_id in deps.assignable_knowledgebase_ids]
     return [{"id": row.knowledgebase_id, "name": row.name, "status": row.status} for row in rows]
 
 
@@ -1719,6 +2080,9 @@ async def _audit(
         "operation": operation,
         "outcome": outcome,
         "target_agent_id": arguments.get("agent_id"),
+        "profile_id": arguments.get("profile_id"),
+        "replacement_profile_id": arguments.get("replacement_profile_id"),
+        "migrated_references": arguments.get("migrated_references"),
         "grant_id": arguments.get("grant_id"),
         "grantee_email": arguments.get("grantee_email"),
     }

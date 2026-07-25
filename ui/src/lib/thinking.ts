@@ -5,7 +5,8 @@ export const GENERIC_THINKING_EFFORTS = [
   'medium',
   'high',
   'xhigh',
-  'max'
+  'max',
+  'ultra'
 ] as const;
 
 export function thinkingEffortLabel(value: string): string {

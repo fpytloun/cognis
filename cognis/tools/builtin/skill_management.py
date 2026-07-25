@@ -18,9 +18,13 @@ from cognis.models.skill import (
     SkillAssetRef,
     SkillToolSpec,
 )
-from cognis.models.tool import ToolDefinition, ToolResult, ToolSource, stable_tool_id
+from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.models.tool import ToolResult, ToolSource, stable_tool_id
 from cognis.tools.skill_service import (
+    apply_mapping_patch,
+    apply_named_list_patch,
     asset_refs_to_inputs,
+    cleanup_unpublished_skill_assets,
     compute_decomposition_source_hash,
     create_skill_version_with_assets,
     export_cognis_package,
@@ -53,6 +57,7 @@ def skill_management_tools() -> list[ToolDefinition]:
         SKILL_GET_TOOL,
         SKILL_VERSIONS_TOOL,
         SKILL_WRITE_TOOL,
+        SKILL_PATCH_TOOL,
         SKILL_ASSET_WRITE_TOOL,
         SKILL_ASSET_DELETE_TOOL,
         SKILL_DELETE_TOOL,
@@ -207,6 +212,41 @@ SKILL_WRITE_TOOL = ToolDefinition(
             },
         },
         "required": ["name", "instructions"],
+    },
+    source=_SKILL_SOURCE,
+    category="skill",
+    read_only=False,
+    non_bypassable=True,
+    timeout_seconds=30,
+)
+
+SKILL_PATCH_TOOL = ToolDefinition(
+    name="skill_patch",
+    description=(
+        "Partially update an existing skill. Omitted fields remain unchanged; nested "
+        "prompt_templates use set/remove and tools, steps, and assets use upsert/remove. "
+        "Creates an immutable version only when versioned content changes. Use skill_write "
+        "for creation or complete replacement."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "skill_id": {"type": "string"},
+            "expected_current_version_id": {"type": "string"},
+            "expected_content_hash": {"type": "string"},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "instructions": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "attach_to_all_agents": {"type": "boolean"},
+            "linked_tool_ids": {"type": "array", "items": {"type": "string"}},
+            "secret_placeholders": {"type": "array", "items": {"type": "string"}},
+            "prompt_templates": {"type": "object"},
+            "tools": {"type": "object"},
+            "steps": {"type": "object"},
+            "assets": {"type": "object"},
+        },
+        "required": ["skill_id"],
     },
     source=_SKILL_SOURCE,
     category="skill",
@@ -380,6 +420,7 @@ _SKILL_TOOL_NAMES = {
     "skill_get",
     "skill_versions",
     "skill_write",
+    "skill_patch",
     "skill_asset_write",
     "skill_asset_delete",
     "skill_delete",
@@ -518,6 +559,9 @@ def materialize_loaded_skill_context(
     tags: list[str] | None,
     linked_tool_ids: list[str] | None,
     attach_to_all_agents: bool = False,
+    version_id: str | None = None,
+    version_number: int | None = None,
+    content_hash: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build the protected context and activation metadata for a loaded skill."""
 
@@ -601,7 +645,18 @@ def materialize_loaded_skill_context(
         "message": "Skill loaded into working context for this turn.",
         "tags": tags or [],
         "linked_tool_ids": linked_tool_ids or [],
+        "version_id": version_id,
+        "version_number": version_number,
+        "content_hash": content_hash or "",
     }
+    from cognis.core.daily_brief_contract import daily_brief_contract_version
+
+    contract_version = daily_brief_contract_version(
+        name=name,
+        prompt_templates=templates,
+        instructions=instructions,
+    )
+    result["contract_version"] = contract_version
     metadata = {
         "protected_context": "\n".join(protected_context_parts),
         "discovered_tool_ids": declared_tool_ids,
@@ -612,6 +667,10 @@ def materialize_loaded_skill_context(
             "description": description,
             "instructions": instructions,
             "tags": tags or [],
+            "version_id": version_id,
+            "version_number": version_number,
+            "content_hash": content_hash or "",
+            "contract_version": contract_version,
         },
     }
     return result, metadata
@@ -649,6 +708,10 @@ async def handle_skill_management_tool(
                 llm=llm,
                 artifact_store=artifact_store,
                 current_agent_id=current_agent_id,
+            )
+        if tool_name == "skill_patch":
+            return await _handle_skill_patch(
+                session_factory, user_email, arguments, artifact_store=artifact_store
             )
         if tool_name == "skill_asset_write":
             return await _handle_skill_asset_write(
@@ -870,6 +933,9 @@ async def _handle_skill_load(
         tags=row.tags or [],
         linked_tool_ids=row.linked_tool_ids,
         attach_to_all_agents=row.auto_load,
+        version_id=version_row.version_id if version_row is not None else None,
+        version_number=version_row.version_number if version_row is not None else None,
+        content_hash=version_row.content_hash if version_row is not None else None,
     )
     declared_tool_ids = metadata.get("discovered_tool_ids", [])
     skill_activation = metadata.get("skill_activation")
@@ -1294,6 +1360,208 @@ async def _handle_skill_write(
         ),
     }
     return ToolResult(output=json.dumps(result, indent=2), metadata=metadata or None)
+
+
+async def _handle_skill_patch(
+    session_factory: Any,
+    user_email: str,
+    arguments: dict[str, Any],
+    *,
+    artifact_store: Any | None,
+) -> ToolResult:
+    """Apply an explicit partial patch to the current immutable skill version."""
+
+    import json
+
+    from cognis.store.queries import (
+        get_next_version_number,
+        get_skill_scoped,
+        set_current_version_if_matches,
+        update_skill,
+    )
+
+    if artifact_store is None:
+        return ToolResult(output="Skill management requires artifact support.", is_error=True)
+    skill_id = str(arguments.get("skill_id", "")).strip()
+    if not skill_id:
+        return ToolResult(output="skill_id is required", is_error=True)
+    mutation_keys = set(arguments) - {
+        "skill_id",
+        "expected_current_version_id",
+        "expected_content_hash",
+    }
+    if not mutation_keys:
+        return ToolResult(output="No patch operations provided", is_error=True)
+
+    async with session_factory() as session:
+        row = await get_skill_scoped(session, skill_id, owner_email=user_email)
+        if row is None:
+            return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
+        if row.is_system:
+            return ToolResult(output="Cannot modify system skills directly", is_error=True)
+        current = await resolve_current_skill_version(session, row)
+        if current is None:
+            return ToolResult(
+                output="version_conflict: skill has no current version", is_error=True
+            )
+        if (
+            arguments.get("expected_current_version_id") is not None
+            and arguments["expected_current_version_id"] != current.version_id
+        ) or (
+            arguments.get("expected_content_hash") is not None
+            and arguments["expected_content_hash"] != current.content_hash
+        ):
+            return ToolResult(
+                output="version_conflict: skill changed since it was read; reload and retry",
+                is_error=True,
+            )
+
+        current_assets = await load_skill_asset_refs(session, current)
+        try:
+            instructions = (
+                str(arguments["instructions"])
+                if "instructions" in arguments
+                else current.instructions
+            )
+            tools = current.tools
+            if "tools" in arguments:
+                tools = normalize_skill_tools(
+                    apply_named_list_patch(tools, arguments["tools"] or {}, key="name")
+                )
+            templates = current.prompt_templates or {}
+            if "prompt_templates" in arguments:
+                templates = normalize_prompt_templates(
+                    apply_mapping_patch(templates, arguments["prompt_templates"] or {})
+                )
+            steps = list(current.steps or [])
+            if "steps" in arguments:
+                steps = (
+                    normalize_skill_steps(
+                        apply_named_list_patch(steps, arguments["steps"] or {}, key="name")
+                    )
+                    or []
+                )
+            linked_tool_ids = (
+                normalize_linked_tool_ids(arguments.get("linked_tool_ids"))
+                if "linked_tool_ids" in arguments
+                else current.linked_tool_ids or []
+            )
+            placeholders = (
+                normalize_secret_placeholders(arguments.get("secret_placeholders"))
+                if "secret_placeholders" in arguments
+                else current.secret_placeholders
+            )
+            asset_inputs = asset_refs_to_inputs(current_assets)
+            if "assets" in arguments:
+                asset_inputs = apply_named_list_patch(
+                    asset_inputs, arguments["assets"] or {}, key="filename"
+                )
+        except (TypeError, ValueError) as exc:
+            return ToolResult(output=str(exc), is_error=True)
+
+        metadata_updates: dict[str, Any] = {}
+        for key in ("name", "description", "tags"):
+            if key in arguments:
+                metadata_updates[key] = arguments[key]
+        if "attach_to_all_agents" in arguments:
+            metadata_updates["auto_load"] = bool(arguments["attach_to_all_agents"])
+        if "linked_tool_ids" in arguments:
+            metadata_updates["linked_tool_ids"] = linked_tool_ids
+        content_changed = any(
+            [
+                instructions != current.instructions,
+                (tools or []) != (current.tools or []),
+                (templates or {}) != (current.prompt_templates or {}),
+                (steps or []) != (current.steps or []),
+                (linked_tool_ids or []) != (current.linked_tool_ids or []),
+                (placeholders or []) != (current.secret_placeholders or []),
+                _canonical_asset_inputs(asset_inputs)
+                != _canonical_asset_inputs(asset_refs_to_inputs(current_assets)),
+            ]
+        )
+        metadata_changed = any(
+            getattr(row, key) != value for key, value in metadata_updates.items()
+        )
+        if not content_changed and not metadata_changed:
+            return ToolResult(output="no_op_patch: patch does not change the skill", is_error=True)
+        if content_changed:
+            metadata_updates.update(
+                instructions=instructions, tools=tools, prompt_templates=templates
+            )
+        try:
+            updated = await update_skill(
+                session, skill_id, owner_email=user_email, **metadata_updates
+            )
+            assert updated is not None
+            version = current
+            if content_changed:
+                version = await create_skill_version_with_assets(
+                    session,
+                    artifact_store,
+                    skill_id=skill_id,
+                    version_number=await get_next_version_number(session, skill_id),
+                    owner_email=user_email,
+                    instructions=instructions,
+                    tools=tools,
+                    linked_tool_ids=linked_tool_ids,
+                    prompt_templates=templates,
+                    secret_placeholders=placeholders,
+                    steps=steps,
+                    assets=asset_inputs,
+                    allow_binary_assets=False,
+                    source_url=current.source_url,
+                    resolved_url=current.resolved_url,
+                    commit_sha=current.commit_sha,
+                    import_checksum=current.import_checksum,
+                    imported_at=current.imported_at,
+                    import_format=current.import_format,
+                    decomposition_source_hash=(
+                        None if "steps" in arguments else current.decomposition_source_hash
+                    ),
+                )
+                if not await set_current_version_if_matches(
+                    session,
+                    skill_id,
+                    expected_version_id=current.version_id,
+                    version_id=version.version_id,
+                ):
+                    await session.rollback()
+                    await cleanup_unpublished_skill_assets(
+                        artifact_store,
+                        version,
+                    )
+                    return ToolResult(
+                        output="version_conflict: skill changed while patching; reload and retry",
+                        is_error=True,
+                    )
+            elif not await set_current_version_if_matches(
+                session,
+                skill_id,
+                expected_version_id=current.version_id,
+                version_id=current.version_id,
+            ):
+                await session.rollback()
+                return ToolResult(
+                    output="version_conflict: skill changed while patching; reload and retry",
+                    is_error=True,
+                )
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            return ToolResult(output=str(exc), is_error=True)
+
+    return ToolResult(
+        output=json.dumps(
+            {
+                "skill_id": skill_id,
+                "version_id": version.version_id,
+                "version_number": version.version_number,
+                "content_hash": version.content_hash,
+                "version_created": content_changed,
+            },
+            indent=2,
+        )
+    )
 
 
 async def _handle_skill_asset_write(

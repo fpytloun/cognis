@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, cast
 
+import sqlalchemy as sa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import inspect, select, text
@@ -19,7 +20,10 @@ from cognis.config import CognisConfig
 from cognis.core.system_skills import SYSTEM_SKILL_DEFAULTS, get_system_skill_default
 from cognis.logging import get_logger
 from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.settings_schema import DEFAULT_SETTINGS
 from cognis.store.database import create_engine, create_session_factory
+from cognis.store.migrations.compat import normalize_legacy_profile_override_revision
+from cognis.store.models import Base
 from cognis.store.queries import (
     count_users,
     create_skill,
@@ -28,88 +32,13 @@ from cognis.store.queries import (
     get_next_version_number,
     get_setting,
     get_skill,
+    get_skill_version,
     set_current_version,
     upsert_setting,
 )
 from cognis.tools.skill_parser import compute_content_hash
 
 logger = get_logger(__name__)
-
-DEFAULT_SETTINGS: Final[dict[str, tuple[str, object]]] = {
-    "session.compaction_threshold": ("session", 0.85),
-    "session.compaction_preserve_turns": ("session", 10),
-    "session.compaction_max_input_tokens": ("session", 0),
-    "session.compaction_llm_max_attempts": ("session", 2),
-    "session.compaction_max_recursion": ("session", 2),
-    "session.compaction_fallback_enabled": ("session", True),
-    "session.step_timeout_seconds": ("session", 3600),
-    "session.stale_after_seconds": ("session", 300),
-    "session.llm_stream_idle_timeout_seconds": ("session", 300),
-    "session.llm_stream_max_retries": ("session", 3),
-    "session.anthropic_cache_ttl": ("session", "5m"),
-    "session.memory_instructions_max_tokens": ("session", 2000),
-    "session.core_memories_max_tokens": ("session", 2000),
-    "session.immutable_prefix_repair_cooldown_seconds": ("session", 300),
-    "session.recall_ttl_seconds": ("session", 86400),
-    "session.max_tool_calls_per_turn": ("session", 200),
-    "session.idle_timeout_seconds": ("session", 1800),
-    "session.long_lived_chat_idle_compaction_seconds": ("session", 21600),
-    "session.long_lived_chat_idle_compaction_min_events": ("session", 20),
-    "session.max_session_age_seconds": ("session", 86400),
-    "session.max_delegation_depth": ("session", 5),
-    "session.max_active_turns_per_user": ("session", 20),
-    "session.max_queued_messages": ("session", 20),
-    "session.escalation_timeout_seconds": ("session", 300),
-    "session.step_request_questions_timeout_seconds": ("session", 3600),
-    "session.cache_max_entries": ("session", 200),
-    "managed_conversations.cleanup_retention_days": ("managed_conversations", 7),
-    "search.display_min_score": ("search", 0.2),
-    "evaluator.timeout_ms": ("evaluator", 180000),
-    "decision_engine.inline_max_length": ("decision_engine", 200),
-    "security.non_bypassable_tools": (
-        "security",
-        ["shell", "bash", "write_file", "delete_file"],
-    ),
-    "security.api_read_requests_per_minute": ("security", 600),
-    "security.api_write_requests_per_minute": ("security", 200),
-    "security.token_ttl_seconds": ("security", 3600),
-    "security.max_connections": ("security", 100),
-    "security.ws_auth_timeout_seconds": ("security", 10),
-    "mcp.tool_timeout_seconds": ("mcp", 300),
-    "mcp.connect_timeout_seconds": ("mcp", 15),
-    "web.backend": ("web", "direct"),
-    "web.search_backend": ("web", "direct"),
-    "web.fetch_backend": ("web", "direct"),
-    "web.fetch_fallback_browser": ("web", True),
-    "web.searxng_url": ("web", ""),
-    "web.searxng_engines": ("web", ""),
-    "web.searxng_categories": ("web", ""),
-    "web.searxng_language": ("web", ""),
-    "web.browser_fetch.session_idle_seconds": ("web", 60),
-    "web.browser_fetch.wait_timeout_seconds": ("web", 30),
-    "web.browser_fetch.navigation_timeout_seconds": ("web", 60),
-    "web.browser_fetch.wait_until": ("web", "domcontentloaded"),
-    "web.browser_fetch.network_idle_after_dom_seconds": ("web", 3),
-    "web.browser_fetch.headed_fallback_enabled": ("web", False),
-    "web.concurrency.global_cap": ("web", 32),
-    "web.concurrency.per_host_cap": ("web", 4),
-    "web.concurrency.direct_cap": ("web", 16),
-    "web.concurrency.tavily_cap": ("web", 8),
-    "web.concurrency.brave_cap": ("web", 2),
-    "web.concurrency.searxng_cap": ("web", 4),
-    "web.concurrency.browser_cap": ("web", 4),
-    "web.rate_limit.tavily_qps": ("web", 5.0),
-    "web.rate_limit.brave_qps": ("web", 1.0),
-    "web.rate_limit.searxng_qps": ("web", 5.0),
-    "executors.allow_in_process": ("executors", True),
-    "executors.allow_subprocess": ("executors", True),
-    "executors.secondary_assignment_ttl_seconds": ("executors", 3600),
-    "executors.secondary_disconnect_retry_seconds": ("executors", 15),
-    "executors.secondary_disconnect_retry_interval_seconds": ("executors", 3),
-    "tts.enabled": ("tts", True),
-    "tts.default_voice": ("tts", "alloy"),
-    "tts.cache_ttl_days": ("tts", 30),
-}
 
 _BUILTIN_MANAGEMENT_SKILLS: Final[list[dict[str, object]]] = list(SYSTEM_SKILL_DEFAULTS.values())
 
@@ -215,11 +144,12 @@ def ensure_secrets_key(config: CognisConfig) -> None:
 
 async def run_schema_bootstrap(engine: AsyncEngine) -> None:
     """Create schema directly for MVP before/alongside Alembic use."""
-    from cognis.store.models import Base
 
     async with engine.begin() as conn:
+        await conn.run_sync(normalize_legacy_profile_override_revision)
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_session_lifecycle_columns)
+        await conn.run_sync(_ensure_delegate_lineage_column)
         await conn.run_sync(_ensure_session_compaction_columns)
         await conn.run_sync(_ensure_api_key_columns)
         await conn.run_sync(_ensure_agent_capabilities_column)
@@ -245,6 +175,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
         await conn.run_sync(_ensure_conversation_starred_at_column)
+        await conn.run_sync(_ensure_conversation_sidebar_activity_index)
         await conn.run_sync(_ensure_mcp_server_headers_column)
         await conn.run_sync(_ensure_mcp_oauth_schema)
         await conn.run_sync(_ensure_system_override_tables)
@@ -255,12 +186,14 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_session_policy_column)
         await conn.run_sync(_ensure_task_board_indexes)
         await conn.run_sync(_ensure_agent_profile_columns)
+        await conn.run_sync(_ensure_managed_conversation_lineage)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
         await conn.run_sync(_ensure_step_run_runtime_info_column)
+        await conn.run_sync(_ensure_canonical_chart_payloads)
         await conn.run_sync(_ensure_workflow_lifecycle_columns)
-        await conn.run_sync(_ensure_system_agent_override_skill_columns)
+        await conn.run_sync(_ensure_system_agent_override_columns)
         await conn.run_sync(_ensure_agent_grants_table)
         await conn.run_sync(_ensure_agent_grant_overrides_column)
         await conn.run_sync(_ensure_harness_recovery_tables)
@@ -276,6 +209,81 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_tts_cache_table)
         await conn.run_sync(_ensure_knowledgebase_schema)
         await conn.run_sync(_ensure_todos_tables)
+        await conn.run_sync(_ensure_local_model_runtime_columns)
+        await conn.run_sync(_ensure_local_model_byte_counter_types)
+        await conn.run_sync(_ensure_local_model_provider_columns)
+        await conn.run_sync(_ensure_channel_delivery_progress_columns)
+
+
+def _ensure_canonical_chart_payloads(sync_conn: object) -> None:
+    """Idempotently upgrade supported inline legacy chart payloads."""
+
+    from cognis.rendering.rich_visuals import upgrade_legacy_chart_payload
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "deliverables" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("deliverables")}
+    if not {"deliverable_id", "rich_payload"}.issubset(columns):
+        return
+
+    metadata = sa.MetaData()
+    deliverables = sa.Table("deliverables", metadata, autoload_with=cast(Any, sync_conn))
+    cursor: str | None = None
+    while True:
+        query = (
+            sa.select(deliverables.c.deliverable_id, deliverables.c.rich_payload)
+            .where(deliverables.c.rich_payload.is_not(None))
+            .order_by(deliverables.c.deliverable_id)
+            .limit(100)
+        )
+        if cursor is not None:
+            query = query.where(deliverables.c.deliverable_id > cursor)
+        rows = list(sync_conn.execute(query))  # type: ignore[attr-defined]
+        if not rows:
+            return
+        for deliverable_id, payload in rows:
+            cursor = str(deliverable_id)
+            if not isinstance(payload, dict):
+                continue
+            result = upgrade_legacy_chart_payload(payload)
+            if result.upgraded_blocks:
+                sync_conn.execute(  # type: ignore[attr-defined]
+                    deliverables.update()
+                    .where(deliverables.c.deliverable_id == deliverable_id)
+                    .values(rich_payload=result.payload)
+                )
+
+
+def _ensure_channel_delivery_progress_columns(sync_conn: object) -> None:
+    """Apply additive channel outbox migrations during normal bootstrap."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "channel_delivery_outbox" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("channel_delivery_outbox")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "completed_chunk_count" not in columns:
+        execute(
+            text(
+                "ALTER TABLE channel_delivery_outbox "
+                "ADD COLUMN completed_chunk_count INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    if "projected_chunk_count" not in columns:
+        execute(
+            text("ALTER TABLE channel_delivery_outbox ADD COLUMN projected_chunk_count INTEGER")
+        )
+    if "projection_digest" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN projection_digest VARCHAR"))
+    if "inflight_chunk_index" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN inflight_chunk_index INTEGER"))
+    if "inflight_idempotent" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN inflight_idempotent BOOLEAN"))
+    if "attachments_json" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN attachments_json JSON"))
+    if "deliverable_id" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN deliverable_id VARCHAR"))
 
 
 def _ensure_task_creator_agent_column(sync_conn: object) -> None:
@@ -286,6 +294,78 @@ def _ensure_task_creator_agent_column(sync_conn: object) -> None:
     if "created_by_agent_id" not in task_columns:
         sync_conn.execute(  # type: ignore[attr-defined]
             text("ALTER TABLE tasks ADD COLUMN created_by_agent_id VARCHAR")
+        )
+
+
+def _ensure_local_model_runtime_columns(sync_conn: object) -> None:
+    """Add operation intent used by the managed Ollama runtime."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "local_model_operations" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("local_model_operations")}
+    if "post_pull_provider_upsert" not in columns:
+        dialect_name = str(getattr(getattr(sync_conn, "dialect", None), "name", ""))
+        boolean_default = "FALSE" if dialect_name == "postgresql" else "0"
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(
+                "ALTER TABLE local_model_operations "
+                f"ADD COLUMN post_pull_provider_upsert "
+                f"BOOLEAN NOT NULL DEFAULT {boolean_default}"
+            )
+        )
+
+
+def _ensure_local_model_byte_counter_types(sync_conn: object) -> None:
+    """Widen legacy PostgreSQL local-model byte counters without rebuilding SQLite."""
+
+    dialect_name = str(getattr(getattr(sync_conn, "dialect", None), "name", ""))
+    if dialect_name != "postgresql":
+        # SQLite INTEGER already stores signed 64-bit values. Rebuilding these related
+        # tables during every bootstrap would be less safe than retaining its affinity.
+        return
+    inspector = cast(Any, inspect(sync_conn))
+    tables = set(inspector.get_table_names())
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    for table_name, column_name in (
+        ("local_model_operations", "progress_bytes"),
+        ("local_model_target_statuses", "observed_size_bytes"),
+    ):
+        if table_name not in tables:
+            continue
+        column = next(
+            (
+                candidate
+                for candidate in inspector.get_columns(table_name)
+                if candidate["name"] == column_name
+            ),
+            None,
+        )
+        column_type = column["type"] if column is not None else None
+        if isinstance(column_type, sa.BigInteger):
+            continue
+        if isinstance(column_type, sa.Integer):
+            execute(text(f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT"))
+
+
+def _ensure_local_model_provider_columns(sync_conn: object) -> None:
+    """Add the reusable managed-provider identity used by local models."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "llm_providers" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("llm_providers")}
+    if "managed_local_key" not in columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE llm_providers ADD COLUMN managed_local_key VARCHAR")
+        )
+    indexes = {index["name"] for index in inspector.get_indexes("llm_providers")}
+    if "uq_llm_providers_managed_local_key" not in indexes:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(
+                "CREATE UNIQUE INDEX uq_llm_providers_managed_local_key "
+                "ON llm_providers (managed_local_key)"
+            )
         )
 
 
@@ -320,6 +400,10 @@ def _ensure_knowledgebase_schema(sync_conn: object) -> None:
     execute = sync_conn.execute  # type: ignore[attr-defined]
     if "content_hash" not in artifact_columns:
         execute(text("ALTER TABLE artifacts ADD COLUMN content_hash VARCHAR"))
+    if "source_tool_call_id" not in artifact_columns:
+        execute(text("ALTER TABLE artifacts ADD COLUMN source_tool_call_id VARCHAR"))
+    if "source_anchor" not in artifact_columns:
+        execute(text("ALTER TABLE artifacts ADD COLUMN source_anchor VARCHAR"))
     if "updated_at" not in artifact_columns:
         execute(
             text(
@@ -327,6 +411,57 @@ def _ensure_knowledgebase_schema(sync_conn: object) -> None:
                 "DEFAULT CURRENT_TIMESTAMP"
             )
         )
+
+    # Keep production startup equivalent to Alembic revision 094.  Every
+    # mutation is NULL-only or guarded so repeated startup remains deterministic
+    # and old controller versions can safely ignore the additive schema.
+    artifacts = sa.Table("artifacts", sa.MetaData(), autoload_with=cast(Any, sync_conn))
+    execute(
+        artifacts.update()
+        .where(
+            artifacts.c.purpose == "tool_artifact",
+            artifacts.c.source_tool_call_id.is_(None),
+            artifacts.c.conversation_id.is_not(None),
+        )
+        .values(source_tool_call_id=artifacts.c.conversation_id)
+    )
+    execute(
+        artifacts.update()
+        .where(
+            artifacts.c.purpose == "tool_artifact",
+            artifacts.c.source_anchor.is_(None),
+            artifacts.c.session_id.is_not(None),
+        )
+        .values(source_anchor=artifacts.c.session_id)
+    )
+    legacy_tool_outputs = execute(
+        sa.select(artifacts.c.artifact_id, artifacts.c.filename).where(
+            artifacts.c.purpose == "tool_output",
+            artifacts.c.source_tool_call_id.is_(None),
+            artifacts.c.filename.is_not(None),
+        )
+    ).all()
+    for artifact_id, filename in legacy_tool_outputs:
+        filename_text = str(filename or "")
+        if not filename_text.endswith(".txt"):
+            continue
+        source_tool_call_id = filename_text[:-4].strip()
+        if not source_tool_call_id:
+            continue
+        execute(
+            artifacts.update()
+            .where(
+                artifacts.c.artifact_id == artifact_id,
+                artifacts.c.source_tool_call_id.is_(None),
+            )
+            .values(source_tool_call_id=source_tool_call_id)
+        )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_artifacts_tool_source "
+            "ON artifacts (owner_email, source_tool_call_id, source_anchor)"
+        )
+    )
 
 
 def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
@@ -343,6 +478,20 @@ def _ensure_session_lifecycle_columns(sync_conn: object) -> None:
             )
         )
         execute(text("UPDATE sessions SET updated_at = COALESCE(updated_at, started_at)"))
+
+
+def _ensure_delegate_lineage_column(sync_conn: object) -> None:
+    """Add explicit lightweight delegate lineage metadata."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    session_columns = {column["name"] for column in inspector.get_columns("sessions")}
+    if "delegation_metadata" not in session_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE sessions ADD COLUMN delegation_metadata JSON")
+        )
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("UPDATE sessions SET delegation_metadata = '{}' WHERE delegation_metadata IS NULL")
+        )
 
 
 def _ensure_todos_tables(sync_conn: object) -> None:
@@ -427,10 +576,42 @@ def _ensure_api_key_columns(sync_conn: object) -> None:
 def _ensure_harness_recovery_tables(sync_conn: object) -> None:
     """Create durable recovery tables introduced after the MVP bootstrap."""
 
-    from cognis.store.models import FollowUpDedupeRow, RememberQueueRow
+    from cognis.store.models import FollowUpDedupeRow, FollowUpIntentRow, RememberQueueRow
 
     RememberQueueRow.__table__.create(bind=sync_conn, checkfirst=True)
     FollowUpDedupeRow.__table__.create(bind=sync_conn, checkfirst=True)
+    FollowUpIntentRow.__table__.create(bind=sync_conn, checkfirst=True)
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    for table_name in ("follow_up_intents", "follow_up_dedupe"):
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if "lease_owner" not in columns:
+            execute(text(f"ALTER TABLE {table_name} ADD COLUMN lease_owner VARCHAR"))
+        if "lease_expires_at" not in columns:
+            execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN lease_expires_at TIMESTAMP WITH TIME ZONE"
+                )
+            )
+
+    inspector = cast(Any, inspect(sync_conn))
+    intent_indexes = {index["name"] for index in inspector.get_indexes("follow_up_intents")}
+    if "ix_follow_up_intents_lease" not in intent_indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_follow_up_intents_lease "
+                "ON follow_up_intents (status, lease_expires_at)"
+            )
+        )
+    dedupe_indexes = {index["name"] for index in inspector.get_indexes("follow_up_dedupe")}
+    if "ix_follow_up_dedupe_lease" not in dedupe_indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_follow_up_dedupe_lease "
+                "ON follow_up_dedupe (status, lease_expires_at)"
+            )
+        )
 
 
 def _ensure_tool_classification_table(sync_conn: object) -> None:
@@ -809,6 +990,34 @@ def _ensure_conversation_starred_at_column(sync_conn: object) -> None:
         )
 
 
+def _ensure_conversation_sidebar_activity_index(sync_conn: object) -> None:
+    """Backfill and index conversation activity for sidebar list queries."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        columns = {column["name"] for column in inspector.get_columns("conversations")}
+    except Exception:
+        return
+    if "last_message_at" not in columns or "created_at" not in columns:
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    execute(
+        text("UPDATE conversations SET last_message_at = created_at WHERE last_message_at IS NULL")
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_conversations_owner_activity "
+            "ON conversations (user_email, status, last_message_at, created_at)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_conversations_owner_agent_context "
+            "ON conversations (user_email, status, agent_id, context_type)"
+        )
+    )
+
+
 def _ensure_step_run_conversation_id_column(sync_conn: object) -> None:
     inspector = cast(Any, inspect(sync_conn))
     try:
@@ -1152,6 +1361,24 @@ def _ensure_mcp_oauth_schema(sync_conn: object) -> None:
         execute(text("ALTER TABLE mcp_servers ADD COLUMN auth_config JSON"))
     MCPOAuthTokenRow.__table__.create(sync_conn, checkfirst=True)
     MCPOAuthTransactionRow.__table__.create(sync_conn, checkfirst=True)
+    try:
+        token_columns = {column["name"] for column in inspector.get_columns("mcp_oauth_tokens")}
+    except Exception:
+        token_columns = set()
+    dialect_name = getattr(getattr(sync_conn, "dialect", None), "name", "")
+    timestamp_type = "TIMESTAMP WITH TIME ZONE" if dialect_name == "postgresql" else "TIMESTAMP"
+    additions = {
+        "refresh_failure_count": "INTEGER NOT NULL DEFAULT 0",
+        "next_refresh_attempt_at": timestamp_type,
+        "last_refresh_error_code": "VARCHAR",
+        "last_refresh_error_description": "TEXT",
+        "last_refresh_error_at": timestamp_type,
+    }
+    for name, sql_type in additions.items():
+        if token_columns and name not in token_columns:
+            execute(text(f"ALTER TABLE mcp_oauth_tokens ADD COLUMN {name} {sql_type}"))
+    for index in MCPOAuthTokenRow.__table__.indexes:
+        index.create(sync_conn, checkfirst=True)
 
 
 def _ensure_system_override_tables(sync_conn: object) -> None:
@@ -1207,6 +1434,55 @@ def _ensure_agent_profile_columns(sync_conn: object) -> None:
                 "ALTER TABLE managed_conversation_links ADD COLUMN target_agent_profile_id VARCHAR"
             )
         )
+
+    channel_account_columns = columns_for("channel_accounts")
+    if channel_account_columns and "default_agent_profile_id" not in channel_account_columns:
+        execute(text("ALTER TABLE channel_accounts ADD COLUMN default_agent_profile_id VARCHAR"))
+
+
+def _ensure_managed_conversation_lineage(sync_conn: object) -> None:
+    """Add managed-conversation lifecycle and lineage columns when missing."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if not inspector.has_table("managed_conversation_links"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("managed_conversation_links")}
+
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "parent_link_id" not in columns:
+        execute(text("ALTER TABLE managed_conversation_links ADD COLUMN parent_link_id VARCHAR"))
+    if "root_link_id" not in columns:
+        execute(text("ALTER TABLE managed_conversation_links ADD COLUMN root_link_id VARCHAR"))
+    if "depth" not in columns:
+        execute(
+            text(
+                "ALTER TABLE managed_conversation_links ADD COLUMN depth INTEGER NOT NULL DEFAULT 1"
+            )
+        )
+    if "last_result_turn_id" not in columns:
+        execute(
+            text("ALTER TABLE managed_conversation_links ADD COLUMN last_result_turn_id VARCHAR")
+        )
+
+    execute(
+        text(
+            "UPDATE managed_conversation_links "
+            "SET root_link_id = link_id, depth = 1 "
+            "WHERE root_link_id IS NULL"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_managed_conversation_links_parent_link "
+            "ON managed_conversation_links (parent_link_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_managed_conversation_links_root_depth "
+            "ON managed_conversation_links (root_link_id, depth)"
+        )
+    )
 
 
 def _ensure_task_completion_delivery_columns(sync_conn: object) -> None:
@@ -1266,11 +1542,100 @@ def _ensure_step_run_execution_paths(sync_conn: object) -> None:
 
 
 def _ensure_deliverables_table(sync_conn: object) -> None:
-    """Create the deliverables table when missing."""
+    """Create/upgrade the deliverables table when missing."""
 
     from cognis.store.models import DeliverableRow
 
     DeliverableRow.__table__.create(sync_conn, checkfirst=True)
+    inspector = cast(Any, inspect(sync_conn))
+    column_info = {column["name"]: column for column in inspector.get_columns("deliverables")}
+    columns = set(column_info)
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    step_run_column = column_info.get("step_run_id")
+    if step_run_column is not None and step_run_column.get("nullable") is False:
+        _make_deliverables_step_run_nullable(sync_conn)
+    content_column = column_info.get("content")
+    if content_column is not None and content_column.get("nullable") is False:
+        _make_legacy_deliverables_content_nullable(sync_conn)
+    for name, ddl in {
+        "conversation_id": "ALTER TABLE deliverables ADD COLUMN conversation_id VARCHAR",
+        "session_id": "ALTER TABLE deliverables ADD COLUMN session_id VARCHAR",
+        "turn_id": "ALTER TABLE deliverables ADD COLUMN turn_id VARCHAR",
+        "storage_namespace": "ALTER TABLE deliverables ADD COLUMN storage_namespace VARCHAR NOT NULL DEFAULT 'deliverables'",
+        "storage_object_id": "ALTER TABLE deliverables ADD COLUMN storage_object_id VARCHAR NOT NULL DEFAULT ''",
+        "content_key": "ALTER TABLE deliverables ADD COLUMN content_key VARCHAR NOT NULL DEFAULT 'content.md'",
+        "content_mime": "ALTER TABLE deliverables ADD COLUMN content_mime VARCHAR NOT NULL DEFAULT 'text/markdown'",
+        "content_size": "ALTER TABLE deliverables ADD COLUMN content_size INTEGER NOT NULL DEFAULT 0",
+        "content_hash": "ALTER TABLE deliverables ADD COLUMN content_hash VARCHAR NOT NULL DEFAULT ''",
+        "rich_key": "ALTER TABLE deliverables ADD COLUMN rich_key VARCHAR",
+        "rich_size": "ALTER TABLE deliverables ADD COLUMN rich_size INTEGER",
+        "rich_hash": "ALTER TABLE deliverables ADD COLUMN rich_hash VARCHAR",
+        "outputs_key": "ALTER TABLE deliverables ADD COLUMN outputs_key VARCHAR",
+        "outputs_mime": "ALTER TABLE deliverables ADD COLUMN outputs_mime VARCHAR",
+        "outputs_size": "ALTER TABLE deliverables ADD COLUMN outputs_size INTEGER",
+        "outputs_hash": "ALTER TABLE deliverables ADD COLUMN outputs_hash VARCHAR",
+        "validation_warnings": "ALTER TABLE deliverables ADD COLUMN validation_warnings JSON",
+        "render_metadata": "ALTER TABLE deliverables ADD COLUMN render_metadata JSON",
+        "export_metadata": "ALTER TABLE deliverables ADD COLUMN export_metadata JSON",
+        "html_cache_key": "ALTER TABLE deliverables ADD COLUMN html_cache_key VARCHAR",
+        "pdf_cache_key": "ALTER TABLE deliverables ADD COLUMN pdf_cache_key VARCHAR",
+    }.items():
+        if name not in columns:
+            execute(text(ddl))
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_deliverables_conversation_scope "
+            "ON deliverables (conversation_id, session_id, turn_id)"
+        )
+    )
+
+
+def _make_deliverables_step_run_nullable(sync_conn: object) -> None:
+    """Allow direct-chat deliverables by relaxing legacy step_run_id nullability."""
+
+    _make_deliverables_column_nullable(
+        sync_conn,
+        column_name="step_run_id",
+        existing_type=sa.String(),
+    )
+
+
+def _make_legacy_deliverables_content_nullable(sync_conn: object) -> None:
+    """Stop obsolete inline payload constraints from rejecting metadata-only rows."""
+
+    _make_deliverables_column_nullable(
+        sync_conn,
+        column_name="content",
+        existing_type=sa.Text(),
+    )
+
+
+def _make_deliverables_column_nullable(
+    sync_conn: object,
+    *,
+    column_name: str,
+    existing_type: Any,
+) -> None:
+    """Relax a known legacy deliverables column across supported database dialects."""
+
+    dialect_name = sync_conn.dialect.name  # type: ignore[attr-defined]
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    alter_statement = {
+        "step_run_id": text("ALTER TABLE deliverables ALTER COLUMN step_run_id DROP NOT NULL"),
+        "content": text("ALTER TABLE deliverables ALTER COLUMN content DROP NOT NULL"),
+    }[column_name]
+    if dialect_name == "postgresql":
+        execute(alter_statement)
+        return
+    if dialect_name == "sqlite":
+        from alembic.operations import Operations
+        from alembic.runtime.migration import MigrationContext
+
+        context = MigrationContext.configure(sync_conn)
+        with Operations(context).batch_alter_table("deliverables") as batch:
+            batch.alter_column(column_name, existing_type=existing_type, nullable=True)
+        return
+    execute(alter_statement)
 
 
 def _ensure_step_run_deliverable_columns(sync_conn: object) -> None:
@@ -1321,8 +1686,8 @@ def _ensure_workflow_lifecycle_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE workflows ADD COLUMN archived_at TIMESTAMP WITH TIME ZONE"))
 
 
-def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:
-    """Add missing skill override columns to system agent overrides."""
+def _ensure_system_agent_override_columns(sync_conn: object) -> None:
+    """Add missing runtime override columns to system agent overrides."""
 
     inspector = cast(Any, inspect(sync_conn))
     try:
@@ -1337,6 +1702,15 @@ def _ensure_system_agent_override_skill_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE system_agent_overrides ADD COLUMN tools_override JSON"))
     if "permissions_override" not in columns:
         execute(text("ALTER TABLE system_agent_overrides ADD COLUMN permissions_override JSON"))
+    if "agent_profiles_override" not in columns:
+        execute(text("ALTER TABLE system_agent_overrides ADD COLUMN agent_profiles_override JSON"))
+    if "default_agent_profile_id_override" not in columns:
+        execute(
+            text(
+                "ALTER TABLE system_agent_overrides "
+                "ADD COLUMN default_agent_profile_id_override VARCHAR"
+            )
+        )
 
 
 async def _ensure_system_user(session: AsyncSession) -> None:
@@ -1421,36 +1795,36 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
         assert defaults is not None
         existing = await get_skill(session, str(skill["skill_id"]))
         if existing is not None:
+            if existing.owner_email is not None:
+                continue
             updates: dict[str, object] = {
                 "is_system": True,
                 "auto_load": bool(defaults.get("auto_load", False)),
+                "name": defaults["name"],
+                "description": defaults["description"],
+                "instructions": defaults["instructions"],
+                "tools": defaults["tools"],
+                "prompt_templates": defaults["prompt_templates"],
+                "tags": defaults["tags"],
                 "linked_tool_ids": [
                     str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])
                 ],
             }
-            if existing.owner_email is None and existing.current_version_id is None:
-                updates.update(
-                    {
-                        "name": defaults["name"],
-                        "description": defaults["description"],
-                        "instructions": defaults["instructions"],
-                        "tools": defaults["tools"],
-                        "prompt_templates": defaults["prompt_templates"],
-                        "tags": defaults["tags"],
-                    }
-                )
             for key, value in updates.items():
                 setattr(existing, key, value)
-            if existing.current_version_id is None:
-                content_hash = compute_content_hash(
-                    existing.instructions,
-                    existing.tools,
-                    existing.linked_tool_ids,
-                    existing.prompt_templates,
-                    steps=defaults.get("steps")
-                    if isinstance(defaults.get("steps"), list)
-                    else None,
-                )
+            content_hash = compute_content_hash(
+                existing.instructions,
+                existing.tools,
+                existing.linked_tool_ids,
+                existing.prompt_templates,
+                steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+            )
+            current_version = (
+                await get_skill_version(session, existing.current_version_id)
+                if existing.current_version_id is not None
+                else None
+            )
+            if current_version is None or current_version.content_hash != content_hash:
                 version_row = await create_skill_version(
                     session,
                     skill_id=existing.skill_id,

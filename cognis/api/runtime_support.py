@@ -16,6 +16,7 @@ from cognis.api.tool_inventory import (
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
+from cognis.core.daily_brief_contract import daily_brief_contract_version
 from cognis.core.executor_pin_lifecycle import (
     ensure_active_executor_pin,
     load_executor_pin_lifecycle_settings,
@@ -63,6 +64,7 @@ from cognis.tools.builtin.knowledgebase import (
     build_knowledgebase_tool_handlers,
     knowledgebase_tools,
 )
+from cognis.tools.builtin.mcp_management import mcp_management_tools
 from cognis.tools.builtin.memory import memory_tools
 from cognis.tools.builtin.orchestration import orchestration_tools
 from cognis.tools.builtin.projects import build_project_tool_handlers, project_tools
@@ -144,7 +146,7 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return max(1, parsed)
 
 
-DEFAULT_OFF_BUILTIN_TOOLS = frozenset({"manage_agents"})
+DEFAULT_OFF_BUILTIN_TOOLS = frozenset({"manage_agents", "manage_mcp"})
 
 INTARIS_MCP_FALLBACKS = Counter(
     "cognis_intaris_mcp_fallbacks_total",
@@ -192,6 +194,69 @@ class RemoteInventoryMergeResult:
 
 async def noop_cleanup() -> None:
     """No-op cleanup callback."""
+
+
+def _terminal_browser_cleanup(
+    connection: Any,
+    access_context: RuntimeAccessContext | None,
+    *,
+    after: Callable[[], Awaitable[None]] = noop_cleanup,
+    notifier: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> Callable[[], Awaitable[None]]:
+    """Build best-effort browser cleanup for terminal descendant runtimes."""
+    if (
+        access_context is None
+        or not access_context.parent_session_id
+        or not access_context.session_id
+        or not access_context.user_email
+    ):
+        return after
+
+    async def cleanup() -> None:
+        owner = {
+            "execution_scope_id": access_context.session_id,
+            "session_id": access_context.session_id,
+            "conversation_id": access_context.conversation_id,
+            "user_email": access_context.user_email,
+            "agent_id": access_context.agent_id,
+            "parent_session_id": access_context.parent_session_id,
+            "delegation_mode": access_context.delegation_mode,
+        }
+        if notifier is not None:
+            await notifier(owner)
+            await after()
+            return
+        resolved = connection() if callable(connection) else connection
+        connections = resolved if isinstance(resolved, (list, tuple)) else [resolved]
+        for target in connections:
+            try:
+                await target.rpc_call(
+                    "browser.session_terminal",
+                    {"owner": owner},
+                )
+            except Exception:
+                logger.warning(
+                    "browser: terminal descendant cleanup failed",
+                    extra={
+                        "extra_data": {
+                            "session_id": access_context.session_id,
+                            "parent_session_id": access_context.parent_session_id,
+                        }
+                    },
+                    exc_info=True,
+                )
+        await after()
+
+    return cleanup
+
+
+def _browser_cleanup_executor_ids(
+    executor_id: str,
+    executor_pool: Any | None,
+) -> list[str]:
+    if executor_pool is None:
+        return [executor_id]
+    return [target.executor_id for target in executor_pool.all]
 
 
 def _agent_executor_binding(agent: AgentDefinition) -> tuple[str, bool]:
@@ -627,6 +692,7 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
         *workflow_tools(),
         *memory_tools(),
         *agent_management_tools(),
+        *mcp_management_tools(),
         *conversation_tools(),
         *project_tools(),
         *(knowledgebase_tools() if knowledgebase_enabled else []),
@@ -653,6 +719,7 @@ def _opted_in_builtin_tools(agent: Any | None) -> set[str]:
 def _management_tools_allowed(
     agent: Any | None,
     access_context: RuntimeAccessContext | None,
+    tool_name: str,
 ) -> bool:
     if agent is None:
         return False
@@ -662,9 +729,9 @@ def _management_tools_allowed(
         str(item) for item in agent_tools_config.get("allow_tools") or [] if isinstance(item, str)
     }
     if (
-        "manage_agents" not in opted_in
-        and "manage_agents" not in explicit_allow
-        and "builtin:manage_agents" not in explicit_allow
+        tool_name not in opted_in
+        and tool_name not in explicit_allow
+        and f"builtin:{tool_name}" not in explicit_allow
     ):
         return False
     if getattr(agent, "agent_type", "primary") == "secondary":
@@ -716,6 +783,7 @@ def select_static_tools(
     disabled_mcp_servers = disabled_mcp_server_keys(agent_tools_config)
     skill_mutation_tools = {
         "skill_write",
+        "skill_patch",
         "skill_delete",
         "skill_import_url",
         "skill_restore_version",
@@ -730,7 +798,7 @@ def select_static_tools(
             continue
         default_off_allowed = False
         if tool.name in DEFAULT_OFF_BUILTIN_TOOLS:
-            default_off_allowed = _management_tools_allowed(agent, access_context)
+            default_off_allowed = _management_tools_allowed(agent, access_context, tool.name)
             if not default_off_allowed:
                 continue
         # Agent-level disable takes precedence
@@ -805,6 +873,8 @@ async def enrich_image_tool_model_descriptions(
         default_model=default_model,
         image_models=image_models,
     )
+    from cognis.models.tool import ToolDynamicOption, tool_with_input_schema
+
     enriched: list[ToolDefinition] = []
     for tool in tools:
         if tool.name not in {"image_generate", "image_edit"}:
@@ -818,7 +888,19 @@ async def enrich_image_tool_model_descriptions(
             model_property["enum"] = image_models
         properties["model"] = model_property
         parameters["properties"] = properties
-        enriched.append(tool.model_copy(update={"parameters": parameters}))
+        enriched.append(
+            tool_with_input_schema(
+                tool,
+                parameters,
+                dynamic_options=[
+                    ToolDynamicOption(
+                        path="$.model",
+                        source="image_generation_provider.list_models",
+                        values=image_models,
+                    )
+                ],
+            )
+        )
     return enriched
 
 
@@ -1164,7 +1246,7 @@ def build_step_runtime_factory(
                 resolved_skills = await resolve_skills_for_agent(
                     db_session, tool_agent, owner_email=user_email
                 )
-            if not _management_tools_allowed(tool_agent, access_context):
+            if not _management_tools_allowed(tool_agent, access_context, "manage_agents"):
                 resolved_skills.skills = [
                     skill
                     for skill in resolved_skills.skills
@@ -1208,6 +1290,9 @@ def build_step_runtime_factory(
                             tags=skill.tags,
                             linked_tool_ids=skill.linked_tool_ids,
                             attach_to_all_agents=skill.auto_load,
+                            version_id=skill.version_id,
+                            version_number=skill.version_number,
+                            content_hash=skill.content_hash,
                         )
                         protected_context = load_metadata.get("protected_context")
                         if isinstance(protected_context, str) and protected_context.strip():
@@ -1244,6 +1329,14 @@ def build_step_runtime_factory(
                             "attached": skill.attached,
                             "auto_load": skill.auto_load,
                             "auto_load_instructions": skill.auto_load_instructions,
+                            "version_id": skill.version_id,
+                            "version_number": skill.version_number,
+                            "content_hash": skill.content_hash,
+                            "contract_version": daily_brief_contract_version(
+                                name=skill.name,
+                                prompt_templates=skill.prompt_templates,
+                                instructions=skill.instructions,
+                            ),
                             "tags": list(getattr(skill, "tags", []) or []),
                             "linked_tool_ids": list(getattr(skill, "linked_tool_ids", []) or []),
                         }
@@ -1489,10 +1582,32 @@ def build_step_runtime_factory(
                         executor_type=resolved_type,
                         fallback_source="remote_executor_metadata",
                     )
+
+                    def browser_cleanup_connections() -> list[Any]:
+                        executor_ids = _browser_cleanup_executor_ids(
+                            executor_id,
+                            executor_pool_obj,
+                        )
+                        return [
+                            current
+                            for target_id in executor_ids
+                            if (current := ws_provider.get_connection(target_id)) is not None
+                        ]
+
                     return ResolvedStepRuntime(
                         tool_registry=remote_registry,
                         executor_connection=conn,
-                        cleanup=noop_cleanup,
+                        cleanup=_terminal_browser_cleanup(
+                            browser_cleanup_connections,
+                            access_context,
+                            notifier=lambda owner: ws_provider.notify_browser_session_terminal(
+                                _browser_cleanup_executor_ids(
+                                    executor_id,
+                                    executor_pool_obj,
+                                ),
+                                owner,
+                            ),
+                        ),
                         executor_environment=env_snapshot,
                         runtime_info=_runtime_info(
                             executor_config=executor_config,
@@ -1616,12 +1731,15 @@ async def _resolve_web_config(
     searxng_engines = ""
     searxng_categories = ""
     searxng_language = ""
+    tavily_enabled = True
+    brave_enabled = True
+    searxng_enabled = True
     browser_fetch_session_idle = 60
     browser_fetch_wait_timeout = 30
     browser_fetch_navigation_timeout = 60
     browser_fetch_wait_until = "domcontentloaded"
     browser_fetch_network_idle = 3
-    browser_fetch_headed_fallback = False
+    browser_fetch_headed_fallback = True
     concurrency: dict[str, Any] = {
         "global_cap": 32,
         "per_host_cap": 4,
@@ -1666,6 +1784,20 @@ async def _resolve_web_config(
                 if isinstance(fallback_value, bool):
                     fetch_fallback_browser = fallback_value
                 for key, target in (
+                    ("web.tavily_enabled", "tavily"),
+                    ("web.brave_enabled", "brave"),
+                    ("web.searxng_enabled", "searxng"),
+                ):
+                    raw = await get_setting_value(session, key, True)
+                    if not isinstance(raw, bool):
+                        continue
+                    if target == "tavily":
+                        tavily_enabled = raw
+                    elif target == "brave":
+                        brave_enabled = raw
+                    else:
+                        searxng_enabled = raw
+                for key, target in (
                     ("web.searxng_url", "searxng_url"),
                     ("web.searxng_engines", "searxng_engines"),
                     ("web.searxng_categories", "searxng_categories"),
@@ -1707,7 +1839,7 @@ async def _resolve_web_config(
                 if isinstance(network_idle_value, int) and network_idle_value >= 0:
                     browser_fetch_network_idle = network_idle_value
                 headed_value = await get_setting_value(
-                    session, "web.browser_fetch.headed_fallback_enabled", False
+                    session, "web.browser_fetch.headed_fallback_enabled", True
                 )
                 if isinstance(headed_value, bool):
                     browser_fetch_headed_fallback = headed_value
@@ -1744,6 +1876,9 @@ async def _resolve_web_config(
                     )
         except Exception:
             logger.debug("web: failed to read web settings", exc_info=True)
+            tavily_enabled = False
+            brave_enabled = False
+            searxng_enabled = False
 
     # Read API keys from secrets provider
     if hasattr(providers, "secrets") and hasattr(providers.secrets, "get_secret"):
@@ -1757,16 +1892,29 @@ async def _resolve_web_config(
             except Exception:
                 logger.debug("web: failed to read secret %s", secret_name)
 
+    # Disabled backends retain their encrypted configuration in storage, but
+    # executors must not receive credentials or connection details that would
+    # let explicit tool arguments bypass the availability lists.
+    if not tavily_enabled:
+        web_secrets.pop("tavily_api_key", None)
+    if not brave_enabled:
+        web_secrets.pop("brave_api_key", None)
+    if not searxng_enabled:
+        searxng_url = ""
+        searxng_engines = ""
+        searxng_categories = ""
+        searxng_language = ""
+
     available_search = ["direct"]
-    if web_secrets.get("tavily_api_key"):
+    if tavily_enabled and web_secrets.get("tavily_api_key"):
         available_search.append("tavily")
-    if web_secrets.get("brave_api_key"):
+    if brave_enabled and web_secrets.get("brave_api_key"):
         available_search.append("brave")
-    if searxng_url.strip():
+    if searxng_enabled and searxng_url.strip():
         available_search.append("searxng")
 
     available_fetch = ["direct"]
-    if web_secrets.get("tavily_api_key"):
+    if tavily_enabled and web_secrets.get("tavily_api_key"):
         available_fetch.append("tavily")
     # ``browser`` becomes available iff the executor exposes a BrowserManager,
     # which we resolve at executor configure time. Add a hint here so the
@@ -1774,6 +1922,12 @@ async def _resolve_web_config(
     available_fetch.append("browser")
 
     available_union = sorted({*available_search, *available_fetch})
+    if legacy_backend not in available_union:
+        legacy_backend = "direct"
+    if search_backend not in available_search:
+        search_backend = "direct"
+    if fetch_backend not in available_fetch:
+        fetch_backend = "direct"
 
     return {
         "web_backend": legacy_backend,
@@ -1954,6 +2108,8 @@ async def _resolve_executor_mcp_servers(
                             oauth_executor_name=getattr(result, "oauth_executor_name", None),
                             redirect_uri=getattr(result, "redirect_uri", None),
                             instructions=getattr(result, "instructions", None),
+                            scopes=getattr(result, "scopes", None),
+                            resource=getattr(result, "resource", None),
                         )
                     )
                     logger.warning(

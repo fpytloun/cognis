@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  __chatV2SyncEngineTestHooks,
   addLocalSystemMessage,
   addOptimisticUserMessage,
   applyBackfill,
@@ -103,6 +104,26 @@ describe('Chat v2 sync engine', () => {
     expect(state.timelineItems.map((item) => item.id)).toEqual(['message:1']);
   });
 
+  it('persists opaque backfill cursors and disables older loading at the terminal page', () => {
+    const state = applySnapshot(snapshot({
+      timeline: { items: [message()], has_more_before: true, before_cursor: 'opaque-page-1' }
+    }));
+    expect(state.hasMoreBefore).toBe(true);
+    expect(state.beforeCursor).toBe('opaque-page-1');
+
+    const next = applyBackfill(state, {
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      items: [],
+      has_more_before: false,
+      before_cursor: null,
+      server_time: '2026-01-01T00:00:02Z'
+    });
+    expect(next.hasMoreBefore).toBe(false);
+    expect(next.beforeCursor).toBe(null);
+  });
+
   it('applies sync ops only when cursor matches', () => {
     const state = applySnapshot(snapshot());
     const item = message({
@@ -125,6 +146,97 @@ describe('Chat v2 sync engine', () => {
       'message:1',
       'message:2'
     ]);
+  });
+
+  it('keeps the canonical timeline identity stable for runtime-only frames', () => {
+    const state = applySnapshot(snapshot({
+      timeline: {
+        items: [
+          message(),
+          message({
+            id: 'message:3',
+            sort_key: '0000:000000000000003:000000:02:000000000',
+            message_id: 'msg-3',
+            content: 'third'
+          })
+        ],
+        has_more_before: false,
+        before_cursor: null
+      }
+    }));
+    const frame: ChatRealtimeFrame = {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [
+          message({
+            id: 'message:runtime',
+            sort_key: '9998:999999999999999:000000:02:000000000',
+            stable: false,
+            status: 'running',
+            message_id: 'turn-1',
+            content: 'streaming',
+            partial: true
+          })
+        ]
+      }),
+      server_time: '2026-01-01T00:00:02Z'
+    };
+
+    __chatV2SyncEngineTestHooks.resetCounters();
+    const result = applyRealtimeFrame(state, frame);
+
+    expect(result.outcome).toBe('applied');
+    expect(result.state.timelineItems).toBe(state.timelineItems);
+    expect(__chatV2SyncEngineTestHooks.counters().reconcileLocalItemsCalls).toBe(0);
+
+    const visible = visibleTimelineItems(result.state);
+    expect(visible.map((item) => item.id)).toEqual(['message:1', 'message:3', 'message:runtime']);
+    expect(visible[0]).toBe(state.timelineItems[0]);
+    expect(visible[1]).toBe(state.timelineItems[1]);
+    expect(__chatV2SyncEngineTestHooks.counters().reconcileLocalItemsCalls).toBe(0);
+  });
+
+  it('reconciles local items once during a canonical transition and not in visible derives', () => {
+    const optimistic = addOptimisticUserMessage(applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })), {
+      content: 'queued',
+      clientMessageId: 'cmsg-1',
+      createdAt: '2026-01-01T00:00:00Z'
+    });
+    const canonicalEcho = message({
+      id: 'user:cmsg-1',
+      sort_key: '0000:000000000000001:000000:00:000000000',
+      role: 'user',
+      content: 'queued',
+      message_id: 'server-msg-1',
+      client_message_id: 'cmsg-1',
+      source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 1, event_type: 'user_message' }]
+    });
+
+    __chatV2SyncEngineTestHooks.resetCounters();
+    const result = applySyncResponse(
+      optimistic,
+      syncResponse({
+        cursor_before: 'cursor-1',
+        cursor_after: 'cursor-2',
+        ops: [{ op: 'upsert_item', item: canonicalEcho }]
+      })
+    );
+
+    expect(result.outcome).toBe('applied');
+    expect(result.state.localItems).toEqual([]);
+    expect(__chatV2SyncEngineTestHooks.counters().reconcileLocalItemsCalls).toBe(1);
+
+    expect(visibleTimelineItems(result.state).map((item) => item.id)).toEqual(['user:cmsg-1']);
+    expect(visibleTimelineItems(result.state).map((item) => item.id)).toEqual(['user:cmsg-1']);
+    expect(__chatV2SyncEngineTestHooks.counters().reconcileLocalItemsCalls).toBe(1);
   });
 
   it('does not downgrade open tool cycle state from partial sync metadata', () => {
@@ -438,6 +550,69 @@ describe('Chat v2 sync engine', () => {
     expect(merged.tool_output_artifact_id).toBe('artifact-1');
   });
 
+  it('never drops or reorders existing newer items when older history is prepended', () => {
+    // Regression guard: backfill is a pure prepend/upsert. The newer items the
+    // user was reading (and any live streaming tail) must survive untouched and
+    // stay sorted after the prepended older page.
+    const olderPage = [0, 1, 2].map((seq) => message({
+      id: `message:old-${seq}`,
+      sort_key: `0000:00000000000000${seq}:000000:02:000000000`,
+      message_id: `old-${seq}`,
+      content: `older ${seq}`
+    }));
+    const newer = [7, 8].map((seq) => message({
+      id: `message:new-${seq}`,
+      sort_key: `0000:00000000000000${seq}:000000:02:000000000`,
+      message_id: `new-${seq}`,
+      content: `newer ${seq}`
+    }));
+    // A live streaming assistant in the runtime band (9998) — the active tail.
+    const liveTail = {
+      ...message({
+        id: 'message:live:phase:0',
+        message_id: 'live',
+        content: 'streaming…',
+        stable: false,
+        partial: true,
+        status: 'running'
+      }),
+      sort_key: '9998:999999999999999:000000:02:000000000'
+    } as TimelineItem;
+
+    const state = applySnapshot(snapshot({
+      timeline: { items: [...newer, liveTail], has_more_before: true },
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [liveTail]
+      })
+    }));
+    const beforeIds = state.timelineItems.map((item) => item.id);
+
+    const next = applyBackfill(state, {
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      items: olderPage,
+      has_more_before: false,
+      before_cursor: null,
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    const afterIds = next.timelineItems.map((item) => item.id);
+    // Every pre-existing item is still present (no drops).
+    for (const id of beforeIds) {
+      expect(afterIds).toContain(id);
+    }
+    // Older page is prepended; the newer items keep their relative order and
+    // the live tail remains last.
+    expect(afterIds).toEqual([
+      'message:old-0', 'message:old-1', 'message:old-2',
+      'message:new-7', 'message:new-8',
+      'message:live:phase:0'
+    ]);
+  });
+
   it('ignores duplicate realtime frames where cursor_after is already local', () => {
     const state = applySnapshot(snapshot({ cursor: 'cursor-2' }));
     const frame: ChatRealtimeFrame = {
@@ -495,7 +670,7 @@ describe('Chat v2 sync engine', () => {
     expect(result.state.runtime?.runtime_revision).toBe(2);
   });
 
-  it('still honors cursor-preserving reset sync responses', () => {
+  it('accepts server reset responses before cursor reconciliation', () => {
     const state = applySnapshot(snapshot({ cursor: 'cursor-3', runtime: runtime(1) }));
 
     const result = applySyncResponse(
@@ -510,7 +685,7 @@ describe('Chat v2 sync engine', () => {
       })
     );
 
-    expect(result.outcome).toBe('cursor_mismatch');
+    expect(result.outcome).toBe('reset_required');
     expect(result.state.syncStatus).toBe('gapped');
     expect(result.state.cursor).toBe('cursor-3');
   });
@@ -1189,6 +1364,120 @@ describe('Chat v2 sync engine', () => {
     });
   });
 
+  it('carries the streamed final message on a CURSOR-SKEWED settle frame', () => {
+    // Regression: once the client cursor advances past the subscribe-time
+    // server cursor (after the first REST sync), every WS runtime frame arrives
+    // with cursor_before === cursor_after !== state.cursor. The settle frame on
+    // this skewed path used to skip carrySettledRuntimeItems, so the just-
+    // streamed final assistant message (a runtime-only volatile item) dropped
+    // out of the visible timeline and stayed gone until reload.
+    const streamedFinal = {
+      id: 'message:msg-final:phase:1',
+      kind: 'message',
+      sort_key: '9998:999999999999999:000001:02:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'assistant_message' }],
+      stable: false,
+      role: 'assistant',
+      content: 'Here is the final answer.',
+      message_id: 'msg-final',
+      turn_id: 'turn-1',
+      turn_cycle_index: 1,
+      attachments: [],
+      partial: true,
+      status: 'running'
+    } as TimelineItem;
+    // Advance the client cursor so the frame is cursor-skewed relative to it.
+    const base = {
+      ...applySnapshot(snapshot({ runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [streamedFinal]
+      }) })),
+      cursor: 'cursor-advanced'
+    };
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, { has_active_turn: false, volatile_items: [] }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(settled.outcome).toBe('applied');
+    const visible = visibleTimelineItems(settled.state);
+    expect(visible.map((item) => item.id)).toContain('message:msg-final:phase:1');
+    expect(visible.find((item) => item.id === 'message:msg-final:phase:1')).toMatchObject({
+      status: 'complete',
+      partial: false
+    });
+  });
+
+  it('preserves the streamed turn_cycle_index when the completion frame carries null', () => {
+    // Regression: the completion frame shares the streamed item id. The server
+    // now sends turn_cycle_index=null when the final cycle is unknown (instead
+    // of coercing to 0). The client merge is `incoming ?? existing`, so the
+    // correct streamed cycle (1) must survive rather than being clobbered to a
+    // colliding value that would fold the settled answer into a tool group.
+    const streamed = {
+      id: 'message:msg-final:phase:1',
+      kind: 'message',
+      sort_key: '9998:999999999999999:000001:02:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'assistant_stream' }],
+      stable: false,
+      role: 'assistant',
+      content: 'Streaming…',
+      message_id: 'msg-final',
+      turn_id: 'turn-1',
+      turn_cycle_index: 1,
+      attachments: [],
+      partial: true,
+      status: 'running'
+    } as TimelineItem;
+    const base = applySnapshot(snapshot({ runtime: runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      volatile_items: [streamed]
+    }) }));
+
+    // The completion frame carries the SAME item id, updated content, and a
+    // null cycle (final cycle unknown server-side). The turn is still active
+    // (continuation pending) so the runtime overlay merges the item rather than
+    // replacing wholesale — exercising the `incoming ?? existing` merge.
+    const completion = {
+      ...streamed,
+      content: 'Streaming… done.',
+      turn_cycle_index: null,
+      partial: false,
+      status: 'complete'
+    } as TimelineItem;
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [completion]
+      }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(settled.outcome).toBe('applied');
+    const visible = visibleTimelineItems(settled.state);
+    const final = visible.find((item) => item.id === 'message:msg-final:phase:1');
+    expect(final).toMatchObject({ content: 'Streaming… done.', turn_cycle_index: 1 });
+  });
+
   it('terminalizes stale stable running items after the active turn has settled', () => {
     const runningThinking = {
       id: 'thinking:running',
@@ -1210,6 +1499,28 @@ describe('Chat v2 sync engine', () => {
       status: 'complete',
       blocks: [expect.objectContaining({ status: 'complete' })]
     });
+  });
+
+  it('clears the partial flag on a settled assistant message', () => {
+    // A `partial` assistant message is treated as "live" by the activity-fold
+    // gate, which then requires backend cycle-state confirmation to fold. At
+    // settle the turn's cycle states are dropped, so a retained `partial` flag
+    // deadlocks folding until a full canonical sync replaces the item. Settle
+    // must clear it.
+    const partialAssistant = message({
+      id: 'message:partial',
+      sort_key: '0000:000000000000002:000000:02:000000000',
+      message_id: 'msg-partial',
+      status: 'running',
+      partial: true
+    });
+    const state = {
+      ...applySnapshot(snapshot({ timeline: { items: [partialAssistant], has_more_before: false } })),
+      runtime: runtime(2, { has_active_turn: false })
+    };
+
+    const settled = visibleTimelineItems(state)[0];
+    expect(settled).toMatchObject({ kind: 'message', status: 'complete', partial: false });
   });
 
   it('preserves backfilled older history across a snapshot replace', () => {
@@ -1347,7 +1658,7 @@ describe('Chat v2 sync engine', () => {
     expect(ids).toContain('message:turn-1:phase:0');
     expect(ids).toContain('message:turn-2:phase:0');
     // Prior-turn reply is carried below canonical items but ABOVE the new
-    // turn's streaming items (9997 band < 9998 band).
+    // turn's streaming items (9996 band < 9998 band).
     expect(ids.indexOf('message:turn-1:phase:0')).toBeLessThan(ids.indexOf('message:turn-2:phase:0'));
     const carried = visibleTimelineItems(nextTurn.state).find(
       (item) => item.id === 'message:turn-1:phase:0'
@@ -1402,6 +1713,76 @@ describe('Chat v2 sync engine', () => {
     );
   });
 
+  it('orders idle compaction between carried prior-turn output and the optimistic user message', () => {
+    const carriedReply = {
+      id: 'message:turn-1:phase:0',
+      kind: 'message',
+      sort_key: '9996:999999999999999:000000:02:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-old', seq: 0, event_type: 'assistant_complete' }],
+      stable: false,
+      status: 'complete',
+      role: 'assistant',
+      content: 'previous reply',
+      message_id: 'turn-1',
+      turn_id: 'turn-1',
+      attachments: [],
+      partial: false
+    } as TimelineItem;
+    const base = {
+      ...applySnapshot(snapshot()),
+      localItems: [carriedReply]
+    };
+    const withOptimistic = addOptimisticUserMessage(base, {
+      content: 'next question',
+      clientMessageId: 'cmsg-next'
+    });
+    const withCompaction = applyRealtimeFrame(withOptimistic, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-2', session_id: 'sess-old', status: 'running' },
+        volatile_items: [
+          {
+            id: 'compaction:sess-old',
+            kind: 'compaction',
+            sort_key: '9997:999999999999999:000000:10:000000000',
+            source_refs: [
+              {
+                store: 'runtime',
+                session_id: 'sess-old',
+                seq: 0,
+                event_type: 'session_compaction_started'
+              }
+            ],
+            stable: false,
+            status: 'running',
+            session_id: 'sess-old',
+            summary_preview: 'Compacting conversation history…',
+            method: 'pending',
+            turns_compacted: 0,
+            hard_pressure_exceeded: false,
+            used_timeout_fallback: false
+          } as TimelineItem
+        ]
+      }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    const ids = visibleTimelineItems(withCompaction.state).map((item) => item.id);
+    expect(ids.indexOf('message:turn-1:phase:0')).toBeLessThan(
+      ids.indexOf('compaction:sess-old')
+    );
+    expect(ids.indexOf('compaction:sess-old')).toBeLessThan(
+      ids.indexOf('local-user:cmsg-next')
+    );
+  });
+
   it('mints monotonic local sort keys after reconciliation evicts confirmed items', () => {
     const base = applySnapshot(snapshot());
     const withFirst = addOptimisticUserMessage(base, {
@@ -1451,7 +1832,7 @@ describe('Chat v2 sync engine', () => {
     const guessed = {
       id: 'message:turn-1:phase:0',
       kind: 'message',
-      sort_key: '9997:999999999999999:000000:02:000000000',
+      sort_key: '9996:999999999999999:000000:02:000000000',
       source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'assistant_complete' }],
       stable: false,
       status: 'complete',
@@ -1501,7 +1882,7 @@ describe('Chat v2 sync engine', () => {
     const carriedPhase2 = {
       id: 'message:turn-1:phase:2',
       kind: 'message',
-      sort_key: '9997:999999999999999:000002:02:000000000',
+      sort_key: '9996:999999999999999:000002:02:000000000',
       source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'assistant_complete' }],
       stable: false,
       status: 'complete',

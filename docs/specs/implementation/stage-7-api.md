@@ -43,6 +43,14 @@ resolve escalations, and configure settings.
 Message send/history moved to Chat v2 (`/api/v1/chat/v2/conversations/:id/*`);
 legacy conversation message routes are no longer part of the API.
 
+Chat v2 retry uses
+`POST /api/v1/chat/v2/conversations/:id/turns/:turn_id/retry`. The endpoint
+accepts only failed, inactive turns and re-runs the original turn with retry
+semantics instead of recording a new `user_message`. The UI retry banner and
+failed-turn continue affordance must call this primitive; they must not resend
+composer text or send a literal `Continue` message. A durable gray
+`model_recovery` notice (`Retrying turn…`) marks the retry attempt.
+
 ### 2. Agent Routes
 
 - `cognis/api/routes/agents.py`

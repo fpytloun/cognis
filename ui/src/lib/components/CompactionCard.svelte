@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { CompactionTimelineItem } from '$lib/chat';
+  import type { CompactionTimelineItem } from '$lib/timeline-render-model';
   import { renderMarkdown } from '$lib/markdown';
   import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import Button from '$lib/components/ui/Button.svelte';

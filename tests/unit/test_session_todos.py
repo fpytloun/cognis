@@ -159,6 +159,27 @@ async def test_conversation_todos_replace_and_clear_atomically(tmp_path: object)
 
 
 @pytest.mark.asyncio
+async def test_conversation_todos_preserve_parallel_in_progress_items(tmp_path: object) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/parallel-conversation-todos.db")
+    await run_schema_bootstrap(engine)
+    factory = create_session_factory(engine)
+    todos = [
+        {"content": "Implement backend", "status": "in_progress"},
+        {"content": "Validate frontend contract", "status": "in_progress"},
+    ]
+    try:
+        async with factory() as session:
+            await _seed_conversation(session)
+            assert await replace_conversation_todos(session, "conv_1", todos) == todos
+            await session.commit()
+
+        async with factory() as session:
+            assert await list_conversation_todos(session, "conv_1") == todos
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_session_todos_replace_and_clear_atomically(tmp_path: object) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/session-todos.db")
     await run_schema_bootstrap(engine)

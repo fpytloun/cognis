@@ -21,6 +21,7 @@ from cognis.models.tool import (
     ExecutorHandle,
     ToolCall,
     ToolResult,
+    tool_input_schema,
 )
 from cognis.providers.base import ToolOutputChunkCallback
 from cognis.providers.circuit_breaker import CircuitBreaker
@@ -28,7 +29,14 @@ from cognis.tools.builtin.conversations import build_conversation_tool_handlers
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.builtin.task_continuation import build_task_continuation_tool_handlers
 from cognis.tools.executor.browser.handlers import build_manager_from_config
-from cognis.tools.executor.browser.manager import BROWSER_MANAGER_KEY, BrowserManager
+from cognis.tools.executor.browser.manager import (
+    BROWSER_CLEANUP_RETAINER_KEY,
+    BROWSER_MANAGER_KEY,
+    BrowserLifecycleError,
+    BrowserManager,
+    BrowserManagerCleanupRetainer,
+    BrowserSessionOwner,
+)
 from cognis.tools.executor.definitions import executor_tool_handlers
 from cognis.tools.executor.file_freshness import get_file_freshness_tracker
 from cognis.tools.executor.lsp import (
@@ -106,6 +114,7 @@ class InProcessExecutorConnection:
                 call_id=str(params.get("call_id") or uuid.uuid4().hex),
                 name=str(params["tool_name"]),
                 arguments=dict(params.get("arguments") or {}),
+                runtime_metadata=dict(params.get("runtime_metadata") or {}),
             )
             timeout_seconds = params.get("timeout_seconds")
             result = await self.tool_execute(
@@ -128,6 +137,26 @@ class InProcessExecutorConnection:
                     include_completed=include_completed,
                 )
             }
+        if method == "browser.session_terminal":
+            manager = self.runtime_metadata.get(BROWSER_MANAGER_KEY)
+            retainer = self.runtime_metadata.get(BROWSER_CLEANUP_RETAINER_KEY)
+            if not isinstance(manager, BrowserManager) and not isinstance(
+                retainer, BrowserManagerCleanupRetainer
+            ):
+                return {"closed": 0, "complete": True}
+            raw_owner = params.get("owner")
+            if not isinstance(raw_owner, dict):
+                raise ValueError("browser.session_terminal requires owner metadata")
+            owner = BrowserSessionOwner.from_dict(raw_owner)
+            closed = 0
+            if isinstance(manager, BrowserManager):
+                closed += await manager.mark_owner_terminal(owner)
+            if isinstance(retainer, BrowserManagerCleanupRetainer):
+                closed += await retainer.mark_owner_terminal(owner)
+            return {
+                "closed": closed,
+                "complete": True,
+            }
         raise ValueError(f"Unsupported executor method: {method}")
 
     async def list_tools(self) -> list[dict[str, Any]]:
@@ -149,6 +178,33 @@ class InProcessExecutorConnection:
             handler = self.internal_handlers.get(tool_call.name)
         if handler is None:
             return ToolResult(output="Tool is not executable on this executor.", is_error=True)
+        if registered_tool is not None:
+            descriptor = registered_tool.definition.descriptor
+            local_hash = descriptor.schema_hash if descriptor is not None else None
+            expected_hash = tool_call.runtime_metadata.get("tool_contract_hash")
+            if local_hash is not None and expected_hash != local_hash:
+                return ToolResult(
+                    output="Controller and in-process executor tool contracts do not match.",
+                    is_error=True,
+                    metadata={
+                        "code": "tool_contract_mismatch",
+                        "expected_hash": expected_hash,
+                        "local_hash": local_hash,
+                    },
+                )
+            from cognis.core.tool_arguments import validate_tool_arguments
+
+            validation_error = validate_tool_arguments(
+                tool_call.name,
+                tool_call.arguments,
+                schema=tool_input_schema(registered_tool.definition),
+            )
+            if validation_error is not None:
+                return ToolResult(
+                    output=json.dumps(validation_error.as_tool_result()),
+                    is_error=True,
+                    metadata={"code": "invalid_tool_arguments"},
+                )
 
         async def invoke_handler() -> ToolResult:
             start = perf_counter()
@@ -159,7 +215,14 @@ class InProcessExecutorConnection:
                 execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
                 output_chunk_callback=output_chunk_callback,
             )
-            result = await handler(tool_call.arguments, context)
+            try:
+                result = await handler(tool_call.arguments, context)
+            except BrowserLifecycleError as exc:
+                return ToolResult(
+                    output=str(exc),
+                    is_error=True,
+                    metadata={"browser_lifecycle_error": exc.code},
+                )
             duration_ms = int((perf_counter() - start) * 1000)
             return _normalize_tool_result(result, duration_ms)
 
@@ -174,6 +237,12 @@ class InProcessExecutorConnection:
             return ToolResult(output="Tool execution timed out.", is_error=True)
         except asyncio.CancelledError:
             return ToolResult(output="Tool execution cancelled.", is_error=True)
+        except BrowserLifecycleError as exc:
+            return ToolResult(
+                output=str(exc),
+                is_error=True,
+                metadata={"browser_lifecycle_error": exc.code},
+            )
         except Exception as exc:
             # Include the actual error message so the LLM knows WHY
             # the tool failed and can adjust its approach.
@@ -205,6 +274,7 @@ class InProcessExecutorProvider:
         self.guardrails_provider = guardrails_provider
         self.compaction_strategy = compaction_strategy
         self._active: dict[str, _ExecutorRuntime] = {}
+        self._browser_cleanup_retainer = BrowserManagerCleanupRetainer()
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self._background_shell_completed_callback: (
             Callable[[str, dict[str, Any]], Awaitable[None]] | None
@@ -264,6 +334,7 @@ class InProcessExecutorProvider:
             # Stage A: eagerly build the BrowserManager so all tool calls for
             # this executor share a single persistent instance.
             _wire_browser_manager(runtime_metadata)
+            runtime_metadata[BROWSER_CLEANUP_RETAINER_KEY] = self._browser_cleanup_retainer
             try:
                 lsp_manager = build_lsp_manager(config.metadata)
                 if lsp_manager is not None:
@@ -326,24 +397,20 @@ class InProcessExecutorProvider:
         runtime = self._active.pop(handle.executor_id, None)
         if runtime is None:
             return
-        await _close_clients(runtime.mcp_clients)
-        await cleanup_lsp_manager(runtime.lsp_manager, executor_id=handle.executor_id)
         browser_manager = runtime.connection.runtime_metadata.get(BROWSER_MANAGER_KEY)
         if isinstance(browser_manager, BrowserManager):
+            self._browser_cleanup_retainer.retain(browser_manager)
+        try:
+            await _close_clients(runtime.mcp_clients)
+            await cleanup_lsp_manager(runtime.lsp_manager, executor_id=handle.executor_id)
+        finally:
             try:
-                await browser_manager.cleanup()
+                await cleanup_shell_manager(runtime.connection.runtime_metadata)
             except Exception:
                 _logger.debug(
-                    "browser: cleanup error during executor cancel",
+                    "shell: cleanup error during executor cancel",
                     extra={"extra_data": {"executor_id": handle.executor_id}},
                 )
-        try:
-            await cleanup_shell_manager(runtime.connection.runtime_metadata)
-        except Exception:
-            _logger.debug(
-                "shell: cleanup error during executor cancel",
-                extra={"extra_data": {"executor_id": handle.executor_id}},
-            )
 
     async def list_active(self) -> list[ExecutorHandle]:
         """List active executor handles."""
@@ -414,6 +481,7 @@ class InProcessExecutorProvider:
 
         for executor_id in list(self._active):
             await self.cancel(self._active[executor_id].handle)
+        await self._browser_cleanup_retainer.wait_until_empty()
 
     async def health(self) -> ProviderHealth:
         """Return executor provider health."""
