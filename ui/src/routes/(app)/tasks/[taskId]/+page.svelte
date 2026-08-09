@@ -14,9 +14,8 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 import PanelRightOpen from 'lucide-svelte/icons/panel-right-open';
 import PlayCircle from 'lucide-svelte/icons/play-circle';
 import Settings2 from 'lucide-svelte/icons/settings-2';
-import Sparkles from 'lucide-svelte/icons/sparkles';
 import Target from 'lucide-svelte/icons/target';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
@@ -35,7 +34,13 @@ import Target from 'lucide-svelte/icons/target';
   import Input from '$lib/components/ui/Input.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
-  import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
+  import WorkflowPhases from '$lib/components/task-cockpit/WorkflowPhases.svelte';
+  import TaskBrief from '$lib/components/task-cockpit/TaskBrief.svelte';
+  import TaskProgressPanel from '$lib/components/task-cockpit/TaskProgressPanel.svelte';
+  import TaskWorkPanel from '$lib/components/task-cockpit/TaskWorkPanel.svelte';
+  import TaskAgentDock from '$lib/components/task-cockpit/TaskAgentDock.svelte';
+  import AttentionPanel from '$lib/components/task-cockpit/AttentionPanel.svelte';
+  import ActivityStrip from '$lib/components/task-cockpit/ActivityStrip.svelte';
   import {
     clearQuestionDraft,
     readQuestionDraft,
@@ -44,6 +49,7 @@ import Target from 'lucide-svelte/icons/target';
   } from '$lib/interactive-drafts';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
+  import { taskAgentDock } from '$lib/stores/taskAgentDock.svelte';
   import {
     isTaskRerunnable,
     loadTaskPageData,
@@ -52,6 +58,7 @@ import Target from 'lucide-svelte/icons/target';
   } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
+  import { taskPrimaryAction, taskPrimaryActionLabel, type TaskPrimaryAction } from '$lib/task-actions';
   import { policyFromText, policyText } from '$lib/session-policy';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
@@ -74,6 +81,7 @@ import Target from 'lucide-svelte/icons/target';
   let loading = $state(true);
   let saving = $state(false);
   let rerunBusy = $state(false);
+  let lifecycleBusy = $state(false);
   let chatBusyKey = $state<string | null>(null);
   let error = $state('');
   let task = $state<TaskDetail | null>(null);
@@ -106,6 +114,7 @@ import Target from 'lucide-svelte/icons/target';
   let tickNow = $state(Date.now());
   let durationTimer: ReturnType<typeof setInterval> | null = null;
   let visibilityHandler: (() => void) | null = null;
+  let taskRefreshGeneration = 0;
 
   type SessionDrawerState = {
     conversationId: string;
@@ -315,21 +324,59 @@ import Target from 'lucide-svelte/icons/target';
   }
 
   function mobilePrimaryActionLabel(): string {
-    if (isRerunnable) return 'Re-run task';
-    if (isEditable) return 'Configure';
-    return 'Actions';
+    return taskPrimaryActionLabel(mobilePrimaryAction());
+  }
+
+  function mobilePrimaryAction(): TaskPrimaryAction {
+    return taskPrimaryAction(task?.status ?? '', {
+      hasAttention: Boolean(activePause),
+      hasWorkflow: Boolean(task?.workflow_id),
+      rerunnable: isRerunnable,
+      editable: isEditable
+    });
   }
 
   function openMobilePrimaryAction(): void {
-    if (isRerunnable) {
+    const action = mobilePrimaryAction();
+    if (action === 'answer' || action === 'resume') {
+      if (action === 'answer') {
+        const attention = document.getElementById('attention');
+        attention?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        window.requestAnimationFrame(() => attention?.querySelector<HTMLElement>('textarea, button')?.focus());
+      } else {
+        void changeLifecycle('resume');
+      }
+      return;
+    }
+    if (action === 'revise') {
+      openRevisionComposer();
+      return;
+    }
+    if (action === 'rerun') {
       void rerunTask();
       return;
     }
-    if (isEditable) {
+    if (action === 'configure') {
       configModalOpen = true;
       return;
     }
     taskActionsOpen = true;
+  }
+
+  function openRevisionComposer(): void {
+    const target = selectedStepName || revisionStepOptions[0]?.name || '';
+    if (target) commentsRef?.setRevisionTarget(target);
+    document.getElementById('task-comments-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function handlePausedPrimaryAction(): void {
+    if (activePause) {
+      const attention = document.getElementById('attention');
+      attention?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      window.requestAnimationFrame(() => attention?.querySelector<HTMLElement>('textarea, button')?.focus());
+      return;
+    }
+    void changeLifecycle('resume');
   }
 
   function isProjectedStepRun(stepRun: StepRun | null): boolean {
@@ -442,6 +489,12 @@ import Target from 'lucide-svelte/icons/target';
       call_id: notification.notification_id,
       session_id: notification.session_id,
       tool_name: typeof notification.payload.tool_name === 'string' ? notification.payload.tool_name : null,
+      arguments_display:
+        notification.payload.arguments_display
+        && typeof notification.payload.arguments_display === 'object'
+        && !Array.isArray(notification.payload.arguments_display)
+          ? notification.payload.arguments_display as Record<string, unknown>
+          : null,
       decision: 'escalate',
       resolved: false,
       reasoning: typeof notification.payload.reasoning === 'string' ? notification.payload.reasoning : null,
@@ -712,7 +765,7 @@ import Target from 'lucide-svelte/icons/target';
   function activeStepTodos(stepRun: StepRun): Array<{ content: string; status: string; priority: string }> {
     const todos = Array.isArray(stepRun.todos) ? stepRun.todos : [];
     return todos
-      .map((todo: Record<string, unknown>) => {
+      .map((todo) => {
         const content = typeof todo.content === 'string' ? todo.content.trim() : '';
         if (!content) return null;
         return {
@@ -818,18 +871,8 @@ import Target from 'lucide-svelte/icons/target';
   }
 
   async function openTaskChat(): Promise<void> {
-    if (!task || chatBusyKey) return;
-    chatBusyKey = `task:${task.task_id}`;
-    try {
-      const result = await api.tasks.chat(task.task_id);
-      addToast('Opened a chat continuation for this task.', 'success');
-      await goto(`/chat/${result.conversation_id}`);
-    } catch (err) {
-      const apiError = asApiError(err);
-      addToast(apiError.message || 'Could not open task chat.', 'error');
-    } finally {
-      chatBusyKey = null;
-    }
+    await tick();
+    taskAgentDock.open('chat');
   }
 
   async function openStepChat(stepRun: StepRun): Promise<void> {
@@ -877,11 +920,8 @@ import Target from 'lucide-svelte/icons/target';
     return latestRun?.step_name ?? workflowNames[0] ?? '';
   }
 
-  // ---------------------------------------------------------------------------
-  // Diagram helpers
-  // ---------------------------------------------------------------------------
-
-  /** Resolve the workflow definition for the diagram */
+  // The definition remains available for advanced step configuration details.
+  // Primary execution state and ordering come from the backend projection.
   let workflowDef = $derived.by(() => {
     if (!task?.workflow_id) return null;
     return workflows.find((w) => w.workflow_id === task!.workflow_id) ?? null;
@@ -892,58 +932,17 @@ import Target from 'lucide-svelte/icons/target';
     return workflowToFormState(workflowDef).steps;
   });
 
-  let diagramActiveStep = $derived.by(() => {
-    if (!task) return '';
-    if (!['running', 'evaluating'].includes(task.status)) return '';
-    return task.workflow_run?.current_step_name ?? '';
-  });
-
-  /** Build step status map from step_runs (latest attempt per step) */
-  let diagramStepStatuses = $derived.by(() => {
-    if (!task) return {};
-    const map: Record<string, string> = {};
-    const latestAttempts: Record<string, number> = {};
-    for (const sr of task.step_runs) {
-      const nextStatus = displayStepStatus(sr);
-      if (!(sr.step_name in latestAttempts) || sr.attempt >= latestAttempts[sr.step_name]) {
-        latestAttempts[sr.step_name] = sr.attempt;
-        map[sr.step_name] = nextStatus;
-      }
-    }
-    return map;
-  });
-
-  /** Build step duration map (accumulated across attempts per step) */
-  let diagramStepDurations = $derived.by(() => {
-    if (!task) return {};
-    const map: Record<string, string> = {};
-    const totals = new Map<string, number>();
-    for (const sr of task.step_runs) {
-      const seconds = sr.duration_seconds;
-      if (typeof seconds === 'number') {
-        totals.set(sr.step_name, (totals.get(sr.step_name) ?? 0) + seconds);
-        continue;
-      }
-      const started = sr.started_at ? Date.parse(sr.started_at) : NaN;
-      const ended = sr.completed_at ? Date.parse(sr.completed_at) : tickNow;
-      if (Number.isFinite(started) && Number.isFinite(ended)) {
-        totals.set(sr.step_name, (totals.get(sr.step_name) ?? 0) + Math.max(0, (ended - started) / 1000));
-      }
-    }
-    for (const [name, seconds] of totals) {
-      const dur = formatDuration(new Date(0).toISOString(), new Date(seconds * 1000).toISOString(), tickNow);
-      if (dur) map[name] = dur;
-    }
-    return map;
-  });
-
-  let diagramSkippedSteps = $derived(task?.workflow_state?.skipped_steps ?? []);
+  let projectedActiveStep = $derived(task?.workflow_projection?.current_step_name ?? '');
 
   let stepGroups = $derived.by(() => {
     if (!task) return [] as StepGroup[];
     const groups = new Map<string, StepGroup>();
-    const workflowStepNames = diagramSteps.map((step) => step.name);
-    diagramSteps.forEach((step, index) => {
+    const projectedSteps = task.workflow_projection?.phases.flatMap((phase) => phase.steps) ?? [];
+    const canonicalSteps = projectedSteps.length > 0
+      ? projectedSteps.map((step) => ({ name: step.name, type: step.type }))
+      : diagramSteps;
+    const workflowStepNames = canonicalSteps.map((step) => step.name);
+    canonicalSteps.forEach((step, index) => {
       groups.set(step.name, {
         stepName: step.name,
         stepType: step.type,
@@ -1140,7 +1139,7 @@ import Target from 'lucide-svelte/icons/target';
       }
       const status = group.latest ? displayStepStatus(group.latest) : '';
       if (!status) continue;
-      if (group.stepName === diagramActiveStep && ['running', 'evaluating'].includes(status)) {
+      if (group.stepName === projectedActiveStep && ['running', 'evaluating'].includes(status)) {
         labels[group.stepName] = status === 'evaluating' ? 'evaluating' : 'live';
         continue;
       }
@@ -1151,13 +1150,13 @@ import Target from 'lucide-svelte/icons/target';
 
   let executionSummary = $derived.by(() => {
     if (!task) return null;
-    const activeGroup = selectedStepGroup ?? stepGroups.find((group) => group.stepName === diagramActiveStep) ?? null;
+    const activeGroup = selectedStepGroup ?? stepGroups.find((group) => group.stepName === projectedActiveStep) ?? null;
     return {
-      activeStepName: task.pending_pause?.step_name ?? diagramActiveStep ?? activeGroup?.stepName ?? '',
+      activeStepName: task.workflow_projection?.current_step_name ?? task.pending_pause?.step_name ?? activeGroup?.stepName ?? '',
       activeLabel: task.pending_pause
         ? taskPauseSummaryLabel(task.pending_pause.pause_type)
         : task.status === 'running'
-          ? diagramActiveStep
+          ? projectedActiveStep
             ? 'Agent is executing'
             : 'Task is live'
           : task.status === 'paused'
@@ -1192,7 +1191,9 @@ import Target from 'lucide-svelte/icons/target';
     const multiAttemptSteps = new Set(
       latestRuns.filter((r) => r.attempt > 1).map((r) => r.step_name)
     ).size;
-    const skipped = diagramSkippedSteps.length;
+    const skipped = task.workflow_projection?.phases
+      .flatMap((phase) => phase.steps)
+      .filter((step) => step.status === 'skipped').length ?? task.workflow_state?.skipped_steps?.length ?? 0;
 
     // Loop iterations from workflow state
     const loopIters = task.workflow_state?.loop_iterations;
@@ -1434,10 +1435,12 @@ import Target from 'lucide-svelte/icons/target';
   // ---------------------------------------------------------------------------
 
   async function loadTask(): Promise<void> {
+    const refreshGeneration = ++taskRefreshGeneration;
     loading = true;
     error = '';
     try {
       const data = await loadTaskPageData(api, taskIdFromRoute());
+      if (refreshGeneration !== taskRefreshGeneration) return;
       task = preserveLoadedStepRuns(data.task, task?.step_runs ?? []);
       agents = data.agents;
       workflows = data.workflows;
@@ -1475,20 +1478,23 @@ import Target from 'lucide-svelte/icons/target';
         taskCredentialRequest = null;
       }
     } catch (caughtError) {
+      if (refreshGeneration !== taskRefreshGeneration) return;
       task = null;
       taskEscalations = [];
       taskCredentialRequest = null;
       error = asApiError(caughtError).message;
     } finally {
-      loading = false;
+      if (refreshGeneration === taskRefreshGeneration) loading = false;
     }
   }
 
-  async function refreshTaskOnly(): Promise<void> {
-    if (document.hidden) return;
+  async function refreshTaskOnly(options: { force?: boolean } = {}): Promise<void> {
+    if (document.hidden && !options.force) return;
+    const refreshGeneration = ++taskRefreshGeneration;
     try {
       const previousRuns = task?.step_runs ?? [];
       const data = await refreshTaskPageData(api, taskIdFromRoute(), allTasks);
+      if (refreshGeneration !== taskRefreshGeneration) return;
       task = preserveLoadedStepRuns(data.task, previousRuns);
       allTasks = data.allTasks;
       error = data.auxiliaryError;
@@ -1520,6 +1526,7 @@ import Target from 'lucide-svelte/icons/target';
         // best-effort: comments will retry on next poll
       }
     } catch (caughtError) {
+      if (refreshGeneration !== taskRefreshGeneration) return;
       if (shouldClearTaskFromError(caughtError)) {
         task = null;
         taskEscalations = [];
@@ -1581,7 +1588,7 @@ import Target from 'lucide-svelte/icons/target';
     try {
       await api.tasks.addDependency(task.task_id, dependencyTaskId, true);
       dependencyTaskId = '';
-      task = await api.tasks.detail(task.task_id);
+      await refreshTaskOnly({ force: true });
       addToast('Dependency added.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1599,7 +1606,7 @@ import Target from 'lucide-svelte/icons/target';
     if (!confirmed) return;
     try {
       await api.tasks.removeDependency(task.task_id, dependsOn);
-      task = await api.tasks.detail(task.task_id);
+      await refreshTaskOnly({ force: true });
       addToast('Dependency removed.', 'success');
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -1607,8 +1614,8 @@ import Target from 'lucide-svelte/icons/target';
     }
   }
 
-  async function respondToGate(action: string): Promise<void> {
-    if (!task) return;
+  async function respondToGate(action: string): Promise<boolean> {
+    if (!task) return false;
     try {
       await api.tasks.gateResponse(task.task_id, {
         step_name: task.pending_pause?.step_name,
@@ -1616,19 +1623,21 @@ import Target from 'lucide-svelte/icons/target';
         feedback: gateFeedback || undefined
       });
       gateFeedback = '';
-      task = await api.tasks.detail(task.task_id);
+      await refreshTaskOnly({ force: true });
+      return true;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      return false;
     }
   }
 
-  async function respondToStepQuestion(answersOverride?: QuestionSetAnswer[]): Promise<void> {
-    if (!task) return;
+  async function respondToStepQuestion(answersOverride?: QuestionSetAnswer[]): Promise<boolean> {
+    if (!task) return false;
     const questions = task.pending_pause?.questions ?? [];
     const answers = answersOverride ?? buildStepQuestionReply(questions);
     if (!stepQuestionAnswersSatisfyRequired(questions, answers)) {
       error = 'Answer all required questions before sending.';
-      return;
+      return false;
     }
     try {
       await api.tasks.stepResponse(task.task_id, {
@@ -1638,9 +1647,11 @@ import Target from 'lucide-svelte/icons/target';
       stepResponse = '';
       clearActiveStepQuestionDraft();
       stepQuestionAnswers = {};
-      task = await api.tasks.detail(task.task_id);
+      await refreshTaskOnly({ force: true });
+      return true;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
+      return false;
     }
   }
 
@@ -1687,6 +1698,21 @@ import Target from 'lucide-svelte/icons/target';
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to cancel task');
+    }
+  }
+
+  async function changeLifecycle(action: 'submit' | 'pause' | 'resume'): Promise<void> {
+    if (!task || lifecycleBusy) return;
+    lifecycleBusy = true;
+    try {
+      await api.tasks[action](task.task_id);
+      await refreshTaskOnly();
+      addToast(`Task ${action === 'submit' ? 'submitted' : `${action}d`}.`, 'success');
+    } catch (caughtError) {
+      error = asApiError(caughtError).message;
+      addToast(error, 'error', 4_000, `Unable to ${action} task`);
+    } finally {
+      lifecycleBusy = false;
     }
   }
 
@@ -1752,7 +1778,11 @@ import Target from 'lucide-svelte/icons/target';
     width and let only explicitly wide children (workflow diagram,
     chip rows, code/table blocks) own horizontal scrolling.
   -->
-  <section class="min-h-0 min-w-0 w-full max-w-full space-y-5 overflow-x-hidden px-3 py-4 sm:px-5 sm:py-6">
+  <section
+    class="min-h-0 min-w-0 w-full max-w-full space-y-5 overflow-x-hidden px-3 py-4 sm:px-5 sm:py-6"
+    data-testid="task-cockpit-surface"
+    data-source-tree={import.meta.env.VITE_STAGE41_SOURCE_TREE ?? ''}
+  >
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div class="min-w-0 space-y-3">
         <Button size="sm" variant="secondary" onclick={() => goto('/tasks')}>Back to task board</Button>
@@ -1763,8 +1793,13 @@ import Target from 'lucide-svelte/icons/target';
             class="h-11 w-11 rounded-2xl"
           />
           <div class="min-w-0">
-            <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task detail</p>
+            <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task Cockpit</p>
             <h1 class="mt-1 break-words text-2xl font-semibold text-white" title={task.title}>{task.title}</h1>
+            {#if task.expected_output}
+              <p class="mt-2 max-w-3xl text-sm leading-6 text-slate-300" data-testid="task-cockpit-objective">
+                {task.expected_output}
+              </p>
+            {/if}
             <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-400">
               <span>Owner agent</span>
               <span class="font-medium text-slate-200">{agentName(task.agent_id)}</span>
@@ -1797,9 +1832,19 @@ import Target from 'lucide-svelte/icons/target';
           </Button>
 
           {#if isRerunnable}
-            <Button class="hidden lg:inline-flex" size="sm" disabled={rerunBusy} onclick={rerunTask}>
+            <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={rerunBusy} onclick={rerunTask}>
               Re-run task
             </Button>
+          {/if}
+          {#if task.status === 'draft'}
+            <Button class="hidden lg:inline-flex" size="sm" disabled={lifecycleBusy} onclick={() => void changeLifecycle('submit')}>Submit task</Button>
+          {:else if task.status === 'running' || task.status === 'evaluating'}
+            <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={lifecycleBusy} onclick={() => void changeLifecycle('pause')}>Pause task</Button>
+          {:else if task.status === 'paused'}
+             <Button class="hidden lg:inline-flex" size="sm" disabled={lifecycleBusy} onclick={handlePausedPrimaryAction}>{activePause ? 'Review decision' : 'Resume task'}</Button>
+          {/if}
+          {#if TERMINAL_STATUSES.includes(task.status) && task.workflow_id}
+            <Button class="hidden lg:inline-flex" size="sm" onclick={openRevisionComposer}>Revise result</Button>
           {/if}
           <Button class="hidden lg:inline-flex" size="sm" variant="secondary" onclick={() => (configModalOpen = true)}>
             <Settings2 class="mr-1.5 h-3.5 w-3.5" />
@@ -1811,7 +1856,7 @@ import Target from 'lucide-svelte/icons/target';
             {:else}
               <MessageSquarePlus class="mr-1.5 h-3.5 w-3.5" />
             {/if}
-            Chat about task
+             Ask
           </Button>
           {#if isCancellable}
             <Button class="hidden lg:inline-flex" size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
@@ -1824,15 +1869,29 @@ import Target from 'lucide-svelte/icons/target';
       <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">{error}</p>
     {/if}
 
+    {#if activePause && taskAgentDock.state === 'minimized'}
+      <AttentionPanel
+        pause={activePause}
+        onGate={(action, instruction) => { gateFeedback = instruction; return respondToGate(action); }}
+        onQuestion={(answers) => respondToStepQuestion(answers)}
+      />
+    {/if}
+
+    <TaskBrief
+      {task}
+      workflowLabel={workflowName(task.workflow_id)}
+      projectLabel={task.project_id ? projects.find((project) => project.project_id === task?.project_id)?.name ?? task.project_id : 'No project'}
+      agentLabel={agentName(task.agent_id)}
+    />
+
     <div class="grid min-w-0 gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
-      <div class="min-w-0 space-y-5">
-        <!-- Pipeline diagram -->
-        {#if diagramSteps.length > 0}
-          <Card class="overflow-hidden p-0">
+      <div class="flex min-w-0 flex-col gap-5">
+        <!-- Backend-owned workflow cockpit -->
+        <Card class="order-2 overflow-hidden p-0">
             <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Live workflow</p>
+                  <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Phase workflow</p>
                   <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-300">
                     {#if task.status === 'running' || task.status === 'evaluating'}
                       <span class="inline-flex h-5 w-5 items-center justify-center rounded-full border border-sky-500/30 bg-sky-500/10 text-sky-300">
@@ -1857,12 +1916,12 @@ import Target from 'lucide-svelte/icons/target';
                         {:else}
                           <MessageSquarePlus class="mr-1.5 h-3.5 w-3.5" />
                         {/if}
-                        Chat about step
+                        Ask
                       </Button>
                     {:else}
                       <Tooltip text="No step session recorded yet.">
                         <button type="button" aria-disabled="true" class="inline-flex items-center justify-center rounded-xl border border-slate-700 bg-slate-900/60 px-3 py-1.5 text-sm font-medium text-slate-500 cursor-not-allowed">
-                          Chat about step
+                          Ask
                         </button>
                       </Tooltip>
                     {/if}
@@ -1898,60 +1957,26 @@ import Target from 'lucide-svelte/icons/target';
                   </div>
                 </div>
               {/if}
-              <div class="mt-4 flex gap-2 overflow-x-auto pb-1">
-                {#each stepGroups as group}
-                  {@const liveStatus = group.latest ? displayStepStatus(group.latest) : (task.pending_pause?.step_name === group.stepName ? 'paused' : 'pending')}
-                  <button
-                    class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs transition ${selectedStepGroup?.stepName === group.stepName ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-700 bg-slate-900/70 text-slate-300 hover:border-slate-600 hover:text-white'}`}
-                    onclick={() => openStepDetail(group.stepName)}
-                    type="button"
-                  >
-                    {#if ['approved', 'completed'].includes(liveStatus)}
-                      <CheckCircle2 class="h-3.5 w-3.5 text-emerald-300" />
-                    {:else if group.stepType === 'gate'}
-                      <GitBranch class="h-3.5 w-3.5 text-sky-300" />
-                    {:else}
-                      <PlayCircle class="h-3.5 w-3.5 text-slate-400" />
-                    {/if}
-                    <span>{group.stepName}</span>
-                    {#if group.attempts.length > 1}
-                      <span class="rounded-full bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-300">x{group.attempts.length}</span>
-                    {/if}
-                  </button>
-                {/each}
-              </div>
             </div>
             <div class="px-3 py-3 sm:px-5 sm:py-4">
-            <WorkflowDiagram
-              steps={diagramSteps}
-              interactionMode={workflowDef?.interaction?.mode?.toString() ?? 'explicit_gates'}
-              activeStepName={diagramActiveStep}
+            <WorkflowPhases
+              projection={task.workflow_projection}
               selectedStepName={selectedStepGroup?.stepName ?? ''}
-              stepStatuses={diagramStepStatuses}
-              stepDurations={diagramStepDurations}
-              stepAttemptCounts={stepAttemptCounts}
-              stepStateLabels={stepStateLabels}
-              stepHasLogs={stepHasLogs}
-              stepHasOutput={stepHasOutput}
-              skippedSteps={diagramSkippedSteps}
               onStepSelect={(stepName) => openStepDetail(stepName)}
               onStepLogsOpen={openSessionLogsForStep}
               onStepOutputOpen={openOutputModalForStep}
             />
             </div>
-          </Card>
-        {/if}
+        </Card>
 
-        <div id="task-comments-anchor">
-          <TaskComments
-            bind:this={commentsRef}
-            task={task}
-            stepOptions={revisionStepOptions}
-            initialTargetStep={revisionTargetSeed ?? selectedStepName}
-            onSubmitted={handleCommentSubmitted}
-          />
-        </div>
+        <details id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
+          <summary class="cursor-pointer text-sm font-medium text-white">Task context and notes</summary>
+          <div class="mt-4">
+            <TaskComments bind:this={commentsRef} task={task} notesOnly onSubmitted={handleCommentSubmitted} />
+          </div>
+        </details>
 
+         <div class="order-1 scroll-mt-20 space-y-5">
         {#if taskEscalations.length > 0}
           {@const activeEscalation = taskEscalations[0]}
           <EscalationPrompt
@@ -1974,123 +1999,39 @@ import Target from 'lucide-svelte/icons/target';
           />
         {/if}
 
-        <!-- Pending pause -->
-        {#if activePause}
-          <Card class="overflow-hidden p-0">
-            <div class="space-y-4">
-              <div class="border-b border-slate-800/80 bg-gradient-to-r from-sky-500/10 via-slate-900 to-slate-900 px-5 py-4">
-                <div class="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.25em] text-slate-400">
-                  <span>{activePause.pause_type === 'gate' ? 'Workflow gate' : 'Step question'}</span>
-                  {#if activePause.step_name}
-                    <span class="rounded-full border border-slate-700 bg-slate-950/70 px-2 py-0.5 text-[10px] tracking-[0.2em] text-slate-300">{activePause.step_name}</span>
-                  {/if}
-                </div>
-                <h2 class="mt-3 text-lg font-semibold text-white">
-                  {activePause.pause_type === 'gate'
-                    ? activePause.question
-                    : activeStepQuestions[0]?.question ?? 'Step question'}
-                </h2>
-                <p class="mt-2 text-sm text-slate-400">
-                  {activePause.pause_type === 'gate'
-                    ? 'Review the latest attempt, give guidance if needed, then continue or stop the workflow.'
-                    : 'Answer here to resume the active step without leaving the task view.'}
-                </p>
-              </div>
-
-              <div class="px-5 pb-5">
-              {#if activePause.pause_type === 'gate'}
-                <div class="space-y-3">
-                  <div class="rounded-2xl border border-sky-500/20 bg-sky-500/5 p-4">
-                    <div class="flex items-center gap-2 text-sm font-medium text-sky-100">
-                      <Sparkles class="h-4 w-4 text-sky-300" />
-                      Optional instruction for the next attempt
-                    </div>
-                    <p class="mt-1 text-sm text-slate-400">This will be passed into the next execution when you continue or retry.</p>
-                    <textarea bind:value={gateFeedback} class="mt-3 min-h-[120px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500" placeholder="Example: approve the direction, but tighten the final summary and validate edge cases before finishing."></textarea>
-                  </div>
-                  <div class="grid gap-2 sm:grid-cols-2">
-                    {#each activePause.options ?? [] as option}
-                      <Button class="justify-center" size="sm" onclick={() => respondToGate(String(option.action ?? 'continue'))}>{String(option.label ?? option.action ?? 'continue')}</Button>
-                    {/each}
-                    {#if (activePause.options ?? []).length === 0}
-                      <Button class="justify-center" size="sm" onclick={() => respondToGate('continue')}>Continue workflow</Button>
-                    {/if}
-                    <Button class="justify-center" size="sm" variant="secondary" onclick={() => respondToGate('cancel')}>Stop task</Button>
-                  </div>
-                </div>
-              {:else}
-                <div class="space-y-4">
-                  {#each activeStepQuestions as question, questionIndex (question.id)}
-                    {@const answerState = stepQuestionState(question.id)}
-                    <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <span class="rounded-full border border-slate-700 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-400">Question {questionIndex + 1}</span>
-                        {#if question.multiple}
-                          <span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-sky-200">Multi-select</span>
-                        {/if}
-                        {#if !question.required}
-                          <span class="rounded-full border border-slate-700 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-slate-400">Optional</span>
-                        {/if}
-                      </div>
-                      {#if question.header}
-                        <p class="mt-3 text-xs uppercase tracking-[0.2em] text-slate-500">{question.header}</p>
-                      {/if}
-                      <p class="mt-2 text-sm font-medium text-slate-100">{question.question}</p>
-                      {#if question.options.length > 0}
-                        <div class="mt-3 space-y-2">
-                          {#each question.options as option (option.id)}
-                            <button
-                              type="button"
-                              class={`flex w-full items-start gap-3 rounded-2xl border px-3 py-2 text-left text-xs transition ${stepQuestionOptionSelected(question.id, option.id) ? 'border-sky-400/70 bg-sky-500/20 text-sky-50' : 'border-slate-700 bg-slate-900/70 text-slate-200 hover:border-sky-400/40 hover:bg-sky-500/10 hover:text-white'}`}
-                              onclick={() => { void submitStepQuestionOption(question, option.id); }}
-                            >
-                              <span class={`mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center border ${question.multiple ? 'rounded' : 'rounded-full'} ${stepQuestionOptionSelected(question.id, option.id) ? 'border-sky-200 bg-sky-300 text-slate-950' : 'border-slate-500 bg-slate-950/40'}`}>
-                                {#if stepQuestionOptionSelected(question.id, option.id)}
-                                  {#if question.multiple}
-                                    ✓
-                                  {:else}
-                                    <span class="h-1.5 w-1.5 rounded-full bg-slate-950"></span>
-                                  {/if}
-                                {/if}
-                              </span>
-                              <span class="min-w-0">
-                                <span class="block font-medium">{option.label}</span>
-                                {#if option.description}
-                                  <span class="mt-0.5 block text-slate-400">{option.description}</span>
-                                {/if}
-                              </span>
-                            </button>
-                          {/each}
-                        </div>
-                      {/if}
-                      {#if question.allow_custom}
-                        <textarea
-                          value={answerState.custom}
-                          oninput={(event) => setStepQuestionCustom(question.id, event.currentTarget.value)}
-                          class="mt-3 min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100 placeholder:text-slate-500"
-                          placeholder="Optional custom answer"
-                        ></textarea>
-                      {/if}
-                    </div>
-                  {/each}
-                  {#if activeStepQuestions.length === 0}
-                    <p class="rounded-2xl border border-rose-500/20 bg-rose-500/5 p-4 text-sm text-rose-200">This step question has no question-set payload and cannot be answered from the task view.</p>
-                  {/if}
-                  <div class="flex flex-wrap gap-2">
-                    <Button size="sm" disabled={activeStepQuestions.length === 0 || !currentStepQuestionReplyValid()} onclick={() => respondToStepQuestion()}>Send response</Button>
-                  </div>
-                </div>
-              {/if}
-              </div>
-            </div>
+        {#if (task.status === 'failed' || task.status === 'paused') && !activePause && taskEscalations.length === 0 && !taskCredentialRequest}
+          <Card class="border-rose-500/30 bg-rose-500/5 p-4">
+            <p class="text-xs font-semibold uppercase tracking-[0.25em] text-rose-300">{task.status === 'failed' ? 'Task failed' : 'Task blocked'}</p>
+            <p class="mt-2 text-sm text-slate-200">{task.result_summary || task.applied_completion_reason || 'The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.'}</p>
           </Card>
         {/if}
+        </div>
+
+        {#if (task.status === 'running' || task.status === 'evaluating') && !activePause}
+          <div class="order-1">
+            <ActivityStrip label={executionSummary?.activeLabel ?? 'Task is running'} stepName={executionSummary?.activeStepName ?? ''} />
+          </div>
+        {/if}
+
+        <div id="result" class="order-3 scroll-mt-20">
+          <TaskWorkPanel
+            stepRuns={task.step_runs}
+            {agents}
+            canonicalDeliverableId={typeof task.result_data?.final_deliverable_id === 'string' ? task.result_data.final_deliverable_id : null}
+            onViewSession={(sessionId) => { void openSessionLogsById(sessionId); }}
+            onViewWork={(scope, category) => { taskAgentDock.openWork(scope, category); }}
+          />
+        </div>
+
+        <div class="order-4">
+          <TaskProgressPanel projection={task.progress} />
+        </div>
 
         <!--
           Desktop-only inline step detail. On mobile we rely on the dedicated
           bottom sheet so the page keeps one clear detail pattern.
         -->
-        <Card class="hidden overflow-hidden p-0 lg:block">
+        <Card class="order-6 hidden overflow-hidden p-0 lg:block">
           <div class="border-b border-slate-800/80 px-4 py-3 sm:px-5 sm:py-4">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div class="min-w-0">
@@ -2456,7 +2397,7 @@ import Target from 'lucide-svelte/icons/target';
           <div class="mt-4 space-y-4 text-sm text-slate-300">
             <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
-              <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
+               <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'No final result is available for this task state.'}</p>
               {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
                 <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
                   {#if finalTaskResultTitle(task)}
@@ -2471,7 +2412,7 @@ import Target from 'lucide-svelte/icons/target';
                 <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
               {/if}
               {#if hasFinalTaskOutput(task)}
-                <p class="mt-4 text-xs text-slate-500">The finalized deliverable stays in the full step output modal to keep this summary lightweight.</p>
+                 <a class="mt-4 inline-block text-xs text-sky-300 hover:text-sky-200" href="#result">Go to the canonical result</a>
               {/if}
             </div>
           </div>
@@ -2557,10 +2498,10 @@ import Target from 'lucide-svelte/icons/target';
           </dl>
         </Card>
 
-        <!-- Statistics -->
+        <!-- Run health -->
         {#if stats && stats.totalAttempts > 0}
           <Card class="p-5">
-            <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Statistics</p>
+             <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Run health</p>
             <dl class="mt-3 space-y-2 text-sm">
               <div class="flex justify-between">
                 <dt class="text-slate-500">Steps completed</dt>
@@ -2568,7 +2509,7 @@ import Target from 'lucide-svelte/icons/target';
               </div>
               <div class="flex justify-between">
                 <dt class="inline-flex items-center gap-1 text-slate-500">
-                  Total step runs
+                   Steps
                   <Tooltip text="Total number of step execution attempts, including retries. Higher than step count when steps are retried after evaluation rejection.">
                     <span class="cursor-help text-slate-600">(?)</span>
                   </Tooltip>
@@ -2578,7 +2519,7 @@ import Target from 'lucide-svelte/icons/target';
               {#if stats.evalRevisions > 0}
                 <div class="flex justify-between">
                   <dt class="inline-flex items-center gap-1 text-slate-500">
-                    Eval revisions
+                     Retries
                     <Tooltip text="Times the evaluator sent a step back for revision. The agent retries within the same step run.">
                       <span class="cursor-help text-slate-600">(?)</span>
                     </Tooltip>
@@ -2630,7 +2571,7 @@ import Target from 'lucide-svelte/icons/target';
           {#if task.applied_completion_reason}
             <p class="mt-3 text-xs leading-5 text-slate-500">{task.applied_completion_reason}</p>
           {/if}
-          <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'This task has not produced a final result yet.'}</p>
+           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'No final result is available for this task state.'}</p>
           {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
             <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
               {#if finalTaskResultTitle(task)}
@@ -2645,7 +2586,7 @@ import Target from 'lucide-svelte/icons/target';
             <Button class="mt-4" size="sm" variant="secondary" onclick={() => void promoteWorkflowFromTask()}>Promote workflow</Button>
           {/if}
           {#if hasFinalTaskOutput(task)}
-            <p class="mt-4 text-xs text-slate-500">The finalized deliverable stays in the full step output modal to keep this summary lightweight.</p>
+             <a class="mt-4 inline-block text-xs text-sky-300 hover:text-sky-200" href="#result">Go to the canonical result</a>
           {/if}
         </Card>
       </div>
@@ -2979,9 +2920,17 @@ import Target from 'lucide-svelte/icons/target';
   <Sheet open={taskActionsOpen} onClose={() => (taskActionsOpen = false)} side="bottom" label="Task actions">
     {#snippet children()}
       <div class="space-y-2">
+        {#if task?.status === 'draft'}
+          <Button class="w-full justify-center" onclick={() => { taskActionsOpen = false; void changeLifecycle('submit'); }} disabled={lifecycleBusy}>Submit task</Button>
+        {:else if task?.status === 'running' || task?.status === 'evaluating'}
+          <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void changeLifecycle('pause'); }} disabled={lifecycleBusy}>Pause task</Button>
+        {:else if task?.status === 'paused'}
+          <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void changeLifecycle('resume'); }} disabled={lifecycleBusy}>Resume task</Button>
+        {/if}
         <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; configModalOpen = true; }} disabled={!isEditable}>
           Configure task
         </Button>
+        <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void openTaskChat(); }} disabled={chatBusyKey !== null}>Ask</Button>
         {#if isRerunnable}
           <Button class="w-full justify-center" onclick={() => { taskActionsOpen = false; void rerunTask(); }} disabled={rerunBusy}>
             Re-run task
@@ -2995,6 +2944,13 @@ import Target from 'lucide-svelte/icons/target';
       </div>
     {/snippet}
   </Sheet>
+
+  <TaskAgentDock
+    {task}
+    agent={taskAgent}
+    onGate={(action, instruction) => { gateFeedback = instruction; return respondToGate(action); }}
+    onQuestion={(answers) => respondToStepQuestion(answers)}
+  />
 
   {#if outputModalStepRun}
     <StepOutputModal

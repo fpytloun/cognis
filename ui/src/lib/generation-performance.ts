@@ -66,3 +66,9 @@ export function responsivenessBadge(
   }
   return { label: 'Steady', detail, tone: 'neutral' };
 }
+
+export function responsivenessBadgeOrNull(
+  performance: GenerationPerformanceSnapshot | null | undefined
+): ReturnType<typeof responsivenessBadge> {
+  return performance ? responsivenessBadge(performance) : null;
+}

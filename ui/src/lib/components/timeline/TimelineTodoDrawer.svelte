@@ -70,7 +70,7 @@
       onclick={() => { open = !open; }}
       type="button"
     >
-      <span class="truncate text-slate-300">
+      <span class="scrollbar-hidden-x min-w-0 text-slate-300">
         <span class="font-medium text-slate-200">Todos</span>
         <span class="text-slate-500"> · {activeTodos.length} active{#if todoCounts.inProgress > 0} · {todoCounts.inProgress} in progress{/if}{#if todoCounts.pending > 0} · {todoCounts.pending} pending{/if}</span>
       </span>
@@ -89,7 +89,7 @@
               aria-label={todo.status.replace('_', ' ')}
               title={todo.status.replace('_', ' ')}
             ></span>
-            <span class="min-w-0 flex-1 truncate">{todo.content}</span>
+            <span class="scrollbar-hidden-x min-w-0 flex-1">{todo.content}</span>
           </li>
         {/each}
       </ul>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   delegationToolCallDisplayTitle,
+  managedConversationStatusIsRunning,
   managedConversationToolPresentation,
   memoryToolPresentation,
   nativeInspectionToolPresentation,
@@ -12,6 +13,14 @@ import {
 } from './tool-call-summary';
 
 describe('tool call summaries', () => {
+  it('animates only queued or running managed conversation states', () => {
+    expect(managedConversationStatusIsRunning('running')).toBe(true);
+    expect(managedConversationStatusIsRunning('queued')).toBe(true);
+    expect(managedConversationStatusIsRunning('active')).toBe(false);
+    expect(managedConversationStatusIsRunning('idle')).toBe(false);
+    expect(managedConversationStatusIsRunning('error')).toBe(false);
+  });
+
   it('builds web search cards with result and lazy image references', () => {
     expect(webToolPresentation({
       toolName: 'web_search',
@@ -35,6 +44,26 @@ describe('tool call summaries', () => {
       requestText: 'example charts',
       results: [{ title: 'Example chart', url: 'https://example.com/chart' }],
       media: [{ url: 'https://cdn.example.com/chart.png', artifactRef: 'tool_artifact:call_123:media:1' }],
+    });
+  });
+
+  it('surfaces degraded search status in the rich presentation', () => {
+    expect(webToolPresentation({
+      toolName: 'web_search',
+      status: 'completed',
+      arguments: { query: 'current news' },
+      result: [
+        '[[search:status]]',
+        'Search degraded: 3 engine failure(s). Treat freshness and coverage as incomplete.',
+        '',
+        '[[result:1]]',
+        '[1] Current article',
+        '    URL: https://example.com/article',
+        '    Domain: example.com',
+      ].join('\n'),
+    })).toMatchObject({
+      warning: 'Search degraded: 3 engine failure(s). Treat freshness and coverage as incomplete.',
+      results: [{ title: 'Current article' }],
     });
   });
 

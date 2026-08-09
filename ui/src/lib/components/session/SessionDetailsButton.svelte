@@ -1,10 +1,12 @@
 <script lang="ts">
   import Info from 'lucide-svelte/icons/info';
 
-  let { open, loading = false, onclick } = $props<{
+  let { open, loading = false, ariaControls, testId, onclick } = $props<{
     open: boolean;
     loading?: boolean;
-    onclick: () => void;
+    ariaControls: string;
+    testId: string;
+    onclick: (event: MouseEvent) => void;
   }>();
 </script>
 
@@ -15,7 +17,8 @@
   title="Session details"
   aria-label="Toggle session details"
   aria-expanded={open}
-  disabled={loading}
+  aria-controls={ariaControls}
+  data-testid={testId}
 >
   <Info class={`h-4 w-4 ${loading ? 'animate-pulse' : ''}`} />
 </button>

@@ -5,8 +5,9 @@
   import DelegationCard from '$lib/components/DelegationCard.svelte';
   import ThinkingBlock from '$lib/components/ThinkingBlock.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
+  import UserInteractionMessage from '$lib/components/UserInteractionMessage.svelte';
   import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
-  import type { AssistantDeliverableTimelineItem, MessageTimelineItem, SystemMessageTimelineItem, TimelineItem, ToolCallTimelineItem } from '$lib/timeline-render-model';
+  import type { AssistantDeliverableTimelineItem, MessageTimelineItem, SystemMessageTimelineItem, TimelineItem, ToolCallTimelineItem, UserInteractionTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineScope } from '$lib/chat-v2/types';
   import type { Agent } from '$lib/types/api';
 
@@ -116,6 +117,10 @@
 {:else if item.kind === 'assistant_deliverable'}
   <div data-kind="assistant_deliverable" class="flex min-w-0 w-full max-w-full justify-start">
     <AssistantDeliverableBlock item={item as AssistantDeliverableTimelineItem} />
+  </div>
+{:else if item.kind === 'user_interaction'}
+  <div data-kind="user_interaction" class="flex min-w-0 justify-end">
+    <UserInteractionMessage item={item as UserInteractionTimelineItem} />
   </div>
 {:else if item.kind === 'delegation'}
   <div>

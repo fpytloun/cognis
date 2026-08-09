@@ -22,7 +22,8 @@ import type {
   ThinkingBlock,
   ThinkingTimelineItem,
   TimelineItem as RenderTimelineItem,
-  ToolCallTimelineItem
+  ToolCallTimelineItem,
+  UserInteractionTimelineItem
 } from '$lib/timeline-render-model';
 import type {
   CompactionTimelineItem as ChatV2CompactionTimelineItem,
@@ -57,7 +58,8 @@ const RENDERABLE_KINDS: ReadonlySet<string> = new Set([
   'compaction',
   'question_set',
   'auth_challenge',
-  'credential_request'
+  'credential_request',
+  'user_interaction'
 ]);
 
 /**
@@ -150,6 +152,22 @@ function convertToRenderItem(
         item.created_at ?? item.updated_at ?? null,
         'warning'
       );
+    case 'user_interaction':
+      return {
+        id: item.id,
+        kind: 'user_interaction',
+        orderKey: item.sort_key,
+        timestamp: item.created_at ?? item.updated_at ?? null,
+        interactionType: item.interaction_type,
+        originCallId: item.origin_call_id ?? null,
+        title: item.title,
+        summary: item.summary ?? null,
+        answers: item.answers.map((answer) => ({
+          question: answer.question ?? null,
+          answer: answer.answer
+        })),
+        status: item.status
+      } satisfies UserInteractionTimelineItem;
     default:
       return null;
   }
@@ -238,6 +256,8 @@ function toRenderSystemMessage(
     noticeId: item.notice_id ?? null,
     noticeKind: item.notice_kind ?? null,
     noticeScope: item.notice_scope ?? null,
+    retryReason: item.retry_reason ?? null,
+    retrySourceTurnId: item.retry_source_turn_id ?? null,
     reasonClass: item.reason_class ?? null,
     providerId: item.provider_id ?? null,
     model: item.model ?? null,

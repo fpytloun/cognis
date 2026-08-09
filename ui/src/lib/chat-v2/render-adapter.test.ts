@@ -8,7 +8,8 @@ import type {
   MessageTimelineItem,
   ThinkingTimelineItem,
   TimelineItem,
-  ToolCallTimelineItem
+  ToolCallTimelineItem,
+  UserInteractionTimelineItem
 } from './types';
 
 function baseRefs(seq = 1) {
@@ -101,7 +102,38 @@ function compaction(overrides: Partial<CompactionTimelineItem> = {}): Compaction
   };
 }
 
+function userInteraction(
+  overrides: Partial<UserInteractionTimelineItem> = {}
+): UserInteractionTimelineItem {
+  return {
+    id: 'user-interaction:notif-question',
+    kind: 'user_interaction',
+    sort_key: '0000:000000000000004:000000:06:000000000',
+    source_refs: baseRefs(4),
+    stable: true,
+    interaction_id: 'notif-question',
+    interaction_type: 'step_question',
+    origin_call_id: 'call-question',
+    title: 'You answered questions',
+    answers: [{ question: 'Target?', answer: 'Staging' }],
+    status: 'complete',
+    ...overrides
+  };
+}
+
 describe('render-adapter', () => {
+  it('renders canonical user interaction answers as a user-side row model', () => {
+    const rendered = toRenderItem(userInteraction());
+
+    expect(rendered).toMatchObject({
+      id: 'user-interaction:notif-question',
+      kind: 'user_interaction',
+      originCallId: 'call-question',
+      title: 'You answered questions',
+      answers: [{ question: 'Target?', answer: 'Staging' }]
+    });
+  });
+
   describe('message', () => {
     it('renders markdown and preserves identity/order/attachments', () => {
       const rendered = toRenderItem(message({ attachments: [{ artifact_id: 'a1' }] as never })) as Extract<
@@ -150,6 +182,8 @@ describe('render-adapter', () => {
           notice_id: 'notice-1',
           notice_kind: 'managed_takeover',
           notice_scope: 'conversation',
+          retry_reason: 'controller_restart',
+          retry_source_turn_id: 'turn-source',
           follow_up_conversation_id: 'conv-follow',
           follow_up_session_id: 'sess-follow',
           created_at: '2026-01-01T00:00:00Z'
@@ -162,6 +196,8 @@ describe('render-adapter', () => {
         noticeId: 'notice-1',
         noticeKind: 'managed_takeover',
         noticeScope: 'conversation',
+        retryReason: 'controller_restart',
+        retrySourceTurnId: 'turn-source',
         followUpConversationId: 'conv-follow',
         followUpSessionId: 'sess-follow',
         timestamp: '2026-01-01T00:00:00Z',

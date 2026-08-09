@@ -16,7 +16,7 @@
   import { highlightToolOutput, inferLanguageFromPath, isReadToolName, pathFromToolArguments } from '$lib/syntax/tool-output';
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import { canOpenToolOutput, toolOutputOpenLabel } from '$lib/tool-output-status';
-  import { delegationToolCallDisplayTitle, managedConversationToolPresentation, memoryToolPresentation, nativeInspectionToolPresentation, skillLoadDisplayName, stepTodoWriteStatusSummary, toolOutputHelperPresentation, webToolPresentation, workflowToolPresentation } from '$lib/tool-call-summary';
+  import { delegationToolCallDisplayTitle, managedConversationStatusIsRunning, managedConversationToolPresentation, memoryToolPresentation, nativeInspectionToolPresentation, skillLoadDisplayName, stepTodoWriteStatusSummary, toolOutputHelperPresentation, webToolPresentation, workflowToolPresentation } from '$lib/tool-call-summary';
   import { formatStepQuestionResponse, normalizeStepQuestionAnswers, normalizeStepQuestions, type StepQuestionAnswer } from '$lib/tool-call-question-set';
   import { formatPatchPreparationProgressLabel, shouldShowPatchPreparationProgress } from '$lib/tool-call-progress';
   import { displayToolName } from '$lib/tools-display';
@@ -28,11 +28,21 @@
     getToolCall = () => null,
     onViewSession,
     scope,
+    density = 'default',
+    summaryMode = 'default',
+    compactLabelMode,
+    contextLabel,
+    contextSessionId,
   } = $props<{
     item: ToolCallTimelineItem;
     getToolCall?: (callId: string) => ToolCallTimelineItem | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
     scope?: TimelineScope | undefined;
+    density?: 'default' | 'compact';
+    summaryMode?: 'default' | 'command';
+    compactLabelMode?: 'command' | 'description' | undefined;
+    contextLabel?: string | undefined;
+    contextSessionId?: string | undefined;
   }>();
 
   type StructuredEntry = { key: string; value: unknown };
@@ -170,6 +180,10 @@
     }
     expanded = !expanded;
   }
+
+  const expandedContentId = $derived(
+    `tool-call-content-${item.callId.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+  );
 
   function clearBashExpandTimer(): void {
     if (bashExpandTimer !== null) {
@@ -427,7 +441,7 @@
 
   function managedConversationRunning(): boolean {
     if (!isManagedConversationTool()) return false;
-    return isActiveToolStatus(
+    return managedConversationStatusIsRunning(
       managedConversationToolPresentation(item)?.displayStatus || item.status,
     );
   }
@@ -445,6 +459,7 @@
     const normalized = status.toLowerCase();
     if (error || normalized === 'failed' || normalized === 'error' || normalized === 'interrupted') return 'text-rose-300';
     if (normalized === 'completed' || normalized === 'complete' || normalized === 'idle' || normalized === 'closed') return 'text-emerald-300';
+    if (normalized === 'active') return 'text-violet-200';
     return 'text-sky-300';
   }
 
@@ -452,6 +467,7 @@
     const normalized = status.toLowerCase();
     if (error || normalized === 'failed' || normalized === 'error' || normalized === 'interrupted') return 'bg-rose-300';
     if (normalized === 'completed' || normalized === 'complete' || normalized === 'idle' || normalized === 'closed') return 'bg-emerald-300';
+    if (normalized === 'active') return 'bg-violet-300';
     return 'bg-sky-300';
   }
 
@@ -808,8 +824,18 @@
     return typeof target.arguments?.command === 'string' ? target.arguments.command : target.toolName;
   }
 
+  function commandSummaryText(): string {
+    return commandText().replace(/\s*\n\s*/g, ' ↵ ').trim();
+  }
+
   function terminalTitle(): string {
     return descriptionText() || commandText();
+  }
+
+  function compactCommandLabel(): string {
+    return compactLabelMode === 'description'
+      ? descriptionText() || commandText()
+      : commandText();
   }
 
   function formatStructuredValue(value: unknown): string {
@@ -911,27 +937,46 @@
   }
 </script>
 
-<article class={`min-w-0 overflow-hidden rounded-2xl border bg-slate-900/80 text-sm shadow-card ${borderColor()}`}>
+<article class={`min-w-0 overflow-hidden border ${density === 'compact' ? 'rounded-lg bg-slate-950/45 text-xs shadow-none' : 'rounded-2xl bg-slate-900/80 text-sm shadow-card'} ${borderColor()}`}>
   <!-- Header row (always visible, clickable) -->
   <button
-    class="flex min-w-0 w-full items-start gap-3 px-4 py-3 text-left transition hover:bg-slate-800/40 sm:items-center"
+    class={`flex min-w-0 w-full text-left transition hover:bg-slate-800/40 ${density === 'compact' ? 'items-center gap-2 px-3 py-2' : 'items-start gap-3 px-4 py-3 sm:items-center'}`}
     onclick={toggle}
     type="button"
+    aria-expanded={expanded}
+    aria-controls={expandedContentId}
   >
-    <span class="text-xs text-slate-500">{expanded ? '\u25BC' : '\u25B6'}</span>
-    <span class="min-w-0 flex flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
-      <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]" title={item.toolName}>{displayToolName(item.displayToolName ?? item.toolName)}</span>
-      {#if subtitle()}
-        <span class="min-w-0 text-xs text-slate-400 sm:flex-1 sm:truncate">{subtitle()}</span>
-      {/if}
-    </span>
+    <span class={`shrink-0 text-slate-500 ${density === 'compact' ? 'text-[10px]' : 'text-xs'}`}>{expanded ? '\u25BC' : '\u25B6'}</span>
+    {#if summaryMode === 'command' || compactLabelMode}
+      <span
+        class="command-scroll min-w-0 flex-1 overflow-x-auto overscroll-x-contain whitespace-nowrap font-mono text-xs text-slate-200 [-webkit-overflow-scrolling:touch]"
+        data-testid="tool-command-summary-scroll"
+        title={compactCommandLabel()}
+      >
+        <span class="inline-block min-w-max font-mono">
+          <span class="text-emerald-400">$</span>
+          {compactLabelMode ? compactCommandLabel() : commandSummaryText()}
+        </span>
+      </span>
+    {:else}
+      <span class="min-w-0 flex flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-3">
+        <span class="min-w-0 font-semibold text-cyan-300 [overflow-wrap:anywhere]" title={item.toolName}>{displayToolName(item.displayToolName ?? item.toolName)}</span>
+        {#if subtitle()}
+          <span class="min-w-0 text-xs text-slate-400 sm:flex-1 sm:truncate">{subtitle()}</span>
+        {/if}
+      </span>
+    {/if}
     <span class={`flex shrink-0 items-center gap-1.5 self-start text-xs font-medium ${statusColor()} sm:self-auto`}>
       {#if isActiveToolStatus(item.status)}
         <LiveDots inline={true} size="sm" tone="sky" />
         <span class="sr-only">{isPreparingPatch() ? 'Preparing' : 'Running'}</span>
       {:else}
         <span>{statusIcon()}</span>
-        <span>{item.status}</span>
+        {#if density === 'compact'}
+          <span class="sr-only">{item.status}</span>
+        {:else}
+          <span>{item.status}</span>
+        {/if}
       {/if}
       {#if isDelegateTool() && delegationDurationText()}
         <span class="text-slate-500">{delegationDurationText()}</span>
@@ -943,7 +988,24 @@
 
   <!-- Expanded content -->
   {#if expanded}
-    <div class="space-y-3 border-t border-slate-800/60 px-4 py-3">
+    <div id={expandedContentId} class={`space-y-3 border-t border-slate-800/60 ${density === 'compact' ? 'px-3 py-2.5' : 'px-4 py-3'}`}>
+      {#if contextLabel}
+        <div class="flex min-w-0 items-center justify-between gap-3 text-[10px] text-slate-500">
+          <span>Workstream</span>
+          <span class="flex min-w-0 items-center gap-2">
+            <span class="truncate text-right" title={contextLabel}>{contextLabel}</span>
+            {#if onViewSession && contextSessionId?.startsWith('sess_')}
+              <button
+                class="shrink-0 font-medium text-sky-300 transition hover:text-sky-200"
+                type="button"
+                onclick={() => void onViewSession?.(contextSessionId)}
+              >
+                View session
+              </button>
+            {/if}
+          </span>
+        </div>
+      {/if}
       {#if item.timestamp}
         <div class="flex items-center justify-between gap-3 text-[11px] text-slate-500">
           <span>Executed</span>
@@ -1444,6 +1506,9 @@
               {#if webPresentation.error}
                 <p class="m-4 rounded-xl border border-rose-400/25 bg-rose-500/10 px-3 py-2 text-sm leading-6 text-rose-100">{webPresentation.error}</p>
               {/if}
+              {#if webPresentation.warning}
+                <p class="m-4 rounded-xl border border-amber-400/25 bg-amber-500/10 px-3 py-2 text-sm leading-6 text-amber-100">{webPresentation.warning}</p>
+              {/if}
 
               {#if webPresentation.answer}
                 <section class="border-t border-violet-500/15 px-4 py-3">
@@ -1461,14 +1526,19 @@
                     <article class="rounded-xl border border-violet-400/15 bg-slate-950/30 px-3 py-2">
                       <div class="flex flex-wrap items-start justify-between gap-2">
                         <a href={result.url} target="_blank" rel="noreferrer" class="min-w-0 text-sm font-semibold text-slate-100 hover:text-violet-200 hover:underline [overflow-wrap:anywhere]">{result.title}</a>
-                        {#if result.domain || result.score}
-                          <div class="flex gap-2 text-[10px] text-slate-400">
+                        {#if result.domain || result.score || result.resultType || result.publishedDate || result.freshness || result.sourceEngine}
+                          <div class="flex flex-wrap gap-2 text-[10px] text-slate-400">
                             {#if result.domain}<span>{result.domain}</span>{/if}
+                            {#if result.resultType}<span>{result.resultType}</span>{/if}
+                            {#if result.publishedDate}<span>{result.publishedDate}</span>{/if}
+                            {#if result.freshness}<span>{result.freshness}</span>{/if}
+                            {#if result.sourceEngine}<span>{result.sourceEngine}</span>{/if}
                             {#if result.score}<span>{result.score}</span>{/if}
                           </div>
                         {/if}
                       </div>
-                      {#if result.snippet}<p class="mt-2 text-xs leading-5 text-slate-300">{result.snippet}</p>{/if}
+                       {#if result.snippet}<p class="mt-2 text-xs leading-5 text-slate-300">{result.snippet}</p>{/if}
+                       {#if result.recommendation}<p class="mt-1 text-[10px] uppercase tracking-wide text-violet-300">Fetch: {result.recommendation}</p>{/if}
                     </article>
                   {/each}
                 </section>
@@ -2229,7 +2299,7 @@
           <div>
             <div class={`overflow-hidden rounded-xl border ${item.isError ? 'border-rose-500/30' : 'border-slate-700/70'} bg-[#05070a] shadow-inner`}>
               <div class="flex items-center justify-between border-b border-white/10 bg-slate-950/90 px-3 py-2 text-[11px] text-slate-400">
-                <span class="truncate font-medium text-slate-300">{terminalTitle()}</span>
+                <span class="command-scroll min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-medium text-slate-300" data-testid="tool-terminal-description-scroll">{terminalTitle()}</span>
                 {#if isActiveToolStatus(item.status)}
                   <LiveDots inline={true} size="sm" tone="emerald" />
                 {:else}
@@ -2316,7 +2386,7 @@
         {/if}
       {/if}
 
-      {#if isBashTool() && (item.result != null || (item.arguments && Object.keys(item.arguments).length > 0))}
+      {#if (isBashTool() || isRichWebTool()) && hasRawPayload()}
         <div>
           <button
             class="flex items-center gap-2 text-xs font-medium uppercase tracking-widest text-slate-500 transition hover:text-slate-300"
@@ -2328,19 +2398,23 @@
           </button>
           {#if rawExpanded}
             <div class="mt-2 space-y-2 rounded-lg border border-slate-800/60 bg-slate-950/40 p-3 text-xs">
-              <div>
-                <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
-                <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
-              </div>
-              <div>
-                <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
-                <div class="relative">
-                  <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
-                  <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
-                    {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
-                  </button>
+              {#if item.arguments && Object.keys(item.arguments).length > 0}
+                <div>
+                  <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Input</p>
+                  <pre class="max-h-[28vh] overflow-auto rounded-lg border border-slate-800/60 bg-slate-950/60 p-3 text-slate-300">{formattedArguments}</pre>
                 </div>
-              </div>
+              {/if}
+              {#if item.result != null}
+                <div>
+                  <p class="mb-1 font-medium uppercase tracking-widest text-slate-500">Output</p>
+                  <div class="relative">
+                    <pre class={`max-h-[32vh] overflow-auto rounded-lg border bg-slate-950/60 p-3 pr-10 text-xs leading-5 ${item.isError ? 'border-rose-500/30 text-rose-300' : 'border-slate-800/60 text-slate-300'}`}>{#if rawOutputData.html}{@html rawOutputData.html}{:else}{rawOutputData.text}{/if}</pre>
+                    <button class="copy-icon-button absolute right-2 top-2" onclick={() => void copyBox('output', rawOutputText)} type="button" title="Copy output" aria-label="Copy output">
+                      {#if copiedBox === 'output'}<Check class="h-3.5 w-3.5" />{:else}<Copy class="h-3.5 w-3.5" />{/if}
+                    </button>
+                  </div>
+                </div>
+              {/if}
             </div>
           {/if}
         </div>
@@ -2388,6 +2462,18 @@
     </div>
   {/if}
 </article>
+
+<style>
+  .command-scroll {
+    scrollbar-width: none;
+  }
+
+  .command-scroll::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+</style>
 
 <ToolOutputDrawer
   open={outputDrawerOpen}

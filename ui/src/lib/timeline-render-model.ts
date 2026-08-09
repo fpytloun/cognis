@@ -18,6 +18,7 @@ export type TimelineItem =
   | WorkflowComposedTimelineItem
   | NoticeTimelineItem
   | SystemMessageTimelineItem
+  | UserInteractionTimelineItem
   | CompactionTimelineItem
   | ThinkingTimelineItem;
 
@@ -32,6 +33,19 @@ export interface AssistantDeliverableTimelineItem {
   format: string;
   title?: string | null;
   content?: string | null;
+}
+
+export interface UserInteractionTimelineItem {
+  id: string;
+  kind: 'user_interaction';
+  orderKey?: string;
+  timestamp: string | null;
+  interactionType: string;
+  originCallId?: string | null;
+  title: string;
+  summary?: string | null;
+  answers: Array<{ question?: string | null; answer: string }>;
+  status: 'complete' | 'cancelled' | 'denied' | 'failed';
 }
 
 export interface ThinkingBlock {
@@ -260,6 +274,8 @@ export interface SystemMessageTimelineItem {
   noticeId?: string | null;
   noticeKind?: string | null;
   noticeScope?: string | null;
+  retryReason?: string | null;
+  retrySourceTurnId?: string | null;
   reasonClass?: string | null;
   providerId?: string | null;
   model?: string | null;

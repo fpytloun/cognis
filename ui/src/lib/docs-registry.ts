@@ -201,7 +201,23 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Run Cognis with Docker or systemd, remote executors, TLS, backups, and hardening.',
     category: 'operations',
     sourcePath: 'docs/guide/deployment.md',
-    relatedSlugs: ['executors', 'security-and-privacy', 'troubleshooting']
+    relatedSlugs: ['high-availability', 'executors', 'security-and-privacy', 'troubleshooting']
+  },
+  {
+    slug: 'high-availability',
+    title: 'High availability',
+    description: 'Deploy and operate multiple Cognis controllers with durable failover.',
+    category: 'operations',
+    sourcePath: 'docs/guide/high-availability.md',
+    relatedSlugs: ['deployment', 'ha-e2e', 'executors', 'architecture']
+  },
+  {
+    slug: 'ha-e2e',
+    title: 'HA E2E Compose',
+    description: 'Qualify a two-controller Cognis deployment with the Docker Compose HA stack.',
+    category: 'operations',
+    sourcePath: 'docs/guide/ha-e2e.md',
+    relatedSlugs: ['high-availability', 'deployment', 'troubleshooting']
   },
   {
     slug: 'troubleshooting',
@@ -229,6 +245,8 @@ export const ONBOARDING_DOC_SLUGS = [
   'channels',
   'executors',
   'deployment',
+  'high-availability',
+  'ha-e2e',
   'tools-and-skills',
   'content-and-sharing',
   'rich-deliverables',

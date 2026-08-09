@@ -9,6 +9,11 @@ marked.setOptions({
 
 const forbiddenAttributes = ['onerror', 'onclick', 'onload', 'onmouseover'];
 const forbiddenTags = ['iframe', 'script', 'style'];
+const markdownRenderPolicyVersion = 'markdown-policy-v2';
+const youtubeVideoIdPattern = /^[A-Za-z0-9_-]{11}$/;
+const youtubePlaceholderPattern = /<span data-cognis-youtube-embed="(\d+)"><\/span>/g;
+const safeIframeAllow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
+const safeIframeSandbox = 'allow-presentation allow-scripts allow-same-origin';
 const genericEnclosingFenceLanguages = new Set(['', 'md', 'markdown', 'plain', 'plaintext', 'text', 'txt']);
 const markdownCacheLimit = 500;
 const markdownCache = new Map<string, string>();
@@ -22,6 +27,28 @@ export interface MarkdownHeading {
 export interface MarkdownDocumentRender {
   html: string;
   headings: MarkdownHeading[];
+}
+
+export interface MarkdownResolvedLink {
+  href: string;
+  title?: string | null;
+}
+
+export interface MarkdownResolvedImage {
+  src: string;
+  alt?: string;
+  title?: string | null;
+}
+
+export interface MarkdownRenderContext {
+  cacheKey?: string;
+  resolveLink?: (href: string) => string | MarkdownResolvedLink | null;
+  resolveImage?: (src: string) => string | MarkdownResolvedImage | null;
+}
+
+interface MarkdownRenderState {
+  context?: MarkdownRenderContext;
+  youtubeVideoIds: string[];
 }
 
 interface FenceLine {
@@ -271,6 +298,122 @@ function isOutgoingHref(href: string | null | undefined): boolean {
   return trimmed.startsWith('http://') || trimmed.startsWith('https://') || trimmed.startsWith('mailto:');
 }
 
+function isSafeLinkHref(href: string): boolean {
+  const value = href.trim();
+  if (!value || value.startsWith('//') || value.includes('\\')) return false;
+  if (/^[./#?]/.test(value)) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' || url.protocol === 'mailto:';
+  } catch {
+    return !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value);
+  }
+}
+
+function isSafeImageSrc(src: string): boolean {
+  const value = src.trim();
+  if (!value || value.startsWith('//') || value.includes('\\')) return false;
+  if (/^[./]/.test(value)) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
+    return !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value);
+  }
+}
+
+function resolveLinkToken(href: string, context: MarkdownRenderContext | undefined): MarkdownResolvedLink | null {
+  if (!isSafeLinkHref(href)) return null;
+  const resolved = context?.resolveLink?.(href);
+  if (resolved === null) return null;
+  const result = typeof resolved === 'string' ? { href: resolved } : resolved ?? { href };
+  return isSafeLinkHref(result.href) ? result : null;
+}
+
+function resolveImageToken(src: string, context: MarkdownRenderContext | undefined): MarkdownResolvedImage | null {
+  if (!isSafeImageSrc(src)) return null;
+  const resolved = context?.resolveImage?.(src);
+  if (resolved === null) return null;
+  const result = typeof resolved === 'string' ? { src: resolved } : resolved ?? { src };
+  return isSafeImageSrc(result.src) ? result : null;
+}
+
+function parseHtmlAttributes(raw: string): Map<string, string | null> | null {
+  const attributes = new Map<string, string | null>();
+  const attributePattern = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/gy;
+  let cursor = 0;
+  while (cursor < raw.length) {
+    while (cursor < raw.length && /\s/.test(raw[cursor])) cursor += 1;
+    if (cursor >= raw.length) break;
+    attributePattern.lastIndex = cursor;
+    const match = attributePattern.exec(raw);
+    if (!match) return null;
+    const name = match[1].toLowerCase();
+    if (attributes.has(name)) return null;
+    attributes.set(name, match[2] ?? match[3] ?? match[4] ?? null);
+    cursor = attributePattern.lastIndex;
+  }
+  return attributes;
+}
+
+function youtubeVideoIdFromIframe(rawHtml: string): string | null {
+  const match = rawHtml.match(/^<iframe\b([^>]*)>\s*<\/iframe>$/i);
+  if (!match) return null;
+  const attributes = parseHtmlAttributes(match[1]);
+  if (!attributes) return null;
+
+  const allowedNames = new Set([
+    'src',
+    'title',
+    'width',
+    'height',
+    'loading',
+    'frameborder',
+    'allowfullscreen',
+    'sandbox',
+    'allow',
+  ]);
+  const rejectedNames = new Set(['srcdoc', 'style', 'form', 'formaction']);
+  for (const [name, value] of attributes) {
+    if (name.startsWith('on') || rejectedNames.has(name) || !allowedNames.has(name)) return null;
+    if (name === 'sandbox' && value !== safeIframeSandbox) return null;
+    if (name === 'allow' && value !== safeIframeAllow) return null;
+  }
+
+  const src = attributes.get('src');
+  if (typeof src !== 'string') return null;
+  const authority = src.match(/^https:\/\/([^/]+)/)?.[1] ?? '';
+  if (!authority || authority.includes('%') || authority.includes(':')) return null;
+  let url: URL;
+  try {
+    url = new URL(src);
+  } catch {
+    return null;
+  }
+  if (
+    url.protocol !== 'https:'
+    || url.username
+    || url.password
+    || url.port
+    || (url.hostname !== 'www.youtube.com' && url.hostname !== 'www.youtube-nocookie.com')
+    || url.search
+    || url.hash
+  ) {
+    return null;
+  }
+  const path = url.pathname.match(/^\/embed\/([A-Za-z0-9_-]{11})$/);
+  return path && youtubeVideoIdPattern.test(path[1]) ? path[1] : null;
+}
+
+function renderYoutubeEmbeds(html: string, videoIds: string[]): string {
+  return html.replace(youtubePlaceholderPattern, (_match, rawIndex: string) => {
+    const videoId = videoIds[Number(rawIndex)];
+    if (!videoId) return '';
+    const src = `https://www.youtube-nocookie.com/embed/${videoId}`;
+    return `<div class="markdown-youtube-embed"><iframe src="${src}" title="YouTube video player" loading="lazy" referrerpolicy="strict-origin-when-cross-origin" sandbox="${safeIframeSandbox}" allow="${safeIframeAllow}" allowfullscreen></iframe></div>`;
+  });
+}
+
 function markOutgoingLinks(html: string): string {
   return html.replace(/^<a /, '<a target="_blank" rel="noopener noreferrer" ');
 }
@@ -418,7 +561,7 @@ function postProcessMarkdownHtml(html: string): string {
   return template.innerHTML;
 }
 
-function createLinkRenderer(): Renderer {
+function createLinkRenderer(state?: MarkdownRenderState): Renderer {
   const renderer = new Renderer();
   const baseLink = renderer.link.bind(renderer);
   const baseTable = renderer.table.bind(renderer);
@@ -439,18 +582,30 @@ function createLinkRenderer(): Renderer {
   };
 
   renderer.link = (token) => {
-    const html = baseLink(token);
-    return isOutgoingHref(token.href) && typeof html === 'string' ? markOutgoingLinks(html) : html;
+    const resolved = resolveLinkToken(token.href, state?.context);
+    if (!resolved) return escapeHtml(token.text);
+    const html = baseLink({ ...token, href: resolved.href, title: resolved.title ?? token.title });
+    return isOutgoingHref(resolved.href) && typeof html === 'string' ? markOutgoingLinks(html) : html;
   };
 
-  renderer.html = (token) => escapeHtml(token.text);
+  renderer.image = (token) => {
+    const resolved = resolveImageToken(token.href, state?.context);
+    if (!resolved) return escapeHtml(token.text);
+    const title = resolved.title ?? token.title;
+    const titleAttribute = title ? ` title="${escapeHtml(title)}"` : '';
+    return `<img src="${escapeHtml(resolved.src)}" alt="${escapeHtml(resolved.alt ?? token.text)}"${titleAttribute}>`;
+  };
+
+  renderer.html = (token) => {
+    const videoId = youtubeVideoIdFromIframe(token.text);
+    if (!videoId || !state) return escapeHtml(token.text);
+    const index = state.youtubeVideoIds.push(videoId) - 1;
+    return `<span data-cognis-youtube-embed="${index}"></span>`;
+  };
   renderer.table = (...args) => `<div class="markdown-table-wrap">${baseTable(...args)}</div>`;
 
   return renderer;
 }
-
-const defaultLinkRenderer = createLinkRenderer();
-const docsRenderer = createDocsRenderer();
 
 function cacheGet(key: string): string | undefined {
   const value = markdownCache.get(key);
@@ -475,14 +630,21 @@ export function sanitizeHtml(html: string): string {
   });
 }
 
-export function renderMarkdown(markdown: string): string {
+function renderCacheKey(normalized: string, context: MarkdownRenderContext | undefined, mode: string): string | null {
+  if ((context?.resolveLink || context?.resolveImage) && !context.cacheKey) return null;
+  return `${markdownRenderPolicyVersion}\0${mode}\0${typeof document === 'undefined' ? 'ssr' : 'dom'}\0${context?.cacheKey ?? ''}\0${normalized}`;
+}
+
+export function renderMarkdown(markdown: string, context?: MarkdownRenderContext): string {
   const normalized = normalizeMarkdownForRender(markdown);
-  const cacheKey = `${typeof document === 'undefined' ? 'ssr' : 'dom'}\0${normalized}`;
-  const cached = cacheGet(cacheKey);
+  const cacheKey = renderCacheKey(normalized, context, 'block');
+  const cached = cacheKey === null ? undefined : cacheGet(cacheKey);
   if (cached !== undefined) return cached;
-  const parsed = marked.parse(normalized, { async: false, renderer: defaultLinkRenderer });
-  const html = postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
-  cacheSet(cacheKey, html);
+  const state: MarkdownRenderState = { context, youtubeVideoIds: [] };
+  const parsed = marked.parse(normalized, { async: false, renderer: createLinkRenderer(state) });
+  const sanitized = sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  const html = postProcessMarkdownHtml(renderYoutubeEmbeds(sanitized, state.youtubeVideoIds));
+  if (cacheKey !== null) cacheSet(cacheKey, html);
   return html;
 }
 
@@ -521,15 +683,20 @@ function inlineCacheSet(key: string, value: string): void {
  * output the same way `renderMarkdown` does, marks outgoing links
  * `target="_blank" rel="noopener noreferrer"`, and linkifies bare URLs.
  */
-export function renderInlineMarkdown(markdown: string): string {
+export function renderInlineMarkdown(markdown: string, context?: MarkdownRenderContext): string {
   if (!markdown) return '';
   const normalized = normalizeMarkdownForRender(markdown);
-  const cacheKey = `${typeof document === 'undefined' ? 'ssr' : 'dom'}\0${normalized}`;
-  const cached = inlineCacheGet(cacheKey);
+  const cacheKey = renderCacheKey(normalized, context, 'inline');
+  const cached = cacheKey === null ? undefined : inlineCacheGet(cacheKey);
   if (cached !== undefined) return cached;
-  const parsed = marked.parseInline(normalized, { async: false, renderer: defaultLinkRenderer });
-  const html = postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
-  inlineCacheSet(cacheKey, html);
+  const state: MarkdownRenderState = { context, youtubeVideoIds: [] };
+  const directVideoId = youtubeVideoIdFromIframe(normalized);
+  const parsed = directVideoId
+    ? `<span data-cognis-youtube-embed="${state.youtubeVideoIds.push(directVideoId) - 1}"></span>`
+    : marked.parseInline(normalized, { async: false, renderer: createLinkRenderer(state) });
+  const sanitized = sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  const html = postProcessMarkdownHtml(renderYoutubeEmbeds(sanitized, state.youtubeVideoIds));
+  if (cacheKey !== null) inlineCacheSet(cacheKey, html);
   return html;
 }
 
@@ -576,10 +743,14 @@ export function renderInlineMarkdownNoLinks(markdown: string): string {
   return html;
 }
 
-export function renderMarkdownDocument(markdown: string, idPrefix = 'deliverable-section'): MarkdownDocumentRender {
+export function renderMarkdownDocument(
+  markdown: string,
+  idPrefix = 'deliverable-section',
+  context?: MarkdownRenderContext,
+): MarkdownDocumentRender {
   const headings = extractMarkdownHeadings(markdown, idPrefix);
   return {
-    html: addHeadingIds(renderMarkdown(markdown), headings),
+    html: addHeadingIds(renderMarkdown(markdown, context), headings),
     headings,
   };
 }
@@ -598,8 +769,8 @@ export function stripMarkdown(markdown: string): string {
     .trim();
 }
 
-function createDocsRenderer(): Renderer {
-  const renderer = createLinkRenderer();
+function createDocsRenderer(state: MarkdownRenderState): Renderer {
+  const renderer = createLinkRenderer(state);
   const baseCode = renderer.code.bind(renderer);
 
   renderer.code = (...args) => `<div class="markdown-code-wrap">${baseCode(...args)}</div>`;
@@ -607,12 +778,14 @@ function createDocsRenderer(): Renderer {
   return renderer;
 }
 
-export function renderDocsMarkdown(markdown: string): string {
+export function renderDocsMarkdown(markdown: string, context?: MarkdownRenderContext): string {
+  const state: MarkdownRenderState = { context, youtubeVideoIds: [] };
   const parsed = marked.parse(normalizeMarkdownForRender(markdown), {
     async: false,
-    renderer: docsRenderer
+    renderer: createDocsRenderer(state)
   });
-  return postProcessMarkdownHtml(sanitizeHtml(typeof parsed === 'string' ? parsed : ''));
+  const sanitized = sanitizeHtml(typeof parsed === 'string' ? parsed : '');
+  return postProcessMarkdownHtml(renderYoutubeEmbeds(sanitized, state.youtubeVideoIds));
 }
 
 /**
@@ -635,9 +808,10 @@ export interface MarkdownStreamer {
   reset(): void;
 }
 
-export function createMarkdownStreamer(): MarkdownStreamer {
+export function createMarkdownStreamer(context?: MarkdownRenderContext): MarkdownStreamer {
   // Map of block text -> rendered HTML fragment (stable blocks only).
   const cache = new Map<string, string>();
+  const cacheEnabled = !((context?.resolveLink || context?.resolveImage) && !context.cacheKey);
   let stableHtml = '';
   let stableLen = 0;
 
@@ -690,13 +864,20 @@ export function createMarkdownStreamer(): MarkdownStreamer {
 
     // Anything after the last block break is the tail. If we're not in a
     // fence and the last char was a blank line, tail is empty.
-    const tail = blockStart < text.length ? text.slice(blockStart) : '';
+    let tail = blockStart < text.length ? text.slice(blockStart) : '';
+    const incompleteIframeIndex = blocks.findIndex(
+      (block) => /^ {0,3}<iframe\b/i.test(block) && !/<iframe\b[^>]*>\s*<\/iframe>/i.test(block),
+    );
+    if (incompleteIframeIndex !== -1) {
+      const deferred = blocks.splice(incompleteIframeIndex).join('\n\n');
+      tail = tail ? `${deferred}\n\n${tail}` : deferred;
+    }
 
     return { stable: blocks, tail };
   }
 
   function parseSanitize(chunk: string): string {
-    return renderMarkdown(chunk);
+    return renderMarkdown(chunk, context);
   }
 
   function render(content: string): string {
@@ -711,10 +892,10 @@ export function createMarkdownStreamer(): MarkdownStreamer {
     // Cache hit: re-use memoized HTML for each stable block.
     let pieces = '';
     for (const block of stable) {
-      let html = cache.get(block);
+      let html = cacheEnabled ? cache.get(block) : undefined;
       if (html === undefined) {
         html = parseSanitize(block);
-        cache.set(block, html);
+        if (cacheEnabled) cache.set(block, html);
       }
       pieces += html;
     }
@@ -726,21 +907,9 @@ export function createMarkdownStreamer(): MarkdownStreamer {
   }
 
   function finalize(content: string): string {
-    // Force a full parse of the tail; cache stable blocks for future calls.
-    const { stable, tail } = splitBlocks(content);
-    let pieces = '';
-    for (const block of stable) {
-      let html = cache.get(block);
-      if (html === undefined) {
-        html = parseSanitize(block);
-        cache.set(block, html);
-      }
-      pieces += html;
-    }
-    if (tail.trim()) {
-      // Don't cache trailing fragment (may still grow with follow-up edits).
-      pieces += parseSanitize(tail);
-    }
+    // A final full parse guarantees convergence for constructs that can span
+    // streaming block boundaries, including raw HTML tokens.
+    const pieces = parseSanitize(content);
     stableHtml = pieces;
     stableLen = content.length;
     return pieces;

@@ -72,7 +72,7 @@ const DEFAULT_CODEX_TRANSPORT: CodexTransport = 'direct';
 const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
   'model_id', 'display_name', 'context_window', 'max_input_tokens', 'max_context_window', 'max_output_tokens',
   'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
-  'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'reasoning_efforts',
+  'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'supports_fast_mode', 'fast_mode_tier', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
   'supports_openai_namespace_tools', 'supports_openai_allowed_tools',
   'supports_openai_apply_patch', 'supports_responses_api', 'supports_extended_thinking',

@@ -30,10 +30,12 @@ import {
 export interface ChatV2RefreshWatermark {
   cursor: string | null;
   runtimeRevision: number | null;
+  mutationRevision: number;
 }
 
 export class ChatV2Store {
   private _state: ChatV2ClientState = $state.raw(emptyChatV2State());
+  private mutationRevision = 0;
 
   readonly visibleItems: TimelineItem[] = $derived(visibleTimelineItems(this._state));
   readonly cycleStates: TurnCycleState[] = $derived(this._state.cycleStates);
@@ -45,19 +47,24 @@ export class ChatV2Store {
   refreshWatermark(): ChatV2RefreshWatermark {
     return {
       cursor: this._state.cursor,
-      runtimeRevision: this._state.runtime?.runtime_revision ?? null
+      runtimeRevision: this._state.runtime?.runtime_revision ?? null,
+      mutationRevision: this.mutationRevision
     };
   }
 
   replaceFromSnapshotIfUnchanged(snapshot: ChatSnapshot, watermark: ChatV2RefreshWatermark): boolean {
     const current = this.refreshWatermark();
-    if (current.cursor !== watermark.cursor || current.runtimeRevision !== watermark.runtimeRevision) return false;
+    if (
+      current.cursor !== watermark.cursor
+      || current.runtimeRevision !== watermark.runtimeRevision
+      || current.mutationRevision !== watermark.mutationRevision
+    ) return false;
     this.replaceFromSnapshot(snapshot);
     return true;
   }
 
   replaceFromSnapshot(snapshot: ChatSnapshot): void {
-    this._state = applySnapshot(snapshot, this._state);
+    this.replaceState(applySnapshot(snapshot, this._state));
   }
 
   addOptimisticUser(input: {
@@ -66,47 +73,47 @@ export class ChatV2Store {
     clientMessageId: string;
     createdAt?: string;
   }): void {
-    this._state = addOptimisticUserMessage(this._state, input);
+    this.replaceState(addOptimisticUserMessage(this._state, input));
   }
 
   markOptimisticUserFailed(clientMessageId: string): void {
-    this._state = markOptimisticUserMessageFailed(this._state, clientMessageId);
+    this.replaceState(markOptimisticUserMessageFailed(this._state, clientMessageId));
   }
 
   addLocalSystemMessage(input: { id: string; content: string; noticeId?: string | null; createdAt?: string }): void {
-    this._state = addLocalSystemMessage(this._state, input);
+    this.replaceState(addLocalSystemMessage(this._state, input));
   }
 
   applySync(response: ChatSyncResponse): ChatV2SyncResult {
     const result = applySyncResponse(this._state, response);
-    this._state = result.state;
+    this.replaceState(result.state);
     return result;
   }
 
   applyRealtime(frame: ChatRealtimeFrame): ChatV2SyncResult {
     const result = applyRealtimeFrame(this._state, frame);
-    this._state = result.state;
+    this.replaceState(result.state);
     return result;
   }
 
   applyBackfill(response: TimelineBackfillResponse): void {
-    this._state = applyBackfill(this._state, response);
+    this.replaceState(applyBackfill(this._state, response));
   }
 
   applySend(response: SendMessageV2Response): void {
-    this._state = applySendResponse(this._state, response);
+    this.replaceState(applySendResponse(this._state, response));
   }
 
   applyCancel(response: CancelTurnV2Response): void {
-    this._state = applyCancelResponse(this._state, response);
+    this.replaceState(applyCancelResponse(this._state, response));
   }
 
   applyQueueMutation(response: QueueMutationResponse): void {
-    this._state = applyQueueMutationResponse(this._state, response);
+    this.replaceState(applyQueueMutationResponse(this._state, response));
   }
 
   reset(): void {
-    this._state = emptyChatV2State();
+    this.replaceState(emptyChatV2State());
   }
 
   /**
@@ -143,7 +150,7 @@ export class ChatV2Store {
     // the cache. $state.snapshot is proxy-safe whether the input is plain data
     // or a reactive proxy from a caller.
     const restored = $state.snapshot(state) as ChatV2ClientState;
-    this._state = { ...restored, cycleStates: restored.cycleStates ?? [] };
+    this.replaceState({ ...restored, cycleStates: restored.cycleStates ?? [] });
   }
 
   /**
@@ -154,10 +161,16 @@ export class ChatV2Store {
   settleRuntimeOverlay(): void {
     const runtime = this._state.runtime;
     if (!runtime || !runtime.has_active_turn) return;
-    this._state = {
+    this.replaceState({
       ...this._state,
       runtime: { ...runtime, has_active_turn: false, active_turn: null, volatile_items: [], cycle_states: [] },
       cycleStates: this._state.cycleStates.filter((state) => state.turn_id !== runtime.active_turn?.turn_id)
-    };
+    });
+  }
+
+  private replaceState(state: ChatV2ClientState): void {
+    if (state === this._state) return;
+    this._state = state;
+    this.mutationRevision += 1;
   }
 }

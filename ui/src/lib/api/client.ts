@@ -42,6 +42,30 @@ import type {
   IntarisMCPServer,
   IntarisSessionDetail,
   KnowledgebaseModel,
+  KnowledgebaseFacetRequest,
+  KnowledgebaseFacetResponse,
+  KnowledgebaseShareCandidate,
+  KnowledgebaseShareModel,
+  KnowledgebaseShareRequest,
+  KnowledgebaseCreateRequest,
+  KnowledgebaseUpdateRequest,
+   KnowledgebaseHealth,
+   KnowledgebaseCapabilities,
+   KnowledgebaseArtifactModel,
+   KnowledgebaseAttachRequest,
+    KnowledgebaseDocumentDetail,
+    KnowledgebaseDocumentListResponse,
+   KnowledgebaseDocumentUploadResponse,
+  KnowledgebaseDocumentContentResponse,
+  KnowledgebaseDocumentConflictPolicy,
+  KnowledgebaseIndexJobModel,
+  KnowledgebaseSearchRequest,
+  KnowledgebaseSearchResponse,
+  KnowledgebaseSourceContextRequest,
+  KnowledgebaseSourceContextResponse,
+  KnowledgebaseDiagnostics,
+  KnowledgebaseAskRequest,
+  KnowledgebaseAskResponse,
   LocalModelCatalogItem,
   LocalModelCatalogResponse,
   LocalModelCatalogSource,
@@ -105,6 +129,7 @@ import type {
   TaskBoardColumn,
   TaskBoardItem,
   TaskChatResponse,
+  TaskControlChatResponse,
   TaskComment,
   TaskDetail,
   TaskRerunResponse,
@@ -118,6 +143,7 @@ import type {
   UserUpdatePayload,
   VapidPublicKeyResponse,
   WebBackendUpdatePayload,
+  WebDefaultsUpdatePayload,
   WebConfigStatus,
   Workflow,
   WorkflowRun
@@ -384,7 +410,7 @@ export const api = {
         agent_id?: string | null;
         agent_ids?: string[] | null;
         project_id?: string | null;
-        status?: 'active' | 'starred' | 'archived' | 'all';
+        status?: 'active' | 'starred' | 'archived' | 'all' | 'task';
         context_type?: string | null;
         context_types?: string[] | null;
         from_ts?: string | null;
@@ -811,8 +837,243 @@ export const api = {
   },
 
   knowledgebases: {
+    health(): Promise<KnowledgebaseHealth> {
+      return request<KnowledgebaseHealth>('/api/v1/knowledgebases/health');
+    },
+
+    capabilities(): Promise<KnowledgebaseCapabilities> {
+      return request<KnowledgebaseCapabilities>('/api/v1/knowledgebases/capabilities');
+    },
+
     list(): Promise<KnowledgebaseModel[]> {
       return request<KnowledgebaseModel[]>('/api/v1/knowledgebases/');
+    },
+
+    get(knowledgebaseId: string): Promise<KnowledgebaseModel> {
+      return request<KnowledgebaseModel>(`/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}`);
+    },
+
+    create(payload: KnowledgebaseCreateRequest): Promise<KnowledgebaseModel> {
+      return request<KnowledgebaseModel>('/api/v1/knowledgebases/', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    update(knowledgebaseId: string, payload: KnowledgebaseUpdateRequest): Promise<KnowledgebaseModel> {
+      return request<KnowledgebaseModel>(`/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    remove(knowledgebaseId: string): Promise<{ deleted: boolean }> {
+      return request<{ deleted: boolean }>(`/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}`, {
+        method: 'DELETE'
+      });
+    },
+
+    shares(knowledgebaseId: string): Promise<KnowledgebaseShareModel[]> {
+      return request<KnowledgebaseShareModel[]>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/shares`
+      );
+    },
+
+    shareCandidates(
+      knowledgebaseId: string,
+      query: string,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<KnowledgebaseShareCandidate[]> {
+      return request<KnowledgebaseShareCandidate[]>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/shares/candidates${encodeQuery({ q: query })}`,
+        { signal: options.signal }
+      );
+    },
+
+    grantShare(knowledgebaseId: string, payload: KnowledgebaseShareRequest): Promise<KnowledgebaseShareModel> {
+      return request<KnowledgebaseShareModel>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/shares`,
+        { method: 'PUT', body: JSON.stringify(payload) }
+      );
+    },
+
+    revokeShare(knowledgebaseId: string, userEmail: string): Promise<{ revoked: boolean }> {
+      return request<{ revoked: boolean }>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/shares/${encodeURIComponent(userEmail)}`,
+        { method: 'DELETE' }
+      );
+    },
+
+    diagnostics(knowledgebaseId: string): Promise<KnowledgebaseDiagnostics> {
+      return request<KnowledgebaseDiagnostics>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/diagnostics`
+      );
+    },
+
+    search(
+      knowledgebaseId: string,
+      payload: KnowledgebaseSearchRequest,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<KnowledgebaseSearchResponse> {
+      return request<KnowledgebaseSearchResponse>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/search`,
+        { method: 'POST', body: JSON.stringify(payload), signal: options.signal }
+      );
+    },
+
+    ask(
+      knowledgebaseId: string,
+      payload: KnowledgebaseAskRequest,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<KnowledgebaseAskResponse> {
+      return request<KnowledgebaseAskResponse>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/ask`,
+        { method: 'POST', body: JSON.stringify(payload), signal: options.signal, timeoutMs: 60_000 }
+      );
+    },
+
+    sourceContext(
+      knowledgebaseId: string,
+      payload: KnowledgebaseSourceContextRequest
+    ): Promise<KnowledgebaseSourceContextResponse> {
+      return request<KnowledgebaseSourceContextResponse>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/source-context`,
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
+    },
+
+    facets(
+      knowledgebaseId: string,
+      payload: KnowledgebaseFacetRequest,
+      options: { signal?: AbortSignal } = {}
+    ): Promise<KnowledgebaseFacetResponse> {
+      return request<KnowledgebaseFacetResponse>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/facets`,
+        { method: 'POST', body: JSON.stringify(payload), signal: options.signal }
+      );
+    },
+
+    artifacts(knowledgebaseId: string): Promise<KnowledgebaseArtifactModel[]> {
+      return request<KnowledgebaseArtifactModel[]>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/artifacts`
+      );
+    },
+
+    attachArtifact(
+      knowledgebaseId: string,
+      payload: KnowledgebaseAttachRequest
+    ): Promise<KnowledgebaseArtifactModel> {
+      return request<KnowledgebaseArtifactModel>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/artifacts`,
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
+    },
+
+    detachArtifact(knowledgebaseId: string, artifactId: string): Promise<KnowledgebaseArtifactModel> {
+      return request<KnowledgebaseArtifactModel>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/artifacts/${encodeURIComponent(artifactId)}`,
+        { method: 'DELETE' }
+      );
+    },
+
+    reindexArtifact(knowledgebaseId: string, artifactId: string): Promise<KnowledgebaseIndexJobModel> {
+      return request<KnowledgebaseIndexJobModel>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/artifacts/${encodeURIComponent(artifactId)}/reindex`,
+        { method: 'POST' }
+      );
+    },
+
+    reindexAll(knowledgebaseId: string): Promise<KnowledgebaseIndexJobModel[]> {
+      return request<KnowledgebaseIndexJobModel[]>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/reindex`,
+        { method: 'POST' }
+      );
+    },
+
+    jobs(knowledgebaseId: string): Promise<KnowledgebaseIndexJobModel[]> {
+      return request<KnowledgebaseIndexJobModel[]>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/jobs`
+      );
+    },
+
+    retryJob(knowledgebaseId: string, jobId: string): Promise<KnowledgebaseIndexJobModel> {
+      return request<KnowledgebaseIndexJobModel>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/jobs/${encodeURIComponent(jobId)}/retry`,
+        { method: 'POST' }
+      );
+    },
+
+    cancelJob(knowledgebaseId: string, jobId: string): Promise<KnowledgebaseIndexJobModel> {
+      return request<KnowledgebaseIndexJobModel>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/jobs/${encodeURIComponent(jobId)}/cancel`,
+        { method: 'POST' }
+      );
+    },
+
+    agentAssignments(knowledgebaseId: string): Promise<string[]> {
+      return request<string[]>(`/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/agents`);
+    },
+
+    assignAgent(knowledgebaseId: string, agentId: string): Promise<{ assigned: boolean }> {
+      return request<{ assigned: boolean }>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/agents/${encodeURIComponent(agentId)}`,
+        { method: 'POST' }
+      );
+    },
+
+    unassignAgent(knowledgebaseId: string, agentId: string): Promise<{ assigned: boolean }> {
+      return request<{ assigned: boolean }>(
+        `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/agents/${encodeURIComponent(agentId)}`,
+        { method: 'DELETE' }
+      );
+    },
+
+    documents: {
+      upload(
+        knowledgebaseId: string,
+        files: File[],
+        paths: string[],
+        conflictPolicy: KnowledgebaseDocumentConflictPolicy,
+        options: { signal?: AbortSignal } = {}
+      ): Promise<KnowledgebaseDocumentUploadResponse> {
+        const form = new FormData();
+        files.forEach((file) => form.append('files[]', file, file.name));
+        paths.forEach((path) => form.append('paths[]', path));
+        form.set('conflict_policy', conflictPolicy);
+        return request<KnowledgebaseDocumentUploadResponse>(
+          `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/documents`,
+          { method: 'POST', body: form, signal: options.signal, timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS }
+        );
+      },
+
+      list(
+        knowledgebaseId: string,
+        params: { status?: string; query?: string; sort?: 'path' | 'updated_at'; direction?: 'asc' | 'desc'; cursor?: string; limit?: number } = {},
+        options: { signal?: AbortSignal } = {}
+      ): Promise<KnowledgebaseDocumentListResponse> {
+        return request<KnowledgebaseDocumentListResponse>(
+          `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/documents${encodeQuery(params)}`,
+          { signal: options.signal }
+        );
+      },
+
+      get(knowledgebaseId: string, kbArtifactId: string): Promise<KnowledgebaseDocumentDetail> {
+        return request<KnowledgebaseDocumentDetail>(
+          `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/documents/${encodeURIComponent(kbArtifactId)}`
+        );
+      },
+
+      content(
+        knowledgebaseId: string,
+        kbArtifactId: string,
+        contentMode: 'source' | 'extracted' = 'extracted',
+        options: { signal?: AbortSignal } = {}
+      ): Promise<KnowledgebaseDocumentContentResponse> {
+        return request<KnowledgebaseDocumentContentResponse>(
+          `/api/v1/knowledgebases/${encodeURIComponent(knowledgebaseId)}/documents/${encodeURIComponent(kbArtifactId)}/content${encodeQuery({ content_mode: contentMode })}`,
+          { signal: options.signal }
+        );
+      }
     }
   },
 
@@ -1333,6 +1594,12 @@ export const api = {
 
     chat(taskId: string): Promise<TaskChatResponse> {
       return request<TaskChatResponse>(`/api/v1/tasks/${taskId}/chat`, {
+        method: 'POST'
+      });
+    },
+
+    controlChat(taskId: string): Promise<TaskControlChatResponse> {
+      return request<TaskControlChatResponse>(`/api/v1/tasks/${taskId}/control-chat`, {
         method: 'POST'
       });
     },
@@ -1869,6 +2136,13 @@ export const api = {
 
     updateBackend(backend: string, payload: WebBackendUpdatePayload): Promise<WebConfigStatus> {
       return request<WebConfigStatus>(`/api/v1/web-config/backends/${encodeURIComponent(backend)}`, {
+        method: 'PUT',
+        body: JSON.stringify(payload)
+      });
+    },
+
+    updateDefaults(payload: WebDefaultsUpdatePayload): Promise<WebConfigStatus> {
+      return request<WebConfigStatus>('/api/v1/web-config/defaults', {
         method: 'PUT',
         body: JSON.stringify(payload)
       });

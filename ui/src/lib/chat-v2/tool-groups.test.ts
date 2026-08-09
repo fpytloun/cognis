@@ -1242,7 +1242,7 @@ describe('prepareTimelineRows', () => {
     expect(rows[0].defaultExpanded).toBe(false);
   });
 
-  it('adds failure detail only for shell and generic tool groups', () => {
+  it('adds failure detail for shell, generic, and web tool groups', () => {
     const shellRows = prepareTimelineRows([
       tool('bash', 'bash', { is_error: true, status: 'failed' })
     ], DEFAULT_USER_PREFERENCES);
@@ -1255,7 +1255,7 @@ describe('prepareTimelineRows', () => {
 
     expect(shellRows[0].kind === 'tool_group' ? shellRows[0].summary.detailLabel : '').toBe('1 tool (1 failed)');
     expect(genericRows[0].kind === 'tool_group' ? genericRows[0].summary.detailLabel : '').toBe('1 tool (1 failed)');
-    expect(webRows[0].kind === 'tool_group' ? webRows[0].summary.detailLabel : '').toBe('1 tool');
+    expect(webRows[0].kind === 'tool_group' ? webRows[0].summary.detailLabel : '').toBe('1 tool (1 failed)');
   });
 
   it('keeps group identity stable when live tools append', () => {

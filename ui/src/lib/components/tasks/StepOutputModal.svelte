@@ -204,6 +204,7 @@
     class="relative z-10 flex max-h-full w-full max-w-3xl flex-col overflow-hidden rounded-[1.75rem] border border-slate-800 bg-slate-950 shadow-card"
     role="dialog"
     aria-modal="true"
+    data-blocking-overlay
     aria-labelledby="step-output-title"
   >
     <div class="shrink-0 border-b border-slate-800 px-5 py-4 sm:px-6">

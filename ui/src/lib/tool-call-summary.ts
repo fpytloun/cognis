@@ -320,6 +320,11 @@ export interface WebResultPresentation {
   domain: string;
   snippet: string;
   score: string;
+  publishedDate: string;
+  resultType: string;
+  recommendation: string;
+  freshness: string;
+  sourceEngine: string;
 }
 
 export interface WebMediaPresentation {
@@ -342,6 +347,7 @@ export interface WebToolPresentation {
   results: WebResultPresentation[];
   media: WebMediaPresentation[];
   error: string;
+  warning: string;
 }
 
 export type WorkflowToolPresentation = WriteDeliverablePresentation | StepCompletePresentation | StepTodoWritePresentation;
@@ -589,6 +595,11 @@ export function managedConversationToolPresentation(item: ToolCallSummaryInput):
     error,
     displayStatus,
   };
+}
+
+export function managedConversationStatusIsRunning(status: string | null | undefined): boolean {
+  const normalized = (status ?? '').trim().toLowerCase();
+  return normalized === 'running' || normalized === 'queued';
 }
 
 function nativeInspectionKind(name: string): NativeInspectionKind | null {
@@ -877,11 +888,17 @@ export function webToolPresentation(item: ToolCallSummaryInput): WebToolPresenta
         title: heading || sectionField(lines, 'URL') || 'Search result',
         url: sectionField(lines, 'URL'),
         domain: sectionField(lines, 'Domain'),
-        snippet: sectionField(lines, 'Snippet'),
-        score: sectionField(lines, 'Relevance'),
+         snippet: sectionField(lines, 'Snippet'),
+         score: sectionField(lines, 'Relevance'),
+         publishedDate: sectionField(lines, 'Published'),
+         resultType: sectionField(lines, 'Type'),
+         recommendation: sectionField(lines, 'Fetch recommendation'),
+         freshness: sectionField(lines, 'Freshness'),
+         sourceEngine: sectionField(lines, 'Source engine'),
       });
     }
     const answer = (sections.get('answer') ?? '').replace(/^Answer:\s*/i, '').trim();
+    const warning = sections.get('search:status')?.trim() ?? '';
     const summary = item.status === 'started'
       ? 'Searching the web…'
       : error || `${results.length} result${results.length === 1 ? '' : 's'}${media.length ? ` and ${media.length} image reference${media.length === 1 ? '' : 's'}` : ''}.`;
@@ -897,6 +914,7 @@ export function webToolPresentation(item: ToolCallSummaryInput): WebToolPresenta
       results,
       media,
       error,
+      warning,
     };
   }
 
@@ -921,6 +939,7 @@ export function webToolPresentation(item: ToolCallSummaryInput): WebToolPresenta
     results: [],
     media,
     error,
+    warning: '',
   };
 }
 

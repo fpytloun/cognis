@@ -1,13 +1,15 @@
 <script lang="ts">
   import Check from 'lucide-svelte/icons/check';
   import Copy from 'lucide-svelte/icons/copy';
+  import GitFork from 'lucide-svelte/icons/git-fork';
   import Square from 'lucide-svelte/icons/square';
   import Volume2 from 'lucide-svelte/icons/volume-2';
-  import { onMount } from 'svelte';
+  import { getContext, onMount } from 'svelte';
   import { api } from '$lib/api/client';
   import type { MessageTimelineItem } from '$lib/timeline-render-model';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
+  import CodeBlockModal from '$lib/components/CodeBlockModal.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import Popover from '$lib/components/ui/Popover.svelte';
@@ -17,6 +19,10 @@
   import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
   import type { Agent } from '$lib/types/api';
   import { cancellationOriginLabel } from '$lib/cancellation-reason';
+  import {
+    forkAssistantMessageContext,
+    type ForkAssistantMessage
+  } from '$lib/chat-message-actions';
 
   let {
     item,
@@ -53,6 +59,9 @@
     agent ? (agent.display_name ?? agent.name) : runtimeAgentName ?? 'Assistant'
   );
   const agentAvatarUrl = $derived(agent?.avatar_url ?? null);
+  const forkAssistantMessage = getContext<ForkAssistantMessage | undefined>(
+    forkAssistantMessageContext
+  );
   const partialStatusLabel = $derived(
     item.finishReason === 'user_cancelled'
       ? cancellationOriginLabel('user')
@@ -77,7 +86,16 @@
   let messageCopied = $state(false);
   let copiedCodeBlocks = $state<Set<string>>(new Set());
   let copyResetTimer: number | null = null;
+  let forking = $state(false);
+  const canFork = $derived(
+    !compact
+    && !item.streaming
+    && Boolean(item.sessionId)
+    && item.seq !== null
+    && forkAssistantMessage !== undefined
+  );
   const codeCopyResetTimers = new Map<string, number>();
+  let expandedCode = $state<{ text: string; language: string | null } | null>(null);
 
   function sizeClass(): string {
     if (compact) return 'w-full min-w-0';
@@ -157,7 +175,10 @@
 
   function proseClass(): string {
     return item.role === 'user'
-      ? 'prose-user'
+      // Typography defaults use dark ink for headings, tables, and other
+      // semantic Markdown elements. User bubbles have a sky background, so
+      // invert the full typography palette instead of styling only paragraphs.
+      ? 'prose-invert prose-user'
       : 'prose-invert prose-code:text-sky-200 prose-code:before:content-none prose-code:after:content-none';
   }
 
@@ -180,6 +201,16 @@
       }, 2000);
     } catch {
       addToast('Failed to copy message', 'error');
+    }
+  }
+
+  async function forkMessage(): Promise<void> {
+    if (!canFork || forking || !item.sessionId || item.seq === null || !forkAssistantMessage) return;
+    forking = true;
+    try {
+      await forkAssistantMessage(item.sessionId, item.seq);
+    } finally {
+      forking = false;
     }
   }
 
@@ -233,6 +264,20 @@
       return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="sr-only">Copied code block</span>';
     }
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span class="sr-only">Copy code block</span>';
+  }
+
+  function codeLanguage(code: HTMLElement): string | null {
+    for (const className of code.classList) {
+      if (className.startsWith('language-')) return className.slice('language-'.length);
+    }
+    return null;
+  }
+
+  function openCodeModal(code: HTMLElement): void {
+    expandedCode = {
+      text: code.textContent ?? '',
+      language: codeLanguage(code)
+    };
   }
 
   function escapeRegExp(value: string): string {
@@ -380,9 +425,20 @@
           wrapper.append(block);
         }
 
+        const actions = document.createElement('div');
+        actions.className = 'chat-code-actions';
+
+        const expandButton = document.createElement('button');
+        expandButton.type = 'button';
+        expandButton.className = 'copy-icon-button';
+        expandButton.setAttribute('aria-label', 'Open code block in modal');
+        expandButton.title = 'Open code block in modal';
+        expandButton.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 3 6 0 0 6"></path><path d="m21 3-7 7"></path><path d="m9 21-6 0 0-6"></path><path d="m3 21 7-7"></path></svg><span class="sr-only">Open code block in modal</span>';
+        expandButton.addEventListener('click', () => openCodeModal(code));
+
         const button = document.createElement('button');
         button.type = 'button';
-        button.className = 'copy-icon-button chat-code-copy-button';
+        button.className = 'copy-icon-button';
         button.setAttribute('aria-label', 'Copy code block');
         button.title = 'Copy code block';
         button.innerHTML = codeCopyIcon(copiedCodeBlocks.has(copyKey));
@@ -397,7 +453,8 @@
         };
 
         button.addEventListener('click', onClick);
-        wrapper.append(button);
+        actions.append(expandButton, button);
+        wrapper.append(actions);
         buttonByKey.set(copyKey, button);
       }
 
@@ -524,6 +581,18 @@
                 <Copy />
               {/if}
             </button>
+            {#if canFork}
+              <button
+                class="copy-icon-button ml-1 border-l border-slate-700"
+                onclick={forkMessage}
+                type="button"
+                title="Fork conversation from this message"
+                aria-label="Fork conversation from this message"
+                disabled={forking}
+              >
+                <GitFork />
+              </button>
+            {/if}
           {/if}
         </div>
       </div>
@@ -555,6 +624,14 @@
       {/if}
     </div>
   </article>
+{/if}
+
+{#if expandedCode}
+  <CodeBlockModal
+    code={expandedCode.text}
+    language={expandedCode.language}
+    onClose={() => { expandedCode = null; }}
+  />
 {/if}
 
 <style>

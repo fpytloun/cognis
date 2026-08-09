@@ -115,6 +115,8 @@ const INTERNAL_TOOL_NAMES = new Set([
   'switch_executor',
   'request_user_input',
   'step_request_questions',
+  'request_auth_challenge',
+  'request_credential',
   'read_tool_output',
   'search_tool_output',
   'list_tool_output_anchors',
@@ -420,7 +422,7 @@ function appendFailureDetail(label: string, failedCount: number): string {
 }
 
 function shouldShowFailureDetail(kind: ToolGroupKind): boolean {
-  return kind === 'command' || kind === 'mixed';
+  return kind === 'command' || kind === 'mixed' || kind === 'web';
 }
 
 function earliestTimestamp(items: ToolCallTimelineItem[]): string | null {
@@ -1032,8 +1034,20 @@ export function prepareTimelineRows(
   cycleStates: readonly TurnCycleState[] = []
 ): TimelineRow[] {
   const visibleItems = dedupeVisibleToolCalls(items.filter((item) => visibleItem(item, preferences)));
+  const renderedToolCallIds = new Set(
+    visibleItems
+      .filter((item): item is ToolCallTimelineItem => item.kind === 'tool_call')
+      .map((item) => item.call_id)
+  );
+  const interactionFilteredItems = preferences.chat.show_internal_tool_calls
+    ? visibleItems.filter(
+        (item) => item.kind !== 'user_interaction'
+          || !item.origin_call_id
+          || !renderedToolCallIds.has(item.origin_call_id)
+      )
+    : visibleItems;
   if (!preferences.chat.group_tool_calls) {
-    return visibleItems.map((item) => ({ kind: 'item', item }));
+    return interactionFilteredItems.map((item) => ({ kind: 'item', item }));
   }
 
   const rows: TimelineRow[] = [];
@@ -1079,7 +1093,7 @@ export function prepareTimelineRows(
     pendingThinking = [];
   }
 
-  for (const item of visibleItems) {
+  for (const item of interactionFilteredItems) {
     if (item.kind === 'thinking') {
       flushPendingTools();
       const previous = pendingThinking[pendingThinking.length - 1];

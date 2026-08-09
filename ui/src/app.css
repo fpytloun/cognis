@@ -4,6 +4,28 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer utilities {
+  .scrollbar-hidden-x {
+    overflow-x: auto;
+    white-space: nowrap;
+    scrollbar-width: none;
+  }
+  .scrollbar-hidden-x::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+  [data-testid="focused-session-loading"] .truncate {
+    overflow-x: auto;
+    white-space: nowrap;
+    text-overflow: clip;
+    scrollbar-width: none;
+  }
+  [data-testid="focused-session-loading"] .truncate::-webkit-scrollbar {
+    display: none;
+  }
+}
+
 :root {
   color-scheme: dark;
   --app-viewport-height: 100dvh;
@@ -172,12 +194,6 @@ textarea:focus-visible,
   overflow-wrap: anywhere;
 }
 
-.chat-markdown table {
-  display: block;
-  width: max-content;
-  min-width: 100%;
-}
-
 .chat-markdown pre {
   position: relative;
   padding-top: 3rem;
@@ -269,6 +285,28 @@ textarea:focus-visible,
   overflow-x: auto;
 }
 
+.chat-markdown .markdown-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.chat-markdown .markdown-table-wrap table {
+  display: table;
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  overflow: visible;
+}
+
+.chat-markdown .markdown-table-wrap :is(th, td) {
+  min-width: 8rem;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
 .docs-markdown .markdown-code-wrap,
 .docs-markdown .markdown-table-wrap {
   max-width: 100%;
@@ -278,6 +316,24 @@ textarea:focus-visible,
 .docs-markdown .markdown-code-wrap pre,
 .docs-markdown .markdown-table-wrap table {
   min-width: max-content;
+}
+
+.markdown-youtube-embed {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 0.75rem;
+  background: rgb(2 6 23);
+}
+
+.markdown-youtube-embed iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
 }
 
 .copy-icon-button {
@@ -322,21 +378,26 @@ textarea:focus-visible,
 .chat-markdown .chat-code-wrap pre {
   margin-top: 0;
   margin-bottom: 0;
+  max-height: min(32rem, 55vh);
+  overflow: auto;
+  padding-top: 3rem;
 }
 
-.chat-code-copy-button {
+.chat-code-actions {
   position: absolute;
   top: 0.5rem;
   right: 0.5rem;
   z-index: 1;
+  display: flex;
+  gap: 0.5rem;
 }
 
 @media (max-width: 640px) {
-  .chat-markdown pre {
+  .chat-markdown .chat-code-wrap pre {
     padding-top: 2.75rem;
   }
 
-  .chat-code-copy-button {
+  .chat-code-actions {
     top: 0.5rem;
     right: 0.5rem;
   }

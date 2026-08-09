@@ -3,7 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   localPerformanceMetrics,
   mergeLatestPerformance,
-  responsivenessBadge
+  responsivenessBadge,
+  responsivenessBadgeOrNull
 } from './generation-performance';
 import type { GenerationPerformanceSnapshot } from './types/api';
 
@@ -32,6 +33,9 @@ const localPerformance: GenerationPerformanceSnapshot = {
 };
 
 describe('local generation performance', () => {
+  it('returns no inspector badge when generation telemetry is absent', () => {
+    expect(responsivenessBadgeOrNull(null)).toBeNull();
+  });
   it('renders raw pp, tg, TTFT, and load metrics', () => {
     expect(localPerformanceMetrics(localPerformance)).toEqual([
       { label: 'Prompt processing', value: '50.0 tokens/s', raw: 'pp' },

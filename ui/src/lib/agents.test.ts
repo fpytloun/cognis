@@ -352,6 +352,7 @@ describe('agent payload mapping', () => {
         provider_id: 'openai',
         model: 'gpt-default',
         reasoning_effort: 'medium'
+        ,fast_mode: true
       },
       agent_profiles: {
         fast: {
@@ -360,6 +361,7 @@ describe('agent payload mapping', () => {
           provider_id: 'openai',
           model: 'gpt-fast',
           reasoning_effort: 'low',
+          fast_mode: true,
           system_prompt_extra: 'Be concise.',
           memory_enabled: false,
           memory_backend_options: { mode: 'proactive' },
@@ -374,6 +376,7 @@ describe('agent payload mapping', () => {
     expect(form.providerId).toBe('openai');
     expect(form.model).toBe('gpt-default');
     expect(form.reasoningEffort).toBe('medium');
+    expect(form.fastMode).toBe('enabled');
     expect(form.agentProfiles).toEqual([
       {
         profileId: 'fast',
@@ -381,6 +384,7 @@ describe('agent payload mapping', () => {
         providerId: 'openai',
         model: 'gpt-fast',
         reasoningEffort: 'low',
+        fastMode: 'enabled',
         systemPromptExtra: 'Be concise.',
         memoryAvailability: 'disabled',
         memoryMode: 'proactive',
@@ -396,6 +400,7 @@ describe('agent payload mapping', () => {
       provider_id: 'openai',
       model: 'gpt-default',
       reasoning_effort: 'medium'
+      ,fast_mode: true
     });
     expect(payload.agent_profiles).toEqual({
       fast: {
@@ -404,6 +409,7 @@ describe('agent payload mapping', () => {
         provider_id: 'openai',
         model: 'gpt-fast',
         reasoning_effort: 'low',
+        fast_mode: true,
         system_prompt_extra: 'Be concise.',
         memory_enabled: false,
         memory_backend_options: { mode: 'proactive' },
@@ -427,6 +433,7 @@ describe('agent payload mapping', () => {
         providerId: '',
         model: '',
         reasoningEffort: '',
+        fastMode: 'inherit',
         systemPromptExtra: '',
         memoryAvailability: 'inherit',
         memoryMode: '',

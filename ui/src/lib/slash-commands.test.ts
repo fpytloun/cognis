@@ -49,6 +49,7 @@ describe('slash command helpers', () => {
       '/fork',
       '/model',
       '/thinking',
+      '/fast',
       '/profile',
       '/skill',
       '/executor',
@@ -110,6 +111,7 @@ describe('slash command helpers', () => {
   it('requests dynamic parameter suggestions only for structured parameter commands', () => {
     expect(slashParameterSuggestionCommand('/skill cog')).toBe('/skill');
     expect(slashParameterSuggestionCommand('/thinking ')).toBe('/thinking');
+    expect(slashParameterSuggestionCommand('/fast ')).toBe('/fast');
     expect(slashParameterSuggestionCommand('/profile ')).toBe('/profile');
     expect(slashParameterSuggestionCommand('/benchmark ')).toBe('/benchmark');
     expect(localSlashCommandSuggestions('/profile ')).toEqual([]);

@@ -96,6 +96,12 @@
       call_id: item.notification_id,
       session_id: item.session_id,
       tool_name: typeof item.payload.tool_name === 'string' ? item.payload.tool_name : null,
+      arguments_display:
+        item.payload.arguments_display
+        && typeof item.payload.arguments_display === 'object'
+        && !Array.isArray(item.payload.arguments_display)
+          ? item.payload.arguments_display as Record<string, unknown>
+          : null,
       decision: 'escalate',
       resolved: false,
       reasoning: typeof item.payload.reasoning === 'string' ? item.payload.reasoning : null,
@@ -177,12 +183,19 @@
         </div>
       </div>
       <div class="flex items-center gap-2">
-        <SessionDetailsButton open={sessionDetailsOpen} onclick={() => { sessionDetailsOpen = !sessionDetailsOpen; }} />
+        <SessionDetailsButton
+          open={sessionDetailsOpen}
+          ariaControls={`session-logs-info-${sessionId}`}
+          testId="session-logs-header-info"
+          onclick={() => { sessionDetailsOpen = !sessionDetailsOpen; }}
+        />
         <button class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-white sm:h-8 sm:w-8" onclick={onclose} aria-label="Close" type="button">&times;</button>
       </div>
     </div>
     {#if sessionDetailsOpen}
-      <SessionDetailsPanel {sessionId} />
+      <div id={`session-logs-info-${sessionId}`}>
+        <SessionDetailsPanel {sessionId} />
+      </div>
     {/if}
     {#if escalations.length > 0}
       {@const escalation = escalations[0]}

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createMarkdownStreamer } from './markdown';
+import { createMarkdownStreamer, renderMarkdown } from './markdown';
 
 describe('createMarkdownStreamer', () => {
   const preCount = (html: string) => html.match(/<pre\b/g)?.length ?? 0;
@@ -103,5 +103,53 @@ describe('createMarkdownStreamer', () => {
     expect(tildeHtml).toContain('hello');
     expect(backtickHtml).toContain('After');
     expect(tildeHtml).toContain('After');
+  });
+
+  it('does not activate a split iframe until the complete token arrives', () => {
+    const s = createMarkdownStreamer();
+    const first = '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"';
+    const complete = `${first}></iframe>`;
+
+    expect(s.render(first)).not.toContain('<iframe');
+    expect(s.render(first)).not.toContain('markdown-youtube-embed');
+    expect(s.render(complete)).toContain('markdown-youtube-embed');
+    expect(s.finalize(complete)).toBe(renderMarkdown(complete));
+  });
+
+  it('does not stabilize an incomplete iframe block before a later closing tag', () => {
+    const s = createMarkdownStreamer();
+    const partial = '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ">\n\n';
+    const complete = `${partial}</iframe>`;
+
+    expect(s.render(partial)).not.toContain('markdown-youtube-embed');
+    expect(s.finalize(complete)).toBe(renderMarkdown(complete));
+  });
+
+  it('does not treat inline code that mentions iframe as an incomplete HTML token', () => {
+    const s = createMarkdownStreamer();
+    const content = '`<iframe` is inert.\n\nA stable following block.';
+
+    expect(s.render(content)).toContain('A stable following block.');
+    expect(s.finalize(content)).toBe(renderMarkdown(content));
+  });
+
+  it('does not treat indented iframe code as an incomplete HTML token', () => {
+    const s = createMarkdownStreamer();
+    const content = '    <iframe\n\nA stable following block.';
+
+    expect(s.render(content)).toContain('A stable following block.');
+    expect(s.finalize(content)).toBe(renderMarkdown(content));
+  });
+
+  it('does not cache resolver results when hooks have no cache key', () => {
+    let prefix = '/first/';
+    const content = '[document](./guide.md)\n\nTail';
+    const s = createMarkdownStreamer({
+      resolveLink: (href) => `${prefix}${href}`,
+    });
+
+    expect(s.render(content)).toContain('/first/./guide.md');
+    prefix = '/second/';
+    expect(s.render(content)).toContain('/second/./guide.md');
   });
 });

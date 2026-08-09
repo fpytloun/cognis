@@ -37,6 +37,11 @@ function detail(sessionId: string) {
       provider_id: 'provider-a',
       effective_prompt_budget: 6000,
     },
+    token_usage: {
+      prompt_tokens: 1200,
+      completion_tokens: 100,
+      total_tokens: 1300,
+    },
     last_generation: {
       is_local: true,
       provider_id: 'provider-a',
@@ -72,11 +77,18 @@ describe('SessionDetailsPanel', () => {
   it('renders full authorized session details', async () => {
     intarisDetail.mockResolvedValue(detail('session-a'));
     render(SessionDetailsPanel, { sessionId: 'session-a' });
-    await waitFor(() => expect(screen.getByText('Summary session-a')).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText('Summary session-a')).toHaveLength(2));
+    expect(screen.getByTestId('session-narrative')).not.toHaveAttribute('open');
     expect(screen.getByText(/model-a · Provider A/)).toBeTruthy();
     expect(screen.getByText('profile-a')).toBeTruthy();
-    expect(screen.getByText('1,200 / 8,000 tokens')).toBeTruthy();
+    expect(screen.getByText(/1,200 \/ 8,000/)).toBeTruthy();
     expect(screen.getByText('Executor A')).toBeTruthy();
+    expect(screen.getByTestId('session-context-usage-bar')).toHaveAttribute('aria-valuenow', '15');
+    expect(screen.getByTestId('session-details-diagnostics')).not.toHaveAttribute('open');
+    expect(screen.getByText('Show context & runtime details')).toBeTruthy();
+    expect(screen.getByTestId('session-token-usage')).toBeTruthy();
+    expect(screen.getByText('Input 1,200')).toBeTruthy();
+    expect(screen.getByText('Output 100')).toBeTruthy();
   });
 
   it('rejects a stale response after a scope switch', async () => {
@@ -86,7 +98,7 @@ describe('SessionDetailsPanel', () => {
     const view = render(SessionDetailsPanel, { sessionId: 'session-a' });
     await view.rerender({ sessionId: 'session-b' });
     second.resolve(detail('session-b'));
-    await waitFor(() => expect(screen.getByText('Summary session-b')).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText('Summary session-b')).toHaveLength(2));
     first.resolve(detail('session-a'));
     await Promise.resolve();
     expect(screen.queryByText('Summary session-a')).toBeNull();

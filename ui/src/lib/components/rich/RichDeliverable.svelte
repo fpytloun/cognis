@@ -29,6 +29,7 @@
   export let title = '';
   export let surface: 'embedded' | 'standalone';
   export let compact = false;
+  export let collapsedByDefault = false;
   export let standaloneUrl = '';
   export let pdfUrl = '';
   export let shareLinkCallback: (() => Promise<string>) | null = null;
@@ -66,6 +67,7 @@
   $: publicationContext.set(buildCitationRegistry(normalized.blocks, normalized.sources, instanceNamespace));
   $: showToc = options.showToc;
   let fullOpen = false;
+  let inlineExpanded = !collapsedByDefault;
   let tocOpen = false;
   let copied = false;
   let shareCopied = false;
@@ -93,6 +95,11 @@
 
   function openContextualToc() {
     if (showToc) tocOpen = true;
+  }
+
+  function toggleInlineDocument() {
+    inlineExpanded = !inlineExpanded;
+    if (!inlineExpanded) tocOpen = false;
   }
 
   /**
@@ -359,8 +366,8 @@
   <div class="rich-orb rich-orb-a" aria-hidden="true"></div>
   <div class="rich-orb rich-orb-b" aria-hidden="true"></div>
 
-  <header class="rich-toolbar" class:actions-only={heroOwnsIdentity} data-testid="rich-deliverable-toolbar">
-    {#if !heroOwnsIdentity}
+  <header class="rich-toolbar" class:actions-only={heroOwnsIdentity && inlineExpanded} data-testid="rich-deliverable-toolbar">
+    {#if !heroOwnsIdentity || !inlineExpanded}
     <div>
       {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
       <h1>{@html renderInlineMarkdown(title || 'Deliverable')}</h1>
@@ -371,6 +378,18 @@
     </div>
     {/if}
     <nav class="rich-actions" aria-label="Document actions">
+      {#if collapsedByDefault}
+        <button
+          type="button"
+          aria-label={inlineExpanded ? 'Collapse document' : 'Expand document'}
+          title={inlineExpanded ? 'Collapse document' : 'Expand document'}
+          aria-expanded={inlineExpanded}
+          aria-controls={`${instanceNamespace}-inline-document`}
+          on:click={toggleInlineDocument}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d={inlineExpanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} /></svg>
+        </button>
+      {/if}
       {#if showToc}
         <button class="rich-toc-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={() => tocOpen = true}>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h2m3 0h11M4 12h2m3 0h11M4 18h2m3 0h11" /></svg>
@@ -392,7 +411,14 @@
   {#if shareError}<p class="rich-action-error">{shareError}</p>{/if}
 
   {#if !fullOpen}
-  <div class:has-toc={showToc} class="rich-document">
+  <div
+    id={`${instanceNamespace}-inline-document`}
+    class:has-toc={showToc}
+    class="rich-document"
+    hidden={!inlineExpanded}
+    aria-hidden={!inlineExpanded}
+    data-testid="rich-deliverable-inline-document"
+  >
     {#if showToc}
       <RichToc
         items={tocItems}

@@ -39,6 +39,7 @@ import TriangleAlert from 'lucide-svelte/icons/triangle-alert';
       {@const config = variantConfig(toast)}
       <button
         class={`pointer-events-auto flex w-full items-start gap-3 rounded-2xl border px-4 py-3 text-left shadow-card backdrop-blur transition hover:translate-y-[-1px] ${config.className}`}
+        data-toast-variant={toast.variant}
         onclick={() => removeToast(toast.id)}
         type="button"
       >

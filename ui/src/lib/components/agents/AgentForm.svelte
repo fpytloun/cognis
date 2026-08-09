@@ -465,6 +465,17 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     return modelInfoForProvider(form.providerId, form.model);
   }
 
+  function supportsFastMode(): boolean {
+    return selectedProviderModelInfo()?.supports_fast_mode === true;
+  }
+
+  function supportsFastModeForProfile(profile: AgentRuntimeProfileFormState): boolean {
+    return modelInfoForProvider(
+      profile.providerId || form.providerId,
+      profile.model || form.model
+    )?.supports_fast_mode === true;
+  }
+
   function availableThinkingEfforts(): string[] {
     const modelInfo = selectedProviderModelInfo();
     if (modelInfo) {
@@ -501,6 +512,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       providerId: '',
       model: '',
       reasoningEffort: '',
+      fastMode: 'inherit',
       systemPromptExtra: '',
       memoryAvailability: 'inherit',
       memoryMode: '',
@@ -1284,6 +1296,17 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               {/each}
             </select>
           </label>
+          {#if supportsFastMode()}
+            <label class="space-y-2 text-sm font-medium text-slate-200">
+              <span>Fast mode</span>
+              <select bind:value={form.fastMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditField('llm_config.fast_mode')}>
+                <option value="inherit">Default</option>
+                <option value="enabled">Enabled</option>
+                <option value="disabled">Disabled</option>
+              </select>
+              <span class="block text-xs text-slate-400">Uses the provider's accelerated tier; it may increase usage.</span>
+            </label>
+          {/if}
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Voice</span>
             <Input bind:value={form.voice} placeholder="Use system default" disabled={!canEditField('llm_config.voice')} />
@@ -1444,6 +1467,20 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                       {/each}
                     </select>
                   </label>
+                  {#if supportsFastModeForProfile(profile)}
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>Fast mode</span>
+                      <select
+                        bind:value={profile.fastMode}
+                        class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
+                        disabled={!canEditProfiles()}
+                      >
+                        <option value="inherit">Inherit agent setting</option>
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                      </select>
+                    </label>
+                  {/if}
 
                   <label class="space-y-2 text-sm font-medium text-slate-200 md:col-span-2">
                     <span>System prompt extra</span>

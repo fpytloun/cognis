@@ -15,7 +15,14 @@
   import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
   import { userPreferences } from '$lib/stores/userPreferences';
   import { wsClient } from '$lib/ws/client';
-  import type { ChatRealtimeFrame, ChatSyncResponse, TimelineBackfillResponse } from '$lib/chat-v2/types';
+  import type {
+    ChatRealtimeFrame,
+    ChatSyncResponse,
+    SendMessageV2Response,
+    TimelineBackfillResponse
+  } from '$lib/chat-v2/types';
+  import type { AttachmentRef } from '$lib/types/api';
+  import type { TodoSnapshotItem } from '$lib/todos';
 
   export interface ScopedChatV2Realtime {
     subscribe: (listener: (event: ChatRealtimeFrame) => void) => () => void;
@@ -32,6 +39,7 @@
     userScrolledUp = $bindable(false),
     onViewSession,
     emptyLabel = 'No events recorded yet.',
+    onTodosChange,
     onMissingStream,
     activityStatus = '',
     stepRun = null,
@@ -46,6 +54,7 @@
     userScrolledUp?: boolean;
     onViewSession?: (sessionId: string) => void | Promise<void>;
     emptyLabel?: string;
+    onTodosChange?: (todos: TodoSnapshotItem[]) => void;
     onMissingStream?: (() => void) | undefined;
     activityStatus?: string;
     stepRun?: StepRun | null;
@@ -72,6 +81,9 @@
   const effectivePreferences = $derived(preferences ?? $userPreferences ?? DEFAULT_USER_PREFERENCES);
   const cycleStates = $derived<TurnCycleState[]>(store.cycleStates);
   const todos = $derived(selectLatestTodoState(items));
+  $effect(() => {
+    onTodosChange?.(todos);
+  });
   const runtimeActive = $derived(store.snapshot.runtime?.has_active_turn === true);
   const stepRunLive = $derived(stepRun?.status === 'running' || stepRun?.status === 'evaluating');
   const effectiveRuntimeActive = $derived(stepRun ? stepRunLive : runtimeActive);
@@ -152,6 +164,44 @@
          await recoverFor(currentScope, currentStore, scopeVersion, requestVersion);
        }
     }
+  }
+
+  export function stageOptimisticMessage(input: {
+    scopeKey: string;
+    content: string;
+    attachments?: AttachmentRef[];
+    clientMessageId: string;
+  }): boolean {
+    if (input.scopeKey !== scope.key) return false;
+    store.addOptimisticUser({
+      content: input.content,
+      attachments: input.attachments,
+      clientMessageId: input.clientMessageId
+    });
+    return true;
+  }
+
+  export async function reconcileMessageAdmission(input: {
+    scopeKey: string;
+    response: SendMessageV2Response;
+  }): Promise<boolean> {
+    if (input.scopeKey !== scope.key) return false;
+    const scopeVersion = scopeGeneration;
+    const currentStore = store;
+    currentStore.applySend(input.response);
+    await sync();
+    return input.scopeKey === scope.key
+      && scopeVersion === scopeGeneration
+      && currentStore === store;
+  }
+
+  export function markMessageAdmissionFailed(input: {
+    scopeKey: string;
+    clientMessageId: string;
+  }): boolean {
+    if (input.scopeKey !== scope.key) return false;
+    store.markOptimisticUserFailed(input.clientMessageId);
+    return true;
   }
 
   async function loadOlder(): Promise<void> {

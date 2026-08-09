@@ -12,6 +12,7 @@ import type {
   SendMessageV2Response,
   TimelineBackfillResponse,
   TimelineItem,
+  TimelineItemStatus,
   TurnCycleState
 } from './types';
 import type { AttachmentRef } from '$lib/types/api';
@@ -318,9 +319,23 @@ export function applySendResponse(state: ChatV2ClientState, response: SendMessag
   if (state.conversationId !== response.conversation_id) {
     return markGapped(state, 'lineage_changed', 'Send response conversation does not match local state');
   }
+  const acknowledgedStatus: TimelineItemStatus =
+    response.status === 'queued' ? 'waiting' : 'complete';
+  const localItems = state.localItems.map((item) =>
+    item.kind === 'message'
+    && item.role === 'user'
+    && item.client_message_id === response.client_message_id
+      ? {
+          ...item,
+          status: acknowledgedStatus,
+          updated_at: response.server_time,
+        }
+      : item
+  );
   return cacheClientState({
     ...state,
     cursor: response.cursor ?? state.cursor,
+    localItems,
     lastError: null
   }, getTimelineById(state));
 }
@@ -895,6 +910,16 @@ export function maybeApplyRuntime(
   incoming: RuntimeOverlaySnapshot | null
 ): RuntimeOverlaySnapshot | null {
   if (!incoming) return current;
+  if (!incoming.has_active_turn) {
+    const volatileItems = incoming.volatile_items.filter((item) => !(
+      item.kind === 'message'
+      && item.role === 'system'
+      && item.notice_scope === 'transient_retry'
+    ));
+    if (volatileItems.length !== incoming.volatile_items.length) {
+      incoming = { ...incoming, volatile_items: volatileItems };
+    }
+  }
   if (!current) return incoming;
   // A new epoch (process restart / different replica / reset) is authoritative
   // and replaces the overlay wholesale, regardless of revision numbers.
@@ -1100,6 +1125,31 @@ function carrySettledRuntimeItems(
     byId.set(item.id, { ...item, sort_key: carriedSortKey(item.sort_key) });
   }
   for (const item of currentRuntime.volatile_items) {
+    // This notice describes in-flight recovery only. It has no canonical event
+    // and must disappear when the active turn settles.
+    if (
+      item.kind === 'message'
+      && item.role === 'system'
+      && item.notice_scope === 'transient_retry'
+    ) {
+      continue;
+    }
+    // Native apply_patch input creates a progress-only runtime card before the
+    // provider emits a complete tool call. If the turn stops during that input,
+    // no canonical event can reconcile this empty placeholder.
+    if (
+      item.kind === 'tool_call'
+      && item.tool_name === 'apply_patch'
+      && item.progress_phase === 'preparing_input'
+      && !item.progress_complete
+      && !item.arguments
+      && !item.arguments_preview
+      && !item.result_preview
+      && !item.streamed_output
+      && item.file_diffs.length === 0
+    ) {
+      continue;
+    }
     const settled = terminalizeSettledItem(item);
     byId.set(item.id, { ...settled, sort_key: carriedSortKey(settled.sort_key) });
   }

@@ -7,7 +7,17 @@
 
   import { parseFileDiff, type FileDiff, type ParsedDiffLine } from '$lib/diff';
 
-  let { diffs } = $props<{ diffs: FileDiff[] }>();
+  let {
+    diffs,
+    collapsible = true,
+    collapsedByDefault = false,
+    onExpand,
+  } = $props<{
+    diffs: FileDiff[];
+    collapsible?: boolean;
+    collapsedByDefault?: boolean;
+    onExpand?: (() => void) | undefined;
+  }>();
 
   let collapsed = $state<Record<string, boolean>>({});
 
@@ -19,7 +29,7 @@
 
   function toggle(path: string, index: number): void {
     const key = keyFor(path, index);
-    collapsed = { ...collapsed, [key]: !collapsed[key] };
+    collapsed = { ...collapsed, [key]: !(collapsed[key] ?? collapsedByDefault) };
   }
 
   function escapeHtml(value: string): string {
@@ -64,6 +74,9 @@
 <div class="space-y-3">
   {#each parsedDiffs as diff, index (keyFor(diff.path, index))}
     {@const key = keyFor(diff.path, index)}
+    {@const isCollapsed = collapsed[key] ?? collapsedByDefault}
+    {@const hasContent = Boolean(diffs[index]?.diff?.trim())}
+    {@const contentId = `file-diff-content-${index}-${key.replace(/[^a-zA-Z0-9_-]/g, '-')}`}
     {#if diff.omittedCount > 0 && !diff.path}
       <div class="rounded-xl border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-100">
         {diff.omittedCount} additional file diff{diff.omittedCount === 1 ? '' : 's'} omitted from this preview.
@@ -73,7 +86,9 @@
         <button
           class="flex w-full min-w-0 items-center gap-3 border-b border-slate-700/80 bg-slate-950/80 px-3 py-2 text-left transition hover:bg-slate-900"
           type="button"
-          onclick={() => toggle(diff.path, index)}
+          onclick={() => hasContent && collapsible ? toggle(diff.path, index) : onExpand?.()}
+          aria-expanded={hasContent && collapsible ? !isCollapsed : undefined}
+          aria-controls={hasContent && collapsible ? contentId : undefined}
         >
           <span class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-700 bg-slate-900 text-[10px] font-semibold text-cyan-200" title={diff.languageLabel}>
             {#if diff.iconLabel}
@@ -89,13 +104,16 @@
           <span class="flex shrink-0 items-center gap-2 font-mono text-xs">
             {#if diff.additions > 0}<span class="text-lime-300">+{diff.additions}</span>{/if}
             {#if diff.deletions > 0}<span class="text-rose-300">-{diff.deletions}</span>{/if}
-            {#if diff.truncated}<span class="rounded-full border border-yellow-500/30 px-2 py-0.5 text-[10px] text-yellow-200">truncated</span>{/if}
-            {#if collapsed[key]}<ChevronDown class="h-4 w-4 text-slate-500" />{:else}<ChevronUp class="h-4 w-4 text-slate-500" />{/if}
+            {#if hasContent && collapsible}
+              {#if isCollapsed}<ChevronDown class="h-4 w-4 text-slate-500" />{:else}<ChevronUp class="h-4 w-4 text-slate-500" />{/if}
+            {:else if onExpand}
+              <span class="hidden rounded border border-slate-700 px-2 py-1 text-[10px] text-sky-200 sm:inline-flex">{hasContent ? 'Expand diff' : 'View diff'}</span>
+            {/if}
           </span>
         </button>
 
-        {#if !collapsed[key]}
-          <div class="max-h-[58vh] overflow-auto text-xs leading-5">
+        {#if hasContent && (!collapsible || !isCollapsed)}
+          <div class="max-h-[58vh] overflow-auto text-xs leading-5" id={contentId}>
             <table class="w-full border-collapse font-mono">
               <tbody>
                 {#each diff.lines as line, lineIndex (`${key}:${lineIndex}`)}

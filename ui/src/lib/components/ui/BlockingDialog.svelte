@@ -129,6 +129,7 @@
         aria-label={label}
         aria-labelledby={titleId}
         aria-modal="true"
+        data-blocking-overlay
         class={cn(
           'relative flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-950 shadow-card',
           panelClass

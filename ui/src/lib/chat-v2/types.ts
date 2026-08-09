@@ -9,6 +9,7 @@ export type TimelineItemStatus =
   | 'complete'
   | 'failed'
   | 'cancelled'
+  | 'denied'
   | 'compacted'
   | 'skipped';
 export type ChatResetReason =
@@ -65,6 +66,224 @@ export interface SourceRef {
 export interface FileDiffRef {
   path: string;
   diff: string;
+  path_id?: string | null;
+  relative_path?: string | null;
+  root_label?: string | null;
+  root_name?: string | null;
+  root_id?: string | null;
+  additions?: number | null;
+  deletions?: number | null;
+  content_truncated?: boolean;
+  old_path?: string | null;
+  status?: 'added' | 'modified' | 'deleted' | 'renamed' | string | null;
+  binary?: boolean;
+  generated?: boolean;
+  truncated?: boolean;
+  source_workstream?: WorkstreamRef | null;
+}
+
+export interface WorkstreamRef {
+  key: string;
+  kind: string;
+  parent_key?: string | null;
+  root_key: string;
+  edge_kind: string;
+  ordinal: number;
+  conversation_id?: string | null;
+  session_id: string;
+  backing_session_ids?: string[];
+  event_store_session_id: string;
+  task_id?: string | null;
+  step_run_id?: string | null;
+  link_id?: string | null;
+  title: string;
+  agent_id: string;
+  agent_profile_id?: string | null;
+  status: string;
+  attempt?: number | null;
+  step_name?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  current: boolean;
+  superseded: boolean;
+  summary?: WorkProjectionResponse['summary'] | null;
+  activity_state?: 'ongoing' | 'active' | 'closed' | null;
+  activity_scope_id?: string | null;
+  completion_reason?: string | null;
+  completed_at?: string | null;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  agent_display_name?: string | null;
+  agent_avatar_url?: string | null;
+}
+
+export interface WorkDeliverable {
+  deliverable_id: string;
+  sort_key?: string;
+  format: string;
+  title?: string | null;
+  content?: string | null;
+  content_preview_truncated?: boolean;
+  recoverable?: boolean;
+  render_metadata?: Record<string, unknown> | null;
+  export_metadata?: Record<string, unknown> | null;
+  source_workstream?: WorkstreamRef | null;
+}
+
+export interface WorkMutationEvent {
+  id: string;
+  call_id: string;
+  sort_key: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  tool_name: string;
+  display_name?: string | null;
+  category: string;
+  operation_kind: string;
+  status: TimelineItemStatus;
+  duration_ms?: number | null;
+  error?: string | null;
+  arguments: Record<string, unknown>;
+  result_preview?: string | null;
+  streamed_output?: string | null;
+  evaluation?: Record<string, unknown> | null;
+  output_size?: number | null;
+  truncated?: boolean;
+  has_full_output?: boolean;
+  recovery_call_id?: string | null;
+  tool_output_artifact_id?: string | null;
+  paths: string[];
+  file_stats?: Array<{
+    path: string;
+    path_id: string;
+    relative_path?: string | null;
+    root_label?: string | null;
+    root_name?: string | null;
+    root_id?: string | null;
+    additions: number;
+    deletions: number;
+    preview_available: boolean;
+  }>;
+  file_diffs: FileDiffRef[];
+  diffs_truncated: boolean;
+  total_file_count?: number;
+  omitted_file_count?: number;
+  omitted_file_stat_count?: number;
+  file_stats_recoverable?: boolean;
+  additions?: number;
+  deletions?: number;
+  source_workstream?: WorkstreamRef | null;
+}
+
+export interface WorkCommandEvent {
+  id: string;
+  call_id: string;
+  sort_key: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  tool_name?: string;
+  display_name?: string | null;
+  command?: string | null;
+  description?: string | null;
+  workdir?: string | null;
+  status: TimelineItemStatus;
+  duration_ms?: number | null;
+  exit_code?: number | null;
+  error?: string | null;
+  arguments?: Record<string, unknown>;
+  evaluation?: Record<string, unknown> | null;
+  preview?: string | null;
+  preview_truncated: boolean;
+  has_full_output: boolean;
+  recovery_call_id?: string | null;
+  tool_output_artifact_id?: string | null;
+  output_size?: number | null;
+  source_workstream?: WorkstreamRef | null;
+}
+
+export interface WorkArtifact {
+  artifact_id: string;
+  sort_key?: string;
+  filename: string;
+  mime_type?: string | null;
+  size_bytes?: number | null;
+  title?: string | null;
+  source_workstream?: WorkstreamRef | null;
+}
+
+export interface WorkProjectionResponse {
+  schema_version: ChatV2SchemaVersion;
+  projection_version: string;
+  scope: TimelineScope;
+  final_deliverable?: WorkDeliverable | null;
+  deliverables?: WorkDeliverable[];
+  workstreams?: WorkstreamRef[];
+  graph_fingerprint?: string | null;
+  work_revision?: number | null;
+  graph_revision?: number | null;
+  graph_truncated?: boolean;
+  mutations: WorkMutationEvent[];
+  commands: WorkCommandEvent[];
+  removed_call_ids?: string[];
+  artifacts: WorkArtifact[];
+  summary: {
+    mutations: number;
+    commands: number;
+    changed_files: number;
+    artifacts: number;
+    deliverables?: number;
+    additions?: number;
+    deletions?: number;
+    omitted_files?: number;
+  };
+  materialization?: {
+    state: 'materializing' | 'caught_up' | 'repair' | 'failed';
+    completed_streams: number;
+    total_streams: number;
+    covered_events: number;
+    target_events: number;
+    failed_streams: number;
+    retry_after_ms?: number | null;
+  };
+  has_more_before: boolean;
+  before_cursor?: string | null;
+  server_time: string;
+  available_range?: {
+    from?: string | null;
+    to?: string | null;
+  } | null;
+}
+
+export type WorkCategory = 'files' | 'commands' | 'mutations' | 'artifacts' | 'deliverables';
+
+export interface ActivityRecentItem {
+  id: string;
+  category: WorkCategory;
+  session_id: string;
+  occurred_at: string;
+  status?: TimelineItemStatus | null;
+  title?: string | null;
+}
+
+export interface ActivityOverviewResponse {
+  schema_version: ChatV2SchemaVersion;
+  projection_version: string;
+  scope: TimelineScope;
+  summary: WorkProjectionResponse['summary'];
+  materialization: NonNullable<WorkProjectionResponse['materialization']>;
+  workstreams: WorkstreamRef[];
+  recent: Partial<Record<WorkCategory, ActivityRecentItem[]>>;
+  recent_work?: ActivityRecentWork | null;
+  graph_fingerprint: string;
+  graph_truncated: boolean;
+}
+
+export interface ActivityRecentWork {
+  commands: WorkCommandEvent[];
+  files: WorkMutationEvent[];
+  mutations: WorkMutationEvent[];
+  artifacts: WorkArtifact[];
+  deliverables: WorkDeliverable[];
 }
 
 export interface ThinkingBlock {
@@ -111,6 +330,8 @@ export interface MessageTimelineItem extends TimelineItemBase {
   notice_id?: string | null;
   notice_kind?: string | null;
   notice_scope?: string | null;
+  retry_reason?: string | null;
+  retry_source_turn_id?: string | null;
   reason_class?: string | null;
   provider_id?: string | null;
   model?: string | null;
@@ -129,6 +350,15 @@ export interface MessageTimelineItem extends TimelineItemBase {
   partial: boolean;
   chat_mode?: ChatMode | null;
   chat_mode_source?: string | null;
+}
+
+export interface ForkAssistantMessageV2Response {
+  conversation_id: string;
+  session_id: string;
+  source_session_id: string;
+  source_seq: number;
+  copied: boolean;
+  server_time: string;
 }
 
 export interface ThinkingTimelineItem extends TimelineItemBase {
@@ -240,6 +470,23 @@ export interface CredentialRequestTimelineItem extends TimelineItemBase {
   status: 'waiting' | 'complete' | 'cancelled' | 'failed';
 }
 
+export interface UserInteractionAnswer {
+  question?: string | null;
+  answer: string;
+}
+
+export interface UserInteractionTimelineItem extends TimelineItemBase {
+  kind: 'user_interaction';
+  interaction_id: string;
+  interaction_type: string;
+  origin_call_id?: string | null;
+  origin_tool_name?: string | null;
+  title: string;
+  summary?: string | null;
+  answers: UserInteractionAnswer[];
+  status: 'complete' | 'cancelled' | 'denied' | 'failed';
+}
+
 export interface TodoStateTimelineItem extends TimelineItemBase {
   kind: 'todo_state';
   todos: Array<{
@@ -317,6 +564,7 @@ export type TimelineItem =
   | QuestionSetTimelineItem
   | AuthChallengeTimelineItem
   | CredentialRequestTimelineItem
+  | UserInteractionTimelineItem
   | TodoStateTimelineItem
   | ArtifactTimelineItem
   | AssistantDeliverableTimelineItem
@@ -410,6 +658,7 @@ export interface ChatSnapshot {
   runtime: RuntimeOverlaySnapshot;
   cursor: string;
   server_time: string;
+  activity_overview?: ActivityOverviewResponse | null;
 }
 
 export type ChatViewOp =

@@ -20,6 +20,7 @@ export interface AgentRuntimeProfileFormState {
   providerId: string;
   model: string;
   reasoningEffort: string;
+  fastMode: 'inherit' | 'enabled' | 'disabled';
   systemPromptExtra: string;
   memoryAvailability: 'inherit' | 'enabled' | 'disabled';
   memoryMode: string;
@@ -63,6 +64,7 @@ export interface AgentFormState {
   temperature: string;
   maxTokens: string;
   reasoningEffort: string;
+  fastMode: 'inherit' | 'enabled' | 'disabled';
   voice: string;
   memoryBackend: string;
   memoryMode: string;
@@ -204,6 +206,9 @@ function profileFormStateFromAgentProfiles(
       providerId: typeof profile.provider_id === 'string' ? profile.provider_id : '',
       model: typeof profile.model === 'string' ? profile.model : '',
       reasoningEffort: typeof profile.reasoning_effort === 'string' ? profile.reasoning_effort : '',
+      fastMode: (
+        profile.fast_mode === true ? 'enabled' : profile.fast_mode === false ? 'disabled' : 'inherit'
+      ) as AgentRuntimeProfileFormState['fastMode'],
       systemPromptExtra:
         typeof profile.system_prompt_extra === 'string' ? profile.system_prompt_extra : '',
       memoryAvailability: (
@@ -242,6 +247,8 @@ function serializeAgentProfiles(
       provider_id: profile.providerId.trim() || null,
       model: profile.model.trim() || null,
       reasoning_effort: profile.reasoningEffort.trim() || null,
+      fast_mode:
+        profile.fastMode === 'enabled' ? true : profile.fastMode === 'disabled' ? false : null,
       system_prompt_extra: profile.systemPromptExtra.trim() || null,
       memory_enabled:
         profile.memoryAvailability === 'enabled'
@@ -287,6 +294,7 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     temperature: '',
     maxTokens: '',
     reasoningEffort: '',
+    fastMode: 'inherit',
     voice: '',
     memoryBackend: 'mnemory',
     memoryMode: 'full_auto',
@@ -362,6 +370,9 @@ export function agentToFormState(agent: Agent): AgentFormState {
     maxTokens: typeof llmConfig.max_tokens === 'number' ? String(llmConfig.max_tokens) : '',
     reasoningEffort:
       typeof llmConfig.reasoning_effort === 'string' ? llmConfig.reasoning_effort : '',
+    fastMode: (
+      llmConfig.fast_mode === true ? 'enabled' : llmConfig.fast_mode === false ? 'disabled' : 'inherit'
+    ) as AgentFormState['fastMode'],
     voice: typeof llmConfig.voice === 'string' ? llmConfig.voice : '',
     memoryBackend:
       typeof agent.capabilities?.memory_backend === 'string'
@@ -634,6 +645,8 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       temperature: form.temperature ? Number(form.temperature) : undefined,
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
       reasoning_effort: form.reasoningEffort || undefined,
+      fast_mode:
+        form.fastMode === 'enabled' ? true : form.fastMode === 'disabled' ? false : undefined,
       voice: form.voice || undefined
     },
     capabilities: {
@@ -710,6 +723,8 @@ export function formStateToSystemOverridePayload(form: AgentFormState): Record<s
       temperature: form.temperature ? Number(form.temperature) : undefined,
       max_tokens: form.maxTokens ? Number(form.maxTokens) : undefined,
       reasoning_effort: form.reasoningEffort || undefined,
+      fast_mode:
+        form.fastMode === 'enabled' ? true : form.fastMode === 'disabled' ? false : undefined,
       voice: form.voice || undefined
     },
     agent_profiles: fullPayload.agent_profiles,

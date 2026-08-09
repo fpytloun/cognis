@@ -19,7 +19,9 @@ import { dev } from '$app/environment';
 const contentSecurityPolicy = [
   "default-src 'self'",
   "base-uri 'self'",
-  "frame-ancestors 'none'",
+  // Task Control Chat embeds the same Chat v2 route in a same-origin iframe.
+  // Keep cross-origin embedding blocked while permitting that product surface.
+  "frame-ancestors 'self'",
   "img-src 'self' data: blob: http: https:",
   "font-src 'self' data:",
   "object-src 'none'",

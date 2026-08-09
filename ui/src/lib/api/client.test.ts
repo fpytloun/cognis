@@ -311,6 +311,101 @@ describe('conversation API client', () => {
   });
 });
 
+describe('knowledgebase API client contracts', () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it('preserves nested relative paths in multipart ingestion', async () => {
+    const response = { outcomes: [] };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(JSON.stringify(response), { status: 200, headers: jsonHeaders })
+    );
+    global.fetch = fetchMock;
+    const files = [new File(['a'], 'a.md'), new File(['b'], 'b.md')];
+
+    await api.knowledgebases.documents.upload(
+      'kb_1',
+      files,
+      ['guides/setup/a.md', 'reference/nested/b.md'],
+      'replace'
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/knowledgebases/kb_1/documents');
+    const body = fetchMock.mock.calls[0]?.[1]?.body as FormData;
+    expect(body.getAll('paths[]')).toEqual(['guides/setup/a.md', 'reference/nested/b.md']);
+    expect(body.getAll('files[]')).toHaveLength(2);
+    expect(body.get('conflict_policy')).toBe('replace');
+  });
+
+  it('uses backend document paging and content query contracts', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ documents: [], next_cursor: null }), { status: 200, headers: jsonHeaders }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        kb_artifact_id: 'kba_1', artifact_id: 'art_1', source_path: 'a.md',
+        content_mode: 'extracted', mime_type: 'text/markdown', text: 'A',
+        size_bytes: 1, extraction_method: 'markdown', diagnostics: {}
+      }), { status: 200, headers: jsonHeaders }));
+    global.fetch = fetchMock;
+
+    await api.knowledgebases.documents.list('kb_1', { sort: 'updated_at', direction: 'desc', limit: 25 });
+    await api.knowledgebases.documents.content('kb_1', 'kba_1', 'source');
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/knowledgebases/kb_1/documents?sort=updated_at&direction=desc&limit=25');
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('/api/v1/knowledgebases/kb_1/documents/kba_1/content?content_mode=source');
+  });
+
+  it('uses exact direct-sharing paths and payloads', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('[]', { status: 200, headers: jsonHeaders }))
+      .mockResolvedValueOnce(new Response('[]', { status: 200, headers: jsonHeaders }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        grant_id: 'kbg_1', user_email: 'reader@example.com', user_name: 'Reader',
+        permission: 'view', granted_at: '2026-01-01T00:00:00Z', note: null
+      }), { status: 200, headers: jsonHeaders }))
+      .mockResolvedValueOnce(new Response('{"revoked":true}', { status: 200, headers: jsonHeaders }));
+    global.fetch = fetchMock;
+    await api.knowledgebases.shares('kb_1');
+    await api.knowledgebases.shareCandidates('kb_1', 're');
+    await api.knowledgebases.grantShare('kb_1', { user_email: 'reader@example.com', permission: 'view' });
+    await api.knowledgebases.revokeShare('kb_1', 'reader@example.com');
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      '/api/v1/knowledgebases/kb_1/shares',
+      '/api/v1/knowledgebases/kb_1/shares/candidates?q=re',
+      '/api/v1/knowledgebases/kb_1/shares',
+      '/api/v1/knowledgebases/kb_1/shares/reader%40example.com'
+    ]);
+    expect(fetchMock.mock.calls[2]?.[1]?.method).toBe('PUT');
+    expect(fetchMock.mock.calls[2]?.[1]?.body).toBe('{"user_email":"reader@example.com","permission":"view"}');
+    expect(fetchMock.mock.calls[3]?.[1]?.method).toBe('DELETE');
+  });
+
+  it('posts typed facet requests with cancellation support', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(JSON.stringify({ fields: [] }), { status: 200, headers: jsonHeaders })
+    );
+    global.fetch = fetchMock;
+    const controller = new AbortController();
+    await api.knowledgebases.facets(
+      'kb_1',
+      {
+        fields: ['category'],
+        filters: [{ field: 'active', op: 'eq', value: true }],
+        limit_per_field: 25
+      },
+      { signal: controller.signal }
+    );
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/knowledgebases/kb_1/facets');
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'POST', signal: controller.signal,
+      body: '{"fields":["category"],"filters":[{"field":"active","op":"eq","value":true}],"limit_per_field":25}'
+    });
+  });
+});
+
 describe('long-running API client endpoints', () => {
   const originalFetch = global.fetch;
 

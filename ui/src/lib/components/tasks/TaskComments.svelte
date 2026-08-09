@@ -21,12 +21,14 @@
     stepOptions = [],
     initialTargetStep = '',
     initialIntent = 'record_only' as CommentIntent,
+    notesOnly = false,
     onSubmitted = undefined as ((comment: TaskComment) => void | Promise<void>) | undefined
   } = $props<{
     task: TaskDetail | null;
     stepOptions?: StepOption[];
     initialTargetStep?: string;
     initialIntent?: CommentIntent;
+    notesOnly?: boolean;
     onSubmitted?: (comment: TaskComment) => void | Promise<void>;
   }>();
 
@@ -100,6 +102,7 @@
         return 'Re-enters the workflow at the chosen step. Previous outputs for that step and downstream steps are superseded.';
     }
   });
+  const revisionIntentLabel = $derived(isTerminal ? 'Revise result' : 'Request revision');
 
   const intentBadge: Record<string, { label: string; cls: string }> = {
     record_only: { label: 'Note', cls: 'border-slate-700 bg-slate-900/80 text-slate-300' },
@@ -294,26 +297,28 @@
 <Card class="p-4 sm:p-5">
   <div class="flex items-start justify-between gap-3">
     <div>
-      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Comments</p>
-      <h3 class="mt-1 text-base font-semibold text-white">Notes, context, answers, and revisions</h3>
-      <p class="mt-1 text-xs text-slate-400">{intentDescription}</p>
+      <p class="text-xs uppercase tracking-[0.25em] text-slate-500">{notesOnly ? 'Notes' : 'Collaboration'}</p>
+      <h3 class="mt-1 text-base font-semibold text-white">{notesOnly ? 'Add task context' : 'Guide the next cycle, answer, or revise'}</h3>
+      <p class="mt-1 text-xs text-slate-400">{notesOnly ? 'Stored on the task for the team. This note does not resolve a decision.' : intentDescription}</p>
     </div>
   </div>
 
   {#if task}
     <div class="mt-4 space-y-3">
-      <div
-        role="radiogroup"
-        aria-label="Comment intent"
-        tabindex="-1"
-        class="grid grid-cols-2 gap-2 sm:grid-cols-4"
-        onkeydown={handleIntentKeydown}
-      >
-        {@render intentButton('record_only', 'Note', true)}
-        {@render intentButton('context_only', 'Context', true)}
-        {@render intentButton('answer_pause', 'Answer pause', canAnswerPause)}
-        {@render intentButton('request_revision', 'Request revision', canRequestRevision)}
-      </div>
+      {#if !notesOnly}
+        <div
+          role="radiogroup"
+          aria-label="Comment intent"
+          tabindex="-1"
+          class="grid grid-cols-2 gap-2 sm:grid-cols-4"
+          onkeydown={handleIntentKeydown}
+        >
+          {@render intentButton('record_only', 'Note', true)}
+          {@render intentButton('context_only', 'Guide next agent cycle', true)}
+          {@render intentButton('answer_pause', 'Answer pause', canAnswerPause)}
+          {@render intentButton('request_revision', revisionIntentLabel, canRequestRevision)}
+        </div>
+      {/if}
 
       {#if intent === 'request_revision'}
         <label class="block space-y-1 text-sm font-medium text-slate-200">
@@ -350,8 +355,8 @@
 
       <div class="flex flex-wrap items-center justify-between gap-3">
         <p class="text-xs text-slate-400">{stateEffectLabel(intent)}</p>
-        <Button onclick={submit} disabled={!submittable}>
-          {posting ? 'Posting…' : intent === 'request_revision' ? 'Request revision' : intent === 'answer_pause' ? 'Submit answer' : 'Add comment'}
+        <Button onclick={() => { if (notesOnly) intent = 'record_only'; void submit(); }} disabled={!submittable}>
+          {posting ? 'Posting…' : notesOnly ? 'Add note' : intent === 'request_revision' ? (isTerminal ? 'Revise result' : 'Request revision') : intent === 'answer_pause' ? 'Submit answer' : intent === 'context_only' ? 'Guide next cycle' : 'Add note'}
         </Button>
       </div>
 

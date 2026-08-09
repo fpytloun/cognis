@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AssistantDeliverableTimelineItem } from '$lib/chat-v2/types';
@@ -170,5 +170,32 @@ describe('AssistantDeliverableBlock', () => {
     expect(container.querySelector('.assistant-deliverable-card')).toBeNull();
     expect(container.querySelector('.rich-deliverable.embedded')).toBeTruthy();
     expect(screen.getByRole('heading', { name: 'Rich body' })).toBeTruthy();
+  });
+
+  it('collapses only the inline body while toolbar actions and full view remain available', async () => {
+    mocks.getDeliverable.mockResolvedValue(deliverable());
+    render(AssistantDeliverableBlock, { item: item(), collapsedByDefault: true });
+
+    const root = await screen.findByTestId('rich-deliverable');
+    const inlineDocument = screen.getByTestId('rich-deliverable-inline-document');
+    const expand = screen.getByRole('button', { name: 'Expand document' });
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    expect(expand).toHaveAttribute('aria-controls', inlineDocument.id);
+    expect(inlineDocument).not.toBeVisible();
+    expect(screen.getByTestId('rich-deliverable-toolbar')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Open full view' })).toBeVisible();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    const fullView = screen.getByTestId('rich-deliverable-full-view');
+    expect(within(fullView).getByText('Validated')).toBeVisible();
+    await fireEvent.click(within(fullView).getByRole('button', { name: 'Close' }));
+    expect(inlineDocument).not.toBeVisible();
+
+    await fireEvent.click(expand);
+    expect(screen.getByRole('button', { name: 'Collapse document' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByTestId('rich-deliverable-inline-document')).toBeVisible();
+    await fireEvent.click(screen.getByRole('button', { name: 'Collapse document' }));
+    expect(screen.getByTestId('rich-deliverable-inline-document')).not.toBeVisible();
+    expect(root.querySelector('.assistant-deliverable-card')).toBeNull();
   });
 });

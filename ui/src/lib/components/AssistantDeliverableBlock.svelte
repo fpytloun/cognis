@@ -15,6 +15,7 @@
 
   export let item: AssistantDeliverableTimelineItem | RenderAssistantDeliverableTimelineItem;
   export let loadDeliverable: ((deliverableId: string) => Promise<Deliverable>) | undefined = undefined;
+  export let collapsedByDefault = false;
 
   let deliverable: Deliverable | null = null;
   let loading = true;
@@ -118,7 +119,7 @@
   });
 </script>
 
-<div class="assistant-deliverable-wrapper">
+<div class="assistant-deliverable-wrapper" data-deliverable-id={deliverableId} data-collapsed-by-default={collapsedByDefault ? 'true' : undefined}>
   {#if loading}
     <div class="text-sm text-slate-400">Loading deliverable…</div>
   {:else if error}
@@ -143,6 +144,7 @@
       shareLinkCallback={createShareLink}
       surface="embedded"
       compact
+      {collapsedByDefault}
     />
   {/if}
 </div>

@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { onMount } from 'svelte';
-  import { fade } from 'svelte/transition';
+  import { fade, fly } from 'svelte/transition';
 
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import { cn } from '$lib/utils';
@@ -37,6 +37,8 @@
     children: Snippet;
     header?: Snippet;
     dismissible?: boolean;
+    panelId?: string;
+    restoreFocusOnClose?: boolean;
   }
 
   let {
@@ -48,7 +50,9 @@
     maxHeight = '90dvh',
     children,
     header,
-    dismissible = true
+    dismissible = true,
+    panelId,
+    restoreFocusOnClose = true
   }: Props = $props();
 
   let panelEl = $state<HTMLDivElement | null>(null);
@@ -82,7 +86,7 @@
       unregisterOverlay?.();
       unregisterOverlay = null;
       overlayId = null;
-      previouslyFocused?.focus();
+      if (restoreFocusOnClose) previouslyFocused?.focus();
       previouslyFocused = null;
       dragOffsetY = 0;
       dragging = false;
@@ -189,6 +193,7 @@
     ></button>
 
     <div
+      id={panelId}
       bind:this={panelEl}
       tabindex="-1"
       class={cn(
@@ -204,6 +209,11 @@
         : side === 'left'
         ? `padding-top: calc(0.75rem + max(0px, calc(env(safe-area-inset-top) - var(--app-shell-top-offset, 0px)))); padding-bottom: max(0.75rem, calc(env(safe-area-inset-bottom) - var(--app-shell-bottom-offset, 0px))); padding-left: env(safe-area-inset-left);`
         : undefined}
+      in:fly={{
+        x: side === 'right' ? 64 : side === 'left' ? -64 : 0,
+        y: side === 'bottom' ? 64 : 0,
+        duration: 180
+      }}
     >
       {#if side === 'bottom' && dismissible}
         <!-- svelte-ignore a11y_no_static_element_interactions -->

@@ -6,6 +6,7 @@ import {
   addOptimisticUserMessage,
   applyBackfill,
   applyRealtimeFrame,
+  applySendResponse,
   applySnapshot,
   applySyncResponse,
   maybeApplyRuntime,
@@ -102,6 +103,72 @@ describe('Chat v2 sync engine', () => {
     expect(state.syncStatus).toBe('ready');
     expect(state.cursor).toBe('cursor-1');
     expect(state.timelineItems.map((item) => item.id)).toEqual(['message:1']);
+  });
+
+  it('settles the optimistic sending state as soon as admission is acknowledged', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
+      {
+        content: 'hello',
+        clientMessageId: 'client-1',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+
+    const accepted = applySendResponse(optimistic, {
+      status: 'accepted',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: null,
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    const acceptedItem = accepted.localItems[0];
+    expect(acceptedItem?.status).toBe('complete');
+    expect(acceptedItem?.updated_at).toBe('2026-01-01T00:00:01Z');
+
+    const duplicate = applySendResponse(optimistic, {
+      status: 'duplicate',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: null,
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    expect(duplicate.localItems[0]?.status).toBe('complete');
+
+    const queued = applySendResponse(optimistic, {
+      status: 'queued',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-1',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    expect(queued.localItems[0]?.status).toBe('waiting');
+
+    const unrelated = addOptimisticUserMessage(optimistic, {
+      content: 'another message',
+      clientMessageId: 'client-2',
+      createdAt: '2026-01-01T00:00:00Z',
+    });
+    const acknowledgedOne = applySendResponse(unrelated, {
+      status: 'accepted',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: null,
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    expect(acknowledgedOne.localItems.map((item) => item.status)).toEqual(['complete', 'pending']);
   });
 
   it('persists opaque backfill cursors and disables older loading at the terminal page', () => {
@@ -646,6 +713,32 @@ describe('Chat v2 sync engine', () => {
 
     expect(result.outcome).toBe('cursor_mismatch');
     expect(result.state.syncStatus).toBe('gapped');
+  });
+
+  it('rejects a late canonical-recovery sync response for A that resolves after A->B->A switching advanced state past its basis cursor', () => {
+    // Regression scenario for the agent-direct cached-restore path: a
+    // recoverChatV2Canonical('A') sync request is in flight (basis
+    // cursor-1) when the user switches to B and back to A. The page-level
+    // route guard alone (conversationId === route) cannot distinguish this
+    // late response from a fresh one, because both target the same
+    // conversationId once the user is back on A. Correctness instead relies
+    // on this cursor_before check: by the time the stale response resolves,
+    // either (a) nothing else advanced the state past cursor-1 -- in which
+    // case cursor_before matches and the response is legitimately applied,
+    // exactly as if no switch had happened -- or (b) a coalesced reissue (or
+    // a live frame) already advanced state to cursor-2 first, in which case
+    // the mismatch below is what protects the restored view.
+    const state = applySnapshot(snapshot({ cursor: 'cursor-2' }));
+
+    const staleResponse = syncResponse({
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-2b'
+    });
+
+    const result = applySyncResponse(state, staleResponse);
+
+    expect(result.outcome).toBe('cursor_mismatch');
+    expect(result.state.cursor).toBe('cursor-2');
   });
 
   it('does not mark gapped for stale cursor-preserving runtime-only frames', () => {
@@ -1362,6 +1455,91 @@ describe('Chat v2 sync engine', () => {
       status: 'complete',
       blocks: [expect.objectContaining({ status: 'complete' })]
     });
+  });
+
+  it('drops an incomplete progress-only apply_patch card when the turn settles', () => {
+    const patchProgress = {
+      id: 'tool:incomplete-patch',
+      kind: 'tool_call',
+      sort_key: '9998:999999999999999:000000:03:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'tool_call' }],
+      stable: false,
+      status: 'running',
+      call_id: 'incomplete-patch',
+      tool_name: 'apply_patch',
+      arguments: null,
+      arguments_preview: null,
+      result_preview: null,
+      streamed_output: null,
+      attachments: [],
+      file_diffs: [],
+      is_error: false,
+      truncated: false,
+      has_full_output: false,
+      progress_phase: 'preparing_input',
+      progress_input_chars: 120,
+      progress_input_lines: 4,
+      progress_complete: false,
+      turn_id: 'turn-1'
+    } as TimelineItem;
+    const base = applySnapshot(snapshot({ runtime: runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      volatile_items: [patchProgress]
+    }) }));
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, { has_active_turn: false, volatile_items: [] }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(visibleTimelineItems(settled.state).map((item) => item.id)).toEqual(['message:1']);
+  });
+
+  it('drops a transient Intaris recovery system notice when the turn settles', () => {
+    const recoveryNotice = {
+      id: 'system:intaris-recovery:turn-1:intaris_append',
+      kind: 'message',
+      sort_key: '9998:999999999999999:000000:09:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'system_message' }],
+      stable: false,
+      status: 'complete',
+      role: 'system',
+      content: 'Paused while Intaris recovers.',
+      message_id: 'intaris-recovery:turn-1:intaris_append',
+      notice_id: 'intaris-recovery:turn-1:intaris_append',
+      notice_kind: 'intaris_recovery',
+      notice_scope: 'transient_retry',
+      turn_id: 'turn-1',
+      attachments: [],
+      partial: false
+    } as TimelineItem;
+    const base = applySnapshot(snapshot({ runtime: runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      volatile_items: [recoveryNotice]
+    }) }));
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, { has_active_turn: false, volatile_items: [recoveryNotice] }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(visibleTimelineItems(settled.state).map((item) => item.id)).toEqual(['message:1']);
   });
 
   it('carries the streamed final message on a CURSOR-SKEWED settle frame', () => {

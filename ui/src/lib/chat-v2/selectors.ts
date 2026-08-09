@@ -23,6 +23,7 @@ export const TIMELINE_KIND_RENDER_POLICY = {
   question_set: true,
   auth_challenge: true,
   credential_request: true,
+  user_interaction: true,
   todo_state: false,
   artifact: true,
   assistant_deliverable: true,

@@ -12,6 +12,7 @@ import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import CircleHelp from 'lucide-svelte/icons/circle-help';
 import Clock from 'lucide-svelte/icons/clock';
 import FolderKanban from 'lucide-svelte/icons/folder-kanban';
+import Library from 'lucide-svelte/icons/library';
 import ListTodo from 'lucide-svelte/icons/list-todo';
 import Menu from 'lucide-svelte/icons/menu';
 import MessageSquareText from 'lucide-svelte/icons/message-square-text';
@@ -58,6 +59,7 @@ import X from 'lucide-svelte/icons/x';
     { href: '/tools', label: 'Tools', icon: Wrench },
     { href: '/channels', label: 'Channels', icon: Radio },
     { href: '/local-models', label: 'Local Models', icon: Box },
+    { href: '/knowledge', label: 'Knowledge', icon: Library },
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 
@@ -439,7 +441,7 @@ import X from 'lucide-svelte/icons/x';
   <ConfirmDialog />
   <ShortcutHelp />
   <div class="app-shell-viewport fixed inset-x-0 top-[var(--app-viewport-offset-top,0px)] h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
-    <div class="mx-auto flex h-full max-w-[1600px] overflow-hidden lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
+    <div class="mx-auto flex h-full w-full max-w-[2400px] min-w-0 overflow-hidden lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
       {#if !isChatWindowMode}
       <aside
         class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}

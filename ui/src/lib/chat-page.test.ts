@@ -4,10 +4,13 @@ import {
   buildConversationUrl,
   CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
   cloneSidebarProjection,
+  conversationInspectorFits,
   conversationActivityValue,
   conversationInitialLoadPolicy,
   conversationPendingSnapshotFlags,
   conversationMatchesSidebarProjectionFilter,
+  isTaskControlConversationSummary,
+  shouldInsertDirectlyLoadedConversation,
   conversationAttentionDotClass,
   conversationAttentionLabel,
   conversationAttentionOrbitClass,
@@ -53,6 +56,8 @@ import {
   shouldAdoptConversationSessionId,
   shouldSuppressPreSessionSocketError,
   isCurrentConversationLoad,
+  startCachedTimelineRefresh,
+  refreshCachedTimeline,
   nextControllerRecoveryDelayMs,
   shouldContinueControllerRecovery,
   parseConversationStatusFilter,
@@ -60,6 +65,9 @@ import {
   nextPollDelayMs,
   nextConversationLoadId,
   shouldReconcileAfterReconnect,
+  shouldRecoverChatV2ForInvalidation,
+  shouldSnapshotAfterChatV2Sync,
+  ChatV2CanonicalRecoveryCoalescer,
   shouldApplyLegacyLifecycleFrame,
   resolveTurnActivityAuthority,
   applyRuntimeAuthoritySequence,
@@ -86,6 +94,7 @@ import {
   TIMELINE_WINDOW_MAX_ROWS,
   shouldAttemptStaleRuntimeRefresh,
   shouldApplyPendingNotificationRefresh,
+  shouldApplySidebarProjectionRefresh,
   shouldDebounceConversationViewRefresh,
   shouldDebounceSidebarResync,
   shouldRecoverMissingConversationRow,
@@ -107,7 +116,13 @@ import {
   STALE_RUNTIME_REFRESH_BACKOFF_MS,
   STALE_RUNTIME_REFRESH_MAX_ATTEMPTS
 } from '$lib/chat-page';
+import {
+  deriveChatV2ViewProjection,
+  applyCachedQueueToProjection,
+  resolveOlderMessagesCursorAfterSnapshot,
+} from '$lib/chat-page';
 import { conversationTimelineScope } from '$lib/chat-v2/types';
+import { emptyChatV2State } from '$lib/chat-v2/sync-engine';
 import type { Conversation, SidebarProjection } from '$lib/types/api';
 
 describe('recoverable turn retry state', () => {
@@ -119,6 +134,12 @@ describe('recoverable turn retry state', () => {
 });
 
 describe('chat page helpers', () => {
+  it('pins the inspector from available width without a browser or PWA mode exception', () => {
+    expect(conversationInspectorFits(911)).toBe(false);
+    expect(conversationInspectorFits(912)).toBe(true);
+    expect(conversationInspectorFits(1600)).toBe(true);
+  });
+
   it('keeps canonical runtime authoritative over reordered legacy lifecycle frames', () => {
     expect(shouldApplyLegacyLifecycleFrame(true)).toBe(false);
     expect(resolveTurnActivityAuthority({
@@ -265,6 +286,135 @@ describe('chat page helpers', () => {
       now: 32000,
       staleMs: 30000,
     })).toBe(false);
+  });
+
+  it('derives the active-turn projection from the state actually passed in, never a stale carryover', () => {
+    // Conversation A: an active turn in progress.
+    const stateA = {
+      ...emptyChatV2State(),
+      conversationId: 'conv-a',
+      queue: { messages: [{ client_txn_id: 'q-1' }] as never, queued_count: 1 },
+      runtime: {
+        runtime_epoch: 'epoch-a',
+        runtime_revision: 1,
+        generated_at: '2026-01-01T00:00:00Z',
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-a', session_id: 'sess-a', status: 'running' as const },
+        volatile_items: [],
+      },
+    };
+    const projectionA = deriveChatV2ViewProjection(stateA);
+    expect(projectionA.currentActiveTurnId).toBe('turn-a');
+    expect(projectionA.turnInProgress).toBe(true);
+    expect(projectionA.queuedCount).toBe(1);
+
+    // Conversation B has no active turn at all. Restoring/reconciling B's own
+    // state must derive B's projection fresh -- it must never keep A's
+    // turn-a id merely because it was the last one computed.
+    const stateB = {
+      ...emptyChatV2State(),
+      conversationId: 'conv-b',
+      queue: { messages: [], queued_count: 0 },
+      runtime: {
+        runtime_epoch: 'epoch-b',
+        runtime_revision: 1,
+        generated_at: '2026-01-01T00:00:01Z',
+        has_active_turn: false,
+        active_turn: null,
+        volatile_items: [],
+      },
+    };
+    const projectionB = deriveChatV2ViewProjection(stateB);
+    expect(projectionB.currentActiveTurnId).toBeNull();
+    expect(projectionB.turnInProgress).toBe(false);
+    expect(projectionB.queuedCount).toBe(0);
+    expect(projectionB.awaitingAssistantStart).toBe(false);
+
+    // A different active turn for conversation B must never be confused with A's.
+    const stateBWithOwnTurn = {
+      ...stateB,
+      runtime: { ...stateB.runtime, has_active_turn: true, active_turn: { turn_id: 'turn-b', session_id: 'sess-b', status: 'running' as const } },
+    };
+    expect(deriveChatV2ViewProjection(stateBWithOwnTurn).currentActiveTurnId).toBe('turn-b');
+  });
+
+  it('applies the cached page-level queue over a stale store-derived projection without touching active-turn identity', () => {
+    // The Chat v2 store's queue lagged (e.g. refreshQueuedMessages() updated
+    // the page-level fields directly, independent of chatV2Store, after the
+    // store's own queue snapshot was last taken). deriveChatV2ViewProjection
+    // reflects that stale store queue.
+    const staleProjection = deriveChatV2ViewProjection({
+      ...emptyChatV2State(),
+      conversationId: 'conv-a',
+      queue: { messages: [{ client_txn_id: 'stale-q-1' }] as never, queued_count: 1 },
+      runtime: {
+        runtime_epoch: 'epoch-a',
+        runtime_revision: 1,
+        generated_at: '2026-01-01T00:00:00Z',
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-a', session_id: 'sess-a', status: 'running' as const },
+        volatile_items: [],
+      },
+    });
+    expect(staleProjection.queuedCount).toBe(1);
+
+    // The cached page-level queue captured at save time is newer/different
+    // (e.g. a message was dequeued after the store's queue snapshot).
+    const cachedQueue = {
+      queuedMessages: [] as never,
+      queuedCount: 0,
+    };
+
+    const restored = applyCachedQueueToProjection(staleProjection, cachedQueue);
+
+    // The cached queue wins...
+    expect(restored.queuedMessages).toBe(cachedQueue.queuedMessages);
+    expect(restored.queuedCount).toBe(0);
+    // ...but active-turn identity/runtime flags derived by the projection are
+    // left completely untouched.
+    expect(restored.currentActiveTurnId).toBe('turn-a');
+    expect(restored.turnInProgress).toBe(true);
+    expect(restored.awaitingAssistantStart).toBe(false);
+  });
+
+  it('resolves the older-messages cursor after a snapshot: preserve deep backfill normally, replace on lineage reset', () => {
+    // Ordinary recovery (reconnect/outbox drain/cancel): a deeper cursor
+    // already obtained from prior scroll-up backfill is preserved even
+    // though the fresh snapshot's own cursor is shallower.
+    expect(resolveOlderMessagesCursorAfterSnapshot({
+      currentCursor: 'deep-cursor',
+      beforeCursor: 'shallow-cursor',
+      hasMoreBefore: true,
+      resetLineage: false,
+    })).toEqual({ olderMessagesCursor: 'deep-cursor', hasOlderMessages: true });
+
+    // No cursor held yet: always take the snapshot's cursor regardless of
+    // resetLineage.
+    expect(resolveOlderMessagesCursorAfterSnapshot({
+      currentCursor: null,
+      beforeCursor: 'fresh-cursor',
+      hasMoreBefore: true,
+      resetLineage: false,
+    })).toEqual({ olderMessagesCursor: 'fresh-cursor', hasOlderMessages: true });
+
+    // Lineage reset (cursor_mismatch/reset_required fallback, or no sync
+    // cursor could be established): a previously held cursor -- including one
+    // restored from a cached view of an older lineage -- must always be
+    // replaced from the fresh snapshot, never preserved.
+    expect(resolveOlderMessagesCursorAfterSnapshot({
+      currentCursor: 'stale-pre-reset-cursor',
+      beforeCursor: 'post-reset-cursor',
+      hasMoreBefore: true,
+      resetLineage: true,
+    })).toEqual({ olderMessagesCursor: 'post-reset-cursor', hasOlderMessages: true });
+
+    // Lineage reset with no further history available from the fresh snapshot.
+    expect(resolveOlderMessagesCursorAfterSnapshot({
+      currentCursor: 'stale-pre-reset-cursor',
+      beforeCursor: null,
+      hasMoreBefore: false,
+      resetLineage: true,
+    })).toEqual({ olderMessagesCursor: null, hasOlderMessages: false });
   });
 
   it('treats runtime snapshots older than the active view as stale', () => {
@@ -545,6 +695,17 @@ describe('chat page helpers', () => {
     })).toBe(false);
   });
 
+  it('discards out-of-order sidebar projection responses', () => {
+    expect(shouldApplySidebarProjectionRefresh({
+      requestEpoch: 7,
+      currentEpoch: 8,
+    })).toBe(false);
+    expect(shouldApplySidebarProjectionRefresh({
+      requestEpoch: 8,
+      currentEpoch: 8,
+    })).toBe(true);
+  });
+
   it('lets server-pushed pending types win over a stale refetch epoch', () => {
     const requestEpoch = 4;
     const serverPushEpoch = 5;
@@ -777,6 +938,86 @@ describe('chat page helpers', () => {
     })).toBe(true);
   });
 
+  it('isolates task-control socket upserts and sidebar resync rows by status filter', () => {
+    const normal = {
+      conversation_id: 'conv-normal',
+      agent_id: 'agent-a',
+      status: 'active',
+      starred_at: '2026-01-01T00:00:00Z',
+      context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
+    } as unknown as SidebarProjection['conversations']['items'][number];
+    const task = {
+      ...normal,
+      conversation_id: 'conv-task',
+      context: {
+        type: 'web',
+        ref: 'web:task_control:task-1',
+        platform_data: { kind: 'task_control', task_id: 'task-1' },
+        memory_labels: {},
+      },
+    } as unknown as SidebarProjection['conversations']['items'][number];
+    const filter = (status: 'active' | 'all' | 'starred' | 'archived' | 'task') => ({
+      selectedChannels: [],
+      selectedAgentIds: [],
+      selectedConversationStatus: status,
+    });
+
+    expect(isTaskControlConversationSummary(task)).toBe(true);
+    expect(isTaskControlConversationSummary(normal)).toBe(false);
+    expect(conversationMatchesSidebarProjectionFilter(task, filter('task'))).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(normal, filter('task'))).toBe(false);
+    for (const status of ['active', 'all', 'starred', 'archived'] as const) {
+      expect(conversationMatchesSidebarProjectionFilter(task, filter(status))).toBe(false);
+    }
+    expect(conversationMatchesSidebarProjectionFilter(normal, filter('active'))).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(normal, filter('all'))).toBe(true);
+    expect(conversationMatchesSidebarProjectionFilter(normal, filter('starred'))).toBe(true);
+  });
+
+  it('does not reinsert a directly loaded task conversation into Active after reload', () => {
+    const task = {
+      conversation_id: 'conv-task',
+      agent_id: 'agent-a',
+      status: 'active',
+      starred_at: null,
+      context: {
+        type: 'web',
+        ref: 'web:task_control:task-1',
+        platform_data: { kind: 'task_control', task_id: 'task-1' },
+        memory_labels: {},
+      },
+    } as unknown as SidebarProjection['conversations']['items'][number];
+    const active = {
+      selectedChannels: [],
+      selectedAgentIds: [],
+      selectedConversationStatus: 'active' as const,
+    };
+    const taskFilter = {
+      ...active,
+      selectedConversationStatus: 'task' as const,
+    };
+
+    expect(shouldInsertDirectlyLoadedConversation(task, active)).toBe(false);
+    expect(shouldInsertDirectlyLoadedConversation(task, taskFilter)).toBe(true);
+    expect(shouldInsertDirectlyLoadedConversation({
+      ...task,
+      conversation_id: 'conv-normal',
+      context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
+    }, taskFilter)).toBe(false);
+    expect(conversationStatusFilterForConversation(task, 'active')).toBe('active');
+    expect(conversationStatusFilterForConversation(task, 'task')).toBe('task');
+    expect(conversationStatusFilterForConversation({
+      status: 'active',
+      starred_at: null,
+      context: { platform_data: {} },
+    }, 'task')).toBe('active');
+    expect(conversationStatusFilterForConversation({
+      status: 'active',
+      starred_at: null,
+      context: { platform_data: {} },
+    }, 'all')).toBe('all');
+  });
+
   it('increments and validates conversation load ids', () => {
     const first = nextConversationLoadId(0);
     const second = nextConversationLoadId(first);
@@ -787,10 +1028,79 @@ describe('chat page helpers', () => {
     expect(isCurrentConversationLoad(first, second)).toBe(false);
   });
 
+  it('settles cached timeline refresh independently from metadata and ignores stale routes', async () => {
+    let resolveCanonical: (() => void) | undefined;
+    let settled = 0;
+    let current = true;
+    const canonical = startCachedTimelineRefresh(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveCanonical = resolve;
+        }),
+      () => {
+        settled += 1;
+      },
+      () => current
+    );
+    const metadata = Promise.reject(new Error('metadata failed')).catch(() => undefined);
+
+    expect(resolveCanonical).toBeTypeOf('function');
+    expect(settled).toBe(0);
+    await metadata;
+    expect(settled).toBe(0);
+    resolveCanonical?.();
+    await canonical;
+    expect(settled).toBe(1);
+
+    current = false;
+    await startCachedTimelineRefresh(
+      async () => undefined,
+      () => {
+        settled += 1;
+      },
+      () => current
+    );
+    expect(settled).toBe(1);
+  });
+
+  it('uses a cache-only hit without incremental sync', async () => {
+    const snapshot = { cursor: 'fresh' };
+    const sync = vi.fn(async () => undefined);
+    const apply = vi.fn(() => true);
+
+    await expect(refreshCachedTimeline({
+      captureWatermark: () => ({ cursor: 'cached' }),
+      probe: async () => snapshot,
+      applyIfUnchanged: apply,
+      sync,
+    })).resolves.toBe('snapshot');
+
+    expect(apply).toHaveBeenCalledWith(snapshot, { cursor: 'cached' });
+    expect(sync).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['miss', null, true],
+    ['live frame race', { cursor: 'stale' }, false],
+  ])('falls back to current-cursor sync after %s', async (_name, snapshot, applyResult) => {
+    const sync = vi.fn(async () => undefined);
+
+    await expect(refreshCachedTimeline({
+      captureWatermark: () => ({ cursor: 'cached' }),
+      probe: async () => snapshot,
+      applyIfUnchanged: () => applyResult,
+      sync,
+    })).resolves.toBe('sync');
+
+    expect(sync).toHaveBeenCalledTimes(1);
+  });
+
   it('parses conversation status filters with active as the fallback', () => {
     expect(parseConversationStatusFilter('starred')).toBe('starred');
     expect(parseConversationStatusFilter('archived')).toBe('archived');
     expect(parseConversationStatusFilter('active')).toBe('active');
+    expect(parseConversationStatusFilter('all')).toBe('all');
+    expect(parseConversationStatusFilter('task')).toBe('task');
     expect(parseConversationStatusFilter('unknown')).toBe('active');
     expect(parseConversationStatusFilter(null)).toBe('active');
   });
@@ -1227,6 +1537,100 @@ describe('chat page helpers', () => {
         localTurnInProgress: true
       })
     ).toBe(true);
+  });
+
+  it('recovers canonical state only for matching or global invalidations', () => {
+    expect(shouldRecoverChatV2ForInvalidation({
+      activeConversationId: 'conv-1',
+      invalidatedConversationId: 'conv-1'
+    })).toBe(true);
+    expect(shouldRecoverChatV2ForInvalidation({
+      activeConversationId: 'conv-1'
+    })).toBe(true);
+    expect(shouldRecoverChatV2ForInvalidation({
+      activeConversationId: 'conv-1',
+      invalidatedConversationId: 'conv-2'
+    })).toBe(false);
+  });
+
+  it('coalesces invalidations during sync into one awaited bounded rerun', async () => {
+    const coalescer = new ChatV2CanonicalRecoveryCoalescer();
+    let releaseFirst: (() => void) | undefined;
+    let runs = 0;
+    const first = coalescer.run('conversation:conv-1', async () => {
+      runs += 1;
+      await new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+    });
+    const effective = coalescer.run('conversation:conv-1', async () => {
+      runs += 1;
+    });
+    expect(effective).toBe(first);
+    releaseFirst?.();
+    await effective;
+    expect(runs).toBe(2);
+  });
+
+  it('keeps A refresh visible through A→B→A rerun despite metadata failure and resubscribes once', async () => {
+    const coalescer = new ChatV2CanonicalRecoveryCoalescer();
+    let activeLoad = 1;
+    let bannerVisible = true;
+    let releaseOldA: (() => void) | undefined;
+    let resubscriptions = 0;
+    const oldRecovery = coalescer.run('A', async () => {
+      await new Promise<void>((resolve) => {
+        releaseOldA = resolve;
+      });
+    });
+    const oldBanner = startCachedTimelineRefresh(
+      () => oldRecovery,
+      () => {
+        bannerVisible = false;
+      },
+      () => activeLoad === 1
+    );
+
+    activeLoad = 2; // B
+    activeLoad = 3; // A again
+    const effectiveRecovery = coalescer.run('A', async () => {
+      resubscriptions += 1;
+    });
+    const currentBanner = startCachedTimelineRefresh(
+      () => effectiveRecovery,
+      () => {
+        bannerVisible = false;
+      },
+      () => activeLoad === 3
+    );
+    await Promise.reject(new Error('metadata failed')).catch(() => undefined);
+    expect(bannerVisible).toBe(true);
+
+    releaseOldA?.();
+    await Promise.all([oldBanner, currentBanner]);
+    expect(bannerVisible).toBe(false);
+    expect(resubscriptions).toBe(1);
+  });
+
+  it('falls back to snapshot for reset and cursor mismatch sync outcomes', () => {
+    expect(shouldSnapshotAfterChatV2Sync({
+      resetRequired: true,
+      outcome: 'applied'
+    })).toBe(true);
+    expect(shouldSnapshotAfterChatV2Sync({
+      resetRequired: false,
+      outcome: 'cursor_mismatch'
+    })).toBe(true);
+    expect(shouldSnapshotAfterChatV2Sync({
+      resetRequired: false,
+      outcome: 'applied'
+    })).toBe(false);
+  });
+
+  it('requests canonical recovery after reconnect even without a sequence gap', () => {
+    expect(shouldRecoverChatV2ForInvalidation({
+      activeConversationId: 'conv-1'
+    })).toBe(true);
   });
 
   it('reconciles after reconnect when a stale local turn remains active', () => {

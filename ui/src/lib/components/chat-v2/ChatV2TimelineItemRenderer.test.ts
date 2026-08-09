@@ -82,6 +82,7 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
   it('preserves established user and system message DOM', () => {
     const user = render(ChatV2TimelineItemRenderer, { item: message('user', '# User Markdown'), scope });
     expect(user.container.querySelector('[data-role="user"] .prose-user h1')?.textContent).toBe('User Markdown');
+    expect(user.container.querySelector('[data-role="user"] .prose-user')?.classList).toContain('prose-invert');
     user.unmount();
 
     const system = render(ChatV2TimelineItemRenderer, { item: message('system', 'System notice'), scope });

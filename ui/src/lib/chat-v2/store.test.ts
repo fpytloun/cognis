@@ -1,10 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { ChatV2Store } from './store.svelte';
+import { refreshCachedTimeline } from '../chat-page';
 import { reactiveAttachmentRefs } from './store-test-helpers.svelte';
 import { emptyChatV2State } from './sync-engine';
 import type { ChatV2ClientState } from './sync-engine';
-import type { ChatRealtimeFrame, ChatSnapshot, TimelineItem } from './types';
+import type {
+  ChatRealtimeFrame,
+  ChatSnapshot,
+  QueueMutationResponse,
+  TimelineBackfillResponse,
+  TimelineItem
+} from './types';
 
 function message(overrides: Partial<TimelineItem> = {}): TimelineItem {
   return {
@@ -72,6 +79,107 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     expect(store.replaceFromSnapshotIfUnchanged(snapshot([message({ content: 'stale' })]), watermark)).toBe(false);
     expect(store.snapshot.cursor).toBe('cursor-2');
     expect(store.visibleItems.map((item) => item.id)).toContain('message:live');
+  });
+
+  it('rejects a delayed snapshot after a queue deletion and falls back to sync', async () => {
+    const store = new ChatV2Store();
+    const queuedSnapshot = snapshot([message()]);
+    queuedSnapshot.queue = {
+      messages: [
+        {
+          queue_id: 'queue-1',
+          content: 'queued',
+          attachments: [],
+          position: 0
+        }
+      ],
+      queued_count: 1
+    };
+    store.replaceFromSnapshot(queuedSnapshot);
+    let resolveProbe: ((value: ChatSnapshot) => void) | undefined;
+    const probe = new Promise<ChatSnapshot>((resolve) => {
+      resolveProbe = resolve;
+    });
+    const sync = vi.fn(async () => undefined);
+    const refresh = refreshCachedTimeline({
+      captureWatermark: () => store.refreshWatermark(),
+      probe: () => probe,
+      applyIfUnchanged: (candidate, watermark) =>
+        store.replaceFromSnapshotIfUnchanged(candidate, watermark),
+      sync
+    });
+    const deletion: QueueMutationResponse = {
+      conversation_id: 'conv-1',
+      client_txn_id: 'txn-1',
+      status: 'deleted',
+      queue: { messages: [], queued_count: 0 },
+      cursor: 'cursor-1',
+      server_time: '2026-01-01T00:00:01Z'
+    };
+
+    store.applyQueueMutation(deletion);
+    resolveProbe?.(queuedSnapshot);
+    await expect(refresh).resolves.toBe('sync');
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(store.snapshot.queue?.messages).toEqual([]);
+  });
+
+  it('rejects a delayed snapshot after backfill, falls back to sync, and preserves pagination state', async () => {
+    const store = new ChatV2Store();
+    const current = snapshot([message()]);
+    current.timeline = { items: current.timeline.items, has_more_before: true, before_cursor: 'before-1' };
+    store.replaceFromSnapshot(current);
+    let resolveProbe: ((value: ChatSnapshot) => void) | undefined;
+    const probe = new Promise<ChatSnapshot>((resolve) => {
+      resolveProbe = resolve;
+    });
+    const sync = vi.fn(async () => undefined);
+    const refresh = refreshCachedTimeline({
+      captureWatermark: () => store.refreshWatermark(),
+      probe: () => probe,
+      applyIfUnchanged: (candidate, watermark) =>
+        store.replaceFromSnapshotIfUnchanged(candidate, watermark),
+      sync
+    });
+    const older = message({
+      id: 'message:older',
+      sort_key: '0000:000000000000000:000000:02:000000000',
+      content: 'older'
+    });
+    const backfill: TimelineBackfillResponse = {
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      items: [older],
+      has_more_before: true,
+      before_cursor: 'before-2',
+      server_time: '2026-01-01T00:00:01Z'
+    };
+
+    store.applyBackfill(backfill);
+    resolveProbe?.(snapshot([message({ content: 'stale' })]));
+    await expect(refresh).resolves.toBe('sync');
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(store.visibleItems.map((item) => item.id)).toEqual(['message:older', 'message:1']);
+    expect(store.snapshot.beforeCursor).toBe('before-2');
+    expect(store.snapshot.hasMoreBefore).toBe(true);
+  });
+
+  it('does not advance the mutation revision for rejected duplicate optimistic mutations', () => {
+    const store = new ChatV2Store();
+    const input = {
+      content: 'pending',
+      clientMessageId: 'client-1',
+      createdAt: '2026-01-01T00:00:00Z'
+    };
+    store.addOptimisticUser(input);
+    const watermark = store.refreshWatermark();
+
+    store.addOptimisticUser(input);
+
+    expect(store.refreshWatermark()).toEqual(watermark);
   });
 
   it('serializeState returns a plain, non-proxy deep copy that survives structuredClone', () => {

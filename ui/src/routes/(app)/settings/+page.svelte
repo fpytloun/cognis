@@ -71,6 +71,7 @@
     LLMProvider,
     LLMProviderOAuthStatus,
     CodexUsage,
+    CodexUsageAdditionalLimit,
     CodexUsageWindow,
     ModelRouting,
     ProviderTestResult,
@@ -799,11 +800,36 @@
       .map((model) => `Model '${model}' is not present in configured providers.`);
   }
 
-  function codexWindowLabel(window: CodexUsageWindow | null): string {
-    if (!window) return 'unavailable';
-    const duration = window.window_duration_mins ? `${window.window_duration_mins}m window` : 'window';
-    const reset = window.resets_at ? `resets ${new Date(window.resets_at).toLocaleString()}` : 'reset unknown';
-    return `${Math.round(window.used_percent)}% used, ${duration}, ${reset}`;
+  function codexWindowDuration(window: CodexUsageWindow): string {
+    const minutes = window.window_duration_mins;
+    if (!minutes) return 'rolling window';
+    if (minutes % 1440 === 0) return `${minutes / 1440}-day rolling window`;
+    if (minutes % 60 === 0) return `${minutes / 60}-hour rolling window`;
+    return `${minutes}-minute rolling window`;
+  }
+
+  function codexWindowReset(window: CodexUsageWindow): string {
+    return window.resets_at
+      ? `Resets ${new Date(window.resets_at).toLocaleString()}`
+      : 'Reset time unavailable';
+  }
+
+  function codexLimitTone(usedPercent: number): string {
+    if (usedPercent >= 100) return 'bg-rose-400';
+    if (usedPercent >= 85) return 'bg-orange-400';
+    if (usedPercent >= 65) return 'bg-amber-300';
+    return 'bg-emerald-400';
+  }
+
+  function codexBaseLimitLabel(window: CodexUsageWindow, position: 'primary' | 'secondary'): string {
+    const minutes = window.window_duration_mins ?? 0;
+    if (minutes >= 7 * 24 * 60) return 'Weekly rolling limit';
+    if (minutes >= 24 * 60) return 'Long-term rolling limit';
+    return position === 'primary' ? 'Short-term rolling limit' : 'Secondary rolling limit';
+  }
+
+  function codexAdditionalLimitLabel(limit: CodexUsageAdditionalLimit): string {
+    return limit.limit_name?.trim() || limit.limit_id?.trim() || 'Additional feature limit';
   }
 
   function diagnosticsEnvBlock(): string {
@@ -2296,13 +2322,11 @@
     busy = true;
     error = '';
     try {
-      const legacyBackend = webSearchBackendForm === 'tavily' && webFetchBackendForm === 'tavily'
-        ? 'tavily'
-        : 'direct';
-      webBackendForm = legacyBackend;
-      await api.settings.update('web.backend', legacyBackend);
-      await api.settings.update('web.search_backend', webSearchBackendForm);
-      await api.settings.update('web.fetch_backend', webFetchBackendForm);
+      webConfig = await api.webConfig.updateDefaults({
+        search_backend: webSearchBackendForm as 'direct' | 'tavily' | 'brave' | 'searxng',
+        fetch_backend: webFetchBackendForm as 'direct' | 'tavily' | 'browser'
+      });
+      webBackendForm = webConfig.backend;
       await api.settings.update('web.fetch_fallback_browser', webFetchFallbackBrowserForm);
       await api.settings.update('web.browser_fetch.session_idle_seconds', Number(webBrowserFetchSessionIdleForm));
       await api.settings.update('web.browser_fetch.wait_timeout_seconds', Number(webBrowserFetchWaitTimeoutForm));
@@ -3015,10 +3039,67 @@
                           <Button size="sm" variant="secondary" onclick={refreshCodexUsage} disabled={busy}>Refresh usage</Button>
                         </div>
                         {#if providerCodexUsage}
-                          <div class="mt-2 space-y-1">
-                            <p>Plan: <span class="font-mono text-slate-100">{providerCodexUsage.plan_type ?? 'unknown'}</span></p>
-                            <p>Primary: {codexWindowLabel(providerCodexUsage.primary)}</p>
-                            <p>Secondary: {codexWindowLabel(providerCodexUsage.secondary)}</p>
+                          <div class="mt-3 space-y-3">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                              <p>Plan: <span class="font-mono text-slate-100">{providerCodexUsage.plan_type ?? 'unknown'}</span></p>
+                              {#if providerCodexUsage.limit_reached}
+                                <span class="rounded-full bg-rose-500/15 px-2 py-0.5 text-rose-200">Limit reached</span>
+                              {/if}
+                            </div>
+                            {#if providerCodexUsage.primary}
+                              {@const window = providerCodexUsage.primary}
+                              <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="codex-primary-limit">
+                                <div class="flex items-center justify-between gap-3">
+                                  <p class="font-medium text-slate-200">{codexBaseLimitLabel(window, 'primary')}</p>
+                                  <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                                </div>
+                                <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="Codex short-term rolling limit usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                                  <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                                </div>
+                                <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                              </div>
+                            {/if}
+                            {#if providerCodexUsage.secondary}
+                              {@const window = providerCodexUsage.secondary}
+                              <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5" data-testid="codex-secondary-limit">
+                                <div class="flex items-center justify-between gap-3">
+                                  <p class="font-medium text-slate-200">{codexBaseLimitLabel(window, 'secondary')}</p>
+                                  <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                                </div>
+                                <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label="Codex secondary rolling limit usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                                  <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                                </div>
+                                <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                              </div>
+                            {/if}
+                            {#each providerCodexUsage.additional_rate_limits as limit}
+                              {#if limit.primary}
+                                {@const window = limit.primary}
+                                <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
+                                  <div class="flex items-center justify-between gap-3">
+                                    <p class="font-medium text-slate-200">{codexAdditionalLimitLabel(limit)}</p>
+                                    <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                                  </div>
+                                  <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${codexAdditionalLimitLabel(limit)} usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                                    <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                                  </div>
+                                  <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                                </div>
+                              {/if}
+                              {#if limit.secondary}
+                                {@const window = limit.secondary}
+                                <div class="rounded-lg border border-slate-800 bg-slate-950/50 p-2.5">
+                                  <div class="flex items-center justify-between gap-3">
+                                    <p class="font-medium text-slate-200">{codexAdditionalLimitLabel(limit)} — secondary window</p>
+                                    <span class="text-slate-100">{Math.round(window.used_percent)}% used</span>
+                                  </div>
+                                  <div class="mt-2 h-2 overflow-hidden rounded-full bg-slate-800" role="progressbar" aria-label={`${codexAdditionalLimitLabel(limit)} secondary usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={window.used_percent}>
+                                    <div class={`h-full rounded-full ${codexLimitTone(window.used_percent)}`} style={`width: ${Math.min(100, Math.max(0, window.used_percent))}%`}></div>
+                                  </div>
+                                  <p class="mt-1.5 text-slate-400">{codexWindowDuration(window)} · {codexWindowReset(window)}</p>
+                                </div>
+                              {/if}
+                            {/each}
                             {#if providerCodexUsage.rate_limit_reached_type}
                               <p class="text-amber-200">Limit status: {providerCodexUsage.rate_limit_reached_type}</p>
                             {/if}

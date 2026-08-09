@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ChatV2ApiClient, ChatV2ApiError } from './api';
 import { sessionTimelineScope, taskStepTimelineScope } from './types';
+import { selectedWorkSubtreeScope } from '$lib/inspectorTreeNavigation';
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
 
@@ -30,6 +31,54 @@ describe('ChatV2ApiClient', () => {
       body: undefined,
       signal: expect.any(AbortSignal)
     });
+  });
+
+  it('returns a warmed cache-only snapshot', async () => {
+    const payload = { schema_version: 2, cursor: 'cursor-1' };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+    await expect(client.snapshotCacheOnly('conv-1')).resolves.toEqual(payload);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/v1/chat/v2/conversations/conv-1/snapshot/cache-only'
+    );
+  });
+
+  it.each([204, 404, 405, 500])(
+    'returns null when the cache-only probe responds with %s',
+    async (status) => {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status }));
+      const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+      await expect(client.snapshotCacheOnly('conv-1')).resolves.toBeNull();
+    }
+  );
+
+  it.each([401, 403])('preserves cache-only authorization failure %s', async (status) => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status }));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+    await expect(client.snapshotCacheOnly('conv-1')).rejects.toMatchObject({ status });
+  });
+
+  it('emits bounded client performance best-effort with keepalive', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+    await expect(client.clientPerformance('cached_restore_ms', 25)).resolves.toBeUndefined();
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(fetchMock.mock.calls[0]![0]).toBe('/api/v1/chat/v2/client-performance');
+    expect(init?.method).toBe('POST');
+    expect(init?.credentials).toBe('include');
+    expect(init?.keepalive).toBe(true);
+    expect(JSON.parse(String(init?.body))).toEqual({
+      metric: 'cached_restore_ms',
+      duration_ms: 25
+    });
+
+    fetchMock.mockRejectedValueOnce(new Error('offline'));
+    await expect(client.clientPerformance('timeline_fresh_ms', 50)).resolves.toBeUndefined();
   });
 
   it('sends idempotent messages with PUT and JSON payload', async () => {
@@ -86,6 +135,34 @@ describe('ChatV2ApiClient', () => {
     expect(JSON.parse(String(init?.body))).toEqual({ content: '/fork new topic' });
   });
 
+  it('forks a conversation from a completed assistant message', async () => {
+    const payload = {
+      conversation_id: 'conv-fork',
+      session_id: 'session-fork',
+      source_session_id: 'session-source',
+      source_seq: 42,
+      copied: true,
+      server_time: '2026-01-01T00:00:00Z'
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+    await expect(
+      client.forkAssistantMessage('conv-1', {
+        source_session_id: 'session-source',
+        source_seq: 42
+      })
+    ).resolves.toEqual(payload);
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe('/api/v1/chat/v2/conversations/conv-1/assistant-messages/fork');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(String(init?.body))).toEqual({
+      source_session_id: 'session-source',
+      source_seq: 42
+    });
+  });
+
   it('serializes sync query parameters', async () => {
     const payload = {
       schema_version: 2,
@@ -120,6 +197,35 @@ describe('ChatV2ApiClient', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/chat/v2/sessions/sess-1/snapshot');
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
       '/api/v1/chat/v2/task-steps/step-1/timeline?before=older&limit=25'
+    );
+  });
+
+  it('serializes an exact selected session separately from its task-step scope', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({}));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    await client.work({
+      key: 'task_step:run-1',
+      kind: 'task_step',
+      step_run_id: 'run-1',
+      conversation_id: 'conv-1',
+      session_id: 'session-descendant-b',
+    }, { category: 'mutations', before: 'cursor-1', sessionId: 'session-a' });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/v1/chat/v2/task-steps/run-1/work?before=cursor-1&category=mutations&session_id=session-a'
+    );
+  });
+
+  it('loads a selected session subtree without an exact-session filter', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({}));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+
+    await client.work(
+      selectedWorkSubtreeScope('managed-conversation-1', 'session-child'),
+      { category: 'files' },
+    );
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/v1/chat/v2/sessions/session-child/work?category=files'
     );
   });
 

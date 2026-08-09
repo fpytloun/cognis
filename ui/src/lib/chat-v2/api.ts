@@ -6,12 +6,15 @@ import type {
   ChatSyncResponse,
   CommandV2Response,
   ControlMutationV2Request,
+  ForkAssistantMessageV2Response,
   QueueMutationResponse,
   QueueUpdateV2Request,
   RetryTurnV2Response,
   SendMessageV2Request,
   SendMessageV2Response,
-  TimelineBackfillResponse
+  TimelineBackfillResponse,
+  WorkProjectionResponse,
+  ActivityOverviewResponse
 } from './types';
 import type { TimelineScope } from './types';
 
@@ -133,7 +136,7 @@ export class ChatV2ApiClient {
     this.fetchImpl = options.fetch ?? fetch;
   }
 
-  private scopePath(scope: TimelineScope | string, operation: 'snapshot' | 'sync' | 'timeline' | `tool-outputs/${string}`): string {
+  private scopePath(scope: TimelineScope | string, operation: 'snapshot' | 'sync' | 'timeline' | 'work' | 'activity-overview' | `tool-outputs/${string}`): string {
     const resolved = typeof scope === 'string'
       ? { kind: 'conversation' as const, conversation_id: scope }
       : scope;
@@ -167,6 +170,78 @@ export class ChatV2ApiClient {
   snapshot(scope: TimelineScope | string): Promise<ChatSnapshot> {
     return request<ChatSnapshot>(this.scopePath(scope, 'snapshot'), {
       fetchImpl: this.fetchImpl
+    });
+  }
+
+  async snapshotCacheOnly(conversationId: string): Promise<ChatSnapshot | null> {
+    try {
+      const snapshot = await request<ChatSnapshot | undefined>(
+        `/api/v1/chat/v2/conversations/${encodeURIComponent(conversationId)}/snapshot/cache-only`,
+        {
+          fetchImpl: this.fetchImpl,
+          timeoutMs: 3_000
+        }
+      );
+      return snapshot ?? null;
+    } catch (error) {
+      if (error instanceof ChatV2ApiError && (error.status === 401 || error.status === 403)) {
+        throw error;
+      }
+      return null;
+    }
+  }
+
+  async clientPerformance(
+    metric: 'cached_restore_ms' | 'timeline_fresh_ms',
+    durationMs: number
+  ): Promise<void> {
+    try {
+      await request<void>('/api/v1/chat/v2/client-performance', {
+        fetchImpl: this.fetchImpl,
+        method: 'POST',
+        keepalive: true,
+        body: JSON.stringify({ metric, duration_ms: durationMs })
+      });
+    } catch {
+      // Observability must never affect chat navigation or rendering.
+    }
+  }
+
+  work(
+    scope: TimelineScope | string,
+    options: {
+      before?: string;
+      limit?: number;
+      category?: import('./types').WorkCategory;
+      from?: string;
+      to?: string;
+      sessionId?: string;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<WorkProjectionResponse> {
+    return request<WorkProjectionResponse>(
+      `${this.scopePath(scope, 'work')}${encodeQuery({
+        before: options.before,
+        limit: options.limit,
+        category: options.category,
+        from: options.from,
+        to: options.to,
+        session_id: options.sessionId,
+      })}`,
+      {
+        fetchImpl: this.fetchImpl,
+        signal: options.signal
+      }
+    );
+  }
+
+  activityOverview(
+    scope: TimelineScope | string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ActivityOverviewResponse> {
+    return request<ActivityOverviewResponse>(this.scopePath(scope, 'activity-overview'), {
+      fetchImpl: this.fetchImpl,
+      signal: options.signal
     });
   }
 
@@ -224,6 +299,20 @@ export class ChatV2ApiClient {
         method: 'PUT',
         timeoutMs: 600_000,
         body: JSON.stringify({ content })
+      }
+    );
+  }
+
+  forkAssistantMessage(
+    conversationId: string,
+    payload: { source_session_id: string; source_seq: number }
+  ): Promise<ForkAssistantMessageV2Response> {
+    return request<ForkAssistantMessageV2Response>(
+      `/api/v1/chat/v2/conversations/${encodeURIComponent(conversationId)}/assistant-messages/fork`,
+      {
+        fetchImpl: this.fetchImpl,
+        method: 'POST',
+        body: JSON.stringify(payload)
       }
     );
   }

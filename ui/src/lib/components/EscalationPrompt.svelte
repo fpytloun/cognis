@@ -1,5 +1,6 @@
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
+  import ToolInvocationPreview from '$lib/components/ToolInvocationPreview.svelte';
   import type { Escalation } from '$lib/types/api';
 
   let { item, secondsRemaining, onApprove, onDeny, pending = false, queuedCount = 0 } = $props<{
@@ -36,14 +37,12 @@
     <p class="mt-1 text-xs text-sky-300/60">Session: {item.session_id.slice(0, 12)}...</p>
   {/if}
 
-  <div class="mt-3 space-y-2 text-sm leading-6 text-sky-50">
-    {#if item.risk}
-      <p><span class="font-semibold">Risk:</span> {item.risk}</p>
-    {/if}
-    {#if item.reasoning}
-      <p><span class="font-semibold">Reasoning:</span> {item.reasoning}</p>
-    {/if}
-  </div>
+  <ToolInvocationPreview
+    toolName={item.tool_name}
+    argumentsDisplay={item.arguments_display}
+    reasoning={item.reasoning}
+    risk={item.risk}
+  />
 
   <p class="mt-3 text-xs text-sky-200/70">
     You can also type <code class="rounded bg-sky-900/40 px-1 py-0.5">/approve</code> or <code class="rounded bg-sky-900/40 px-1 py-0.5">/deny</code> in the chat input.

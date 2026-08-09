@@ -5,19 +5,20 @@ import { page } from '$app/stores';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
 import ArrowUp from 'lucide-svelte/icons/arrow-up';
 import MoreVertical from 'lucide-svelte/icons/more-vertical';
+import X from 'lucide-svelte/icons/x';
 
   import { api, asApiError } from '$lib/api/client';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
+  import StepCanvas from '$lib/components/workflows/StepCanvas.svelte';
   import { loadSkillWorkflowDraft, skillToWorkflowDraft } from '$lib/skills';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
-  import WorkflowDiagram from '$lib/components/workflows/WorkflowDiagram.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import { blockNavigationIfDirty, installBeforeUnloadGuard } from '$lib/navigation/unsaved';
@@ -33,8 +34,10 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     buildStepProfileMap,
     workflowThinkingEfforts,
     validateWorkflowForm,
+    workflowIssueGroup,
     workflowToFormState,
-    type WorkflowFormState
+    type WorkflowFormState,
+    type WorkflowInspectorGroup
   } from '$lib/workflows';
   import type { Agent, StepProfileDefinition, Workflow } from '$lib/types/api';
 
@@ -59,6 +62,26 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   // `mobileShowEditor` is true when the editor is the active view.
   // Plain `let` — this file uses Svelte legacy reactivity, not runes.
   let mobileShowEditor = false;
+  let selectedStepIndex = 0;
+  let mobileInspectorOpen = false;
+  let openInspectorGroup: WorkflowInspectorGroup = 'basics';
+  const inspectorGroups: Array<[WorkflowInspectorGroup, string]> = [
+    ['basics', 'Basics'],
+    ['agent-runtime', 'Agent/runtime'],
+    ['context-session', 'Context/session'],
+    ['tools', 'Tools'],
+    ['routing-review', 'Routing/review'],
+    ['completion-evaluation', 'Completion/evaluation'],
+    ['advanced', 'Advanced']
+  ];
+
+  function focusInspectorGroup(group: WorkflowInspectorGroup): void {
+    requestAnimationFrame(() => {
+      const panel = document.querySelector<HTMLElement>(`[data-inspector-panel="${group}"]`);
+      const field = panel?.querySelector<HTMLElement>('input:not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not([disabled])');
+      (field ?? document.querySelector<HTMLElement>(`[data-inspector-group="${group}"]`))?.focus();
+    });
+  }
 
   function canEditSystemWorkflowField(field: 'stepReasoning' | 'stepMaxAttempts'): boolean {
     if (!selectedWorkflow?.is_system) return true;
@@ -127,6 +150,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         form = createEmptyWorkflowForm();
       }
       initialSnapshot = JSON.stringify(form);
+      selectedStepIndex = Math.min(selectedStepIndex, Math.max(0, form.steps.length - 1));
     } catch (caughtError) {
       error = asApiError(caughtError).message;
     } finally {
@@ -146,6 +170,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       form = nextForm;
       error = '';
       initialSnapshot = JSON.stringify(form);
+      selectedStepIndex = 0;
       // On mobile, selecting a workflow transitions to the editor screen.
       mobileShowEditor = true;
     } catch (caughtError) {
@@ -164,8 +189,15 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     form = createEmptyWorkflowForm();
     error = '';
     initialSnapshot = JSON.stringify(form);
+    selectedStepIndex = 0;
     // Open the editor screen on mobile for a new workflow too.
     mobileShowEditor = true;
+  }
+
+  async function showMobileRegistry(): Promise<void> {
+    if (await confirmDiscardChanges()) {
+      mobileShowEditor = false;
+    }
   }
 
   async function loadDraftFromQuery(): Promise<void> {
@@ -277,9 +309,19 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   }
 
   async function saveWorkflow(): Promise<void> {
+    if (!selectedWorkflow?.is_system && !editingSkillId && isDirty()) {
+      form.presentationEdited = true;
+    }
     const issues = validateWorkflowForm(form);
     if (issues.length > 0) {
       error = issues.join(' ');
+      const issue = issues[0];
+      const stepMatch = /Step\s+(\d+)/i.exec(issue);
+      const namedStep = form.steps.findIndex((step) => step.name && issue.includes(step.name));
+      selectedStepIndex = namedStep >= 0 ? namedStep : Math.max(0, Number(stepMatch?.[1] ?? 1) - 1);
+      openInspectorGroup = workflowIssueGroup(issue);
+      mobileInspectorOpen = true;
+      focusInspectorGroup(openInspectorGroup);
       return;
     }
     saving = true;
@@ -345,11 +387,94 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
   }
 
   function addStep(): void {
-    form.steps = [...form.steps, createEmptyStep()];
+    const step = createEmptyStep();
+    step.phaseId = form.phases.at(-1)?.id ?? 'main';
+    form.steps = [...form.steps, step];
+    form.presentationEdited = true;
+    selectedStepIndex = form.steps.length - 1;
+    mobileInspectorOpen = true;
   }
 
-  function removeStep(index: number): void {
+  function addStepToPhase(phaseId: string): void {
+    const step = createEmptyStep();
+    step.phaseId = phaseId;
+    form.steps = [...form.steps, step];
+    form.presentationEdited = true;
+    selectedStepIndex = form.steps.length - 1;
+    mobileInspectorOpen = true;
+  }
+
+  function selectStep(index: number): void {
+    selectedStepIndex = index;
+    mobileInspectorOpen = true;
+  }
+
+  async function removeStep(index: number): Promise<void> {
+    if (!(await confirmAction({
+      title: 'Remove workflow step?',
+      message: `Remove ${form.steps[index]?.name || `step ${index + 1}`} from this workflow?`,
+      confirmLabel: 'Remove step',
+      variant: 'danger'
+    }))) return;
     form.steps = form.steps.filter((_, candidateIndex) => candidateIndex !== index);
+    form.presentationEdited = true;
+    selectedStepIndex = Math.min(selectedStepIndex, Math.max(0, form.steps.length - 1));
+  }
+
+  function phaseIdFromTitle(title: string): string {
+    const base = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'phase';
+    let candidate = base;
+    let suffix = 2;
+    while (form.phases.some((phase) => phase.id === candidate)) candidate = `${base}-${suffix++}`;
+    return candidate;
+  }
+
+  function addPhase(): void {
+    const title = `Phase ${form.phases.length + 1}`;
+    const id = phaseIdFromTitle(title);
+    form.phases = [...form.phases, { id, title, description: '' }];
+    const step = createEmptyStep();
+    step.phaseId = id;
+    form.steps = [...form.steps, step];
+    form.presentationEdited = true;
+  }
+
+  async function removePhase(index: number): Promise<void> {
+    const phase = form.phases[index];
+    if (!phase || form.phases.length === 1) return;
+    if (!(await confirmAction({
+      title: 'Remove workflow phase?',
+      message: `Remove ${phase.title} and all of its steps?`,
+      confirmLabel: 'Remove phase',
+      variant: 'danger'
+    }))) return;
+    form.steps = form.steps.filter((step) => step.phaseId !== phase.id);
+    form.phases = form.phases.filter((_, candidate) => candidate !== index);
+    form.presentationEdited = true;
+  }
+
+  function movePhase(index: number, delta: -1 | 1): void {
+    const target = index + delta;
+    if (target < 0 || target >= form.phases.length) return;
+    const phases = [...form.phases];
+    [phases[index], phases[target]] = [phases[target], phases[index]];
+    form.phases = phases;
+    form.steps = phases.flatMap((phase) => form.steps.filter((step) => step.phaseId === phase.id));
+    form.presentationEdited = true;
+  }
+
+  function duplicateStep(index: number): void {
+    const source = form.steps[index];
+    const copy = structuredClone(source);
+    copy.name = source.name ? `${source.name}_copy` : '';
+    form.steps = [...form.steps.slice(0, index + 1), copy, ...form.steps.slice(index + 1)];
+    form.presentationEdited = true;
+  }
+
+  function moveStepToPhase(index: number, phaseId: string): void {
+    form.steps[index].phaseId = phaseId;
+    form.steps = form.phases.flatMap((phase) => form.steps.filter((step) => step.phaseId === phase.id));
+    form.presentationEdited = true;
   }
 
   function moveStep(targetIndex: number): void {
@@ -358,9 +483,12 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       return;
     }
     const steps = [...form.steps];
+    const targetPhaseId = steps[targetIndex]?.phaseId;
     const [moved] = steps.splice(dragIndex, 1);
+    if (targetPhaseId) moved.phaseId = targetPhaseId;
     steps.splice(targetIndex, 0, moved);
     form.steps = steps;
+    form.presentationEdited = true;
     dragIndex = -1;
   }
 
@@ -375,9 +503,12 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
     const target = index + delta;
     if (target < 0 || target >= form.steps.length) return;
     const steps = [...form.steps];
+    const targetPhaseId = steps[target].phaseId;
     const [moved] = steps.splice(index, 1);
+    moved.phaseId = targetPhaseId;
     steps.splice(target, 0, moved);
     form.steps = steps;
+    form.presentationEdited = true;
   }
 
   function touchWorkflowSteps(): void {
@@ -498,6 +629,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       error = '';
       addToast('Workflow imported into the editor.', 'success');
       initialSnapshot = JSON.stringify(form);
+      selectedStepIndex = 0;
     } catch (caughtError) {
       error = asApiError(caughtError).message;
       addToast(error, 'error', 4_000, 'Unable to import workflow');
@@ -554,9 +686,9 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
         - mobileShowEditor=true  → editor is visible, registry hidden.
       A "Back" breadcrumb appears in the editor on mobile.
     -->
-    <div class="grid min-w-0 gap-5 lg:grid-cols-[320px_minmax(0,1fr)]">
+    <div class="grid min-w-0 gap-5 xl:grid-cols-[280px_minmax(0,1fr)]">
       <!-- Registry column: hidden on mobile when editor is open -->
-      <aside class={`min-w-0 space-y-5 ${mobileShowEditor ? 'hidden lg:block' : 'block'}`}>
+      <aside class={`min-w-0 space-y-5 ${mobileShowEditor ? 'hidden xl:block' : 'block'}`} data-testid="workflow-registry">
         <Card class="p-4">
           <label class="flex items-center justify-between gap-3 text-sm text-slate-200">
             <span>Show ephemeral workflows</span>
@@ -586,12 +718,12 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
       </aside>
 
       <!-- Editor column: hidden on mobile when registry is the active screen -->
-      <div class={`min-w-0 space-y-5 ${mobileShowEditor ? 'block' : 'hidden lg:block'}`}>
+      <div class={`min-w-0 space-y-5 ${mobileShowEditor ? 'block' : 'hidden xl:block'}`}>
         <!-- Mobile back breadcrumb -->
         {#if mobileShowEditor}
           <button
-            class="flex items-center gap-2 text-sm text-slate-400 transition hover:text-white lg:hidden"
-            onclick={() => (mobileShowEditor = false)}
+            class="flex items-center gap-2 text-sm text-slate-400 transition hover:text-white xl:hidden"
+            onclick={() => void showMobileRegistry()}
             type="button"
           >
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><polyline points="15 18 9 12 15 6"></polyline></svg>
@@ -629,15 +761,10 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
           </Card>
         {/if}
 
-        <!-- Pipeline diagram (first thing the user sees) -->
-        <Card class="overflow-hidden p-5">
-          <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Pipeline diagram</p>
-          <div class="mt-3">
-            <WorkflowDiagram steps={form.steps} interactionMode={form.interactionMode} />
-          </div>
-        </Card>
-
         <!-- Workflow metadata -->
+        <details class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+          <summary class="cursor-pointer text-xs uppercase tracking-[0.25em] text-slate-400">Workflow settings</summary>
+          <div class="mt-5 space-y-5">
         <Card class="p-5">
           <p class="mb-3 text-xs uppercase tracking-[0.25em] text-slate-400">Metadata</p>
           <div class="grid gap-4 md:grid-cols-2">
@@ -752,19 +879,102 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
             />
           </div>
         </Card>
+          </div>
+        </details>
 
-        <!-- Step editor -->
+        <div class="grid min-w-0 gap-5 lg:grid-cols-[minmax(300px,0.8fr)_minmax(420px,1.2fr)]" data-testid="workflow-builder-regions">
+          <div class="min-w-0 space-y-5">
         <Card class="p-5">
-          <div class="flex items-center justify-between gap-3">
+          <div data-testid="workflow-phase-builder">
+          <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Step editor</p>
-              <h2 class="mt-1 text-lg font-semibold text-white">Workflow steps</h2>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Phase builder</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">Workflow phases</h2>
+              <p class="mt-1 text-sm text-slate-400">Phases organize contiguous steps for people. Execution remains step-based.</p>
+            </div>
+            <Button size="sm" variant="secondary" onclick={addPhase} disabled={!!selectedWorkflow?.is_system}>Add phase</Button>
+          </div>
+          <div class="mt-4 space-y-3">
+            {#each form.phases as phase, phaseIndex}
+              <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4" data-testid={`workflow-phase-${phase.id}`}>
+                <div class="grid gap-3 md:grid-cols-[minmax(8rem,0.8fr)_minmax(12rem,1fr)_auto]">
+                  <label class="space-y-1 text-xs text-slate-400">Phase ID
+                    <Input value={phase.id} disabled title="Phase IDs remain stable; rename the phase title instead." />
+                  </label>
+                  <label class="space-y-1 text-xs text-slate-400">Title
+                    <Input bind:value={phase.title} disabled={!!selectedWorkflow?.is_system} oninput={() => (form.presentationEdited = true)} />
+                  </label>
+                  <div class="flex items-end gap-1">
+                    <button type="button" aria-label="Move phase up" class="h-10 w-10 rounded-xl border border-slate-700 text-slate-300 disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === 0} onclick={() => movePhase(phaseIndex, -1)}><ArrowUp class="mx-auto h-4 w-4" /></button>
+                    <button type="button" aria-label="Move phase down" class="h-10 w-10 rounded-xl border border-slate-700 text-slate-300 disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === form.phases.length - 1} onclick={() => movePhase(phaseIndex, 1)}><ArrowDown class="mx-auto h-4 w-4" /></button>
+                    <button type="button" aria-label="Remove phase" class="h-10 rounded-xl border border-rose-500/30 px-3 text-xs text-rose-300 disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || form.phases.length === 1} onclick={() => void removePhase(phaseIndex)}>Remove</button>
+                  </div>
+                </div>
+                <label class="mt-3 block space-y-1 text-xs text-slate-400">Description
+                  <Input bind:value={phase.description} disabled={!!selectedWorkflow?.is_system} oninput={() => (form.presentationEdited = true)} />
+                </label>
+                <p class="mt-3 text-xs text-slate-500">{form.steps.filter((step) => step.phaseId === phase.id).length} steps</p>
+              </article>
+            {/each}
+          </div>
+          </div>
+        </Card>
+
+        <Card class="p-4">
+          <div class="mb-4 flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Canvas</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">Phases and steps</h2>
             </div>
             <Button size="sm" variant="secondary" onclick={addStep} disabled={!!selectedWorkflow?.is_system}>Add step</Button>
           </div>
+          <StepCanvas
+            phases={form.phases}
+            steps={form.steps}
+            selectedIndex={selectedStepIndex}
+            disabled={!!selectedWorkflow?.is_system}
+            onselect={selectStep}
+            onmove={moveStepBy}
+            onadd={addStepToPhase}
+          />
+        </Card>
+          </div>
+
+        <!-- Step editor -->
+        <div class={`min-w-0 ${mobileInspectorOpen ? 'fixed inset-0 z-50 overflow-y-auto bg-slate-950 lg:static lg:z-auto lg:block lg:max-h-[calc(100vh-8rem)] lg:overflow-y-auto' : 'hidden lg:block'}`} data-testid="workflow-step-inspector" aria-label="Selected step inspector">
+        <Card class="min-w-0 rounded-none p-5 lg:rounded-2xl">
+          <div class="flex items-center justify-between gap-3">
+            <div>
+              <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Inspector</p>
+              <h2 class="mt-1 text-lg font-semibold text-white">{form.steps[selectedStepIndex]?.name || `Step ${selectedStepIndex + 1}`}</h2>
+            </div>
+            <button class="h-11 w-11 rounded-xl text-slate-300 hover:bg-slate-800 lg:hidden" type="button" aria-label="Back to workflow canvas" onclick={() => (mobileInspectorOpen = false)}><X class="mx-auto h-5 w-5" /></button>
+          </div>
+
+          <div class="mt-4 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3" aria-label="Inspector groups">
+            {#each inspectorGroups as group}
+              <button
+                type="button"
+                class={`min-h-10 rounded-xl border px-2 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400 ${openInspectorGroup === group[0] ? 'border-sky-400/60 bg-sky-500/10 text-sky-100' : 'border-slate-800 text-slate-400'}`}
+                data-inspector-group={group[0]}
+                aria-expanded={openInspectorGroup === group[0]}
+                onclick={() => (openInspectorGroup = group[0])}
+              >{group[1]}</button>
+            {/each}
+          </div>
+          <p class="mt-3 text-xs text-slate-500" aria-live="polite">
+            {openInspectorGroup === 'basics' ? 'Name, type, phase, and primary instructions.'
+              : openInspectorGroup === 'agent-runtime' ? 'Agent selection, runtime profile, reasoning, and tool profile.'
+              : openInspectorGroup === 'context-session' ? 'Inputs, prior-step context, and session continuation.'
+              : openInspectorGroup === 'tools' ? 'Deterministic tool, arguments, outputs, safety, and redaction.'
+              : openInspectorGroup === 'routing-review' ? 'Branches, evaluator rejection, outcome routes, and loop budgets.'
+              : openInspectorGroup === 'completion-evaluation' ? 'Evaluation, retries, gate decisions, and terminal output.'
+              : 'Deterministic recovery and uncommon execution controls.'}
+          </p>
 
           <div class="mt-4 space-y-4">
             {#each form.steps as step, index}
+              {#if index === selectedStepIndex}
               <article class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" draggable={!selectedWorkflow?.is_system} ondragstart={() => (dragIndex = index)} ondragover={(event) => event.preventDefault()} ondrop={() => moveStep(index)}>
                 <!-- Step header: name, type, step number badge, reorder
                      buttons. The up/down buttons are the touch-friendly
@@ -774,6 +984,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-slate-800 text-[11px] font-medium text-slate-400">{index + 1}</span>
                   <span class="min-w-0 flex-1 break-words text-sm font-medium text-slate-100">{step.name || `Step ${index + 1}`}</span>
                   <div class="flex shrink-0 items-center gap-1">
+                    <button type="button" aria-label="Duplicate step" class="inline-flex h-10 items-center rounded-xl px-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40 md:h-8" disabled={!!selectedWorkflow?.is_system} onclick={() => duplicateStep(index)}>Duplicate</button>
                     <button
                       type="button"
                       aria-label="Move step up"
@@ -793,12 +1004,14 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                       <ArrowDown class="h-4 w-4" />
                     </button>
                   </div>
-                  <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-sky-600/40 text-sky-400' : 'border-slate-700 text-slate-400'}">{step.type === 'gate' ? 'Gate' : 'Run'}</span>
+                  <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase tracking-widest {step.type === 'gate' ? 'border-sky-600/40 text-sky-400' : 'border-slate-700 text-slate-400'}">{step.type.replace('_', ' ')}</span>
                   {#if step.agentOverride && step.type === 'run'}
                     <span class="break-all rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-[10px] text-sky-300">{step.agentOverride}</span>
                   {/if}
                 </div>
 
+                {#if openInspectorGroup === 'basics'}
+                <section data-inspector-panel="basics" aria-label="Basic step fields">
                 <div class="grid gap-4 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span>Name</span>
@@ -809,11 +1022,28 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                     <select bind:value={step.type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
                       <option value="run">Run (agent executes)</option>
                       <option value="gate">Gate (pause for approval)</option>
+                      <option value="tool_call">Tool call (deterministic)</option>
+                      <option value="condition">Condition (deterministic branch)</option>
+                      <option value="complete">Complete (deterministic terminal)</option>
                     </select>
                   </label>
-                </div>
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span>Phase</span>
+                    <select value={step.phaseId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} onchange={(event) => moveStepToPhase(index, event.currentTarget.value)}>
+                      {#each form.phases as phase}<option value={phase.id}>{phase.title}</option>{/each}
+                    </select>
+                  </label>
+                 </div>
+                 <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                   <span>Prompt</span>
+                   <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                 </label>
+                 </section>
+                 {/if}
 
-                {#if step.type === 'run'}
+                 {#if openInspectorGroup === 'agent-runtime'}
+                 <section data-inspector-panel="agent-runtime" aria-label="Agent and runtime fields">
+                 {#if step.type === 'run'}
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span class="inline-flex items-center gap-2">
                       Agent override
@@ -873,7 +1103,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                       <div class="grid gap-4 md:grid-cols-3">
                         <label class="space-y-2 text-sm font-medium text-slate-200">
                           <span>Preset</span>
-                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => applyStepProfilePreset(index, (event.currentTarget as HTMLSelectElement).value)}>
+                          <select bind:value={step.stepProfileId} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!canEditSystemProfileField()} onchange={(event) => applyStepProfilePreset(index, event.currentTarget.value)}>
                             {#each stepProfileOptions as option}
                               <option value={option.id}>{option.label}</option>
                             {/each}
@@ -962,15 +1192,15 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                       </div>
                     </div>
                   </details>
-                {/if}
+                 {/if}
+                 {#if step.type !== 'run'}<p class="text-sm text-slate-500">This step type has no agent runtime fields.</p>{/if}
+                 </section>
+                 {/if}
 
-                <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
-                  <span>Prompt</span>
-                  <textarea bind:value={step.prompt} class="min-h-[110px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
-                </label>
-
-                <!-- Input configuration -->
-                <div class="mt-4 grid gap-4 md:grid-cols-2">
+                 <!-- Input configuration -->
+                 {#if openInspectorGroup === 'context-session'}
+                 <section data-inspector-panel="context-session" aria-label="Context and session fields">
+                 <div class="mt-4 grid gap-4 md:grid-cols-2">
                   <label class="space-y-2 text-sm font-medium text-slate-200">
                     <span class="inline-flex items-center gap-2">
                       Input from previous steps
@@ -995,10 +1225,23 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                     </span>
                     <Input bind:value={step.inputText} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null'} placeholder={step.inputMode === 'full' ? 'plan' : 'plan, review or all'} />
                   </label>
-                </div>
+                  <label class="space-y-2 text-sm font-medium text-slate-200">
+                    <span class="inline-flex items-center gap-2">
+                      Continue session from
+                      <Tooltip text="Optional earlier run step whose conversation and session continue. It must also be an input source and use the same agent and runtime profile.">
+                        <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
+                      </Tooltip>
+                    </span>
+                    <Input bind:value={step.reuseSessionFrom} disabled={!!selectedWorkflow?.is_system || step.inputMode === 'null' || step.type !== 'run'} placeholder="plan" />
+                  </label>
+                 </div>
+                 </section>
+                 {/if}
 
-                <!-- Completion configuration -->
-                {#if step.type === 'run'}
+                 <!-- Completion configuration -->
+                 {#if openInspectorGroup === 'completion-evaluation'}
+                 <section data-inspector-panel="completion-evaluation" aria-label="Completion and evaluation fields">
+                 {#if step.type === 'run'}
                   <div class="mt-4 grid gap-4 md:grid-cols-2">
                     <label class="space-y-2 text-sm font-medium text-slate-200">
                       <span class="inline-flex items-center gap-2">
@@ -1058,7 +1301,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                 {/if}
 
                 <!-- Gate configuration -->
-                {#if step.type === 'gate'}
+                 {#if step.type === 'gate'}
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span>Gate message</span>
                     <textarea bind:value={step.gateMessage} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
@@ -1066,16 +1309,148 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                   <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
                     <span class="inline-flex items-center gap-2">
                       Gate options
-                      <Tooltip text="One option per line in 'Label|action' format. Actions: 'continue' advances, 'revise(step_name)' loops back. Example: Approve|continue">
+                      <Tooltip text="One option per line in 'Label|action|prompt' format. Set prompt to true when the option requires feedback.">
                         <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-slate-700 text-xs text-slate-400 hover:text-slate-200 focus-visible:border-slate-400 md:h-5 md:w-5">?</button>
                       </Tooltip>
                     </span>
-                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue&#10;Request changes|revise(plan)"></textarea>
+                    <textarea bind:value={step.gateOptionsText} class="min-h-[90px] w-full rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system} placeholder="Approve|continue|false&#10;Request changes|revise(plan)|true"></textarea>
                   </label>
-                {/if}
+                  <div class="mt-4 grid gap-4 md:grid-cols-2">
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>Gate input steps</span>
+                      <Input bind:value={step.gateInputText} disabled={!!selectedWorkflow?.is_system} placeholder="plan, review" />
+                    </label>
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>Timeout seconds</span>
+                      <Input bind:value={step.gateTimeoutSeconds} disabled={!!selectedWorkflow?.is_system} min="1" type="number" />
+                    </label>
+                    <label class="space-y-2 text-sm font-medium text-slate-200">
+                      <span>Timeout action</span>
+                      <select bind:value={step.gateTimeoutAction} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}>
+                        <option value="fail">Fail</option>
+                        <option value="continue">Continue</option>
+                        <option value="cancel">Cancel</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                    <span>Conditions (JSON array)</span>
+                    <textarea bind:value={step.gateConditionsText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                  </label>
+                  <label class="mt-4 block space-y-2 text-sm font-medium text-slate-200">
+                    <span>Thresholds (JSON object)</span>
+                    <textarea bind:value={step.gateThresholdsText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm text-slate-100" disabled={!!selectedWorkflow?.is_system}></textarea>
+                  </label>
+                 {/if}
+                 {#if step.type === 'complete'}
+                   <div class="mt-4 space-y-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/5 p-4" data-testid={`complete-editor-${index}`}>
+                     <div class="grid gap-4 md:grid-cols-2">
+                       <label class="space-y-2 text-sm font-medium text-slate-200">Terminal status
+                         <select bind:value={step.completeStatus} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="completed">Completed</option><option value="failed">Failed</option></select>
+                       </label>
+                       <label class="space-y-2 text-sm font-medium text-slate-200">Delivery override
+                         <select bind:value={step.completeDeliveryMode} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Workflow default</option><option value="same_conversation">Same conversation</option><option value="preferred_channel">Preferred channel</option><option value="latest_active_for_agent">Latest active for agent</option><option value="specific_conversation">Specific conversation</option><option value="silent">Silent</option></select>
+                       </label>
+                     </div>
+                     <label class="block space-y-2 text-sm font-medium text-slate-200">Summary template
+                       <textarea bind:value={step.completeSummary} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 text-sm"></textarea>
+                     </label>
+                     <label class="block space-y-2 text-sm font-medium text-slate-200">Content template
+                       <textarea bind:value={step.completeContent} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 text-sm"></textarea>
+                     </label>
+                     <label class="block space-y-2 text-sm font-medium text-slate-200">Outputs (JSON object)
+                       <textarea bind:value={step.completeOutputsText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm"></textarea>
+                     </label>
+                     <label class="block space-y-2 text-sm font-medium text-slate-200">Notification (optional JSON object)
+                       <textarea bind:value={step.completeNotificationText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" placeholder={'{"mode":"silent","reason":"No work found"}'}></textarea>
+                     </label>
+                   </div>
+                 {/if}
+                 </section>
+                 {/if}
+
+                 {#if openInspectorGroup === 'advanced'}
+                 <section data-inspector-panel="advanced" aria-label="Advanced step fields">
+                 {#if ['tool_call', 'condition', 'complete'].includes(step.type)}
+                  <details class="mt-4 rounded-2xl border border-slate-700/70 bg-slate-950/40 p-4">
+                    <summary class="cursor-pointer text-sm font-medium text-slate-200">Deterministic routing and recovery</summary>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                      <label class="space-y-2 text-sm font-medium text-slate-200">Run when
+                        <Input bind:value={step.deterministicWhen} placeholder={'{{ vars.enabled }}'} />
+                      </label>
+                      {#if step.type === 'tool_call'}
+                        <label class="space-y-2 text-sm font-medium text-slate-200">Next step
+                          <select bind:value={step.deterministicNext} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Natural next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
+                        </label>
+                      {/if}
+                      <label class="space-y-2 text-sm font-medium text-slate-200">On error
+                        <select bind:value={step.deterministicOnError} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Runtime default</option><option value="fail">Fail</option><option value="continue">Continue</option><option value="skip">Skip</option><option value="gate">Gate</option></select>
+                      </label>
+                      <label class="space-y-2 text-sm font-medium text-slate-200">Skip output (optional JSON object)
+                        <textarea bind:value={step.deterministicOnSkipText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm"></textarea>
+                      </label>
+                    </div>
+                  </details>
+                 {/if}
+                 {#if !['tool_call', 'condition', 'complete'].includes(step.type)}<p class="text-sm text-slate-500">This step type has no advanced deterministic controls.</p>{/if}
+                 </section>
+                 {/if}
+
+                 {#if openInspectorGroup === 'tools'}
+                 <section data-inspector-panel="tools" aria-label="Tool fields">
+                 {#if step.type === 'tool_call'}
+                  <div class="mt-4 space-y-4 rounded-2xl border border-violet-500/20 bg-violet-500/5 p-4" data-testid={`tool-call-editor-${index}`}>
+                    <label class="block space-y-2 text-sm font-medium text-slate-200">Tool name
+                      <Input bind:value={step.toolName} disabled={!!selectedWorkflow?.is_system} placeholder="builtin:read" />
+                    </label>
+                    <div class="grid gap-4 md:grid-cols-2">
+                      <label class="space-y-2 text-sm font-medium text-slate-200">Arguments (JSON object)
+                        <textarea bind:value={step.toolArgsText} class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" disabled={!!selectedWorkflow?.is_system}></textarea>
+                      </label>
+                      <label class="space-y-2 text-sm font-medium text-slate-200">Output mapping (JSON object)
+                        <textarea bind:value={step.toolOutputsText} class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" disabled={!!selectedWorkflow?.is_system}></textarea>
+                      </label>
+                    </div>
+                    <label class="block space-y-2 text-sm font-medium text-slate-200">Summary template
+                      <Input bind:value={step.toolSummary} disabled={!!selectedWorkflow?.is_system} />
+                    </label>
+                    <div class="grid gap-4 md:grid-cols-3">
+                      <label class="flex items-center gap-2 text-sm text-slate-200"><input type="checkbox" bind:checked={step.toolFailOnError} /> Fail on error</label>
+                      <label class="flex items-center gap-2 text-sm text-amber-200"><input type="checkbox" bind:checked={step.toolAllowSideEffects} /> Allow side effects</label>
+                      <label class="space-y-1 text-sm text-slate-200">Timeout seconds <Input type="number" bind:value={step.toolTimeoutSeconds} /></label>
+                    </div>
+                    <label class="block space-y-2 text-sm font-medium text-slate-200">Redact argument names
+                      <Input bind:value={step.toolRedactArgsText} placeholder="token, password" />
+                    </label>
+                  </div>
+                 {/if}
+                 {#if step.type !== 'tool_call'}<p class="text-sm text-slate-500">This step type has no deterministic tool fields.</p>{/if}
+                 </section>
+                 {/if}
+
+                 {#if openInspectorGroup === 'routing-review'}
+                 <section data-inspector-panel="routing-review" aria-label="Routing and review fields">
+                 {#if step.type === 'condition'}
+                  <div class="mt-4 space-y-4 rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4" data-testid={`condition-editor-${index}`}>
+                    <label class="block space-y-2 text-sm font-medium text-slate-200">Expression
+                      <textarea bind:value={step.conditionExpression} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm" placeholder={'{{ steps.fetch.outputs.items | length > 0 }}'}></textarea>
+                    </label>
+                    <div class="grid gap-4 md:grid-cols-2">
+                      <label class="space-y-2 text-sm font-medium text-slate-200">True branch
+                        <select bind:value={step.conditionThen} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
+                      </label>
+                      <label class="space-y-2 text-sm font-medium text-slate-200">False branch
+                        <select bind:value={step.conditionElse} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2"><option value="">Next step</option>{#each form.steps as target}<option value={target.name} disabled={target === step}>{target.name || 'Unnamed step'}</option>{/each}</select>
+                      </label>
+                    </div>
+                    <label class="block space-y-2 text-sm font-medium text-slate-200">Output mapping (optional JSON object)
+                      <textarea bind:value={step.conditionOutputText} class="min-h-24 w-full rounded-xl border border-slate-700 bg-slate-950/80 p-3 font-mono text-sm"></textarea>
+                    </label>
+                  </div>
+                 {/if}
 
                 <!-- Evaluator retry loop -->
-                {#if step.evaluate || step.evaluatorRejectTarget}
+                {#if step.type === 'run' && (step.evaluate || step.evaluatorRejectTarget)}
                   <details class="mt-4" open={!!step.evaluatorRejectTarget}>
                     <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
                       Evaluator retry loop
@@ -1110,7 +1485,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                 {/if}
 
                 <!-- Outcome routing -->
-                {#if step.type === 'run'}
+                 {#if step.type === 'run'}
                   <details class="mt-4" open={step.outcomeSuccessAction !== 'none' || step.outcomeRejectedAction !== 'none' || step.outcomeFailedAction !== 'none'}>
                     <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-slate-100">
                       Outcome routing
@@ -1221,19 +1596,25 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
                               <option value="gate">Ask human</option>
                             </select>
                           </label>
-                        {/if}
-                      </div>
-                    </div>
-                  </details>
-                {/if}
+                 {/if}
+                       </div>
+                     </div>
+                   </details>
+                 {/if}
+                 {#if step.type !== 'run' && step.type !== 'condition'}<p class="text-sm text-slate-500">This step type has no routing or review fields.</p>{/if}
+                 </section>
+                 {/if}
 
                 <div class="mt-4 flex justify-end">
                   <Button size="sm" variant="danger" onclick={() => removeStep(index)} disabled={!!selectedWorkflow?.is_system}>Remove step</Button>
                 </div>
               </article>
+              {/if}
             {/each}
           </div>
         </Card>
+        </div>
+        </div>
       </div>
     </div>
 

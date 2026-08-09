@@ -1,6 +1,9 @@
 export interface FileDiff {
   path: string;
   diff: string;
+  additions?: number | null;
+  deletions?: number | null;
+  content_truncated?: boolean;
   truncated?: boolean;
   original_size?: number;
   omitted_count?: number;
@@ -131,9 +134,9 @@ export function parseFileDiff(input: FileDiff): ParsedFileDiff {
     language: detected.language,
     languageLabel: detected.label,
     iconLabel: detected.icon,
-    additions,
-    deletions,
-    truncated: Boolean(input.truncated),
+    additions: input.additions ?? additions,
+    deletions: input.deletions ?? deletions,
+    truncated: Boolean(input.truncated || input.content_truncated),
     omittedCount: typeof input.omitted_count === 'number' ? input.omitted_count : 0,
     lines: parsedLines,
   };
@@ -152,6 +155,9 @@ export function normalizeFileDiffs(value: unknown): FileDiff[] {
       return {
         path,
         diff,
+        ...(typeof record.additions === 'number' ? { additions: record.additions } : {}),
+        ...(typeof record.deletions === 'number' ? { deletions: record.deletions } : {}),
+        ...(record.content_truncated === true ? { content_truncated: true } : {}),
         truncated: record.truncated === true,
         original_size: typeof record.original_size === 'number' ? record.original_size : undefined,
         omitted_count: omittedCount,

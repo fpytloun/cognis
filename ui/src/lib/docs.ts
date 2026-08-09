@@ -83,11 +83,18 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/channels.md': '/docs/channels',
   'docs/guide/executors.md': '/docs/executors',
   'docs/guide/deployment.md': '/docs/deployment',
+  'docs/guide/high-availability.md': '/docs/high-availability',
+  'docs/guide/ha-e2e.md': '/docs/ha-e2e',
   'docs/guide/troubleshooting.md': '/docs/troubleshooting'
 };
 
 const GITHUB_REPO_URL = 'https://github.com/fpytloun/cognis';
-const DOC_REPO_URLS = new Set(['compose.local.yml', 'deploy/systemd', 'deploy/systemd/README.md']);
+const DOC_REPO_URLS = new Set([
+  'compose.local.yml',
+  'deploy/helm/cognis',
+  'deploy/systemd',
+  'deploy/systemd/README.md'
+]);
 
 function normalizeDocPath(path: string): string {
   const parts = path.split('/');

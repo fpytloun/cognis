@@ -8,6 +8,7 @@ import {
   renderInlineMarkdownNoLinks,
   renderMarkdown,
   renderMarkdownDocument,
+  sanitizeHtml,
   stripMarkdown,
 } from '$lib/markdown';
 
@@ -48,6 +49,151 @@ describe('renderMarkdown', () => {
     expect(html).not.toContain('<a href=');
     expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
     expect(html).toContain('&lt;img src=&quot;x&quot;');
+  });
+
+  it('renders GFM tables, strikethrough, autolinks, task lists, nested lists, and fences', () => {
+    const html = renderMarkdown([
+      '| Name | State |',
+      '| --- | --- |',
+      '| item | ~~old~~ |',
+      '',
+      '<https://example.com/docs>',
+      '',
+      '- [x] complete',
+      '- parent',
+      '  - child',
+      '',
+      '```ts',
+      'const value = 1;',
+      '```',
+    ].join('\n'));
+
+    expect(html).toContain('<table>');
+    expect(html).toContain('<del>old</del>');
+    expect(html).toContain('href="https://example.com/docs"');
+    expect(html).toContain('type="checkbox"');
+    expect(html).toContain('<li>child</li>');
+    expect(html).toContain('language-ts');
+  });
+
+  it('renders only complete valid YouTube iframe tokens as canonical embeds', () => {
+    const html = renderMarkdown(
+      '<iframe width="560" height="315" src="https://www.youtube.com/embed/dQw4w9WgXcQ" title="Ignored title" frameborder="0" allowfullscreen></iframe>',
+    );
+
+    expect(html).toContain('class="markdown-youtube-embed"');
+    expect(html).toContain('src="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ"');
+    expect(html).toContain('title="YouTube video player"');
+    expect(html).toContain('loading="lazy"');
+    expect(html).toContain('referrerpolicy="strict-origin-when-cross-origin"');
+    expect(html).toContain('sandbox="allow-presentation allow-scripts allow-same-origin"');
+    expect(html).toContain('allowfullscreen');
+    expect(html).not.toContain('width="560"');
+    expect(html).not.toContain('Ignored title');
+  });
+
+  it('renders strict YouTube embeds through inline and docs helpers', () => {
+    const iframe = '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>';
+    expect(renderInlineMarkdown(iframe)).toContain('youtube-nocookie.com/embed/dQw4w9WgXcQ');
+    expect(renderDocsMarkdown(iframe)).toContain('youtube-nocookie.com/embed/dQw4w9WgXcQ');
+
+    const unsafe = '<iframe src="https://youtube.com.evil.example/embed/dQw4w9WgXcQ"></iframe>';
+    expect(renderInlineMarkdown(unsafe)).not.toContain('<iframe');
+    expect(renderDocsMarkdown(unsafe)).not.toContain('<iframe');
+  });
+
+  it.each([
+    '<iframe src="http://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="//www.youtube.com/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="data:text/html,dQw4w9WgXcQ"></iframe>',
+    '<iframe src="blob:https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="javascript:alert(1)"></iframe>',
+    '<iframe src="https://user@www.youtube.com/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="https://www.youtube.com:443/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="https://www.youtube.com.evil.test/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="https://www%2eyoutube.com/embed/dQw4w9WgXcQ"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/too-short"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ?autoplay=1"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" srcdoc="<script>alert(1)</script>"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" style="position:fixed"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" onload="alert(1)"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" sandbox="allow-top-navigation"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" allow="camera"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" form="attack"></iframe>',
+  ])('keeps an unsafe or malformed iframe escaped: %s', (source) => {
+    const html = renderMarkdown(source);
+    expect(html).not.toContain('<iframe');
+    expect(html).not.toContain('markdown-youtube-embed');
+    expect(html).toContain('&lt;iframe');
+  });
+
+  it('keeps arbitrary active HTML and namespace payloads inert', () => {
+    const payloads = [
+      '<script>alert(1)</script>',
+      '<img src=x onerror=alert(1)>',
+      '<style>body{display:none}</style>',
+      '<form action="https://evil.test"><input name=x></form>',
+      '<svg><script>alert(1)</script></svg>',
+      '<math><mtext><img src=x onerror=alert(1)></mtext></math>',
+    ];
+    for (const payload of payloads) {
+      const html = renderMarkdown(payload);
+      expect(html).not.toMatch(/<(script|img|style|form|svg|math)\b/i);
+    }
+  });
+
+  it('does not grant iframe capability to direct sanitizer callers', () => {
+    expect(sanitizeHtml('<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>')).not.toContain('<iframe');
+  });
+
+  it('applies safe context resolvers and separates their cache entries', () => {
+    const markdown = '[document](./guide.md) ![diagram](./diagram.png)';
+    const first = renderMarkdown(markdown, {
+      cacheKey: 'knowledge-a',
+      resolveLink: (href) => ({ href: `/knowledge/a/${href}`, title: 'A' }),
+      resolveImage: (src) => ({ src: `/knowledge/a/${src}`, alt: 'Resolved A' }),
+    });
+    const second = renderMarkdown(markdown, {
+      cacheKey: 'knowledge-b',
+      resolveLink: (href) => `/knowledge/b/${href}`,
+      resolveImage: (src) => `/knowledge/b/${src}`,
+    });
+
+    expect(first).toContain('href="/knowledge/a/./guide.md"');
+    expect(first).toContain('src="/knowledge/a/./diagram.png"');
+    expect(first).toContain('alt="Resolved A"');
+    expect(second).toContain('href="/knowledge/b/./guide.md"');
+    expect(second).toContain('src="/knowledge/b/./diagram.png"');
+    expect(second).not.toContain('/knowledge/a/');
+  });
+
+  it('rejects unsafe original and rewritten resolver URLs', () => {
+    const seen: string[] = [];
+    const html = renderMarkdown(
+      '[bad](javascript:alert(1)) [safe](./safe) ![image](./image.png)',
+      {
+        resolveLink: (href) => {
+          seen.push(href);
+          return 'javascript:alert(1)';
+        },
+        resolveImage: (src) => {
+          seen.push(src);
+          return 'data:text/html,attack';
+        },
+      },
+    );
+
+    expect(seen).toEqual(['./safe', './image.png']);
+    expect(html).not.toContain('javascript:');
+    expect(html).not.toContain('data:text');
+    expect(html).not.toContain('<img');
+  });
+
+  it('rejects backslash forms that browsers can normalize to network URLs', () => {
+    const html = renderMarkdown('[link](/\\evil.test/path) ![image](/\\evil.test/image.png)');
+
+    expect(html).not.toContain('<a');
+    expect(html).not.toContain('<img');
   });
 
   it('opens outgoing markdown links in a new tab', () => {

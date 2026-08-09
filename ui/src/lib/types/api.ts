@@ -219,6 +219,7 @@ export interface ConversationStateDelta {
 
 export interface Conversation {
   conversation_id: string;
+  root_controller_conversation_id?: string | null;
   user_email: string;
   agent_id: string;
     agent_profile_id?: string | null;
@@ -284,6 +285,34 @@ export interface AgentDirectChat {
   conversation: Conversation;
 }
 
+export interface BackgroundWorkTodo {
+  content: string;
+  status: string;
+  priority: string;
+}
+
+export interface BackgroundWorkItem {
+  kind: 'managed_conversation' | 'delegated_session';
+  work_id: string;
+  controller_conversation_id: string;
+  target_conversation_id?: string | null;
+  session_id?: string | null;
+  title: string;
+  agent_id: string;
+  agent_profile_id?: string | null;
+  status: string;
+  started_at?: string | null;
+  updated_at?: string | null;
+  todos: BackgroundWorkTodo[];
+}
+
+export interface BackgroundWorkProjection {
+  items: BackgroundWorkItem[];
+  active_count: number;
+  truncated: boolean;
+  generated_at: string;
+}
+
 export interface SidebarProjection {
   agents: Agent[];
   agent_direct_chats: AgentDirectChat[];
@@ -292,6 +321,7 @@ export interface SidebarProjection {
   removed_conversation_ids?: string[];
   full_resync_required?: boolean;
   sync_timestamp?: string | null;
+  background_work: BackgroundWorkProjection;
 }
 
 export interface ConversationOpenRequest {
@@ -419,6 +449,8 @@ export interface ActiveStreamSnapshot {
   session_id: string;
   message_id: string;
   turn_id?: string | null;
+  retry_reason?: string | null;
+  retry_source_turn_id?: string | null;
   content: string;
   chunk_count: number;
   content_offset: number;
@@ -436,6 +468,7 @@ export interface MessageRuntimeMetadata {
   provider_id?: string | null;
   model?: string | null;
   reasoning_effort?: string | null;
+  fast_mode?: boolean | null;
   reasoning_mode?: string | null;
 }
 
@@ -645,6 +678,7 @@ export interface IntarisSessionDetail {
   denied_count: number;
   escalated_count: number;
   context_usage?: ContextUsage | null;
+  token_usage?: TokenUsage | null;
   last_generation?: GenerationPerformanceSnapshot | null;
 }
 
@@ -654,6 +688,7 @@ export interface AgentRuntimeProfile {
   provider_id?: string | null;
   model?: string | null;
   reasoning_effort?: string | null;
+  fast_mode?: boolean | null;
   system_prompt_extra?: string | null;
   memory_enabled?: boolean | null;
   memory_backend_options?: Record<string, unknown>;
@@ -746,16 +781,337 @@ export interface AgentGrant {
   grantee_overrides: Record<string, unknown> | null;
 }
 
+export type KnowledgebaseStatus = 'active' | 'archived' | 'deleted';
+
 export interface KnowledgebaseModel {
   knowledgebase_id: string;
+  owner_email: string | null;
+  access_level: 'owner' | 'shared';
   name: string;
   description: string | null;
-  status: string;
+  status: KnowledgebaseStatus;
   metadata_schema: Record<string, unknown>;
   settings: Record<string, unknown>;
   created_at: string | null;
   updated_at: string | null;
   archived_at: string | null;
+}
+
+export interface KnowledgebaseShareRequest {
+  user_email: string;
+  permission: 'view';
+  note?: string | null;
+}
+
+export interface KnowledgebaseShareModel {
+  grant_id: string;
+  user_email: string;
+  user_name: string | null;
+  permission: 'view';
+  granted_at: string;
+  note: string | null;
+}
+
+export interface KnowledgebaseShareCandidate {
+  email: string;
+  name: string | null;
+}
+
+export interface KnowledgebaseCreateRequest {
+  name: string;
+  description?: string | null;
+  metadata_schema?: Record<string, unknown>;
+  settings?: Record<string, unknown>;
+}
+
+export interface KnowledgebaseUpdateRequest {
+  name?: string;
+  description?: string | null;
+  metadata_schema?: Record<string, unknown>;
+  settings?: Record<string, unknown>;
+  status?: 'active' | 'archived';
+}
+
+export interface KnowledgebaseHealth {
+  enabled: boolean;
+  vector_backend: string;
+  embedding_route_configured: boolean;
+  healthy: boolean;
+  notes: string[];
+}
+
+export interface KnowledgebaseCapabilities {
+  enabled: boolean;
+  vector_backend: string;
+  backend_ready: boolean;
+  embedding_ready: boolean;
+  indexer_ready: boolean;
+  ask_ready: boolean;
+  supported_mime_types: string[];
+  supported_extensions: string[];
+  limits: Record<string, number>;
+  notes: string[];
+}
+
+export type KnowledgebaseArtifactStatus =
+  | 'queued'
+  | 'running'
+  | 'indexed'
+  | 'stale'
+  | 'failed'
+  | 'removed'
+  | 'detached';
+
+export interface KnowledgebaseArtifactModel {
+  kb_artifact_id: string;
+  knowledgebase_id: string;
+  source_path: string | null;
+  artifact_id: string | null;
+  pending_artifact_id: string | null;
+  pending_source_hash: string | null;
+  active_generation: number;
+  desired_generation: number;
+  status: KnowledgebaseArtifactStatus;
+  source_hash: string | null;
+  source_filename: string | null;
+  source_mime_type: string | null;
+  source_size_bytes: number | null;
+  metadata: Record<string, unknown>;
+  chunk_count: number;
+  last_job_id: string | null;
+  last_error: string | null;
+  last_diagnostics: Record<string, unknown>;
+  attached_at: string | null;
+  indexed_at: string | null;
+  stale_at: string | null;
+  removed_at: string | null;
+}
+
+/**
+ * Generic ingested-document view of a knowledgebase artifact.
+ *
+ * This is a client-only projection: today it is derived from
+ * `KnowledgebaseArtifactModel` (see `documentFromArtifact` in
+ * `$lib/knowledge/documents.ts`). When a dedicated `documents` backend
+ * endpoint lands it is expected to return this exact shape directly;
+ * only `$lib/api/client.ts` document methods need to change.
+ */
+export interface KnowledgebaseDocumentModel {
+  doc_id: string;
+  knowledgebase_id: string;
+  artifact_id: string | null;
+  display_name: string;
+  /** Generic folder-relative path used to reconstruct a browse tree. Null for flat/unpathed uploads. */
+  source_path: string | null;
+  mime_type: string | null;
+  size_bytes: number | null;
+  status: KnowledgebaseArtifactStatus;
+  chunk_count: number;
+  metadata: Record<string, unknown>;
+  last_job_id: string | null;
+  last_error: string | null;
+  attached_at: string | null;
+  indexed_at: string | null;
+}
+
+export interface KnowledgebaseDocumentListResponse {
+  documents: KnowledgebaseArtifactModel[];
+  next_cursor: string | null;
+}
+
+export interface KnowledgebaseDocumentDetail extends KnowledgebaseArtifactModel {
+  last_job: KnowledgebaseIndexJobModel | null;
+}
+
+export type KnowledgebaseDocumentConflictPolicy = 'skip' | 'replace' | 'keep_both';
+
+export type KnowledgebaseDocumentUploadStatus =
+  | 'created'
+  | 'updated'
+  | 'unchanged'
+  | 'skipped'
+  | 'failed';
+
+export interface KnowledgebaseDocumentUploadOutcome {
+  filename: string;
+  source_path: string | null;
+  status: KnowledgebaseDocumentUploadStatus;
+  artifact_id: string | null;
+  kb_artifact_id: string | null;
+  job_id: string | null;
+  error_code: string | null;
+  message: string | null;
+}
+
+export interface KnowledgebaseDocumentUploadResponse {
+  outcomes: KnowledgebaseDocumentUploadOutcome[];
+}
+
+export interface KnowledgebaseDocumentContentResponse {
+  kb_artifact_id: string;
+  artifact_id: string;
+  source_path: string | null;
+  content_mode: 'source' | 'extracted';
+  mime_type: string;
+  text: string;
+  size_bytes: number;
+  extraction_method: string | null;
+  diagnostics: Record<string, unknown>;
+}
+
+export type KnowledgebaseJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export type KnowledgebaseJobType =
+  | 'index_artifact'
+  | 'reindex_artifact'
+  | 'delete_artifact_index'
+  | 'delete_stale_vectors'
+  | 'rebuild_knowledgebase';
+
+export interface KnowledgebaseIndexJobModel {
+  job_id: string;
+  knowledgebase_id: string;
+  kb_artifact_id: string | null;
+  artifact_id: string | null;
+  generation: number;
+  job_type: KnowledgebaseJobType;
+  status: KnowledgebaseJobStatus;
+  attempts: number;
+  error: string | null;
+  diagnostics: Record<string, unknown>;
+  chunks_indexed: number;
+  chunks_deleted: number;
+  queued_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface KnowledgebaseChunkLocator {
+  artifact_id: string;
+  artifact_hash: string | null;
+  chunk_id: string;
+  chunk_index: number;
+  char_start: number | null;
+  char_end: number | null;
+  byte_start: number | null;
+  byte_end: number | null;
+  line_start: number | null;
+  line_end: number | null;
+  page_start: number | null;
+  page_end: number | null;
+  paragraph_start: number | null;
+  paragraph_end: number | null;
+  timestamp_start_ms: number | null;
+  timestamp_end_ms: number | null;
+  extraction_method: string;
+}
+
+export interface KnowledgebaseSourceCitation {
+  artifact_id: string;
+  filename: string | null;
+  mime_type: string | null;
+  locator: KnowledgebaseChunkLocator;
+}
+
+export type KnowledgebaseFilterOp = 'eq' | 'in' | 'contains' | 'overlap' | 'gte' | 'lte' | 'between';
+
+export interface KnowledgebaseFilter {
+  field: string;
+  op: KnowledgebaseFilterOp;
+  value: unknown;
+}
+
+export interface KnowledgebaseSearchRequest {
+  query: string;
+  limit?: number;
+  filters?: KnowledgebaseFilter[];
+}
+
+export interface KnowledgebaseSearchMatch {
+  chunk_id: string;
+  kb_artifact_id: string;
+  artifact_id: string;
+  snippet: string;
+  score: number;
+  score_breakdown: Record<string, number>;
+  metadata: Record<string, unknown>;
+  citation: KnowledgebaseSourceCitation;
+}
+
+export interface KnowledgebaseSearchResponse {
+  matches: KnowledgebaseSearchMatch[];
+  diagnostics: Record<string, unknown>;
+}
+
+export interface KnowledgebaseSourceContextRequest {
+  chunk_id: string;
+  before_chars?: number;
+  after_chars?: number;
+}
+
+export interface KnowledgebaseSourceContextResponse {
+  chunk_id: string;
+  artifact_id: string;
+  text: string;
+  locator: KnowledgebaseChunkLocator;
+  warnings: string[];
+}
+
+export interface KnowledgebaseDiagnostics {
+  enabled: boolean;
+  artifact_counts: Record<string, number>;
+  job_counts: Record<string, number>;
+  chunk_count: number;
+  backend_health: Record<string, unknown>;
+}
+
+export interface KnowledgebaseAttachRequest {
+  artifact_id: string;
+  source_path?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export type KnowledgebaseAskStatus = 'answered' | 'insufficient_evidence' | 'error';
+
+export interface KnowledgebaseAskError {
+  code: 'synthesis_timeout' | 'provider_error' | 'invalid_response' | 'unsupported_citation';
+  message: string;
+  correlation_id: string | null;
+}
+
+export interface KnowledgebaseFacetRequest {
+  fields: string[];
+  filters?: KnowledgebaseFilter[];
+  search?: Record<string, string>;
+  limit_per_field?: number;
+}
+
+export interface KnowledgebaseFacetValue { value: unknown; count: number; }
+export interface KnowledgebaseFacetField {
+  field: string;
+  type: 'string' | 'number' | 'boolean' | 'datetime' | 'array';
+  values: KnowledgebaseFacetValue[];
+  cardinality: number;
+  truncated: boolean;
+}
+export interface KnowledgebaseFacetResponse {
+  fields: KnowledgebaseFacetField[];
+  documents_scanned: number;
+}
+
+export interface KnowledgebaseAskRequest {
+  question: string;
+  filters: KnowledgebaseFilter[];
+  limit: number;
+  max_answer_tokens?: number;
+}
+
+export interface KnowledgebaseAskResponse {
+  status: KnowledgebaseAskStatus;
+  answer: string | null;
+  cited_chunk_ids: string[];
+  matches: KnowledgebaseSearchMatch[];
+  error: KnowledgebaseAskError | null;
 }
 
 export interface ToolParameterProperty {
@@ -1832,7 +2188,7 @@ export interface StepRun {
   evaluation: Record<string, unknown> | null;
   runtime_info: Record<string, unknown> | null;
   deliverables: Deliverable[];
-  todos: Array<Record<string, unknown>>;
+  todos: TaskProgressTodo[];
   started_at: string | null;
   completed_at: string | null;
   updated_at: string | null;
@@ -1886,6 +2242,7 @@ export interface Task {
   result_data: Record<string, unknown> | null;
   applied_completion_mode: 'default' | 'direct' | 'silent' | null;
   applied_completion_reason: string | null;
+  progress?: TaskProgressProjection | null;
 }
 
 export interface TaskBoardItem {
@@ -1903,6 +2260,7 @@ export interface TaskBoardItem {
   completed_at: string | null;
   updated_at: string | null;
   result_summary: string | null;
+  progress?: TaskProgressProjection | null;
 }
 
 export interface TaskBoardDoneGroup {
@@ -1929,6 +2287,79 @@ export interface TaskDetail extends Task {
   step_runs: StepRun[];
   workflow_run: WorkflowRun | null;
   pending_pause: PendingPause | null;
+  workflow_projection: TaskWorkflowProjection | null;
+}
+
+export interface TaskProgressTodo {
+  content: string;
+  status: string;
+  priority?: string;
+}
+
+export interface TaskProgressWorkItem {
+  kind: 'managed_conversation' | 'delegated_session';
+  work_id: string;
+  step_name: string;
+  step_run_id: string;
+  title: string | null;
+  agent_id: string;
+  status: string;
+  result_summary: string | null;
+  error: string | null;
+  todos: TaskProgressTodo[];
+  conversation_id?: string | null;
+  session_id?: string | null;
+  started_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface TaskProgressProjection {
+  todos: TaskProgressTodo[];
+  work_items: TaskProgressWorkItem[];
+  active_count: number;
+  completed_count: number;
+  truncated: boolean;
+}
+
+export interface WorkflowStepProjection {
+  name: string;
+  type: string;
+  status: string;
+  attempt_count: number;
+  max_attempts: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_seconds: number | null;
+  action_required: boolean;
+  pause_type: string | null;
+  summary: string | null;
+  error: string | null;
+  has_output: boolean;
+  has_logs: boolean;
+  has_deliverable: boolean;
+  skip_reason: string | null;
+  step_run_id: string | null;
+  output_url: string | null;
+  logs_url: string | null;
+  deliverables_url: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface WorkflowPhaseProjection {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+  steps: WorkflowStepProjection[];
+}
+
+export interface TaskWorkflowProjection {
+  workflow_id: string;
+  workflow_version: number | null;
+  workflow_digest: string | null;
+  current_phase_id: string | null;
+  current_step_name: string | null;
+  phases: WorkflowPhaseProjection[];
 }
 
 export interface TaskComment {
@@ -1960,17 +2391,29 @@ export interface TaskChatResponse {
   session_id: string;
 }
 
+export interface TaskControlChatResponse extends TaskChatResponse {
+  task_id: string;
+  agent_id: string;
+  agent_profile_id: string | null;
+  task_status: string;
+  attempt_number: number;
+}
+
 export interface WorkflowStep {
   name: string;
   type: string;
   description?: string;
   prompt?: string;
+  objective?: string | null;
+  responsibilities?: string[];
+  defer_to?: string[];
   agent_override?: string | null;
   agent_profile_id?: string | null;
   reasoning_effort?: string | null;
   input?: {
     type: string;
     source?: string | string[] | null;
+    reuse_session_from?: string | null;
   } | string | string[] | null;
   allow_questions?: boolean;
   step_profile_id?: string | null;
@@ -1988,6 +2431,48 @@ export interface WorkflowStep {
   on_reject?: Record<string, unknown> | null;
   outcome_routes?: Array<Record<string, unknown>> | null;
   require_deliverable?: boolean;
+  when?: string | null;
+  on_skip?: Record<string, unknown> | null;
+  on_error?: 'fail' | 'continue' | 'skip' | 'gate' | null;
+  next?: string | null;
+  tool_call?: {
+    tool: string;
+    args?: Record<string, unknown>;
+    summary?: string | null;
+    outputs?: Record<string, unknown>;
+    fail_on_error?: boolean;
+    timeout_seconds?: number | null;
+    allow_side_effects?: boolean;
+    redact_args?: string[];
+  } | null;
+  condition?: {
+    if: string;
+    then?: string | null;
+    else?: string | null;
+    output?: Record<string, unknown> | null;
+    revision_source?: string | null;
+    max_loop_iterations?: number | null;
+    on_exhausted?: 'continue' | 'fail' | 'gate';
+  } | null;
+  complete?: {
+    status?: 'completed' | 'failed';
+    summary: string;
+    content?: string | null;
+    outputs?: Record<string, unknown>;
+    notification?: Record<string, unknown> | null;
+    delivery_mode_override?: string | null;
+  } | null;
+}
+
+export interface WorkflowPhaseDefinition {
+  id: string;
+  title: string;
+  description: string;
+  step_names: string[];
+}
+
+export interface WorkflowPresentation {
+  phases: WorkflowPhaseDefinition[];
 }
 
 export interface StepProfileDefinition {
@@ -2016,6 +2501,7 @@ export interface Workflow {
   interaction: Record<string, unknown>;
   defaults: Record<string, unknown>;
   steps: WorkflowStep[];
+  presentation?: WorkflowPresentation | null;
   is_system: boolean;
   owner_email: string | null;
   lifecycle: 'persistent' | 'ephemeral' | string;
@@ -2116,6 +2602,8 @@ export interface ModelEntry {
   supports_file_input: boolean;
   supports_embedding: boolean;
   supports_reasoning: boolean;
+  supports_fast_mode: boolean;
+  fast_mode_tier?: string | null;
   reasoning_efforts: string[];
   supports_prompt_caching: boolean;
   supports_tool_search: boolean;
@@ -2158,6 +2646,7 @@ export function defaultModelEntry(modelId: string): ModelEntry {
     supports_file_input: false,
     supports_embedding: false,
     supports_reasoning: false,
+    supports_fast_mode: false,
     reasoning_efforts: [],
     supports_prompt_caching: false,
     supports_tool_search: false,
@@ -2357,6 +2846,11 @@ export interface WebBackendUpdatePayload {
   searxng_language?: string;
 }
 
+export interface WebDefaultsUpdatePayload {
+  search_backend: 'direct' | 'tavily' | 'brave' | 'searxng';
+  fetch_backend: 'direct' | 'tavily' | 'browser';
+}
+
 export interface ProviderHealth {
   name: string;
   status: string;
@@ -2388,6 +2882,7 @@ export interface Escalation {
   call_id: string;
   session_id: string | null;
   tool_name: string | null;
+  arguments_display?: Record<string, unknown> | null;
   decision: string;
   resolved: boolean;
   reasoning: string | null;
@@ -2494,6 +2989,7 @@ export interface ContextUsage {
   loop_pressure_threshold?: number;
   compaction_threshold?: number | null;
   projection_policy?: ProjectionPolicyUsage | null;
+  last_llm_usage?: TokenUsage;
 }
 
 export interface GenerationPerformanceSnapshot {
@@ -2518,6 +3014,16 @@ export interface GenerationPerformanceSnapshot {
   processor: string | null;
   gpu_residency: string | null;
   measured_at: string;
+}
+
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cached_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_write_tokens?: number;
+  cache_creation_input_tokens?: number;
 }
 
 export interface ProjectionPolicyUsage {
@@ -2801,6 +3307,8 @@ export interface QueuedMessage {
   queue_id: string;
   client_message_id?: string | null;
   content: string;
+  kind?: 'automatic_continuation';
+  continuation_reason?: string | null;
   attachments: AttachmentRef[];
   created_at?: string | null;
   updated_at?: string | null;
@@ -2826,6 +3334,28 @@ export interface WebSocketReconnectedEvent {
   missed_events_count: number;
   last_seq?: number;
   has_active_turn?: boolean;
+}
+
+export interface WebSocketScopeInvalidatedEvent {
+  type: 'scope_invalidated';
+  reason:
+    | 'chat_scope_changed'
+    | 'task_progress_changed'
+    | 'notification_state_changed'
+    | 'executor_state_changed'
+    | 'sidebar_changed';
+  revision: string;
+  conversation_id?: string;
+  session_id?: string;
+  task_id?: string;
+  step_run_id?: string;
+}
+
+export interface WebSocketWorkInvalidatedEvent {
+  type: 'work_invalidated';
+  reason: 'work_invalidated';
+  revision: string;
+  work_scope_key: string;
 }
 
 export interface WebSocketSessionRecoveredEvent {
@@ -3227,6 +3757,8 @@ export type CognisWebSocketEvent =
   | WebSocketQueuedEvent
   | WebSocketQueuedMessagesUpdatedEvent
   | WebSocketReconnectedEvent
+  | WebSocketScopeInvalidatedEvent
+  | WebSocketWorkInvalidatedEvent
   | WebSocketSessionRecoveredEvent
   | WebSocketTtsSentenceReadyEvent
   | WebSocketSidebarConversationUpsertEvent

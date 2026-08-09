@@ -6,9 +6,11 @@ import type {
   LastOpenedConversationCandidate,
   QuestionSetQuestion,
   QuestionSetReply,
+  QueuedMessage,
   SidebarProjection,
 } from '$lib/types/api';
 import { isAuthChallengeToolCall } from '$lib/chat-v2/selectors';
+import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
 import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
 
 export interface ConversationRetryScope {
@@ -16,13 +18,28 @@ export interface ConversationRetryScope {
   history: boolean;
 }
 
-export type ConversationStatusFilter = 'active' | 'starred' | 'archived';
+export type ConversationStatusFilter = 'active' | 'starred' | 'archived' | 'all' | 'task';
 export type ConversationAttentionTone = 'default' | 'amber' | 'rose';
 export type ChatModeTone = 'default' | 'plan' | 'build';
 export type PendingDirectQuestionKind = 'question' | 'auth_challenge';
 export const DEFAULT_INITIAL_TIMELINE_LIMIT = 200;
 export const DIRECT_CHAT_INITIAL_SESSION_LIMIT = 20;
 export const DIRECT_CHAT_INITIAL_TIMELINE_LIMIT = 80;
+
+export async function refreshCachedTimeline<Snapshot, Watermark>(operations: {
+  captureWatermark: () => Watermark;
+  probe: () => Promise<Snapshot | null>;
+  applyIfUnchanged: (snapshot: Snapshot, watermark: Watermark) => boolean;
+  sync: () => Promise<void>;
+}): Promise<'snapshot' | 'sync'> {
+  const watermark = operations.captureWatermark();
+  const snapshot = await operations.probe();
+  if (snapshot !== null && operations.applyIfUnchanged(snapshot, watermark)) {
+    return 'snapshot';
+  }
+  await operations.sync();
+  return 'sync';
+}
 
 export function shouldApplyLegacyLifecycleFrame(chatV2OwnsConversation: boolean): boolean {
   return !chatV2OwnsConversation;
@@ -178,6 +195,90 @@ export function shouldRefreshForStaleRuntime(input: RuntimeStalenessInput): bool
   if (!input.turnInProgress && !input.hasActiveTimelineItem) return false;
   if (input.lastRuntimeAt <= 0) return false;
   return input.now - input.lastRuntimeAt > input.staleMs;
+}
+
+/**
+ * Page-level projection derived from a Chat v2 client state: queue view,
+ * active-turn flags, and the active turn id. This is the single source of
+ * truth the page uses to decide whose turn is "in progress" -- it must be
+ * recomputed from the state actually loaded for the current conversation,
+ * never carried over as a stale scalar from a previous conversation. In
+ * particular, restoring a cached view for conversation B must re-derive
+ * `currentActiveTurnId` from B's own restored state through this function
+ * rather than keep whatever turn id was active for conversation A.
+ */
+export interface ChatV2ViewProjection {
+  queuedMessages: QueuedMessage[];
+  queuedCount: number;
+  turnInProgress: boolean;
+  awaitingAssistantStart: boolean;
+  currentActiveTurnId: string | null;
+}
+
+export function deriveChatV2ViewProjection(state: ChatV2ClientState): ChatV2ViewProjection {
+  const queuedMessages = (state.queue?.messages ?? []) as QueuedMessage[];
+  const turnInProgress = state.runtime?.has_active_turn === true;
+  return {
+    queuedMessages,
+    queuedCount: state.queue?.queued_count ?? queuedMessages.length,
+    turnInProgress,
+    // Restoring or reconciling a state is never itself proof that a fresh
+    // turn just started locally; that flag is set only by the send path.
+    awaitingAssistantStart: false,
+    currentActiveTurnId: turnInProgress ? (state.runtime?.active_turn?.turn_id ?? null) : null,
+  };
+}
+
+/**
+ * Applies the authoritative cached page-level queue fields over a freshly
+ * derived Chat v2 projection, preserving everything else the projection
+ * derived (active-turn identity, turn-in-progress, awaiting-assistant-start).
+ *
+ * `queuedMessages`/`queuedCount` are not solely sourced from
+ * `ChatV2ClientState.queue`: `refreshQueuedMessages()` updates the page-level
+ * fields directly from a dedicated REST call, independent of the Chat v2
+ * store, so the store's `queue` can lag behind what was actually visible and
+ * cached at save time. `saveCurrentConversationView()` always caches the
+ * page-level fields (whichever source last wrote them), so on restore those
+ * cached values -- not whatever `deriveChatV2ViewProjection` just derived from
+ * the restored (possibly stale) store queue -- must win as the authoritative
+ * exact queue for the conversation being restored.
+ */
+export function applyCachedQueueToProjection(
+  projection: ChatV2ViewProjection,
+  cachedQueue: { queuedMessages: QueuedMessage[]; queuedCount: number },
+): ChatV2ViewProjection {
+  return {
+    ...projection,
+    queuedMessages: cachedQueue.queuedMessages,
+    queuedCount: cachedQueue.queuedCount,
+  };
+}
+
+/**
+ * Decides the older-messages pagination cursor to hold after applying a
+ * fresh Chat v2 snapshot. Ordinary recovery (reconnect, outbox drain, cancel)
+ * preserves a deeper cursor already obtained from prior scroll-up backfill,
+ * since the snapshot's own cursor is never deeper than what has already been
+ * fetched. A lineage reset (server reported cursor_mismatch/reset_required,
+ * or no sync cursor could be established at all) invalidates that
+ * assumption -- the previously held cursor may reference an event chain that
+ * no longer exists, so it must always be replaced from the fresh snapshot.
+ */
+export function resolveOlderMessagesCursorAfterSnapshot(params: {
+  currentCursor: string | null;
+  beforeCursor: string | null;
+  hasMoreBefore: boolean;
+  resetLineage: boolean;
+}): { olderMessagesCursor: string | null; hasOlderMessages: boolean } {
+  if (!params.resetLineage && params.currentCursor !== null) {
+    return { olderMessagesCursor: params.currentCursor, hasOlderMessages: true };
+  }
+  const olderMessagesCursor = params.beforeCursor ?? null;
+  return {
+    olderMessagesCursor,
+    hasOlderMessages: Boolean(params.hasMoreBefore && olderMessagesCursor),
+  };
 }
 
 /**
@@ -338,6 +439,13 @@ export function shouldRecoverMissingConversationRow(params: {
 export function shouldApplyPendingNotificationRefresh(params: {
   requestEpoch: number;
   currentEpoch: number | undefined;
+}): boolean {
+  return params.currentEpoch === params.requestEpoch;
+}
+
+export function shouldApplySidebarProjectionRefresh(params: {
+  requestEpoch: number;
+  currentEpoch: number;
 }): boolean {
   return params.currentEpoch === params.requestEpoch;
 }
@@ -614,6 +722,12 @@ export function removeSidebarConversationRow(
 }
 
 export function cloneSidebarProjection(projection: SidebarProjection): SidebarProjection {
+  const backgroundWork = projection.background_work ?? {
+    items: [],
+    active_count: 0,
+    truncated: false,
+    generated_at: new Date(0).toISOString(),
+  };
   return {
     agents: projection.agents.map((agent) => ({ ...agent })),
     agent_direct_chats: projection.agent_direct_chats.map((item) => ({
@@ -626,6 +740,13 @@ export function cloneSidebarProjection(projection: SidebarProjection): SidebarPr
       has_more: projection.conversations.has_more,
     },
     context_types: [...projection.context_types],
+    background_work: {
+      ...backgroundWork,
+      items: backgroundWork.items.map((item) => ({
+        ...item,
+        todos: item.todos.map((todo) => ({ ...todo })),
+      })),
+    },
   };
 }
 
@@ -647,6 +768,12 @@ export function rememberSidebarProjectionSnapshot(
 export function isAgentDirectConversationSummary(conversation: Conversation | null | undefined): boolean {
   return conversation?.context?.type === 'web'
     && conversation.context.platform_data?.kind === 'agent_direct';
+}
+
+export function isTaskControlConversationSummary(
+  conversation: Conversation | null | undefined,
+): boolean {
+  return conversation?.context?.platform_data?.kind === 'task_control';
 }
 
 export function conversationInitialLoadPolicy(
@@ -676,6 +803,13 @@ export function conversationMatchesSidebarProjectionFilter(
 
   const contextType = conversation.context?.type?.toLowerCase() ?? 'unknown';
   const selectedChannels = new Set(filter.selectedChannels.map((channel) => channel.toLowerCase()));
+  const taskControl = isTaskControlConversationSummary(conversation);
+  if (filter.selectedConversationStatus === 'task') {
+    return taskControl
+      && conversation.status === 'active'
+      && (selectedChannels.size === 0 || selectedChannels.has(contextType));
+  }
+  if (taskControl) return false;
   if (isAgentDirectConversationSummary(conversation)) {
     const channelMatches = selectedChannels.size === 0 || selectedChannels.has('web');
     return channelMatches && conversation.status === 'active';
@@ -687,7 +821,18 @@ export function conversationMatchesSidebarProjectionFilter(
 
   if (filter.selectedConversationStatus === 'active') return conversation.status === 'active';
   if (filter.selectedConversationStatus === 'archived') return conversation.status === 'archived';
+  if (filter.selectedConversationStatus === 'all') return conversation.status !== 'deleted';
   return conversation.status === 'active' && Boolean(conversation.starred_at);
+}
+
+export function shouldInsertDirectlyLoadedConversation(
+  conversation: Conversation,
+  filter: SidebarProjectionFilter,
+): boolean {
+  if (filter.selectedConversationStatus === 'task' || isTaskControlConversationSummary(conversation)) {
+    return conversationMatchesSidebarProjectionFilter(conversation, filter);
+  }
+  return true;
 }
 
 export interface FailedTurnRetryTailItem {
@@ -738,13 +883,20 @@ const RECOVERABLE_FAILED_TURN_NOTICE_MARKERS = [
   'Turn failed: the model did not produce output',
 ];
 
-const CONVERSATION_STATUS_FILTERS = new Set<ConversationStatusFilter>(['active', 'starred', 'archived']);
+const CONVERSATION_STATUS_FILTERS = new Set<ConversationStatusFilter>([
+  'active',
+  'starred',
+  'archived',
+  'all',
+  'task',
+]);
 
 export const CHAT_STORAGE_KEYS = {
   enterToSend: 'cognis-chat-enter-to-send',
   selectedAgent: 'cognis-chat-selected-agent',
   selectedChannel: 'cognis-chat-selected-channel',
   sidebarCollapsed: 'cognis-chat-sidebar-collapsed',
+  sidebarWidth: 'cognis-chat-sidebar-width',
   lastOpenedConversation: 'cognis-chat-last-opened-conversation'
 } as const;
 
@@ -756,6 +908,17 @@ export const SESSION_LOG_POLL_INTERVAL_MS = 3000;
 export const SESSION_LOG_POLL_MAX_INTERVAL_MS = 30000;
 export const CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX = 24;
 export const CHAT_USER_SCROLL_DELTA_THRESHOLD_PX = 2;
+export const CHAT_PINNED_INSPECTOR_MIN_WIDTH = 384;
+export const CHAT_PINNED_INSPECTOR_MIN_CHAT_WIDTH = 512;
+export const CHAT_PINNED_INSPECTOR_GAP = 16;
+
+export function conversationInspectorFits(availableWidth: number): boolean {
+  return availableWidth
+    >= CHAT_PINNED_INSPECTOR_MIN_CHAT_WIDTH
+      + CHAT_PINNED_INSPECTOR_MIN_WIDTH
+      + CHAT_PINNED_INSPECTOR_GAP;
+}
+
 /**
  * Distance from the bottom of the rendered rows (px) within which scrolling
  * down triggers downward window re-expansion, so unmounted newer rows remount
@@ -1165,9 +1328,16 @@ export function setConversationStatusSearchParam(params: URLSearchParams, status
 }
 
 export function conversationStatusFilterForConversation(
-  conversation: { status?: string | null; starred_at?: string | null },
+  conversation: {
+    status?: string | null;
+    starred_at?: string | null;
+    context?: { platform_data?: Record<string, unknown> | null } | null;
+  },
   currentFilter: ConversationStatusFilter,
 ): ConversationStatusFilter {
+  if (conversation.context?.platform_data?.kind === 'task_control') return currentFilter;
+  if (currentFilter === 'all') return 'all';
+  if (currentFilter === 'task') return 'active';
   if (currentFilter === 'starred' && conversation.starred_at) return 'starred';
   if (conversation.status === 'archived') return 'archived';
   return 'active';
@@ -1552,6 +1722,17 @@ export function isCurrentConversationLoad(requestId: number, activeRequestId: nu
   return requestId === activeRequestId;
 }
 
+export function startCachedTimelineRefresh(
+  refresh: () => Promise<void>,
+  onSettled: () => void,
+  isCurrent: () => boolean
+): Promise<void> {
+  const timelineRefresh = refresh();
+  return timelineRefresh.finally(() => {
+    if (isCurrent()) onSettled();
+  });
+}
+
 export function shouldReconcileAfterReconnect(params: {
   remoteLastSeq?: number | null;
   activeSessionLastSeq: number;
@@ -1562,6 +1743,67 @@ export function shouldReconcileAfterReconnect(params: {
   if (remoteLastSeq > params.activeSessionLastSeq) return true;
   if (params.remoteHasActiveTurn === false && params.localTurnInProgress) return true;
   return false;
+}
+
+export function shouldRecoverChatV2ForInvalidation(params: {
+  activeConversationId: string;
+  invalidatedConversationId?: string;
+}): boolean {
+  return (
+    !params.invalidatedConversationId
+    || params.invalidatedConversationId === params.activeConversationId
+  );
+}
+
+export class ChatV2CanonicalRecoveryCoalescer {
+  private readonly states = new Map<string, {
+    operation: () => Promise<void>;
+    promise: Promise<void>;
+    rerun: boolean;
+  }>();
+
+  run(scopeKey: string, operation: () => Promise<void>): Promise<void> {
+    const current = this.states.get(scopeKey);
+    if (current) {
+      current.operation = operation;
+      current.rerun = true;
+      return current.promise;
+    }
+    const state = {
+      operation,
+      rerun: false,
+      promise: Promise.resolve()
+    };
+    state.promise = (async () => {
+      try {
+        do {
+          state.rerun = false;
+          await state.operation();
+        } while (state.rerun);
+      } finally {
+        if (this.states.get(scopeKey) === state) {
+          this.states.delete(scopeKey);
+        }
+      }
+    })();
+    this.states.set(scopeKey, state);
+    return state.promise;
+  }
+
+  clear(): void {
+    this.states.clear();
+  }
+}
+
+export function shouldSnapshotAfterChatV2Sync(params: {
+  resetRequired: boolean;
+  outcome: string;
+}): boolean {
+  return (
+    params.resetRequired
+    || params.outcome === 'reset_required'
+    || params.outcome === 'cursor_mismatch'
+  );
 }
 
 export function getConversationRetryScope(errors: {

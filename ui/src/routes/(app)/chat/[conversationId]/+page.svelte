@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
-  import { onMount, tick, untrack } from 'svelte';
+  import { onMount, setContext, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { fade } from 'svelte/transition';
 import ArrowLeft from 'lucide-svelte/icons/arrow-left';
@@ -15,6 +15,7 @@ import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import Copy from 'lucide-svelte/icons/copy';
 import ExternalLink from 'lucide-svelte/icons/external-link';
+import FileCode2 from 'lucide-svelte/icons/file-code-2';
 import Headphones from 'lucide-svelte/icons/headphones';
 import Info from 'lucide-svelte/icons/info';
 import ListPlus from 'lucide-svelte/icons/list-plus';
@@ -25,8 +26,12 @@ import Star from 'lucide-svelte/icons/star';
 import X from 'lucide-svelte/icons/x';
 
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
   import AgentProfilePopover from '$lib/components/AgentProfilePopover.svelte';
   import ChatSearchBar from '$lib/components/ChatSearchBar.svelte';
+  import ConversationInfoDrawer from '$lib/components/ConversationInfoDrawer.svelte';
+  import ActivityTree from '$lib/components/ActivityTree.svelte';
+  import InspectorOverview from '$lib/components/InspectorOverview.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
   import ConversationMode from '$lib/components/ConversationMode.svelte';
@@ -36,11 +41,13 @@ import X from 'lucide-svelte/icons/x';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import ChatV2TimelineList from '$lib/components/chat-v2/ChatV2TimelineList.svelte';
-  import ScopedChatV2Timeline from '$lib/components/chat-v2/ScopedChatV2Timeline.svelte';
+  import ChildChatView from '$lib/components/chat-v2/ChildChatView.svelte';
+  import ManagedConversationControls from '$lib/components/ManagedConversationControls.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
   import SessionDetailsContent from '$lib/components/session/SessionDetailsContent.svelte';
-  import SessionDetailsPanel from '$lib/components/session/SessionDetailsPanel.svelte';
-  import TimelineTodoDrawer from '$lib/components/timeline/TimelineTodoDrawer.svelte';
+  import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
+  import WorkView from '$lib/components/work/WorkView.svelte';
+  import TimelineOngoingWorkDrawer from '$lib/components/timeline/TimelineOngoingWorkDrawer.svelte';
   import TimelineViewport from '$lib/components/timeline/TimelineViewport.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -50,12 +57,26 @@ import X from 'lucide-svelte/icons/x';
   import PullToRefresh from '$lib/components/ui/PullToRefresh.svelte';
   import { api, asApiError } from '$lib/api/client';
   import {
+    getActivityOverview,
+    getActivityOverviewEntry,
+    invalidateActivityOverview,
+    requestActivityOverview,
+    visibleSnapshotOverview,
+  } from '$lib/activityOverviewCache';
+  import {
+    getSessionInfo,
+    setSessionInfo,
+    type SessionInfoData,
+  } from '$lib/sessionInfoCache';
+  import { acceptsSessionDiagnostics, diagnosticsForSession } from '$lib/sessionDiagnostics';
+  import {
     buildConversationUrl,
     CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
     CHAT_USER_SCROLL_DELTA_THRESHOLD_PX,
     CHAT_TIMELINE_EXPAND_DOWN_THRESHOLD_PX,
     conversationPendingSnapshotFlags,
     conversationMatchesSidebarProjectionFilter,
+    shouldInsertDirectlyLoadedConversation,
     conversationAttentionDotClass,
     conversationAttentionLabel,
     conversationAttentionOrbitClass,
@@ -78,6 +99,7 @@ import X from 'lucide-svelte/icons/x';
     isNearScrollBottom,
     isMissingSessionError,
     isCurrentConversationLoad,
+    startCachedTimelineRefresh,
     isForeignSessionTimelineEvent,
     isLastOpenedConversationStorageKey,
     isAgentDirectConversationSummary,
@@ -120,6 +142,7 @@ import X from 'lucide-svelte/icons/x';
     type TimelineWindow,
     shouldAttemptStaleRuntimeRefresh,
     shouldApplyPendingNotificationRefresh,
+    shouldApplySidebarProjectionRefresh,
     shouldDebounceConversationViewRefresh,
     shouldDebounceSidebarResync,
     shouldRecoverMissingConversationRow,
@@ -130,10 +153,17 @@ import X from 'lucide-svelte/icons/x';
     shouldClearRecoverableRetry,
     settleWithTimeout,
     shouldReconcileAfterReconnect,
+    shouldRecoverChatV2ForInvalidation,
+    shouldSnapshotAfterChatV2Sync,
+    ChatV2CanonicalRecoveryCoalescer,
     nextControllerRecoveryDelayMs,
     shouldContinueControllerRecovery,
     shouldPreserveLiveTailOnResize,
     shouldRefreshForStaleRuntime,
+    deriveChatV2ViewProjection,
+    applyCachedQueueToProjection,
+    resolveOlderMessagesCursorAfterSnapshot,
+    refreshCachedTimeline,
     isRuntimeSnapshotOlderThanView,
     shouldAdoptConversationSessionId,
     shouldSuppressPreSessionSocketError,
@@ -144,6 +174,7 @@ import X from 'lucide-svelte/icons/x';
     type ConversationStatusFilter,
     type PendingDirectQuestion,
     CHAT_STORAGE_KEYS,
+    conversationInspectorFits,
     CONVERSATION_SWITCH_TIMEOUT_MS,
     SESSION_LOG_POLL_INTERVAL_MS
   } from '$lib/chat-page';
@@ -152,8 +183,10 @@ import X from 'lucide-svelte/icons/x';
   import { auth } from '$lib/stores/auth';
   import { confirmAction } from '$lib/stores/confirm';
   import { mobileNavOpen as mobileNavOpenStore, requestOpenMobileNav } from '$lib/stores/mobileNav';
+  import { conversationInfoDrawer } from '$lib/stores/conversationInfo.svelte';
   import { registerOverlay } from '$lib/stores/overlays';
-  import { canAttemptPwaAuxiliaryWindow } from '$lib/stores/pwa';
+  import { invalidateWorkFromSocket, invalidateWorkScope } from '$lib/work/workViewState';
+  import { canAttemptPwaAuxiliaryWindow, displayMode } from '$lib/stores/pwa';
   import { onTabReset } from '$lib/stores/tabReset';
   import { addToast } from '$lib/stores/toasts';
   import { loadUserPreferences, userPreferences } from '$lib/stores/userPreferences';
@@ -199,20 +232,49 @@ import X from 'lucide-svelte/icons/x';
     parseChatModeDirectiveInput,
     slashParameterSuggestionCommand
   } from '$lib/slash-commands';
-  import { chatV2Api } from '$lib/chat-v2/api';
-  import { conversationTimelineScope } from '$lib/chat-v2/types';
+   import { chatV2Api } from '$lib/chat-v2/api';
+   import { conversationActivityState } from '$lib/conversation-activity';
+   import { createClientPerformanceTiming } from '$lib/chat-v2/client-performance';
+    import {
+      shouldAwaitCanonicalUserMessage,
+      shouldRenderOptimisticUserMessage
+    } from '$lib/chat-v2/oversized-message';
+  import { forkAssistantMessageContext, type ForkAssistantMessage } from '$lib/chat-message-actions';
+   import { conversationTimelineScope, sessionTimelineScope, type ActivityOverviewResponse, type TimelineScope, type WorkCategory, type WorkstreamRef } from '$lib/chat-v2/types';
   import { MemoryChatV2Outbox, createIndexedDbChatV2Outbox, type OutboxEntry } from '$lib/chat-v2/outbox';
   import { ChatV2Store } from '$lib/chat-v2/store.svelte';
   import { isRenderableTimelineItem, selectLatestTodoState, selectPendingInputToolCall } from '$lib/chat-v2/selectors';
   import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
   import type { ChatRealtimeFrame, ChatSnapshot, TimelineItem as ChatV2TimelineItem } from '$lib/chat-v2/types';
   import { incompleteTodos, visibleTodos as activeVisibleTodos } from '$lib/todos';
+  import { backgroundWorkItemIsRunning, currentCycleDelegations, mergeCurrentCycleDelegations, overlayManagedConversationStatus } from '$lib/ongoing-work';
   import {
-    localPerformanceMetrics,
-    mergeLatestPerformance,
-    responsivenessBadge
+     localPerformanceMetrics,
+     mergeLatestPerformance,
+     responsivenessBadgeOrNull
   } from '$lib/generation-performance';
-  import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, ConversationTodoItem, Escalation, GenerationPerformanceSnapshot, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection, SlashCommandSuggestion } from '$lib/types/api';
+  import {
+    rootOverviewForConversation,
+    canonicalWorkstreamSessionId,
+    selectedWorkSubtreeScope,
+    structuralParentSessionId,
+    traverseInspectorSession,
+    workstreamForSession,
+  } from '$lib/inspectorTreeNavigation';
+  import {
+    childViewForWorkstream,
+    childViewScope,
+    childViewWorkstream,
+    controllerRootConversationId,
+    eventNeedsTreeRefresh,
+    parentChildView,
+    type ChildView,
+  } from '$lib/childView';
+  import {
+    promoteRootOverview,
+    RootOverviewRequestEpoch,
+  } from '$lib/rootOverviewRequestEpoch';
+   import type { ActiveThinkingSnapshot, Agent, AgentDirectChat, AttachmentRef, BackgroundWorkItem, BackgroundWorkProjection, CognisWebSocketEvent, ContextUsage, Conversation, ConversationSearchMatch, ConversationStateEnvelope, ConversationTodoItem, Escalation, GenerationPerformanceSnapshot, MessageEvent, Notification, QueuedMessage, QuestionSetAnswer, QuestionSetQuestion, QuestionSetReply, Session, SidebarProjection, SlashCommandSuggestion } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
   import { isNonFatalWebSocketBackpressureError } from '$lib/ws/errors';
 
@@ -240,6 +302,7 @@ import X from 'lucide-svelte/icons/x';
   let expandedSearchSessionIds = $state<string[]>([]);
   let searchEnabled = $state(true);
   let isWindowMode = $derived(page.url.searchParams.get('window') === '1');
+  let isStandalonePwa = $derived($displayMode === 'standalone');
   let canOpenAuxiliaryWindow = $derived(canAttemptPwaAuxiliaryWindow());
   let chatSearchOpen = $state(false);
   let chatSearchQuery = $state('');
@@ -253,6 +316,12 @@ import X from 'lucide-svelte/icons/x';
   let lastChatSearchConversationId = '';
   let agents = $state<Agent[]>([]);
   let agentDirectChats = $state<AgentDirectChat[]>([]);
+  let backgroundWork = $state<BackgroundWorkProjection>({
+    items: [],
+    active_count: 0,
+    truncated: false,
+    generated_at: new Date(0).toISOString(),
+  });
   let sidebarProjectionLoaded = $state(false);
   let sidebarProjectionFailed = $state(false);
   let currentConversation = $state<Conversation | null>(null);
@@ -261,6 +330,7 @@ import X from 'lucide-svelte/icons/x';
   let conversationTodoSnapshots = $state<Record<string, ChatTodo[]>>({});
   let conversationSubloadsLoading = $state(false);
   let cachedConversationRefreshing = $state(false);
+  let canonicalTimelineApplyRevision = 0;
   let composer = $state('');
   let composerElement = $state<HTMLTextAreaElement | null>(null);
   let composerAttachments = $state<AttachmentRef[]>([]);
@@ -317,12 +387,93 @@ import X from 'lucide-svelte/icons/x';
   let conversationFiltersOpen = $state(true);
   let agentFilterDropdownOpen = $state(false);
   let channelFilterDropdownOpen = $state(false);
-  // Unified flag for the expanded header info panel. Replaces the older
-  // pair of `sessionInfoOpen` (desktop popover) + `mobileHeaderDetailsOpen`
-  // (mobile-only panel) with one state so the Info button has a single,
-  // predictable effect regardless of viewport size.
-  let headerInfoOpen = $state(false);
-  let headerInfoMode = $state<'full' | 'context'>('full');
+  let headerInfoOpen = $derived(conversationInfoDrawer.open);
+  let headerInfoMode = $derived(conversationInfoDrawer.mode);
+  let headerInfoTrigger: HTMLElement | null = null;
+  let headerInfoConversationId: string | null = null;
+  let focusedSessionId = $state<string | null>(null);
+  let childView = $state<ChildView | null>(null);
+  let focusedWorkCategory = $state<WorkCategory>('files');
+  let activityOverview = $state<ActivityOverviewResponse | null>(null);
+  let rootActivityOverview = $state<ActivityOverviewResponse | null>(null);
+  let activityOverviewLoading = $state(false);
+  let activityOverviewLoadingScopeKey = $state<string | null>(null);
+  let activityOverviewGeneration = 0;
+  let activityOverviewError = $state<string | null>(null);
+  let treeRootConversationId = $derived(
+    currentConversation ? controllerRootConversationId(currentConversation) : null,
+  );
+  let scopedRootActivityOverview = $derived(rootOverviewForConversation(
+    rootActivityOverview,
+    treeRootConversationId,
+  ) ?? rootOverviewForConversation(
+    rootActivityOverview,
+    currentConversation?.conversation_id,
+  ));
+  let renderedActivityOverview = $derived(activityOverview
+    ? { ...activityOverview, workstreams: scopedRootActivityOverview?.workstreams ?? activityOverview.workstreams }
+    : scopedRootActivityOverview);
+  let directManagedWorkstream = $derived(
+    currentConversation?.managed_agent
+      ? renderedActivityOverview?.workstreams.find(
+          (node) => node.conversation_id === currentConversation?.conversation_id,
+        ) ?? null
+      : null,
+  );
+  let focusedWorkstream = $derived(focusedSessionId
+    ? workstreamForSession(renderedActivityOverview?.workstreams ?? [], focusedSessionId)
+    : directManagedWorkstream ?? renderedActivityOverview?.workstreams.find((node) => node.current) ?? null);
+  let canonicalFocusedSessionId = $derived(
+    focusedSessionId ? focusedWorkstream?.session_id ?? focusedSessionId : null
+  );
+  let treeFocusedSessionId = $derived(
+    canonicalFocusedSessionId ?? directManagedWorkstream?.session_id ?? null,
+  );
+  let deepLinkConsumedFor: string | null = null;
+  let chatShellElement = $state<HTMLElement | null>(null);
+  let chatShellWidth = $state(0);
+  let isTaskControlMode = $derived(page.url.searchParams.get('taskControl') === '1');
+  function requestTaskAgentDockMinimize(): void {
+    if (!isTaskControlMode || window.parent === window) return;
+    window.parent.postMessage({ type: 'cognis:task-agent-dock:minimize' }, window.location.origin);
+  }
+  function taskControlFocusableElements(): HTMLElement[] {
+    return Array.from(document.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), iframe, [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => element.getClientRects().length > 0 && element.getAttribute('aria-hidden') !== 'true');
+  }
+
+  function handleTaskControlFocusBoundary(event: KeyboardEvent): void {
+    if (!isTaskControlMode || event.key !== 'Tab' || window.parent === window) return;
+    const elements = taskControlFocusableElements();
+    const active = document.activeElement;
+    const atBoundary = event.shiftKey ? active === elements[0] : active === elements.at(-1);
+    if (!atBoundary) return;
+    event.preventDefault();
+    window.parent.postMessage({
+      type: 'cognis:task-agent-dock:focus-boundary',
+      direction: event.shiftKey ? 'backward' : 'forward'
+    }, window.location.origin);
+  }
+  $effect(() => {
+    const requestedView = page.url.searchParams.get('view');
+    const loadedConversationId = currentConversation?.conversation_id;
+    if (requestedView !== 'work' || !loadedConversationId || deepLinkConsumedFor === loadedConversationId) return;
+    deepLinkConsumedFor = loadedConversationId;
+    conversationInfoDrawer.mode = 'work';
+    conversationInfoDrawer.setOpen(true);
+  });
+  $effect(() => {
+    conversationInfoDrawer.hydrate();
+  });
+  $effect(() => {
+    if (!chatShellElement || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(([entry]) => {
+      chatShellWidth = entry?.contentRect.width ?? 0;
+    });
+    observer.observe(chatShellElement);
+    return () => observer.disconnect();
+  });
   // Default to iMessage-style: Enter inserts a newline and the user taps
   // the send button (or presses Cmd/Ctrl+Enter) to submit. Users who
   // previously opted into Enter-to-send keep their choice via localStorage.
@@ -361,6 +512,7 @@ import X from 'lucide-svelte/icons/x';
   let lastConversationViewRefreshAt = 0;
   let lastSidebarSyncAt = 0;
   let lastSidebarSyncTimestamp: string | null = null;
+  let sidebarProjectionRefreshEpoch = 0;
   let pendingNotificationEpoch = 0;
   const pendingNotificationEpochByConversation = new Map<string, number>();
   const missingConversationRecoveryAt = new Map<string, number>();
@@ -394,6 +546,10 @@ import X from 'lucide-svelte/icons/x';
   let pushDeliveryError = $state('');
   let awaitingAssistantStart = $state(false);
   let turnInProgress = $state(false);
+  let cancelTurnPendingConversationId = $state<string | null>(null);
+  let cancelTurnPending = $derived(
+    currentConversation?.conversation_id === cancelTurnPendingConversationId
+  );
   // Track the turn_id of the most recently settled/cancelled turn.
   let lastSettledTurnId = $state<string | null>(null);
   // Track the turn_id of the currently running turn (set on turn_started).
@@ -414,9 +570,19 @@ import X from 'lucide-svelte/icons/x';
   let ignoreNextTitleBlur = $state(false);
   let sessionIdCopied = $state(false);
   let showAgentProfile = $state(false);
-  let subSessionPanelOpen = $state(false);
-  let subSessionClosing = $state(false);
-  let subSessionId = $state('');
+  let childWorkstream = $derived(childViewWorkstream(
+    renderedActivityOverview?.workstreams ?? [],
+    childView,
+  ));
+  let childManagedConversation = $state<Conversation | null>(null);
+  let childManagedBusy = $state<string | null>(null);
+  let childManagedError = $state('');
+  let childBackgroundWork = $derived(backgroundWork.items.filter((item) => (
+    childView?.kind === 'managed'
+      ? item.target_conversation_id === childView.conversationId
+        || item.controller_conversation_id === childView.conversationId
+      : childView?.kind === 'delegate' && item.session_id === childView.sessionId
+  )));
   let subSessionUserScrolledUp = $state(false);
   let timelineEl = $state<HTMLDivElement | null>(null);
   let timelineContentEl = $state<HTMLDivElement | null>(null);
@@ -439,36 +605,81 @@ import X from 'lucide-svelte/icons/x';
   let footerChromeEl = $state<HTMLDivElement | null>(null);
   let selectedChannels = $state<string[]>([]);
   let chatSidebarCollapsed = $state(false);
+  let chatSidebarWidth = $state(304);
+  const CHAT_SIDEBAR_MIN_WIDTH = 240;
+  const CHAT_SIDEBAR_MAX_WIDTH = 480;
+  let compactSidebarForInspector = $derived(false);
+  let canPinInspector = $derived(
+    conversationInspectorFits(
+      chatShellWidth - (
+        chatSidebarCollapsed || isWindowMode
+          ? 0
+          : chatSidebarWidth
+      ),
+    )
+  );
+  let effectiveInspectorWidth = $derived(Math.min(
+    conversationInfoDrawer.preferredWidth,
+    Math.max(384, chatShellWidth - (chatSidebarCollapsed || isWindowMode ? 0 : chatSidebarWidth) - 512 - 16),
+  ));
+  let inspectorPresentation = $derived(conversationInfoDrawer.presentation(canPinInspector));
+  let inspectorPinned = $derived(inspectorPresentation === 'pinned');
   const chatV2CanonicalRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const chatV2CanonicalRecoveryInFlight = new Set<string>();
+  const chatV2CanonicalRecoveryCoalescer = new ChatV2CanonicalRecoveryCoalescer();
   // Set when a recovery is requested while one is already in flight. The
   // in-flight recovery re-runs once on completion instead of being silently
   // dropped. Without this, a debounced mid-turn sync (whose server-side event
   // read predates the assistant-message flush) swallows the immediate settle
   // recovery, and the just-streamed final message stays missing until reload.
-  const chatV2CanonicalRecoveryRerun = new Set<string>();
   const CHAT_V2_CANONICAL_RECOVERY_DEBOUNCE_MS = 1_000;
 
-  function applyChatV2Snapshot(snapshot: ChatSnapshot): void {
-    chatV2Store.replaceFromSnapshot(snapshot);
+  function applyChatV2Snapshot(
+    snapshot: ChatSnapshot,
+    options: {
+      resetLineage?: boolean;
+      refreshWatermark?: ReturnType<ChatV2Store['refreshWatermark']>;
+    } = {}
+  ): boolean {
+    if (options.refreshWatermark) {
+      if (!chatV2Store.replaceFromSnapshotIfUnchanged(snapshot, options.refreshWatermark)) {
+        return false;
+      }
+    } else {
+      chatV2Store.replaceFromSnapshot(snapshot);
+    }
     conversationViewServerTimeMs = Date.parse(snapshot.server_time) || Date.now();
     lastConversationViewRefreshAt = Date.now();
     lastRuntimeSnapshotAt = Date.now();
     applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
     applyLastGenerationSnapshot(chatV2Store.snapshot.runtime?.last_generation);
+    const snapshotOverview = visibleSnapshotOverview(snapshot, inspectorScope?.key);
+    const snapshotRoot = rootOverviewForConversation(snapshot.activity_overview ?? null, treeRootConversationId);
+    if (snapshotRoot) rootActivityOverview = snapshotRoot;
+    if (snapshotOverview) activityOverview = snapshotOverview;
     // Refresh the older-history cursor from the snapshot when we do not already
-    // hold one. Without this, a snapshot recovery (reconnect, outbox drain,
-    // cancel) left olderMessagesCursor stale/empty and subsequent scroll-up
-    // backfills became no-ops. A deeper cursor from prior backfill is kept.
-    if (olderMessagesCursor === null) {
-      olderMessagesCursor = snapshot.timeline.before_cursor ?? null;
-      hasOlderMessages = Boolean(snapshot.timeline.has_more_before && olderMessagesCursor);
-    }
+    // hold one, or when the caller explicitly signals a lineage reset (e.g. a
+    // cursor_mismatch/reset_required fallback, or no sync cursor could be
+    // established at all). Without this, a snapshot recovery (reconnect,
+    // outbox drain, cancel) left olderMessagesCursor stale/empty and
+    // subsequent scroll-up backfills became no-ops. A deeper cursor from prior
+    // backfill is kept in the ordinary (non-reset) case. On a lineage reset a
+    // previously held cursor may reference an event chain that no longer
+    // exists (e.g. it was restored from a cached view of an older lineage), so
+    // it must always be replaced from the fresh snapshot instead of preserved.
+    const cursorResolution = resolveOlderMessagesCursorAfterSnapshot({
+      currentCursor: olderMessagesCursor,
+      beforeCursor: snapshot.timeline.before_cursor ?? null,
+      hasMoreBefore: snapshot.timeline.has_more_before,
+      resetLineage: options.resetLineage === true,
+    });
+    olderMessagesCursor = cursorResolution.olderMessagesCursor;
+    hasOlderMessages = cursorResolution.hasOlderMessages;
     applyChatV2StateToTimeline();
     chatV2Lifecycle.acceptSnapshot(
       conversationTimelineScope(snapshot.conversation.conversation_id),
       snapshot.cursor,
     );
+    return true;
   }
 
   function chatV2OwnsActiveConversation(conversationId: string | null = conversationIdFromRoute()): boolean {
@@ -482,6 +693,27 @@ import X from 'lucide-svelte/icons/x';
   function chatV2RecoveryMatchesRoute(conversationId: string): boolean {
     return shouldApplyChatV2Recovery(conversationId, conversationIdFromRoute());
   }
+
+  // A->B->A recovery race: this conversationId-vs-route check alone does not
+  // distinguish a genuinely fresh recovery for A from a late response to an
+  // A recovery request that was still in flight when the user switched away
+  // to B and back to A -- both see the same conversationId once back on A.
+  // This is intentionally left as conversationId-only: the actual staleness
+  // protection is the cursor_before check in
+  // chat-v2/sync-engine.ts:applySyncLike (state.cursor is reset to the cached
+  // entry's cursor by chatV2Store.restoreState() on cached restore). A late
+  // response either matches that basis cursor -- meaning nothing else
+  // advanced state in the meantime, so applying it is correct regardless of
+  // the intervening B visit -- or it is rejected as 'cursor_mismatch' and
+  // routed to a resetLineage snapshot. The
+  // ChatV2CanonicalRecoveryCoalescer additionally coalesces concurrent
+  // recoverChatV2Canonical() calls per conversationId, so a reissue after
+  // cached restore never races a duplicate request against the in-flight
+  // one. See sync-engine.test.ts: "rejects a late canonical-recovery sync
+  // response for A that resolves after A->B->A switching advanced state past
+  // its basis cursor" for the proof this relies on.
+
+
 
   async function applyChatV2Frame(frame: ChatRealtimeFrame): Promise<void> {
     const previousStatus = chatV2Store.snapshot.syncStatus;
@@ -519,67 +751,91 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  async function recoverChatV2Canonical(conversationId: string): Promise<void> {
-    if (!chatV2RecoveryMatchesRoute(conversationId)) return;
-    if (chatV2CanonicalRecoveryInFlight.has(conversationId)) {
-      // A recovery is already running. Mark a re-run so the in-flight call
-      // fetches once more after it finishes — the current in-flight sync may
-      // have started before the events we now need were flushed.
-      chatV2CanonicalRecoveryRerun.add(conversationId);
-      return;
-    }
-    chatV2CanonicalRecoveryInFlight.add(conversationId);
-    try {
+  async function recoverChatV2Canonical(
+    conversationId: string,
+    requestId?: number
+  ): Promise<void> {
+    const matchesLoad = () => (
+      chatV2RecoveryMatchesRoute(conversationId)
+      && (requestId === undefined || !isStaleConversationLoad(requestId))
+    );
+    if (!matchesLoad()) return;
+    return chatV2CanonicalRecoveryCoalescer.run(conversationId, async () => {
+      if (!matchesLoad()) return;
+      try {
       const cursor = chatV2Store.snapshot.conversationId === conversationId
         ? chatV2Store.snapshot.cursor
         : null;
       if (!cursor) {
-        await recoverChatV2Snapshot(conversationId);
+        // No basis for incremental sync at all (nothing loaded yet, or the
+        // store does not own this conversation). Any pagination cursor
+        // currently held cannot be trusted to align with a lineage we have
+        // no sync cursor for, so this is a lineage reset for cursor purposes.
+        await recoverChatV2Snapshot(conversationId, { resetLineage: true }, requestId);
         return;
       }
       const response = await chatV2Api.sync(conversationId, cursor);
-      if (!chatV2RecoveryMatchesRoute(conversationId)) return;
+      if (!matchesLoad()) return;
       const result = chatV2Store.applySync(response);
-      if (response.reset_required || result.outcome === 'reset_required' || result.outcome === 'cursor_mismatch') {
-        await recoverChatV2Snapshot(conversationId);
+      if (shouldSnapshotAfterChatV2Sync({
+        resetRequired: response.reset_required,
+        outcome: result.outcome,
+      })) {
+        // The server reported a reset/cursor mismatch the sync engine cannot
+        // recover from: the event lineage changed underneath us, so any
+        // previously held older-messages cursor (including one restored from
+        // a cached view) must be replaced from the fresh snapshot rather than
+        // preserved.
+        await recoverChatV2Snapshot(conversationId, { resetLineage: true }, requestId);
         return;
       }
       applyContextUsageSnapshot(chatV2Store.snapshot.runtime?.context_usage);
       applyLastGenerationSnapshot(chatV2Store.snapshot.runtime?.last_generation);
       applyChatV2StateToTimeline();
+      canonicalTimelineApplyRevision += 1;
       if (chatV2Store.snapshot.cursor) {
         wsClient.updateChatV2Cursor(conversationId, chatV2Store.snapshot.cursor);
       }
-    } catch (error) {
-      if (!chatV2RecoveryMatchesRoute(conversationId)) return;
-      const apiError = asApiError(error);
-      if (apiError.status === 503 || apiError.code === 'event_store_unavailable') {
-        historyError = apiError.message;
-        markControllerUnavailable(error);
-        return;
-      }
-      await recoverChatV2Snapshot(conversationId);
-    } finally {
-      chatV2CanonicalRecoveryInFlight.delete(conversationId);
-      if (chatV2CanonicalRecoveryRerun.delete(conversationId)) {
-        // A recovery was requested while this one ran. Run it again so the
-        // freshly flushed canonical events (e.g. the settle assistant message)
-        // are pulled. Guard against unbounded loops: this only re-runs once per
-        // in-flight completion, and each re-run advances the cursor watermark.
-        if (chatV2OwnsActiveConversation(conversationId)) {
-          void recoverChatV2Canonical(conversationId);
+      // A successful incremental sync is proof the conversation's runtime
+      // view is now current, exactly like a full snapshot. Without bumping
+      // these markers here, a cached-restore reconciliation that lands via
+      // this branch (rather than a fallback snapshot) leaves them at their
+      // pre-switch values; if that stale timestamp is already older than
+      // STALE_RUNTIME_REFRESH_MS, the periodic stale-runtime guard fires a
+      // redundant full refreshConversationView() moments later, undoing the
+      // point of reconciling incrementally.
+      lastConversationViewRefreshAt = Date.now();
+      lastRuntimeSnapshotAt = Date.now();
+      } catch (error) {
+        if (!matchesLoad()) return;
+        const apiError = asApiError(error);
+        if (apiError.status === 503 || apiError.code === 'event_store_unavailable') {
+          historyError = apiError.message;
+          markControllerUnavailable(error);
+          return;
         }
+        await recoverChatV2Snapshot(conversationId, {}, requestId);
       }
-    }
+    });
   }
 
-  async function recoverChatV2Snapshot(conversationId: string): Promise<void> {
-    if (!chatV2RecoveryMatchesRoute(conversationId)) return;
+  async function recoverChatV2Snapshot(
+    conversationId: string,
+    options: { resetLineage?: boolean } = {},
+    requestId?: number,
+  ): Promise<void> {
+    const matchesLoad = () => (
+      chatV2RecoveryMatchesRoute(conversationId)
+      && (requestId === undefined || !isStaleConversationLoad(requestId))
+    );
+    if (!matchesLoad()) return;
     try {
       const snapshot = await chatV2Api.snapshot(conversationId);
-      if (!chatV2RecoveryMatchesRoute(conversationId)) return;
-      applyChatV2Snapshot(snapshot);
+      if (!matchesLoad()) return;
+      applyChatV2Snapshot(snapshot, options);
+      canonicalTimelineApplyRevision += 1;
     } catch (error) {
+      if (!matchesLoad()) return;
       const failureMessage = asApiError(error).message;
       if (conversationIdFromRoute() !== conversationId) {
         reportError(error);
@@ -609,12 +865,23 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function cancelActiveTurnWithChatV2(): void {
-    if (!currentConversation || !turnInProgress) return;
+    if (!currentConversation || !turnInProgress || cancelTurnPending) return;
     const cancelConversationId = currentConversation.conversation_id;
+    cancelTurnPendingConversationId = cancelConversationId;
     void chatV2Api.cancelTurn(cancelConversationId, {
       client_txn_id: crypto.randomUUID()
-    }).then(() => recoverChatV2Snapshot(cancelConversationId)).catch((caughtError) => {
+    }).then(async (response) => {
+      if (chatV2OwnsActiveConversation(cancelConversationId)) {
+        chatV2Store.applyCancel(response);
+        applyChatV2StateToTimeline();
+      }
+      await recoverChatV2Snapshot(cancelConversationId);
+    }).catch((caughtError) => {
       addToast(asApiError(caughtError).message, 'error');
+    }).finally(() => {
+      if (cancelTurnPendingConversationId === cancelConversationId) {
+        cancelTurnPendingConversationId = null;
+      }
     });
   }
 
@@ -664,12 +931,15 @@ import X from 'lucide-svelte/icons/x';
             updated_at: new Date().toISOString(),
             last_error: undefined
           });
-          await chatV2Api.sendMessage(entry.conversation_id, entry.client_txn_id, {
+          const response = await chatV2Api.sendMessage(entry.conversation_id, entry.client_txn_id, {
             content: entry.content,
             attachments: entry.attachments,
             client_message_id: entry.client_message_id,
             chat_mode: entry.chat_mode
           });
+          if (chatV2OwnsActiveConversation(entry.conversation_id)) {
+            chatV2Store.applySend(response);
+          }
           await chatV2Outbox.update(entry.client_txn_id, {
             status: 'acked',
             updated_at: new Date().toISOString(),
@@ -700,13 +970,12 @@ import X from 'lucide-svelte/icons/x';
   // imperative timeline mutation is needed here. Scroll position is owned by
   // the Chat v2 viewport (anchor/follow), not by replacement side effects.
   function applyChatV2StateToTimeline(): void {
-    const state = chatV2Store.snapshot;
-    queuedMessages = (state.queue?.messages ?? []) as QueuedMessage[];
-    queuedCount = state.queue?.queued_count ?? queuedMessages.length;
-    turnInProgress = state.runtime?.has_active_turn === true;
-    awaitingAssistantStart = false;
-    currentActiveTurnId = state.runtime?.active_turn?.turn_id ?? null;
-    if (!turnInProgress) currentActiveTurnId = null;
+    const projection = deriveChatV2ViewProjection(chatV2Store.snapshot);
+    queuedMessages = projection.queuedMessages;
+    queuedCount = projection.queuedCount;
+    turnInProgress = projection.turnInProgress;
+    awaitingAssistantStart = projection.awaitingAssistantStart;
+    currentActiveTurnId = projection.currentActiveTurnId;
     shrinkTailWindowIfPinned();
     lastRenderableVisibleCount = renderableVisibleItems.length;
   }
@@ -789,7 +1058,8 @@ import X from 'lucide-svelte/icons/x';
     }
     appendChatV2LocalSystemMessage(
       response.text,
-      `rest:${response.result_type}:${response.client_txn_id}`
+      `rest:${response.result_type}:${response.client_txn_id}`,
+      typeof data.notice_id === 'string' ? data.notice_id : undefined
     );
   }
 
@@ -802,18 +1072,22 @@ import X from 'lucide-svelte/icons/x';
     }
   }
 
-  interface SessionInfoData {
-    intaris_session_id: string;
-    intention: string | null;
-    summary: string | null;
-    status: string;
-    total_calls: number;
-    approved_count: number;
-    denied_count: number;
-    escalated_count: number;
-    context_usage?: ContextUsage | null;
-    last_generation?: GenerationPerformanceSnapshot | null;
-  }
+  const forkAssistantMessage: ForkAssistantMessage = async (sourceSessionId, sourceSeq) => {
+    if (!currentConversation) return;
+    try {
+      const fork = await chatV2Api.forkAssistantMessage(currentConversation.conversation_id, {
+        source_session_id: sourceSessionId,
+        source_seq: sourceSeq
+      });
+      addToast('Conversation forked.', 'success');
+      await goto(conversationUrl(fork.conversation_id));
+    } catch (caughtError) {
+      addToast(asApiError(caughtError).message, 'error', 4000, 'Unable to fork conversation');
+      throw caughtError;
+    }
+  };
+  setContext(forkAssistantMessageContext, forkAssistantMessage);
+
   let sessionInfo = $state<SessionInfoData | null>(null);
   let sessionInfoLoading = $state(false);
   let sessionInfoRequestId = 0;
@@ -942,19 +1216,41 @@ import X from 'lucide-svelte/icons/x';
     sessionInfo = null;
     sessionInfoLoading = false;
     sessionNarrativeExpanded = false;
+    diagnosticsOwnerSessionId = null;
+    contextUsage = null;
+    lastGenerationPerformance = null;
   }
 
   function isStaleSessionInfoLoad(requestId: number, conversationId: string, sessionId: string): boolean {
     return (
       requestId !== sessionInfoRequestId ||
       currentConversation?.conversation_id !== conversationId ||
-      currentConversation?.active_session_id !== sessionId
+      (focusedSessionId ?? currentConversation?.active_session_id) !== sessionId
     );
   }
 
   function formatTokenCount(value: number | null | undefined): string {
     if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
     return value.toLocaleString();
+  }
+
+  function performanceMeasurementLabel(performance: GenerationPerformanceSnapshot | null): string {
+    return performance?.measured_at
+      ? `Measured ${new Date(performance.measured_at).toLocaleString()}`
+      : 'Local runtime telemetry is not available for this model.';
+  }
+
+  function performanceHardwareLabel(performance: GenerationPerformanceSnapshot | null): string {
+    if (!performance) return '';
+    return [
+      performance.processor ? `Processor ${performance.processor}` : null,
+      performance.gpu_residency ? `GPU residency ${performance.gpu_residency}` : null,
+      performance.digest ? `Digest ${performance.digest}` : null,
+    ].filter(Boolean).join(' · ');
+  }
+
+  function optionalPerformanceMetrics(performance: GenerationPerformanceSnapshot | null) {
+    return performance ? localPerformanceMetrics(performance) : [];
   }
 
   function formatPercent(value: number | null | undefined): string {
@@ -1020,30 +1316,64 @@ import X from 'lucide-svelte/icons/x';
     return usage.agent_profile_id;
   }
 
+  function activeAgentProfileLabel(): string | null {
+    const profileId = currentConversation?.agent_profile_id;
+    if (profileId) return profileId;
+    return contextUsageProfileLabel(activeContextUsage());
+  }
+
   function activeContextUsage(): ContextUsage | null {
-    return contextUsage ?? sessionInfo?.context_usage ?? null;
+    const sessionId = focusedSessionId ?? currentConversation?.active_session_id ?? null;
+    return diagnosticsOwnerSessionId === sessionId ? contextUsage : null;
   }
 
   function activeLastGeneration(): GenerationPerformanceSnapshot | null {
-    return lastGenerationPerformance ?? sessionInfo?.last_generation ?? null;
+    const sessionId = focusedSessionId ?? currentConversation?.active_session_id ?? null;
+    return diagnosticsOwnerSessionId === sessionId ? lastGenerationPerformance : null;
   }
 
-  function applyContextUsageSnapshot(usage: ContextUsage | null | undefined): void {
+  function applyContextUsageSnapshot(
+    usage: ContextUsage | null | undefined,
+    ownerSessionId = currentConversation?.active_session_id ?? null,
+  ): void {
+    if (!acceptsSessionDiagnostics(
+      focusedSessionId,
+      currentConversation?.active_session_id ?? null,
+      ownerSessionId,
+    )) return;
     if (!usage) return;
+    diagnosticsOwnerSessionId = ownerSessionId;
     contextUsage = usage;
-    if (sessionInfo) {
+    if (sessionInfo?.intaris_session_id === ownerSessionId) {
       sessionInfo = { ...sessionInfo, context_usage: usage };
     }
   }
 
   function applyLastGenerationSnapshot(
-    performance: GenerationPerformanceSnapshot | null | undefined
+    performance: GenerationPerformanceSnapshot | null | undefined,
+    ownerSessionId = currentConversation?.active_session_id ?? null,
   ): void {
+    if (!acceptsSessionDiagnostics(
+      focusedSessionId,
+      currentConversation?.active_session_id ?? null,
+      ownerSessionId,
+    )) return;
     if (performance === undefined) return;
-    lastGenerationPerformance = mergeLatestPerformance(lastGenerationPerformance, performance);
-    if (sessionInfo) {
+    const previousOwnerSessionId = diagnosticsOwnerSessionId;
+    diagnosticsOwnerSessionId = ownerSessionId;
+    lastGenerationPerformance = previousOwnerSessionId === ownerSessionId
+      ? mergeLatestPerformance(lastGenerationPerformance, performance)
+      : performance;
+    if (sessionInfo?.intaris_session_id === ownerSessionId) {
       sessionInfo = { ...sessionInfo, last_generation: performance };
     }
+  }
+
+  function applyCachedSessionDiagnostics(sessionId: string | null, info: SessionInfoData | null): void {
+    const diagnostics = diagnosticsForSession(sessionId, info);
+    diagnosticsOwnerSessionId = diagnostics.ownerSessionId;
+    contextUsage = diagnostics.contextUsage;
+    lastGenerationPerformance = diagnostics.lastGeneration;
   }
 
   function sessionNarrativeText(info: SessionInfoData | null): string | null {
@@ -1200,29 +1530,229 @@ import X from 'lucide-svelte/icons/x';
     ];
   }
 
-  function toggleHeaderInfo(): void {
-    headerInfoMode = 'full';
-    headerInfoOpen = !headerInfoOpen;
-    if (headerInfoOpen && !sessionInfo) {
+  function toggleHeaderInfo(event?: MouseEvent): void {
+    if (!conversationInfoDrawer.open) {
+      headerInfoTrigger = event?.currentTarget instanceof HTMLElement
+        ? event.currentTarget
+        : document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+      conversationInfoDrawer.mode = 'overview';
+      void loadActivityOverview();
+    }
+    conversationInfoDrawer.contextOpen = false;
+    conversationInfoDrawer.setOpen(!conversationInfoDrawer.open);
+    if (conversationInfoDrawer.open && conversationInfoDrawer.tab === 'session' && !sessionInfo) {
       void loadSessionInfo();
     }
   }
 
-  function toggleContextInfo(): void {
-    if (headerInfoOpen && headerInfoMode === 'context') {
-      headerInfoOpen = false;
+  const inspectorScope = $derived(
+    currentConversation
+      ? childView
+        ? childViewScope(childView)
+        : selectedWorkSubtreeScope(currentConversation.conversation_id, canonicalFocusedSessionId)
+      : null
+  );
+  const rootOverviewEpoch = new RootOverviewRequestEpoch();
+  let rootRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function scheduleTreeRefresh(): void {
+    if (rootRefreshTimer) return;
+    rootRefreshTimer = setTimeout(() => {
+      rootRefreshTimer = null;
+      void loadRootActivityOverview(true);
+      if (childView) void loadActivityOverview(true);
+    }, 40);
+  }
+
+  async function loadRootActivityOverview(force = false): Promise<void> {
+    if (!treeRootConversationId) return;
+    const rootId = treeRootConversationId;
+    const scope = conversationTimelineScope(rootId);
+    if (force) invalidateActivityOverview(scope.key);
+    const token = rootOverviewEpoch.begin(rootId);
+    try {
+      await promoteRootOverview(
+        rootOverviewEpoch,
+        token,
+        () => treeRootConversationId,
+        () => requestActivityOverview(scope, () => chatV2Api.activityOverview(scope)),
+        (next) => {
+          const valid = rootOverviewForConversation(next, rootId);
+          if (valid) rootActivityOverview = valid;
+        },
+      );
+    } catch {
+      if (!rootOverviewEpoch.isCurrent(token, treeRootConversationId)) return;
+      if (rootId !== currentConversation?.conversation_id) {
+        const fallbackId = currentConversation?.conversation_id;
+        if (!fallbackId) return;
+        const fallbackScope = conversationTimelineScope(fallbackId);
+        try {
+          await promoteRootOverview(
+            rootOverviewEpoch,
+            token,
+            () => treeRootConversationId,
+            () => requestActivityOverview(
+              fallbackScope,
+              () => chatV2Api.activityOverview(fallbackScope),
+            ),
+            (fallback) => {
+              const valid = rootOverviewForConversation(fallback, fallbackId);
+              if (valid) rootActivityOverview = valid;
+            },
+          );
+        } catch {
+          // Retain the currently rendered root. A failed fallback must not
+          // clear or promote data for a newer tree-root conversation.
+          if (!rootOverviewEpoch.isCurrent(token, treeRootConversationId)) return;
+        }
+      }
+    }
+  }
+
+  $effect(() => {
+    if (
+      focusedSessionId
+      && canonicalFocusedSessionId
+      && focusedSessionId !== canonicalFocusedSessionId
+    ) {
+      focusedSessionId = canonicalFocusedSessionId;
+    }
+  });
+
+  async function loadActivityOverview(force = false): Promise<void> {
+    if (!inspectorScope) return;
+    const requestedScope = inspectorScope;
+    if (force) invalidateActivityOverview(requestedScope.key);
+    const cached = getActivityOverviewEntry(requestedScope);
+    if (cached) {
+      activityOverview = cached.value;
+      if (!force && cached.state === 'fresh') return;
+    }
+    const generation = ++activityOverviewGeneration;
+    activityOverviewLoading = true;
+    activityOverviewLoadingScopeKey = requestedScope.key;
+    activityOverviewError = null;
+    try {
+      const next = await requestActivityOverview(
+        requestedScope,
+        () => chatV2Api.activityOverview(requestedScope),
+      );
+      if (inspectorScope?.key === requestedScope.key && generation === activityOverviewGeneration) {
+        activityOverview = next;
+      }
+    } catch (caughtError) {
+      if (inspectorScope?.key === requestedScope.key && generation === activityOverviewGeneration) {
+        activityOverviewError = caughtError instanceof Error ? caughtError.message : 'Unable to load activity overview';
+      }
+    } finally {
+      if (inspectorScope?.key === requestedScope.key && generation === activityOverviewGeneration) {
+        activityOverviewLoading = false;
+        activityOverviewLoadingScopeKey = null;
+      }
+    }
+  }
+
+  function openInspectorWork(category: WorkCategory = 'files', sessionId?: string): void {
+    if (sessionId) {
+      focusedSessionId = canonicalWorkstreamSessionId(
+        renderedActivityOverview?.workstreams ?? [],
+        sessionId,
+      );
+    }
+    focusedWorkCategory = category;
+    conversationInfoDrawer.mode = 'work';
+    conversationInfoDrawer.setOpen(true);
+    void category;
+  }
+
+  function focusInspectorSession(sessionId: string, scopeOverride?: TimelineScope): void {
+    const canonicalSessionId = canonicalWorkstreamSessionId(
+      renderedActivityOverview?.workstreams ?? [],
+      sessionId,
+    ) ?? sessionId;
+    focusedSessionId = canonicalSessionId;
+    const conversationId = scopeOverride?.conversation_id ?? currentConversation?.conversation_id;
+    const nextScope = scopeOverride ?? sessionTimelineScope(canonicalSessionId, conversationId);
+    activityOverview = getActivityOverview(nextScope);
+    sessionInfo = conversationId ? getSessionInfo(conversationId, canonicalSessionId) : null;
+    applyCachedSessionDiagnostics(canonicalSessionId, sessionInfo);
+    void tick().then(() => loadActivityOverview());
+  }
+
+  $effect(() => {
+    const scopeKey = inspectorScope?.key;
+    const conversationScopeKey = treeRootConversationId
+      ? conversationTimelineScope(treeRootConversationId).key
+      : null;
+    if (typeof window === 'undefined' || !scopeKey) return;
+    const invalidateOverview = (event: Event): void => {
+      const invalidatedKey = (event as CustomEvent<{ scopeKey?: string }>).detail?.scopeKey;
+      if (invalidatedKey !== scopeKey && invalidatedKey !== conversationScopeKey) return;
+      scheduleTreeRefresh();
+    };
+    window.addEventListener('cognis:work-invalidated', invalidateOverview);
+    return () => window.removeEventListener('cognis:work-invalidated', invalidateOverview);
+  });
+
+  function toggleWorkView(event?: MouseEvent): void {
+    if (headerInfoOpen && headerInfoMode === 'work') {
+      closeHeaderInfo();
       return;
     }
-    headerInfoMode = 'context';
-    headerInfoOpen = true;
+    headerInfoTrigger = event?.currentTarget instanceof HTMLElement
+      ? event.currentTarget
+      : document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    conversationInfoDrawer.mode = 'work';
+    conversationInfoDrawer.setOpen(true);
+  }
+
+  function toggleContextInfo(event?: MouseEvent): void {
+    if (headerInfoOpen && headerInfoMode === 'context') {
+      closeHeaderInfo();
+      return;
+    }
+    headerInfoTrigger = event?.currentTarget instanceof HTMLElement
+      ? event.currentTarget
+      : document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    conversationInfoDrawer.mode = 'overview';
+    conversationInfoDrawer.setOpen(true);
     if (!sessionInfo) {
       void loadSessionInfo();
     }
+    void loadActivityOverview();
   }
 
-  function closeHeaderInfo(): void {
-    headerInfoOpen = false;
+  function closeHeaderInfo(restoreFocus = true): void {
+    conversationInfoDrawer.close();
+    const trigger = headerInfoTrigger;
+    headerInfoTrigger = null;
+    if (!restoreFocus) return;
+    requestAnimationFrame(() => {
+      trigger?.focus();
+    });
   }
+
+  $effect(() => {
+    const conversationId = currentConversation?.conversation_id ?? null;
+    const sessionId = currentConversation?.active_session_id ?? null;
+    if (conversationId === headerInfoConversationId) return;
+    headerInfoConversationId = conversationId;
+    invalidateSessionInfo();
+    focusedSessionId = null;
+    activityOverview = null;
+    rootActivityOverview = null;
+    childView = null;
+    if (conversationId && sessionId && headerInfoOpen && headerInfoMode === 'session') {
+      void untrack(() => loadSessionInfo());
+    }
+    if (conversationId) {
+      void untrack(() => loadRootActivityOverview());
+      if (headerInfoOpen) void untrack(() => loadActivityOverview());
+    }
+  });
 
   function applyQueuedMessageSnapshot(messages: QueuedMessage[], count = messages.length): void {
     queuedMessages = messages;
@@ -1367,15 +1897,31 @@ import X from 'lucide-svelte/icons/x';
     return mutableQueuedMessagesConversation() !== null;
   }
 
+  function isAutomaticContinuation(message: QueuedMessage): boolean {
+    return message.kind === 'automatic_continuation';
+  }
+
+  function queuedMessageLabel(message: QueuedMessage): string {
+    if (!isAutomaticContinuation(message)) return message.content;
+    if (message.continuation_reason === 'llm_cycle_ceiling_reached') {
+      return 'Continuing automatically after the LLM cycle limit.';
+    }
+    if (message.continuation_reason === 'tool_call_ceiling_reached') {
+      return 'Continuing automatically after the tool-call limit.';
+    }
+    if (message.continuation_reason === 'step_timeout') {
+      return 'Continuing automatically after the step timed out.';
+    }
+    return 'Continuing automatically.';
+  }
+
   function mutableQueuedMessagesConversation(): Conversation | null {
     if (!currentConversation || isReadOnly(currentConversation)) return null;
     return currentConversation;
   }
   let contextUsage = $state<ContextUsage | null>(null);
   let lastGenerationPerformance = $state<GenerationPerformanceSnapshot | null>(null);
-  let subSessionInfoOpen = $state(false);
-  let subSessionInfo = $state<SessionInfoData | null>(null);
-  let subSessionInfoLoading = $state(false);
+  let diagnosticsOwnerSessionId = $state<string | null>(null);
   const NON_TERMINAL_SESSION_STATES = new Set(['active', 'idle', 'running']);
 
   let pendingDirectQuestion = $state<PendingDirectQuestion | null>(null);
@@ -1384,7 +1930,7 @@ import X from 'lucide-svelte/icons/x';
   let directQuestionCollapsed = $state(false);
   let pendingCredentialRequest = $state<Notification | null>(null);
   let directQuestionSubmitting = $state(false);
-  let chatTodoDrawerOpen = $state(false);
+  let ongoingWorkDrawerOpen = $state(false);
   let retainedChatTodos = $state<ChatTodo[]>([]);
   let backendConversationState = $state<ConversationStateEnvelope | null>(null);
 
@@ -1950,13 +2496,48 @@ import X from 'lucide-svelte/icons/x';
   let activeChatTodos = $derived.by(() => incompleteTodos(chatTodos));
   let visibleChatProgressTodos = $derived(activeVisibleTodos(chatTodos));
   let shouldShowChatTodoProgress = $derived(turnInProgress && visibleChatProgressTodos.length > 0);
-  // Keep the latest todo snapshot visible even after everything is
-  // completed so the user can still inspect what just finished.
-  let shouldShowChatTodoDrawer = $derived(chatTodos.length > 0);
+  let projectedConversationWork = $derived.by(() => (
+    backgroundWork.items.filter((item) => (
+      item.controller_conversation_id === currentConversation?.conversation_id
+    ))
+  ));
+  let currentCycleWork = $derived.by(() => (
+    currentConversation
+      ? currentCycleDelegations(
+          chatV2Store.visibleItems,
+          chatV2Store.cycleStates,
+          currentActiveTurnId,
+          currentConversation.conversation_id,
+        )
+      : []
+  ));
+  let currentConversationWork = $derived.by(() => (
+    mergeCurrentCycleDelegations(projectedConversationWork, currentCycleWork)
+  ));
+  let shouldShowOngoingWorkDrawer = $derived(
+    chatTodos.length > 0 || currentConversationWork.length > 0
+  );
+  let currentConversationHasActiveBackgroundWork = $derived(
+    currentConversationWork.some(backgroundWorkItemIsRunning)
+  );
   let chatTodoCounts = $derived.by(() => ({
     inProgress: activeChatTodos.filter((todo) => todo.status === 'in_progress').length,
     pending: activeChatTodos.filter((todo) => todo.status === 'pending').length,
   }));
+
+  function conversationHasActiveBackgroundWork(conversationId: string): boolean {
+    return backgroundWork.items.some((item) => (
+      item.controller_conversation_id === conversationId
+      && backgroundWorkItemIsRunning(item)
+    ));
+  }
+
+  function isBackgroundTargetConversation(conversationId: string): boolean {
+    return backgroundWork.items.some((item) => (
+      item.kind === 'managed_conversation'
+      && item.target_conversation_id === conversationId
+    ));
+  }
 
   function visibleTodoSnapshot(todos: ChatTodo[] | undefined): ChatTodo[] {
     return activeVisibleTodos(todos);
@@ -2476,16 +3057,66 @@ import X from 'lucide-svelte/icons/x';
     currentConversation = { ...entry.conversation };
     sessions = entry.sessions.map((session) => ({ ...session }));
     chatV2Store.restoreState(entry.chatV2State);
-    queuedCount = entry.queuedCount;
-    queuedMessages = entry.queuedMessages.map((message) => ({ ...message }));
+    // Derive queue/turn-flag/active-turn-id projections through the same
+    // projection path used for live snapshots and sync frames
+    // (applyChatV2StateToTimeline -> deriveChatV2ViewProjection), instead of
+    // re-assigning the cached scalar fields directly. This guarantees
+    // currentActiveTurnId (and everything else the projection derives)
+    // reflects conversationId's own just-restored state immediately -- never
+    // a value left over from whatever conversation was open before the
+    // switch, which cached scalar fields alone cannot guarantee if the two
+    // ever drifted apart.
+    applyChatV2StateToTimeline();
+    // The Chat v2 store's queue can lag the page-level queuedMessages/
+    // queuedCount, which refreshQueuedMessages() writes directly from a
+    // dedicated REST call independent of chatV2Store. saveCurrentConversationView()
+    // always caches the page-level fields (whichever source last wrote
+    // them), so those cached values -- not what applyChatV2StateToTimeline()
+    // just derived from the restored (possibly stale) store queue -- are the
+    // authoritative exact queue for this conversation. Reapply them on top of
+    // the projection without touching the active-turn/runtime identity
+    // fields the projection just correctly derived.
+    const restoredQueue = applyCachedQueueToProjection(
+      {
+        queuedMessages,
+        queuedCount,
+        turnInProgress,
+        awaitingAssistantStart,
+        currentActiveTurnId,
+      },
+      {
+        queuedMessages: entry.queuedMessages.map((message) => ({ ...message })),
+        queuedCount: entry.queuedCount,
+      },
+    );
+    queuedMessages = restoredQueue.queuedMessages;
+    queuedCount = restoredQueue.queuedCount;
     contextUsage = entry.contextUsage;
     sessionInfo = entry.sessionInfo ? { ...entry.sessionInfo } : null;
-    turnInProgress = entry.turnInProgress;
-    awaitingAssistantStart = entry.awaitingAssistantStart;
     activeSessionLastSeq = entry.activeSessionLastSeq;
     olderMessagesCursor = entry.olderMessagesCursor ?? null;
     hasOlderMessages = entry.hasOlderMessages ?? false;
     activeTurnChatMode = entry.activeTurnChatMode ?? 'default';
+    // The cache entry only carries durable per-conversation view state. Any
+    // transient open/send/modal state from whatever conversation was
+    // previously active must not bleed into the restored conversation -- this
+    // is the same guarantee clearConversationViewState() gives the full
+    // (uncached) reload path. None of these are keyed by conversation, so they
+    // are always reset on restore rather than restored from cache.
+    lastGenerationPerformance = null;
+    pendingDirectQuestion = null;
+    pendingCredentialRequest = null;
+    directQuestionPageIndex = 0;
+    directQuestionCollapsed = false;
+    directQuestionSubmitting = false;
+    escalations = [];
+    escalationError = '';
+    escalationResolutionPending = null;
+    lastRecoverableMessage = '';
+    lastRecoverableTurnId = null;
+    suppressedRecoverableTurnId = null;
+    editingTitle = false;
+    childView = null;
     // Opening a conversation always lands at the latest message (auto-tail),
     // regardless of where the user was scrolled when they last left it. The
     // cached mid-history scroll position is intentionally not restored on a
@@ -2531,7 +3162,7 @@ import X from 'lucide-svelte/icons/x';
     lastRecoverableTurnId = null;
     suppressedRecoverableTurnId = null;
     editingTitle = false;
-    subSessionPanelOpen = false;
+    childView = null;
     // Opening/switching a conversation lands at the tail (latest message).
     // Pinning here makes the post-load refresh auto-scroll to bottom.
     userScrolledUp = false;
@@ -2618,6 +3249,7 @@ import X from 'lucide-svelte/icons/x';
           has_more: conversationsHasMore,
         },
         context_types: availableChannelTypes,
+        background_work: backgroundWork,
       },
       SIDEBAR_PROJECTION_CACHE_LIMIT,
     );
@@ -2632,6 +3264,7 @@ import X from 'lucide-svelte/icons/x';
       mergeAgentDirectChats(projection.agent_direct_chats);
     }
     if (reset || projection.context_types.length > 0) applyAvailableChannelTypes(projection.context_types);
+    backgroundWork = projection.background_work;
     mergeConversationList(projection.conversations.items, { reset });
     for (const removedId of projection.removed_conversation_ids ?? []) {
       removeConversationFromSidebar(removedId);
@@ -2664,6 +3297,7 @@ import X from 'lucide-svelte/icons/x';
   }
 
   async function loadSidebarProjection(): Promise<void> {
+    const requestEpoch = ++sidebarProjectionRefreshEpoch;
     conversationListLoadCount += 1;
     const initialKey = sidebarProjectionCacheKey();
     const hadCachedProjection = applyCachedSidebarProjection(initialKey);
@@ -2675,11 +3309,19 @@ import X from 'lucide-svelte/icons/x';
     });
     try {
       let response = await load();
+      if (!shouldApplySidebarProjectionRefresh({
+        requestEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })) return;
       if (initialKey !== sidebarProjectionCacheKey()) return;
       agents = response.agents;
       if (restoreSelectedAgent()) {
         const restoredKey = sidebarProjectionCacheKey();
         response = await load();
+        if (!shouldApplySidebarProjectionRefresh({
+          requestEpoch,
+          currentEpoch: sidebarProjectionRefreshEpoch,
+        })) return;
         if (restoredKey !== sidebarProjectionCacheKey()) return;
         agents = response.agents;
         restoreSelectedAgent();
@@ -2687,6 +3329,10 @@ import X from 'lucide-svelte/icons/x';
       applySidebarProjection(response);
       rememberSidebarProjection();
     } catch (caughtError) {
+      if (!shouldApplySidebarProjectionRefresh({
+        requestEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })) return;
       sidebarProjectionFailed = true;
       throw caughtError;
     } finally {
@@ -3057,20 +3703,17 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function subSessionAgent(): Agent | undefined {
-    if (!subSessionId) return undefined;
-    const session = sessions.find((session) => session.session_id === subSessionId);
-    if (!session) return undefined;
-    return agents.find((agent) => agent.agent_id === session.agent_id);
+    if (!childWorkstream) return undefined;
+    return agents.find((agent) => agent.agent_id === childWorkstream?.agent_id);
   }
 
   function subSessionStatus(): string | null {
-    if (!subSessionId) return null;
-    return sessions.find((session) => session.session_id === subSessionId)?.status ?? subSessionInfo?.status ?? null;
+    return childWorkstream?.status ?? null;
   }
 
   function shouldPollSubSession(): boolean {
     const status = subSessionStatus();
-    return Boolean(subSessionPanelOpen && subSessionId && (!status || NON_TERMINAL_SESSION_STATES.has(status)));
+    return Boolean(childView && (!status || NON_TERMINAL_SESSION_STATES.has(status)));
   }
 
   function searchResultAgent(result: ConversationSearchMatch): Agent | undefined {
@@ -3535,11 +4178,16 @@ import X from 'lucide-svelte/icons/x';
       agentIds: selectedAgentIds.length > 0 ? selectedAgentIds : null,
       status: selectedConversationStatus,
     };
+    const requestEpoch = ++sidebarProjectionRefreshEpoch;
     try {
       const isDeltaRequest = Boolean(lastSidebarSyncTimestamp);
       const response = isDeltaRequest
         ? await api.conversations.sidebar(null, filters, { changedSince: lastSidebarSyncTimestamp })
         : await api.conversations.sidebar(null, filters);
+      if (!shouldApplySidebarProjectionRefresh({
+        requestEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })) return;
       if (isDeltaRequest && (response.agents.length > 0 || response.context_types.length > 0)) {
         applySidebarProjection(response, { reset: true });
         rememberSidebarProjection();
@@ -3552,6 +4200,10 @@ import X from 'lucide-svelte/icons/x';
       applySidebarProjection(response, { reset: !isDeltaRequest });
       rememberSidebarProjection();
     } catch (error) {
+      if (!shouldApplySidebarProjectionRefresh({
+        requestEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })) return;
       console.debug('Sidebar resync failed', { reason, error });
       await loadSidebarProjection();
     }
@@ -3594,6 +4246,12 @@ import X from 'lucide-svelte/icons/x';
         call_id: item.notification_id,
         session_id: item.session_id,
         tool_name: typeof item.payload.tool_name === 'string' ? item.payload.tool_name : null,
+        arguments_display:
+          item.payload.arguments_display
+          && typeof item.payload.arguments_display === 'object'
+          && !Array.isArray(item.payload.arguments_display)
+            ? item.payload.arguments_display as Record<string, unknown>
+            : null,
         decision: 'escalate',
         resolved: false,
         reasoning: typeof item.payload.reasoning === 'string' ? item.payload.reasoning : null,
@@ -4195,6 +4853,37 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
     chatSidebarCollapsed = window.localStorage.getItem(CHAT_STORAGE_KEYS.sidebarCollapsed) === '1';
+    const storedWidth = Number(window.localStorage.getItem(CHAT_STORAGE_KEYS.sidebarWidth));
+    if (Number.isFinite(storedWidth)) {
+      chatSidebarWidth = Math.max(CHAT_SIDEBAR_MIN_WIDTH, Math.min(CHAT_SIDEBAR_MAX_WIDTH, storedWidth));
+    }
+  }
+
+  function setChatSidebarWidth(nextWidth: number): void {
+    chatSidebarWidth = Math.max(CHAT_SIDEBAR_MIN_WIDTH, Math.min(CHAT_SIDEBAR_MAX_WIDTH, nextWidth));
+    window.localStorage.setItem(CHAT_STORAGE_KEYS.sidebarWidth, String(chatSidebarWidth));
+  }
+
+  function startChatSidebarResize(event: PointerEvent): void {
+    const startX = event.clientX;
+    const startWidth = chatSidebarWidth;
+    const move = (next: PointerEvent) => setChatSidebarWidth(startWidth + next.clientX - startX);
+    const stop = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', stop);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+  }
+
+  function resizeChatSidebarWithKeyboard(event: KeyboardEvent): void {
+    const step = event.shiftKey ? 40 : 10;
+    if (event.key === 'ArrowLeft') setChatSidebarWidth(chatSidebarWidth - step);
+    else if (event.key === 'ArrowRight') setChatSidebarWidth(chatSidebarWidth + step);
+    else if (event.key === 'Home') setChatSidebarWidth(CHAT_SIDEBAR_MIN_WIDTH);
+    else if (event.key === 'End') setChatSidebarWidth(CHAT_SIDEBAR_MAX_WIDTH);
+    else return;
+    event.preventDefault();
   }
 
   function toggleChatSidebar(): void {
@@ -4294,20 +4983,25 @@ import X from 'lucide-svelte/icons/x';
 
   async function loadSessionInfo(): Promise<void> {
     const conversationId = currentConversation?.conversation_id;
-    const sid = currentConversation?.active_session_id;
+    const sid = focusedSessionId ?? currentConversation?.active_session_id;
     if (!conversationId || !sid) {
       invalidateSessionInfo();
       return;
     }
+    const cached = getSessionInfo(conversationId, sid);
+    if (cached) {
+      sessionInfo = cached;
+      applyCachedSessionDiagnostics(sid, cached);
+      return;
+    }
     const requestId = nextSessionInfoRequestId();
     sessionInfoLoading = true;
-    sessionInfo = null;
     try {
       const detail = await api.sessions.intarisDetail(sid);
       if (isStaleSessionInfoLoad(requestId, conversationId, sid)) {
         return;
       }
-      sessionInfo = {
+      const nextSessionInfo: SessionInfoData = {
         intaris_session_id: detail.intaris_session_id,
         intention: detail.intention,
         summary: detail.summary,
@@ -4319,12 +5013,12 @@ import X from 'lucide-svelte/icons/x';
         context_usage: detail.context_usage ?? null,
         last_generation: detail.last_generation ?? null
       };
-      applyContextUsageSnapshot(detail.context_usage);
-      applyLastGenerationSnapshot(detail.last_generation);
+      setSessionInfo(conversationId, sid, nextSessionInfo);
+      sessionInfo = nextSessionInfo;
+      applyContextUsageSnapshot(detail.context_usage, sid);
+      applyLastGenerationSnapshot(detail.last_generation, sid);
     } catch {
-      if (!isStaleSessionInfoLoad(requestId, conversationId, sid)) {
-        sessionInfo = null;
-      }
+      // Retain the last rendered session details when a refresh fails.
     } finally {
       if (!isStaleSessionInfoLoad(requestId, conversationId, sid)) {
         sessionInfoLoading = false;
@@ -4349,30 +5043,6 @@ import X from 'lucide-svelte/icons/x';
       applyLastGenerationSnapshot(detail.last_generation);
     } catch {
       // Context diagnostics are opportunistic; the Info panel can still load details on demand.
-    }
-  }
-
-  async function loadSubSessionInfo(): Promise<void> {
-    if (!subSessionId) return;
-    subSessionInfoLoading = true;
-    try {
-      const detail = await api.sessions.intarisDetail(subSessionId);
-      subSessionInfo = {
-        intaris_session_id: detail.intaris_session_id,
-        intention: detail.intention,
-        summary: detail.summary,
-        status: detail.status,
-        total_calls: detail.total_calls,
-        approved_count: detail.approved_count,
-        denied_count: detail.denied_count,
-        escalated_count: detail.escalated_count,
-        context_usage: detail.context_usage ?? null,
-        last_generation: detail.last_generation ?? null
-      };
-    } catch {
-      subSessionInfo = null;
-    } finally {
-      subSessionInfoLoading = false;
     }
   }
 
@@ -4739,7 +5409,27 @@ import X from 'lucide-svelte/icons/x';
     }
 
     const requestId = beginConversationLoad();
+    const clientPerformance = createClientPerformanceTiming(
+      performance.now(),
+      () => performance.now(),
+      (metric, durationMs) => {
+        void chatV2Api.clientPerformance(metric, durationMs);
+      }
+    );
     const previousConversationId = activeConversationId;
+    if (
+      previousConversationId
+      && currentConversation?.conversation_id === previousConversationId
+      && !conversationMatchesSidebarProjectionFilter(
+        currentConversation,
+        currentSidebarProjectionFilter()
+      )
+    ) {
+      // A deep-linked managed conversation is intentionally made visible while
+      // open, even when it falls outside the current sidebar filter. Restore
+      // the filtered projection as soon as the user leaves it.
+      removeConversationFromSidebar(previousConversationId);
+    }
     if (
       controllerRecoveryConversationId !== null
       && controllerRecoveryConversationId !== conversationId
@@ -4757,7 +5447,6 @@ import X from 'lucide-svelte/icons/x';
     escalationError = '';
     escalationResolutionPending = null;
     cachedConversationRefreshing = false;
-    headerInfoOpen = false;
     invalidateSessionInfo();
     mobileListOpen = false;
 
@@ -4766,11 +5455,14 @@ import X from 'lucide-svelte/icons/x';
       wsClient.unsubscribeConversation(previousConversationId);
     }
 
-    const cachedEntry = conversationViewCache.get(conversationId);
-    if (cachedEntry && isAgentDirectConversation(cachedEntry.conversation)) {
-      conversationViewCache.delete(conversationId);
-    }
-
+    // A cached view is restored for every conversation kind, including
+    // agent-direct: it paints the previously-seen timeline/state immediately
+    // (see restoreConversationView()), which is the primary win for slow
+    // repeat switching into long agent-direct conversations. Any transient
+    // open/send/modal state from the previously active conversation that is
+    // not part of the cache entry is reset inside restoreConversationView()
+    // itself, so cached restore cannot leak conversation A's ephemeral state
+    // into conversation B.
     const cachedView = restoreConversationView(conversationId);
     if (cachedView) {
       if (isAgentDirectConversation(cachedView.conversation)) {
@@ -4788,6 +5480,11 @@ import X from 'lucide-svelte/icons/x';
       sessionsError = '';
       mobileListOpen = false;
       cachedConversationRefreshing = true;
+      await tick();
+      if (isStaleConversationLoad(requestId)) {
+        return;
+      }
+      clientPerformance.cachedRestore();
       wsClient.subscribeConversation(
         conversationId,
         cachedView.activeSessionLastSeq,
@@ -4797,25 +5494,65 @@ import X from 'lucide-svelte/icons/x';
       markConversationReadLocally(conversationId);
       api.conversations.markRead(conversationId).catch(() => {});
       conversationSubloadsLoading = true;
+      const canonicalTimelineRefresh = startCachedTimelineRefresh(
+        async () => {
+          const appliedBefore = canonicalTimelineApplyRevision;
+          await refreshCachedTimeline({
+            captureWatermark: () => chatV2Store.refreshWatermark(),
+            probe: () => chatV2Api.snapshotCacheOnly(conversationId),
+            applyIfUnchanged: (snapshot, refreshWatermark) => {
+              if (isStaleConversationLoad(requestId)) return false;
+              const applied = applyChatV2Snapshot(snapshot, {
+                resetLineage: true,
+                refreshWatermark,
+              });
+              if (applied) {
+                canonicalTimelineApplyRevision += 1;
+                if (chatV2Store.snapshot.cursor) {
+                  wsClient.updateChatV2Cursor(conversationId, chatV2Store.snapshot.cursor);
+                }
+              }
+              return applied;
+            },
+            sync: () => recoverChatV2Canonical(conversationId, requestId),
+          });
+          clientPerformance.timelineFresh(
+            !isStaleConversationLoad(requestId)
+              && canonicalTimelineApplyRevision > appliedBefore
+          );
+        },
+        () => {
+          cachedConversationRefreshing = false;
+        },
+        () => !isStaleConversationLoad(requestId),
+      );
+      void canonicalTimelineRefresh.catch(reportError);
       try {
-        const conversation = await api.conversations.detail(conversationId, { includeState: false });
+        const [conversation] = await Promise.all([
+          api.conversations.detail(conversationId, { includeState: false }),
+          reloadConversationSubloads(conversationId, requestId, {
+            reloadSessions: true,
+            reloadHistory: false,
+            resubscribe: true,
+            preserveScroll: true,
+          }),
+        ]);
         if (isStaleConversationLoad(requestId)) {
           return;
         }
         currentConversation = { ...conversation, has_unread: false };
-        mergeConversationList([currentConversation]);
+        if (shouldInsertDirectlyLoadedConversation(currentConversation, currentSidebarProjectionFilter())) {
+          mergeConversationList([currentConversation]);
+        } else {
+          removeConversationFromSidebar(currentConversation.conversation_id);
+        }
         patchAgentDirectChat(currentConversation);
         persistLastOpenedConversation(currentConversation);
         void refreshQueuedMessages(conversationId);
-        await reloadConversationSubloads(conversationId, requestId, {
-          reloadSessions: true,
-          reloadHistory: true,
-          resubscribe: true,
-          preserveScroll: true,
-        });
-        if (isStaleConversationLoad(requestId)) {
-          return;
-        }
+        // Timeline reconciliation starts immediately above and runs independently
+        // from conversation/session metadata. Its banner clears on canonical
+        // completion rather than waiting for either metadata request.
+        saveCurrentConversationView();
         markConversationReadLocally(conversationId);
         patchConversationInList(conversationId, {
           active_session_id: currentConversation?.active_session_id,
@@ -4831,7 +5568,6 @@ import X from 'lucide-svelte/icons/x';
       } finally {
         if (!isStaleConversationLoad(requestId)) {
           conversationSubloadsLoading = false;
-          cachedConversationRefreshing = false;
         }
       }
       return;
@@ -4867,7 +5603,11 @@ import X from 'lucide-svelte/icons/x';
       error = '';
       initialLoadTimedOut = false;
       persistLastOpenedConversation(conversation);
-      mergeConversationList([conversation]);
+      if (shouldInsertDirectlyLoadedConversation(conversation, currentSidebarProjectionFilter())) {
+        mergeConversationList([conversation]);
+      } else {
+        removeConversationFromSidebar(conversation.conversation_id);
+      }
       patchAgentDirectChat(conversation);
       void refreshQueuedMessages(conversationId);
       wsClient.subscribeConversation(
@@ -5502,9 +6242,18 @@ import X from 'lucide-svelte/icons/x';
       ? `cmsg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`
       : null;
     const willQueueBehindActiveTurn = !isSlashCommand && !isStepInputReply && turnInProgress;
+    const awaitCanonicalUserMessage =
+      !isSlashCommand && !isStepInputReply && shouldAwaitCanonicalUserMessage(optimisticContent);
     const composerAttachmentsSnapshot = $state.snapshot(composerAttachments) as typeof composerAttachments;
 
-    if (!isSlashCommand && !isStepInputReply && clientMessageId && !willQueueBehindActiveTurn) {
+    if (
+      clientMessageId &&
+      shouldRenderOptimisticUserMessage({
+        isSlashCommand,
+        isStepInputReply,
+        awaitCanonicalUserMessage
+      })
+    ) {
       saveOptimisticUserMessageDraft({
         conversationId: directQuestionDraftConversationId() ?? routeConversationId,
         clientMessageId,
@@ -5647,12 +6396,15 @@ import X from 'lucide-svelte/icons/x';
       console.warn('Chat v2 outbox persistence failed; sending online without durable retry', outboxError);
     }
     try {
-      await chatV2Api.sendMessage(sendConversationId, clientTxnId, {
+      const response = await chatV2Api.sendMessage(sendConversationId, clientTxnId, {
         content: effectiveContent,
         attachments,
         client_message_id: effectiveClientMessageId,
         chat_mode: effectiveChatMode
       });
+      if (chatV2OwnsActiveConversation(sendConversationId)) {
+        chatV2Store.applySend(response);
+      }
       if (outboxStored) {
         await chatV2Outbox.update(clientTxnId, { status: 'acked', updated_at: new Date().toISOString() }).catch(() => undefined);
       }
@@ -5672,6 +6424,13 @@ import X from 'lucide-svelte/icons/x';
         }).catch(() => undefined);
       }
       if (!shouldApplyChatSendFailureSideEffects(sendConversationId, conversationIdFromRoute())) return;
+      if (awaitCanonicalUserMessage) {
+        chatV2Store.addOptimisticUser({
+          content: optimisticContent,
+          attachments,
+          clientMessageId: effectiveClientMessageId,
+        });
+      }
       awaitingAssistantStart = false;
       turnInProgress = chatV2Store.snapshot.runtime?.has_active_turn === true;
       currentActiveTurnId = chatV2Store.snapshot.runtime?.active_turn?.turn_id ?? null;
@@ -6115,11 +6874,39 @@ import X from 'lucide-svelte/icons/x';
 
   function handleSocketEvent(event: import('$lib/types/api').CognisWebSocketEvent | ChatRealtimeFrame): void {
     const currentId = conversationIdFromRoute();
+    if (eventNeedsTreeRefresh(event as { type: string } & Record<string, unknown>)) {
+      scheduleTreeRefresh();
+    }
+    if (event.type === 'work_invalidated') {
+      invalidateWorkFromSocket(event);
+    } else if (
+      currentId
+      && (!('conversation_id' in event) || event.conversation_id === currentId)
+      && event.type === 'scope_invalidated'
+      && event.reason === 'chat_scope_changed'
+    ) {
+      invalidateWorkScope(conversationTimelineScope(currentId).key);
+    }
     const chatV2OwnsCurrent = chatV2OwnsActiveConversation(currentId);
     const legacyLifecycleEnabled = shouldApplyLegacyLifecycleFrame(chatV2OwnsCurrent);
     if (event.type === 'chat_v2_frame') {
       if (event.conversation_id === currentId) {
         void applyChatV2Frame(event);
+      }
+      return;
+    }
+    if (event.type === 'scope_invalidated') {
+      if (event.reason === 'sidebar_changed' || event.reason === 'executor_state_changed') {
+        void resyncSidebarData('cluster-invalidation', { force: true });
+      }
+      if (event.reason === 'notification_state_changed') {
+        void refreshPendingNotifications();
+      }
+      if (shouldRecoverChatV2ForInvalidation({
+        activeConversationId: currentId,
+        invalidatedConversationId: event.conversation_id,
+      })) {
+        scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
       }
       return;
     }
@@ -6152,12 +6939,22 @@ import X from 'lucide-svelte/icons/x';
       && typeof (event as { created_conversation_id?: unknown }).created_conversation_id === 'string'
     ) {
       void patchCreatedConversationRow((event as { created_conversation_id: string }).created_conversation_id);
+      void resyncSidebarData('managed-conversation-created', { force: true });
     }
 
     if ('conversation_id' in event && event.conversation_id && event.conversation_id !== currentId) {
       // Event for a different conversation — mark it as unread locally
       // and show a browser notification if appropriate.
       const otherConvId = event.conversation_id;
+      if (
+        event.type.startsWith('delegation_')
+        || (
+          isBackgroundTargetConversation(otherConvId)
+          && ['turn_started', 'queued', 'turn_settled', 'message_complete'].includes(event.type)
+        )
+      ) {
+        void resyncSidebarData('foreign-background-work-lifecycle', { force: true });
+      }
       if (event.type === 'conversation_state_snapshot') {
         const todos = backendTodoSnapshot(event.state);
         if (todos !== null) {
@@ -6606,6 +7403,7 @@ import X from 'lucide-svelte/icons/x';
         event.type === 'delegation_completed' ||
         event.type === 'delegation_failed')
     ) {
+      void resyncSidebarData('delegation-lifecycle', { force: true });
       api.conversations
         .sessions(currentConversation.conversation_id)
         .then((s) => {
@@ -6613,6 +7411,12 @@ import X from 'lucide-svelte/icons/x';
           syncActiveSessionAttention(currentConversation?.conversation_id, s);
         })
         .catch(() => {});
+    }
+    if (currentConversation && event.type === 'delegation_progress') {
+      void resyncSidebarData('delegation-progress');
+    }
+    if (currentConversation && event.type === 'turn_settled') {
+      void resyncSidebarData('turn-settled-background-work', { force: true });
     }
 
     // Escalation push events
@@ -6762,7 +7566,13 @@ import X from 'lucide-svelte/icons/x';
     }
 
     if (event.type === 'reconnected') {
+      if (currentId) {
+        invalidateWorkScope(conversationTimelineScope(currentId).key, { reconnect: true });
+      }
       void resyncSidebarData('websocket-reconnect', { force: true });
+      if (chatV2OwnsCurrent) {
+        scheduleChatV2CanonicalRecovery(currentId, { immediate: true });
+      }
       const previousTurnInProgress = turnInProgress;
       if (!chatV2OwnsCurrent) {
         awaitingAssistantStart = false;
@@ -6881,23 +7691,122 @@ import X from 'lucide-svelte/icons/x';
     await Promise.all([loadAgentDirectChats(), loadConversationPage(true)]);
   }
 
-  function handleViewSession(sessionId: string): void {
+  function handleViewSession(sessionId: string, selectedNode?: WorkstreamRef): void {
     if (!currentConversation) return;
-    subSessionId = sessionId;
-    subSessionPanelOpen = true;
-    subSessionInfo = null;
-    subSessionInfoOpen = false;
+    const nodes = scopedRootActivityOverview?.workstreams ?? [];
+    const node = selectedNode ?? workstreamForSession(nodes, sessionId);
+    if (!node) return;
+    const nextChildView = childViewForWorkstream(node, treeRootConversationId ?? currentConversation.conversation_id);
+    const canonicalSessionId = nextChildView.sessionId;
+    const traversal = traverseInspectorSession({
+      drawerOpen: conversationInfoDrawer.open,
+      activeTab: conversationInfoDrawer.tab,
+      presentation: inspectorPresentation,
+      focusedSessionId,
+      middleSessionId: childView?.sessionId ?? null,
+      workSessionId: focusedSessionId,
+    }, canonicalSessionId);
+    childView = nextChildView;
+    childManagedConversation = null;
+    childManagedError = '';
+    if (nextChildView.kind === 'managed') {
+      const requestedConversationId = nextChildView.conversationId;
+      void api.conversations.detail(requestedConversationId, { includeState: false })
+        .then((conversation) => {
+          if (childView?.kind === 'managed' && childView.conversationId === requestedConversationId) {
+            childManagedConversation = conversation;
+          }
+        })
+        .catch((caughtError) => {
+          if (childView?.kind === 'managed' && childView.conversationId === requestedConversationId) {
+            childManagedError = asApiError(caughtError).message;
+          }
+        });
+    }
+    focusInspectorSession(traversal.focusedSessionId!, childViewScope(nextChildView));
+    if (headerInfoMode === 'session') void tick().then(loadSessionInfo);
+  }
+
+  function navigateToStructuralParent(): void {
+    if (childView) {
+      const parentView = parentChildView(scopedRootActivityOverview?.workstreams ?? [], childView);
+      if (parentView) {
+        const parentNode = childViewWorkstream(scopedRootActivityOverview?.workstreams ?? [], parentView);
+        if (parentNode) {
+          handleViewSession(parentView.sessionId, parentNode);
+          return;
+        }
+      }
+    }
+    const currentSessionId = focusedSessionId ?? childView?.sessionId ?? null;
+    const parentSessionId = structuralParentSessionId(
+      scopedRootActivityOverview?.workstreams ?? [],
+      currentSessionId,
+    );
+    if (parentSessionId) {
+      handleViewSession(parentSessionId);
+      return;
+    }
+    focusedSessionId = null;
+    childView = null;
+    activityOverview = rootActivityOverview;
+    const conversationId = currentConversation?.conversation_id;
+    const activeSessionId = currentConversation?.active_session_id;
+    sessionInfo = conversationId && activeSessionId ? getSessionInfo(conversationId, activeSessionId) : null;
+    applyCachedSessionDiagnostics(activeSessionId ?? null, sessionInfo);
   }
 
   function closeSubSessionPanel(): void {
-    subSessionClosing = true;
-    setTimeout(() => {
-      subSessionPanelOpen = false;
-      subSessionClosing = false;
-      subSessionId = '';
-      subSessionInfo = null;
-      subSessionInfoOpen = false;
-    }, 250);
+    childView = null;
+    childManagedConversation = null;
+    childManagedError = '';
+    focusedSessionId = null;
+    activityOverview = rootActivityOverview;
+  }
+
+  async function runChildManagedAction(
+    action: 'stop' | 'send' | 'take-control',
+    payload?: Record<string, unknown>,
+  ): Promise<void> {
+    if (!childManagedConversation || childManagedBusy) return;
+    if (action === 'take-control') {
+      const confirmed = await confirmAction({
+        title: 'Take control of managed conversation?',
+        message: 'The managed conversation will be closed read-only and forked into a normal conversation.',
+        confirmLabel: 'Take control',
+      });
+      if (!confirmed) return;
+    }
+    childManagedBusy = action;
+    childManagedError = '';
+    try {
+      const response = await api.conversations.managedAction(
+        childManagedConversation.conversation_id,
+        action,
+        payload,
+      );
+      if (response.managed_agent) {
+        childManagedConversation = {
+          ...childManagedConversation,
+          managed_agent: response.managed_agent,
+          has_active_turn: ['running', 'queued'].includes(response.managed_agent.turn_state ?? ''),
+        };
+      } else {
+        childManagedConversation = await api.conversations.detail(
+          childManagedConversation.conversation_id,
+          { includeState: false },
+        );
+      }
+      scheduleTreeRefresh();
+      const followUpId = typeof response.result?.conversation_id === 'string'
+        ? response.result.conversation_id
+        : response.managed_agent?.follow_up_conversation_id;
+      if (action === 'take-control' && followUpId) await goto(conversationUrl(followUpId));
+    } catch (caughtError) {
+      childManagedError = asApiError(caughtError).message;
+    } finally {
+      childManagedBusy = null;
+    }
   }
 
   $effect(() => {
@@ -7092,9 +8001,12 @@ import X from 'lucide-svelte/icons/x';
   //
   // Window over explicitly renderable canonical items only. The policy is
   // exhaustive, so newly added kinds cannot silently create blank rows.
-   let renderableVisibleItems = $derived.by<ChatV2TimelineItem[]>(() =>
-     chatV2Store.visibleItems.filter(isRenderableTimelineItem)
-   );
+    let renderableVisibleItems = $derived.by<ChatV2TimelineItem[]>(() =>
+      overlayManagedConversationStatus(
+        chatV2Store.visibleItems.filter(isRenderableTimelineItem),
+        backgroundWork.items,
+      )
+    );
   let displayedTimeline = $derived.by<ChatV2TimelineItem[]>(() => {
     const end = timelineWindowEndIndex(renderableVisibleItems.length);
     const start = Math.min(Math.max(0, visibleStartIndex), end);
@@ -7149,6 +8061,13 @@ import X from 'lucide-svelte/icons/x';
   });
 
   onMount(() => {
+    const handleTaskControlEscape = (event: KeyboardEvent): void => {
+      if (!isTaskControlMode || event.key !== 'Escape') return;
+      event.preventDefault();
+      requestTaskAgentDockMinimize();
+    };
+    window.addEventListener('keydown', handleTaskControlEscape);
+    window.addEventListener('keydown', handleTaskControlFocusBoundary, true);
     void loadUserPreferences(auth.getSnapshot().user?.email);
     restoreEnterToSendPreference();
     restoreSelectedChannel();
@@ -7248,6 +8167,8 @@ import X from 'lucide-svelte/icons/x';
     });
 
     return () => {
+      window.removeEventListener('keydown', handleTaskControlEscape);
+      window.removeEventListener('keydown', handleTaskControlFocusBoundary, true);
       saveCurrentConversationView();
       mobileListOverlayCleanup?.();
       mobileListOverlayCleanup = null;
@@ -7296,7 +8217,7 @@ import X from 'lucide-svelte/icons/x';
         window.clearTimeout(timer);
       }
       chatV2CanonicalRecoveryTimers.clear();
-      chatV2CanonicalRecoveryRerun.clear();
+      chatV2CanonicalRecoveryCoalescer.clear();
       chatV2Lifecycle.release();
       if (activeConversationId) {
         wsClient.unsubscribeConversation(activeConversationId);
@@ -7314,7 +8235,9 @@ import X from 'lucide-svelte/icons/x';
   <LoadingState label="Loading conversation" description="Fetching history, restoring workflow prompts, and preparing the live stream." />
 {:else}
   <div
-    class={`relative flex h-full min-h-0 flex-col overflow-hidden ${isWindowMode ? '' : `gap-3 ${chatSidebarCollapsed ? '' : 'lg:grid lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-4'}`}`}
+    bind:this={chatShellElement}
+    class={`relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden lg:flex-row ${isWindowMode ? '' : `gap-3 ${chatSidebarCollapsed ? '' : 'lg:gap-4'}`}`}
+    data-testid="chat-shell"
     use:edgeSwipe={{ edge: 'left', onTrigger: handleChatLeftEdgeSwipe }}
     use:edgeSwipe={{ edge: 'right', onTrigger: handleChatRightEdgeSwipe }}
   >
@@ -7351,10 +8274,25 @@ import X from 'lucide-svelte/icons/x';
     <aside
       aria-label="Conversation list"
       aria-modal={mobileListOpen ? 'true' : undefined}
-      class={`fixed left-3 right-3 top-[calc(1rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex max-w-[22rem] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:right-auto lg:max-w-none lg:w-[18rem] lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      class={`chat-history-sidebar fixed left-3 right-3 top-[calc(1rem+env(safe-area-inset-top))] bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-40 flex max-w-[22rem] min-h-0 flex-col rounded-[1.75rem] border border-slate-800/80 bg-slate-900/95 shadow-card backdrop-blur transition-transform duration-200 ease-out lg:static lg:right-auto lg:max-w-none lg:translate-x-0 lg:rounded-none lg:border-0 lg:border-r lg:border-slate-800/60 lg:bg-transparent lg:shadow-none lg:backdrop-blur-0 ${chatSidebarCollapsed ? 'lg:hidden' : 'lg:flex'} ${mobileListOpen || !currentConversation ? 'translate-x-0' : '-translate-x-[120%] pointer-events-none lg:pointer-events-auto'}`}
+      style:--chat-sidebar-width={`${chatSidebarWidth}px`}
       inert={(!mobileListOpen && Boolean(currentConversation) && isMobileViewport()) || undefined}
       role={mobileListOpen ? 'dialog' : undefined}
     >
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+      <div
+        class="chat-sidebar-resizer absolute -right-1 top-0 z-30 hidden h-full w-2 cursor-col-resize touch-none focus-visible:bg-sky-400/40 lg:block"
+        role="separator"
+        tabindex="0"
+        aria-label="Resize conversation history"
+        aria-orientation="vertical"
+        aria-valuemin={CHAT_SIDEBAR_MIN_WIDTH}
+        aria-valuemax={CHAT_SIDEBAR_MAX_WIDTH}
+        aria-valuenow={chatSidebarWidth}
+        data-testid="chat-sidebar-resizer"
+        onpointerdown={startChatSidebarResize}
+        onkeydown={resizeChatSidebarWithKeyboard}
+      ></div>
       <!-- Static top: filters -->
       <div class="shrink-0 space-y-3 p-4 pb-2 sm:p-4">
         <div class="flex items-center justify-between">
@@ -7500,11 +8438,15 @@ import X from 'lucide-svelte/icons/x';
               {#each visibleAgentDirectChats as item}
                 {@const conversation = item.conversation}
                 {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
-                {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
+                   {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
+                   {@const avatarState = conversationActivityState(conversation, {
+                     open: isActive,
+                     runtimeActive: inProgress,
+                     backgroundWork: backgroundWork.items,
+                   })}
                 {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
                 {@const attentionDescription = conversationAttentionDescription(conversation)}
-                {@const turnMode = conversationChatMode(conversation)}
-                <a
+                 <a
                   class={`group flex min-w-[4.5rem] flex-col items-center gap-1 rounded-2xl px-2 py-2 transition ${isActive ? 'bg-sky-500/15 text-white' : 'text-slate-300 hover:bg-slate-900/70'}`}
                   href={conversationUrl(conversation.conversation_id)}
                   onclick={closeMobileList}
@@ -7512,15 +8454,12 @@ import X from 'lucide-svelte/icons/x';
                   aria-label={`Open direct chat with ${agentLabel(item.agent)}${isActive ? ', current conversation' : ''}${showAttentionDot ? `, ${attentionDescription}` : ''}`}
                   title={`Open direct chat with ${agentLabel(item.agent)}`}
                 >
-                  <span class="relative grid h-12 w-12 shrink-0 place-items-center">
-                    {#if inProgress}
-                      <span class={`conversation-turn-orbit ${conversationOrbitClass(conversation, turnMode)}`} aria-hidden="true"><span></span></span>
-                    {/if}
-                    <AgentAvatar name={agentLabel(item.agent)} avatarUrl={item.agent.avatar_url ?? null} class="h-10 w-10" />
-                    {#if showAttentionDot}
-                      <span class={`absolute right-0 top-0 h-3 w-3 rounded-full border-2 border-slate-950 ${conversationDotClass(conversation)}`} title={attentionDescription}></span>
-                    {/if}
-                  </span>
+                  <ActivityAvatar
+                    name={agentLabel(item.agent)}
+                    avatarUrl={item.agent.avatar_url ?? null}
+                    state={avatarState}
+                    class="h-10 w-10 rounded-2xl"
+                  />
                   <span class="max-w-[4rem] truncate text-center text-[11px] font-medium">{agentLabel(item.agent)}</span>
                 </a>
               {/each}
@@ -7588,7 +8527,7 @@ import X from 'lucide-svelte/icons/x';
           <p class="text-xs text-slate-500">Content search disabled; filtering loaded titles only.</p>
         {/if}
 
-        <div class="grid grid-cols-3 gap-1.5 sm:gap-2">
+        <div class="grid grid-cols-4 gap-1.5 sm:gap-2">
           <Button
             size="sm"
             variant={selectedConversationStatus === 'active' ? 'primary' : 'secondary'}
@@ -7604,6 +8543,11 @@ import X from 'lucide-svelte/icons/x';
             variant={selectedConversationStatus === 'archived' ? 'primary' : 'secondary'}
             onclick={() => void setConversationStatusFilter('archived')}
           >Archived</Button>
+          <Button
+            size="sm"
+            variant={selectedConversationStatus === 'task' ? 'primary' : 'secondary'}
+            onclick={() => void setConversationStatusFilter('task')}
+          >Task</Button>
         </div>
       </div>
 
@@ -7713,10 +8657,15 @@ import X from 'lucide-svelte/icons/x';
                 <p id={`history-section-${section.key}`} class="sticky top-0 z-10 rounded-lg bg-slate-950 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-slate-500 first:mt-0">{section.label}</p>
                 {#each section.conversations as conversation (conversation.conversation_id)}
                   {@const agent = conversationAgentForDisplay(conversation)}
-                  {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
-                  {@const unread = conversation.has_unread && !isActive}
-                  {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
-                  {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
+                   {@const isActive = conversation.conversation_id === currentConversation?.conversation_id}
+                   {@const unread = conversation.has_unread && !isActive}
+                   {@const inProgress = conversation.has_active_turn || (isActive && turnInProgress)}
+                   {@const avatarState = conversationActivityState(conversation, {
+                     open: isActive,
+                     runtimeActive: inProgress,
+                     backgroundWork: backgroundWork.items,
+                   })}
+                   {@const showAttentionDot = conversationShowsAttentionDot(conversation, isActive, inProgress)}
                   {@const attentionDescription = conversationAttentionDescription(conversation)}
                   {@const turnMode = conversationChatMode(conversation)}
                   {@const rowTodoProgressTodos = conversationTodoProgressTodos(conversation)}
@@ -7726,15 +8675,11 @@ import X from 'lucide-svelte/icons/x';
                     onclick={closeMobileList}
                     title={conversationTitle(conversation)}
                   >
-                    <div class="relative grid h-9 w-9 shrink-0 place-items-center">
-                      {#if inProgress}
-                        <span class={`conversation-turn-orbit ${conversationOrbitClass(conversation, turnMode)}`} aria-hidden="true"><span></span></span>
-                      {/if}
-                      <AgentAvatar name={agent?.display_name ?? agent?.name ?? conversation.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-8 w-8" />
-                      {#if showAttentionDot}
-                        <span class={`absolute right-0 top-0 h-2.5 w-2.5 rounded-full border-2 border-slate-950 ${conversationDotClass(conversation)}`} title={attentionDescription}></span>
-                      {/if}
-                    </div>
+                    <ActivityAvatar
+                      name={agent?.display_name ?? agent?.name ?? conversation.agent_id}
+                      avatarUrl={agent?.avatar_url ?? null}
+                      state={avatarState}
+                    />
                     <div class="min-w-0 flex-1">
                       <p class="break-words text-sm {unread ? 'font-semibold text-white' : 'font-medium text-white'}">{conversationTitle(conversation)}</p>
                       <div class="mt-0.5 flex items-center gap-2">
@@ -7798,7 +8743,8 @@ import X from 'lucide-svelte/icons/x';
     -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <section
-      class="relative flex min-h-0 flex-1 flex-col bg-transparent"
+      class={`relative min-h-0 min-w-0 flex-1 bg-transparent ${inspectorPinned ? 'grid grid-cols-[minmax(32rem,1fr)_auto] grid-rows-[auto_auto_minmax(0,1fr)]' : 'flex flex-col'}`}
+      data-testid="chat-main"
       ondragenter={handleDragEnter}
       ondragleave={handleDragLeave}
       ondragover={handleDragOver}
@@ -7819,7 +8765,10 @@ import X from 'lucide-svelte/icons/x';
         Chat header. The iOS PWA status bar can overlay both compact and
         tablet/desktop-width layouts, so keep safe-area clearance on lg+ too.
       -->
-      <div class="border-b border-slate-800/80 px-2.5 pt-[calc(0.5rem+env(safe-area-inset-top))] pb-2 sm:px-4 sm:pt-[calc(0.75rem+env(safe-area-inset-top))] sm:pb-3 lg:px-5 lg:pt-[calc(1rem+env(safe-area-inset-top))] lg:pb-4">
+      <div
+        class="border-b border-slate-800/80 px-2.5 pt-[calc(0.5rem+env(safe-area-inset-top))] pb-2 sm:px-4 sm:pt-[calc(0.75rem+env(safe-area-inset-top))] sm:pb-3 lg:px-5 lg:pt-[calc(1rem+env(safe-area-inset-top))] lg:pb-4"
+        style="padding-left: max(0.625rem, env(safe-area-inset-left)); padding-right: max(0.625rem, env(safe-area-inset-right));"
+      >
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div class="min-w-0 flex-1">
             <div class="flex items-center gap-2">
@@ -7902,7 +8851,11 @@ import X from 'lucide-svelte/icons/x';
                     class="flex items-center gap-1.5 rounded-lg px-1 py-0.5 transition hover:bg-slate-800"
                     onclick={() => { showAgentProfile = !showAgentProfile; }}
                   >
-                    <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url ?? null} class="h-5 w-5" />
+                    <AgentAvatar
+                      name={agent.display_name ?? agent.name}
+                      avatarUrl={agent.avatar_url ?? null}
+                      class="h-5 w-5"
+                    />
                     <span>{agent.display_name ?? agent.name}</span>
                   </button>
                   {#if showAgentProfile}
@@ -7926,6 +8879,12 @@ import X from 'lucide-svelte/icons/x';
                   </button>
                 {/if}
 
+                {#if activeAgentProfileLabel()}
+                  <span class="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 text-[10px] font-medium text-sky-100" title="Agent profile">
+                    profile {activeAgentProfileLabel()}
+                  </span>
+                {/if}
+
                 {@const usage = activeContextUsage()}
                 {#if usage?.model}
                   <span class="max-w-[18rem] truncate rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-300" title={usage?.provider_id ? `${usage.model} (${usage.provider_id})` : usage.model}>
@@ -7934,11 +8893,6 @@ import X from 'lucide-svelte/icons/x';
                   {#if usage.reasoning_effort}
                     <span class="rounded-full border border-slate-700 bg-slate-800/60 px-2 py-0.5 text-[10px] font-medium text-slate-400" title="Thinking effort">
                       thinking {usage.reasoning_effort}
-                    </span>
-                  {/if}
-                  {#if contextUsageProfileLabel(usage)}
-                    <span class="rounded-full border border-sky-400/25 bg-sky-400/10 px-2 py-0.5 text-[10px] font-medium text-sky-100" title="Agent profile">
-                      profile {contextUsageProfileLabel(usage)}
                     </span>
                   {/if}
                 {/if}
@@ -7966,13 +8920,14 @@ import X from 'lucide-svelte/icons/x';
                 <span>No active conversation selected</span>
               {/if}
               </div>
-              {#if activeContextUsage()}
+              {#if activeContextUsage() && !isStandalonePwa}
                 {@const usage = activeContextUsage()}
                 <button
-                  class={`relative ml-auto inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border bg-slate-900/70 transition hover:border-sky-400/40 hover:bg-slate-800/80 ${headerInfoOpen && headerInfoMode === 'context' ? 'border-sky-400/50' : 'border-slate-700'}`}
+                  class={`relative ml-auto hidden h-8 w-8 shrink-0 items-center justify-center rounded-full border bg-slate-900/70 transition hover:border-sky-400/40 hover:bg-slate-800/80 sm:inline-flex ${headerInfoOpen && headerInfoMode === 'context' ? 'border-sky-400/50' : 'border-slate-700'}`}
                   title={contextUsageTooltip(usage)}
                   aria-label={headerInfoOpen && headerInfoMode === 'context' ? 'Close context usage details' : 'Open context usage details'}
                   aria-expanded={headerInfoOpen && headerInfoMode === 'context'}
+                  aria-controls="conversation-info-drawer"
                   onclick={toggleContextInfo}
                   type="button"
                 >
@@ -8005,23 +8960,20 @@ import X from 'lucide-svelte/icons/x';
             every viewport for a predictable affordance.
           -->
           <div class="flex items-start gap-2">
-            {#if currentConversation && canStarConversation(currentConversation)}
-              <div class="flex flex-col items-center gap-1">
-                <button
-                  class={`inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 transition hover:bg-slate-800 sm:h-8 sm:w-8 ${currentConversation.starred_at ? 'text-amber-300 hover:text-amber-200' : 'text-slate-400 hover:text-slate-100'}`}
-                  onclick={() => { if (currentConversation) void toggleConversationStar(currentConversation); }}
-                  type="button"
-                  title={currentConversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                  aria-label={currentConversation.starred_at ? 'Unstar conversation' : 'Star conversation'}
-                  disabled={starringConversationId === currentConversation.conversation_id}
-                >
-                  <Star class={`h-4 w-4 ${currentConversation.starred_at ? 'fill-current' : ''}`} />
-                </button>
-              </div>
-            {/if}
-            {#if !isWindowMode && canOpenAuxiliaryWindow}
+            {#if isTaskControlMode && !isStandalonePwa}
               <button
                 class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:h-8 sm:w-8"
+                onclick={requestTaskAgentDockMinimize}
+                type="button"
+                title="Return to task"
+                aria-label="Return to task"
+              >
+                <X class="h-4 w-4" />
+              </button>
+            {/if}
+            {#if !isStandalonePwa && !isWindowMode && canOpenAuxiliaryWindow}
+              <button
+                class="hidden h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 transition hover:bg-slate-800 hover:text-slate-100 sm:inline-flex sm:h-8 sm:w-8"
                 onclick={openCurrentConversationInSeparateWindow}
                 type="button"
                 title="Open in separate window"
@@ -8041,8 +8993,34 @@ import X from 'lucide-svelte/icons/x';
             >
               <Search class="h-4 w-4" />
             </button>
-            <SessionDetailsButton open={headerInfoOpen} loading={sessionInfoLoading} onclick={toggleHeaderInfo} />
-            {#if !isAgentDirectConversation(currentConversation)}
+            {#if inspectorPresentation === 'pinned' || (!headerInfoOpen && canPinInspector)}
+              <button
+                type="button"
+                class="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                aria-label={headerInfoOpen ? 'Collapse conversation inspector' : 'Open conversation inspector'}
+                aria-expanded={headerInfoOpen}
+                aria-controls="conversation-info-drawer"
+                data-testid="chat-header-info"
+                onclick={toggleHeaderInfo}
+              >{#if headerInfoOpen}<ChevronsRight class="h-4 w-4" />{:else}<ChevronsLeft class="h-4 w-4" />{/if}</button>
+            {:else}
+              <SessionDetailsButton open={headerInfoOpen} loading={sessionInfoLoading} ariaControls="conversation-info-drawer" testId="chat-header-info" onclick={toggleHeaderInfo} />
+            {/if}
+            {#if !isStandalonePwa}
+              <button
+                class={`hidden h-9 w-9 items-center justify-center rounded-lg border transition sm:inline-flex sm:h-8 sm:w-8 ${headerInfoOpen && headerInfoMode === 'work' ? 'border-sky-400/50 bg-sky-500/10 text-sky-200' : 'border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-slate-100'}`}
+                onclick={toggleWorkView}
+                type="button"
+                aria-expanded={headerInfoOpen && headerInfoMode === 'work'}
+                aria-controls="conversation-info-drawer"
+                aria-label="Work"
+                title="Work"
+                data-testid="chat-header-work"
+              >
+                <FileCode2 class="h-4 w-4" />
+              </button>
+            {/if}
+            {#if !isStandalonePwa && !isTaskControlMode && !isAgentDirectConversation(currentConversation)}
               <div class="hidden flex-wrap gap-2 sm:flex">
                 {#if currentConversation?.status === 'archived'}
                   <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
@@ -8063,45 +9041,98 @@ import X from 'lucide-svelte/icons/x';
       </div>
 
       {#if chatSearchOpen}
-        <ChatSearchBar
-          bind:query={chatSearchQuery}
-          results={chatSearchResults}
-          selectedIndex={chatSearchSelectedIndex}
-          loading={chatSearchLoading}
-          disabled={!currentConversation}
-          onSubmit={runChatSearch}
-          onClose={() => { chatSearchOpen = false; chatSearchResults = []; seededChatSearchSession = null; seededChatSearchRef = null; }}
-          onNext={() => selectChatSearchResult(chatSearchSelectedIndex + 1)}
-          onPrevious={() => selectChatSearchResult(chatSearchSelectedIndex - 1)}
-          onSelect={selectChatSearchResult}
-        />
+        <div class="col-start-1 row-start-2 min-w-0">
+          <ChatSearchBar
+            bind:query={chatSearchQuery}
+            results={chatSearchResults}
+            selectedIndex={chatSearchSelectedIndex}
+            loading={chatSearchLoading}
+            disabled={!currentConversation}
+            onSubmit={runChatSearch}
+            onClose={() => { chatSearchOpen = false; chatSearchResults = []; seededChatSearchSession = null; seededChatSearchRef = null; }}
+            onNext={() => selectChatSearchResult(chatSearchSelectedIndex + 1)}
+            onPrevious={() => selectChatSearchResult(chatSearchSelectedIndex - 1)}
+            onSelect={selectChatSearchResult}
+          />
+        </div>
       {/if}
 
-      <!--
-        Expanded session details panel. Sits directly below the header
-        so it extends the header's width, not the title column's. On
-        mobile, it also carries the agent / context / session-id
-        chips that are hidden in the sub-header row above.
-      -->
-      {#if headerInfoOpen && currentConversation}
+      {#if currentConversation}
         {@const panelAgent = conversationAgentForDisplay(currentConversation)}
         {@const panelPerformance = activeLastGeneration()}
-        {@const panelResponsiveness = panelPerformance ? responsivenessBadge(panelPerformance) : null}
-        <div class="max-h-[min(70vh,calc(var(--app-viewport-height,100dvh)-8rem))] overflow-y-auto overscroll-contain border-b border-slate-800/80 bg-slate-900/40 px-3 py-3 sm:max-h-[min(72vh,calc(var(--app-viewport-height,100dvh)-9rem))] sm:px-4 sm:py-4 lg:px-5">
-          {#if headerInfoMode === 'context'}
-            <button
-              class="mb-3 inline-flex items-center gap-1 text-xs font-medium text-slate-400 transition hover:text-slate-200"
-              type="button"
-              onclick={closeHeaderInfo}
-            >
-              <ArrowLeft class="h-3.5 w-3.5" />
-              Back
-            </button>
-          {/if}
-          {#if headerInfoMode !== 'context'}
-            <h2 class="mb-3 text-sm font-semibold text-white">Conversation Info</h2>
-          {/if}
-          <div class={`mb-3 flex-wrap items-center gap-2 text-sm text-slate-300 sm:hidden ${headerInfoMode === 'context' ? 'hidden' : 'flex'}`}>
+        {@const panelResponsiveness = responsivenessBadgeOrNull(panelPerformance)}
+        <ConversationInfoDrawer
+          open={headerInfoOpen}
+          presentation={inspectorPresentation}
+          width={effectiveInspectorWidth}
+          onWidthChange={(width) => conversationInfoDrawer.setWidth(width, false)}
+          onWidthCommit={(width) => conversationInfoDrawer.setWidth(width)}
+           onFocusChange={(focus) => { conversationInfoDrawer.focus = focus; }}
+           onClose={() => closeHeaderInfo(true)}
+         >
+           {#snippet header()}
+               <div class="min-w-0 flex-1">
+                 <h2 id="conversation-info-heading" class="sr-only">Conversation inspector</h2>
+                 <AccessibleTabs
+                   tabs={[{ id: 'overview', label: 'Overview' }, { id: 'work', label: 'Work' }, { id: 'session', label: 'Session' }]}
+                   activeId={headerInfoMode === 'context' ? 'overview' : headerInfoMode}
+                    idPrefix="conversation-info"
+                    ariaLabel="Conversation inspector"
+                    edgeFade={false}
+                   onChange={(id) => {
+                     conversationInfoDrawer.mode = id as 'overview' | 'work' | 'session';
+                     if (id === 'session' && !sessionInfo) void loadSessionInfo();
+                     if (id === 'overview' && !activityOverview) void loadActivityOverview();
+                   }}
+                   testIdPrefix="conversation-info"
+                 />
+               </div>
+           {/snippet}
+           <div
+            id={`conversation-info-panel-${headerInfoMode}`}
+            role={headerInfoMode === 'context' ? undefined : 'tabpanel'}
+            aria-labelledby={headerInfoMode === 'context' ? undefined : `conversation-info-tab-${headerInfoMode}`}
+          >
+           {#if focusedSessionId}
+              <button type="button" class="mb-3 inline-flex items-center gap-1 text-xs text-sky-300" onclick={navigateToStructuralParent}>
+               <ArrowLeft class="h-3.5 w-3.5" /> Back
+             </button>
+           {/if}
+           {#if headerInfoMode === 'overview' || headerInfoMode === 'context'}
+              {#if activityOverviewLoading && !renderedActivityOverview}
+               <p class="text-xs text-slate-500">Loading activity overview…</p>
+              {:else if renderedActivityOverview}
+                 <InspectorOverview
+                   overview={renderedActivityOverview}
+                   {agents}
+                   focusedSession={focusedWorkstream}
+                    focusedSessionId={treeFocusedSessionId}
+                    focusedSessionRuntimeActive={Boolean(
+                      turnInProgress
+                      && (canonicalFocusedSessionId ?? currentConversation.active_session_id) === currentConversation.active_session_id
+                    )}
+                   focusedSessionLoading={Boolean(focusedSessionId && activityOverviewLoadingScopeKey === inspectorScope?.key && activityOverview?.scope.key !== inspectorScope?.key)}
+                   narrow={inspectorPresentation === 'overlay'}
+                   contextUsage={activeContextUsage()}
+                   contextSessionId={diagnosticsOwnerSessionId}
+                   reasoningEffort={activeContextUsage()?.reasoning_effort ?? null}
+                   updating={activityOverviewLoading}
+                   onOpenWork={(category, sessionId) => openInspectorWork(category, sessionId)}
+                   onRefresh={() => void loadActivityOverview(true)}
+                  onViewSession={handleViewSession}
+               />
+             {:else}
+               <p class="text-xs text-rose-300">{activityOverviewError ?? 'Unable to load activity overview.'}</p>
+             {/if}
+           {:else if headerInfoMode === 'work'}
+                 <WorkView
+                  scope={inspectorScope ?? conversationTimelineScope(currentConversation.conversation_id)}
+                   initialTab={focusedWorkCategory === 'deliverables' ? 'results' : focusedWorkCategory}
+                   forceInitialTab
+                   onViewSession={handleViewSession}
+                />
+           {:else}
+           <div class="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-300 sm:hidden">
             <div class="flex items-center gap-2 rounded-lg bg-slate-900/80 px-2 py-1">
               <AgentAvatar name={panelAgent.display_name ?? panelAgent.name} avatarUrl={panelAgent.avatar_url ?? null} class="h-5 w-5" />
               <span>{panelAgent.display_name ?? panelAgent.name}</span>
@@ -8140,18 +9171,23 @@ import X from 'lucide-svelte/icons/x';
           {#if sessionInfoLoading}
             <p class="text-xs text-slate-500">Loading session details…</p>
           {:else if sessionInfo}
-            {@const panelContextUsage = contextUsage ?? sessionInfo.context_usage}
+            {@const loadedSessionInfo = sessionInfo!}
+            {@const panelContextUsage = (contextUsage ?? loadedSessionInfo.context_usage)!}
             {@const narrativeText = sessionNarrativeText(sessionInfo)}
-            {#if headerInfoMode !== 'context'}
-              <SessionDetailsContent
+            {#if true}
+             <SessionDetailsContent
                 detail={sessionInfo}
-                sessionId={currentConversation.active_session_id ?? sessionInfo.intaris_session_id}
+                sessionId={focusedSessionId ?? currentConversation.active_session_id ?? sessionInfo.intaris_session_id}
                 contextUsage={panelContextUsage}
                 performance={activeLastGeneration()}
                 onOpenIntaris={openIntarisSession}
-              />
+                canStar={!isTaskControlMode && canStarConversation(currentConversation)}
+                starred={Boolean(currentConversation.starred_at)}
+                starBusy={starringConversationId === currentConversation.conversation_id}
+                onToggleStar={() => { if (currentConversation) void toggleConversationStar(currentConversation); }}
+             />
             {:else}
-            {#if headerInfoMode !== 'context' && narrativeText}
+            {#if narrativeText}
               <div class="mb-3">
                 <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">{sessionNarrativeLabel(sessionInfo)}</p>
                 <p class={`mt-1 whitespace-pre-wrap text-sm leading-6 text-slate-200 ${sessionNarrativeExpanded ? '' : 'line-clamp-3 sm:line-clamp-none'}`}>{narrativeText}</p>
@@ -8167,11 +9203,11 @@ import X from 'lucide-svelte/icons/x';
             {#if headerInfoMode !== 'context'}
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-400">
-                <span>Status: <span class="text-slate-200">{sessionInfo.status}</span></span>
-                <span>Calls: <span class="text-slate-200">{sessionInfo.total_calls}</span></span>
-                <span class="text-emerald-400">{sessionInfo.approved_count} approved</span>
-                <span class="text-rose-400">{sessionInfo.denied_count} denied</span>
-                <span class="text-sky-400">{sessionInfo.escalated_count} escalated</span>
+                <span>Status: <span class="text-slate-200">{loadedSessionInfo.status}</span></span>
+                <span>Calls: <span class="text-slate-200">{loadedSessionInfo.total_calls}</span></span>
+                <span class="text-emerald-400">{loadedSessionInfo.approved_count} approved</span>
+                <span class="text-rose-400">{loadedSessionInfo.denied_count} denied</span>
+                <span class="text-sky-400">{loadedSessionInfo.escalated_count} escalated</span>
               </div>
               <Button size="sm" variant="secondary" onclick={() => void openIntarisSession(sessionInfo?.intaris_session_id ?? '')}>Open in Intaris</Button>
             </div>
@@ -8192,25 +9228,25 @@ import X from 'lucide-svelte/icons/x';
                     {#if panelPerformance?.runtime}
                       <div>
                         <dt class="text-slate-500">Runtime</dt>
-                        <dd class="mt-0.5 text-slate-200">{panelPerformance.runtime}</dd>
+                        <dd class="mt-0.5 text-slate-200">{panelPerformance?.runtime}</dd>
                       </div>
                     {/if}
                     {#if panelPerformance?.executor_name || panelPerformance?.executor_id}
                       <div>
                         <dt class="text-slate-500">Executor</dt>
-                        <dd class="mt-0.5 text-slate-200">{panelPerformance.executor_name ?? panelPerformance.executor_id}</dd>
+                        <dd class="mt-0.5 text-slate-200">{panelPerformance?.executor_name ?? panelPerformance?.executor_id}</dd>
                       </div>
                     {/if}
                     {#if panelPerformance?.configured_context_tokens}
                       <div>
                         <dt class="text-slate-500">Configured context</dt>
-                        <dd class="mt-0.5 text-slate-200">{formatTokenCount(panelPerformance.configured_context_tokens)} tokens</dd>
+                        <dd class="mt-0.5 text-slate-200">{formatTokenCount(panelPerformance?.configured_context_tokens)} tokens</dd>
                       </div>
                     {/if}
                     {#if panelPerformance?.quantization}
                       <div>
                         <dt class="text-slate-500">Quantization</dt>
-                        <dd class="mt-0.5 text-slate-200">{panelPerformance.quantization}</dd>
+                        <dd class="mt-0.5 text-slate-200">{panelPerformance?.quantization}</dd>
                       </div>
                     {/if}
                   </dl>
@@ -8220,21 +9256,21 @@ import X from 'lucide-svelte/icons/x';
                     <div>
                       <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Last generation</p>
                       <p class="mt-1 text-xs text-slate-500">
-                        {panelPerformance ? `Measured ${new Date(panelPerformance.measured_at).toLocaleString()}` : 'Local runtime telemetry is not available for this model.'}
+                        {performanceMeasurementLabel(panelPerformance)}
                       </p>
                     </div>
                     {#if panelResponsiveness}
                       <span
-                        class={`rounded-full border px-2 py-1 text-[10px] font-semibold ${panelResponsiveness.tone === 'good' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : panelResponsiveness.tone === 'slow' ? 'border-amber-400/30 bg-amber-400/10 text-amber-100' : 'border-sky-400/30 bg-sky-400/10 text-sky-100'}`}
-                        title={panelResponsiveness.detail}
+                        class={`rounded-full border px-2 py-1 text-[10px] font-semibold ${panelResponsiveness?.tone === 'good' ? 'border-emerald-400/30 bg-emerald-400/10 text-emerald-200' : panelResponsiveness?.tone === 'slow' ? 'border-amber-400/30 bg-amber-400/10 text-amber-100' : 'border-sky-400/30 bg-sky-400/10 text-sky-100'}`}
+                        title={panelResponsiveness?.detail}
                       >
-                        {panelResponsiveness.label}
+                        {panelResponsiveness?.label}
                       </span>
                     {/if}
                   </div>
                   {#if panelPerformance}
                     <div class="mt-3 grid gap-2 sm:grid-cols-2">
-                      {#each localPerformanceMetrics(panelPerformance) as metric}
+                      {#each optionalPerformanceMetrics(panelPerformance) as metric}
                         <div class="rounded-xl border border-slate-800/70 bg-slate-950/40 px-2.5 py-2">
                           <p class="text-[10px] uppercase tracking-wide text-slate-500">{metric.label} · {metric.raw}</p>
                           <p class="mt-1 text-xs font-medium text-slate-100">{metric.value}</p>
@@ -8242,11 +9278,11 @@ import X from 'lucide-svelte/icons/x';
                       {/each}
                     </div>
                     {#if panelResponsiveness}
-                      <p class="mt-2 text-[11px] text-slate-500">{panelResponsiveness.label} for {panelResponsiveness.detail}.</p>
+                      <p class="mt-2 text-[11px] text-slate-500">{panelResponsiveness?.label} for {panelResponsiveness?.detail}.</p>
                     {/if}
-                    {#if panelPerformance.processor || panelPerformance.gpu_residency || panelPerformance.digest}
+                    {#if panelPerformance?.processor || panelPerformance?.gpu_residency || panelPerformance?.digest}
                       <p class="mt-2 break-all text-[11px] text-slate-500">
-                        {[panelPerformance.processor ? `Processor ${panelPerformance.processor}` : null, panelPerformance.gpu_residency ? `GPU residency ${panelPerformance.gpu_residency}` : null, panelPerformance.digest ? `Digest ${panelPerformance.digest}` : null].filter(Boolean).join(' · ')}
+                        {performanceHardwareLabel(panelPerformance)}
                       </p>
                     {/if}
                   {/if}
@@ -8337,7 +9373,7 @@ import X from 'lucide-svelte/icons/x';
           {:else}
             <p class="text-xs text-slate-500">Unable to load session details.</p>
           {/if}
-          <div class={`mt-3 flex-wrap gap-2 sm:hidden ${headerInfoMode === 'context' ? 'hidden' : 'flex'}`}>
+          <div class={`mt-3 flex-wrap gap-2 sm:hidden ${isTaskControlMode ? 'hidden' : 'flex'}`}>
             {#if currentConversation.status === 'archived'}
               <Button size="sm" variant="secondary" disabled={archivingConversation} onclick={restoreConversation}>
                 {archivingConversation ? 'Restoring…' : 'Restore'}
@@ -8351,11 +9387,13 @@ import X from 'lucide-svelte/icons/x';
               {deletingConversation ? 'Deleting…' : 'Delete'}
             </Button>
           </div>
-        </div>
+          {/if}
+          </div>
+        </ConversationInfoDrawer>
       {/if}
 
       <!-- Message area + composer -->
-      <div class="flex min-h-0 flex-1 flex-col gap-2 px-0 pt-2 pb-0 sm:gap-4 sm:px-4 sm:py-4">
+      <div class="col-start-1 row-start-3 flex min-h-0 min-w-0 flex-1 flex-col gap-2 overflow-x-hidden px-0 pt-2 pb-0 sm:gap-4 sm:px-4 sm:py-4">
         {#if isMemoryDegraded()}
           <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
             Memory is currently unavailable — this conversation won't have access to past context.
@@ -8402,22 +9440,25 @@ import X from 'lucide-svelte/icons/x';
 
         {#if queuedCount > 0}
           <div class="rounded-2xl border border-sky-400/30 bg-sky-500/10 px-3 py-3 text-sm text-sky-100">
-            <p class="font-medium">Current turn is still running; queued messages below will run next.</p>
+            <p class="font-medium">Current turn is still running. While it is waiting on managed agent work, queued messages can interject at a safe tool boundary to resume this turn; otherwise they run next.</p>
             {#if queuedMessages.length > 0}
               <div class="mt-3 space-y-1.5">
                 {#each queuedMessages as queued (queued.queue_id)}
-                  {@const canMutateQueue = canMutateQueuedMessages()}
+                  {@const automaticContinuation = isAutomaticContinuation(queued)}
+                  {@const canMutateQueue = !automaticContinuation && canMutateQueuedMessages()}
                   {@const isExpanded = queueIsExpanded(queued.queue_id)}
                   <div class="chat-queue-item-enter rounded-xl border border-sky-300/20 bg-slate-950/40 px-2.5 py-2">
                     <div class="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
                       <span class="shrink-0 rounded-full border border-sky-300/20 bg-sky-400/10 px-2 py-0.5 text-[11px] font-medium text-sky-100">#{queued.position}</span>
-                      <span class="shrink-0 text-[11px] uppercase tracking-wide text-sky-200/70">waiting</span>
-                      <p class="min-w-0 flex-1 truncate text-slate-100">{queued.content}</p>
+                      <span class="shrink-0 text-[11px] uppercase tracking-wide text-sky-200/70">{automaticContinuation ? 'automatic' : 'waiting'}</span>
+                      <p class="min-w-0 flex-1 truncate text-slate-100">{queuedMessageLabel(queued)}</p>
                       {#if queued.attachments?.length}
                         <span class="shrink-0 rounded-full border border-sky-300/20 px-2 py-0.5 text-[11px] text-sky-100/80">{queued.attachments.length} attachment{queued.attachments.length === 1 ? '' : 's'}</span>
                       {/if}
                       <div class="ml-auto flex shrink-0 items-center gap-1.5">
-                        <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} aria-expanded={isExpanded} aria-label={`${isExpanded ? 'Collapse' : 'Expand'} queued message #${queued.position}`} onclick={() => toggleQueuedMessage(queued.queue_id)}>{isExpanded ? 'Collapse' : 'Details'}</Button>
+                        {#if !automaticContinuation}
+                          <Button size="sm" variant="ghost" disabled={queueBusyId === queued.queue_id} aria-expanded={isExpanded} aria-label={`${isExpanded ? 'Collapse' : 'Expand'} queued message #${queued.position}`} onclick={() => toggleQueuedMessage(queued.queue_id)}>{isExpanded ? 'Collapse' : 'Details'}</Button>
+                        {/if}
                         {#if canMutateQueue}
                           <Button size="sm" variant="secondary" disabled={queueBusyId === queued.queue_id} onclick={() => startQueuedMessageEdit(queued)}>Edit</Button>
                           <Button size="sm" variant="danger" disabled={queueBusyId === queued.queue_id} onclick={() => void deleteQueuedMessage(queued.queue_id)}>Delete</Button>
@@ -8574,7 +9615,9 @@ import X from 'lucide-svelte/icons/x';
           onTouchMove={handleTimelineTouchMove}
           onTouchEnd={handleTimelineTouchEnd}
           onKeydown={handleTimelineKeydown}
-          onPointerDown={closeHeaderInfo}
+          onPointerDown={() => {
+            if (inspectorPresentation === 'overlay') closeHeaderInfo(false);
+          }}
            onViewSession={handleViewSession}
            onJumpToBottom={jumpToBottom}
            onJumpToActiveStart={jumpToActiveTimelineStart}
@@ -8633,13 +9676,14 @@ import X from 'lucide-svelte/icons/x';
 
             <!-- Escalation prompts (sequential: show one at a time) -->
             {#if escalationResolutionPending}
-              <div class="rounded-3xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 shadow-card">
-                <div class="flex flex-wrap items-center justify-between gap-4">
-                  <div>
-                    <p class="text-xs font-medium uppercase tracking-[0.25em] text-sky-200">Approval submitted</p>
-                    <h3 class="mt-1 text-base font-semibold text-white">{escalationResolutionPending.tool_name ?? 'Escalated action'}</h3>
+              <div class="ml-auto w-full max-w-xl rounded-[1.4rem] border border-emerald-400/35 bg-emerald-500/15 px-4 py-3 text-emerald-50 shadow-card sm:rounded-3xl">
+                <div class="flex items-center gap-2.5">
+                  <span class="h-2 w-2 shrink-0 rounded-full bg-current opacity-80" aria-hidden="true"></span>
+                  <div class="min-w-0 flex-1">
+                    <p class="text-sm font-semibold">Approval submitted · {escalationResolutionPending.tool_name ?? 'Escalated action'}</p>
+                    <p class="mt-0.5 text-xs text-emerald-100/75">Waiting for controller acknowledgement</p>
                   </div>
-                  <LiveDots inline={true} size="sm" tone="sky" label="Waiting for controller acknowledgement" />
+                  <LiveDots inline={true} size="sm" tone="emerald" label="Waiting for controller acknowledgement" />
                 </div>
               </div>
             {:else if escalations.length > 0}
@@ -8659,12 +9703,30 @@ import X from 'lucide-svelte/icons/x';
         </TimelineViewport>
 
         <div bind:this={footerChromeEl} class="shrink-0 space-y-3">
-          {#if shouldShowChatTodoDrawer}
-            <TimelineTodoDrawer todos={chatTodos} bind:open={chatTodoDrawerOpen} />
+          {#if shouldShowOngoingWorkDrawer}
+            <TimelineOngoingWorkDrawer
+              todos={chatTodos}
+              work={currentConversationWork}
+              truncated={backgroundWork.truncated}
+              bind:open={ongoingWorkDrawerOpen}
+              onViewSession={handleViewSession}
+            />
           {/if}
 
           <!-- Composer or read-only banner -->
           {#if currentConversation && isManagedConversation(currentConversation)}
+            <ManagedConversationControls
+              conversation={currentConversation}
+              busy={managedActionBusy}
+              error={managedActionError}
+              onStop={() => void stopManagedConversation()}
+              onSend={(message) => {
+                managedInstruction = message;
+                void sendManagedInstruction();
+              }}
+              onTakeControl={() => void takeControlOfManagedConversation()}
+            />
+            <!-- Legacy inline controls retained only in git history.
             <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100">
               <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div class="min-w-0 sm:flex-1">
@@ -8754,6 +9816,7 @@ import X from 'lucide-svelte/icons/x';
                 <p class="mt-2 break-words text-xs text-rose-100">{managedActionError}</p>
               {/if}
             </div>
+            -->
           {:else if currentConversation && !isWebConversation(currentConversation)}
             <div class="rounded-2xl border border-slate-700/60 bg-slate-900/60 px-4 py-3 text-center text-sm text-slate-400">
               This conversation is from <span class="font-medium text-slate-300">{contextTypeBadge(currentConversation)}</span>. Read-only in web UI.
@@ -9071,6 +10134,9 @@ import X from 'lucide-svelte/icons/x';
                   class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-500 text-slate-950 transition duration-100 hover:bg-sky-400 active:scale-90 disabled:opacity-50"
                   disabled={directQuestionSubmitting || voiceTranscribing}
                 >
+                  {#if currentConversationHasActiveBackgroundWork && !turnInProgress}
+                    <span class="conversation-turn-orbit conversation-turn-orbit--background" aria-hidden="true"><span></span></span>
+                  {/if}
                   <ArrowUp class="h-4 w-4" stroke-width="2.5" />
                   {#if turnInProgress}
                     <span class="absolute -bottom-0.5 -right-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full border border-slate-950 bg-slate-950 text-sky-300">
@@ -9081,20 +10147,25 @@ import X from 'lucide-svelte/icons/x';
               {:else if turnInProgress}
                 <button
                   type="button"
-                  aria-label="Cancel turn"
-                  title="Cancel turn"
+                  aria-label={cancelTurnPending ? 'Cancelling turn' : 'Cancel turn'}
+                  title={cancelTurnPending ? 'Cancelling…' : 'Cancel turn'}
                   class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-800 text-slate-200 transition hover:bg-slate-700"
+                  disabled={cancelTurnPending}
                   onclick={() => { haptic.warning(); cancelActiveTurnWithChatV2(); }}
                 >
                   <span class={`conversation-turn-orbit ${turnOrbitClass(activeTurnChatMode)}`} aria-hidden="true"><span></span></span>
-                  <Square class="absolute h-2.5 w-2.5 fill-current text-slate-100" />
+                  {#if cancelTurnPending}
+                    <span class="absolute h-2.5 w-2.5 animate-pulse rounded-sm bg-slate-100"></span>
+                  {:else}
+                    <Square class="absolute h-2.5 w-2.5 fill-current text-slate-100" />
+                  {/if}
                 </button>
               {:else}
                 <button
                   type="button"
                   aria-label="Open conversation mode"
                   title="Conversation mode"
-                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
+                  class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-40"
                   onclick={() => { conversationModeOpen = true; }}
                   disabled={!currentConversation || isReadOnly(currentConversation) || directQuestionSubmitting || voiceTranscribing}
                 >
@@ -9130,54 +10201,34 @@ import X from 'lucide-svelte/icons/x';
         />
       {/if}
 
-      <!-- Sub-session drawer overlay -->
-      {#if subSessionPanelOpen}
-        <!-- Backdrop -->
-        <button
-          class={`absolute inset-0 z-20 bg-slate-950/80 transition-opacity duration-250 ${subSessionClosing ? 'opacity-0' : 'opacity-100'}`}
-          onclick={closeSubSessionPanel}
-          type="button"
-          aria-label="Close sub-session"
-        ></button>
-
-        <!-- Drawer -->
-        <aside class={`absolute inset-0 z-30 flex h-full min-h-0 w-full flex-col overflow-hidden border-l border-slate-800/80 bg-slate-900 shadow-2xl ${subSessionClosing ? 'animate-slide-out-right' : 'animate-slide-in-right'}`}>
-          <div class="flex shrink-0 items-center gap-3 border-b border-slate-800/80 px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))]">
-            <button
-              class="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-800 hover:text-white"
-              onclick={closeSubSessionPanel}
-              type="button"
-              title="Back to conversation"
-            >
-              <ArrowLeft class="h-4 w-4" />
-            </button>
-            <div class="min-w-0 flex-1">
-              <p class="text-xs font-medium uppercase tracking-[0.2em] text-slate-400">Sub-session</p>
-              <p class="mt-0.5 truncate font-mono text-xs text-slate-500">{subSessionId.slice(0, 16)}</p>
-              <div class="mt-2">
-                <LiveDots inline={true} size="sm" tone={subSessionUserScrolledUp ? 'slate' : 'sky'} label={subSessionUserScrolledUp ? 'Live follow paused' : 'Following latest'} />
-              </div>
-            </div>
-            <SessionDetailsButton open={subSessionInfoOpen} onclick={() => { subSessionInfoOpen = !subSessionInfoOpen; }} />
-          </div>
-
-          {#if subSessionInfoOpen}
-            <SessionDetailsPanel sessionId={subSessionId} onOpenIntaris={openIntarisSession} />
-          {/if}
-
-          <ScopedChatV2Timeline
-            scope={{
-              key: `session:${subSessionId}`,
-              kind: 'session',
-              conversation_id: currentConversation?.conversation_id ?? null,
-              session_id: subSessionId,
-              label: subSessionId
-            }}
+      {#if childView && childWorkstream}
+        <aside class={`${inspectorPinned ? 'relative col-start-1 row-start-1 row-end-4' : 'absolute inset-0'} z-30 min-h-0 min-w-0 overflow-hidden`} data-testid="child-middle-column">
+          <ChildChatView
+            view={childView}
+            node={childWorkstream}
             agent={subSessionAgent() ?? null}
             preferences={$userPreferences}
+            work={childBackgroundWork}
+            workTruncated={backgroundWork.truncated}
+            inspectorOpen={headerInfoOpen}
             bind:userScrolledUp={subSessionUserScrolledUp}
+            onBack={navigateToStructuralParent}
+            onClose={closeSubSessionPanel}
+            onToggleInspector={(trigger) => {
+              headerInfoTrigger = trigger;
+              conversationInfoDrawer.setOpen(!headerInfoOpen);
+              if (conversationInfoDrawer.open) {
+                if (headerInfoMode === 'session') void loadSessionInfo();
+                else if (headerInfoMode === 'overview') void loadActivityOverview();
+              }
+            }}
             onViewSession={handleViewSession}
-            emptyLabel="No events recorded yet."
+            managedConversation={childManagedConversation}
+            managedBusy={childManagedBusy}
+            managedError={childManagedError}
+            onManagedStop={() => void runChildManagedAction('stop', { reason: 'Stopped by user from managed conversation UI' })}
+            onManagedSend={(message) => void runChildManagedAction('send', { message, wait: false })}
+            onManagedTakeControl={() => void runChildManagedAction('take-control')}
           />
         </aside>
       {/if}
@@ -9270,6 +10321,14 @@ import X from 'lucide-svelte/icons/x';
     --turn-orbit-shadow-rgb: 245 158 11;
   }
 
+  .conversation-turn-orbit--background {
+    --turn-orbit-rgb: 167 139 250;
+    --turn-orbit-tip-rgb: 196 181 253;
+    --turn-orbit-shadow-rgb: 139 92 246;
+    animation-duration: 1.8s;
+    opacity: 0.72;
+  }
+
   .conversation-turn-orbit--amber {
     --turn-orbit-rgb: 251 191 36;
     --turn-orbit-tip-rgb: 252 211 77;
@@ -9292,6 +10351,13 @@ import X from 'lucide-svelte/icons/x';
     border-radius: 9999px;
     background: rgb(var(--turn-orbit-rgb));
     box-shadow: 0 0 10px rgb(var(--turn-orbit-rgb) / 0.9), 0 0 18px rgb(var(--turn-orbit-shadow-rgb) / 0.45);
+  }
+
+  @media (min-width: 1024px) {
+    .chat-history-sidebar {
+      width: var(--chat-sidebar-width);
+      flex: 0 0 var(--chat-sidebar-width);
+    }
   }
 
   @media (prefers-reduced-motion: reduce) {
