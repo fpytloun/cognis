@@ -52,6 +52,7 @@ from cognis.models.search import (
     SearchMatch,
     SearchSessionMatch,
 )
+from cognis.models.task import TaskDelivery
 
 
 def test_task_requests_normalize_empty_optional_ids() -> None:
@@ -71,6 +72,11 @@ def test_task_requests_normalize_empty_optional_ids() -> None:
     assert update.workflow_id is None
     assert update.project_id is None
     assert update.skill_id is None
+
+
+def test_task_delivery_defaults_to_preferred_channel() -> None:
+    assert TaskCreateRequest(agent_id="agent-1", title="Task").delivery_mode == "preferred_channel"
+    assert TaskDelivery().mode == "preferred_channel"
 
 
 class _FakeRow(types.SimpleNamespace):

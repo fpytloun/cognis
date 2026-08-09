@@ -24,7 +24,11 @@ from cognis.core.orchestration_policy import (
 )
 from cognis.core.prompts import PromptContext, build_system_instructions
 from cognis.models.session import ConversationContext
-from cognis.tools.builtin.orchestration import DELEGATE_TOOL, OrchestrationMode
+from cognis.tools.builtin.orchestration import (
+    DELEGATE_TOOL,
+    OrchestrationMode,
+    orchestration_tools,
+)
 
 
 def _guidance(
@@ -137,6 +141,31 @@ def test_managed_and_workflow_contexts_reject_surface_forbidden_claims() -> None
     assert "asynchronously" not in task
 
 
+def test_task_primary_mode_exposes_only_restricted_orchestration() -> None:
+    names = {tool.name for tool in orchestration_tools(OrchestrationMode.TASK_PRIMARY)}
+
+    assert names == {
+        "delegate",
+        "agent_conversation_create",
+        "agent_conversation_send",
+        "agent_conversation_wait",
+        "agent_conversation_interrupt",
+        "agent_conversation_retry",
+        "agent_conversation_fork",
+        "agent_conversation_close",
+        "agent_conversation_list",
+        "agent_conversation_get",
+    }
+    guidance = _guidance(
+        ConversationContext(type="task"),
+        OrchestrationMode.TASK_PRIMARY,
+        names,
+    )
+    assert guidance is not None
+    assert "Task-owned managed conversations" in guidance
+    assert "Task and workflow creation" in guidance
+
+
 def test_policy_allows_but_hidden_tools_are_not_claimed() -> None:
     assert (
         _guidance(
@@ -174,7 +203,8 @@ def test_delegate_guidance_reuses_existing_child_context() -> None:
     assert "follow_up_subsession" in description
     assert "fork_subsession" in description
     assert "same problem" in description
-    assert "start fresh only" in description.lower()
+    assert "they do not change specialist" in description
+    assert "start fresh with the appropriate specialist" in description.lower()
 
 
 def test_capability_guidance_prioritizes_follow_up_for_terminal_delegates() -> None:

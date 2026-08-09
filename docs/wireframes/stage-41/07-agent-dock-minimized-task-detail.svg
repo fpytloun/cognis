@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="1000" viewBox="0 0 1160 1000" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}.amber{fill:#f5b544}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .fab{fill:#0f2333;stroke:#38bdf8;stroke-width:2.5}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="1000"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">07 · Task Agent Dock — MINIMIZED on a task-detail page (task-scoped, unmounts off-route)</text>
+  <text x="28" y="54" class="m" font-size="12">The dock is owned by the task-detail layout. It exists ONLY on /tasks/[taskId]. Here it is the calm minimized FAB while the user reads the Cockpit.</text>
+
+  <!-- app shell: sidebar -->
+  <rect x="28" y="72" width="150" height="620" class="panel" rx="12"/>
+  <text x="46" y="100" class="ac" font-size="11" font-weight="700" letter-spacing="2">COGNIS</text>
+  <rect x="44" y="120" width="118" height="26" rx="8" class="sub"/><text x="56" y="137" class="m" font-size="11">Chat</text>
+  <rect x="44" y="152" width="118" height="26" rx="8" class="sub"/><text x="56" y="169" class="m" font-size="11">Agents</text>
+  <rect x="44" y="184" width="118" height="26" rx="8" class="sub"/><text x="56" y="201" class="m" font-size="11">Projects</text>
+  <rect x="44" y="216" width="118" height="26" rx="8" class="acbg"/><text x="56" y="233" class="ac" font-size="11" font-weight="700">Tasks</text>
+  <rect x="44" y="248" width="118" height="26" rx="8" class="sub"/><text x="56" y="265" class="m" font-size="11">Workflows</text>
+  <text x="46" y="300" class="cap" font-size="10">Leaving Tasks →</text>
+  <text x="46" y="314" class="cap" font-size="10">dock UNMOUNTS (see 4).</text>
+
+  <!-- main content: TASK DETAIL / cockpit -->
+  <rect x="194" y="72" width="938" height="620" class="panel" rx="12"/>
+  <text x="216" y="102" class="lbl" font-size="14">Task · Release safety review</text>
+  <text x="216" y="122" class="m" font-size="11">/tasks/t_8821 — task-detail route. The dock lives inside THIS view (Cockpit, tabs, inspector, Work modal).</text>
+  <!-- route/scope reminder chip -->
+  <rect x="216" y="134" width="240" height="24" rx="8" class="acbg"/><text x="230" y="151" class="ac" font-size="10" font-weight="700">Scope = route · t_8821 (implicit)</text>
+  <circle cx="480" cy="146" r="10" class="callout"/><text x="476" y="150" class="cnum" font-size="11">2</text>
+
+  <rect x="216" y="172" width="880" height="52" class="sub" rx="10"/><text x="232" y="203" class="m" font-size="12">Header · status: PAUSED · primary: Answer &amp; resume · overflow</text>
+  <rect x="216" y="236" width="880" height="96" class="att" rx="10"/>
+  <text x="232" y="260" class="amber" font-size="11" font-weight="700">ATTENTION HERO · gate waiting (also resolvable from the dock)</text>
+  <text x="232" y="282" class="cap" font-size="11">Approve this release for production?  ✓ 12 tests · 1 file · loop 1/5</text>
+  <rect x="216" y="344" width="880" height="120" class="sub" rx="10"/><text x="232" y="372" class="m" font-size="12">Workflow phases · typed step cards…</text>
+  <rect x="216" y="476" width="880" height="100" class="sub" rx="10"/><text x="232" y="504" class="m" font-size="12">Result / Work (inline)…</text>
+
+  <!-- FAB minimized bottom-right, INSIDE task view -->
+  <circle cx="1086" cy="634" r="30" class="fab"/>
+  <text x="1086" y="640" class="ac" font-size="20" text-anchor="middle" font-weight="700">◐</text>
+  <circle cx="1106" cy="612" r="11" class="amber"/><text x="1106" y="616" class="bg" font-size="11" text-anchor="middle" font-weight="700">!</text>
+  <circle cx="1040" cy="634" r="10" class="callout"/><text x="1036" y="638" class="cnum" font-size="11">1</text>
+  <!-- task-title launcher label (solid, this-task) -->
+  <rect x="892" y="668" width="196" height="26" rx="8" class="acbg"/>
+  <text x="908" y="685" class="ac" font-size="10" font-weight="700">Agent · Release safety review</text>
+  <circle cx="874" cy="681" r="10" class="callout"/><text x="870" y="685" class="cnum" font-size="11">3</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="742" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="766" class="note" font-size="12">1 MINIMIZED state: a small (~52px) launcher pinned bottom-right WITHIN the task-detail view (drag to any corner; position persists per</text>
+  <text x="44" y="784" class="note" font-size="12">task). The status ring shows the task's live state. Calm by default — pulses ONCE on new attention, never with reduced-motion.</text>
+  <text x="28" y="808" class="note" font-size="12">2 SCOPE = THE ROUTE. The bound task id always equals the /tasks/[taskId] URL param. There is no stored, mutable scope that can drift,</text>
+  <text x="44" y="826" class="note" font-size="12">so a mutation can only ever target the task you are currently viewing. No "following" chip, no detach, no scope-switch UI.</text>
+  <text x="28" y="850" class="note" font-size="12">3 The launcher shows the current TASK TITLE (solid, not dashed) — it is unambiguously about this task, the page you are on.</text>
+  <text x="28" y="874" class="note" font-size="12">4 ROUTE UNMOUNT: navigating to Tasks list / Projects / Chat / Workflows / Settings REMOVES the dock and its launcher entirely.</text>
+  <text x="44" y="892" class="note" font-size="12">The persistent server-side task-control conversation survives; it REOPENS (same transcript + decision state) when you return to t_8821.</text>
+  <text x="28" y="916" class="note" font-size="12">5 Task A → Task B: navigating straight from one task detail to another REBINDS to B's conversation (brief header transition); A is never</text>
+  <text x="44" y="934" class="note" font-size="12">silently retained. Per-task open/minimized state may be remembered; otherwise the dock defaults to minimized on entry.</text>
+  <text x="28" y="958" class="note" font-size="12">6 Attention badge (amber !) mirrors the Cockpit Attention hero (shared source) — the two can never disagree. Unread messages use a</text>
+  <text x="44" y="976" class="note" font-size="12">plain count. Keyboard: `A` toggles the dock (task routes only); FAB is last in the task view tab order. Off task detail: normal notifications.</text>
+</svg>

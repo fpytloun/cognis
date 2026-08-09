@@ -23,6 +23,20 @@ def test_coding_skill_defines_complete_isolated_git_workflow() -> None:
     assert "Do not amend, rebase, merge into a user-owned branch" in instructions
 
 
+def test_coding_skill_defaults_to_conventional_commits() -> None:
+    skill = get_system_skill_default("cognis-coding")
+
+    assert skill is not None
+    instructions = _normalized_instructions(skill)
+    assert "Use Conventional Commits v1.0.0 for task-owned commits" in instructions
+    assert "unless the repository defines a different commit convention" in instructions
+    assert "<type>[optional scope][!]: <short description>" in instructions
+    assert "`feat`, `fix`, `refactor`, `test`, `docs`, `perf`, `build`, `ci`, or `chore`" in (
+        instructions
+    )
+    assert "Do not invent scopes, issue IDs, or breaking markers" in instructions
+
+
 def test_coding_skill_scopes_parallel_implementation_and_validation() -> None:
     skill = get_system_skill_default("cognis-coding")
 
@@ -69,8 +83,8 @@ def test_coding_skill_defines_bounded_delivery_contract() -> None:
     assert "Keep reviews scope-locked" in instructions
     assert "Reuse context generically, not only for review" in instructions
     assert "Before any fresh delegation" in instructions
-    assert "Continue it for the same line of work" in instructions
-    assert "branch from it for an independent alternative" in instructions
+    assert "specialist role, tool/authority scope" in instructions
+    assert "follow-up and fork preserve the source" in instructions
     assert "does not default to a" in instructions
 
 

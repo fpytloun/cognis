@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import func, select
 
 import cognis.store.queries as store_queries
 from cognis.api import runtime_support
 from cognis.api.runtime_support import (
     _build_remote_runtime_registry,
+    _mcp_degraded_notice,
     _merge_remote_runtime_inventory,
     _resolve_intaris_mcp_tools,
     mcp_server_assignment_key,
     select_static_tools,
     tool_disabled_by_agent_config,
 )
+from cognis.core.executor_pin_lifecycle import ExecutorPinLifecycleResult
 from cognis.core.executor_policy import ExecutorPolicy
+from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.tool_router import ToolRoute, ToolRouter
 from cognis.models.agent import AgentDefinition
 from cognis.models.knowledgebase import KnowledgebaseModel
@@ -31,6 +37,16 @@ from cognis.models.tool import (
 )
 from cognis.providers.executor.in_process import InProcessExecutorConnection
 from cognis.runtime_context import RuntimeAccessContext
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.models import (
+    Agent,
+    Base,
+    Conversation,
+    ExecutorPinNoticeOutboxRow,
+    ExecutorPinTransitionRow,
+    Task,
+    User,
+)
 from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 from cognis.tools.skills import ResolvedSkillSet
@@ -38,6 +54,62 @@ from cognis.tools.skills import ResolvedSkillSet
 
 async def _executor_pin_lifecycle_settings(_session_factory: object) -> dict[str, int]:
     return {"retry_seconds": 0, "retry_interval_seconds": 0}
+
+
+def test_mcp_degraded_notice_exposes_only_authorization_failures() -> None:
+    notice = _mcp_degraded_notice(
+        {
+            "mcp_servers": [
+                {
+                    "name": "mfg-portal",
+                    "server_id": "mcp_mfg_portal",
+                    "status": "failed",
+                    "authorization_required": True,
+                },
+                {"name": "unrelated", "status": "failed", "authorization_required": False},
+                {"name": "healthy", "status": "ready"},
+            ]
+        },
+        can_authorize=True,
+    )
+
+    assert notice is not None
+    assert "mfg-portal" in notice
+    assert "mcp_mfg_portal" in notice
+    assert "unrelated" not in notice
+    assert "authorization required" in notice
+    assert "manage_mcp" in notice
+
+
+def test_mcp_degraded_notice_ignores_missing_or_non_authorization_metadata() -> None:
+    assert _mcp_degraded_notice({}, can_authorize=True) is None
+    assert (
+        _mcp_degraded_notice(
+            {"mcp_servers": [{"name": "mfg-portal", "status": "failed"}]},
+            can_authorize=True,
+        )
+        is None
+    )
+
+
+def test_mcp_degraded_notice_directs_user_when_management_tool_is_unavailable() -> None:
+    notice = _mcp_degraded_notice(
+        {
+            "mcp_servers": [
+                {
+                    "name": "mfg-portal",
+                    "server_id": "mcp_mfg_portal",
+                    "status": "failed",
+                    "authorization_required": True,
+                }
+            ]
+        },
+        can_authorize=False,
+    )
+
+    assert notice is not None
+    assert "Tools & Skills" in notice
+    assert "manage_mcp" not in notice
 
 
 def _agent(*, tools: dict[str, object] | None = None) -> AgentDefinition:
@@ -1809,10 +1881,11 @@ async def test_initial_active_executor_persisted_for_explicit_id(
     async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
         return [_executor_row("exec-1")]
 
-    persisted: dict[str, str | None] = {"id": None}
+    persisted: dict[str, str | None] = {"id": None, "source": None}
 
-    async def _initialize(_session, conversation_id, executor_id):
+    async def _initialize(_session, conversation_id, executor_id, *, source):
         persisted["id"] = executor_id
+        persisted["source"] = source
         return True
 
     monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
@@ -1837,6 +1910,44 @@ async def test_initial_active_executor_persisted_for_explicit_id(
     )
     assert config["executor_id"] == "exec-1"
     assert persisted["id"] == "exec-1"
+    assert persisted["source"] == "explicit_primary"
+
+
+@pytest.mark.asyncio
+async def test_initial_active_executor_persisted_for_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_executor_row(*_: object, **__: object) -> SimpleNamespace:
+        return _executor_row("exec-selector")
+
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [_executor_row("exec-selector", labels={"role": "local"})]
+
+    persisted: dict[str, str | None] = {"id": None, "source": None}
+
+    async def _initialize(_session, conversation_id, executor_id, *, source):
+        persisted["id"] = executor_id
+        persisted["source"] = source
+        return True
+
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    monkeypatch.setattr(store_queries, "initialize_conversation_active_executor", _initialize)
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        _runtime_providers(),
+        AgentDefinition(
+            agent_id="agent-selector",
+            owner_email="alice@example.com",
+            name="Selector",
+            execution={"executor_selector": {"role": "local"}},
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_id="conv-selector",
+    )
+    assert config["executor_id"] == "exec-selector"
+    assert persisted == {"id": "exec-selector", "source": "selector_primary"}
 
 
 @pytest.mark.asyncio
@@ -1880,6 +1991,7 @@ async def test_pinned_active_executor_takes_precedence(
         "alice@example.com",
         ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
         conversation_active_executor_id="exec-add",
+        conversation_active_executor_source="additional",
     )
     # Pin overrides the primary binding
     assert config["executor_id"] == "exec-add"
@@ -1920,4 +2032,275 @@ async def test_pinned_unassigned_executor_raises(
             "alice@example.com",
             ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
             conversation_active_executor_id="exec-ghost",
+            conversation_active_executor_source="explicit_primary",
         )
+
+
+@pytest.mark.asyncio
+async def test_missing_selector_pin_in_grace_is_transient_at_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [_executor_row("replacement", labels={"role": "local"})]
+
+    async def _lifecycle(**kwargs: object) -> ExecutorPinLifecycleResult:
+        assert kwargs["active_executor_source"] == "selector_primary"
+        return ExecutorPinLifecycleResult(
+            active_executor_id="missing",
+            transient_unavailable=True,
+            retry_after_seconds=7,
+        )
+
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    monkeypatch.setattr(
+        runtime_support,
+        "load_executor_pin_lifecycle_settings",
+        _executor_pin_lifecycle_settings,
+    )
+    monkeypatch.setattr(runtime_support, "ensure_active_executor_pin", _lifecycle)
+
+    with pytest.raises(TransientExecutorUnavailable) as error:
+        await runtime_support._resolve_eligible_executor_config(
+            _runtime_providers(),
+            AgentDefinition(
+                agent_id="agent-selector",
+                owner_email="alice@example.com",
+                name="Selector",
+                execution={"executor_selector": {"role": "local"}},
+            ),
+            "alice@example.com",
+            ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+            conversation_id="conv-selector",
+            conversation_active_executor_id="missing",
+            conversation_active_executor_source="selector_primary",
+            conversation_active_executor_generation=3,
+        )
+    assert error.value.executor_id == "missing"
+    assert error.value.retry_after_seconds == 7
+
+
+@pytest.mark.asyncio
+async def test_legacy_null_selector_source_resolves_and_canonicalizes_on_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/runtime-pin-source.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        session.add(User(email="runtime-source@example.com", name="U", role="user"))
+        await session.flush()
+        session.add(
+            Agent(
+                agent_id="runtime-source-agent",
+                owner_email="runtime-source@example.com",
+                name="A",
+            )
+        )
+        await session.flush()
+        session.add(
+            Conversation(
+                conversation_id="runtime-source-conv",
+                user_email="runtime-source@example.com",
+                agent_id="runtime-source-agent",
+                context_type="chat",
+                active_executor_id="ready-selector",
+                active_executor_source=None,
+                active_executor_generation=2,
+            )
+        )
+        session.add(
+            Task(
+                task_id="runtime-source-task",
+                title="T",
+                created_by="runtime-source@example.com",
+                agent_id="runtime-source-agent",
+                active_executor_id="ready-selector",
+                active_executor_source=None,
+                active_executor_generation=2,
+            )
+        )
+        await session.commit()
+
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [
+            _executor_row(
+                "ready-selector",
+                owner_email="runtime-source@example.com",
+                labels={"role": "local"},
+            )
+        ]
+
+    class _ReadyWebSocket:
+        def get_connection(self, executor_id: str) -> SimpleNamespace | None:
+            return SimpleNamespace(connected=True) if executor_id == "ready-selector" else None
+
+        def get_handle(self, executor_id: str) -> SimpleNamespace | None:
+            return SimpleNamespace(status="ready") if executor_id == "ready-selector" else None
+
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    providers = SimpleNamespace(
+        _session_factory=factory,
+        executor=SimpleNamespace(websocket=_ReadyWebSocket(), status_provider=None),
+    )
+    config = await runtime_support._resolve_eligible_executor_config(
+        providers,
+        AgentDefinition(
+            agent_id="runtime-source-agent",
+            owner_email="runtime-source@example.com",
+            name="A",
+            execution={"executor_selector": {"role": "local"}},
+        ),
+        "runtime-source@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_id="runtime-source-conv",
+        task_id="runtime-source-task",
+        conversation_active_executor_id="ready-selector",
+        conversation_active_executor_source=None,
+        conversation_active_executor_generation=2,
+    )
+    assert config["executor_id"] == "ready-selector"
+
+    async with factory() as session:
+        task = await store_queries.get_task(session, "runtime-source-task")
+        conversation = await store_queries.get_conversation(session, "runtime-source-conv")
+        assert task is not None and conversation is not None
+        assert task.active_executor_source == "selector_primary"
+        assert conversation.active_executor_source == "selector_primary"
+        assert task.active_executor_generation == conversation.active_executor_generation == 2
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_missing_selector_grace_reconnect_and_failover_on_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/runtime-missing-selector.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    user_email = "runtime-missing@example.com"
+    async with factory() as session:
+        session.add(User(email=user_email, name="U", role="user"))
+        await session.flush()
+        session.add(Agent(agent_id="runtime-missing-agent", owner_email=user_email, name="A"))
+        await session.flush()
+        session.add(
+            Conversation(
+                conversation_id="runtime-missing-conv",
+                user_email=user_email,
+                agent_id="runtime-missing-agent",
+                context_type="chat",
+                active_executor_id="missing-selector",
+                active_executor_generation=2,
+            )
+        )
+        session.add(
+            Task(
+                task_id="runtime-missing-task",
+                title="T",
+                created_by=user_email,
+                agent_id="runtime-missing-agent",
+                active_executor_id="missing-selector",
+                active_executor_generation=2,
+            )
+        )
+        await session.commit()
+
+    rows = [_executor_row("replacement", owner_email=user_email, labels={"role": "local"})]
+    ready_ids = {"replacement"}
+
+    async def _list_executors(*_: object, **__: object) -> list[SimpleNamespace]:
+        return list(rows)
+
+    class _ReadyWebSocket:
+        def get_connection(self, executor_id: str) -> SimpleNamespace | None:
+            return SimpleNamespace(connected=True) if executor_id in ready_ids else None
+
+        def get_handle(self, executor_id: str) -> SimpleNamespace | None:
+            return SimpleNamespace(status="ready") if executor_id in ready_ids else None
+
+    monkeypatch.setattr(store_queries, "list_executors", _list_executors)
+    providers = SimpleNamespace(
+        _session_factory=factory,
+        executor=SimpleNamespace(websocket=_ReadyWebSocket(), status_provider=None),
+    )
+    agent = AgentDefinition(
+        agent_id="runtime-missing-agent",
+        owner_email=user_email,
+        name="A",
+        execution={"executor_selector": {"role": "local"}},
+    )
+    policy = ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
+
+    async def resolve(
+        *,
+        source: str | None,
+        unavailable_since: object = None,
+    ) -> dict[str, object]:
+        return await runtime_support._resolve_eligible_executor_config(
+            providers,
+            agent,
+            user_email,
+            policy,
+            conversation_id="runtime-missing-conv",
+            task_id="runtime-missing-task",
+            conversation_active_executor_id="missing-selector",
+            conversation_active_executor_source=source,
+            conversation_active_executor_generation=2,
+            conversation_active_executor_unavailable_since=unavailable_since,
+        )
+
+    with pytest.raises(TransientExecutorUnavailable):
+        await resolve(source=None)
+    async with factory() as session:
+        task = await store_queries.get_task(session, "runtime-missing-task")
+        conversation = await store_queries.get_conversation(session, "runtime-missing-conv")
+        assert task is not None and conversation is not None
+        observed_at = task.active_executor_unavailable_since
+        assert observed_at is not None
+        assert (
+            task.active_executor_source == conversation.active_executor_source == "selector_primary"
+        )
+
+    rows.insert(
+        0,
+        _executor_row("missing-selector", owner_email=user_email, labels={"role": "local"}),
+    )
+    ready_ids.add("missing-selector")
+    recovered = await resolve(source="selector_primary", unavailable_since=observed_at)
+    assert recovered["executor_id"] == "missing-selector"
+    async with factory() as session:
+        task = await store_queries.get_task(session, "runtime-missing-task")
+        conversation = await store_queries.get_conversation(session, "runtime-missing-conv")
+        assert task is not None and conversation is not None
+        assert task.active_executor_unavailable_since is None
+        assert conversation.active_executor_unavailable_since is None
+        old_observation = datetime.now(UTC) - timedelta(seconds=30)
+        task.active_executor_unavailable_since = old_observation
+        conversation.active_executor_unavailable_since = old_observation
+        await session.commit()
+
+    rows.pop(0)
+    ready_ids.remove("missing-selector")
+    failed_over = await resolve(
+        source="selector_primary",
+        unavailable_since=old_observation,
+    )
+    assert failed_over["executor_id"] == "replacement"
+    async with factory() as session:
+        task = await store_queries.get_task(session, "runtime-missing-task")
+        conversation = await store_queries.get_conversation(session, "runtime-missing-conv")
+        transition_count = await session.scalar(
+            select(func.count()).select_from(ExecutorPinTransitionRow)
+        )
+        outbox_count = await session.scalar(
+            select(func.count()).select_from(ExecutorPinNoticeOutboxRow)
+        )
+        assert task is not None and conversation is not None
+        assert task.active_executor_id == conversation.active_executor_id == "replacement"
+        assert task.active_executor_generation == conversation.active_executor_generation == 3
+        assert transition_count == outbox_count == 1
+    await engine.dispose()

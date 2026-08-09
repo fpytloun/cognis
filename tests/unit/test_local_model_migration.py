@@ -138,7 +138,41 @@ def test_local_model_migration_is_the_single_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["095_channel_delivery_dlv_id"]
+    assert script.get_heads() == ["120_schedule_fire_kinds"]
+    assert script.get_revision("120_schedule_fire_kinds").down_revision == (
+        "119_work_scope_revisions"
+    )
+    assert script.get_revision("119_work_scope_revisions").down_revision == (
+        "118_channel_delivery_receipts"
+    )
+    assert script.get_revision("118_channel_delivery_receipts").down_revision == (
+        "117_group_context"
+    )
+    assert script.get_revision("117_group_context").down_revision == ("116_managed_resume_prepared")
+    assert script.get_revision("116_managed_resume_prepared").down_revision == (
+        "115_managed_channel_resume"
+    )
+    assert script.get_revision("115_managed_channel_resume").down_revision == (
+        "114_managed_channel_fences"
+    )
+    assert script.get_revision("114_managed_channel_fences").down_revision == (
+        "113_managed_channel_lifecycle"
+    )
+    assert script.get_revision("113_managed_channel_lifecycle").down_revision == (
+        "112_channel_observed_targets"
+    )
+    assert script.get_revision("112_channel_observed_targets").down_revision == (
+        "111_managed_channel_foundation"
+    )
+    assert script.get_revision("111_managed_channel_foundation").down_revision == (
+        "110_conversation_lineage"
+    )
+    assert script.get_revision("110_conversation_lineage").down_revision == (
+        "109_task_control_conversation"
+    )
+    assert script.get_revision("109_task_control_conversation").down_revision == (
+        "108_kb_active_metadata"
+    )
     assert script.get_revision("094_artifact_tool_source_id").down_revision == (
         "093_canonical_chart_payloads"
     )

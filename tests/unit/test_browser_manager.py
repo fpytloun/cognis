@@ -48,6 +48,171 @@ def test_browser_manager_derives_persistent_profile_from_origin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_bootstrap_warms_new_patchright_chrome_profile_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = BrowserManager(
+        runtime="patchright",
+        channel="chrome",
+        native_bootstrap_seconds=1,
+    )
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    terminated = asyncio.Event()
+    calls: list[tuple[object, ...]] = []
+
+    class _Process:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            await terminated.wait()
+            return 0
+
+        def terminate(self) -> None:
+            self.returncode = 0
+            terminated.set()
+
+        def kill(self) -> None:
+            self.terminate()
+
+    async def _create(*args: object, **kwargs: object) -> _Process:
+        assert (profile / ".cognis-native-bootstrap.html").stat().st_mode & 0o777 == 0o600
+        calls.append((*args, kwargs))
+        return _Process()
+
+    monkeypatch.setattr(manager, "_native_chrome_executable", lambda: "/chrome")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _create)
+
+    await manager._bootstrap_native_profile(  # noqa: SLF001
+        user_data_dir=profile,
+        url="https://example.com/listings",
+        display=":99",
+    )
+    await manager._bootstrap_native_profile(  # noqa: SLF001
+        user_data_dir=profile,
+        url="https://example.com/listings",
+        display=":99",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][:5] == (
+        "/chrome",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        (profile / ".cognis-native-bootstrap.html").as_uri(),
+    )
+    assert not (profile / ".cognis-native-bootstrap.html").exists()
+    assert (profile / ".cognis-native-bootstrap-v1").is_file()
+
+
+@pytest.mark.asyncio
+async def test_native_bootstrap_does_not_mark_profile_when_chrome_exits_early(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = BrowserManager(runtime="patchright", channel="chrome")
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    class _Process:
+        returncode = 1
+
+        async def wait(self) -> int:
+            return 1
+
+        def terminate(self) -> None:
+            raise AssertionError("already exited")
+
+        def kill(self) -> None:
+            raise AssertionError("already exited")
+
+    async def _create(*_args: object, **_kwargs: object) -> _Process:
+        return _Process()
+
+    monkeypatch.setattr(manager, "_native_chrome_executable", lambda: "/chrome")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _create)
+
+    await manager._bootstrap_native_profile(  # noqa: SLF001
+        user_data_dir=profile,
+        url="https://example.com",
+        display=":99",
+    )
+
+    assert not (profile / ".cognis-native-bootstrap-v1").exists()
+
+
+@pytest.mark.asyncio
+async def test_native_bootstrap_removes_redirect_file_when_chrome_spawn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = BrowserManager(runtime="patchright", channel="chrome")
+    profile = tmp_path / "profile"
+    profile.mkdir()
+
+    async def _fail(*_args: object, **_kwargs: object) -> object:
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(manager, "_native_chrome_executable", lambda: "/chrome")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fail)
+
+    with pytest.raises(OSError, match="spawn failed"):
+        await manager._bootstrap_native_profile(  # noqa: SLF001
+            user_data_dir=profile,
+            url="https://example.com/?token=secret",
+            display=":99",
+        )
+
+    assert not (profile / ".cognis-native-bootstrap.html").exists()
+    assert not (profile / ".cognis-native-bootstrap-v1").exists()
+
+
+@pytest.mark.asyncio
+async def test_native_bootstrap_is_not_used_for_headless_persistent_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manager = BrowserManager(runtime="patchright", channel="chrome")
+    bootstrap_calls: list[dict[str, object]] = []
+
+    class _Context:
+        pages: list[object] = []
+
+        async def new_page(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+    async def _launch(*_args: object, **_kwargs: object) -> _Context:
+        return _Context()
+
+    async def _ready(*, headless: bool) -> None:
+        manager._playwrights[headless] = SimpleNamespace(  # noqa: SLF001
+            chromium=SimpleNamespace(launch_persistent_context=_launch)
+        )
+        return None
+
+    async def _bootstrap(**kwargs: object) -> None:
+        bootstrap_calls.append(kwargs)
+
+    async def _defaults(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_ensure_playwright_ready_locked", _ready)
+    monkeypatch.setattr(manager, "_bootstrap_native_profile", _bootstrap)
+    monkeypatch.setattr(manager, "_apply_context_defaults", _defaults)
+
+    await manager._open_persistent_context(  # noqa: SLF001
+        url="https://example.com",
+        headless=True,
+        auth_state=None,
+        profile_id="example",
+    )
+
+    assert bootstrap_calls == []
+
+
+@pytest.mark.asyncio
 async def test_browser_manager_scopes_inspect_and_close_to_owner() -> None:
     manager = BrowserManager()
     closed: list[bool] = []

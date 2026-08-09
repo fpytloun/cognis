@@ -269,6 +269,23 @@ class TestNoGuardrailsProvider:
         intaris_mock.record_events.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_read_events_forwards_backward_paging(
+        self, provider: Any, intaris_mock: MagicMock
+    ) -> None:
+        await provider.read_events("sess_1", before_seq=12, limit=5)
+
+        intaris_mock.read_events.assert_awaited_once_with(
+            "sess_1",
+            after_seq=0,
+            limit=5,
+            types=None,
+            last_n=None,
+            before_seq=12,
+            seqs=None,
+            allow_missing_stream=False,
+        )
+
+    @pytest.mark.asyncio
     async def test_create_session_delegates_to_intaris(
         self, provider: Any, intaris_mock: MagicMock
     ) -> None:

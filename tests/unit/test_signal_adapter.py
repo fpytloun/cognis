@@ -718,6 +718,8 @@ class TestSignalInboundNormalization:
         assert msg.chat_id == "grp-abc"
         assert msg.chat_name == "Test Group"
         assert msg.was_mentioned is True
+        assert msg.platform_data["_cognis_ordering_key"] == "00000001700000000000"
+        assert msg.platform_data["_cognis_ordering_source"] == "provider"
 
     @pytest.mark.asyncio
     async def test_process_envelope_ignores_empty_body_no_attachments(self) -> None:
@@ -909,6 +911,74 @@ class TestDirectSendBehavior:
         called_params = mock_runtime.request.await_args.args[1]
         assert called_params["message"] == "Heading\n\nBold and code"
         assert called_params["textStyle"] == ["0:7:BOLD", "9:4:BOLD", "18:4:MONOSPACE"]
+        adapter._dispatch_inbound = AsyncMock()  # type: ignore[method-assign]
+        sent_sync = {
+            "timestamp": 12345,
+            "message": "Heading",
+            "_cognis_chat_id": "+420111222333",
+            "_cognis_chat_type": "direct",
+        }
+        await adapter._process_envelope({"source": "+1"}, sent_sync)
+        adapter._dispatch_inbound.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_suppresses_sync_notification_before_send_response(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def _send(_: OutboundMessage) -> str:
+            send_started.set()
+            await release_send.wait()
+            return "12345"
+
+        adapter._send_direct = _send  # type: ignore[method-assign]
+        adapter._dispatch_inbound = AsyncMock()  # type: ignore[method-assign]
+        message = OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="group-1",
+            content="assistant output",
+        )
+        media_message = message.model_copy(
+            update={
+                "content": "",
+                "media": [MediaAttachment(content_b64="YQ==", mime_type="image/png")],
+            }
+        )
+        assert adapter._transmitted_message_body(media_message) == "\u200b"
+        adapter._signal_config = _SignalConfig(
+            {"transport": "rest"},
+            {"account_number": "+1"},
+        )
+        rest_message = message.model_copy(
+            update={"platform_data": {"signal_markdown_text": "*assistant output*"}}
+        )
+        assert adapter._transmitted_message_body(rest_message) == "*assistant output*"
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+
+        send_task = asyncio.create_task(adapter.send_message(message))
+        await send_started.wait()
+        await adapter._process_envelope(
+            {"source": "+1"},
+            {
+                "timestamp": 12345,
+                "message": "assistant output",
+                "groupInfo": {"groupId": "group-1", "groupName": "Group"},
+            },
+        )
+        release_send.set()
+
+        assert await send_task == "12345"
+        adapter._dispatch_inbound.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_direct_send_uses_inline_media_without_download(self) -> None:

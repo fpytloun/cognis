@@ -13,6 +13,10 @@ Systemd unit files for running Cognis as managed services on Linux.
 ## Controller (system-level)
 
 Runs the Cognis controller as a dedicated `cognis` system user.
+This is a single-node deployment pattern. It preserves SQLite/filesystem
+bootstrap by default and can use PostgreSQL or Redis through environment
+variables, but multi-controller HA should use the Helm topology documented in
+[`docs/guide/high-availability.md`](../../docs/guide/high-availability.md).
 
 ### Install
 

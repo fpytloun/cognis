@@ -67,6 +67,22 @@ WebSocket executors can report several runtime states:
 
 `desired` and `applied` are config generations, not simple reconnect counters. If they differ, the executor is behind the latest saved configuration.
 
+### Disconnect and replay semantics
+
+Cognis may retry a small allowlist of read-only unary executor RPCs after an
+ambiguous transport failure. Those retries reuse a stable logical call ID. The
+executor keeps a bounded, short-lived in-memory cache of terminal results and
+rejects reuse of the same ID with a different payload.
+
+The cache does not contain stream chunks or mutating calls. Tool execution and
+streaming inference are never replayed after an `accepted_unknown` or partial
+outcome. Restarting the executor loses the unary result cache, so a controller
+that cannot recover a cached result must continue to treat the prior outcome as
+ambiguous rather than claiming that it did or did not execute.
+
+See [High availability](high-availability.md) for
+controller ownership, selector failover, and StatefulSet identity guidance.
+
 ## Choosing the right mode
 
 - Use local executor modes for development and simple single-user setups.
@@ -145,13 +161,13 @@ asymmetric:
   on a tool call, or session-wide via the `switch_executor` tool. The
   controller never picks them automatically.
 
-Once the controller has picked the initial active executor, it does NOT
-change the binding for any reason. If the active executor goes offline or
-becomes unassigned, tool calls return factual `is_error=True` results
-naming the executor and its state. The agent decides whether to retry,
-call `switch_executor` to move to a different executor, or stop. The
-controller does not auto-fall-back, does not silently re-route, and does
-not cancel the turn.
+Explicit primary bindings do not automatically change. Label-selector primaries
+are different: if the active executor stays unavailable beyond reconnect grace,
+a later admission may atomically fail over to another connected,
+selector-matching primary. Failover never occurs in the middle of an accepted
+operation and emits a durable system notice. Additional executors remain
+explicit-only; an expired additional assignment may return to an eligible
+primary.
 
 For task workflows, the binding is persisted at the task level. All steps
 of a single task run on the same executor by default — even though each

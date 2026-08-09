@@ -171,11 +171,10 @@ Responsibilities:
 - Per-user concurrent turn limits
 
 Follow-up turns use typed controller metadata rather than ad hoc prompt text.
-The scheduler receives a semantic follow-up payload, deduplicates repeated
-follow-up IDs in memory, and submits a system-initiated turn that keeps
-historical messages in context while marking the new follow-up event as the
-active instruction. For MVP, this dedupe is single-controller only and does
-not provide replay across restart or multi-replica deployments.
+The scheduler receives a semantic follow-up payload and submits a
+system-initiated turn that keeps historical messages in context while marking
+the new follow-up event as the active instruction. Durable follow-up intent and
+turn ownership provide restart and multi-controller admission safety.
 
 Streaming design: **Hybrid** — `TurnObserver` callbacks for real-time
 streaming (no EventBus overhead per token), EventBus lifecycle events
@@ -732,9 +731,9 @@ change after being written.
 - Lost on controller restart — warm from Intaris on first access
 - Evicted on session idle timeout or LRU pressure
 
-**L2 — Redis** (Phase 2+, when needed):
+**L2 — Redis** (optional):
 - Survives controller restarts
-- Required for multiple controller replicas
+- Reduces repeated Intaris cold loads across controller replicas
 - Events as sorted set by seq; metadata as hash
 - TTL matching session idle timeout
 - MVP can skip Redis entirely

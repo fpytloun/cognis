@@ -67,6 +67,12 @@ def test_office_tool_schemas_are_direct_codex_compatible() -> None:
         assert forbidden_top_level.isdisjoint(tool.parameters)
 
 
+def test_office_query_schema_does_not_advertise_unsupported_limit() -> None:
+    tool = next(tool for tool in OFFICE_EXECUTOR_TOOLS if tool.name == "office_query")
+
+    assert "limit" not in tool.parameters["properties"]
+
+
 def test_office_manifest_is_pinned_and_unknown_versions_are_not_supported() -> None:
     assert OFFICECLI_CERTIFIED_VERSION == "v1.0.102"
     assert OFFICECLI_ASSETS["linux-x64"].sha256 == (
@@ -243,6 +249,148 @@ async def test_office_handler_uses_runtime_gating() -> None:
 
     assert result.is_error is True
     assert "OfficeCLI unavailable" in result.output
+
+
+@pytest.mark.asyncio
+async def test_office_read_maps_json_to_text_and_omits_zero_value_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.officecli.handlers import handle_office_read
+    from cognis.tools.executor.officecli.runner import OfficeCliCommandResult
+    from cognis.tools.registry import ToolExecutionContext
+
+    calls: list[tuple[str, list[str], dict[str, object]]] = []
+
+    async def fake_run(command: str, args: list[str], **kwargs: object) -> OfficeCliCommandResult:
+        calls.append((command, args, kwargs))
+        return OfficeCliCommandResult(
+            argv=[],
+            exit_code=0,
+            stdout='{"success":true}',
+            stderr="",
+            json_data={"success": True},
+        )
+
+    monkeypatch.setattr("cognis.tools.executor.officecli.handlers.run_officecli", fake_run)
+    context = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="local"),
+        runtime_metadata={
+            "officecli": {
+                "available": True,
+                "version": OFFICECLI_CERTIFIED_VERSION,
+                "command": "/bin/officecli",
+            }
+        },
+    )
+
+    result = await handle_office_read(
+        {
+            "source_path": __file__,
+            "view": "json",
+            "start": 0,
+            "end": 0,
+            "limit": 0,
+            "page": 0,
+            "max_lines": 300,
+        },
+        context,
+    )
+
+    assert result.is_error is False
+    assert calls == [
+        (
+            "view",
+            [__file__, "text", "--max-lines", "300", "--json"],
+            {
+                "officecli_path": "/bin/officecli",
+                "timeout_seconds": 60.0,
+                "parse_json": True,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_office_read_requests_json_for_stats_and_issues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.officecli.handlers import handle_office_read
+    from cognis.tools.executor.officecli.runner import OfficeCliCommandResult
+    from cognis.tools.registry import ToolExecutionContext
+
+    calls: list[list[str]] = []
+
+    async def fake_run(command: str, args: list[str], **kwargs: object) -> OfficeCliCommandResult:
+        assert command == "view"
+        assert kwargs["parse_json"] is True
+        calls.append(args)
+        return OfficeCliCommandResult(
+            argv=[],
+            exit_code=0,
+            stdout='{"success":true}',
+            stderr="",
+            json_data={"success": True},
+        )
+
+    monkeypatch.setattr("cognis.tools.executor.officecli.handlers.run_officecli", fake_run)
+    context = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="local"),
+        runtime_metadata={
+            "officecli": {
+                "available": True,
+                "version": OFFICECLI_CERTIFIED_VERSION,
+                "command": "/bin/officecli",
+            }
+        },
+    )
+
+    for view in ("stats", "issues"):
+        result = await handle_office_read({"source_path": __file__, "view": view}, context)
+        assert result.is_error is False
+
+    assert calls == [[__file__, "stats", "--json"], [__file__, "issues", "--json"]]
+
+
+@pytest.mark.asyncio
+async def test_office_query_ignores_stale_unsupported_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.officecli.handlers import handle_office_query
+    from cognis.tools.executor.officecli.runner import OfficeCliCommandResult
+    from cognis.tools.registry import ToolExecutionContext
+
+    calls: list[list[str]] = []
+
+    async def fake_run(command: str, args: list[str], **kwargs: object) -> OfficeCliCommandResult:
+        assert command == "query"
+        calls.append(args)
+        return OfficeCliCommandResult(
+            argv=[],
+            exit_code=0,
+            stdout='{"success":true}',
+            stderr="",
+            json_data={"success": True},
+        )
+
+    monkeypatch.setattr("cognis.tools.executor.officecli.handlers.run_officecli", fake_run)
+    context = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="local"),
+        runtime_metadata={
+            "officecli": {
+                "available": True,
+                "version": OFFICECLI_CERTIFIED_VERSION,
+                "command": "/bin/officecli",
+            }
+        },
+    )
+
+    result = await handle_office_query(
+        {"source_path": __file__, "selector": "*", "limit": 1000},
+        context,
+    )
+
+    assert result.is_error is False
+    assert calls == [[__file__, "*", "--json"]]
 
 
 @pytest.mark.asyncio

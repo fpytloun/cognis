@@ -17,6 +17,7 @@ from cognis.api.chat_v2.realtime import (
     assistant_stream_runtime_item,
     compaction_runtime_item,
     delegation_runtime_item,
+    system_message_runtime_item,
     thinking_runtime_items,
     tool_call_runtime_item,
     tool_result_runtime_item,
@@ -28,6 +29,44 @@ TS = "2026-01-01T00:00:00Z"
 def _canonical_ids(raw_events: list[RawSessionEvent]) -> dict[str, str]:
     projection = project_timeline(normalize_session_events(raw_events).events)
     return {item.id: item.kind for item in projection.timeline.items}
+
+
+def test_retry_notice_runtime_and_canonical_ids_match() -> None:
+    runtime = system_message_runtime_item(
+        notice_id="retry:turn-source:2",
+        content="Retrying turn after controller restart…",
+        turn_id="turn-retry",
+        session_id="sess-1",
+        timestamp=TS,
+        notice_kind="model_recovery",
+        notice_scope="turn",
+        retry_reason="controller_restart",
+        retry_source_turn_id="turn-source",
+        attempt=2,
+    )
+    canonical = _canonical_ids(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=1,
+                type="system_message",
+                data={
+                    "notice_id": "retry:turn-source:2",
+                    "content": "Retrying turn after controller restart…",
+                    "turn_id": "turn-retry",
+                    "kind": "model_recovery",
+                    "scope": "turn",
+                    "retry_reason": "controller_restart",
+                    "retry_source_turn_id": "turn-source",
+                    "attempt": 2,
+                },
+            )
+        ]
+    )
+
+    assert runtime.id == "system:retry:turn-source:2"
+    assert canonical[runtime.id] == runtime.kind
 
 
 def test_compaction_ids_match_from_running_state_through_canonical_projection() -> None:

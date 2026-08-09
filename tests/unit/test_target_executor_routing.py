@@ -12,6 +12,7 @@ from cognis.core.executor_pool import (
     ExecutorPool,
     ResolvedExecutorTarget,
 )
+from cognis.providers.executor.delivery import AmbiguousToolOutcome
 
 
 def _target(executor_id: str, *, usable: bool = True) -> ResolvedExecutorTarget:
@@ -55,6 +56,7 @@ def loop_with_pool():
 
 def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
     """Build a minimal StepContext-like object."""
+    from cognis.core.harness_guards import SameTurnToolCallLedger
     from cognis.models.tool import NativeToolDefinition as ToolDefinition
     from cognis.models.tool import ToolSource
     from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -113,6 +115,7 @@ def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
     ctx.session = MagicMock()
     ctx.agent = MagicMock()
     ctx.tool_registry = registry
+    ctx.same_turn_tool_call_ledger = SameTurnToolCallLedger()
     return ctx
 
 
@@ -386,6 +389,7 @@ async def test_read_only_tool_retries_after_same_executor_reconnect(loop_with_po
     ws_provider = MagicMock()
     ws_provider.get_connection = MagicMock(side_effect=[None])
     ws_provider.wait_for_connection = AsyncMock(return_value=fresh_conn)
+    ws_provider.invalidate_forwarded_connection = AsyncMock()
     loop_with_pool.providers.executor.websocket = ws_provider
 
     loop_with_pool._get_tool_registry = lambda c: c.tool_registry
@@ -398,7 +402,9 @@ async def test_read_only_tool_retries_after_same_executor_reconnect(loop_with_po
                 is_error=True,
                 metadata={
                     "code": "executor_disconnected",
+                    "delivery_state": "accepted_unknown",
                     "executor_id": "exec-active",
+                    "epoch": 3,
                     "retryable": True,
                     "same_executor_only": True,
                 },
@@ -417,6 +423,10 @@ async def test_read_only_tool_retries_after_same_executor_reconnect(loop_with_po
     assert ctx.executor_connection is fresh_conn
     assert ctx.executor_connection is not stale_conn
     assert loop_with_pool.tool_router.execute.await_count == 2
+    ws_provider.invalidate_forwarded_connection.assert_awaited_once_with("exec-active", stale_conn)
+    assert ws_provider.wait_for_connection.await_args.kwargs["failed_connection"] is stale_conn
+    assert ws_provider.wait_for_connection.await_args.kwargs["delivery_state"] == "accepted_unknown"
+    assert ws_provider.wait_for_connection.await_args.kwargs["failed_epoch"] == 3
     assert ws_provider.wait_for_connection.await_args.kwargs["timeout"] >= 60.0
 
 
@@ -444,6 +454,7 @@ async def test_mutating_tool_is_not_automatically_retried_after_reconnect(
             is_error=True,
             metadata={
                 "code": "executor_disconnected",
+                "delivery_state": "accepted_unknown",
                 "executor_id": "exec-active",
                 "retryable": True,
                 "same_executor_only": True,
@@ -452,16 +463,103 @@ async def test_mutating_tool_is_not_automatically_retried_after_reconnect(
     )
 
     tc = _toolcall("bash", {"command": "mv a b"})
-    result = await loop_with_pool._execute_regular_tool(ctx, tc)
+    with pytest.raises(AmbiguousToolOutcome) as exc:
+        await loop_with_pool._execute_regular_tool(ctx, tc)
 
-    assert result.is_error is True
-    assert result.metadata["auto_retried"] is False
-    assert result.metadata["auto_retry_skipped_reason"] == "tool_not_idempotent"
-    assert result.metadata["same_executor_reconnected"] is True
-    assert "same executor reconnected" in result.output.lower()
-    assert "may have side effects" in result.output
+    assert exc.value.tool_name == "bash"
+    assert exc.value.argument_fingerprint
+    assert ctx.same_turn_tool_call_ledger.already_executed(tc.name, tc.arguments)
     loop_with_pool.tool_router.execute.assert_awaited_once()
-    ws_provider.wait_for_connection.assert_awaited_once()
+    ws_provider.wait_for_connection.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ambiguity_uses_registered_canonical_name_for_alias(loop_with_pool) -> None:
+    from cognis.core.agent_loop import _same_turn_duplicate_tool_call_indexes
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    registered = ctx.tool_registry.get("bash")
+
+    class _AliasRegistry:
+        def get(self, name: str) -> Any:
+            return registered if name in {"bash", "mcp_server__bash"} else None
+
+    ctx.tool_registry = _AliasRegistry()
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        return_value=ToolResult(
+            output="outcome unknown",
+            is_error=True,
+            metadata={
+                "code": "executor_disconnected",
+                "delivery_state": "accepted_unknown",
+                "executor_id": "exec-active",
+                "same_executor_only": True,
+            },
+        )
+    )
+    dispatched_arguments = {"command": "touch /tmp/alias-side-effect"}
+    arguments = {**dispatched_arguments, "target_executor": "exec-active"}
+
+    with pytest.raises(AmbiguousToolOutcome) as exc:
+        await loop_with_pool._execute_regular_tool(
+            ctx,
+            _toolcall("mcp_server__bash", arguments),
+        )
+
+    assert exc.value.tool_name == "bash"
+    assert ctx.same_turn_tool_call_ledger.already_executed("bash", dispatched_arguments)
+    assert not ctx.same_turn_tool_call_ledger.already_executed("mcp_server__bash", arguments)
+    assert _same_turn_duplicate_tool_call_indexes(
+        ctx.same_turn_tool_call_ledger,
+        [
+            _toolcall("mcp_server__bash", arguments),
+            _toolcall("bash", dispatched_arguments),
+        ],
+        ctx.tool_registry,
+    ) == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_pre_send_write_retries_once_on_same_executor(loop_with_pool) -> None:
+    from cognis.models.tool import ToolResult
+
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    fresh_conn = MagicMock(name="fresh_connection")
+    ws_provider = MagicMock()
+    ws_provider.wait_for_connection = AsyncMock(return_value=fresh_conn)
+    ws_provider.invalidate_forwarded_connection = AsyncMock()
+    loop_with_pool.providers.executor.websocket = ws_provider
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    loop_with_pool.tool_router.execute = AsyncMock(
+        side_effect=[
+            ToolResult(
+                output="not sent",
+                is_error=True,
+                metadata={
+                    "code": "executor_delivery_failure",
+                    "delivery_state": "not_sent",
+                    "executor_id": "exec-active",
+                    "same_executor_only": True,
+                },
+            ),
+            ToolResult(output="ok", is_error=False),
+        ]
+    )
+
+    result = await loop_with_pool._execute_regular_tool(
+        ctx, _toolcall("bash", {"command": "touch /tmp/x"})
+    )
+
+    assert result.is_error is False
+    assert loop_with_pool.tool_router.execute.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -590,3 +688,151 @@ async def test_target_executor_retry_waits_same_target_not_primary(loop_with_poo
     assert ctx.executor_connection is primary_conn
     second_call = loop_with_pool.tool_router.execute.await_args_list[1]
     assert second_call.args[4] is secondary_reconnected
+
+
+@pytest.mark.asyncio
+async def test_parallel_write_ambiguity_cancels_and_ledgers_in_flight_sibling(
+    loop_with_pool,
+) -> None:
+    import asyncio
+
+    from cognis.core.agent_loop import _PreparedRegularToolCall
+    from cognis.core.harness_guards import tool_call_argument_fingerprint
+    from cognis.models.tool import NativeToolDefinition, ToolCall, ToolSource
+    from cognis.tools.registry import RegisteredTool, ToolRegistry
+
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    registry = ToolRegistry()
+    for name in ("write_one", "write_two"):
+        registry.register(
+            RegisteredTool(
+                definition=NativeToolDefinition(
+                    name=name,
+                    description=name,
+                    parameters={"type": "object", "properties": {}},
+                    source=ToolSource(type="executor"),
+                )
+            )
+        )
+    ctx.tool_registry = registry
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    sibling_side_effect_completed = False
+    first = ToolCall(call_id="call-write-1", name="write_one", arguments={"value": 1})
+    sibling = ToolCall(call_id="call-write-2", name="write_two", arguments={"value": 2})
+
+    async def execute(_ctx: Any, tool_call: ToolCall) -> Any:
+        nonlocal sibling_side_effect_completed
+        if tool_call.name == "write_one":
+            await sibling_started.wait()
+            fingerprint = tool_call_argument_fingerprint(tool_call.name, tool_call.arguments)
+            ctx.same_turn_tool_call_ledger.record_fingerprint(tool_call.name, fingerprint)
+            raise AmbiguousToolOutcome(
+                tool_name=tool_call.name,
+                argument_fingerprint=fingerprint,
+                executor_id="exec-active",
+                generation=1,
+                epoch=7,
+            )
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+        sibling_side_effect_completed = True
+
+    loop_with_pool._execute_regular_tool = execute
+
+    with pytest.raises(AmbiguousToolOutcome) as exc:
+        await loop_with_pool._execute_parallel_regular_tool_group(
+            ctx,
+            [
+                _PreparedRegularToolCall(first, "tool-write-1"),
+                _PreparedRegularToolCall(sibling, "tool-write-2"),
+            ],
+        )
+
+    assert sibling_cancelled.is_set()
+    assert sibling_side_effect_completed is False
+    assert ctx.same_turn_tool_call_ledger.already_executed("write_one", first.arguments)
+    assert ctx.same_turn_tool_call_ledger.already_executed("write_two", sibling.arguments)
+    assert exc.value.detail()["uncertain_tool_calls"] == [
+        {
+            "tool_name": "write_two",
+            "argument_fingerprint": tool_call_argument_fingerprint("write_two", sibling.arguments),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_ambiguity_ledgers_completed_unfinalized_write_sibling(
+    loop_with_pool,
+) -> None:
+    import asyncio
+
+    from cognis.core.agent_loop import _PreparedRegularToolCall
+    from cognis.core.harness_guards import tool_call_argument_fingerprint
+    from cognis.models.tool import (
+        NativeToolDefinition,
+        ToolCall,
+        ToolResult,
+        ToolSource,
+    )
+    from cognis.tools.registry import RegisteredTool, ToolRegistry
+
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool, active_executor_id="exec-active")
+    registry = ToolRegistry()
+    for name in ("write_one", "write_two"):
+        registry.register(
+            RegisteredTool(
+                definition=NativeToolDefinition(
+                    name=name,
+                    description=name,
+                    parameters={"type": "object", "properties": {}},
+                    source=ToolSource(type="executor"),
+                )
+            )
+        )
+    ctx.tool_registry = registry
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    sibling_completed = asyncio.Event()
+    first = ToolCall(call_id="call-write-1", name="write_one", arguments={"value": 1})
+    sibling = ToolCall(call_id="call-write-2", name="write_two", arguments={"value": 2})
+
+    async def execute(_ctx: Any, tool_call: ToolCall) -> ToolResult:
+        if tool_call.name == "write_two":
+            sibling_completed.set()
+            return ToolResult(output="side effect completed", is_error=False)
+        await sibling_completed.wait()
+        fingerprint = tool_call_argument_fingerprint(tool_call.name, tool_call.arguments)
+        ctx.same_turn_tool_call_ledger.record_fingerprint(tool_call.name, fingerprint)
+        raise AmbiguousToolOutcome(
+            tool_name=tool_call.name,
+            argument_fingerprint=fingerprint,
+            executor_id="exec-active",
+            generation=1,
+            epoch=7,
+        )
+
+    loop_with_pool._execute_regular_tool = execute
+
+    with pytest.raises(AmbiguousToolOutcome) as exc:
+        await loop_with_pool._execute_parallel_regular_tool_group(
+            ctx,
+            [
+                _PreparedRegularToolCall(first, "tool-write-1"),
+                _PreparedRegularToolCall(sibling, "tool-write-2"),
+            ],
+        )
+
+    assert ctx.same_turn_tool_call_ledger.already_executed("write_two", sibling.arguments)
+    assert exc.value.detail()["uncertain_tool_calls"] == [
+        {
+            "tool_name": "write_two",
+            "argument_fingerprint": tool_call_argument_fingerprint("write_two", sibling.arguments),
+        }
+    ]

@@ -7,7 +7,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cognis.executor.channel_handler import ChannelHandler
-from cognis.models.channel import InboundMessage, OutboundMessage
+from cognis.models.channel import (
+    ChannelCapabilities,
+    ChannelRecipient,
+    InboundMessage,
+    OutboundMessage,
+    ResolvedChannelTarget,
+)
 
 
 class FakeWS:
@@ -130,6 +136,189 @@ async def test_send_unknown_account_returns_error() -> None:
     handler = ChannelHandler()
     result = await handler.send("missing", {"content": "hello"})
     assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_validates_account_and_recipient_without_pii(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+    adapter.capabilities = ChannelCapabilities(
+        recipient_capabilities={
+            "address_kinds": ["signal_e164"],
+            "supports_resolution": True,
+        }
+    )
+    target = ResolvedChannelTarget(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        chat_kind="direct",
+    )
+    adapter.resolve_recipient = AsyncMock(return_value=target)  # type: ignore[attr-defined]
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    started = await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u"}, {})
+    assert started["capabilities"]["recipient_capabilities"]["supports_resolution"] is True
+
+    raw_address = "+420111222333"
+    result = await handler.resolve_recipient(
+        "acct-1",
+        ChannelRecipient(
+            channel_type="signal",
+            address=raw_address,
+            address_kind="signal_e164",
+            chat_kind="direct",
+        ).model_dump(mode="json"),
+        "opaque-key",
+    )
+    assert result == target.model_dump(mode="json")
+    adapter.resolve_recipient.assert_awaited_once()
+    assert adapter.resolve_recipient.await_args.args[0].address == raw_address
+
+    malformed = await handler.resolve_recipient(
+        "acct-1",
+        {"channel_type": "signal", "address": raw_address, "unexpected": "value"},
+        "opaque-key",
+    )
+    assert malformed["error"]["code"] == "malformed_recipient"
+    assert raw_address not in str(malformed)
+
+    missing = await handler.resolve_recipient(
+        "missing",
+        {"channel_type": "signal", "address": raw_address},
+        "opaque-key",
+    )
+    assert missing["error"]["code"] == "account_not_found"
+    assert raw_address not in str(missing)
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_rejects_unsupported_and_sanitizes_adapter_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+    adapter.capabilities = ChannelCapabilities()
+    adapter.resolve_recipient = AsyncMock(  # type: ignore[attr-defined]
+        side_effect=RuntimeError("provider leaked +420111222333")
+    )
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u"}, {})
+
+    unsupported = await handler.resolve_recipient(
+        "acct-1",
+        {"channel_type": "signal", "address": "+420111222333"},
+        "opaque-key",
+    )
+    assert unsupported["error"]["code"] == "unsupported_resolution"
+
+    adapter.capabilities = ChannelCapabilities(
+        recipient_capabilities={
+            "address_kinds": ["signal_e164"],
+            "supports_resolution": True,
+        }
+    )
+    failed = await handler.resolve_recipient(
+        "acct-1",
+        {
+            "channel_type": "signal",
+            "address": "+420111222333",
+            "address_kind": "signal_e164",
+            "chat_kind": "direct",
+        },
+        "opaque-key",
+    )
+    assert failed["error"]["code"] == "resolution_failed"
+    assert failed["error"]["retryable"] is True
+    assert "+420111222333" not in str(failed)
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_failure_certainty_tracks_creation_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+    adapter.capabilities = ChannelCapabilities(
+        recipient_capabilities={
+            "address_kinds": ["signal_e164"],
+            "supports_resolution": True,
+            "supports_creation": True,
+        }
+    )
+    adapter.resolve_recipient = AsyncMock(side_effect=RuntimeError("provider failure"))  # type: ignore[attr-defined]
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u"}, {})
+
+    def recipient(*, allow_creation: bool) -> dict[str, object]:
+        return ChannelRecipient(
+            channel_type="signal",
+            address="+420111222333",
+            address_kind="signal_e164",
+            chat_kind="direct",
+            allow_resolution=True,
+            allow_creation=allow_creation,
+        ).model_dump(mode="json")
+
+    created_failure = await handler.resolve_recipient(
+        "acct-1", recipient(allow_creation=True), "opaque-key"
+    )
+    assert created_failure["error"]["side_effect_certainty"] == "uncertain"
+
+    non_created_failure = await handler.resolve_recipient(
+        "acct-1", recipient(allow_creation=False), "opaque-key"
+    )
+    assert non_created_failure["error"]["side_effect_certainty"] == "none"
+
+    explicit = RuntimeError("provider failure")
+    explicit.side_effect_certainty = "known"  # type: ignore[attr-defined]
+    adapter.resolve_recipient.side_effect = explicit
+    explicit_failure = await handler.resolve_recipient(
+        "acct-1", recipient(allow_creation=True), "opaque-key"
+    )
+    assert explicit_failure["error"]["side_effect_certainty"] == "known"
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_allows_discord_creation_without_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+    adapter.channel_type = "discord"
+    adapter.capabilities = ChannelCapabilities(
+        recipient_capabilities={
+            "address_kinds": ["discord_user_id"],
+            "chat_kinds": ["direct"],
+            "supports_resolution": False,
+            "supports_creation": True,
+        }
+    )
+    target = ResolvedChannelTarget(
+        channel_type="discord",
+        account_id="acct-discord",
+        chat_id="123456789012345",
+        chat_kind="direct",
+    )
+    adapter.resolve_recipient = AsyncMock(return_value=target)  # type: ignore[attr-defined]
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    await handler.start("acct-discord", "discord", {"agent_id": "a", "user_email": "u"}, {})
+
+    result = await handler.resolve_recipient(
+        "acct-discord",
+        ChannelRecipient(
+            channel_type="discord",
+            address="123456789012345",
+            address_kind="discord_user_id",
+            chat_kind="direct",
+            allow_creation=True,
+        ).model_dump(mode="json"),
+        "opaque-key",
+    )
+
+    assert result == target.model_dump(mode="json")
+    adapter.resolve_recipient.assert_awaited_once()
 
 
 @pytest.mark.asyncio

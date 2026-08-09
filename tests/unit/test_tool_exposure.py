@@ -410,6 +410,53 @@ def test_prepare_tool_exposure_responses_visible_only_when_search_disabled() -> 
     assert function_names == ["read"]
 
 
+@pytest.mark.parametrize(
+    ("llm_api", "expected_strategy"),
+    [
+        (LLMApiMode.RESPONSES, "openai_responses_visible_only"),
+        (LLMApiMode.CHAT_COMPLETIONS, "chat_visible_only"),
+    ],
+)
+def test_prepare_tool_exposure_visible_only_respects_provider_tool_limit(
+    llm_api: LLMApiMode,
+    expected_strategy: str,
+) -> None:
+    controller_schema = {
+        "type": "function",
+        "function": {
+            "name": "step_complete",
+            "description": "complete",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    inventory = [
+        _tool(f"builtin_{index}", source_type="executor", category="filesystem")
+        for index in range(150)
+    ]
+    inventory.extend(_mcp("remote", f"tool/{index}") for index in range(150))
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[controller_schema],
+        model_info=ModelInfo(
+            model_id="gpt-5.4",
+            supports_responses_api=llm_api is LLMApiMode.RESPONSES,
+            max_tools=32,
+        ),
+        contract=_contract(llm_api=llm_api, discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        allow_tool_search=False,
+    )
+
+    assert result.debug_metadata["strategy"] == expected_strategy
+    assert len(result.tools) == 32
+    assert result.debug_metadata["visible_tool_count"] == 31
+    assert all(
+        not str(tool.get("function", {}).get("name", "")).startswith("mcp__")
+        for tool in result.tools
+    )
+
+
 def test_prepare_tool_exposure_sorts_final_responses_tools_by_visible_name() -> None:
     result = prepare_tool_exposure(
         inventory_tools=[

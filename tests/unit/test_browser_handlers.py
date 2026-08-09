@@ -794,6 +794,55 @@ async def test_browser_open_does_not_treat_plain_access_denied_as_waf(
 
 
 @pytest.mark.asyncio
+async def test_browser_open_detects_vendor_access_denied_returned_as_http_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    manager.session.navigation_status = 200
+    manager.session.page.title_text = "Zugriff verweigert / Access denied"
+    manager.session.page.content_text = (
+        "<h1>Zugriff verweigert</h1><p>Error Reference: 0.1234.5678</p>"
+    )
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_open(
+        {
+            "session_id": "marketplace",
+            "url": "https://example.com/search",
+            "headless": False,
+        },
+        _context(),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["category"] == "vendor_waf_block"
+    assert result.metadata["http_status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_browser_open_does_not_flag_http_200_page_discussing_waf_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _FakeManager()
+    manager.session.navigation_status = 200
+    manager.session.page.title_text = "Web application firewall documentation"
+    manager.session.page.content_text = "<article>Imperva attack ID reference guide</article>"
+    monkeypatch.setattr(browser_handlers, "_get_manager", lambda _context: manager)
+
+    result = await handle_browser_open(
+        {
+            "session_id": "docs",
+            "url": "https://example.com/waf-guide",
+            "headless": False,
+        },
+        _context(),
+    )
+
+    assert result.is_error is False
+    assert result.metadata == {}
+
+
+@pytest.mark.asyncio
 async def test_browser_open_rejects_invalid_browser_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

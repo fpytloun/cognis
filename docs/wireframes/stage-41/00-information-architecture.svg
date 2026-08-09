@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="860" viewBox="0 0 1120 860" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}
+      .panel{fill:#111a26;stroke:#26323f;stroke-width:1.5;rx:10}
+      .hero{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:1.5}
+      .t{fill:#d5dee7}
+      .m{fill:#7d8b99}
+      .ac{fill:#38bdf8}
+      .amber{fill:#f5b544}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}
+      .lbl{fill:#d5dee7;font-weight:600}
+      .cap{fill:#7d8b99}
+      .arrow{stroke:#4b5b6a;stroke-width:1.5;fill:none;marker-end:url(#a)}
+    </style>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#4b5b6a"/></marker>
+  </defs>
+  <rect class="bg" width="1120" height="860"/>
+  <text x="32" y="42" class="t" font-size="22" font-weight="700">Stage 41 — Task Cockpit Information Architecture (target)</text>
+  <text x="32" y="66" class="m" font-size="13">One primary column (decision → understanding), one secondary context rail, one control drawer. Attention is the hero; chat and Work are inspection surfaces, not competing controls.</text>
+
+  <!-- Desktop frame -->
+  <text x="32" y="104" class="h" font-size="12">DESKTOP ≥ lg (1024px): PRIMARY COLUMN + CONTEXT RAIL</text>
+  <rect x="32" y="116" width="700" height="620" class="panel" rx="10"/>
+  <!-- header -->
+  <rect x="48" y="132" width="668" height="66" class="panel" rx="8"/>
+  <text x="60" y="158" class="lbl" font-size="13">1 · HEADER</text>
+  <text x="60" y="178" class="cap" font-size="11">Title · status pill · priority · project · workflow · agent · elapsed. ONE primary action + overflow menu.</text>
+  <circle cx="704" cy="150" r="9" class="ac"/><text x="700" y="154" class="bg" font-size="11" font-weight="700">1</text>
+
+  <!-- objective -->
+  <rect x="48" y="206" width="668" height="58" class="panel" rx="8"/>
+  <text x="60" y="230" class="lbl" font-size="13">2 · OBJECTIVE</text>
+  <text x="60" y="250" class="cap" font-size="11">Input/context · expected output · (terminal) result summary. Collapsible technical metadata.</text>
+  <circle cx="704" cy="222" r="9" class="ac"/><text x="700" y="226" class="bg" font-size="11" font-weight="700">2</text>
+
+  <!-- attention hero -->
+  <rect x="48" y="272" width="668" height="120" class="att" rx="8"/>
+  <text x="60" y="296" class="amber" font-size="13" font-weight="700">3 · ATTENTION / DECISION  (HERO — only when action is required)</text>
+  <text x="60" y="318" class="cap" font-size="11">Unified panel: gate · step question · credential · failure/blocked. ONE optional-instruction field.</text>
+  <text x="60" y="336" class="cap" font-size="11">Primary decision buttons (Approve / Reject / Answer / Retry) + Stop. "Ask about this" opens control drawer.</text>
+  <rect x="60" y="350" width="150" height="28" rx="6" class="hero"/><text x="80" y="369" class="ac" font-size="11" font-weight="700">Approve</text>
+  <rect x="220" y="350" width="150" height="28" rx="6" class="panel"/><text x="245" y="369" class="t" font-size="11">Reject</text>
+  <rect x="380" y="350" width="150" height="28" rx="6" class="panel"/><text x="398" y="369" class="m" font-size="11">Ask about this →</text>
+  <circle cx="704" cy="288" r="9" class="amber"/><text x="700" y="292" class="bg" font-size="11" font-weight="700">3</text>
+
+  <!-- workflow -->
+  <rect x="48" y="400" width="668" height="150" class="panel" rx="8"/>
+  <text x="60" y="424" class="lbl" font-size="13">4 · WORKFLOW  (phase rail + phase sections + step cards)</text>
+  <rect x="60" y="436" width="120" height="22" rx="11" class="hero"/><text x="76" y="451" class="ac" font-size="10">Prepare · done</text>
+  <rect x="188" y="436" width="130" height="22" rx="11" class="panel"/><text x="204" y="451" class="m" font-size="10">Investigate · done</text>
+  <rect x="326" y="436" width="120" height="22" rx="11" class="att"/><text x="342" y="451" class="amber" font-size="10">Review · waiting</text>
+  <text x="60" y="486" class="cap" font-size="11">Step cards: distinct icon/label per type (Agent · Tool · Condition · Gate · Complete),</text>
+  <text x="60" y="504" class="cap" font-size="11">status · duration · attempts · evidence badges. Selecting a step opens the Step inspector.</text>
+  <text x="60" y="530" class="cap" font-size="11">Current-plan todos + delegated/managed work shown as a compact strip inside the active phase.</text>
+  <circle cx="704" cy="416" r="9" class="ac"/><text x="700" y="420" class="bg" font-size="11" font-weight="700">4</text>
+
+  <!-- result/work -->
+  <rect x="48" y="558" width="668" height="78" class="panel" rx="8"/>
+  <text x="60" y="582" class="lbl" font-size="13">5 · RESULT + WORK  (terminal: result is the hero; Work = evidence)</text>
+  <text x="60" y="602" class="cap" font-size="11">Canonical write_deliverable rendered inline first. Work summary (files/commands/mutations) below,</text>
+  <text x="60" y="620" class="cap" font-size="11">"Explore" opens full Work. Non-terminal: compact Work summary only.</text>
+  <circle cx="704" cy="574" r="9" class="ac"/><text x="700" y="578" class="bg" font-size="11" font-weight="700">5</text>
+
+  <!-- task context -->
+  <rect x="48" y="644" width="668" height="76" class="panel" rx="8"/>
+  <text x="60" y="668" class="lbl" font-size="13">6 · TASK CONTEXT  (secondary — collapsed by default)</text>
+  <text x="60" y="688" class="cap" font-size="11">Collaboration timeline (notes/revisions history) · dependencies · configuration/delivery · activity/audit.</text>
+  <text x="60" y="706" class="cap" font-size="11">The composer here posts NOTES only; it never duplicates the gate decision controls.</text>
+  <circle cx="704" cy="660" r="9" class="ac"/><text x="700" y="664" class="bg" font-size="11" font-weight="700">6</text>
+
+  <!-- context rail -->
+  <rect x="748" y="116" width="340" height="360" class="panel" rx="10"/>
+  <text x="764" y="140" class="h" font-size="12">CONTEXT RAIL (right, ≥ lg)</text>
+  <text x="764" y="166" class="lbl" font-size="12">At-a-glance</text>
+  <text x="764" y="186" class="cap" font-size="11">Origin · timing · agent</text>
+  <text x="764" y="214" class="lbl" font-size="12">Run health (was "Statistics")</text>
+  <text x="764" y="234" class="cap" font-size="11">Plain-language: steps done,</text>
+  <text x="764" y="250" class="cap" font-size="11">retries, review loops, skips —</text>
+  <text x="764" y="266" class="cap" font-size="11">each with a hover definition.</text>
+  <text x="764" y="294" class="lbl" font-size="12">Result (mini)</text>
+  <text x="764" y="314" class="cap" font-size="11">Deep-links to inline result / Work.</text>
+  <text x="764" y="352" class="m" font-size="11">On &lt; lg this rail collapses into</text>
+  <text x="764" y="368" class="m" font-size="11">a "Details" disclosure below the</text>
+  <text x="764" y="384" class="m" font-size="11">workflow (see mobile IA).</text>
+
+  <!-- control drawer -->
+  <rect x="748" y="492" width="340" height="244" class="hero" rx="10"/>
+  <text x="764" y="516" class="ac" font-size="12" font-weight="700">CONTROL DRAWER (right-docked)</text>
+  <text x="764" y="540" class="cap" font-size="11">Task Control Chat opens as a docked</text>
+  <text x="764" y="556" class="cap" font-size="11">drawer beside the cockpit — NOT a</text>
+  <text x="764" y="572" class="cap" font-size="11">full-screen iframe that hides nav.</text>
+  <text x="764" y="598" class="lbl" font-size="12">Inline decision affordance</text>
+  <text x="764" y="618" class="cap" font-size="11">When a gate/question is pending, the</text>
+  <text x="764" y="634" class="cap" font-size="11">drawer shows the SAME Attention</text>
+  <text x="764" y="650" class="cap" font-size="11">controls (Approve/Reject/Answer) so</text>
+  <text x="764" y="666" class="cap" font-size="11">the user never leaves to act.</text>
+  <text x="764" y="694" class="cap" font-size="11">Tabs: Chat · Work (shared component).</text>
+  <text x="764" y="714" class="m" font-size="11">On mobile → full-screen sheet.</text>
+
+  <text x="32" y="770" class="h" font-size="12">DUPLICATION RESOLVED</text>
+  <text x="32" y="792" class="cap" font-size="12">• One pause-resolution surface (Attention panel), mirrored read-only-then-actionable in the control drawer. Header keeps ONE contextual primary action that scrolls to / focuses Attention.</text>
+  <text x="32" y="812" class="cap" font-size="12">• Collaboration composer demoted to notes-only history (§6). "Guide next cycle / Answer pause / Request revision / Optional instruction" collapse into one labelled decision with an optional instruction field.</text>
+  <text x="32" y="832" class="cap" font-size="12">• "Task control chat / Chat about step / Full chat / Work" entry points unified: Step inspector and Attention both route into the single Control drawer with the right scope preselected.</text>
+</svg>

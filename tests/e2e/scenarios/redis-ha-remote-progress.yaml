@@ -1,0 +1,34 @@
+id: redis-ha-remote-progress
+description: Slow multi-phase turn for cross-controller Redis relay and outage qualification.
+trigger: scenario:redis-ha-remote-progress
+turns:
+  - role: assistant
+    steps:
+      - type: thinking
+        chunks:
+          - Inspecting shared state.
+          - Preparing a bounded tool call.
+        delay_ms: 500
+      - type: text
+        chunks:
+          - Remote partial assistant content.
+        delay_ms: 500
+      - type: tool_call
+        call_id: redis-ha-tool
+        name: bash
+        arguments:
+          command: "sleep 3; printf redis-ha-tool-complete"
+          workdir: /tmp
+          description: Keep the HA turn active for deterministic Redis failure injection.
+          timeout: 10000
+        delay_ms: 500
+  - role: assistant
+    steps:
+      - type: thinking
+        chunks:
+          - Validating the tool result and ownership fence.
+        delay_ms: 500
+      - type: text
+        chunks:
+          - Redis HA scenario completed exactly once.
+        delay_ms: 500

@@ -268,6 +268,42 @@ class TestReadTool:
         assert '1: <svg xmlns="http://www.w3.org/2000/svg">' in result.output
         assert '2:   <text x="0" y="12">hello</text>' in result.output
 
+    @pytest.mark.asyncio()
+    async def test_read_typescript_file_ignores_video_mime_type(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "operator-ux-revision.spec.ts"
+        target.write_text("const revision = 'operator-ux';\n", encoding="utf-8")
+        monkeypatch.setattr(
+            filesystem_module.mimetypes,
+            "guess_type",
+            lambda _: ("video/mp2t", None),
+        )
+
+        result = await handle_read({"file_path": str(target)}, _context())
+
+        assert result.is_error is False
+        assert result.attachments is None
+        assert "1: const revision = 'operator-ux';" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_read_typescript_file_with_binary_content_returns_attachment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "recording.ts"
+        target.write_bytes(b"\x47\xff" * 94)
+        monkeypatch.setattr(
+            filesystem_module.mimetypes,
+            "guess_type",
+            lambda _: ("video/mp2t", None),
+        )
+
+        result = await handle_read({"file_path": str(target)}, _context())
+
+        assert result.is_error is False
+        assert result.attachments is not None
+        assert result.attachments[0]["filename"] == "recording.ts"
+
 
 class TestWriteTool:
     """Test the write filesystem tool."""

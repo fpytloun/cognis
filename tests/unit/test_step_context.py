@@ -12,6 +12,7 @@ from cognis.models.workflow import (
     StepDefinition,
     StepInputConfig,
     StepOutput,
+    Workflow,
     WorkflowState,
     resolve_effective_input,
     resolve_source_names,
@@ -83,6 +84,37 @@ def test_step_input_config_last_single_source() -> None:
 def test_step_input_config_last_multiple_sources() -> None:
     config = StepInputConfig(type="last", source=["plan", "review"])
     assert config.source_names() == ["plan", "review"]
+
+
+def test_step_input_config_reuse_round_trip_and_legacy_omission() -> None:
+    workflow = Workflow(
+        workflow_id="wf:reuse",
+        name="Reuse",
+        steps=[
+            StepDefinition(name="plan", type="run"),
+            StepDefinition(
+                name="implement",
+                type="run",
+                input=StepInputConfig(
+                    type="last",
+                    source=["plan"],
+                    reuse_session_from="plan",
+                ),
+            ),
+        ],
+    )
+
+    payload = workflow.model_dump(mode="json", exclude_none=True)
+    assert payload["steps"][1]["input"]["reuse_session_from"] == "plan"
+    assert "reuse_session_from" not in StepInputConfig(type="last", source="plan").model_dump(
+        mode="json", exclude_none=True
+    )
+    assert Workflow.model_validate(payload) == workflow
+
+
+def test_step_input_config_null_rejects_session_reuse() -> None:
+    with pytest.raises(ValueError, match="cannot reuse"):
+        StepInputConfig(type="null", reuse_session_from="plan")
 
 
 def test_step_input_config_full_single_source() -> None:

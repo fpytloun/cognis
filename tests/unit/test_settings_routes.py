@@ -265,6 +265,29 @@ def test_setting_metadata_live_update_and_reset(monkeypatch: object, tmp_path: P
         assert tool_limit_reset.status_code == 200
         assert client.app.state.agent_loop.default_max_tool_calls_per_turn == 500
 
+        cycle_limit = client.put(
+            "/api/v1/settings/session.max_llm_cycles_per_turn",
+            headers=headers,
+            json={"value": 240},
+        )
+        assert cycle_limit.status_code == 200
+        assert client.app.state.agent_loop.default_max_llm_cycles_per_turn == 240
+
+        excessive_cycle_limit = client.put(
+            "/api/v1/settings/session.max_llm_cycles_per_turn",
+            headers=headers,
+            json={"value": 1001},
+        )
+        assert excessive_cycle_limit.status_code == 400
+        assert client.app.state.agent_loop.default_max_llm_cycles_per_turn == 240
+
+        cycle_limit_reset = client.delete(
+            "/api/v1/settings/session.max_llm_cycles_per_turn",
+            headers=headers,
+        )
+        assert cycle_limit_reset.status_code == 200
+        assert client.app.state.agent_loop.default_max_llm_cycles_per_turn == 150
+
 
 def test_settings_list_hides_legacy_noop_settings(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:

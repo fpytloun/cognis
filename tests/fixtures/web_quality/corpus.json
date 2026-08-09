@@ -1,0 +1,51 @@
+[
+  {
+    "name": "cnn_article",
+    "url": "https://www.cnn.com/2026/01/01/technology/example",
+    "expected_status": "complete",
+    "late_marker": "CNN_LATE_SECTION",
+    "html": "<html><head><title>Technology policy changes</title><link rel=\"canonical\" href=\"https://www.cnn.com/2026/01/01/technology/example\"></head><body><article><h1>Technology policy changes</h1><p>Officials described a detailed technology policy update affecting public infrastructure, procurement, security reviews, and long term maintenance. The announcement explains the reasons for the change and gives agencies a phased implementation schedule.</p><h2>Implementation details</h2><p>Teams will publish technical guidance, migration dates, audit requirements, and compatibility notes. Independent reviewers will track progress and report material delays. CNN_LATE_SECTION records the final implementation paragraph.</p></article></body></html>"
+  },
+  {
+    "name": "bbc_article",
+    "url": "https://www.bbc.com/news/articles/example",
+    "expected_status": "complete",
+    "late_marker": "BBC_LATE_SECTION",
+    "html": "<html><head><title>Researchers publish climate findings</title><meta property=\"og:site_name\" content=\"BBC News\"></head><body><main><article><h1>Researchers publish climate findings</h1><p>A research team published a multi-year analysis of regional temperature, rainfall, agriculture, and coastal observations. The report compares independent instruments and explains the uncertainty around each measurement.</p><h2>What happens next</h2><p>Local authorities will review adaptation plans and publish updated risk maps during the next planning cycle. BBC_LATE_SECTION identifies the final evidence-backed paragraph in this sanitized fixture.</p></article></main></body></html>"
+  },
+  {
+    "name": "pubmed_article",
+    "url": "https://pubmed.ncbi.nlm.nih.gov/31452104/",
+    "expected_status": "complete",
+    "late_marker": "PUBMED_CONCLUSION",
+    "html": "<html><head><title>Machine learning in medicine</title></head><body><article><h1>Machine learning in medicine</h1><div class=\"abstract-content\"><h2>Abstract</h2><p>Background: The study evaluates reproducible machine learning methods across several clinical datasets with independent validation, explicit exclusion criteria, and predefined statistical analysis.</p><p>Results: The validated models improved calibration while preserving sensitivity across sites and demographic groups. PUBMED_CONCLUSION notes that prospective evaluation remains necessary before clinical deployment.</p></div></article></body></html>"
+  },
+  {
+    "name": "wikipedia_article",
+    "url": "https://en.wikipedia.org/wiki/Web_scraping",
+    "expected_status": "complete",
+    "late_marker": "WIKIPEDIA_LATE_SECTION",
+    "html": "<html><head><title>Web scraping</title><link rel=\"canonical\" href=\"https://en.wikipedia.org/wiki/Web_scraping\"></head><body><main><h1>Web scraping</h1><p>Web scraping is the automated extraction of information from websites. Systems typically request a document, parse its structure, select relevant elements, and normalize the result for later processing.</p><h2>Legal and operational concerns</h2><p>Operators consider terms of service, privacy, robots directives, request rates, copyright, and data quality. WIKIPEDIA_LATE_SECTION marks the final section of this representative fixture.</p></main></body></html>"
+  },
+  {
+    "name": "stackoverflow_question",
+    "url": "https://stackoverflow.com/questions/231767/example",
+    "expected_status": "complete",
+    "late_marker": "STACKOVERFLOW_ACCEPTED",
+    "html": "<html><head><title>How does yield work?</title></head><body><main><h1>How does yield work?</h1><section id=\"question\"><h2>Question</h2><p>The question asks how a generator pauses execution, retains local state, and resumes when the caller requests another value. It includes a minimal example and asks about memory behavior.</p></section><section id=\"answers\"><h2>Accepted answer</h2><p>A generator function returns an iterator. Each yield expression suspends the frame until iteration resumes, preserving local variables and instruction state. STACKOVERFLOW_ACCEPTED marks the accepted explanation.</p></section></main></body></html>"
+  },
+  {
+    "name": "youtube_unavailable",
+    "url": "https://www.youtube.com/watch?v=fixture",
+    "expected_status": "partial",
+    "late_marker": "Transcript unavailable",
+    "html": "<html><head><title>Fixture video</title><meta property=\"og:title\" content=\"Fixture video\"><meta property=\"og:description\" content=\"Public metadata is available, but the transcript is unavailable for this fixture.\"></head><body><main><h1>Fixture video</h1><p>Transcript unavailable.</p></main></body></html>"
+  },
+  {
+    "name": "blocked_interstitial",
+    "url": "https://social.example/private",
+    "expected_status": "blocked",
+    "late_marker": "Verify you are human",
+    "html": "<html><head><title>Access denied</title></head><body><main><h1>Access denied</h1><p>Verify you are human. CAPTCHA validation is required before this private page can be accessed.</p></main></body></html>"
+  }
+]

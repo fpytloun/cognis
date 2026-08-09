@@ -1,0 +1,151 @@
+mode: simple
+replicaCount: 1
+
+image:
+  repository: ghcr.io/fpytloun/cognis
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+database:
+  type: sqlite
+  existingSecret: ""
+  secretKey: database-url
+
+redis:
+  existingSecret: ""
+  secretKey: redis-url
+  eventCache:
+    ttlSeconds: 3600
+    slidingTtl: true
+    compressionEnabled: true
+    compressionThresholdBytes: 65536
+    maxValueBytes: 2097152
+
+crypto:
+  requireExternal: false
+  existingSecret: ""
+  jwtPrivateKeyKey: jwt-private.pem
+  jwtPublicKeyKey: jwt-public.pem
+  secretsKeyKey: secrets.key
+
+artifacts:
+  backend: filesystem
+  filesystemPath: /data/artifacts
+  s3:
+    endpoint: ""
+    bucket: cognis-artifacts
+    region: ""
+    existingSecret: ""
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+    signingSecretKey: signing-secret
+
+toolOutputs:
+  backend: filesystem
+  s3:
+    endpoint: ""
+    bucket: cognis-tool-outputs
+    region: ""
+    existingSecret: ""
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+
+migration:
+  enabled: false
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+
+persistence:
+  enabled: true
+  existingClaim: ""
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 5Gi
+
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+internalService:
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: cognis.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+serviceAccount:
+  create: false
+  annotations: {}
+  name: ""
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+networkPolicy:
+  enabled: false
+  ingressNamespaceSelector: {}
+
+topologySpreadConstraints: []
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+terminationGracePeriodSeconds: 75
+preStopDelaySeconds: 5
+shutdownDrainTimeoutSeconds: 45
+shutdownCancelTimeoutSeconds: 10
+
+probes:
+  startup:
+    failureThreshold: 30
+    periodSeconds: 5
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+config:
+  dataDir: /data
+  publicBaseUrl: ""
+  mnemoryUrl: http://mnemory:8050
+  intarisUrl: http://intaris:8060
+  logLevel: info
+  logFormat: json
+  trustedProxyCidrs: ""
+  extraEnv: []
+  extraEnvFrom: []

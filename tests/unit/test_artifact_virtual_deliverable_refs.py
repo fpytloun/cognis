@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
+from cognis.core.artifact_access import artifact_authorized_for_conversation
+from cognis.core.artifact_inputs import (
+    authorize_outbound_artifact_refs_in_session,
+    outbound_artifact_grant_is_valid,
+)
 from cognis.core.content_refs import get_deliverable_ref_unscoped
 from cognis.core.tool_router import ToolRouter
+from cognis.models.artifact import AttachmentRef
 from cognis.store.models import Agent, AuditLog, ManagedConversationLink
 from cognis.store.queries import (
+    create_artifact_record,
     create_conversation,
     create_deliverable,
     create_managed_conversation_link,
+    get_artifact_record,
+    get_managed_conversation_link_for_target,
 )
 from cognis.tools.builtin.artifact_tools import handle_artifact_tool
 
@@ -164,6 +174,16 @@ async def _seed_managed_deliverables(factory) -> None:
         )
         await create_deliverable(
             session,
+            deliverable_id="dlv_published",
+            conversation_id="conv-controller",
+            turn_id="turn-published",
+            content="Published deliverable",
+            title="Published report",
+            artifact_store=factory.artifact_store,
+            published_owner_email="owner@example.com",
+        )
+        await create_deliverable(
+            session,
             deliverable_id="dlv_child",
             conversation_id="conv-child",
             turn_id="turn-child",
@@ -197,6 +217,20 @@ async def _seed_managed_deliverables(factory) -> None:
             content="Unrelated branch deliverable",
             title="Branch result",
             artifact_store=factory.artifact_store,
+        )
+        await create_artifact_record(
+            session,
+            artifact_id="att-child-context",
+            namespace="attachments",
+            object_id="att-child-context",
+            filename="context.txt",
+            owner_email="owner@example.com",
+            conversation_id="conv-child",
+            purpose="chat_input",
+            kind="file",
+            mime_type="text/plain",
+            size_bytes=12,
+            status="attached",
         )
         await session.commit()
 
@@ -254,6 +288,66 @@ async def test_artifact_tools_deny_cross_user_deliverable(task_continuation_db) 
 
     assert result.is_error is True
     assert result.output == "Artifact not found: dlv_owner"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_owner_conversation_can_use_published_chat_deliverable(
+    task_continuation_db,
+) -> None:
+    await _seed_managed_deliverables(task_continuation_db)
+
+    metadata = await handle_artifact_tool(
+        "artifact_get_metadata",
+        {"artifact_id": "dlv_published"},
+        llm=None,
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+        user_email="owner@example.com",
+        runtime_metadata=_managed_metadata("conv-unrelated", "agent-unrelated"),
+    )
+    search = await handle_artifact_tool(
+        "artifact_search",
+        {"query": "Published report"},
+        llm=None,
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+        user_email="owner@example.com",
+    )
+    read = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "dlv_published"},
+        llm=None,
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+        user_email="owner@example.com",
+        runtime_metadata=_managed_metadata("conv-unrelated", "agent-unrelated"),
+    )
+
+    assert metadata.is_error is False
+    assert metadata.metadata is not None
+    assert metadata.metadata["filename"] == "Published-report.md"
+    assert search.is_error is False
+    assert search.metadata is not None
+    assert search.metadata["items"][0]["artifact_id"] == "dlv_published"
+    assert read.is_error is False
+    assert read.output == "1: Published deliverable"
+
+
+@pytest.mark.asyncio
+async def test_other_owner_cannot_use_published_chat_deliverable(task_continuation_db) -> None:
+    await _seed_managed_deliverables(task_continuation_db)
+
+    result = await handle_artifact_tool(
+        "artifact_read",
+        {"artifact_id": "dlv_published"},
+        llm=None,
+        artifact_store=task_continuation_db.artifact_store,
+        session_factory=task_continuation_db,
+        user_email="other@example.com",
+    )
+
+    assert result.is_error is True
+    assert result.output == "Artifact not found: dlv_published"
 
 
 @pytest.mark.asyncio
@@ -411,6 +505,116 @@ async def test_controller_can_read_direct_child_deliverable_and_records_audit(
         "managed_descendant_depth": 1,
     }
     assert "Child deliverable" not in json.dumps(audit.details)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("conversation_id", "agent_id"),
+    [
+        ("conv-child", "agent-child"),
+        ("conv-grandchild", "agent-grandchild"),
+    ],
+)
+async def test_managed_descendant_can_access_ancestor_artifact(
+    task_continuation_db,
+    conversation_id: str,
+    agent_id: str,
+) -> None:
+    await _seed_managed_deliverables(task_continuation_db)
+
+    async with task_continuation_db() as session:
+        assert await artifact_authorized_for_conversation(
+            session,
+            artifact=SimpleNamespace(
+                owner_email="owner@example.com",
+                conversation_id="conv-controller",
+            ),
+            owner_email="owner@example.com",
+            conversation_id=conversation_id,
+            agent_id=agent_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_managed_artifact_access_preserves_ancestor_and_sibling_boundaries(
+    task_continuation_db,
+) -> None:
+    await _seed_managed_deliverables(task_continuation_db)
+    child_artifact = SimpleNamespace(
+        owner_email="owner@example.com",
+        conversation_id="conv-child",
+    )
+
+    async with task_continuation_db() as session:
+        assert await artifact_authorized_for_conversation(
+            session,
+            artifact=child_artifact,
+            owner_email="owner@example.com",
+            conversation_id="conv-controller",
+            agent_id="agent-owner",
+        )
+        assert not await artifact_authorized_for_conversation(
+            session,
+            artifact=child_artifact,
+            owner_email="owner@example.com",
+            conversation_id="conv-sibling",
+            agent_id="agent-sibling",
+        )
+        assert not await artifact_authorized_for_conversation(
+            session,
+            artifact=child_artifact,
+            owner_email="other@example.com",
+            conversation_id="conv-controller",
+            agent_id="agent-owner",
+        )
+
+
+@pytest.mark.asyncio
+async def test_nested_ancestor_grant_binds_to_accessor_link(task_continuation_db) -> None:
+    await _seed_managed_deliverables(task_continuation_db)
+
+    async with task_continuation_db() as session:
+        artifact = await get_artifact_record(session, "att-child-context")
+        assert artifact is not None
+        authorized = await authorize_outbound_artifact_refs_in_session(
+            session,
+            [
+                AttachmentRef(
+                    artifact_id=artifact.artifact_id,
+                    kind=artifact.kind,
+                    mime_type=artifact.mime_type,
+                    filename=artifact.filename,
+                    size_bytes=artifact.size_bytes,
+                )
+            ],
+            user_email="owner@example.com",
+            conversation_id="conv-grandchild",
+            agent_id="agent-grandchild",
+        )
+        grant = authorized[0]["_delivery_authorization"]
+        grandchild_link = await get_managed_conversation_link_for_target(
+            session,
+            "conv-grandchild",
+            user_email="owner@example.com",
+        )
+        assert grandchild_link is not None
+        assert grant["scope"] == "ancestor"
+        assert grant["descendant_link_id"] == grandchild_link.link_id
+        assert await outbound_artifact_grant_is_valid(
+            session,
+            attachment=authorized[0],
+            artifact=artifact,
+            owner_email="owner@example.com",
+        )
+
+        grandchild_link.owner_epoch += 1
+        await session.commit()
+        assert not await outbound_artifact_grant_is_valid(
+            session,
+            attachment=authorized[0],
+            artifact=artifact,
+            owner_email="owner@example.com",
+        )
 
 
 @pytest.mark.asyncio

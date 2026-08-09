@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -162,3 +163,84 @@ async def test_officecli_certified_runtime_render_html(tmp_path: Path) -> None:
     assert result.is_error is False
     assert result.attachments
     assert result.attachments[0]["filename"] == "render.html"
+
+
+@pytest.mark.asyncio
+async def test_officecli_certified_runtime_read_and_query_argument_compatibility(
+    tmp_path: Path,
+) -> None:
+    status = await ensure_officecli(OfficeCliRuntimeConfig(cache_dir=tmp_path / "cache"))
+    if not status.available or not status.command:
+        pytest.skip(f"Certified OfficeCLI runtime unavailable: {status.error}")
+
+    from cognis.tools.executor.officecli.handlers import (
+        handle_office_create,
+        handle_office_patch,
+        handle_office_query,
+        handle_office_read,
+    )
+
+    context = ToolExecutionContext(
+        executor_handle=ExecutorHandle(executor_id="test", executor_type="local"),
+        runtime_metadata={
+            "working_directory": str(tmp_path),
+            "officecli": status.metadata(),
+        },
+    )
+    source = tmp_path / "compatibility.xlsx"
+    create_result = await handle_office_create(
+        {
+            "format": "xlsx",
+            "output_path": str(source),
+            "publish_artifact": False,
+        },
+        context,
+    )
+    assert create_result.is_error is False
+    patch_result = await handle_office_patch(
+        {
+            "source_path": str(source),
+            "operations": [
+                {
+                    "verb": "set",
+                    "path": "/Sheet1/A1",
+                    "props": {"value": "OfficeCLI compatibility smoke"},
+                }
+            ],
+            "output_path": str(source),
+            "publish_artifact": False,
+        },
+        context,
+    )
+    assert patch_result.is_error is False
+
+    json_read = await handle_office_read(
+        {
+            "source_path": str(source),
+            "view": "json",
+            "start": 0,
+            "end": 0,
+            "limit": 0,
+            "page": 0,
+            "max_lines": 10,
+        },
+        context,
+    )
+    assert json_read.is_error is False
+    assert "OfficeCLI compatibility smoke" in json.dumps(json.loads(json_read.output)["data"])
+
+    for view in ("stats", "issues"):
+        result = await handle_office_read({"source_path": str(source), "view": view}, context)
+        assert result.is_error is False
+        assert "data" in json.loads(result.output)
+
+    query_result = await handle_office_query(
+        {
+            "source_path": str(source),
+            "selector": "*",
+            "limit": 1000,
+        },
+        context,
+    )
+    assert query_result.is_error is False
+    assert "data" in json.loads(query_result.output)

@@ -17,7 +17,9 @@ fetch data deterministically
 ```
 
 This spec extends [`14-workflow-engine.md`](14-workflow-engine.md) and
-[`27-workflow-composer.md`](27-workflow-composer.md).
+[`27-workflow-composer.md`](27-workflow-composer.md). The Task Cockpit,
+workflow phases, effective-definition snapshots, and UI cutover are specified in
+[`37-workflow-task-cockpit.md`](37-workflow-task-cockpit.md).
 
 ## Non-Goals
 
@@ -210,6 +212,9 @@ class ConditionStepConfig:
     then: str | None = None
     else_: str | None = None
     output: DeterministicOutputConfig | None = None
+    revision_source: str | None = None
+    max_loop_iterations: int | None = None
+    on_exhausted: Literal["continue", "fail", "gate"] = "gate"
 ```
 
 Semantics:
@@ -220,9 +225,18 @@ Semantics:
 4. Record the expression result and selected branch in `StepRun.runtime_info` and
    `StepOutput.metadata`.
 
-Workflow validation must reject unknown step names and must apply loop
-protection to deterministic jumps. A global deterministic jump cap is acceptable
-for v1; per-edge loop budgets can follow the existing review-loop pattern later.
+Workflow validation must reject unknown step names. A condition can set a
+per-route loop budget for backward branches. The engine gates, fails, or
+continues according to `on_exhausted`. The global deterministic jump cap remains
+the final safety boundary. If `revision_source` is set, the engine preserves that
+step output as routed revision context before it clears the backward range.
+
+A forward branch records each bypassed step in
+`WorkflowState.routing_skips` with a bounded branch reason. This is separate
+from the existing exhausted-step `skipped_steps` field, which retains its
+failure semantics. Routing-skipped steps are normal control flow and project as
+skipped in the Task Cockpit. Backward routing must clear or supersede a routing
+skip if that step becomes reachable later in the same task attempt.
 
 ## `complete` Step
 
@@ -366,8 +380,10 @@ Persistence order:
 1. Create `StepRun` before rendering.
 2. Persist redacted render inputs and rendered argument summary before tool
    execution.
-3. For `tool_call`, persist a deterministic idempotency key derived from
-   `task_id`, `step_name`, `attempt_number`, and `step_run_id`.
+3. For `tool_call`, persist a stable controller call identity derived from
+   `task_id`, `step_name`, `attempt_number`, and `step_run_id`. This identity is
+   for recovery and audit. It must not be injected into arbitrary tool arguments
+   unless the target tool declares and validates a compatible idempotency field.
 4. Execute the tool.
 5. Persist raw output references and normalized `StepOutput`.
 6. Mark the `StepRun` terminal only after output persistence succeeds.
@@ -383,6 +399,17 @@ On resume:
 - an `executing` side-effecting `tool_call` must pause/fail for operator review
   unless the tool exposes a verified idempotency contract and the same
   idempotency key can be safely reused.
+
+The deterministic substate (`rendering`, `executing`, `persisted`) is stored in
+the existing `StepRun.runtime_info` envelope. It does not expand the global
+`StepRun.status` vocabulary merely to represent internal dispatch checkpoints.
+The controller crash classifier must explicitly understand deterministic steps;
+the absence of an Intaris session is not evidence that a deterministic tool was
+never dispatched.
+
+Runtime execution and restart recovery use the pinned effective workflow
+definition from Spec 37 when present. This prevents a workflow edit from changing
+the deterministic template or branch graph of an in-flight task.
 
 ## Authoring Guidance
 
@@ -445,7 +472,8 @@ Minimum test coverage:
 - model validation: valid/invalid deterministic configs, unknown branch targets,
   loop caps, backward-compatible existing workflows;
 - workflow engine: `when` skip, true/false condition branches, deterministic
-  output persistence, template error behavior, `on_error` handling;
+  output persistence, routing-skip persistence/reactivation, template error
+  behavior, `on_error` handling;
 - tool calls: read-only builtin tool, executor-routed fake tool,
   `target_executor` validation, missing/write-capable metadata rejection,
   explicit `allow_side_effects=true`, tool error behavior, large output refs;
@@ -453,6 +481,9 @@ Minimum test coverage:
   completion uses existing delivery path;
 - security: template context cannot access credentials, raw sessions, executor
   objects, DB sessions, or raw tool router state.
+- recovery: crash classification distinguishes pre-dispatch, ambiguous
+  dispatch, persisted output, and terminal deterministic steps; write-capable or
+  unknown tool dispatch is never inferred safe from a missing Intaris session.
 
 ## Acceptance Criteria
 

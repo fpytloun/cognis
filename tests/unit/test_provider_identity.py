@@ -4,9 +4,10 @@ import httpx
 import pytest
 
 from cognis.models.session import SessionEvent
+from cognis.providers.circuit_breaker import CircuitState
 from cognis.providers.guardrails.intaris import IntarisProvider
 from cognis.providers.memory.mnemory import MnemoryProvider
-from cognis.runtime_context import current_user_email
+from cognis.runtime_context import current_user_email, scoped_runtime_context
 
 
 class _AuthProvider:
@@ -101,6 +102,101 @@ async def test_intaris_call_mcp_tool_uses_server_and_tool_fields() -> None:
         "arguments": {"q": "bug"},
         "context": {},
     }
+
+
+@pytest.mark.asyncio
+async def test_intaris_record_events_sends_idempotency_as_query_parameter() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"ok": True, "count": 1, "first_seq": 7, "last_seq": 7}
+
+    async def _fake_post(
+        path: str,
+        *,
+        json: list[dict[str, object]],
+        headers: dict[str, str],
+        params: dict[str, str] | None,
+        timeout: float,
+    ) -> _Response:
+        captured["path"] = path
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["params"] = params
+        captured["timeout"] = timeout
+        return _Response()
+
+    intaris.client.post = _fake_post  # type: ignore[method-assign]
+    try:
+        result = await intaris.record_events(
+            "sess-1",
+            [SessionEvent(type="user_message", data={"content": "hello"})],
+            idempotency_key="sess-1:direct-turn:dtr-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+    finally:
+        await intaris.client.aclose()
+
+    assert result.ok is True
+    assert captured["path"] == "/api/v1/session/sess-1/events"
+    assert captured["params"] == {"idempotency_key": "sess-1:direct-turn:dtr-1"}
+    assert "Idempotency-Key" not in captured["headers"]
+
+
+@pytest.mark.asyncio
+async def test_intaris_create_session_verifies_duplicate_after_timeout_retry() -> None:
+    intaris = IntarisProvider("http://localhost:8060", _AuthProvider())
+    calls: list[str] = []
+    intaris.session_breaker.state = CircuitState.HALF_OPEN
+
+    class _Response:
+        def __init__(self, status_code: int) -> None:
+            self.status_code = status_code
+
+        @property
+        def is_success(self) -> bool:
+            return 200 <= self.status_code < 300
+
+        def raise_for_status(self) -> None:
+            if not self.is_success:
+                request = httpx.Request("GET", "http://localhost:8060")
+                response = httpx.Response(self.status_code, request=request)
+                raise httpx.HTTPStatusError("request failed", request=request, response=response)
+
+    async def _fake_post(path: str, **_: object) -> _Response:
+        calls.append(path)
+        return _Response(409)
+
+    async def _fake_get(path: str, **_: object) -> _Response:
+        calls.append(path)
+        return _Response(200)
+
+    intaris.client.post = _fake_post  # type: ignore[method-assign]
+    intaris.client.get = _fake_get  # type: ignore[method-assign]
+    try:
+        await intaris.create_session(
+            session_id="sess-timeout-retry",
+            intention="Resume task",
+            agent_id="agent-1",
+            user_id="user@example.com",
+        )
+    finally:
+        await intaris.client.aclose()
+
+    assert calls == [
+        "/api/v1/intention",
+        "/api/v1/session/sess-timeout-retry",
+    ]
+    assert intaris.session_breaker.state == CircuitState.CLOSED
 
 
 @pytest.mark.asyncio
@@ -303,3 +399,67 @@ async def test_intaris_record_events_retries_missing_session_when_requested() ->
     assert calls == 2
     assert result.ok is True
     assert result.last_seq == 1
+
+
+@pytest.mark.asyncio
+async def test_intaris_verified_empty_stream_does_not_trip_events_breaker() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+    calls: list[str] = []
+
+    async def _fake_get(path: str, **_: object) -> httpx.Response:
+        calls.append(path)
+        request = httpx.Request("GET", f"http://localhost:8060{path}")
+        if path.endswith("/events"):
+            return httpx.Response(404, request=request)
+        return httpx.Response(200, request=request, json={"session_id": "sess-1"})
+
+    with scoped_runtime_context(
+        user_email="user@example.com",
+        agent_id="shared-agent",
+        agent_owner_email="owner@example.com",
+    ):
+        intaris.client.get = _fake_get  # type: ignore[method-assign]
+        result = await intaris.read_events(
+            session_id="sess-1",
+            last_n=1,
+            allow_missing_stream=True,
+        )
+    await intaris.client.aclose()
+
+    assert result.events == []
+    assert result.last_seq == 0
+    assert result.missing_stream_fallback_used is True
+    assert calls == ["/api/v1/session/sess-1/events", "/api/v1/session/sess-1"]
+    assert auth.calls == [
+        ("user@example.com", "shared-agent", ["intaris"], "owner@example.com"),
+        ("user@example.com", "shared-agent", ["intaris"], "owner@example.com"),
+    ]
+    assert intaris.events_breaker.state == CircuitState.CLOSED
+    assert intaris.events_breaker.failures == 0
+
+
+@pytest.mark.asyncio
+async def test_intaris_missing_session_is_not_masked_or_counted_as_outage() -> None:
+    auth = _AuthProvider()
+    intaris = IntarisProvider("http://localhost:8060", auth)
+
+    async def _fake_get(path: str, **_: object) -> httpx.Response:
+        request = httpx.Request("GET", f"http://localhost:8060{path}")
+        return httpx.Response(404, request=request)
+
+    token = current_user_email.set("user@example.com")
+    try:
+        intaris.client.get = _fake_get  # type: ignore[method-assign]
+        with pytest.raises(httpx.HTTPStatusError):
+            await intaris.read_events(
+                session_id="missing-session",
+                last_n=1,
+                allow_missing_stream=True,
+            )
+    finally:
+        current_user_email.reset(token)
+        await intaris.client.aclose()
+
+    assert intaris.events_breaker.state == CircuitState.CLOSED
+    assert intaris.events_breaker.failures == 0

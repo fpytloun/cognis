@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from jsonschema import Draft7Validator
@@ -45,6 +46,7 @@ from cognis.core.agent_loop import (
     _build_delegation_message_result,
     _controller_builtin_enabled,
     _cycle_cache_breakpoints,
+    _delegated_system_builtin_tool_ids,
     _emit_token,
     _emit_tool_result_callback,
     _emit_with_optional_trailing_arg,
@@ -73,12 +75,14 @@ from cognis.core.agent_loop import (
     _visible_allowed_tool_names,
 )
 from cognis.core.agent_profiles import resolve_agent_profile
+from cognis.core.compaction import CompactionResult
 from cognis.core.context_projection import (
     PressureMode,
     ProjectionPolicy,
     ProjectionResult,
     ProjectionTurnState,
 )
+from cognis.core.daily_brief_contract import CURRENT_DAILY_BRIEF_CONTRACT_VERSION
 from cognis.core.events import EventType
 from cognis.core.followups import LLM_CYCLE_CEILING_CONTINUATION_REASON, ContinuationFollowUp
 from cognis.core.harness_guards import SameTurnToolCallLedger
@@ -93,10 +97,11 @@ from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.session_cache import SessionCache
 from cognis.core.session_event_types import INTARIS_APPENDABLE_EVENT_TYPES
+from cognis.core.step_profiles import resolve_step_profile, step_profile_allows_tool
 from cognis.core.tool_router import ToolRouter
-from cognis.core.turn_scheduler import TurnResult
+from cognis.core.turn_scheduler import TurnError, TurnResult
 from cognis.models.agent import AgentDefinition, AgentPermissions, AgentRuntimeProfile
-from cognis.models.deliverable import Deliverable, RichPayloadValidationError
+from cognis.models.deliverable import Deliverable
 from cognis.models.session import (
     ConversationContext,
     ConversationModel,
@@ -125,6 +130,9 @@ from cognis.models.workflow import (
     StepDefinition,
     StepInputConfig,
     StepOutput,
+    StepProfileConfig,
+    StepProfileMode,
+    StepToolOverrides,
     WorkflowState,
 )
 from cognis.providers.llm.errors import (
@@ -136,7 +144,7 @@ from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.providers.llm.retry import LLMContextOverflowError
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store import queries
-from cognis.store.models import Base
+from cognis.store.models import Base, ManagedChannelBinding
 from cognis.store.queries import (
     create_agent,
     create_conversation,
@@ -151,6 +159,55 @@ from cognis.store.queries import (
 from cognis.tools.builtin.orchestration import OrchestrationMode
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
+
+
+@pytest.mark.asyncio
+async def test_intaris_recovery_is_emitted_as_transient_system_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = object.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        guardrails=SimpleNamespace(
+            health=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(status="unhealthy"),
+                    SimpleNamespace(status="healthy"),
+                ]
+            )
+        )
+    )
+    loop.event_bus = SimpleNamespace(publish=AsyncMock())
+    monkeypatch.setattr(agent_loop_module, "_INTARIS_RETRY_POLL_SECONDS", 0)
+    streamed: list[str] = []
+
+    async def on_token(token: str, *_: object) -> None:
+        streamed.append(token)
+
+    await loop._wait_for_intaris_recovery(
+        SimpleNamespace(
+            cancel_event=None,
+            conversation=SimpleNamespace(conversation_id="conv-1"),
+            session=SimpleNamespace(session_id="sess-1"),
+            turn_id="turn-1",
+        ),
+        operation="intaris_append",
+        max_wait_seconds=5,
+        on_token=on_token,
+    )
+
+    assert streamed == []
+    event = loop.event_bus.publish.await_args.args[0]
+    assert event.type == EventType.SYSTEM_NOTICE
+    assert event.data == {
+        "conversation_id": "conv-1",
+        "session_id": "sess-1",
+        "turn_id": "turn-1",
+        "message": "Paused while Intaris recovers. Retrying for up to 5 seconds.",
+        "notice_id": "intaris-recovery:turn-1:intaris_append",
+        "kind": "intaris_recovery",
+        "scope": "transient_retry",
+    }
+
 
 # ---------------------------------------------------------------------------
 # StreamAccumulator tests
@@ -651,6 +708,10 @@ def test_exhausted_idle_timeout_can_auto_continue() -> None:
     assert _should_continue_after_exhausted_mid_stream_failure(
         "Provider disconnected while streaming",
         {"category": "connection"},
+    )
+    assert not _should_continue_after_exhausted_mid_stream_failure(
+        "429 rate_limit_error",
+        {"category": "rate_limit"},
     )
     assert not _should_continue_after_exhausted_mid_stream_failure(
         "HTTP 429 usage_limit_reached",
@@ -2330,6 +2391,72 @@ def test_filter_model_inventory_tools_excludes_controller_and_denied_tools() -> 
     assert [tool.name for tool in filtered] == ["read"]
 
 
+def test_delegated_system_builtin_wildcard_excludes_denied_and_mcp_tools() -> None:
+    read = ToolDefinition(
+        name="read",
+        description="read file",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        read_only=True,
+    )
+    bash = ToolDefinition(
+        name="bash",
+        description="run command",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="shell",
+    )
+    builtin = ToolDefinition(
+        name="memory_search",
+        description="search memory",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="builtin"),
+        category="memory",
+        read_only=True,
+    )
+    mcp = ToolDefinition(
+        name="mcp_remote__search",
+        description="remote search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="intaris_mcp", server_name="remote", raw_tool_name="search"),
+        category="mcp",
+        read_only=True,
+    )
+    agent = AgentDefinition(
+        agent_id="system:code-review",
+        owner_email="system",
+        name="Code Review",
+        agent_type="secondary",
+        is_system=True,
+        tools={"builtin_tools": ["*"]},
+        permissions=AgentPermissions(
+            tool_permissions={"*": Permission.EVALUATE, stable_tool_id(bash): Permission.DENY}
+        ),
+    )
+    registry = SimpleNamespace(list_tools=lambda: [read, bash, builtin, mcp])
+
+    included = _delegated_system_builtin_tool_ids(agent, registry)
+    profile = resolve_step_profile(
+        StepDefinition(
+            name="delegation",
+            type="run",
+            prompt="Review",
+            step_profile_mode=StepProfileMode.HARD,
+            step_profile=StepProfileConfig(
+                tool_overrides=StepToolOverrides(include=included),
+                allow_tool_search=False,
+            ),
+        )
+    )
+
+    assert included == [stable_tool_id(read), stable_tool_id(builtin)]
+    assert step_profile_allows_tool(read, profile) is True
+    assert step_profile_allows_tool(builtin, profile) is True
+    assert step_profile_allows_tool(bash, profile) is False
+    assert step_profile_allows_tool(mcp, profile) is False
+
+
 def test_filter_model_inventory_tools_keeps_write_tools_visible_for_plan_mode() -> None:
     agent = AgentDefinition(
         agent_id="agent-a",
@@ -2380,6 +2507,14 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     cleanup_called = False
     captured_tool_registry: list[object] = []
     captured_contexts: list[object] = []
+    cancel_event = asyncio.Event()
+
+    class _ExecutionFence:
+        async def checkpoint(self, _name: str, **_metadata: object) -> None:
+            if cancel_event.is_set():
+                raise RuntimeError("task lease lost")
+
+    execution_fence = _ExecutionFence()
 
     async def _runtime_factory(
         *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
@@ -2435,6 +2570,7 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
         assert hasattr(ctx, "tool_registry")
         captured_contexts.append(ctx)
         captured_tool_registry.append(ctx.tool_registry)
+        await ctx.execution_fence.checkpoint("tool_in_flight")  # type: ignore[attr-defined]
         return StepOutput(
             summary="done",
             content="done",
@@ -2468,15 +2604,42 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
             task_description="Do the thing",
             parent_intaris_session_id="parent-intaris",
             deliverable_step_run_id="sr-parent",
+            cancel_event=cancel_event,
+            execution_fence=execution_fence,
+        )
+        cancel_event.set()
+        stale_output = await agent_loop._run_child_session(
+            child_session=SimpleNamespace(
+                session_id="child-stale",
+                user_email="user@example.com",
+                agent_id="agent-a",
+                intaris_session_id="child-stale",
+            ),
+            conversation=SimpleNamespace(conversation_id="conv-1"),
+            agent=AgentDefinition(
+                agent_id="agent-a",
+                owner_email="user@example.com",
+                name="Agent A",
+            ),
+            task_description="Do not run stale delegated tool",
+            parent_intaris_session_id="parent-intaris",
+            cancel_event=cancel_event,
+            execution_fence=execution_fence,
         )
     finally:
         monkeypatch.undo()
 
     assert output is not None
-    assert runtime_calls == [("agent-a", "user@example.com")]
-    assert captured_tool_registry == ["child-registry"]
+    assert stale_output is None
+    assert runtime_calls == [
+        ("agent-a", "user@example.com"),
+        ("agent-a", "user@example.com"),
+    ]
+    assert captured_tool_registry == ["child-registry", "child-registry"]
     assert captured_contexts[0].deliverable_step_run_id == "sr-parent"
     assert captured_contexts[0].step_definition.require_deliverable is False
+    assert captured_contexts[0].cancel_event is cancel_event
+    assert captured_contexts[0].execution_fence is execution_fence
     assert cleanup_called is True
 
 
@@ -2734,6 +2897,7 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_policies: list[object] = []
+    captured_steps: list[StepDefinition] = []
 
     async def _runtime_factory(
         *, agent: AgentDefinition, user_email: str, executor_agent: AgentDefinition
@@ -2772,15 +2936,17 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
     ) -> AgentDefinition:
         del child_agent_id, parent_agent, user_email
         return AgentDefinition(
-            agent_id="system:explore",
+            agent_id="system:code-review",
             owner_email="system",
-            name="Explore",
+            name="Code Review",
             agent_type="secondary",
-            system=True,
+            is_system=True,
+            tools={"builtin_tools": ["read", "grep", "glob", "bash"]},
         )
 
     async def _fake_run_step(ctx: StepContext, **_: object) -> StepOutput:
         captured_policies.append(ctx.policy)
+        captured_steps.append(ctx.step_definition)
         return StepOutput(
             summary="done",
             content="done",
@@ -2797,7 +2963,7 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
         child_session=SimpleNamespace(
             session_id="child",
             user_email="user@example.com",
-            agent_id="system:explore",
+            agent_id="system:code-review",
             intaris_session_id="child",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -2806,12 +2972,21 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
             owner_email="user@example.com",
             name="Agent A",
         ),
-        task_description="Explore this",
+        task_description="Review this",
         parent_intaris_session_id="parent-intaris",
         controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
     )
 
     assert captured_policies == [SECONDARY_AGENT_DELEGATION_POLICY]
+    assert captured_steps[0].step_profile_mode == StepProfileMode.HARD
+    assert captured_steps[0].step_profile is not None
+    assert captured_steps[0].step_profile.allow_tool_search is False
+    assert captured_steps[0].step_profile.tool_overrides.include == [
+        "read",
+        "grep",
+        "glob",
+        "bash",
+    ]
 
 
 @pytest.mark.asyncio
@@ -3037,6 +3212,8 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
 
     monkeypatch.setattr(agent_loop, "_run_child_session", _fake_run_child_session)
     monkeypatch.setattr(agent_loop, "_untrack_child", _fake_untrack_child)
+    cancel_event = asyncio.Event()
+    execution_fence = SimpleNamespace()
 
     await agent_loop._run_child_session_async(
         child_session=SimpleNamespace(
@@ -3061,6 +3238,8 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
         parent_turn_id="turn-1",
         parent_assistant_phase_index=4,
         parent_turn_cycle_index=4,
+        cancel_event=cancel_event,
+        execution_fence=execution_fence,
     )
 
     assert captured_kwargs["workspace_root"] == "/home/user/src/cognis"
@@ -3068,6 +3247,8 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
     assert captured_kwargs["workspace_root_explicit"] is True
     assert captured_kwargs["working_directory_explicit"] is True
     assert captured_kwargs["parent_turn_cycle_index"] == 4
+    assert captured_kwargs["cancel_event"] is cancel_event
+    assert captured_kwargs["execution_fence"] is execution_fence
     assert captured_kwargs["untracked"] == ("parent", "child")
     assert published_events
     progress_events = [
@@ -3233,6 +3414,17 @@ async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch
         async def publish(self, event: object) -> None:
             published.append(event)
 
+    async def _continuation_chain(
+        _db_session: object,
+        _session_id: str,
+    ) -> tuple[list[object], bool]:
+        return [], False
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "get_child_session_continuation_chain",
+        _continuation_chain,
+    )
     agent_loop = AgentLoop(
         providers=SimpleNamespace(guardrails=_Guardrails()),
         session_manager=_SessionManager(),
@@ -3294,7 +3486,7 @@ async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_run_child_session_recovers_saved_tool_work_when_no_step_output(
+async def test_run_child_session_prefers_rotated_saved_work_over_partial_error_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     completed: list[tuple[str, str | None, str | None]] = []
@@ -3344,7 +3536,15 @@ async def test_run_child_session_recovers_saved_tool_work_when_no_step_output(
         async def record_events(self, **kwargs: object) -> None:
             recorded_events.extend(kwargs.get("events", []))
 
-        async def read_events(self, **_: object) -> SimpleNamespace:
+        async def read_events(self, *, session_id: str, **_: object) -> SimpleNamespace:
+            if session_id == "child-intaris":
+                return SimpleNamespace(
+                    events=[],
+                    last_seq=0,
+                    has_more=False,
+                    missing_stream_fallback_used=False,
+                )
+            assert session_id == "child-successor-intaris"
             return SimpleNamespace(
                 events=[
                     {
@@ -3378,6 +3578,24 @@ async def test_run_child_session_recovers_saved_tool_work_when_no_step_output(
         async def publish(self, event: object) -> None:
             published.append(event)
 
+    async def _continuation_chain(
+        _db_session: object,
+        session_id: str,
+    ) -> tuple[list[object], bool]:
+        assert session_id == "child"
+        return [
+            SimpleNamespace(session_id="child", intaris_session_id="child-intaris"),
+            SimpleNamespace(
+                session_id="child-successor",
+                intaris_session_id="child-successor-intaris",
+            ),
+        ], False
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "get_child_session_continuation_chain",
+        _continuation_chain,
+    )
     agent_loop = AgentLoop(
         providers=SimpleNamespace(guardrails=_Guardrails()),
         session_manager=_SessionManager(),
@@ -3392,9 +3610,19 @@ async def test_run_child_session_recovers_saved_tool_work_when_no_step_output(
         step_runtime_factory=_runtime_factory,
     )
 
-    async def _fake_run_step(ctx: object, **_: object) -> None:
-        del ctx
-        return None
+    async def _fake_run_step(ctx: StepContext, **_: object) -> StepOutput:
+        ctx.session = SimpleNamespace(
+            session_id="child-successor",
+            intaris_session_id="child-successor-intaris",
+        )
+        return StepOutput(
+            summary="Delegation failed after partial output",
+            content="Partial response before the tool result was recovered.",
+            error="provider stream failed",
+            session_id="child-successor",
+            intaris_session_id="child-successor-intaris",
+            completed_at=datetime.now(UTC),
+        )
 
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
@@ -3423,21 +3651,25 @@ async def test_run_child_session_recovers_saved_tool_work_when_no_step_output(
 
     assert output is not None
     assert output.outputs["recovered_from_saved_tool_results"] is True
+    assert output.metadata["delegation_result_source"] == "saved_tool_results"
     assert "Partial delegated result recovered from saved tool outputs" in output.content
     assert "cognis/core/agent_loop.py:3144: no step output" in output.content
+    assert "Partial response before the tool result was recovered." not in output.content
     assert "read_tool_output(call_id='call_saved')" in output.content
-    assert completed and completed[0][0] == "child"
+    assert completed and completed[0][0] == "child-successor"
     assert completed[0][2] and "call_saved" in completed[0][2]
     assert failed == []
     assert any(
         getattr(event, "type", None) == "delegation"
         and getattr(event, "data", {}).get("status") == "completed"
+        and getattr(event, "data", {}).get("child_session_id") == "child"
         and getattr(event, "data", {}).get("result_source") == "saved_tool_results"
         and getattr(event, "data", {}).get("turn_cycle_index") == 2
         for event in recorded_events
     )
     assert any(
         getattr(event, "type", None) == EventType.DELEGATION_COMPLETED
+        and getattr(event, "data", {}).get("child_session_id") == "child"
         and getattr(event, "data", {}).get("turn_cycle_index") == 2
         for event in published
     )
@@ -4103,6 +4335,62 @@ class _StepCompleteRetryLLM:
                 }
             ]
         }
+
+
+class _DelegatedForbiddenToolThenTextLLM:
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call_forbidden_{self.tool_name}",
+                                    "function": {
+                                        "name": self.tool_name,
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        yield {"choices": [{"delta": {"content": "Recovered delegated result."}}]}
+
+
+class _SingleAssistantTextLLM:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        yield {"choices": [{"delta": {"content": "Delegated Daily Brief research result."}}]}
 
 
 class _StepCompleteOrderingLLM:
@@ -4890,6 +5178,21 @@ class _IdleWaitScheduler:
         return None
 
 
+def test_managed_scheduler_active_turn_ignores_settled_control() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    agent_loop._turn_scheduler = SimpleNamespace(  # noqa: SLF001
+        running_turn_state=lambda _conversation_id: None,
+        active_turn_id=lambda _conversation_id: "settled-turn",
+    )
+
+    checked, active_turn_id = agent_loop._managed_scheduler_active_turn_id(  # noqa: SLF001
+        SimpleNamespace(target_conversation_id="conv-settled")
+    )
+
+    assert checked is True
+    assert active_turn_id is None
+
+
 class _ProfileScheduler(_IdleWaitScheduler):
     def __init__(self, *, active: bool = False, queued: int = 0) -> None:
         super().__init__()
@@ -5238,6 +5541,7 @@ async def test_agent_conversation_set_profile_rejects_ineligible_profile(
 def _background_work_ctx(
     conversation_id: str,
     *,
+    session_id: str = "controller-session",
     context_type: str = "web",
     context_ref: str | None = None,
     parent_session_id: str | None = None,
@@ -5246,8 +5550,8 @@ def _background_work_ctx(
     return StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
         session=SimpleNamespace(
-            session_id="controller-session",
-            intaris_session_id="controller-session",
+            session_id=session_id,
+            intaris_session_id=session_id,
             user_email="user@example.com",
             agent_id="controller-agent",
             parent_session_id=parent_session_id,
@@ -5272,6 +5576,7 @@ def _background_work_ctx(
         ),
         policy=CHAT_POLICY,
         orchestration_mode=OrchestrationMode.FULL,
+        turn_id="controller-turn",
     )
 
 
@@ -5298,15 +5603,969 @@ async def _create_background_work_base(session_factory):
             agent_id="controller-agent",
             context_type="web",
         )
-        await create_session(
+        controller_session = await create_session(
             db_session,
             controller.conversation_id,
             "user@example.com",
             "controller-agent",
             session_id="controller-session",
         )
+        controller.active_session_id = controller_session.session_id
         await db_session.commit()
-        return controller
+    return controller
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_close_releases_completed_channel_binding(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-channel-close.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        target = await create_conversation(
+            db_session,
+            user_email="user@example.com",
+            agent_id="target-agent",
+            context_type="agent_work",
+        )
+        target_session = await create_session(
+            db_session,
+            target.conversation_id,
+            "user@example.com",
+            "target-agent",
+            session_id="target-channel-session",
+        )
+        account = await queries.create_channel_account(
+            db_session,
+            account_id="matrix-account",
+            channel_type="matrix",
+            display_name="Shared Matrix account",
+            agent_id="target-agent",
+            user_email="user@example.com",
+        )
+        link = await create_managed_conversation_link(
+            db_session,
+            user_email="user@example.com",
+            controller_agent_id="controller-agent",
+            controller_conversation_id=controller.conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target-agent",
+            target_conversation_id=target.conversation_id,
+            target_session_id=target_session.session_id,
+            title="Completed channel child",
+            kind="channel",
+            completion_policy="explicit",
+        )
+        db_session.add(
+            ManagedChannelBinding(
+                link_id=link.link_id,
+                user_email="user@example.com",
+                account_id=account.account_id,
+                channel_type="matrix",
+                chat_id="matrix-room",
+                thread_key="",
+                sender_id="matrix-participant",
+                active_route_key="user@example.com:matrix-account:matrix-room:",
+                state="delivery_sent",
+                version=3,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                objective="Resolve the request.",
+                safety_guidance="Keep controller context private.",
+                explicit_tool_allowlist=[],
+            )
+        )
+        await db_session.commit()
+
+    scheduler = SimpleNamespace(cancel_turn=AsyncMock())
+    agent_loop = _background_work_agent_loop(session_factory)
+    agent_loop.providers.managed_channel_service = SimpleNamespace(
+        reconcile_pending_deliveries=AsyncMock()
+    )
+    agent_loop.set_turn_scheduler(scheduler)
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="close-channel",
+            name="agent_conversation_close",
+            arguments={
+                "conversation_id": target.conversation_id,
+                "reason": "Completed live verification",
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "closed"
+    assert payload["conversation"]["conversation_id"] == target.conversation_id
+    async with session_factory() as db_session:
+        binding = await queries.get_managed_channel_binding_for_link(db_session, link.link_id)
+    assert binding is not None
+    assert binding.state == "cancelled"
+    assert binding.active_route_key is None
+    agent_loop.providers.managed_channel_service.reconcile_pending_deliveries.assert_awaited_once()
+    scheduler.cancel_turn.assert_awaited_once_with(target.conversation_id)
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_managed_join_finalizer_recovers_without_in_memory_registration() -> None:
+    recover = AsyncMock()
+    agent_loop = object.__new__(AgentLoop)
+    agent_loop._turn_scheduler = SimpleNamespace(recover_managed_join_handoffs_for_parent=recover)
+    ctx = _background_work_ctx("controller-conversation")
+    assert "pending_managed_join_handoffs" not in ctx.runtime_info
+
+    await agent_loop._recover_pending_managed_join_handoffs(ctx)
+
+    recover.assert_awaited_once_with(
+        controller_session_id="controller-session",
+        controller_turn_id="controller-turn",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_yields_to_fallback_when_settlement_wins_begin_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-begin-race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-race",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    original_begin = queries.begin_managed_conversation_join_handoff
+
+    async def _settle_before_begin(db_session, link_id: str, **kwargs: object):
+        await update_managed_conversation_link(
+            db_session,
+            link_id,
+            conversation_state="completed",
+            turn_state="completed",
+            clear_active_turn_id=True,
+            notify_on_completion=False,
+            last_result_summary="race result",
+            last_result_turn_id="turn-race",
+            completed=True,
+        )
+        return await original_begin(db_session, link_id, **kwargs)
+
+    monkeypatch.setattr(
+        queries,
+        "begin_managed_conversation_join_handoff",
+        _settle_before_begin,
+    )
+
+    class _RaceScheduler:
+        async def wait_for_turn(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("fallback-owned completion must not wait again")
+
+    agent_loop = _background_work_agent_loop(session_factory, _RaceScheduler())
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-wait-race",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-target", "timeout_seconds": 1},
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["fallback_owned"] is True
+    assert result.metadata is not None
+    assert result.metadata["delegation_spawned"] is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_yields_when_admission_releases_before_settlement_persists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-release-race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-release-race",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    original_begin = queries.begin_managed_conversation_join_handoff
+
+    async def _release_before_settlement(db_session, link_id: str, **kwargs: object):
+        await update_managed_conversation_link(
+            db_session,
+            link_id,
+            conversation_state="open",
+            turn_state="idle",
+            clear_active_turn_id=True,
+            notify_on_completion=True,
+        )
+        return await original_begin(db_session, link_id, **kwargs)
+
+    monkeypatch.setattr(
+        queries,
+        "begin_managed_conversation_join_handoff",
+        _release_before_settlement,
+    )
+
+    class _RaceScheduler:
+        async def wait_for_turn(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("released admission must not be joined again")
+
+    agent_loop = _background_work_agent_loop(session_factory, _RaceScheduler())
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-wait-release-race",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-target", "timeout_seconds": 1},
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "idle"
+    assert payload["fallback_owned"] is True
+    assert result.metadata is not None
+    assert result.metadata["delegation_spawned"] is True
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_does_not_yield_to_another_active_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-conflict.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-original",
+            notify_on_completion=True,
+        )
+        await db_session.commit()
+
+    original_begin = queries.begin_managed_conversation_join_handoff
+
+    async def _admit_another_turn(db_session, link_id: str, **kwargs: object):
+        await update_managed_conversation_link(
+            db_session,
+            link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-replacement",
+            notify_on_completion=True,
+        )
+        return await original_begin(db_session, link_id, **kwargs)
+
+    monkeypatch.setattr(
+        queries,
+        "begin_managed_conversation_join_handoff",
+        _admit_another_turn,
+    )
+
+    agent_loop = _background_work_agent_loop(session_factory, SimpleNamespace())
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-wait-conflict",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-target", "timeout_seconds": 1},
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "conflict"
+    assert payload["error"] == {
+        "code": "managed_join_conflict",
+        "message": (
+            "The requested managed turn was replaced or another handoff already owns its result."
+        ),
+        "recoverable": True,
+        "current_turn_id": "turn-replacement",
+    }
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_yields_when_fallback_already_owns_running_turn(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-owned.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-owned",
+            notify_on_completion=False,
+        )
+        joined = await queries.begin_managed_conversation_join_handoff(
+            db_session,
+            link.link_id,
+            target_turn_id="turn-owned",
+            controller_session_id="old-controller-session",
+            controller_turn_id="old-controller-turn",
+            tool_call_id="old-controller-call",
+        )
+        assert joined is not None
+        claimed = await queries.claim_managed_conversation_join_handoff(
+            db_session,
+            link.link_id,
+            target_turn_id="turn-owned",
+            controller_session_id="old-controller-session",
+            controller_turn_id="old-controller-turn",
+            tool_call_id="old-controller-call",
+        )
+        assert claimed is not None
+        await db_session.commit()
+
+    class _FallbackScheduler:
+        async def wait_for_turn(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("fallback-owned running turn must not be joined again")
+
+    agent_loop = _background_work_agent_loop(session_factory, _FallbackScheduler())
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-wait-again",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-target", "timeout_seconds": 1},
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "running"
+    assert payload["fallback_owned"] is True
+    assert "correlated follow-up" in payload["message"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_heals_missed_remote_settlement_signal(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-ha.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Remote target",
+            target_conversation_id="conv-remote",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-remote",
+            notify_on_completion=False,
+        )
+        await db_session.commit()
+
+    class _RemoteScheduler:
+        def __init__(self) -> None:
+            self.generation = 0
+            self.wait_started = asyncio.Event()
+
+        def has_running_turn(self, _conversation_id: str) -> bool:
+            return False
+
+        async def wait_for_turn(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("remote managed turns have no local scheduler task")
+
+        def turn_scope_change_generation(self, _conversation_id: str) -> int:
+            return self.generation
+
+        async def wait_for_turn_scope_change(
+            self,
+            _conversation_id: str,
+            *,
+            after_generation: int,
+            timeout_seconds: float,
+        ) -> bool:
+            del after_generation
+            self.wait_started.set()
+            await asyncio.sleep(min(timeout_seconds, 0.02))
+            return False
+
+    scheduler = _RemoteScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    wait_task = asyncio.create_task(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-ha-wait",
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-remote", "timeout_seconds": 30},
+            ),
+            ctx=_background_work_ctx(controller.conversation_id),
+        )
+    )
+    await asyncio.wait_for(scheduler.wait_started.wait(), timeout=1)
+    assert not wait_task.done()
+
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="completed",
+            turn_state="completed",
+            active_turn_id=None,
+            last_result_summary="remote child result",
+            last_result_turn_id="turn-remote",
+        )
+        await db_session.commit()
+
+    result = await asyncio.wait_for(wait_task, timeout=1)
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["waited"] is True
+    assert payload["fallback_owned"] is False
+    assert payload["settled_turn_id"] == "turn-remote"
+    assert payload["turn"]["final_content"] == "remote child result"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_timeout_race_keeps_result_fallback_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-timeout.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Remote target",
+            target_conversation_id="conv-timeout",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-timeout",
+            notify_on_completion=False,
+        )
+        await db_session.commit()
+
+    scheduler = _IdleWaitScheduler()
+    monkeypatch.setattr("cognis.core.agent_loop.monotonic", Mock(side_effect=[0.0, 2.0]))
+    original_claim = queries.claim_managed_conversation_join_handoff
+
+    async def _settle_then_claim(db_session, link_id: str, **kwargs: object):
+        await update_managed_conversation_link(
+            db_session,
+            link_id,
+            conversation_state="completed",
+            turn_state="completed",
+            active_turn_id=None,
+            last_result_summary="completion raced with timeout",
+            last_result_turn_id="turn-timeout",
+        )
+        return await original_claim(db_session, link_id, **kwargs)
+
+    monkeypatch.setattr(
+        queries,
+        "claim_managed_conversation_join_handoff",
+        _settle_then_claim,
+    )
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-ha-timeout",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-timeout", "timeout_seconds": 1},
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["waited"] is False
+    assert payload["fallback_owned"] is True
+    assert payload["wait_yield_reason"] == "timeout"
+    assert "requested timeout" in payload["message"]
+    assert "last_result_summary" not in payload["conversation"]
+    assert "last_error" not in payload["conversation"]
+    async with session_factory() as db_session:
+        stored = await queries.get_managed_conversation_link(db_session, link.link_id)
+    assert stored is not None
+    assert stored.active_turn_id is None
+    assert stored.last_result_summary == "completion raced with timeout"
+    assert stored.handoff_state == "fallback_claimed"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_yields_for_input_and_reattaches_same_parent_turn(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-input-yield.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-child",
+            notify_on_completion=False,
+        )
+        await db_session.commit()
+
+    class _CooperativeScheduler(_IdleWaitScheduler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.wait_started = asyncio.Event()
+            self.child_settled = asyncio.Event()
+            self.active_turns["conv-target"] = "turn-child"
+            self.settlement = SimpleNamespace(
+                conversation_id="conv-target",
+                session_id="conv-target-session",
+                turn_id="turn-child",
+                final_content="child result",
+                delegated=False,
+                task_id=None,
+            )
+
+        async def wait_for_turn(
+            self,
+            conversation_id: str,
+            *,
+            timeout_seconds: int | None = None,
+        ) -> object:
+            self.waits.append(
+                {
+                    "conversation_id": conversation_id,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            self.wait_started.set()
+            await self.child_settled.wait()
+            return self.settlement
+
+    scheduler = _CooperativeScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    ctx = _background_work_ctx(controller.conversation_id)
+    queued_input = asyncio.Event()
+    boundary_reason = "queued_user_input"
+
+    async def _wait_for_boundary_input(_after_generation: int | None) -> str:
+        await queued_input.wait()
+        return boundary_reason
+
+    ctx.wait_for_boundary_input = _wait_for_boundary_input
+    original_parent_turn_id = ctx.turn_id
+    first_wait = asyncio.create_task(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-yield",
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-target", "timeout_seconds": 30},
+            ),
+            ctx=ctx,
+        )
+    )
+    await asyncio.wait_for(scheduler.wait_started.wait(), timeout=1)
+    queued_input.set()
+    first_result = await asyncio.wait_for(first_wait, timeout=1)
+    first_payload = json.loads(first_result.output)
+
+    assert first_payload["status"] == "running"
+    assert first_payload["wait_yielded_for_input"] is True
+    assert first_payload["conversation"]["active_turn_id"] == "turn-child"
+    assert ctx.turn_id == original_parent_turn_id == "controller-turn"
+    assert scheduler.active_turns["conv-target"] == "turn-child"
+    assert first_result.metadata is not None
+    assert first_result.metadata["async_orchestration_spawned"] is True
+
+    async with session_factory() as db_session:
+        yielded_link = await queries.get_managed_conversation_link(
+            db_session,
+            link.link_id,
+            user_email="user@example.com",
+        )
+    assert yielded_link is not None
+    assert yielded_link.handoff_state == "fallback_claimed"
+    assert yielded_link.handoff_target_turn_id == "turn-child"
+
+    queued_input.clear()
+    scheduler.wait_started.clear()
+    boundary_reason = "queued_completion"
+    completion_wait = asyncio.create_task(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-yield-completion",
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-target", "timeout_seconds": 30},
+            ),
+            ctx=ctx,
+        )
+    )
+    await asyncio.wait_for(scheduler.wait_started.wait(), timeout=1)
+    queued_input.set()
+    completion_result = await asyncio.wait_for(completion_wait, timeout=1)
+    completion_payload = json.loads(completion_result.output)
+    assert completion_payload["status"] == "running"
+    assert completion_payload["wait_yielded_for_boundary_event"] is True
+    assert completion_payload["wait_yielded_for_input"] is False
+    assert completion_payload["wait_yield_reason"] == "queued_completion"
+    assert scheduler.active_turns["conv-target"] == "turn-child"
+
+    queued_input.clear()
+    scheduler.wait_started.clear()
+    second_wait = asyncio.create_task(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-reattach",
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-target", "timeout_seconds": 30},
+            ),
+            ctx=ctx,
+        )
+    )
+    await asyncio.wait_for(scheduler.wait_started.wait(), timeout=1)
+    assert not second_wait.done()
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            last_result_summary="child result",
+            last_result_turn_id="turn-child",
+        )
+        await db_session.commit()
+    scheduler.child_settled.set()
+    second_result = await asyncio.wait_for(second_wait, timeout=1)
+    second_payload = json.loads(second_result.output)
+
+    assert second_payload["status"] == "completed"
+    assert second_payload["wait_yielded_for_input"] is False
+    assert second_payload["settled_turn_id"] == "turn-child"
+    assert "turn" not in second_payload
+    assert "last_result_summary" not in second_payload["conversation"]
+    assert "last_error" not in second_payload["conversation"]
+    assert "sole delivery path" in second_payload["message"]
+    assert ctx.turn_id == original_parent_turn_id
+
+    scheduler.settlement = SimpleNamespace(
+        conversation_id="conv-target",
+        session_id="conv-target-session",
+        turn_id="turn-child",
+        final_content="partial child result",
+        delegated=False,
+        task_id=None,
+        code=None,
+        partial=True,
+        finish_reason="user_cancelled",
+    )
+    interrupted_result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-reattach-interrupted",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-target", "timeout_seconds": 30},
+        ),
+        ctx=ctx,
+    )
+    interrupted_payload = json.loads(interrupted_result.output)
+    assert interrupted_payload["status"] == "interrupted"
+    assert "turn" not in interrupted_payload
+    assert "error" not in interrupted_payload
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_settlement_wins_simultaneous_input_race(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-input-tie.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-child",
+        )
+        await db_session.commit()
+
+    settled = SimpleNamespace(
+        conversation_id="conv-target",
+        session_id="conv-target-session",
+        turn_id="turn-child",
+        final_content="done",
+        delegated=False,
+        task_id=None,
+    )
+
+    class _SettledScheduler(_IdleWaitScheduler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_turns["conv-target"] = "turn-child"
+
+        async def wait_for_turn(self, *_args: object, **_kwargs: object) -> object:
+            return settled
+
+    scheduler = _SettledScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    ctx = _background_work_ctx(controller.conversation_id)
+
+    async def _input_ready(_after_generation: int | None) -> str:
+        return "queued_user_input"
+
+    ctx.wait_for_boundary_input = _input_ready
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-tie",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-target", "timeout_seconds": 1},
+        ),
+        ctx=ctx,
+    )
+    payload = json.loads(result.output)
+
+    assert payload["wait_yielded_for_input"] is False
+    assert payload["settled_turn_id"] == "turn-child"
+    assert payload["turn"]["final_content"] == "done"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_parallel_joined_wait_returns_settled_child_and_yields_running_sibling(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-parallel-yield.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        for conversation_id, turn_id in (
+            ("conv-child-a", "turn-child-a"),
+            ("conv-child-b", "turn-child-b"),
+        ):
+            link = await _create_managed_link_for_background_work(
+                db_session,
+                controller.conversation_id,
+                title=conversation_id,
+                target_conversation_id=conversation_id,
+            )
+            await update_managed_conversation_link(
+                db_session,
+                link.link_id,
+                conversation_state="open",
+                turn_state="running",
+                active_turn_id=turn_id,
+                notify_on_completion=False,
+            )
+        await db_session.commit()
+
+    class _ParallelScheduler(_IdleWaitScheduler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_turns.update(
+                {
+                    "conv-child-a": "turn-child-a",
+                    "conv-child-b": "turn-child-b",
+                }
+            )
+            self.started: set[str] = set()
+            self.both_started = asyncio.Event()
+            self.boundary_event = asyncio.Event()
+            self.child_a_settled = asyncio.Event()
+            self.generation = 0
+
+        async def wait_for_turn(
+            self,
+            conversation_id: str,
+            *,
+            timeout_seconds: int | None = None,
+        ) -> object:
+            self.started.add(conversation_id)
+            if len(self.started) == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            if conversation_id == "conv-child-b":
+                return SimpleNamespace(
+                    conversation_id=conversation_id,
+                    session_id="conv-child-b-session",
+                    turn_id="turn-child-b",
+                    final_content="actual result from B",
+                    delegated=False,
+                    task_id=None,
+                )
+            await self.child_a_settled.wait()
+            return SimpleNamespace(
+                conversation_id=conversation_id,
+                session_id="conv-child-a-session",
+                turn_id="turn-child-a",
+                final_content="actual result from A",
+                delegated=False,
+                task_id=None,
+            )
+
+        def boundary_action_generation(self) -> int:
+            return self.generation
+
+        def signal_actionable_boundary_event(self) -> None:
+            self.generation += 1
+            self.boundary_event.set()
+
+        async def wait_for_boundary_input(self, after_generation: int | None) -> str:
+            while after_generation is None or self.generation <= after_generation:
+                self.boundary_event.clear()
+                if after_generation is not None and self.generation > after_generation:
+                    break
+                await self.boundary_event.wait()
+            return "managed_sibling_settled"
+
+    scheduler = _ParallelScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    agent_loop._flush_events_incremental = AsyncMock()  # type: ignore[method-assign]
+    ctx = _background_work_ctx(controller.conversation_id)
+    ctx.get_boundary_action_generation = scheduler.boundary_action_generation
+    ctx.signal_actionable_boundary_event = scheduler.signal_actionable_boundary_event
+    ctx.wait_for_boundary_input = scheduler.wait_for_boundary_input
+    tool_calls = [
+        ToolCall(
+            call_id="call-wait-a",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-child-a", "timeout_seconds": 30},
+        ),
+        ToolCall(
+            call_id="call-wait-b",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-child-b", "timeout_seconds": 30},
+        ),
+    ]
+
+    results = await asyncio.wait_for(
+        agent_loop._execute_parallel_orchestration_run(
+            ctx,
+            list(enumerate(tool_calls)),
+            events_to_record=[],
+            reason="tool_call:managed_conversation_batch",
+            error_label="managed conversation tool",
+            max_concurrency=2,
+        ),
+        timeout=2,
+    )
+    yielded = json.loads(results[0].output)
+    settled = json.loads(results[1].output)
+
+    assert yielded["status"] == "running"
+    assert yielded["wait_yielded_for_boundary_event"] is True
+    assert yielded["wait_yield_reason"] == "managed_sibling_settled"
+    assert yielded["conversation"]["active_turn_id"] == "turn-child-a"
+    assert scheduler.active_turns["conv-child-a"] == "turn-child-a"
+    assert settled["status"] == "completed"
+    assert settled["wait_yielded_for_boundary_event"] is False
+    assert settled["settled_turn_id"] == "turn-child-b"
+    assert settled["turn"]["final_content"] == "actual result from B"
+    assert ctx.turn_id == "controller-turn"
+    assert "_managed_parallel_boundary_generation" not in ctx.runtime_info
+
+    scheduler.child_a_settled.set()
+    reattached_result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-reattach-a",
+            name="agent_conversation_wait",
+            arguments={"conversation_id": "conv-child-a", "timeout_seconds": 30},
+        ),
+        ctx=ctx,
+    )
+    reattached = json.loads(reattached_result.output)
+    assert reattached["status"] == "completed"
+    assert reattached["settled_turn_id"] == "turn-child-a"
+    assert "turn" not in reattached
+    assert "sole delivery path" in reattached["message"]
+    await engine.dispose()
 
 
 async def _create_managed_link_for_background_work(
@@ -5315,6 +6574,7 @@ async def _create_managed_link_for_background_work(
     *,
     title: str,
     target_conversation_id: str,
+    controller_session_id: str = "controller-session",
 ):
     target = await create_conversation(
         db_session,
@@ -5328,12 +6588,148 @@ async def _create_managed_link_for_background_work(
         user_email="user@example.com",
         controller_agent_id="controller-agent",
         controller_conversation_id=controller_conversation_id,
-        controller_session_id="controller-session",
+        controller_session_id=controller_session_id,
         target_agent_id="target-agent",
         target_conversation_id=target.conversation_id,
         target_session_id=f"{target.conversation_id}-session",
         title=title,
     )
+
+
+@pytest.mark.asyncio
+async def test_background_work_reminder_compact_preserves_old_parent_delegate(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'background-compact.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+
+    async with session_factory() as db_session:
+        compacted = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "controller-agent",
+            previous_session_id="controller-session",
+            activity_scope_id="controller-session",
+            session_id="controller-session-compact",
+        )
+        delegate = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id="controller-session",
+            activity_scope_id="controller-session",
+            delegation_mode="delegate_async",
+            delegation_task="Delegate survives compact",
+            status="active",
+            session_id="compact-delegate",
+        )
+        controller_row = await queries.get_conversation(db_session, controller.conversation_id)
+        assert controller_row is not None
+        controller_row.active_session_id = compacted.session_id
+        delegate.updated_at = datetime.now(UTC)
+        await db_session.commit()
+
+    agent_loop = _background_work_agent_loop(session_factory)
+    reminder = await agent_loop._build_background_work_status_reminder(
+        _background_work_ctx(
+            controller.conversation_id,
+            session_id="controller-session-compact",
+        )
+    )
+
+    assert reminder is not None
+    assert "Delegate survives compact" in reminder["content"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_background_work_reminder_renew_excludes_old_scope_work(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'background-renew.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+
+    async with session_factory() as db_session:
+        renewed = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "controller-agent",
+            previous_session_id="controller-session",
+            activity_scope_id="controller-session-renewed",
+            session_id="controller-session-renewed",
+        )
+        old_delegate = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id="controller-session",
+            activity_scope_id="controller-session",
+            delegation_mode="delegate_async",
+            delegation_task="Old scope delegate",
+            status="active",
+            session_id="old-scope-delegate",
+        )
+        current_delegate = await create_session(
+            db_session,
+            controller.conversation_id,
+            "user@example.com",
+            "target-agent",
+            parent_session_id=renewed.session_id,
+            activity_scope_id=renewed.activity_scope_id,
+            delegation_mode="delegate_async",
+            delegation_task="Current scope delegate",
+            status="active",
+            session_id="current-scope-delegate",
+        )
+        old_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Old scope managed",
+            target_conversation_id="old-scope-managed",
+            controller_session_id="controller-session",
+        )
+        current_link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Current scope managed",
+            target_conversation_id="current-scope-managed",
+            controller_session_id=renewed.session_id,
+        )
+        old_link.turn_state = "running"
+        current_link.turn_state = "running"
+        controller_row = await queries.get_conversation(db_session, controller.conversation_id)
+        assert controller_row is not None
+        controller_row.active_session_id = renewed.session_id
+        now = datetime.now(UTC)
+        old_delegate.updated_at = now
+        current_delegate.updated_at = now
+        await db_session.commit()
+
+    agent_loop = _background_work_agent_loop(session_factory)
+    reminder = await agent_loop._build_background_work_status_reminder(
+        _background_work_ctx(
+            controller.conversation_id,
+            session_id="controller-session-renewed",
+        )
+    )
+
+    assert reminder is not None
+    content = reminder["content"]
+    assert "Current scope delegate" in content
+    assert "Current scope managed" in content
+    assert "Old scope delegate" not in content
+    assert "Old scope managed" not in content
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -5616,6 +7012,7 @@ async def test_background_work_reminder_includes_delegated_sessions_and_suppress
             "user@example.com",
             "target-agent",
             parent_session_id="controller-session",
+            activity_scope_id="controller-session",
             delegation_mode="delegate_async",
             delegation_task="Trace reminder path",
             status="active",
@@ -5628,6 +7025,7 @@ async def test_background_work_reminder_includes_delegated_sessions_and_suppress
             "user@example.com",
             "target-agent",
             parent_session_id="controller-session",
+            activity_scope_id="controller-session",
             delegation_mode="delegate_async",
             delegation_task="Stale reminder path",
             status="active",
@@ -5640,6 +7038,7 @@ async def test_background_work_reminder_includes_delegated_sessions_and_suppress
             "user@example.com",
             "target-agent",
             parent_session_id="controller-session",
+            activity_scope_id="controller-session",
             delegation_mode="delegate",
             delegation_task="Review result",
             status="failed",
@@ -5652,6 +7051,7 @@ async def test_background_work_reminder_includes_delegated_sessions_and_suppress
             "user@example.com",
             "target-agent",
             parent_session_id="controller-session",
+            activity_scope_id="controller-session",
             delegation_mode="delegate",
             delegation_task="Completed child",
             status="completed",
@@ -5809,27 +7209,31 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
 
     if complete_before_arm:
 
-        async def _complete_before_arm(db_session, link_id: str) -> bool:
+        async def _complete_before_arm(db_session, link_id: str, **_kwargs: object) -> None:
             await update_managed_conversation_link(
                 db_session,
                 link_id,
                 conversation_state="completed",
                 turn_state="completed",
                 clear_active_turn_id=True,
+                last_result_summary="completed before fallback claim",
+                last_result_turn_id=active_turn_id,
                 completed=True,
             )
-            return False
+            return None
 
         monkeypatch.setattr(
             queries,
-            "arm_managed_conversation_notification_if_active",
+            "claim_managed_conversation_join_handoff",
             _complete_before_arm,
         )
     elif complete_after_arm:
-        original_arm = queries.arm_managed_conversation_notification_if_active
+        original_arm = queries.claim_managed_conversation_join_handoff
 
-        async def _complete_after_original_arm(db_session, link_id: str) -> bool:
-            armed = await original_arm(db_session, link_id)
+        async def _complete_after_original_arm(
+            db_session, link_id: str, **kwargs: object
+        ) -> object:
+            armed = await original_arm(db_session, link_id, **kwargs)
             await update_managed_conversation_link(
                 db_session,
                 link_id,
@@ -5843,7 +7247,7 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
 
         monkeypatch.setattr(
             queries,
-            "arm_managed_conversation_notification_if_active",
+            "claim_managed_conversation_join_handoff",
             _complete_after_original_arm,
         )
 
@@ -5851,6 +7255,8 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
     if scheduler_active_turn_id is not None:
         scheduler.active_turns[target.conversation_id] = scheduler_active_turn_id
     if complete_before_read:
+        if active_turn_id is not None:
+            scheduler.active_turns[target.conversation_id] = active_turn_id
 
         async def _complete_while_waiting(
             conversation_id: str,
@@ -5870,9 +7276,12 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
                     conversation_state="completed",
                     turn_state="completed",
                     clear_active_turn_id=True,
+                    last_result_summary="completed while waiting",
+                    last_result_turn_id=active_turn_id,
                     completed=True,
                 )
                 await db_session.commit()
+            scheduler.active_turns.pop(conversation_id, None)
 
         scheduler.wait_for_turn = _complete_while_waiting  # type: ignore[method-assign]
     agent_loop = AgentLoop(
@@ -5908,6 +7317,7 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
         ),
         policy=CHAT_POLICY,
         orchestration_mode=OrchestrationMode.FULL,
+        turn_id="controller-turn",
     )
     progress_events: list[tuple[object, ...]] = []
 
@@ -5947,7 +7357,7 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
         )
     )
     assert payload["status"] == expected_status
-    assert payload["waited"] is False
+    assert payload["waited"] is complete_before_read
     assert payload["conversation"]["turn_state"] == (
         "completed"
         if completed
@@ -5956,7 +7366,12 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
     assert payload["conversation"]["active_turn_id"] == (
         None if completed else (scheduler_active_turn_id or active_turn_id)
     )
-    assert scheduler.waits == [{"conversation_id": target.conversation_id, "timeout_seconds": 1}]
+    expected_waits = (
+        [{"conversation_id": target.conversation_id, "timeout_seconds": 1}]
+        if active_turn_id is None or scheduler_active_turn_id is not None or complete_before_read
+        else []
+    )
+    assert scheduler.waits == expected_waits
     assert len(progress_events) == 1
     call_id, tool_name, progress, *_ = progress_events[0]
     assert call_id == "call-1"
@@ -6014,6 +7429,21 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
         await conn.run_sync(Base.metadata.create_all)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        await queries.create_artifact_record(
+            db_session,
+            artifact_id="img-managed-private",
+            namespace="artifacts",
+            object_id="img-managed-private",
+            filename="private.png",
+            owner_email="user@example.com",
+            purpose="chat_input",
+            kind="image",
+            mime_type="image/png",
+            size_bytes=12,
+            status="attached",
+        )
+        await db_session.commit()
 
     class _CreateSessionManager:
         def __init__(self, factory) -> None:
@@ -6059,15 +7489,15 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
         def __init__(self) -> None:
             self.notify_on_completion_at_submit: bool | None = None
             self.turn_state_at_submit: str | None = None
+            self.submitted_attachments: list[dict[str, object]] | None = None
 
         def active_turn_id(self, conversation_id: str) -> str | None:
             assert conversation_id == "conv-created"
             return None
 
-        async def submit_turn(
-            self, conversation_id: str, *_args: object, **_kwargs: object
-        ) -> None:
+        async def submit_turn(self, conversation_id: str, *_args: object, **kwargs: object) -> None:
             assert conversation_id == "conv-created"
+            self.submitted_attachments = kwargs.get("attachments")  # type: ignore[assignment]
             async with session_factory() as db_session:
                 link = await get_managed_conversation_link_for_target(
                     db_session,
@@ -6101,6 +7531,7 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
+        session_factory=session_factory,
     )
     agent_loop.set_turn_scheduler(scheduler)
     progress_events: list[tuple[str, str, dict[str, object]]] = []
@@ -6124,6 +7555,7 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
                 "agent_id": "target-agent",
                 "title": "Target work",
                 "initial_message": "Do the work.",
+                "artifact_ids": ["img-managed-private"],
                 "wait": False,
             },
         ),
@@ -6139,6 +7571,16 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
     assert result.metadata["async_orchestration_spawned"] is True
     assert scheduler.notify_on_completion_at_submit is True
     assert scheduler.turn_state_at_submit == "running"
+    assert scheduler.submitted_attachments == [
+        {
+            "artifact_id": "img-managed-private",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "private.png",
+            "size_bytes": 12,
+            "url": None,
+        }
+    ]
     assert progress_events
     call_id, tool_name, progress = progress_events[0]
     assert (call_id, tool_name) == ("call-1", "agent_conversation_create")
@@ -6283,6 +7725,11 @@ async def test_agent_conversation_create_defaults_to_wait_from_direct_topic(
         link = await get_managed_conversation_link_for_target(db_session, "conv-created-sync")
         assert link is not None
         assert link.notify_on_completion is False
+        assert link.handoff_state == "pending"
+        assert link.handoff_target_turn_id == link.active_turn_id
+        assert link.handoff_controller_session_id == "controller-session"
+        assert link.handoff_controller_turn_id == "controller-turn"
+        assert link.handoff_tool_call_id == "call-1"
 
     await engine.dispose()
 
@@ -6462,7 +7909,7 @@ async def test_agent_conversation_fork_sets_completion_notification_before_submi
 
 
 @pytest.mark.asyncio
-async def test_agent_conversation_send_wait_for_queued_turn_uses_observer_result(
+async def test_agent_conversation_send_wait_rejects_active_turn(
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-queued-wait.db'}")
@@ -6546,27 +7993,23 @@ async def test_agent_conversation_send_wait_for_queued_turn_uses_observer_result
     )
 
     payload = json.loads(result.output)
-    assert result.is_error is False
-    assert payload["status"] == "completed"
-    assert payload["waited"] is True
-    assert payload["turn"]["turn_id"] == payload["expected_turn_id"]
-    assert payload["settlement_matches_expected_turn"] is True
-    assert payload["turn"]["final_content"] == "queued done"
-    assert scheduler.submitted_observer_count == 1
+    assert result.is_error is True
+    assert payload["status"] == "running"
+    assert payload["code"] == "managed_conversation_busy"
+    assert scheduler.submitted_observer_count == 0
     assert scheduler.wait_called is False
     async with session_factory() as db_session:
         refreshed = await get_managed_conversation_link(db_session, link.link_id)
         assert refreshed is not None
-        assert refreshed.conversation_state == "completed"
-        assert refreshed.turn_state == "completed"
+        assert refreshed.conversation_state == "open"
+        assert refreshed.turn_state == "idle"
         assert refreshed.active_turn_id is None
-        assert refreshed.notify_on_completion is False
 
     await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_agent_conversation_send_observer_preserves_queued_turn_identity(
+async def test_agent_conversation_send_does_not_admit_behind_active_turn(
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-queued-absorb.db'}")
@@ -6620,16 +8063,106 @@ async def test_agent_conversation_send_observer_preserves_queued_turn_identity(
     )
 
     payload = json.loads(result.output)
-    assert result.is_error is False
-    assert payload["status"] == "accepted"
-    assert "notified/resumed" in payload["reminder"]
-    assert "end this turn now" in payload["reminder"]
-    assert result.metadata is not None
-    assert result.metadata["async_orchestration_spawned"] is True
-    assert len(scheduler.submitted_observers) == 1
-    assert getattr(scheduler.submitted_observers[0], "supports_mid_turn_absorb", True) is False
-    assert payload["conversation"]["turn_state"] == "queued"
-    assert payload["conversation"]["active_turn_id"] != "turn-active"
+    assert result.is_error is True
+    assert payload["status"] == "running"
+    assert payload["code"] == "managed_conversation_busy"
+    assert scheduler.submitted_observers == ()
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_send_rejects_when_managed_queue_has_pending_messages(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-queue-pending.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Target",
+            target_conversation_id="conv-target",
+        )
+        await db_session.commit()
+
+    class _PendingQueueScheduler:
+        def __init__(self) -> None:
+            self.active = True
+            self.queued = 2
+            self.submitted = False
+            self.allow_queue: bool | None = None
+
+        def has_active_turn(self, conversation_id: str) -> bool:
+            assert conversation_id == "conv-target"
+            return self.active
+
+        def queued_count(self, conversation_id: str) -> int:
+            assert conversation_id == "conv-target"
+            return self.queued
+
+        async def submit_turn(self, *_args: object, **kwargs: object) -> TurnError:
+            self.submitted = True
+            self.allow_queue = bool(kwargs["allow_queue"])
+            return TurnError(
+                code="managed_admission_conflict",
+                message="raw conflict",
+                recoverable=True,
+            )
+
+    scheduler = _PendingQueueScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-1",
+            name="agent_conversation_send",
+            arguments={
+                "conversation_id": "conv-target",
+                "message": "one more instruction",
+                "wait": False,
+            },
+        ),
+        ctx=_background_work_ctx(
+            controller.conversation_id,
+            context_ref="web:user:user@example.com:default",
+        ),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is True
+    assert payload["status"] == "running"
+    assert payload["code"] == "managed_conversation_busy"
+    assert payload["conversation"]["queued_turn_count"] == 2
+    assert "interrupt" in payload["message"]
+    assert scheduler.submitted is False
+
+    scheduler.active = False
+    scheduler.queued = 0
+    conflict_result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="call-2",
+            name="agent_conversation_send",
+            arguments={
+                "conversation_id": "conv-target",
+                "message": "racing instruction",
+                "wait": False,
+            },
+        ),
+        ctx=_background_work_ctx(
+            controller.conversation_id,
+            context_ref="web:user:user@example.com:default",
+        ),
+    )
+
+    conflict_payload = json.loads(conflict_result.output)
+    assert conflict_result.is_error is True
+    assert conflict_payload["error"]["code"] == "managed_conversation_busy"
+    assert "raw conflict" not in conflict_payload["error"]["message"]
+    assert scheduler.submitted is True
+    assert scheduler.allow_queue is False
 
     await engine.dispose()
 
@@ -7681,6 +9214,66 @@ def test_task_surface_hides_async_orchestration_tools() -> None:
     assert "compose_and_run_workflow" not in by_name
 
 
+def test_task_primary_surface_exposes_restricted_joined_orchestration() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="task", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            parent_session_id=None,
+        ),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="task", ref="task-1"),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        task_id="task-1",
+        orchestration_mode=OrchestrationMode.TASK_PRIMARY,
+    )
+
+    by_name = {
+        schema["function"]["name"]: schema for schema in loop._build_controller_tool_schemas(ctx)
+    }
+
+    assert "delegate" in by_name
+    assert "agent_conversation_create" in by_name
+    assert "agent_conversation_set_profile" not in by_name
+    assert "create_task" not in by_name
+    assert "create_workflow" not in by_name
+    assert (
+        "wait" not in by_name["agent_conversation_create"]["function"]["parameters"]["properties"]
+    )
+
+
+def test_async_orchestration_does_not_end_task_primary_step() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="task", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="task", ref="task-1"),
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        policy=WORKFLOW_POLICY,
+        task_id="task-1",
+        orchestration_mode=OrchestrationMode.TASK_PRIMARY,
+    )
+
+    assert not AgentLoop._async_orchestration_ends_step(ctx, True)
+    ctx.orchestration_mode = OrchestrationMode.FULL
+    assert AgentLoop._async_orchestration_ends_step(ctx, True)
+
+
 @pytest.mark.asyncio
 async def test_agent_conversation_create_rejects_explicit_async_from_other_surface() -> None:
     agent_loop = AgentLoop(
@@ -8055,6 +9648,119 @@ class _ContextOverflowThenTextLLM:
         yield {"choices": [{"delta": {"content": "Recovered after compaction."}}]}
 
 
+class _VisibleThenDisconnectLLM:
+    def __init__(self, visible_kind: str) -> None:
+        self.visible_kind = visible_kind
+        self.calls = 0
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        del messages
+        self.calls += 1
+        if self.visible_kind == "content":
+            yield {"choices": [{"delta": {"content": "partial"}}]}
+        elif self.visible_kind == "reasoning":
+            yield {"choices": [{"delta": {"reasoning_content": "thinking"}}]}
+        elif self.visible_kind in {"tool_progress", "provider_thinking_blocks", "thinking_blocks"}:
+            yield {"choices": [{"delta": {self.visible_kind: [{"value": "visible"}]}}]}
+        elif self.visible_kind.startswith("root_"):
+            yield {self.visible_kind.removeprefix("root_"): [{"value": "visible"}]}
+        else:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {"name": "tool", "arguments": "{}"},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        yield {
+            "mid_stream_failure": True,
+            "error": "executor disconnected",
+            "response_error": {"category": MidStreamErrorCategory.CONNECTION.value},
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "visible_kind",
+    [
+        "content",
+        "reasoning",
+        "tool_calls",
+        "tool_progress",
+        "provider_thinking_blocks",
+        "thinking_blocks",
+        "root_tool_progress",
+        "root_provider_thinking_blocks",
+        "root_thinking_blocks",
+    ],
+)
+async def test_executor_visible_chunk_disconnect_is_not_retried(visible_kind: str) -> None:
+    fake_llm = _VisibleThenDisconnectLLM(visible_kind)
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+        default_llm_stream_idle_timeout_seconds=1,
+        default_llm_stream_max_retries=3,
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="visible-disconnect",
+            intaris_session_id="visible-disconnect",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="visible-disconnect"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="hello",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=False,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="visible-disconnect",
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert fake_llm.calls == 1
+
+
 class _StreamProviderContextOverflowThenTextLLM(_ContextOverflowThenTextLLM):
     async def stream_generate(self, messages: list[dict[str, object]], **_: object):
         del messages
@@ -8185,12 +9891,9 @@ def test_post_turn_auto_compaction_preserves_conservative_fallback_without_proje
     assert _should_run_post_turn_auto_compaction(ctx, context_result)
 
 
-def test_pre_turn_compaction_history_gate_skips_same_turn_pressure() -> None:
+def test_pre_turn_compaction_history_gate_skips_empty_history() -> None:
     ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
     events = [
-        SimpleNamespace(type="user_message"),
-        SimpleNamespace(type="assistant_message"),
-        SimpleNamespace(type="user_message"),
         SimpleNamespace(type="assistant_message"),
     ]
     cache = SimpleNamespace(
@@ -8198,24 +9901,21 @@ def test_pre_turn_compaction_history_gate_skips_same_turn_pressure() -> None:
         get_events_since_compaction=lambda _session_id, _types=None: list(events),
     )
 
-    assert not _has_compactable_pre_turn_history(ctx, cache, preserve_turns=2)
+    assert not _has_compactable_pre_turn_history(ctx, cache)
 
 
-def test_pre_turn_compaction_history_gate_allows_old_history_compaction() -> None:
+def test_pre_turn_compaction_history_gate_defers_exact_split_to_strategy() -> None:
     ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
     events = [
         SimpleNamespace(type="user_message"),
-        SimpleNamespace(type="assistant_message"),
-        SimpleNamespace(type="user_message"),
-        SimpleNamespace(type="assistant_message"),
-        SimpleNamespace(type="user_message"),
+        *[SimpleNamespace(type="tool_result") for _ in range(250)],
     ]
     cache = SimpleNamespace(
         get_entry=lambda _session_id: SimpleNamespace(),
         get_events_since_compaction=lambda _session_id, _types=None: list(events),
     )
 
-    assert _has_compactable_pre_turn_history(ctx, cache, preserve_turns=2)
+    assert _has_compactable_pre_turn_history(ctx, cache)
 
 
 def test_pre_turn_compaction_history_gate_preserves_unknown_cache_behavior() -> None:
@@ -8225,11 +9925,11 @@ def test_pre_turn_compaction_history_gate_preserves_unknown_cache_behavior() -> 
         get_events_since_compaction=lambda _session_id, _types=None: [],
     )
 
-    assert _has_compactable_pre_turn_history(ctx, cache, preserve_turns=2)
+    assert _has_compactable_pre_turn_history(ctx, cache)
 
 
 @pytest.mark.asyncio
-async def test_pre_turn_hard_pressure_without_compactable_history_reaches_projection(
+async def test_pre_turn_pressure_delegates_history_decision_to_compaction_strategy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _HardPressureAssembler:
@@ -8279,12 +9979,12 @@ async def test_pre_turn_hard_pressure_without_compactable_history_reaches_projec
     )
 
     auto_compact_saw_model_call: list[bool] = []
+    auto_compact_skip_few_events: list[bool] = []
 
-    async def _record_auto_compact(*_: object, **__: object) -> None:
+    async def _record_auto_compact(*_: object, **kwargs: object) -> CompactionResult:
         auto_compact_saw_model_call.append(bool(fake_llm.calls))
-        if not fake_llm.calls:
-            raise AssertionError("pre-turn auto-compaction should be skipped")
-        return None
+        auto_compact_skip_few_events.append(bool(kwargs.get("skip_few_events_check")))
+        return CompactionResult(compacted=False, method="noop")
 
     monkeypatch.setattr(agent_loop, "_auto_compact", _record_auto_compact)
 
@@ -8308,7 +10008,8 @@ async def test_pre_turn_hard_pressure_without_compactable_history_reaches_projec
     assert output is not None
     assert output.summary == "Done."
     assert len(fake_llm.calls) == 1
-    assert auto_compact_saw_model_call == [True]
+    assert auto_compact_saw_model_call[0] is False
+    assert auto_compact_skip_few_events[0] is True
     assert any(
         getattr(event, "type", None) == EventType.SYSTEM_NOTICE
         and "Continuing with prompt projection" in str(event.data.get("message"))
@@ -10213,6 +11914,7 @@ async def test_responses_text_with_tool_call_is_streamed_persisted_and_replayed(
         todos=[{"content": "Inspect implementation", "status": "pending"}],
         policy=CHAT_POLICY,
         user_message="Inspect this.",
+        intention_eligible=False,
         user_attachments=[],
         system_initiated=False,
     )
@@ -10223,6 +11925,8 @@ async def test_responses_text_with_tool_call_is_streamed_persisted_and_replayed(
     assert output.content == "Final user-visible answer."
     assert streamed == ["I'll inspect that now.", "\n\n", "Final user-visible answer."]
     recorded_events = [event for batch in recorded_batches for event in batch]
+    recorded_user_event = next(event for event in recorded_events if event.type == "user_message")
+    assert recorded_user_event.data["intention_eligible"] is False
     assert any(
         event.type == "assistant_message" and event.data.get("content") == "I'll inspect that now."
         for event in recorded_events
@@ -10536,7 +12240,10 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_workflow_step_absorbs_boundary_batch_before_step_complete_reprompt() -> None:
+@pytest.mark.parametrize("workflow_policy", [WORKFLOW_POLICY, SECONDARY_POLICY])
+async def test_workflow_step_absorbs_boundary_batch_before_step_complete_reprompt(
+    workflow_policy: object,
+) -> None:
     fake_llm = _FakeReminderLLM()
     consumed_reasons: list[str] = []
     recorded_batches: list[list[SessionEvent]] = []
@@ -10596,7 +12303,7 @@ async def test_workflow_step_absorbs_boundary_batch_before_step_complete_repromp
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
-        policy=WORKFLOW_POLICY,
+        policy=workflow_policy,
         user_message="",
         user_attachments=[],
         attachment_notice=None,
@@ -10618,10 +12325,11 @@ async def test_workflow_step_absorbs_boundary_batch_before_step_complete_repromp
 
     assert output is not None
     assert isinstance(output.error, str)
+    assert "before_first_model_call" in consumed_reasons
     assert "after_assistant_message" in consumed_reasons
     assert len(fake_llm.calls) >= 2
-    assert fake_llm.calls[1][-1]["role"] == "user"
-    assert fake_llm.calls[1][-1]["content"].endswith("Please include the rollout impact.")
+    first_transcript = "\n".join(str(message["content"]) for message in fake_llm.calls[0])
+    assert first_transcript.count("Please include the rollout impact.") == 1
     recorded_events = [event for batch in recorded_batches for event in batch]
     context_events = [
         event
@@ -10631,6 +12339,223 @@ async def test_workflow_step_absorbs_boundary_batch_before_step_complete_repromp
     assert len(context_events) == 1
     assert context_events[0].data["comment_id"] == "tcmt-1"
     assert context_events[0].data["author_email"] == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_context_comment_persists_during_retry() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    recorded: list[SessionEvent] = []
+    acknowledged: list[str] = []
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object | None = None,
+    ) -> bool:
+        del ctx, reason, on_token
+        recorded.extend(events)
+        return True
+
+    async def _ack(item: dict[str, object]) -> None:
+        acknowledged.append(str(item["comment_id"]))
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="build", type="run"),
+        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        is_retry=True,
+        turn_id="turn",
+        on_boundary_persisted=_ack,
+    )
+    messages: list[dict[str, object]] = []
+
+    await agent_loop._append_boundary_batch_item(
+        ctx,
+        messages=messages,
+        pending_audit_messages=[],
+        item={
+            "content": "retry context",
+            "source": "task_context_comment",
+            "comment_id": "tcmt-retry",
+            "author_email": "user@example.com",
+            "attachments": [],
+        },
+        on_token=None,
+    )
+
+    assert len(recorded) == 1
+    assert recorded[0].data["comment_id"] == "tcmt-retry"
+    assert acknowledged == ["tcmt-retry"]
+    assert messages[-1] == {"role": "user", "content": "retry context"}
+
+
+@pytest.mark.asyncio
+async def test_context_comment_is_not_acknowledged_when_persistence_fails() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    acknowledged: list[str] = []
+
+    async def _record_events_strict(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        raise RuntimeError("persistence failed")
+
+    async def _ack(item: dict[str, object]) -> None:
+        acknowledged.append(str(item["comment_id"]))
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="build", type="run"),
+        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        turn_id="turn",
+        on_boundary_persisted=_ack,
+    )
+
+    with pytest.raises(RuntimeError, match="persistence failed"):
+        await agent_loop._append_boundary_batch_item(
+            ctx,
+            messages=[],
+            pending_audit_messages=[],
+            item={
+                "content": "recoverable context",
+                "source": "task_context_comment",
+                "comment_id": "tcmt-release",
+                "author_email": "user@example.com",
+                "attachments": [],
+            },
+            on_token=None,
+        )
+
+    assert acknowledged == []
+
+
+@pytest.mark.asyncio
+async def test_context_comment_event_uses_stable_idempotency_key() -> None:
+    keys: list[str] = []
+
+    class _Guardrails:
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            keys.append(str(kwargs["idempotency_key"]))
+            return EventAppendResult(ok=True, count=1, first_seq=1, last_seq=1)
+
+    class _Cache:
+        async def append_recorded_events(
+            self,
+            session: object,
+            events: list[SessionEvent],
+            result: EventAppendResult,
+        ) -> None:
+            del session, events, result
+
+    agent_loop = object.__new__(AgentLoop)
+    agent_loop.providers = SimpleNamespace(guardrails=_Guardrails())
+    agent_loop.session_cache = _Cache()
+    ctx = StepContext(
+        step_definition=StepDefinition(name="build", type="run"),
+        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        turn_id="turn",
+    )
+    event = SessionEvent(
+        type="user_message",
+        data={
+            "role": "user",
+            "content": "context",
+            "source": "task_context_comment",
+            "comment_id": "tcmt-stable",
+        },
+    )
+
+    await agent_loop._record_events_strict(ctx, [event], reason="user_message_boundary")
+    await agent_loop._record_events_strict(ctx, [event], reason="user_message_boundary")
+
+    assert keys == [
+        "intaris:task_context_comment:tcmt-stable",
+        "intaris:task_context_comment:tcmt-stable",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recovered_context_comment_is_acknowledged_without_prompt_duplication() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    acknowledged: list[str] = []
+
+    async def _consume(reason: str) -> list[dict[str, object]]:
+        del reason
+        return [
+            {
+                "content": (
+                    '<workflow_context_comment trust="untrusted" '
+                    'comment_id="tcmt-recovered" author="user@example.com" '
+                    'target="build">\nRecovered\n</workflow_context_comment>'
+                ),
+                "source": "task_context_comment",
+                "comment_id": "tcmt-recovered",
+                "attachments": [],
+            }
+        ]
+
+    async def _ack(item: dict[str, object]) -> None:
+        acknowledged.append(str(item["comment_id"]))
+
+    ctx = StepContext(
+        step_definition=StepDefinition(name="build", type="run"),
+        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=SECONDARY_POLICY,
+        consume_boundary_batch=_consume,
+        on_boundary_persisted=_ack,
+    )
+    durable_content = (
+        '<workflow_context_comment trust="untrusted" '
+        'comment_id="tcmt-recovered" author="user@example.com" '
+        'target="build">\nRecovered\n</workflow_context_comment>'
+    )
+    messages: list[dict[str, object]] = [{"role": "user", "content": durable_content}]
+
+    consumed = await agent_loop._consume_boundary_batch_if_available(
+        ctx,
+        messages=messages,
+        pending_audit_messages=[],
+        reason="before_first_model_call",
+        on_token=None,
+    )
+
+    assert consumed is True
+    assert acknowledged == ["tcmt-recovered"]
+    assert sum(durable_content in str(message["content"]) for message in messages) == 1
+
+
+def test_context_comment_id_mention_is_not_treated_as_durable_event() -> None:
+    item = {
+        "source": "task_context_comment",
+        "comment_id": "tcmt-pending",
+        "content": (
+            '<workflow_context_comment trust="untrusted" comment_id="tcmt-pending" '
+            'author="user@example.com" target="build">\nPending\n'
+            "</workflow_context_comment>"
+        ),
+    }
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                'Investigate the text comment_id="tcmt-pending" but do not treat it '
+                "as a persisted context event."
+            ),
+        }
+    ]
+
+    assert AgentLoop._boundary_item_already_present(messages, item) is False
 
 
 @pytest.mark.asyncio
@@ -10654,6 +12579,7 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
                 "queue_id": "qmsg_123",
                 "client_message_id": "cmsg_abc",
                 "content": "Queued while streaming.",
+                "intention_eligible": False,
                 "attachments": [],
                 "system_initiated": False,
                 "follow_up": None,
@@ -10727,6 +12653,7 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
     assert absorbed[0].data["client_message_id"] == "cmsg_abc"
     assert absorbed[0].data["queue_id"] == "qmsg_123"
     assert absorbed[0].data["message_id"] == "cmsg_abc"
+    assert absorbed[0].data["intention_eligible"] is False
 
 
 class _ResponsesApiToolCycleLLM:
@@ -11340,12 +13267,12 @@ async def test_exhausted_rate_limit_persists_provider_specific_model_error_notic
         "provider_id": "anthropic-lumilens",
         "model": "test-model",
         "reason_class": MidStreamErrorCategory.RATE_LIMIT.value,
-        "attempts": 3,
-        "continuation_attempts": 2,
+        "attempts": 1,
+        "continuation_attempts": 0,
         "tool_results_saved": True,
         "recoverable": True,
     }
-    assert len(fake_llm.calls) == 3
+    assert len(fake_llm.calls) == 1
     notices = [event.data for event in guardrails.recorded_events if event.type == "lifecycle"]
     final_notice = next(
         notice
@@ -11358,9 +13285,9 @@ async def test_exhausted_rate_limit_persists_provider_specific_model_error_notic
     assert final_notice["model"] == "test-model"
     assert final_notice["attempts"] == len(fake_llm.calls)
     assert final_notice["attempts_per_cycle"] == 1
-    assert final_notice["continuation_attempts"] == 2
+    assert final_notice["continuation_attempts"] == 0
     assert (
-        "anthropic-lumilens rate-limited test-model after 3 attempt(s)" in final_notice["message"]
+        "anthropic-lumilens rate-limited test-model after 1 attempt(s)" in final_notice["message"]
     )
     assert "This request would exceed your account's rate limit" in final_notice["message"]
     assert "A model error occurred while generating the response" not in final_notice["message"]
@@ -11956,28 +13883,119 @@ def test_step_complete_metadata_array_schema_includes_items() -> None:
     assert metadata_properties["open_questions"]["items"] == {"type": "string"}
 
 
-def test_delegation_schema_exposes_write_deliverable_for_workflow_backed_child() -> None:
+@pytest.mark.parametrize(
+    ("policy", "surface", "session_id"),
+    [
+        (DELEGATION_POLICY, CONTROLLER_TOOL_SURFACE_WORKFLOW, "child"),
+        (SECONDARY_AGENT_DELEGATION_POLICY, CONTROLLER_TOOL_SURFACE_WORKFLOW, "child"),
+        (DIRECT_CHAT_DELEGATION_POLICY, CONTROLLER_TOOL_SURFACE_DIRECT_CHAT, "child"),
+        (WORKFLOW_POLICY, CONTROLLER_TOOL_SURFACE_WORKFLOW, "child"),
+        (WORKFLOW_POLICY, CONTROLLER_TOOL_SURFACE_WORKFLOW, "child-follow-up-rotated"),
+    ],
+)
+def test_delegated_child_hides_parent_owned_controller_tools(
+    policy: object,
+    surface: str,
+    session_id: str,
+) -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
-        step_definition=StepDefinition(name="delegation", type="run", prompt=""),
-        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        step_definition=StepDefinition(
+            name="delegation",
+            type="run",
+            prompt="",
+            allow_questions=True,
+        ),
+        session=SimpleNamespace(
+            session_id=session_id,
+            intaris_session_id=session_id,
+            parent_session_id="parent",
+        ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
-        policy=DELEGATION_POLICY,
+        policy=policy,
         deliverable_step_run_id="sr-parent",
+        interaction_mode="step_requests",
+        controller_tool_surface=surface,
     )
 
-    tools = loop._build_controller_tool_schemas(ctx)
+    names = {tool["function"]["name"] for tool in loop._build_controller_tool_schemas(ctx)}
 
-    assert any(tool["function"]["name"] == "write_deliverable" for tool in tools)
+    assert {
+        "step_complete",
+        "write_deliverable",
+        "attach_artifact",
+        "step_request_questions",
+        "request_user_input",
+    }.isdisjoint(names)
+    expected_todo_names = (
+        {"todo_write", "todo_list"}
+        if surface == CONTROLLER_TOOL_SURFACE_DIRECT_CHAT
+        else {"step_todo_write", "step_todo_list"}
+    )
+    assert expected_todo_names.issubset(names)
+
+
+def test_actual_workflow_step_retains_parent_owned_controller_tools() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="execute",
+            type="run",
+            prompt="",
+            allow_questions=True,
+        ),
+        session=SimpleNamespace(
+            session_id="workflow-step",
+            intaris_session_id="workflow-step",
+            parent_session_id=None,
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        step_run_id="sr-workflow",
+        interaction_mode="step_requests",
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_WORKFLOW,
+    )
+
+    names = {tool["function"]["name"] for tool in loop._build_controller_tool_schemas(ctx)}
+
+    assert {
+        "step_complete",
+        "write_deliverable",
+        "attach_artifact",
+        "step_request_questions",
+    }.issubset(names)
 
 
 @pytest.mark.asyncio
-async def test_workflow_backed_delegation_can_write_parent_deliverable(
+@pytest.mark.parametrize(
+    ("tool_name", "policy", "surface", "session_id"),
+    [
+        (tool_name, policy, surface, session_id)
+        for tool_name in [
+            "step_complete",
+            "write_deliverable",
+            "attach_artifact",
+            "step_request_questions",
+            "request_user_input",
+        ]
+        for policy, surface, session_id in [
+            (DELEGATION_POLICY, CONTROLLER_TOOL_SURFACE_WORKFLOW, "child-1"),
+            (WORKFLOW_POLICY, CONTROLLER_TOOL_SURFACE_WORKFLOW, "child-follow-up-rotated"),
+        ]
+    ],
+)
+async def test_delegated_child_runtime_rejects_parent_owned_tools_without_side_effects(
+    tool_name: str,
+    policy: object,
+    surface: str,
+    session_id: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    llm = _DelegatedForbiddenToolThenTextLLM(tool_name)
     agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=_FinalAssistantContentLLM(), guardrails=_NoopGuardrails()),
+        providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(),
@@ -11988,23 +14006,19 @@ async def test_workflow_backed_delegation_can_write_parent_deliverable(
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
     )
-    captured: dict[str, object] = {}
+    flushed_events: list[SessionEvent] = []
+    original_flush = agent_loop._flush_events_incremental
 
-    async def _write_deliverable(ctx: StepContext, **kwargs: object) -> Deliverable:
-        captured["owner_step_run_id"] = agent_loop._deliverable_owner_step_run_id(ctx)
-        captured.update(kwargs)
-        deliverable = Deliverable(
-            deliverable_id="dlv-child",
-            step_run_id="sr-parent",
-            version=1,
-            content=str(kwargs["content"]),
-            format="markdown",
-            title="Delegated result",
-            outputs={},
-        )
-        return agent_loop._cache_deliverable(ctx, deliverable)
+    async def _capture_flush(*args: object, **kwargs: object) -> None:
+        events = args[1]
+        assert isinstance(events, list)
+        flushed_events.extend(events)
+        await original_flush(*args, **kwargs)
 
-    monkeypatch.setattr(agent_loop, "_write_step_deliverable", _write_deliverable)
+    monkeypatch.setattr(agent_loop, "_flush_events_incremental", _capture_flush)
+    side_effect = AsyncMock(side_effect=AssertionError("parent-owned side effect executed"))
+    monkeypatch.setattr(agent_loop, "_write_step_deliverable", side_effect)
+    monkeypatch.setattr(agent_loop, "_get_current_deliverable", side_effect)
     ctx = StepContext(
         step_definition=StepDefinition(
             name="delegation",
@@ -12013,27 +14027,120 @@ async def test_workflow_backed_delegation_can_write_parent_deliverable(
             require_deliverable=False,
         ),
         session=SimpleNamespace(
-            session_id="child-1",
-            intaris_session_id="child-1",
+            session_id=session_id,
+            intaris_session_id=session_id,
             mnemory_session_id=None,
             user_email="user@example.com",
             agent_id="agent-1",
+            parent_session_id="parent-1",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
-        policy=DELEGATION_POLICY,
+        policy=policy,
         user_message="Investigate the issue.",
         deliverable_step_run_id="sr-parent",
         system_initiated=True,
+        interaction_mode="step_requests",
+        controller_tool_surface=surface,
     )
 
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
     assert output.error is None
-    assert output.deliverable_id == "dlv-child"
-    assert captured["owner_step_run_id"] == "sr-parent"
-    assert captured["content"] == "Final clean briefing text."
+    assert output.content == "Recovered delegated result."
+    assert len(llm.calls) == 2
+    rejection = next(message for message in llm.calls[1] if message.get("role") == "tool")
+    assert "delegated_child_parent_owned_tool" in str(rejection["content"])
+    side_effect.assert_not_awaited()
+    assert output.attachments == []
+    assert agent_loop.pause_waiter.pending_count() == 0
+    assert ctx.current_deliverable_id is None
+    assert ctx.current_deliverable_content is None
+    assert not any(
+        event.type == "lifecycle"
+        and event.data.get("event")
+        in {
+            "step_complete",
+            "step_questions_requested",
+            "deliverable_written",
+            "artifact_attached",
+        }
+        for event in flushed_events
+    )
+
+
+@pytest.mark.asyncio
+async def test_delegated_daily_brief_child_completes_with_assistant_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _SingleAssistantTextLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    get_deliverable = AsyncMock(side_effect=AssertionError("parent deliverable was read"))
+    monkeypatch.setattr(agent_loop, "_get_current_deliverable", get_deliverable)
+    ctx = StepContext(
+        step_definition=StepDefinition(
+            name="delegation",
+            type="run",
+            prompt="Research Daily Brief sources.",
+            require_deliverable=False,
+        ),
+        session=SimpleNamespace(
+            session_id="daily-brief-child",
+            intaris_session_id="daily-brief-child",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            parent_session_id="daily-brief-parent",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="Research Daily Brief sources.",
+        task_title="Daily Brief",
+        deliverable_step_run_id="sr-parent",
+        system_initiated=True,
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_WORKFLOW,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert llm.calls == 1
+    get_deliverable.assert_not_awaited()
+    assert output is not None
+    assert output.error is None
+    assert output.content == "Delegated Daily Brief research result."
+
+
+def test_actual_workflow_daily_brief_retains_strict_activation() -> None:
+    ctx = StepContext(
+        step_definition=StepDefinition(name="daily", type="run", prompt=""),
+        session=SimpleNamespace(
+            session_id="daily-brief-step",
+            intaris_session_id="daily-brief-step",
+            parent_session_id=None,
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        task_title="Daily Brief",
+    )
+
+    activation = AgentLoop._strict_daily_brief_activation(ctx)
+
+    assert activation is not None
+    assert activation.version == CURRENT_DAILY_BRIEF_CONTRACT_VERSION
 
 
 def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
@@ -12077,7 +14184,7 @@ def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
     assert not ctx_system.policy.require_step_complete
     assert ctx_system.policy.skip_memory
 
-    # A primary agent delegation keeps the full policy
+    # Primary and secondary delegated children both finish with assistant text.
     primary_agent = AgentDefinition(
         agent_id="riker",
         owner_email="user@example.com",
@@ -12092,7 +14199,8 @@ def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
         agent=primary_agent,
         policy=DELEGATION_POLICY,
     )
-    assert ctx_primary.policy.require_step_complete
+    assert not ctx_primary.policy.require_step_complete
+    assert not ctx_primary.policy.step_complete_available
     assert not ctx_primary.policy.skip_memory
 
 
@@ -12141,7 +14249,11 @@ def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() ->
             prompt="Review the changes in this PR.",
             require_deliverable=False,
         ),
-        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        session=SimpleNamespace(
+            session_id="child",
+            intaris_session_id="child",
+            parent_session_id="parent",
+        ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=user_secondary,
         policy=SECONDARY_AGENT_DELEGATION_POLICY,
@@ -12149,7 +14261,7 @@ def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() ->
     )
     prompt = loop._build_step_prompt(ctx)
     # Must use the slim completion hint
-    assert "write your findings as a final assistant message" in prompt
+    assert "Return the result as a final assistant message" in prompt
     # Must NOT contain the heavy deliverable contract
     assert "write_deliverable with the canonical user-facing artifact" not in prompt
     assert "Required Completion Actions" not in prompt
@@ -12180,6 +14292,68 @@ def test_select_delegation_result_falls_back_to_step_output_when_no_messages() -
     result = asyncio.run(_run())
     assert result.content == substantive
     assert result.source == "step_output"
+
+
+def test_select_delegation_result_includes_final_report_after_child_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = object.__new__(AgentLoop)
+    original = SimpleNamespace(session_id="child-1", intaris_session_id="child-intaris-1")
+    successor = SimpleNamespace(session_id="child-2", intaris_session_id="child-intaris-2")
+    stale_report = "Initial analysis before compaction."
+    final_report = "Final delegated report from the rotated successor."
+
+    class _SessionContextManager:
+        async def __aenter__(self) -> SimpleNamespace:
+            return SimpleNamespace()
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+    class _Guardrails:
+        async def read_events(self, *, session_id: str, **_: object) -> SimpleNamespace:
+            content = stale_report if session_id == "child-intaris-1" else final_report
+            return SimpleNamespace(
+                events=[
+                    {
+                        "seq": 1,
+                        "type": "assistant_message",
+                        "data": {"content": content},
+                    }
+                ],
+                last_seq=1,
+                has_more=False,
+                missing_stream_fallback_used=False,
+            )
+
+    async def _continuation_chain(
+        _db_session: object,
+        session_id: str,
+    ) -> tuple[list[object], bool]:
+        assert session_id == original.session_id
+        return [original, successor], False
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "get_child_session_continuation_chain",
+        _continuation_chain,
+    )
+    agent_loop.session_manager = SimpleNamespace(session_factory=lambda: _SessionContextManager())
+    agent_loop.providers = SimpleNamespace(guardrails=_Guardrails())
+
+    async def _run() -> object:
+        return await agent_loop._select_delegation_result_content(
+            child_session=original,
+            step_output=StepOutput(summary="done", content=final_report),
+        )
+
+    result = asyncio.run(_run())
+
+    assert result.source == "assistant_messages"
+    assert stale_report in result.content
+    assert final_report in result.content
+    assert result.content.index(stale_report) < result.content.index(final_report)
+    assert result.content.count(final_report) == 1
 
 
 def test_select_delegation_result_walks_events_when_step_output_is_meta_complaint() -> None:
@@ -12564,83 +14738,6 @@ def test_looks_like_meta_complaint_detects_known_patterns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_write_deliverable_media_validation_failure_is_retryable_tool_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    llm = _DelegationDeliverableThenLimitLLM()
-    messages_by_call: list[list[dict[str, object]]] = []
-    original_stream = llm.stream_generate
-
-    async def recording_stream(messages: list[dict[str, object]], **kwargs: object):
-        messages_by_call.append(messages)
-        async for chunk in original_stream(messages, **kwargs):
-            yield chunk
-
-    monkeypatch.setattr(llm, "stream_generate", recording_stream)
-    agent_loop = AgentLoop(
-        providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
-        session_cache=_NoopSessionCache(),
-        context_assembler=_FakeContextAssembler(),
-        compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
-        remember_queue=_NoopRememberQueue(),
-        event_bus=_NoopEventBus(),
-        session_lock=SessionLock(),
-        pause_waiter=PauseWaiter(),
-    )
-
-    async def _reject_media(*_args: object, **_kwargs: object) -> Deliverable:
-        raise RichPayloadValidationError(
-            reason="rich_media_not_accessible",
-            path="$.blocks[0].media.ref",
-            expected="accessible image artifact",
-        )
-
-    monkeypatch.setattr(agent_loop, "_write_step_deliverable", _reject_media)
-    ctx = StepContext(
-        step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
-        session=SimpleNamespace(
-            session_id="child-media-retry",
-            intaris_session_id="child-media-retry",
-            mnemory_session_id=None,
-            user_email="user@example.com",
-            agent_id="system:explore",
-        ),
-        conversation=SimpleNamespace(
-            conversation_id="conv-1",
-            user_email="user@example.com",
-            agent_id="system:explore",
-            title=None,
-            title_source="unset",
-        ),
-        agent=AgentDefinition(
-            agent_id="system:explore",
-            owner_email="system",
-            name="Explore",
-            agent_type="secondary",
-            execution={"steps": 2},
-            is_system=True,
-        ),
-        policy=SECONDARY_AGENT_DELEGATION_POLICY,
-        user_message="Investigate.",
-        deliverable_step_run_id="sr-parent",
-        system_initiated=True,
-    )
-
-    await agent_loop.run_step(ctx)
-
-    assert llm.calls == 2
-    retry_tool_results = [
-        message
-        for message in messages_by_call[1]
-        if message.get("role") == "tool"
-        and "rich_media_not_accessible" in str(message.get("content"))
-    ]
-    assert len(retry_tool_results) == 1
-
-
-@pytest.mark.asyncio
 async def test_write_deliverable_wraps_non_os_storage_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12685,7 +14782,66 @@ async def test_write_deliverable_wraps_non_os_storage_failure(
 
 
 @pytest.mark.asyncio
-async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_text(
+@pytest.mark.parametrize(
+    ("controller_tool_surface", "deliverable_step_run_id", "expected_owner"),
+    [
+        (CONTROLLER_TOOL_SURFACE_DIRECT_CHAT, None, "user@example.com"),
+        (CONTROLLER_TOOL_SURFACE_WORKFLOW, "step-runtime", None),
+    ],
+)
+async def test_write_deliverable_publication_scope_follows_runtime_context(
+    monkeypatch: pytest.MonkeyPatch,
+    controller_tool_surface: str,
+    deliverable_step_run_id: str | None,
+    expected_owner: str | None,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_SingleTextLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    captured: dict[str, object] = {}
+
+    async def _capture(*_args: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(agent_loop_module, "create_deliverable", _capture)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="write", type="run", prompt=""),
+        session=SimpleNamespace(session_id="sess-runtime", user_email="user@example.com"),
+        conversation=SimpleNamespace(
+            conversation_id="conv-runtime",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        deliverable_step_run_id=deliverable_step_run_id,
+        controller_tool_surface=controller_tool_surface,
+    )
+
+    with pytest.raises(agent_loop_module.DeliverablePersistenceError, match="captured"):
+        await agent_loop._write_step_deliverable(
+            ctx,
+            content="fallback",
+            format="markdown",
+            title=None,
+            target=None,
+            outputs={},
+        )
+
+    assert captured["published_owner_email"] == expected_owner
+
+
+@pytest.mark.asyncio
+async def test_secondary_delegation_ignores_parent_deliverable_when_limit_forces_tail_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent_loop = AgentLoop(
@@ -12726,6 +14882,7 @@ async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_t
             mnemory_session_id=None,
             user_email="user@example.com",
             agent_id="system:explore",
+            parent_session_id="parent-1",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
         agent=AgentDefinition(
@@ -12746,9 +14903,8 @@ async def test_secondary_delegation_prefers_deliverable_when_limit_forces_tail_t
 
     assert output is not None
     assert output.error is None
-    assert output.deliverable_id == "dlv-limit"
-    assert output.content == "Deliverable output from delegated run."
-    assert output.outputs == {"source": "deliverable"}
+    assert output.deliverable_id is None
+    assert output.content
 
 
 @pytest.mark.asyncio
@@ -12838,6 +14994,7 @@ async def test_secondary_delegation_steps_count_llm_turns_not_tool_calls() -> No
             mnemory_session_id=None,
             user_email="user@example.com",
             agent_id="system:explore",
+            parent_session_id="parent-1",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
         agent=AgentDefinition(
@@ -12902,6 +15059,7 @@ async def test_malformed_tool_arguments_do_not_drop_valid_siblings(
             mnemory_session_id=None,
             user_email="user@example.com",
             agent_id="system:explore",
+            parent_session_id="parent-1",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
         agent=AgentDefinition(
@@ -12986,6 +15144,7 @@ async def test_secondary_delegation_max_steps_cancels_open_todos() -> None:
             mnemory_session_id=None,
             user_email="user@example.com",
             agent_id="system:explore",
+            parent_session_id="parent-1",
         ),
         conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
         agent=AgentDefinition(
@@ -13225,9 +15384,11 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
         "preferred_tool": "follow_up_subsession",
         "guidance": (
             "For same-problem continuation, corrections, deeper analysis, or "
-            "rechecks, call follow_up_subsession with this session_id instead of "
-            "creating a fresh delegate. Use fork_subsession only for an "
-            "independent branch."
+            "rechecks, use follow_up_subsession only when this child's specialist "
+            "role, tool/authority scope, and expected output remain compatible. "
+            "Follow-up and fork preserve this child's agent identity and "
+            "capabilities; create a fresh delegate for a different specialist. "
+            "Use fork_subsession only for a compatible independent branch."
         ),
     }
     assert captured["agent"] is primary_agent
@@ -14966,6 +17127,29 @@ def test_step_complete_runtime_notification_error_payload_is_notification_reason
 
 
 @pytest.mark.asyncio
+async def test_invalid_notification_does_not_complete_or_leak_candidate_output() -> None:
+    fake_llm = _StepCompleteRetryLLM(
+        first_arguments={
+            "summary": "rejected summary",
+            "notification": {"mode": "silent", "reason": "Nothing actionable happened."},
+        },
+        second_arguments={"summary": "accepted summary"},
+    )
+
+    output = await _step_complete_test_loop(fake_llm).run_step(
+        _step_complete_test_context(
+            StepDefinition(name="notify", type="run", prompt="", require_deliverable=False)
+        )
+    )
+
+    payload = _first_tool_result_payload(fake_llm)
+    assert len(fake_llm.calls) == 2
+    assert payload["reason"] == "invalid_step_complete_notification"
+    assert output is not None
+    assert output.summary == "accepted summary"
+
+
+@pytest.mark.asyncio
 async def test_step_complete_must_be_last_tool_call_in_response() -> None:
     fake_llm = _StepCompleteOrderingLLM()
     agent_loop = AgentLoop(
@@ -15465,7 +17649,8 @@ def test_build_step_prompt_includes_revision_context() -> None:
 
     prompt = agent_loop._build_step_prompt(ctx)
 
-    assert "## Revision Context" in prompt
+    assert 'kind="reviewer_human_feedback"' in prompt
+    assert "Routed revision context:" in prompt
     assert "Full review text." in prompt
     assert workflow_state.last_revision_context is None
 
@@ -15671,9 +17856,9 @@ async def test_tool_call_ceiling_returns_partial_step_output_without_second_llm_
 
 
 @pytest.mark.asyncio
-async def test_llm_cycle_ceiling_flushes_lifecycle_event_and_returns_continuation_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_llm_cycle_ceiling_flushes_lifecycle_event_and_returns_continuation_metadata() -> (
+    None
+):
     class _RecordingGuardrails(_NoopGuardrails):
         def __init__(self) -> None:
             self.recorded_batches: list[list[SessionEvent]] = []
@@ -15688,7 +17873,6 @@ async def test_llm_cycle_ceiling_flushes_lifecycle_event_and_returns_continuatio
                 last_seq=len(events),
             )
 
-    monkeypatch.setattr(agent_loop_module, "_MAX_LLM_CYCLES_PER_TURN", 0)
     fake_llm = _ToolCallCeilingLLM()
     guardrails = _RecordingGuardrails()
     session_cache = _NoopSessionCache()
@@ -15725,6 +17909,7 @@ async def test_llm_cycle_ceiling_flushes_lifecycle_event_and_returns_continuatio
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
     )
+    agent_loop.default_max_llm_cycles_per_turn = 0
 
     output = await agent_loop.run_step(ctx)
 
@@ -15738,6 +17923,7 @@ async def test_llm_cycle_ceiling_flushes_lifecycle_event_and_returns_continuatio
     assert fake_llm.calls == 0
     assert len(guardrails.recorded_batches) == 2
     assert guardrails.recorded_batches[0][0].type == "user_message"
+    assert guardrails.recorded_batches[0][0].data["intention_eligible"] is True
     recorded_event = guardrails.recorded_batches[1][0]
     assert recorded_event.type == "lifecycle"
     assert recorded_event.data["event"] == LLM_CYCLE_CEILING_CONTINUATION_REASON
@@ -15772,7 +17958,8 @@ def test_build_step_prompt_includes_operator_instruction() -> None:
 
     prompt = agent_loop._build_step_prompt(ctx)
 
-    assert "## Operator Instruction" in prompt
+    assert 'kind="reviewer_human_feedback"' in prompt
+    assert "Human operator instruction:" in prompt
     assert "Incorporate the review and continue." in prompt
 
 
@@ -17287,6 +19474,25 @@ def test_append_tool_events_omit_phase_when_not_stamped() -> None:
     assert "assistant_phase_index" not in events[1].data
 
 
+def test_truncation_detection_prefers_post_rewrite_compact_output_size() -> None:
+    complete_output = "image: tool_artifact:call-real-with-long-id:media:1"
+    result, declared, detected = agent_loop_module._normalize_producer_truncation_metadata(
+        ToolResult(
+            output=f'<tool_result trust="untrusted">\n{complete_output}\n<​/tool_result>',
+            metadata={
+                "_raw_output": complete_output,
+                "stored_output": complete_output,
+                "compact_output_size": len("image: tool_artifact:<tool_call_id>:media:1"),
+                "producer_truncated": False,
+            },
+        )
+    )
+    assert declared is False
+    assert detected is False
+    assert result.metadata["producer_truncated"] is False
+    assert result.metadata["compact_output_size"] == len(complete_output)
+
+
 def test_replay_recovers_exact_write_deliverable_validation_fingerprint() -> None:
     arguments = {
         "action": "rich:pulse",
@@ -17477,7 +19683,7 @@ def test_task_step_logs_promote_only_verified_nested_lazy_refs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_finalize_regular_tool_result_stores_agent_visible_output_and_artifact_id() -> None:
+async def test_finalize_regular_tool_result_derives_producer_truncation_and_recovery() -> None:
     class _Store:
         ttl_seconds = 3600
 
@@ -17570,10 +19776,12 @@ async def test_finalize_regular_tool_result_stores_agent_visible_output_and_arti
         )
         raw_output = "RAW" * 30_000
         result = ToolResult(
-            output="VISIBLE" * 20_000,
+            output=('<tool_result trust="untrusted">\ncompact preview\n<​/tool_result>'),
             metadata={
-                "_raw_output": raw_output,
+                "_raw_output": "compact preview",
+                "stored_output": raw_output,
                 "original_size": len(raw_output),
+                "producer_truncated": False,
                 "output_anchors": [
                     {
                         "anchor": "media:1",
@@ -17617,9 +19825,17 @@ async def test_finalize_regular_tool_result_stores_agent_visible_output_and_arti
     event_data = recorded_events[-1].data
     assert event_data["result"] == messages[-1]["content"]
     assert event_data["result"] != raw_output
-    assert "middle truncated" in event_data["result"]
+    assert "Recover with call_id 'call-final'" in event_data["result"]
+    assert "call-final" in event_data["result"]
+    assert "list_tool_output_anchors" in event_data["result"]
+    assert "read_tool_output" in event_data["result"]
     assert event_data["agent_visible"] is True
-    assert event_data["agent_visible_truncated"] is True
+    assert event_data["agent_visible_truncated"] is False
+    assert event_data["producer_truncated"] is True
+    assert event_data["tool_output_presentation"]["producer_declared_truncated"] is False
+    assert event_data["tool_output_presentation"]["controller_detected_truncated"] is True
+    assert event_data["tool_output_presentation"]["compact_output_size"] == len("compact preview")
+    assert event_data["tool_output_presentation"]["stored_output_size"] == len(raw_output)
     assert event_data["tool_output_artifact_id"] == "toolout_final"
     assert event_data["tool_output_presentation"]["lazy_artifact_refs"] == [
         "tool_artifact:call-final:media:1"
@@ -18666,11 +20882,11 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
 
     prompt = agent_loop._build_step_prompt(ctx)
 
-    assert "## Workflow-Level Expected Output" in prompt
-    assert "This describes the final task result" in prompt
-    assert "## Current Step" in prompt
-    assert "## Current Step Boundaries" in prompt
-    assert "write_deliverable with the canonical user-facing artifact" in prompt
+    assert 'kind="user_task_contract"' in prompt
+    assert "Expected final output:" in prompt
+    assert 'kind="active_step_directive"' in prompt
+    assert 'kind="responsibility_guard"' in prompt
+    assert "write_deliverable before finalization" in prompt
 
 
 def test_plan_step_prompt_has_read_only_boundaries() -> None:
@@ -18699,9 +20915,9 @@ def test_plan_step_prompt_has_read_only_boundaries() -> None:
 
     prompt = agent_loop._build_step_prompt(ctx)
 
-    assert "This is a read-only planning/review step" in prompt
-    assert "do not edit files" in prompt
-    assert "Complete only this current step" in prompt
+    assert "This step is read-only" in prompt
+    assert "Defer implementation, validation, documentation, commit, and final delivery" in prompt
+    assert "Complete only the active step" in prompt
 
 
 def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
@@ -18731,7 +20947,7 @@ def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
     assert reminder is not None
     assert reminder["_workflow_step_reminder"] is True
     content = str(reminder["content"])
-    assert "overrides task-level finishing instructions and loaded skill instructions" in content
+    assert "Static objective, responsibility, and delivery rules" in content
     assert "call write_deliverable" in content
 
 

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from cognis.core.events import EventBus, EventType
 from cognis.core.remember_queue import RememberRetryQueue
+from cognis.providers.memory.protocol import RememberOutcomeUnknownError
 from cognis.store.models import Agent, Base, RememberQueueRow, User
 from cognis.store.queries import create_conversation, create_session
 
@@ -99,6 +100,23 @@ class _FailingWorker:
         raise RuntimeError(self.message)
 
 
+class _AmbiguousWorker:
+    async def remember(self, **kwargs: object) -> None:
+        del kwargs
+        raise RememberOutcomeUnknownError("remember outcome unknown")
+
+
+class _BlockingWorker:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def remember(self, **kwargs: object) -> None:
+        del kwargs
+        self.started.set()
+        await self.release.wait()
+
+
 class _LegacyEventReader(_EventReader):
     async def read_events(self, **kwargs: object) -> object:
         self.read_kwargs.append(dict(kwargs))
@@ -134,6 +152,122 @@ async def test_remember_queue_processes_items() -> None:
     await queue.stop()
 
     assert worker.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_remember_outcome_is_terminal_and_not_reclaimed(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-ambiguous.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(User(email="user@example.com", password_hash="x", role="user"))
+        await session.commit()
+    queue = RememberRetryQueue(
+        _AmbiguousWorker(),
+        session_factory=session_factory,
+        event_reader=_EventReader(),
+        max_concurrent=1,
+    )
+    await queue.enqueue(
+        {
+            "session_id": "s1",
+            "intaris_session_id": "intaris-s1",
+            "user_email": "user@example.com",
+            "user_event_seq": 1,
+            "assistant_event_seq": 2,
+        }
+    )
+    claimed = await queue._claim_due_durable_items(1)
+    await queue._process(claimed[0], asyncio.Semaphore(1))
+
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(RememberQueueRow))
+        assert row is not None
+        assert row.status == "ambiguous"
+        assert row.lease_token is None
+        assert row.last_error is not None
+    assert await queue._claim_due_durable_items(1) == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_durable_remember_lease_renews_during_slow_provider_call(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-renew.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(User(email="user@example.com", password_hash="x", role="user"))
+        await session.commit()
+    worker = _BlockingWorker()
+    first = RememberRetryQueue(
+        worker,
+        session_factory=session_factory,
+        event_reader=_EventReader(),
+        max_concurrent=1,
+    )
+    first.lease_seconds = 0.06
+    second = RememberRetryQueue(
+        _Worker(),
+        session_factory=session_factory,
+        event_reader=_EventReader(),
+        max_concurrent=1,
+    )
+    second.lease_seconds = 0.06
+    await first.enqueue(
+        {
+            "session_id": "s1",
+            "intaris_session_id": "intaris-s1",
+            "user_email": "user@example.com",
+            "user_event_seq": 1,
+            "assistant_event_seq": 2,
+        }
+    )
+    claimed = await first._claim_due_durable_items(1)
+    processing = asyncio.create_task(first._process(claimed[0], asyncio.Semaphore(1)))
+    await worker.started.wait()
+    await asyncio.sleep(0.15)
+    assert await second._claim_due_durable_items(1) == []
+    worker.release.set()
+    await processing
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expired_pre_dispatch_claim_is_recovered_not_marked_ambiguous(tmp_path: Path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-claim-crash.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        session.add(User(email="user@example.com", password_hash="x", role="user"))
+        await session.commit()
+    queue = RememberRetryQueue(
+        _Worker(), session_factory=session_factory, event_reader=_EventReader(), max_concurrent=1
+    )
+    queue.lease_seconds = 0.03
+    await queue.enqueue(
+        {
+            "session_id": "s1",
+            "intaris_session_id": "intaris-s1",
+            "user_email": "user@example.com",
+            "user_event_seq": 1,
+            "assistant_event_seq": 2,
+        }
+    )
+    assert len(await queue._claim_due_durable_items(1)) == 1
+    await asyncio.sleep(0.05)
+
+    assert await queue._claim_due_durable_items(1) == []
+    claimed_after_recovery = await queue._claim_due_durable_items(1)
+    assert len(claimed_after_recovery) == 1
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(RememberQueueRow))
+        assert row is not None
+        assert row.status == "leased"
+        assert row.last_error is None
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+import pytest
 
 from cognis.api.routes.artifacts import _clamp_ttl_to_artifact_expiry, _is_expired
+from cognis.artifacts import store as artifact_store_module
 from cognis.artifacts.store import (
     ArtifactStore,
     ArtifactStoreConfig,
@@ -87,6 +91,40 @@ def test_public_view_url_uses_distinct_route_and_signature(tmp_path) -> None:
     assert "/api/v1/artifacts/content/reports/html_123/report.html?" in download_url
     assert "/api/v1/artifacts/view/reports/html_123/report.html?" in view_url
     assert download_url.split("sig=", 1)[1] != view_url.split("sig=", 1)[1]
+
+
+def test_public_url_clamps_at_signing_time_to_absolute_artifact_expiry(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(
+        ArtifactStoreConfig(
+            backend="filesystem",
+            path=str(tmp_path),
+            base_url="https://cognis.example.com",
+            signing_secret="test-secret",
+            signed_url_ttl_seconds=3600,
+        )
+    )
+    expires_at = datetime.fromtimestamp(1010, tz=UTC)
+    monkeypatch.setattr(artifact_store_module.time, "time", lambda: 1005)
+
+    url = store.get_public_url(
+        "attachments",
+        "art_123",
+        "input.pdf",
+        expires_at=expires_at,
+    )
+
+    assert parse_qs(urlparse(url).query)["exp"] == ["1010"]
+    monkeypatch.setattr(artifact_store_module.time, "time", lambda: 1010)
+    with pytest.raises(ValueError, match="Artifact has expired"):
+        store.get_public_url(
+            "attachments",
+            "art_123",
+            "input.pdf",
+            expires_at=expires_at,
+        )
 
 
 def test_sanitize_artifact_filename_preserves_json_extension() -> None:

@@ -51,6 +51,19 @@ class DummyWebSocket:
         self.sent.append(json.loads(raw))
 
 
+class IncomingWebSocket(DummyWebSocket):
+    def __init__(self, messages: list[dict]) -> None:
+        super().__init__()
+        self._messages = messages
+
+    def __aiter__(self):
+        async def _iterate():
+            for message in self._messages:
+                yield json.dumps(message)
+
+        return _iterate()
+
+
 def test_same_turn_tool_call_key_is_provider_neutral_and_cycle_scoped() -> None:
     first = {
         "execution_scope_id": "scope",
@@ -78,7 +91,115 @@ def test_same_turn_tool_call_key_is_provider_neutral_and_cycle_scoped() -> None:
     )
 
 
-def test_same_turn_tool_call_deduplicator_rejects_serial_siblings_and_allows_next_turn() -> None:
+@pytest.mark.asyncio
+async def test_channel_resolve_recipient_runner_dispatches_typed_request() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    handler = SimpleNamespace(
+        resolve_recipient=AsyncMock(
+            return_value={
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+                "chat_kind": "direct",
+            }
+        )
+    )
+    runner._channel_handler = handler
+    ws = IncomingWebSocket(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": "resolve-1",
+                "method": "channel.resolve_recipient",
+                "params": {
+                    "account_id": "acct-1",
+                    "recipient": {
+                        "channel_type": "signal",
+                        "address": "+420111222333",
+                        "address_kind": "signal_e164",
+                        "chat_kind": "direct",
+                    },
+                    "resolution_key": "opaque-key",
+                },
+            }
+        ]
+    )
+    await runner._message_loop(ws)
+    assert ws.sent == [
+        {
+            "jsonrpc": "2.0",
+            "result": {
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+                "chat_kind": "direct",
+            },
+            "id": "resolve-1",
+        }
+    ]
+    handler.resolve_recipient.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_channel_resolve_recipient_runner_rejects_malformed_request() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._channel_handler = SimpleNamespace(resolve_recipient=AsyncMock())
+    ws = DummyWebSocket()
+    await runner._handle_channel_resolve_recipient(
+        ws,
+        "resolve-2",
+        {"account_id": "acct-1", "recipient": {}, "resolution_key": ""},
+    )
+    assert ws.sent[0]["error"]["code"] == -32602
+    assert ws.sent[0]["error"]["data"] == {
+        "code": "malformed_request",
+        "retryable": False,
+        "side_effect_certainty": "none",
+    }
+    runner._channel_handler.resolve_recipient.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_resolve_recipient_runner_preserves_creation_uncertainty() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    failure = RuntimeError("handler failure")
+    runner._channel_handler = SimpleNamespace(resolve_recipient=AsyncMock(side_effect=failure))
+    ws = DummyWebSocket()
+    await runner._handle_channel_resolve_recipient(
+        ws,
+        "resolve-3",
+        {
+            "account_id": "acct-1",
+            "recipient": {
+                "channel_type": "signal",
+                "address": "+420111222333",
+                "allow_creation": True,
+            },
+            "resolution_key": "opaque-key",
+        },
+    )
+    assert ws.sent[0]["error"]["data"]["side_effect_certainty"] == "uncertain"
+
+    explicit = RuntimeError("handler failure")
+    explicit.side_effect_certainty = "none"  # type: ignore[attr-defined]
+    runner._channel_handler.resolve_recipient.side_effect = explicit
+    await runner._handle_channel_resolve_recipient(
+        ws,
+        "resolve-4",
+        {
+            "account_id": "acct-1",
+            "recipient": {
+                "channel_type": "signal",
+                "address": "+420111222333",
+                "allow_creation": True,
+            },
+            "resolution_key": "opaque-key",
+        },
+    )
+    assert ws.sent[-1]["error"]["data"]["side_effect_certainty"] == "none"
+
+
+def test_same_turn_tool_call_deduplicator_rejects_only_concurrent_siblings() -> None:
     deduplicator = _SameTurnToolCallDeduplicator()
     first = {
         "call_id": "call-first",
@@ -96,8 +217,10 @@ def test_same_turn_tool_call_deduplicator_rejects_serial_siblings_and_allows_nex
 
     assert deduplicator.original_call_id(first) is None
     assert deduplicator.original_call_id(duplicate) == "call-first"
+    deduplicator.release(first)
+    assert deduplicator.original_call_id(duplicate) is None
+    deduplicator.release(duplicate)
     assert deduplicator.original_call_id(next_turn) is None
-    assert deduplicator.original_call_id(duplicate) == "call-first"
 
 
 def _contract_metadata(runner: ExecutorRunner, tool_name: str) -> dict[str, str]:

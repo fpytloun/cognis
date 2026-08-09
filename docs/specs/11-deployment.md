@@ -80,8 +80,17 @@ COGNIS_REDIS_URL=                      # empty = L1-only (default)
 # COGNIS_REDIS_URL=redis://localhost:6379/0
 ```
 
-When set, the session cache uses Redis as an L2 shared store. On Redis
-failure, the cache degrades to L1 in-process + Intaris cold loads.
+When set, controllers use Redis for disposable acceleration: shared raw-event
+cache and volatile Chat v2 runtime relay. PostgreSQL still owns durable
+orchestration/leases/fencing and Intaris still owns canonical content. On Redis
+failure, Cognis uses owner-local volatile detail, PostgreSQL-backed remote
+active-turn state, and direct Intaris reads. Readiness and turn correctness are
+unchanged; stale canonical cache entries are never served on error.
+
+Redis is recommended for HA realtime UX and lower Intaris amplification. A
+Redis-free HA profile remains supported. Remote Redis must use authentication,
+least-privilege ACLs, TLS, network isolation, bounded memory, and monitored
+eviction. Never publish credentialed URL examples.
 
 #### Tool Output Storage
 
@@ -254,14 +263,14 @@ CMD ["cognis-controller", "serve"]
 
 ## Kubernetes
 
-### Single-Replica Production (Current)
+### Single-Replica Production
 
 Cognis runs as a single replica alongside Mnemory and Intaris in a shared
 namespace. The bundled image serves both the API and the UI on `:8080`.
 
 ```
 Namespace: openwebui (shared with Mnemory, Intaris)
-  Deployment: cognis (replicas: 1, strategy: Recreate)
+  Deployment: cognis (replicas: 1, strategy: RollingUpdate)
   Service: cognis (ClusterIP, port 8080)
   Ingress: cognis.fpy.cz (TLS via cert-manager)
   Certificate: cognis.fpy.cz (letsencrypt-prod)
@@ -274,7 +283,7 @@ Namespace: openwebui (shared with Mnemory, Intaris)
 | Dependency | Service URL | Purpose |
 |------------|-------------|---------|
 | PostgreSQL | `postgresql.postgresql.svc.cluster.local:5432` | Cognis metadata DB |
-| Redis | `redis.redis.svc.cluster.local:6379` | L2 session cache |
+| Redis (optional) | `redis.redis.svc.cluster.local:6379` | L2 session cache |
 | MinIO | `http://minio.minio.svc.cluster.local:9000` | Artifacts + tool outputs |
 | Mnemory | `http://mnemory.openwebui.svc.cluster.local:8050` | Memory provider |
 | Intaris | `http://intaris.openwebui.svc.cluster.local:8060` | Guardrails provider |
@@ -417,9 +426,10 @@ spec:
             claimName: cognis-executor-romana-home
 ```
 
-This example uses a pre-created PVC for the executor home directory. That
-works well for singleton executors pinned to a specific node. If you scale
-to one PVC per replica, use `volumeClaimTemplates` instead.
+This one-replica example uses a pre-created PVC. Executor pools must not scale
+one token across replicas: every pod needs a distinct executor record and
+token. See the current StatefulSet identity example in
+[`../guide/high-availability.md`](../guide/high-availability.md).
 
 #### Storage Backends
 
@@ -448,25 +458,27 @@ for line-based read/search — acceptable for ephemeral tool outputs.
 Rollback: remove `*_JWKS_URL` env vars from Mnemory/Intaris to revert
 to API-key-only auth. Cognis can be deleted independently.
 
-### Multi-Replica Production (Phase 2+)
+### Multi-Replica Production
 
 ```
 Namespace: cognis
-  Deployment: cognis-controller (replicas: 2+)
-  Deployment: cognis-ui (replicas: 2+)
-  Service: cognis-controller (ClusterIP)
+  Deployment: cognis-controller (replicas: 2+, bundled API + UI)
+  Service: cognis-controller (one public ClusterIP)
+  Service: cognis-controller-internal (headless discovery)
   Ingress: cognis.example.com
-  ServiceAccount: cognis-executor (can create Jobs)
-
-Namespace: cognis-executors
-  Job: cognis-exec-{id} (on-demand, created by controller)
+  Job: cognis-controller-db-upgrade (Helm pre-install/pre-upgrade hook)
 ```
 
-Multi-replica requires:
-- Redis-backed shared session cache (implemented)
-- Sticky WebSocket sessions via ingress affinity
-- Shared tool output storage via S3 (implemented)
-- Distributed turn scheduling / session locking (not yet implemented)
+Multi-replica requires PostgreSQL, S3-compatible artifacts and tool outputs,
+shared external crypto/signing material, and validation-only controller startup
+after the dedicated migration Job. Redis remains optional. Durable ownership
+covers turns, tasks, schedules, pauses, channels, workers, and executor
+connections. Sticky ingress sessions are not required for correctness.
+
+The same controller image runs scheduler and worker loops; do not split them
+into microservices. See
+[`../guide/high-availability.md`](../guide/high-availability.md) for the current
+topology, rolling upgrades, executor failover, and operational limits.
 
 Network policies: executor pods can reach cognis-controller only. They
 cannot reach Mnemory or Intaris directly.

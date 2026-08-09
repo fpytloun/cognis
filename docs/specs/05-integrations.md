@@ -380,6 +380,9 @@ class GuardrailsProvider(Protocol):
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        before_seq: int | None = None,
+        seqs: list[int] | None = None,
+        allow_missing_stream: bool = False,
     ) -> EventReadResult:
         """
         Read events from session event store.
@@ -390,6 +393,8 @@ class GuardrailsProvider(Protocol):
     async def get_last_seq(
         self,
         session_id: str,
+        *,
+        allow_missing_stream: bool = False,
     ) -> int:
         """Get the last event sequence number for a session."""
         ...
@@ -763,6 +768,14 @@ class LLMProvider(Protocol):
         """
         ...
 ```
+
+`allow_missing_stream` is restricted to reads that can validly observe a newly
+created session before its first event append. Intaris must confirm that the
+session metadata exists under the same user/agent ownership context before
+Cognis converts an event-stream `404` to an empty result. A metadata `404`
+continues to represent a missing or inaccessible session. Intaris event-read
+circuit breaking counts retryable transport, timeout, rate-limit, and server
+failures; deterministic HTTP client errors do not mark the provider unavailable.
 
 ### Token Counting Strategy
 

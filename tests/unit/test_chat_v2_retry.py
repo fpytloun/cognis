@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cognis.api.chat_v2 import routes
+from cognis.api.chat_v2.event_store import IntarisSessionEventStore
 from cognis.api.chat_v2.sync import ConversationSessionRef
+from cognis.api.common import AuthenticatedUser
 
 
 class _AsyncContext:
@@ -24,12 +26,27 @@ def _request(events: list[dict[str, object]]) -> SimpleNamespace:
         )
     )
     return SimpleNamespace(
+        state=SimpleNamespace(user=AuthenticatedUser(email="alice@example.com", role="user")),
         app=SimpleNamespace(
             state=SimpleNamespace(
                 session_factory=lambda: _AsyncContext(),
                 providers=SimpleNamespace(guardrails=guardrails),
             )
+        ),
+    )
+
+
+def _ref(events: list[dict[str, object]]) -> ConversationSessionRef:
+    guardrails = SimpleNamespace(
+        read_events=AsyncMock(
+            return_value=SimpleNamespace(events=events, last_seq=len(events), has_more=False)
         )
+    )
+    return ConversationSessionRef(
+        session_id="sess-1",
+        event_store_session_id="isess-1",
+        ordinal=0,
+        reader=IntarisSessionEventStore(guardrails),
     )
 
 
@@ -37,42 +54,33 @@ def _request(events: list[dict[str, object]]) -> SimpleNamespace:
 async def test_retry_source_uses_durable_failed_turn_without_duplicate_user_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    events = [
+        {
+            "seq": 1,
+            "type": "user_message",
+            "data": {
+                "turn_id": "turn-1",
+                "content": "retry me",
+                "client_message_id": "client-1",
+                "attachments": [],
+            },
+        },
+        {
+            "seq": 2,
+            "type": "lifecycle",
+            "data": {
+                "event": "turn_error",
+                "turn_id": "turn-1",
+                "error_code": "executor_unavailable",
+            },
+        },
+    ]
     monkeypatch.setattr(
         routes,
         "_session_refs",
-        AsyncMock(
-            return_value=[
-                ConversationSessionRef(
-                    session_id="sess-1",
-                    event_store_session_id="isess-1",
-                    ordinal=0,
-                )
-            ]
-        ),
+        AsyncMock(return_value=[_ref(events)]),
     )
-    request = _request(
-        [
-            {
-                "seq": 1,
-                "type": "user_message",
-                "data": {
-                    "turn_id": "turn-1",
-                    "content": "retry me",
-                    "client_message_id": "client-1",
-                    "attachments": [],
-                },
-            },
-            {
-                "seq": 2,
-                "type": "lifecycle",
-                "data": {
-                    "event": "turn_error",
-                    "turn_id": "turn-1",
-                    "error_code": "executor_unavailable",
-                },
-            },
-        ]
-    )
+    request = _request(events)
 
     source, failed_turn_found = await routes._retry_source_from_failed_turn(
         request,
@@ -92,28 +100,19 @@ async def test_retry_source_uses_durable_failed_turn_without_duplicate_user_mess
 async def test_retry_source_distinguishes_legacy_failure_without_source(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    events = [
+        {
+            "seq": 1,
+            "type": "lifecycle",
+            "data": {"event": "turn_error", "turn_id": "turn-legacy"},
+        }
+    ]
     monkeypatch.setattr(
         routes,
         "_session_refs",
-        AsyncMock(
-            return_value=[
-                ConversationSessionRef(
-                    session_id="sess-1",
-                    event_store_session_id="isess-1",
-                    ordinal=0,
-                )
-            ]
-        ),
+        AsyncMock(return_value=[_ref(events)]),
     )
-    request = _request(
-        [
-            {
-                "seq": 1,
-                "type": "lifecycle",
-                "data": {"event": "turn_error", "turn_id": "turn-legacy"},
-            }
-        ]
-    )
+    request = _request(events)
 
     source, failed_turn_found = await routes._retry_source_from_failed_turn(
         request,
@@ -142,19 +141,6 @@ async def test_retry_source_only_consumes_explicitly_successful_retry_attempt(
     monkeypatch: pytest.MonkeyPatch,
     retry_outcome: str,
 ) -> None:
-    monkeypatch.setattr(
-        routes,
-        "_session_refs",
-        AsyncMock(
-            return_value=[
-                ConversationSessionRef(
-                    session_id="sess-1",
-                    event_store_session_id="isess-1",
-                    ordinal=0,
-                )
-            ]
-        ),
-    )
     events: list[dict[str, object]] = [
         {
             "seq": 1,
@@ -197,6 +183,11 @@ async def test_retry_source_only_consumes_explicitly_successful_retry_attempt(
                 "data": {"event": "turn_error", "turn_id": "turn-retry"},
             }
         )
+    monkeypatch.setattr(
+        routes,
+        "_session_refs",
+        AsyncMock(return_value=[_ref(events)]),
+    )
 
     source, failed_turn_found = await routes._retry_source_from_failed_turn(
         _request(events),

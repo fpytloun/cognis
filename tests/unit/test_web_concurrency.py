@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from cognis.models.tool import ToolResult
 from cognis.tools.executor.web.concurrency import (
     WEB_CONCURRENCY_KEY,
     WebConcurrencyController,
@@ -14,6 +15,7 @@ from cognis.tools.executor.web.concurrency import (
     get_or_create_controller,
     host_for,
 )
+from cognis.tools.executor.web.handlers import _run_fetch_with_concurrency
 
 
 def test_host_for_extracts_lowercase_host() -> None:
@@ -184,6 +186,106 @@ async def test_rate_limit_token_bucket_throttles_burst() -> None:
     # Allow generous slack: token-bucket pacing is approximate, but anything
     # under 200 ms would mean throttling did not kick in.
     assert elapsed >= 0.2
+
+
+@pytest.mark.asyncio
+async def test_fractional_qps_uses_inverse_period_without_rejecting_request() -> None:
+    settings = WebConcurrencySettings(
+        backend_caps={"direct_search": 1},
+        rate_limits_qps={"direct_search": 0.5},
+    )
+    controller = WebConcurrencyController(settings)
+
+    limiter = await controller._get_rate_limiter("direct_search")  # noqa: SLF001
+
+    assert limiter is not None
+    assert limiter.max_rate == 1  # type: ignore[attr-defined]
+    assert limiter.time_period == 2  # type: ignore[attr-defined]
+    async with controller.acquire(backend="direct_search"):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_fetch_admission_timeout_is_classified_and_does_not_leak_slot() -> None:
+    controller = WebConcurrencyController(
+        WebConcurrencySettings(
+            global_cap=1,
+            per_host_cap=1,
+            backend_caps={"direct": 1},
+            rate_limits_qps={"direct": 0.0},
+        )
+    )
+
+    class Backend:
+        async def fetch(self, *_: object, **__: object) -> ToolResult:
+            return ToolResult(output="ok")
+
+    async with controller.acquire(backend="direct", host="example.com", op="fetch"):
+        result = await _run_fetch_with_concurrency(
+            controller=controller,
+            backend=Backend(),
+            backend_label="direct",
+            url="https://example.com/page",
+            output_format="markdown",
+            timeout=1,
+            admission_timeout=0.01,
+        )
+    assert result.is_error
+    assert result.metadata["failure_category"] == "admission_timeout"
+
+    recovered = await _run_fetch_with_concurrency(
+        controller=controller,
+        backend=Backend(),
+        backend_label="direct",
+        url="https://example.com/page",
+        output_format="markdown",
+        timeout=1,
+        admission_timeout=0.1,
+    )
+    assert recovered.output == "ok"
+
+
+@pytest.mark.asyncio
+async def test_active_fetch_timeout_releases_slot() -> None:
+    controller = WebConcurrencyController(
+        WebConcurrencySettings(
+            global_cap=1,
+            per_host_cap=1,
+            backend_caps={"direct": 1},
+            rate_limits_qps={"direct": 0.0},
+        )
+    )
+
+    class SlowBackend:
+        async def fetch(self, *_: object, **__: object) -> ToolResult:
+            await asyncio.sleep(1)
+            return ToolResult(output="late")
+
+    class FastBackend:
+        async def fetch(self, *_: object, **__: object) -> ToolResult:
+            return ToolResult(output="recovered")
+
+    with pytest.raises(TimeoutError):
+        await _run_fetch_with_concurrency(
+            controller=controller,
+            backend=SlowBackend(),
+            backend_label="direct",
+            url="https://example.com/page",
+            output_format="markdown",
+            timeout=0.01,  # type: ignore[arg-type]
+            admission_timeout=0.1,
+        )
+
+    recovered = await _run_fetch_with_concurrency(
+        controller=controller,
+        backend=FastBackend(),
+        backend_label="direct",
+        url="https://example.com/page",
+        output_format="markdown",
+        timeout=1,
+        admission_timeout=0.1,
+    )
+    assert recovered.output == "recovered"
 
 
 @pytest.mark.asyncio

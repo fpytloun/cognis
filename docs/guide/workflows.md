@@ -23,6 +23,7 @@ Each workflow defines:
 - optional evaluation or revision behavior
 - loop and gate behavior
 - optional agent overrides per step
+- optional primary-session continuation with `input.reuse_session_from`
 
 The workflow editor is designed for operators and advanced users. Most end users can start with existing workflows and only change them when they need a more structured execution path.
 
@@ -31,7 +32,7 @@ The workflow editor is designed for operators and advanced users. Most end users
 - `direct` style flows for simple work
 - plan -> execute -> review flows for larger tasks
 - gated steps that pause for human approval
-- loops that retry or revise a step until it satisfies the evaluator
+- deterministic condition routes that revise a step from structured review metadata
 
 ## Step tool profiles
 
@@ -117,4 +118,6 @@ Task results are delivered back into the conversation flow, with the chosen fina
 
 - Start simple. Only add evaluation loops or gates when the work truly needs them.
 - Prefer short, explicit step instructions over long multi-purpose prompts.
+- Keep one primary session across related steps. Use isolated agent overrides for independent reviews.
+- Prefer deterministic metadata and condition routing when a reviewer returns a structured decision.
 - Use the task detail view to learn how a workflow behaves before making it more complex.

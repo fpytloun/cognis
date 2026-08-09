@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.13.0] - 2026-08-09
+
+### Added
+
+- Added durable Work projections, scoped inspection, file evidence, activity trees, and responsive workspace navigation for task and conversation execution.
+- Added explicit channel recipient resolution, managed channel conversations, observed message history, and artifact delivery across supported adapters.
+- Added knowledgebase sharing, lifecycle recovery, document follow-ups, and richer browser and management surfaces.
+- Added workflow task-cockpit controls, persistent task control chats, deterministic step execution, and reusable owner artifacts.
+
+### Changed
+
+- Improved Chat v2 synchronization, cache behavior, high-availability recovery, context management, executor routing, and provider telemetry.
+- Improved local model discovery and reconciliation, rich deliverable rendering, web extraction reliability, and responsive mobile UI behavior.
+
+### Fixed
+
+- Fixed managed conversation routing, task and channel delivery, durable turn recovery, session navigation, and Work projection consistency.
+- Fixed streaming, cache, browser, provider, migration, and background-repair races across controller and UI surfaces.
+
 ## [0.12.0] - 2026-07-25
 
 ### Added

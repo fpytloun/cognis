@@ -373,7 +373,7 @@ class TestSchedulerBackoff:
 
 
 @pytest.mark.asyncio
-async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
+async def test_fire_schedule_defaults_empty_delivery_to_preferred_channel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_submit: dict[str, Any] = {}
@@ -396,7 +396,10 @@ async def test_fire_schedule_defaults_missing_delivery_to_preferred_channel(
 
     async def _get_schedule(_db: object, schedule_id: str) -> Any:
         assert schedule_id == "sched_1"
-        return _schedule_row(task_template={"title": "Scheduled task"}, consecutive_errors=2)
+        return _schedule_row(
+            task_template={"title": "Scheduled task", "delivery": {}},
+            consecutive_errors=2,
+        )
 
     async def _get_task(_db: object, task_id: str) -> Any:
         assert task_id == "task_1"
@@ -545,6 +548,7 @@ async def test_scheduler_task_failure_propagates_to_schedule_state(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
     scheduler._event_bus = bus  # type: ignore[attr-defined]
+    scheduler._fire_store = _NonManualFireStore()  # type: ignore[attr-defined]
     scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
 
     await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
@@ -598,6 +602,7 @@ async def test_scheduler_task_success_resets_consecutive_errors(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
     scheduler._event_bus = EventBus()  # type: ignore[attr-defined]
+    scheduler._fire_store = _NonManualFireStore()  # type: ignore[attr-defined]
 
     await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
         Event(type=EventType.TASK_COMPLETED, data={"task_id": "task_1"})
@@ -655,6 +660,7 @@ async def test_scheduler_ignores_stale_task_terminal_event(
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
     scheduler._event_bus = bus  # type: ignore[attr-defined]
+    scheduler._fire_store = _NonManualFireStore()  # type: ignore[attr-defined]
     scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
 
     await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
@@ -1231,6 +1237,11 @@ class _Session:
 
     async def commit(self) -> None:
         return None
+
+
+class _NonManualFireStore:
+    async def is_manual_task(self, _task_id: str) -> bool:
+        return False
 
 
 class _FakeSchedule:

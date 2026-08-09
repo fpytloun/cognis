@@ -221,14 +221,17 @@ task identity, origin, status, and delivery mode; a centralized follow-up
 policy selects the mode and emits validated metadata. Prompt rendering happens
 later, inside context assembly, so producers do not generate follow-up prose.
 
-For MVP, duplicate follow-up suppression is in-memory and scoped to a single
-controller instance. Operators should run one controller replica when relying
-on this dedupe behavior; restart or multi-replica replay guarantees are out of
-scope for this phase.
+Follow-up intent, task/step ownership, and direct-turn admission are durable.
+Repeated recovery attempts are coordinated across controller replicas rather
+than relying on process-local duplicate suppression.
 
-This keeps task communication inside the normal conversation/session model.
-Tasks do not speak directly to channels; they route back into conversations,
-and the conversation's channel connector delivers to Signal/Slack/web/etc.
+Default task communication stays inside the normal conversation/session model.
+A default task result starts an agent follow-up turn. The conversation's
+channel connector delivers the agent response to Signal, Slack, web, or another
+bound channel.
+
+Direct completion is the explicit exception. It sends the final task output as
+a notification to the selected destination without starting an LLM turn.
 
 ### Schedules (task factory)
 
@@ -320,7 +323,10 @@ class StepDefinition:
     name: str
     type: StepType             # "run" | "gate" | deterministic step type
     description: str
-    prompt: str                # objective for the step runner
+    prompt: str                # legacy detailed directive; still valid
+    objective: str | None      # concise active-step objective
+    responsibilities: list[str] # work owned by this step
+    defer_to: list[str]        # later steps that own deferred work
 
     # Optional deterministic precondition for any step type.
     when: str | None = None
@@ -359,6 +365,42 @@ types are specified in
 
 Deferred deterministic types include `notify` and `transform`.
 
+`objective`, `responsibilities`, and `defer_to` are additive. Existing
+definitions that only use `prompt` remain valid.
+
+Each `defer_to` value must name a later workflow step. A step cannot defer work
+to itself, an earlier step, or an unknown step.
+
+### Workflow prompt blocks
+
+The controller composes each isolated run-step request from typed blocks.
+`cognis/core/workflow_prompt.py` is the source of truth for these blocks.
+
+| Block | Model role | Lifetime | Owner |
+|---|---|---|---|
+| Workflow contract | System | Workflow | Controller |
+| User task contract | User | Workflow | Task creator |
+| Project context | User | Workflow | Project owner |
+| Active-step directive | System | Step | Workflow definition |
+| Input references | User | Step | Prior step outputs |
+| Responsibility guard | System | Step | Controller |
+| Reviewer or human feedback | User | Attempt | Reviewer or operator |
+| Completion contract | System | Step | Controller |
+
+User task text, project text, attachments, prior outputs, and feedback stay in
+user-role context. Controller rules stay in system-role context.
+
+Prior outputs and feedback use explicit untrusted provenance labels. The
+controller does not duplicate task text or prior deliverables inside one
+composed request.
+
+The responsibility guard names work owned now and work deferred downstream.
+It does not enforce path-level write restrictions. Completion metadata and
+later review can report boundary violations.
+
+The hidden workflow reminder contains only volatile tool-order guidance. It
+does not repeat the static task, responsibility, or completion contracts.
+
 ### StepInputConfig
 
 Controls what context flows from previous steps into this step.
@@ -367,6 +409,7 @@ Controls what context flows from previous steps into this step.
 class StepInputConfig:
     type: str              # "null" | "full" | "summary" | "last"
     source: str | list[str] | None = None
+    reuse_session_from: str | None = None
     # Step name or list of step names.
     # For "full": single step only.
     # For "summary"/"last": single or list.
@@ -723,6 +766,23 @@ Read-only deterministic tool calls may be retried after restart. Side-effecting
 tool calls must not be silently retried unless the tool exposes an idempotency
 contract and the same idempotency key can be reused safely.
 
+## Workflow Presentation and Task Cockpit
+
+Execution remains an ordered sequence of steps. User-facing **phases** group
+contiguous linked steps into readable sections without introducing another
+runtime state machine. The engine ignores phase presentation metadata; the task
+API derives phase state from the effective workflow definition, current step,
+latest `StepRun` projections, pending pause, and terminal task status.
+
+New task attempts pin the effective workflow definition in `WorkflowState`
+before executing the first step. Runtime resume and UI projection use the same
+pinned definition, so workflow edits cannot alter an in-flight task's step graph
+or make the Task Cockpit disagree with the executed workflow.
+
+The normative phase model, definition snapshot, task-summary projection, Task
+Cockpit, and workflow authoring UX are specified in
+[`37-workflow-task-cockpit.md`](37-workflow-task-cockpit.md).
+
 ### Step-local cognition tools
 
 Inside a step, the agent also has access to step-scoped task/todo tools:
@@ -747,9 +807,30 @@ The controller never infers workflow advancement from todo state alone. Only
 
 ## Step Input Context Assembly
 
-Each step always creates its own Intaris session. No session reuse across
-steps. This keeps audit boundaries clean and allows review loops to go
-back to any step without contamination.
+Each step creates its own `StepRun`, completion contract, deliverable, todos,
+status, and attempt. By default, it also creates its own conversation session.
+
+A run step can set `input.reuse_session_from` to an earlier run step that is
+also present in its input sources. The source and target must resolve to the
+same primary agent and runtime profile. The engine continues the source
+conversation/session and appends a compact target-step boundary. It injects
+only additional cross-session source outputs. It records canonical references
+instead of replaying source content already present in the continued session.
+
+Bundled workflows use this contract for primary-agent continuity. An isolated
+reviewer can run between two primary steps without breaking the primary
+session. Per-step tool profiles can change while the primary runtime profile
+stays stable.
+
+The source session stays idle while a reachable future reuse step references
+it. Task terminal cleanup closes all step sessions. Recovery can rotate an
+uncontinuable physical session inside the same conversation through the
+existing snapshot mechanism. Recovery does not create an unrelated
+conversation or copy hidden reasoning.
+
+`StepRun.runtime_info` records the reuse source, recovery reason, and inclusive
+event sequence boundaries. Evaluators use these boundaries when present and
+retain the legacy full-session fallback for old runs.
 
 ### How context is assembled per input type
 
@@ -962,8 +1043,9 @@ Note the distinction:
 When a step's evaluator returns "revise", the controller:
 1. Increments the step attempt counter
 2. Creates a new StepRun record for the new attempt
-3. Injects: original step prompt + evaluator feedback + previous attempt summary
-4. Agent runs the step again with the feedback
+3. Reuses the recorded session history without replaying task or input blocks
+4. Injects a small retry directive and any durable reviewer or operator feedback
+5. Agent runs the step again with the feedback
 
 This is bounded by `completion.max_attempts`.
 
@@ -1103,17 +1185,18 @@ steps:
     completion: {evaluate: false}
 ```
 
-**General Task** — one bounded execution step with semantic evaluation:
+**General Task** — one bounded execution step with deterministic completion metadata:
 ```yaml
 name: General Task
 steps:
   - name: execute
     type: run
     input: {type: "null"}
-    completion: {evaluate: true, max_attempts: 3, on_exhausted: gate}
+    metadata_contract: [result_status, verification]
+    completion: {evaluate: false}
 ```
 
-**Research** — plan, research, synthesize, evaluate:
+**Research** — one primary session across plan, evidence acquisition, and synthesis:
 ```yaml
 name: Research
 interaction:
@@ -1124,18 +1207,18 @@ steps:
     prompt: "Create a research plan..."
     allow_questions: true
     input: {type: "null"}
-    completion: {evaluate: true}
+    completion: {evaluate: false}
   - name: research
     type: run
     prompt: "Execute the research plan..."
-    input: {type: last, source: plan}
+    input: {type: last, source: plan, reuse_session_from: plan}
     # Research consumes the finalized plan output and gathers evidence
-    completion: {evaluate: true, max_attempts: 2}
+    completion: {evaluate: false}
   - name: synthesize
     type: run
     prompt: "Synthesize findings into a coherent report..."
-    input: {type: summary, source: [plan, research]}
-    completion: {evaluate: true}
+    input: {type: last, source: [plan, research], reuse_session_from: research}
+    completion: {evaluate: false}
 ```
 
 **Software Development** — full feature-oriented coding workflow:
@@ -1149,40 +1232,52 @@ steps:
     prompt: "Break down this task into implementation steps..."
     allow_questions: true
     input: {type: "null"}
-    completion: {evaluate: true, max_attempts: 2}
+    completion: {evaluate: false}
   - name: architect_review
     type: run
     prompt: "Review this plan as a proportional architecture and risk check..."
     input: {type: full, source: plan}
     # Reviewer sees the full plan output, including detailed content
-    completion: {evaluate: true}
-    on_reject: {target: plan, max_loop_iterations: 3, on_exhausted: gate}
+    completion: {evaluate: false}
+  - name: architect_review_route
+    type: condition
+    condition:
+      if: "steps.architect_review.metadata.decision == 'revise'"
+      then: plan
+      max_loop_iterations: 5
+      on_exhausted: gate
   - name: implement
     type: run
     prompt: "Implement the plan with tests and documentation..."
-    input: {type: summary, source: [plan, architect_review]}
+    input: {type: last, source: [plan, architect_review], reuse_session_from: plan}
     # Summary saves context window for actual coding work
-    completion: {evaluate: true, max_attempts: 3}
+    completion: {evaluate: false}
   - name: update_docs
     type: run
     prompt: "Update directly affected docs only when needed..."
-    input: {type: summary, source: implement}
+    input: {type: last, source: implement, reuse_session_from: implement}
     completion: {evaluate: false}
   - name: code_review
     type: run
     prompt: "Review the change for real defects, regressions, and meaningful gaps..."
     input: {type: summary, source: [plan, implement, update_docs]}
-    completion: {evaluate: true}
-    on_reject: {target: implement, max_loop_iterations: 3, on_exhausted: gate}
+    completion: {evaluate: false}
+  - name: code_review_route
+    type: condition
+    condition:
+      if: "steps.code_review.metadata.decision == 'revise'"
+      then: implement
+      max_loop_iterations: 5
+      on_exhausted: gate
   - name: commit
     type: run
     prompt: "Create a conventional commit..."
-    # input not specified → default: type=last, source=code_review
+    input: {type: last, source: [update_docs, code_review], reuse_session_from: update_docs}
     completion: {evaluate: false}
-  - name: update_memory
+  - name: remember
     type: run
     prompt: "Store key findings and decisions as memories..."
-    input: {type: last, source: [plan, implement, code_review]}
+    input: {type: last, source: [plan, implement, code_review, commit], reuse_session_from: commit}
     completion: {evaluate: false}
 ```
 

@@ -12,7 +12,9 @@ from cognis.store.queries import (
     create_task,
     create_task_comment,
     create_user,
+    list_pending_context_task_comments,
     list_task_comments,
+    mark_context_task_comment_applied,
 )
 
 
@@ -126,5 +128,86 @@ async def test_claim_pending_context_task_comments_claims_only_matching_context(
             await session.commit()
 
         assert claimed_again == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_context_comments_remain_pending_until_persistence_acknowledgement(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/task-comment-ack.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = create_session_factory(engine)
+
+    try:
+        async with session_factory() as session:
+            await create_user(session, "user@example.com", "User", "hash")
+            await create_agent(
+                session,
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent",
+            )
+            await create_task(
+                session,
+                task_id="task-1",
+                created_by="user@example.com",
+                agent_id="agent-1",
+                title="Task",
+                status="running",
+            )
+            first = await create_task_comment(
+                session,
+                task_id="task-1",
+                author_email="user@example.com",
+                body="First",
+                intent="context_only",
+                target_step="build",
+                attempt_number=1,
+            )
+            second = await create_task_comment(
+                session,
+                task_id="task-1",
+                author_email="user@example.com",
+                body="Second",
+                intent="context_only",
+                target_step="build",
+                attempt_number=1,
+            )
+            await session.commit()
+
+        async with session_factory() as session:
+            pending = await list_pending_context_task_comments(
+                session,
+                task_id="task-1",
+                step_name="build",
+                attempt_number=1,
+            )
+
+        assert [row.comment_id for row in pending] == [first.comment_id, second.comment_id]
+        assert all(row.applied is False for row in pending)
+
+        async with session_factory() as session:
+            applied = await mark_context_task_comment_applied(
+                session,
+                comment_id=first.comment_id,
+                step_name="build",
+                step_run_id="sr-1",
+                reason="before_first_model_call",
+            )
+            await session.commit()
+
+        assert applied is True
+        async with session_factory() as session:
+            remaining = await list_pending_context_task_comments(
+                session,
+                task_id="task-1",
+                step_name="build",
+                attempt_number=1,
+            )
+
+        assert [row.comment_id for row in remaining] == [second.comment_id]
     finally:
         await engine.dispose()

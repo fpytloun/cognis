@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -31,15 +33,19 @@ from cognis.store.database import create_engine, create_session_factory
 from cognis.store.queries import (
     create_agent,
     create_conversation,
+    create_executor,
     create_llm_provider,
     create_session,
     create_user,
     get_agent,
     get_conversation,
+    get_executor_row,
     get_llm_provider,
     get_user,
     update_agent,
     update_conversation_active_session,
+    update_executor,
+    update_executor_runtime_state,
     update_llm_provider,
     update_user,
     upsert_model_routing,
@@ -49,6 +55,8 @@ E2E_PROVIDER_ID = "e2e-mock-llm"
 E2E_AGENT_ID = "e2e-test-agent"
 E2E_CONVERSATION_ID = "conv_e2e_refresh_scenario"
 E2E_SESSION_ID = "sess_e2e_refresh_scenario"
+HA_EXECUTOR_IDS = ("ha-e2e-executor-1", "ha-e2e-executor-2")
+HA_EXECUTOR_LABELS = {"deployment": "ha-e2e", "role": "primary"}
 
 TEXT_ROUTE_TYPES = ("default", "classifier", "compaction", "evaluator")
 
@@ -76,6 +84,7 @@ async def _seed_provider(session: AsyncSession) -> None:
     llm_base_url = _env("COGNIS_LOCAL_LLM_BASE_URL", "http://mock-llm:8090/v1")
     chat_model = _env("COGNIS_LOCAL_CHAT_MODEL", "mock-model")
 
+    ha_mode = _env("COGNIS_HA_E2E_SEED").lower() in {"1", "true", "yes", "on"}
     provider_config = {
         "scope": "system",
         "preset": "litellm_proxy",
@@ -91,9 +100,20 @@ async def _seed_provider(session: AsyncSession) -> None:
                 "context_window": 131072,
                 "max_output_tokens": 8192,
                 "tier": "cheap",
-            }
+            },
+            {
+                "model_id": "mock-embedding",
+                "display_name": "Mock Embedding (e2e)",
+                "supports_tools": False,
+                "supports_streaming": False,
+                "supports_reasoning": False,
+                "context_window": 8192,
+                "max_output_tokens": 0,
+                "tier": "cheap",
+            },
         ],
         "auth_config": {"mode": "env", "env_var": "COGNIS_LOCAL_LLM_API_KEY"},
+        **({"executor_id": HA_EXECUTOR_IDS[0]} if ha_mode else {}),
     }
 
     existing = await get_llm_provider(session, E2E_PROVIDER_ID)
@@ -102,7 +122,7 @@ async def _seed_provider(session: AsyncSession) -> None:
             session,
             provider_id=E2E_PROVIDER_ID,
             display_name="Mock LLM (e2e testing)",
-            location="controller",
+            location="executor" if ha_mode else "controller",
             backend="litellm",
             owner_email=SYSTEM_USER_EMAIL,
             config=provider_config,
@@ -114,7 +134,7 @@ async def _seed_provider(session: AsyncSession) -> None:
             session,
             E2E_PROVIDER_ID,
             display_name="Mock LLM (e2e testing)",
-            location="controller",
+            location="executor" if ha_mode else "controller",
             backend="litellm",
             owner_email=SYSTEM_USER_EMAIL,
             config=provider_config,
@@ -134,7 +154,15 @@ async def _seed_model_routing(session: AsyncSession) -> None:
             owner_email=SYSTEM_USER_EMAIL,
             config=None,
         )
-    print(f"Seeded e2e model routing for: {', '.join(TEXT_ROUTE_TYPES)}")
+    await upsert_model_routing(
+        session,
+        task_type="embedding",
+        provider_id=E2E_PROVIDER_ID,
+        model="mock-embedding",
+        owner_email=SYSTEM_USER_EMAIL,
+        config=None,
+    )
+    print(f"Seeded e2e model routing for: {', '.join((*TEXT_ROUTE_TYPES, 'embedding'))}")
 
 
 async def _seed_agent(session: AsyncSession) -> None:
@@ -171,7 +199,11 @@ async def _seed_agent(session: AsyncSession) -> None:
             "tool_permissions": {"*": "allow"},
             "can_delegate": False,
         },
-        "execution": {"executor_id": "local-compose-executor"},
+        "execution": (
+            {"executor_selector": HA_EXECUTOR_LABELS}
+            if _env("COGNIS_HA_E2E_SEED").lower() in {"1", "true", "yes", "on"}
+            else {"executor_id": "local-compose-executor"}
+        ),
         "llm_config": {"provider_id": E2E_PROVIDER_ID, "model": chat_model},
         "agent_type": "primary",
         "status": "active",
@@ -196,6 +228,91 @@ async def _seed_agent(session: AsyncSession) -> None:
             },
         )
         print(f"Updated e2e agent: {E2E_AGENT_ID}")
+
+
+def _write_executor_token(executor_id: str, token: str) -> None:
+    token_dir = Path(_env("COGNIS_HA_EXECUTOR_TOKEN_DIR", "/run/cognis-ha-executors"))
+    executor_uid = int(_env("COGNIS_HA_EXECUTOR_TOKEN_UID", "1000"))
+    executor_gid = int(_env("COGNIS_HA_EXECUTOR_TOKEN_GID", "1000"))
+    token_dir.mkdir(parents=True, exist_ok=True)
+    os.chown(token_dir, executor_uid, executor_gid)
+    token_dir.chmod(stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+    path = token_dir / f"executor-{executor_id.rsplit('-', 1)[-1]}.env"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        "\n".join(
+            (
+                f"COGNIS_EXECUTOR_TOKEN={token}",
+                "COGNIS_EXECUTOR_WORKDIR=/home/cognis/workspace",
+                "COGNIS_EXECUTOR_ALLOW_INSECURE_WS=1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    os.chown(temporary, executor_uid, executor_gid)
+    temporary.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+    temporary.replace(path)
+
+
+async def _seed_ha_executors(
+    session: AsyncSession,
+    auth_provider: JWTAuthProvider,
+) -> None:
+    if _env("COGNIS_HA_E2E_SEED").lower() not in {"1", "true", "yes", "on"}:
+        return
+    admin_email = _env("COGNIS_LOCAL_ADMIN_EMAIL", "admin@cognis-e2e.localdev.me")
+    for index, executor_id in enumerate(HA_EXECUTOR_IDS, start=1):
+        labels = HA_EXECUTOR_LABELS
+        if index == 2:
+            labels = {"deployment": "ha-e2e", "role": "standby"}
+        existing = await get_executor_row(session, executor_id)
+        if existing is None:
+            row = await create_executor(
+                session,
+                executor_id=executor_id,
+                name=f"HA E2E Executor {index}",
+                executor_type="websocket",
+                labels=labels,
+                enabled_tools=["bash"],
+                enabled_tool_groups=["shell"],
+                config={},
+                is_default=False,
+                owner_email=admin_email,
+                shared=True,
+            )
+            row.desired_config_version = 1
+            row.runtime_state = "stale"
+        else:
+            await update_executor(
+                session,
+                executor_id,
+                owner_email=admin_email,
+                include_shared=True,
+                name=f"HA E2E Executor {index}",
+                executor_type="websocket",
+                labels=labels,
+                enabled_tools=["bash"],
+                enabled_tool_groups=["shell"],
+                config={},
+                is_default=False,
+                shared=True,
+            )
+            await update_executor_runtime_state(
+                session,
+                executor_id,
+                desired_config_version=max(int(existing.desired_config_version or 0), 1) + 1,
+                runtime_state="stale",
+            )
+            row = existing
+        _write_executor_token(
+            executor_id,
+            auth_provider.sign_executor_token(
+                executor_id,
+                token_version=int(row.token_version or 0),
+            ),
+        )
+        print(f"Seeded HA e2e executor: {executor_id}")
 
 
 async def _seed_refresh_conversation(
@@ -310,6 +427,7 @@ async def _seed() -> None:
     try:
         async with session_factory() as session:
             await _seed_user(session, password_hasher)
+            await _seed_ha_executors(session, auth_provider)
             await _seed_provider(session)
             await _seed_model_routing(session)
             await _seed_agent(session)

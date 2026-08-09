@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="800" viewBox="0 0 1160 800" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}.amber{fill:#f5b544}
+      .user{fill:#0e6ba8}.pribtn{fill:#38bdf8}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .dim{fill:#0a121b;opacity:0.55}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="800"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">04 · Task Control Chat — DOCKED DRAWER (desktop) with inline decision</text>
+  <text x="28" y="54" class="m" font-size="12">Replaces the full-screen iframe overlay that hides navigation. The drawer keeps the cockpit visible and lets the user ACT without leaving.</text>
+
+  <!-- cockpit behind (dimmed) -->
+  <rect x="28" y="70" width="700" height="700" class="panel" rx="10"/>
+  <rect x="28" y="70" width="700" height="700" class="dim" rx="10"/>
+  <text x="48" y="104" class="m" font-size="13">Task Cockpit (remains mounted &amp; scrollable behind the drawer)</text>
+  <rect x="48" y="120" width="660" height="60" class="sub" rx="8"/><text x="64" y="156" class="m" font-size="12">Header · Objective · Attention hero still here</text>
+  <rect x="48" y="192" width="660" height="120" class="sub" rx="8"/><text x="64" y="230" class="m" font-size="12">Workflow phases</text>
+  <text x="48" y="360" class="cap" font-size="11">App navigation (sidebar / bottom bar) stays available — not hidden.</text>
+
+  <!-- DRAWER (right docked) -->
+  <rect x="744" y="70" width="388" height="700" class="panel" rx="12" stroke="#38bdf8"/>
+  <!-- drawer header -->
+  <rect x="744" y="70" width="388" height="70" class="sub" rx="12"/>
+  <text x="762" y="98" class="lbl" font-size="13">Release safety review</text>
+  <rect x="960" y="82" width="60" height="22" rx="11" class="att"/><text x="972" y="97" class="amber" font-size="10" font-weight="700">PAUSED</text>
+  <text x="762" y="118" class="amber" font-size="11">Attention required: gate</text>
+  <text x="1108" y="98" class="m" font-size="16" text-anchor="end">✕</text>
+  <!-- tabs -->
+  <rect x="762" y="150" width="80" height="28" rx="8" class="acbg"/><text x="784" y="169" class="ac" font-size="11" font-weight="700">Chat</text>
+  <rect x="850" y="150" width="80" height="28" rx="8" class="sub"/><text x="874" y="169" class="m" font-size="11">Work</text>
+  <circle cx="1112" cy="164" r="10" class="callout"/><text x="1108" y="168" class="cnum" font-size="11">1</text>
+
+  <!-- inline decision card at top of drawer -->
+  <rect x="762" y="190" width="352" height="150" class="att" rx="10"/>
+  <text x="778" y="212" class="amber" font-size="10" font-weight="700" letter-spacing="1.5">GATE · DECIDE HERE</text>
+  <text x="778" y="234" class="t" font-size="13" font-weight="700">Approve this release for production?</text>
+  <text x="778" y="254" class="cap" font-size="10">✓ checks passed · 12 tests · 1 file changed</text>
+  <rect x="778" y="266" width="150" height="26" rx="7" class="sub"/><text x="792" y="283" class="m" font-size="10">Optional instruction…</text>
+  <rect x="778" y="300" width="150" height="30" rx="8" class="pribtn"/><text x="812" y="320" class="bg" font-size="11" font-weight="700">Approve</text>
+  <rect x="938" y="300" width="90" height="30" rx="8" class="panel" stroke="#f5b544"/><text x="952" y="320" class="amber" font-size="10">Reject</text>
+  <rect x="1038" y="300" width="70" height="30" rx="8" class="sub"/><text x="1050" y="320" class="m" font-size="10">Stop</text>
+  <circle cx="1112" cy="215" r="10" class="callout"/><text x="1108" y="219" class="cnum" font-size="11">2</text>
+
+  <!-- chat transcript -->
+  <rect x="912" y="360" width="202" height="40" rx="10" class="user"/><text x="928" y="384" class="t" font-size="11">What is blocking this release?</text>
+  <rect x="762" y="410" width="300" height="60" rx="10" class="sub"/>
+  <text x="778" y="432" class="t" font-size="11">The release is waiting for your</text>
+  <text x="778" y="448" class="t" font-size="11">approval. Deterministic evidence</text>
+  <text x="778" y="464" class="t" font-size="11">passed; no implementation error.</text>
+  <circle cx="1112" cy="440" r="10" class="callout"/><text x="1108" y="444" class="cnum" font-size="11">3</text>
+
+  <!-- composer -->
+  <rect x="762" y="716" width="352" height="40" rx="20" class="sub"/>
+  <text x="784" y="740" class="m" font-size="12">Message agent-stage39…</text>
+  <circle cx="1088" cy="736" r="6" class="m"/><circle cx="1104" cy="736" r="6" class="m"/>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="470" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="492" class="note" font-size="12">1 One drawer, two tabs (Chat · Work) — the SAME WorkView/chat components used everywhere. Removes the</text>
+  <text x="44" y="510" class="note" font-size="12">"Work / Full chat" duplicate links in the current overlay header and the second in-frame "Work" button.</text>
+  <text x="28" y="534" class="note" font-size="12">2 The pending gate is resolvable INSIDE the drawer. Current build lets the user only ask "what is blocking"</text>
+  <text x="44" y="552" class="note" font-size="12">but forces them to leave to approve — control chat that cannot control. Fixed: same decision component as §02.</text>
+  <text x="28" y="576" class="note" font-size="12">3 Docked (not full-screen iframe): the cockpit stays mounted, app nav stays visible, no CSP/iframe fragility.</text>
+  <text x="44" y="594" class="note" font-size="12">On mobile the drawer becomes a full-screen Sheet (see 05) with the same decision card pinned to the top.</text>
+  <text x="28" y="626" class="note" font-size="12">Preserves persistence contract: reopening restores prior transcript; Star/Archive/Delete remain suppressed in</text>
+  <text x="44" y="644" class="note" font-size="12">task-control mode; Search/Info/Work retained. No new chat/intervention model is introduced.</text>
+</svg>

@@ -317,6 +317,50 @@ def test_middleware_rate_limit_applies_across_different_write_routes(
         )
 
 
+def test_client_performance_endpoint_uses_authenticated_write_rate_limit(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        app.state.api_rate_limiter.update_limits(
+            read_requests_per_minute=5,
+            write_requests_per_minute=1,
+        )
+        headers = _auth_headers(app, email="user@example.com")
+        payload = {"metric": "cached_restore_ms", "duration_ms": 12.5}
+
+        assert (
+            client.post(
+                "/api/v1/chat/v2/client-performance",
+                headers=headers,
+                json=payload,
+            ).status_code
+            == 204
+        )
+        assert (
+            client.post(
+                "/api/v1/chat/v2/client-performance",
+                headers=headers,
+                json=payload,
+            ).status_code
+            == 429
+        )
+
+
 def test_middleware_rejects_invalid_api_key(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         response = client.get("/api/auth/me", headers={"X-API-Key": "cognis_bad_bad"})

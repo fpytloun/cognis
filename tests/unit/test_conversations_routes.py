@@ -26,6 +26,7 @@ from cognis.store.queries import (
     get_conversation,
     get_user_ui_state_value,
     update_conversation_active_session,
+    update_managed_conversation_link,
 )
 
 
@@ -164,6 +165,153 @@ def test_create_conversation_emits_sidebar_upsert(monkeypatch: object, tmp_path:
         assert response.status_code == 200
         conversation_id = response.json()["conversation_id"]
         _assert_sidebar_upsert_call(send_sidebar_update, conversation_id)
+
+
+def test_sidebar_projects_open_managed_work_and_active_delegations(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def _seed() -> tuple[str, str, str]:
+            await _seed_user_and_agent(app)
+            async with app.state.session_factory() as session:
+                controller = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Controller",
+                )
+                parent = await create_session(
+                    session,
+                    controller.conversation_id,
+                    "user@example.com",
+                    "agent-chat",
+                    session_id="sess_parent",
+                )
+                controller.active_session_id = parent.session_id
+                await session.flush()
+                await create_session(
+                    session,
+                    controller.conversation_id,
+                    "user@example.com",
+                    "agent-chat",
+                    session_id="sess_delegate",
+                    parent_session_id=parent.session_id,
+                    activity_scope_id=parent.activity_scope_id,
+                    delegation_mode="delegate",
+                    delegation_task="Inspect active work",
+                )
+                target = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="agent_work",
+                    title="Managed target",
+                )
+                link = await create_managed_conversation_link(
+                    session,
+                    user_email="user@example.com",
+                    controller_agent_id="agent-chat",
+                    controller_conversation_id=controller.conversation_id,
+                    controller_session_id=parent.session_id,
+                    target_agent_id="agent-chat",
+                    target_conversation_id=target.conversation_id,
+                    target_session_id=None,
+                    title="Managed target",
+                )
+                await session.commit()
+                return controller.conversation_id, target.conversation_id, link.link_id
+
+        controller_id, target_id, link_id = asyncio.run(_seed())
+        scheduler_durable_running = app.state.turn_scheduler.durable_running_turn_state
+        scheduler_durable_running_many = app.state.turn_scheduler.durable_running_turn_states
+
+        async def _durable_running_turn_state(conversation_id: str):
+            if conversation_id == target_id:
+                return {"turn_id": "turn_live"}
+            return await scheduler_durable_running(conversation_id)
+
+        app.state.turn_scheduler.durable_running_turn_state = _durable_running_turn_state
+
+        async def _durable_running_turn_states(conversation_ids: list[str]):
+            states = await scheduler_durable_running_many(conversation_ids)
+            if target_id in conversation_ids:
+                states[target_id] = {"turn_id": "turn_live"}
+            return states
+
+        app.state.turn_scheduler.durable_running_turn_states = _durable_running_turn_states
+        response = client.get(
+            "/api/v1/conversations/sidebar",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        background_work = response.json()["background_work"]
+        assert background_work["active_count"] == 2
+        assert background_work["truncated"] is False
+        assert {
+            (item["kind"], item["controller_conversation_id"], item["status"])
+            for item in background_work["items"]
+        } == {
+            ("delegated_session", controller_id, "active"),
+            ("managed_conversation", controller_id, "running"),
+        }
+        managed = next(
+            item for item in background_work["items"] if item["kind"] == "managed_conversation"
+        )
+        assert managed["target_conversation_id"] == target_id
+
+        async def _leave_stale_running_state() -> None:
+            async with app.state.session_factory() as session:
+                await update_managed_conversation_link(
+                    session,
+                    link_id,
+                    turn_state="running",
+                    active_turn_id="turn_stale",
+                )
+                await session.commit()
+
+        asyncio.run(_leave_stale_running_state())
+        app.state.turn_scheduler.durable_running_turn_state = scheduler_durable_running
+        app.state.turn_scheduler.durable_running_turn_states = scheduler_durable_running_many
+        idle_response = client.get(
+            "/api/v1/conversations/sidebar",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert idle_response.status_code == 200
+        idle_background_work = idle_response.json()["background_work"]
+        assert idle_background_work["active_count"] == 1
+        idle_managed = next(
+            item for item in idle_background_work["items"] if item["kind"] == "managed_conversation"
+        )
+        assert idle_managed["status"] == "active"
+
+        async def _settle_cancelled_turn() -> None:
+            async with app.state.session_factory() as session:
+                await update_managed_conversation_link(
+                    session,
+                    link_id,
+                    turn_state="interrupted",
+                    clear_active_turn_id=True,
+                    last_error="The turn was cancelled",
+                )
+                await session.commit()
+
+        asyncio.run(_settle_cancelled_turn())
+        cancelled_response = client.get(
+            "/api/v1/conversations/sidebar",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert cancelled_response.status_code == 200
+        cancelled_managed = next(
+            item
+            for item in cancelled_response.json()["background_work"]["items"]
+            if item["kind"] == "managed_conversation"
+        )
+        assert cancelled_managed["status"] == "cancelled"
 
 
 def test_update_conversation_title_star_archive_and_project_emit_sidebar_upserts(

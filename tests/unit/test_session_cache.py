@@ -1,15 +1,160 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
 from cognis.core.project_context import (
     ProjectContextEntry,
+    ProjectMetadataEntry,
     normalize_project_path,
     project_context_event_data,
 )
+from cognis.core.redis_service import RedisService
 from cognis.core.session_cache import SessionCache
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
+
+
+@pytest.mark.asyncio
+async def test_session_cache_closes_only_owned_redis_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    injected = RedisService("")
+    injected_close = AsyncMock()
+    monkeypatch.setattr(injected, "aclose", injected_close)
+    injected_cache = SessionCache(_Guardrails(), redis_service=injected)
+
+    await injected_cache.aclose()
+
+    injected_close.assert_not_awaited()
+
+    owned_close = AsyncMock()
+    monkeypatch.setattr("cognis.core.session_cache.RedisService.aclose", owned_close)
+    owned_cache = SessionCache(_Guardrails(), redis_url="redis://localhost")
+
+    await owned_cache.aclose()
+
+    owned_close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_session_cache_uses_byte_payloads_with_injected_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RedisService("")
+    redis_set = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "set", redis_set)
+    cache = SessionCache(_Guardrails(), redis_service=service, redis_ttl_seconds=45)
+
+    await cache.refresh(_session("session-bytes"))
+
+    key, payload = redis_set.await_args.args
+    assert key == "cognis:session-cache:v2:session-bytes"
+    assert isinstance(payload, bytes)
+    assert redis_set.await_args.kwargs == {"ttl_seconds": 45}
+
+
+@pytest.mark.asyncio
+async def test_session_cache_classifies_redis_read_failure_as_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RedisService("")
+    service.configured = True
+    redis_get = AsyncMock(return_value=None)
+    monkeypatch.setattr(service, "get", redis_get)
+    error_inc = Mock()
+    miss_inc = Mock()
+    monkeypatch.setattr(
+        "cognis.core.session_cache.REDIS_ERRORS",
+        SimpleNamespace(inc=error_inc),
+    )
+    monkeypatch.setattr(
+        "cognis.core.session_cache.REDIS_MISSES",
+        SimpleNamespace(inc=miss_inc),
+    )
+    cache = SessionCache(_Guardrails(), redis_service=service)
+
+    assert await cache._redis_get("session-failed") is None  # noqa: SLF001
+
+    error_inc.assert_called_once_with()
+    miss_inc.assert_not_called()
+    redis_get.assert_awaited_once_with("cognis:session-cache:v2:session-failed")
+
+
+@pytest.mark.asyncio
+async def test_local_eviction_waits_for_locked_entry_without_touching_redis() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-locked")
+    entry = await cache.refresh(session)
+    redis_delete = AsyncMock()
+    cache._redis_delete = redis_delete  # type: ignore[method-assign]  # noqa: SLF001
+
+    await entry.lock.acquire()
+    try:
+        assert not await cache.evict_local(session.session_id)
+        assert cache.get_entry(session.session_id) is entry
+        eviction_task = cache._local_eviction_tasks[session.session_id]  # noqa: SLF001
+    finally:
+        entry.lock.release()
+
+    await asyncio.wait_for(eviction_task, timeout=1)
+    assert cache.get_entry(session.session_id) is None
+    redis_delete.assert_not_awaited()
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+async def test_canonical_invalidation_preserves_ephemeral_session_overrides() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-overrides")
+    entry = await cache.refresh(session)
+    entry.model_override = "openai/test-model"
+    entry.model_override_provider_id = "provider-1"
+    entry.reasoning_effort_override = "high"
+    entry.loaded_skill_ids = {"skill-1"}
+    entry.activated_skill_ids = {"skill-1"}
+    entry.last_tool_runtime_info = {"executor_id": "executor-1"}
+    entry.discovered_tool_handles = {"tool-1": object()}  # type: ignore[dict-item]
+    project_metadata = ProjectMetadataEntry(
+        project_id="project-1",
+        project_name="Project One",
+        content="Metadata",
+        content_hash="metadata-hash",
+        seq=12,
+    )
+    project_context = ProjectContextEntry(
+        project_root="/workspace/project-1",
+        source_path="/workspace/project-1/AGENTS.md",
+        content="Instructions",
+        content_hash="instructions-hash",
+        seq=13,
+    )
+    entry.project_metadata_contexts = {"project-1": project_metadata}
+    entry.project_contexts = {project_context.project_root: project_context}
+
+    assert await cache.invalidate_canonical(session.session_id)
+    assert entry.canonical_stale
+    assert entry.events == []
+    assert entry.last_event_seq == 0
+    assert entry.discovered_tool_handles == {}
+    assert entry.project_metadata_contexts == {"project-1": project_metadata}
+    assert entry.project_contexts == {project_context.project_root: project_context}
+    refreshed = await cache.refresh(session)
+
+    assert refreshed is entry
+    assert not refreshed.canonical_stale
+    assert refreshed.model_override == "openai/test-model"
+    assert refreshed.model_override_provider_id == "provider-1"
+    assert refreshed.reasoning_effort_override == "high"
+    assert refreshed.loaded_skill_ids == {"skill-1"}
+    assert refreshed.activated_skill_ids == {"skill-1"}
+    assert refreshed.last_tool_runtime_info == {"executor_id": "executor-1"}
+    assert refreshed.project_metadata_contexts == {"project-1": project_metadata}
+    assert refreshed.project_contexts == {project_context.project_root: project_context}
+    await cache.aclose()
 
 
 class _Guardrails:
@@ -417,13 +562,14 @@ class _GapGuardrails:
 
 
 @pytest.mark.asyncio
-async def test_session_cache_gap_deferred_append_backfills_missing_seqs() -> None:
-    """A seq gap on append must not permanently skip externally written events.
+async def test_session_cache_gap_append_backfills_missing_seqs_before_publish() -> None:
+    """A seq gap on append must repair the cache before another replica reads it.
 
     Scenario: a delegation-completed event is written directly to Intaris
     (seq 6, bypassing the cache) while the parent turn's next flush lands at
-    seqs 7-8. Advancing the watermark to 8 would make warm refresh
-    (after_seq=8) skip seq 6 forever.
+    seqs 7-8. Advancing the watermark to 8 would make a warm refresh
+    (after_seq=8) skip seq 6 forever. Deferring repair until a later request
+    exposes a partial timeline to another controller replica.
     """
     guardrails = _GapGuardrails()
     cache = SessionCache(guardrails, max_entries=10)
@@ -431,7 +577,7 @@ async def test_session_cache_gap_deferred_append_backfills_missing_seqs() -> Non
     await cache.refresh(session)  # cold load, watermark=4
 
     # Parent flush lands at seqs 7-8 — seq 6 was written by another writer.
-    await cache.append_recorded_events(
+    entry = await cache.append_recorded_events(
         session,
         [
             SessionEvent(type="tool_result", data={"name": "delegate"}),
@@ -440,15 +586,33 @@ async def test_session_cache_gap_deferred_append_backfills_missing_seqs() -> Non
         EventAppendResult(ok=True, count=2, first_seq=7, last_seq=8),
     )
 
-    entry = await cache.refresh(session)
-
-    # Warm refresh fetched after the deferred watermark (4), not after 8.
+    # The immediate repair reads after the contiguous watermark (4), not 8.
     assert guardrails.calls == [0, 4]
     seqs = [event.seq for event in cache.get_events_since_compaction(session.session_id)]
     assert seqs == [3, 4, 6, 7, 8]
     assert entry.last_event_seq == 8
     # No duplicates from the re-fetched seqs 7-8.
     assert len(seqs) == len(set(seqs))
+
+
+@pytest.mark.asyncio
+async def test_session_cache_failed_gap_backfill_marks_canonical_state_stale() -> None:
+    guardrails = _GapGuardrails()
+    cache = SessionCache(guardrails, max_entries=10)
+    session = _session()
+    await cache.refresh(session)
+
+    async def failed_refresh(_session):
+        raise RuntimeError("Intaris unavailable")
+
+    cache.refresh = failed_refresh
+    entry = await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="assistant_message", data={"content": "later"})],
+        EventAppendResult(ok=True, count=1, first_seq=7, last_seq=7),
+    )
+
+    assert entry.canonical_stale is True
 
 
 @pytest.mark.asyncio
@@ -607,6 +771,29 @@ async def test_session_cache_tracks_discovered_tool_handles_from_lifecycle_event
     )
 
     assert "mcp:googleworkspace:get_events" in cache.get_discovered_tool_ids(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_session_cache_resets_transient_tools_at_step_boundary() -> None:
+    cache = SessionCache(_Guardrails(), max_entries=10)
+    session = _session("session-step-boundary")
+    entry = await cache.refresh(session)
+    entry.activated_skill_ids = {"planning"}
+    entry.activated_skill_tool_ids_by_skill = {"planning": {"tool:planning"}}
+    entry.activated_skill_tool_ids = {"tool:planning"}
+    entry.discovered_tool_handles = {"tool:planning": {"name": "planning"}}
+    entry.classified_inventory = {"tool:planning": "dynamic"}
+    entry.skill_tool_classifications = {"planning": {"tool:planning": "dynamic"}}
+    entry.last_tool_runtime_info = {"executor_id": "executor-1"}
+
+    assert await cache.reset_step_tool_state(session.session_id)
+
+    assert entry.activated_skill_ids == set()
+    assert entry.activated_skill_tool_ids == set()
+    assert entry.discovered_tool_handles == {}
+    assert entry.classified_inventory == {}
+    assert entry.skill_tool_classifications == {}
+    assert entry.last_tool_runtime_info == {}
 
 
 @pytest.mark.asyncio

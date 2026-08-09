@@ -169,7 +169,9 @@ docker run -d \
 
 For a local non-TLS controller, use `ws://localhost:8080/api/executor/ws` only with local networking. Remote executors should use `wss://`.
 
-See [Deployment](docs/guide/deployment.md) for production notes, systemd, backups, TLS, and multi-user hardening.
+See [Deployment](docs/guide/deployment.md) for production notes, and
+[High Availability](docs/guide/high-availability.md) for Helm topology,
+rolling upgrades, failure semantics, and the operator checklist.
 
 ## Configuration
 
@@ -276,6 +278,7 @@ Still ahead:
 - [Channels](docs/guide/channels.md)
 - [Executors](docs/guide/executors.md)
 - [Deployment](docs/guide/deployment.md)
+- [High Availability](docs/guide/high-availability.md)
 - [Security and Privacy](docs/guide/security-and-privacy.md)
 - [Troubleshooting](docs/guide/troubleshooting.md)
 - [Internal Design Specs](docs/specs/README.md)

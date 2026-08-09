@@ -369,6 +369,45 @@ async def test_background_reconcile_failure_marks_executor_blocked(
 
 
 @pytest.mark.asyncio
+async def test_schedule_executor_reconfigure_forwards_to_connection_owner() -> None:
+    calls: list[tuple[str, dict[str, str], float]] = []
+
+    class _ForwardedConnection:
+        async def rpc_call(
+            self,
+            method: str,
+            params: dict[str, str],
+            *,
+            timeout: float,
+        ) -> object:
+            calls.append((method, params, timeout))
+            return {"ok": True}
+
+    forwarded = _ForwardedConnection()
+    websocket = SimpleNamespace(
+        get_connection=lambda _executor_id: forwarded,
+        get_local_connection=lambda _executor_id: None,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            providers=SimpleNamespace(executor=SimpleNamespace(websocket=websocket)),
+        )
+    )
+
+    executor_runtime.schedule_executor_reconfigure(app, "remote-1")
+    task = app.state.executor_reconcile_tasks["remote-1"]
+    await asyncio.wait_for(task, timeout=1)
+
+    assert calls == [
+        (
+            "executor.reconcile",
+            {"executor_id": "remote-1"},
+            executor_runtime.CONFIGURE_RPC_TIMEOUT_SECONDS,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_schedule_executor_reconfigure_replays_update_arriving_during_active_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

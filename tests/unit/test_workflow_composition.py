@@ -6,11 +6,18 @@ import json
 import pytest
 
 from cognis.core.workflow_composition import (
+    COMPOSED_WORKFLOW_PREVIEW_ID,
     SkillMaterial,
     compose_workflow_plan,
     decompose_skill_material,
     validate_composed_workflow,
+    workflow_payload_for_persistence,
     workflow_preview_payload,
+)
+from cognis.tools.builtin.orchestration import (
+    COMPOSE_AND_RUN_WORKFLOW_TOOL,
+    CREATE_WORKFLOW_TOOL,
+    UPDATE_WORKFLOW_TOOL,
 )
 
 
@@ -44,6 +51,51 @@ class _SlowLLM:
         self.calls.append({"messages": messages, **kwargs})
         await asyncio.sleep(1)
         return {"choices": [{"message": {"content": json.dumps({"rationale": "", "steps": []})}}]}
+
+
+def test_composition_tool_directs_ordinary_work_to_standard_tools() -> None:
+    description = COMPOSE_AND_RUN_WORKFLOW_TOOL.description
+    properties = COMPOSE_AND_RUN_WORKFLOW_TOOL.parameters["properties"]
+
+    assert "Advanced, rare operation" in description
+    assert "Use create_task" in description
+    assert "manage_schedules" in description
+    assert "immediately trigger a schedule" in description
+    assert "force_compose" not in properties
+    assert "ordinary schedule creation" in properties["schedule"]["description"]
+
+
+def test_preview_workflow_id_is_never_persisted() -> None:
+    workflow = validate_composed_workflow(
+        {
+            "workflow_id": COMPOSED_WORKFLOW_PREVIEW_ID,
+            "name": "Preview",
+            "description": "",
+            "lifecycle": "persistent",
+            "steps": [{"name": "run", "type": "run", "prompt": "Do the work."}],
+        },
+        skill_materials=[],
+    )
+
+    payload = workflow_payload_for_persistence(workflow)
+
+    assert payload["workflow_id"] is None
+    assert workflow.workflow_id == COMPOSED_WORKFLOW_PREVIEW_ID
+
+
+def test_composer_supplied_workflow_id_is_never_persisted() -> None:
+    workflow = validate_composed_workflow(
+        {
+            "workflow_id": "wf_stable_composer_guess",
+            "name": "Composed",
+            "description": "",
+            "lifecycle": "persistent",
+            "steps": [{"name": "run", "type": "run", "prompt": "Do the work."}],
+        },
+        skill_materials=[],
+    )
+
+    assert workflow_payload_for_persistence(workflow)["workflow_id"] is None
 
 
 def test_validate_composed_workflow_accepts_lifecycle_and_lineage() -> None:
@@ -96,6 +148,39 @@ def test_workflow_preview_payload_uses_step_names() -> None:
 
     assert preview["name"] == "Daily Brief"
     assert preview["steps"] == ["collect", "brief"]
+    assert preview["phases"] == []
+
+
+def test_composed_workflow_round_trips_presentation_into_preview() -> None:
+    workflow = validate_composed_workflow(
+        {
+            "workflow_id": "wf_phased",
+            "name": "Phased",
+            "steps": [
+                {"name": "collect", "type": "run"},
+                {"name": "deliver", "type": "run"},
+            ],
+            "presentation": {
+                "phases": [
+                    {"id": "prepare", "title": "Prepare", "step_names": ["collect"]},
+                    {"id": "deliver", "title": "Deliver", "step_names": ["deliver"]},
+                ]
+            },
+        }
+    )
+
+    assert workflow_preview_payload(workflow)["phases"] == [
+        {"id": "prepare", "title": "Prepare", "step_names": ["collect"]},
+        {"id": "deliver", "title": "Deliver", "step_names": ["deliver"]},
+    ]
+
+
+def test_agent_workflow_tools_expose_phase_capable_presentation_schema() -> None:
+    for tool in (CREATE_WORKFLOW_TOOL, UPDATE_WORKFLOW_TOOL):
+        presentation = tool.parameters["properties"]["presentation"]
+        assert presentation["required"] == ["phases"]
+        phase = presentation["properties"]["phases"]["items"]
+        assert phase["required"] == ["id", "title", "step_names"]
 
 
 def test_decompose_skill_material_requests_provider_json_mode_once() -> None:

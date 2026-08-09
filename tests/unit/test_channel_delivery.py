@@ -38,6 +38,9 @@ class _Manager:
 
 
 class _Session:
+    async def get(self, _model: object, _identifier: object) -> None:
+        return None
+
     async def commit(self) -> None:
         return None
 
@@ -263,6 +266,7 @@ async def test_materialize_media_attachment_loads_artifact_bytes(
                     "object_id": "doc_1",
                     "filename": "report.pdf",
                     "mime_type": "application/pdf",
+                    "size_bytes": 9,
                 },
             )()
         ),
@@ -342,10 +346,9 @@ async def test_materialize_media_attachment_falls_back_to_artifact_link_on_failu
         conversation_id="conv-1",
     )
 
-    assert media is not None
-    assert materialized is True
-    assert fallback_text is None
-    assert media.url == "https://cognis.example.com/diagram.png"
+    assert media is None
+    assert materialized is False
+    assert fallback_text == "[Attachment unavailable: diagram.png]"
 
 
 @pytest.mark.asyncio
@@ -466,6 +469,13 @@ async def test_deliver_outbox_sends_attachment_only_follow_up(
                     "chat_id": "chat-1",
                     "thread_id": None,
                     "conversation_id": "conv-1",
+                    "source_type": "follow_up",
+                    "attachments_json": None,
+                    "deliverable_id": None,
+                    "fallback_text": None,
+                    "completed_chunk_count": 0,
+                    "projection_digest": None,
+                    "projected_chunk_count": None,
                 },
             )()
         ),
@@ -523,8 +533,13 @@ async def test_deliver_outbox_keeps_partial_multipart_delivery_retryable(
             "chat_id": "room-1",
             "thread_id": None,
             "conversation_id": "conv-1",
+            "source_type": "follow_up",
+            "attachments_json": None,
+            "deliverable_id": None,
+            "fallback_text": None,
             "completed_chunk_count": 2,
             "projection_digest": "digest",
+            "projected_chunk_count": 3,
         },
     )()
     claim = AsyncMock(return_value=row)
@@ -703,8 +718,14 @@ async def test_send_to_route_resumes_after_failure_without_duplicate_chunks(
     )
     progress: list[tuple[int, int, str]] = []
 
-    async def save_progress(completed: int, total: int, digest: str) -> bool:
+    async def save_progress(
+        completed: int,
+        total: int,
+        digest: str,
+        receipt: dict[str, object],
+    ) -> bool:
         progress.append((completed, total, digest))
+        assert receipt["content"] == chunks[completed - 1]
         return True
 
     first = await service._send_to_route(  # noqa: SLF001
@@ -844,7 +865,7 @@ async def test_send_to_route_allows_non_signal_media_send_without_message_id() -
         media=[{"url": "https://cognis.example.com/file.pdf", "filename": "file.pdf"}],
     )
 
-    assert status == "sent"
+    assert status == "incomplete"
 
 
 @pytest.mark.asyncio

@@ -195,6 +195,11 @@ def test_async_work_tool_descriptions_discourage_duplicate_parent_work() -> None
     assert "instead of creating a duplicate" in create_description
     assert 'chat_mode="plan"' in create_description
     assert 'chat_mode="build"' in create_description
+    assert "Working mode: execute" in create_description
+    assert "Working mode: coordinate" in create_description
+    assert "does not split or delegate it" in create_description
+    assert "specialist role, tool/authority scope, and expected output" in delegate_description
+    assert "they do not change specialist" in delegate_description
 
     assert "same-problem continuation" in send_description
     assert "instead of creating a duplicate managed conversation" in send_description
@@ -290,6 +295,9 @@ def test_coding_skill_has_generic_coordinator_contract_without_agent_special_cas
     content = str(coding_skill["instructions"])
     assert "explicitly assigned as a coordinator" in content
     assert "plan, split genuinely independent work, and integrate the results" in content
+    assert "When assigning a primary-agent workstream" in content
+    assert "Working mode: execute" in content
+    assert "Working mode: coordinate" in content
     assert "LaForge" not in content
     assert "managed conversation" not in content
 

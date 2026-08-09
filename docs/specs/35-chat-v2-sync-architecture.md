@@ -204,6 +204,70 @@ RuntimeOverlaySnapshot
 replace-whole volatile UI overlay
 ```
 
+### Multi-controller Redis acceleration
+
+PostgreSQL remains authoritative for durable turn orchestration, ownership
+leases, and fencing. Intaris remains authoritative for canonical content.
+Redis is optional and disposable; it cannot create final timeline truth or
+participate in readiness.
+
+When configured, all controllers use one versioned Pub/Sub channel for volatile
+runtime envelopes. Expiring latest-envelope keys and tombstones support
+reconnect hydration and explicit clearing. This is not Streams, consumer
+groups, or a durable queue. Receivers validate schema/version, ownership epoch,
+generation, and fence, then reapply local authorization before WebSocket fanout.
+Late frames from a replaced owner are rejected.
+
+The event cache stores Intaris pages in controller-local L1 only. It stores
+watermarks and bounded `ChatSnapshot` projections in Redis. These caches use
+the same authority, policy, and generation namespace. Snapshot keys contain
+HMAC-derived identities, the projection version, ordered session generations,
+and a Work overview fence.
+Envelopes validate the authority, conversation digest, lineage, Work fence,
+and cursor watermarks. Append generation changes make older projections
+unreadable. A Work commit changes the overview fence and requests another
+snapshot warm. Thus, a cache-only read misses after the commit until the new
+overview is warm. A background warm does not publish while Work coverage is
+less than an event watermark. It waits for the post-commit warm instead. A
+cache-only read does not refresh Work during the request.
+
+A short token-fenced Redis lock coalesces cold projection rebuilds across
+controllers. Active and queued conversations warm without WebSocket
+subscribers. Background Work and snapshot event reads share a controller-local
+admission limit. Intaris read failures cause bounded exponential backoff and
+one recovery probe. Foreground event writes and unrelated endpoint families do
+not use this backoff.
+
+The Intaris append listener performs only local, exception-isolated admissions.
+It invalidates L1 first. Then it records the warm mapping before it admits the
+generation dispatcher. Finally, it admits Work projection data to a bounded,
+session-coalesced queue. An accepted item evicted from the payload queue moves
+to a lightweight, session-coalesced repair-intent map. This map retains no
+event payload and grows only with concurrently dirty sessions. Saturation
+therefore drops payload data but does not reject accepted append work. Missing,
+noncontiguous, replaced, oversized, evicted, or lost batches that reach a
+persisted repair state recover through direct authoritative reads. If repair
+persistence fails, the controller retains the payload-free intent and retries
+with bounded exponential backoff and jitter. A bounded shutdown raises and
+keeps the intent visible if it cannot drain safely. Authorized Work access
+creates and prioritizes missing projection states. The worker does not scan
+sessions or poll healthy projections. A process crash after Intaris commits an
+append but before Cognis retains repair intent can leave an existing caught-up
+projection behind. The next append or explicit repair converges it.
+`Session.updated_at` is not a reliable event-head signal, so the read path does
+not infer repair from it.
+
+The snapshot operation reuses the event cache's one-hour sliding TTL,
+compression, and value bounds. Event pages keep L1 sliding expiration without
+creating Redis page values or Redis touch work. Existing Redis page values
+expire naturally. There is no startup cleanup and no separate projection TTL.
+A Redis error is a cache miss, never a stale-on-error canonical read. Runtime
+envelopes can be dropped. Snapshot and sync remain the correctness mechanism.
+
+Without Redis, owner-local clients retain runtime detail while remote clients
+render PostgreSQL-backed active-turn state and recover canonical content from
+Intaris, with increased Intaris read amplification.
+
 ---
 
 ## Backend module layout
@@ -218,6 +282,7 @@ cognis/api/chat_v2/
   cursors.py          # opaque cursor encode/decode/validation
   normalizer.py       # raw backend events -> normalized events
   projector.py        # pure projection into ChatView
+  shared_snapshot_cache.py # shared generation-fenced snapshot operation
   runtime_overlay.py  # scheduler/session-cache volatile state
   sync.py             # snapshot/sync/backfill orchestration
   routes.py           # FastAPI route bindings only
@@ -266,6 +331,12 @@ separate Chat v2 ingress/idempotency boundary and then uses the existing
 transport-agnostic turn/session machinery to create canonical session events.
 That machinery must itself remain behind a session-event-store writer boundary
 as pluggable backends are introduced.
+
+The Intaris adapter permits a high-watermark read to return sequence `0` when a
+new session exists but its event stream has not yet been initialized. The
+adapter verifies session metadata under the same scoped runtime identity before
+accepting the stream `404`; missing or inaccessible sessions still fail the
+snapshot/sync request.
 
 Internal page shape:
 
@@ -397,6 +468,23 @@ ConversationSessionRef {
 Initial implementation may use the existing conversation active-session lineage
 rules. The public contract only exposes projected timeline/state and opaque
 cursors.
+
+Canonical raw events sort by `(lineage ordinal, session sequence, event ID)`.
+The persisted `previous_session_id` chain assigns oldest-first ordinals, so
+every event in a newer lineage session sorts after every event in an older
+session even when their timestamps overlap or are equal. Timestamps are not a
+canonical ordering input.
+
+Cold snapshot reads exploit that invariant without changing the result. The
+server reads backward event pages from the newest lineage suffix in adaptive
+concurrent batches of 1, 2, 4, then at most 8 sessions per round. It expands
+toward older sessions only while the bounded latest window remains incomplete.
+Each selected session retains the full per-session page limit and its own
+authority-bound reader. Sparse histories can still require every session, but
+no batch exceeds eight concurrent page reads. All-session high watermarks remain
+mandatory for signed cursors, reset detection, projection cache keys, and
+Redis-free multi-controller correctness; adaptive pruning applies only to event
+page payloads.
 
 Lineage reset rules:
 
@@ -612,6 +700,17 @@ Client rules:
 5. Runtime overlay is applied independently by runtime epoch/revision.
 6. If `has_more=true`, client immediately continues `/sync` from
    `cursor_after` before declaring the conversation fully idle.
+
+### Cluster invalidation
+
+In HA mode, PostgreSQL `LISTEN`/`NOTIFY` may wake clients connected to another
+controller by carrying a bounded, allowlisted `scope_invalidated` pointer. The
+signal contains scope IDs and a revision only; it never transports timeline
+events or user content. The client preserves its signed cursor and calls
+canonical `/sync`, falling back to `/snapshot` on reset. Signals are
+best-effort: controller-level reconciliation periodically compares subscribed
+scope watermarks, so lost notifications and listener reconnects cannot affect
+correctness. Simple SQLite mode remains process-local.
 
 ### Backfill older timeline
 
@@ -1174,7 +1273,10 @@ ErrorTimelineItem extends TimelineItemBase {
 
 ## Runtime overlay
 
-Runtime overlay contains volatile state derived from scheduler/session cache.
+Runtime overlay combines cluster-authoritative durable turn state with optional
+owner-local scheduler/session-cache detail. PostgreSQL is authoritative for
+whether a direct turn is active; process-local state only enriches an active
+turn with live streams, thinking, tool output, and resolved chat mode.
 
 ```ts
 RuntimeOverlaySnapshot {
@@ -1207,17 +1309,21 @@ Runtime rules:
   - local runtime is absent, or
   - `runtime_epoch` differs, or
   - `runtime_epoch` matches and `runtime_revision > local.runtime_revision`.
-- If epoch changes and scheduler cannot authoritatively reconstruct an active
-  turn, server emits a snapshot with the new epoch, a newer revision, and
-  `has_active_turn=false`.
+- If epoch changes, the server reconstructs `claimed`, `running`, and
+  `absorbing` direct turns from `direct_turn_requests` before emitting runtime.
+  This prevents a non-owner controller from clearing the spinner for an active
+  turn owned by another replica.
 - Applying runtime replaces previous volatile overlay completely.
 - Runtime items must have `stable=false`.
 - Canonical snapshot/sync items must have `stable=true`.
 - Runtime overlay never advances canonical cursor.
 
-For a future multi-controller deployment, `runtime_epoch` and revision should
-come from shared scheduler/Redis state. Until then, a per-process epoch is valid
-because epoch changes force conservative replacement and spinner clearing.
+Direct-turn transitions publish bounded `CHAT_SCOPE_CHANGED` invalidations and
+conversation watermarks include durable-turn updates, so dropped notifications
+are repaired by periodic reconciliation. Live token, thinking, and tool-output
+frames remain owner-local volatile detail; they are not sent through PostgreSQL
+notifications. A future shared runtime transport may add cross-controller live
+frame replay without changing durable active-turn authority.
 
 ---
 

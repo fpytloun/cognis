@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1010" viewBox="0 0 1000 1010" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}.amber{fill:#f5b544}
+      .pribtn{fill:#38bdf8}.user{fill:#0e6ba8}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.2px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .device{fill:#060b12;stroke:#2a3947;stroke-width:2}
+    </style>
+  </defs>
+  <rect class="bg" width="1000" height="1010"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">05 · Mobile — Cockpit (action required) &amp; Control Chat sheet</text>
+  <text x="28" y="54" class="m" font-size="12">Same hierarchy as desktop; single-column. Sticky action bar; attention hero above the fold; full-screen step inspector &amp; control sheet.</text>
+
+  <!-- PHONE A: cockpit action required -->
+  <rect x="40" y="72" width="390" height="720" rx="30" class="device"/>
+  <!-- top bar -->
+  <rect x="56" y="88" width="358" height="44" class="sub" rx="10"/>
+  <text x="72" y="115" class="t" font-size="13" font-weight="700">☰  Release safety review</text>
+  <rect x="360" y="98" width="44" height="24" rx="12" class="att"/><text x="368" y="114" class="amber" font-size="9" font-weight="700">PAUSED</text>
+  <!-- sticky primary action -->
+  <rect x="56" y="140" width="300" height="44" rx="10" class="att"/><text x="120" y="167" class="amber" font-size="13" font-weight="700">▲ Review the gate</text>
+  <rect x="364" y="140" width="40" height="44" rx="10" class="sub"/><text x="378" y="167" class="m" font-size="16">⋮</text>
+  <circle cx="404" cy="120" r="10" class="callout"/><text x="400" y="124" class="cnum" font-size="11">1</text>
+
+  <!-- objective condensed -->
+  <rect x="56" y="192" width="348" height="40" class="panel" rx="8"/>
+  <text x="72" y="217" class="cap" font-size="10">Objective: verify release workflow &amp; approve handoff. ▸ details</text>
+
+  <!-- ATTENTION hero -->
+  <rect x="56" y="240" width="348" height="250" class="att" rx="10"/>
+  <text x="72" y="262" class="amber" font-size="9" font-weight="700" letter-spacing="1.2">ACTION REQUIRED · GATE</text>
+  <text x="72" y="284" class="t" font-size="13" font-weight="700">Approve this release?</text>
+  <rect x="72" y="298" width="316" height="52" class="sub" rx="8"/>
+  <text x="84" y="320" class="cap" font-size="10">✓ 12 tests passed · 1 file changed</text>
+  <rect x="84" y="326" width="90" height="18" rx="5" class="acbg"/><text x="96" y="339" class="ac" font-size="9">View diff</text>
+  <rect x="180" y="326" width="120" height="18" rx="5" class="acbg"/><text x="192" y="339" class="ac" font-size="9">Work / Chat →</text>
+  <text x="72" y="372" class="cap" font-size="10">Optional instruction</text>
+  <rect x="72" y="380" width="316" height="34" class="panel" rx="8"/>
+  <rect x="72" y="424" width="316" height="40" rx="9" class="pribtn"/><text x="160" y="449" class="bg" font-size="12" font-weight="700">Approve &amp; continue</text>
+  <rect x="72" y="468" width="150" height="16" rx="5" class="panel" stroke="#f5b544"/><text x="86" y="480" class="amber" font-size="9">Reject / revise</text>
+  <rect x="238" y="468" width="150" height="16" rx="5" class="sub"/><text x="252" y="480" class="m" font-size="9">Stop task</text>
+  <circle cx="404" cy="255" r="10" class="callout"/><text x="400" y="259" class="cnum" font-size="11">2</text>
+
+  <!-- workflow collapsed -->
+  <rect x="56" y="498" width="348" height="40" class="panel" rx="8"/><text x="72" y="523" class="lbl" font-size="11">▾ Workflow · Review · waiting</text>
+  <rect x="56" y="546" width="348" height="34" class="sub" rx="8"/><text x="72" y="567" class="m" font-size="10">▸ Task context (notes, config, deps)</text>
+  <rect x="56" y="588" width="348" height="34" class="sub" rx="8"/><text x="72" y="609" class="m" font-size="10">▸ Details (origin · run health · result)</text>
+  <circle cx="404" cy="605" r="10" class="callout"/><text x="400" y="609" class="cnum" font-size="11">3</text>
+
+  <!-- bottom nav -->
+  <rect x="56" y="742" width="358" height="42" class="sub" rx="10"/>
+  <text x="80" y="768" class="m" font-size="10">Chat</text><text x="150" y="768" class="m" font-size="10">Projects</text><text x="235" y="768" class="ac" font-size="10">Tasks</text><text x="305" y="768" class="m" font-size="10">Schedules</text><text x="378" y="768" class="m" font-size="10">···</text>
+
+  <!-- PHONE B: control chat sheet -->
+  <rect x="470" y="72" width="390" height="720" rx="30" class="device"/>
+  <rect x="486" y="88" width="358" height="56" class="sub" rx="10"/>
+  <text x="502" y="110" class="lbl" font-size="12">Release safety review</text>
+  <rect x="760" y="96" width="52" height="20" rx="10" class="att"/><text x="770" y="111" class="amber" font-size="9" font-weight="700">PAUSED</text>
+  <text x="502" y="132" class="amber" font-size="10">Attention required: gate</text>
+  <text x="828" y="112" class="m" font-size="14">✕</text>
+  <!-- pinned decision card -->
+  <rect x="486" y="152" width="358" height="118" class="att" rx="10"/>
+  <text x="502" y="173" class="amber" font-size="9" font-weight="700">GATE · DECIDE HERE</text>
+  <text x="502" y="193" class="t" font-size="12" font-weight="700">Approve this release?</text>
+  <text x="502" y="211" class="cap" font-size="9">✓ checks passed · 12 tests · 1 file</text>
+  <rect x="502" y="222" width="150" height="34" rx="8" class="pribtn"/><text x="540" y="244" class="bg" font-size="11" font-weight="700">Approve</text>
+  <rect x="662" y="222" width="90" height="34" rx="8" class="panel" stroke="#f5b544"/><text x="676" y="244" class="amber" font-size="10">Reject</text>
+  <rect x="762" y="222" width="70" height="34" rx="8" class="sub"/><text x="774" y="244" class="m" font-size="10">Stop</text>
+  <circle cx="834" cy="165" r="10" class="callout"/><text x="830" y="169" class="cnum" font-size="11">4</text>
+  <!-- transcript -->
+  <rect x="600" y="286" width="244" height="40" rx="10" class="user"/><text x="616" y="310" class="t" font-size="10">What is blocking this release?</text>
+  <rect x="486" y="336" width="300" height="56" rx="10" class="sub"/>
+  <text x="502" y="358" class="t" font-size="10">The release is waiting for your</text>
+  <text x="502" y="374" class="t" font-size="10">approval. Evidence passed.</text>
+  <!-- composer -->
+  <rect x="486" y="726" width="358" height="42" rx="21" class="sub"/><text x="512" y="752" class="m" font-size="11">Message agent-stage39…</text>
+  <circle cx="834" cy="330" r="10" class="callout"/><text x="830" y="334" class="cnum" font-size="11">5</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="40" y="826" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="40" y="850" class="note" font-size="11.5">1 Sticky top action bar: ONE contextual primary + ⋮ overflow sheet (Submit/Pause/Resume/Configure/Re-run/Cancel per state — preserves the tested action parity per lifecycle).</text>
+  <text x="40" y="872" class="note" font-size="11.5">2 Attention hero above the fold with inline evidence; decision buttons full-width, ≥44px tap targets.</text>
+  <text x="40" y="894" class="note" font-size="11.5">3 Everything secondary is a labelled disclosure — no horizontal overflow; step inspector opens as a full-screen sheet.</text>
+  <text x="40" y="916" class="note" font-size="11.5">4 Control-chat sheet pins the SAME decision card at top — fixes the truncated "Tas…" title and the "can't act here" gap.</text>
+  <text x="40" y="938" class="note" font-size="11.5">5 Full-screen sheet (Sheet primitive), safe-area aware; back/✕ returns to the cockpit without losing scroll position.</text>
+</svg>

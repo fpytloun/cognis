@@ -39,6 +39,8 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | [Executors](guide/executors.md) | Choose where tools run, configure browser automation, and route tools safely |
 | [Channels](guide/channels.md) | Connect external messaging platforms and understand pairing |
 | [Deployment](guide/deployment.md) | Docker, systemd, remote executors, TLS, backups, and production hardening |
+| [High Availability](guide/high-availability.md) | Kubernetes topology, migration choreography, failover, recovery, and operational limits |
+| [HA E2E Compose](guide/ha-e2e.md) | Deterministic two-controller qualification overlay |
 | [Troubleshooting](guide/troubleshooting.md) | Common setup, provider, executor, browser, channel, and UI problems |
 
 ## In-App Docs

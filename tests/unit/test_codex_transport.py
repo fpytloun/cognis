@@ -18,6 +18,7 @@ from cognis.providers.llm.codex_transport import (
 )
 from cognis.providers.llm.errors import classify_llm_exception, reasoning_summary_rejected
 from cognis.providers.llm.retry import with_llm_retry
+from cognis.providers.llm.transport import LiteLLMTransport
 
 
 def test_codex_headers_merge_auth_extra_headers_and_stream_accept() -> None:
@@ -52,6 +53,7 @@ def test_codex_payload_strips_transport_kwargs() -> None:
             "api_version": "unused",
             "custom_llm_provider": "chatgpt",
             "extra_headers": {"session_id": "session-123"},
+            "_cognis_executor_affinity_id": "executor-a",
             "reasoning": {"effort": "high"},
         }
     )
@@ -77,6 +79,28 @@ def test_codex_payload_forces_store_false() -> None:
     )
 
     assert payload["store"] is False
+
+
+@pytest.mark.asyncio
+async def test_litellm_transport_strips_affinity_for_unary_and_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    async def _completion(**kwargs: object) -> dict[str, object]:
+        captured.append(kwargs)
+        return {"ok": True}
+
+    async def _responses(**kwargs: object) -> dict[str, object]:
+        captured.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr("cognis.providers.llm.transport.litellm.acompletion", _completion)
+    monkeypatch.setattr("cognis.providers.llm.transport.litellm.aresponses", _responses)
+    transport = LiteLLMTransport()
+    await transport.completion(model="model", _cognis_executor_affinity_id="executor-a")
+    await transport.responses(model="model", _cognis_executor_affinity_id="executor-a")
+    assert all("_cognis_executor_affinity_id" not in kwargs for kwargs in captured)
 
 
 def test_default_codex_timeout_does_not_use_httpx_five_second_read_timeout() -> None:
@@ -200,6 +224,11 @@ async def test_direct_codex_transport_reuses_client_and_closes_explicitly() -> N
 
     async def _handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.content and json.loads(request.content).get("stream"):
+            return httpx.Response(
+                200,
+                content=b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+            )
         return httpx.Response(200, json={"id": f"response-{len(requests)}"})
 
     def _client_factory() -> httpx.AsyncClient:
@@ -211,14 +240,24 @@ async def test_direct_codex_transport_reuses_client_and_closes_explicitly() -> N
         CodexAuth(access_token="token", account_id="account"),
         client_factory=_client_factory,
     )
-    kwargs = {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "hi"}]}
+    kwargs = {
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": "hi"}],
+        "_cognis_executor_affinity_id": "executor-a",
+    }
 
     assert await transport.responses(**kwargs) == {"id": "response-1"}
+    assert "_cognis_executor_affinity_id" not in json.loads(requests[0].content)
     assert await transport.responses(**kwargs) == {"id": "response-2"}
+    stream = await transport.responses(**{**kwargs, "stream": True})
+    assert [event async for event in stream] == [
+        {"type": "response.completed", "response": {"status": "completed"}}
+    ]
+    assert "_cognis_executor_affinity_id" not in json.loads(requests[2].content)
     assert len(clients) == 1
     assert not clients[0].is_closed
     request_ids = [request.headers["x-client-request-id"] for request in requests]
-    assert len(set(request_ids)) == 2
+    assert len(set(request_ids)) == 3
     assert all(str(uuid.UUID(request_id)) == request_id for request_id in request_ids)
 
     await transport.aclose()

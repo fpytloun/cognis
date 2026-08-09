@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -9,39 +11,68 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 
+from cognis.api.app import create_app
 from cognis.api.chat_v2 import routes as chat_v2_routes
+from cognis.api.chat_v2 import shared_snapshot_cache as snapshot_cache_module
 from cognis.api.chat_v2.cursors import (
     CursorLineageEntry,
     CursorSessionWatermark,
     InternalChatCursorPayload,
     encode_cursor,
 )
+from cognis.api.chat_v2.event_store import RawSessionEvent
 from cognis.api.chat_v2.routes import (
     _cursor_secret,
     _load_session_context,
     _load_task_step_context,
     _scoped_tool_output_page,
+    _session_read_ref,
     chat_v2_cancel_turn,
+    chat_v2_client_performance,
+    chat_v2_conversation_work,
     chat_v2_delete_queued_message,
     chat_v2_send_message,
     chat_v2_session_snapshot,
     chat_v2_session_sync,
     chat_v2_session_timeline,
+    chat_v2_session_work,
+    chat_v2_snapshot,
+    chat_v2_snapshot_cache_only,
     chat_v2_task_step_snapshot,
     chat_v2_task_step_sync,
     chat_v2_task_step_timeline,
+    chat_v2_task_step_work,
     chat_v2_update_queued_message,
     router,
 )
 from cognis.api.chat_v2.schemas import (
+    ClientPerformanceRequest,
     ControlMutationV2Request,
     QueueUpdateV2Request,
     SendMessageV2Request,
+    TimelineScope,
 )
-from cognis.api.chat_v2.sync import PROJECTION_VERSION
+from cognis.api.chat_v2.shared_snapshot_cache import SnapshotRequestTrace
+from cognis.api.chat_v2.snapshot_coordinator import ConversationSnapshotContext
+from cognis.api.chat_v2.sync import PROJECTION_VERSION, RuntimeOverlayInput
 from cognis.api.common import AuthenticatedUser
+from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.turn_scheduler import TurnError
+from cognis.providers.guardrails.events import EventStoreAuthority
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.models import Agent, Conversation, Session, User
+from tests.unit.api.chat_v2.test_cached_event_store import (
+    AUTHORITY,
+    Delegate,
+    FakeClock,
+    FakeRedis,
+    build_test_snapshot,
+    make_cache,
+    make_snapshot_cache,
+)
+from tests.unit.api.chat_v2.test_sync import FakeEventStore
 
 
 def test_chat_v2_read_routes_are_registered() -> None:
@@ -52,8 +83,16 @@ def test_chat_v2_read_routes_are_registered() -> None:
     }
 
     assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/snapshot") in routes
+    assert (
+        "GET",
+        "/api/v1/chat/v2/conversations/{conversation_id}/snapshot/cache-only",
+    ) in routes
     assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/sync") in routes
     assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/timeline") in routes
+    assert ("POST", "/api/v1/chat/v2/client-performance") in routes
+    assert ("GET", "/api/v1/chat/v2/conversations/{conversation_id}/work") in routes
+    assert ("GET", "/api/v1/chat/v2/sessions/{session_id}/work") in routes
+    assert ("GET", "/api/v1/chat/v2/task-steps/{step_run_id}/work") in routes
     assert (
         "GET",
         "/api/v1/chat/v2/conversations/{conversation_id}/tool-outputs/{call_id}",
@@ -67,6 +106,10 @@ def test_chat_v2_read_routes_are_registered() -> None:
     assert (
         "PUT",
         "/api/v1/chat/v2/conversations/{conversation_id}/commands/{client_txn_id}",
+    ) in routes
+    assert (
+        "POST",
+        "/api/v1/chat/v2/conversations/{conversation_id}/assistant-messages/fork",
     ) in routes
     assert ("POST", "/api/v1/chat/v2/conversations/{conversation_id}/cancel") in routes
     assert (
@@ -86,6 +129,649 @@ def test_chat_v2_read_routes_are_registered() -> None:
             }
 
 
+@pytest.mark.asyncio
+async def test_cache_only_route_authorizes_before_cache_read_and_returns_no_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = cast(Any, SimpleNamespace())
+    snapshot = cast(Any, SimpleNamespace())
+    calls: list[str] = []
+
+    async def load(_request: Any, _conversation_id: str) -> Any:
+        calls.append("authorize")
+        return context
+
+    async def cached(_app: Any, received: Any) -> tuple[Any, str]:
+        calls.append("cache")
+        assert received is context
+        return snapshot, "hit_l1"
+
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load)
+    monkeypatch.setattr(chat_v2_routes, "get_cached_chat_snapshot_coordinated", cached)
+    response = SimpleNamespace(headers={})
+    request = SimpleNamespace(app=SimpleNamespace())
+
+    result = await chat_v2_snapshot_cache_only(cast(Any, request), "conv-1", cast(Any, response))
+
+    assert result is snapshot
+    assert calls == ["authorize", "cache"]
+    assert response.headers["Cache-Control"] == "private, no-store"
+
+
+@pytest.mark.asyncio
+async def test_cache_only_route_miss_returns_empty_no_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        chat_v2_routes,
+        "_load_read_context",
+        AsyncMock(return_value=cast(Any, SimpleNamespace())),
+    )
+    monkeypatch.setattr(
+        chat_v2_routes,
+        "get_cached_chat_snapshot_coordinated",
+        AsyncMock(return_value=(None, "miss")),
+    )
+    response = SimpleNamespace(headers={})
+
+    result = await chat_v2_snapshot_cache_only(
+        cast(Any, SimpleNamespace(app=SimpleNamespace())),
+        "conv-1",
+        cast(Any, response),
+    )
+
+    assert result.status_code == 204
+    assert result.headers["cache-control"] == "private, no-store"
+
+
+@pytest.mark.asyncio
+async def test_conversation_work_route_uses_bounded_typed_backfill_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = ConversationSnapshotContext(
+        scope=cast(Any, SimpleNamespace(key="conversation:conv-1")),
+        conversation=cast(Any, SimpleNamespace()),
+        session_refs=[],
+        event_store=None,
+        cursor_secret="secret",
+        queue=cast(Any, SimpleNamespace()),
+        state=cast(Any, SimpleNamespace()),
+        runtime_input=cast(Any, SimpleNamespace()),
+        session_cache=None,
+        event_post_processor=cast(Any, AsyncMock()),
+        owner_email="owner@example.com",
+        conversation_id="conv-1",
+    )
+    expected = SimpleNamespace()
+    load_context = AsyncMock(return_value=context)
+    build_graph = AsyncMock(return_value=expected)
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load_context)
+    monkeypatch.setattr(chat_v2_routes, "_build_work_graph_projection", build_graph)
+
+    result = await chat_v2_conversation_work(
+        SimpleNamespace(app=SimpleNamespace()),
+        "conv-1",
+        limit=100,
+    )
+
+    assert result is expected
+    build_graph.assert_awaited_once()
+    assert build_graph.await_args.args[1] is context
+    assert build_graph.await_args.kwargs == {
+        "before": None,
+        "limit": 100,
+        "category": None,
+        "from_time": None,
+        "to_time": None,
+        "exact_session_id": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "loader_name", "identifier"),
+    [
+        (chat_v2_conversation_work, "_load_read_context", "conv-1"),
+        (chat_v2_session_work, "_load_session_context", "session-1"),
+        (chat_v2_task_step_work, "_load_task_step_context", "step-1"),
+    ],
+)
+async def test_work_route_families_forward_exact_session_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    route: Any,
+    loader_name: str,
+    identifier: str,
+) -> None:
+    context = SimpleNamespace()
+    monkeypatch.setattr(chat_v2_routes, loader_name, AsyncMock(return_value=context))
+    build_graph = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(chat_v2_routes, "_build_work_graph_projection", build_graph)
+
+    await route(
+        SimpleNamespace(app=SimpleNamespace()),
+        identifier,
+        limit=10,
+        filter_session_id="session-exact",
+    )
+
+    assert build_graph.await_args.kwargs["exact_session_id"] == "session-exact"
+
+
+def test_activity_overview_route_families_are_in_generated_openapi() -> None:
+    document = create_app().openapi()
+
+    for path in (
+        "/api/v1/chat/v2/conversations/{conversation_id}/activity-overview",
+        "/api/v1/chat/v2/sessions/{session_id}/activity-overview",
+        "/api/v1/chat/v2/task-steps/{step_run_id}/activity-overview",
+    ):
+        operation = document["paths"][path]["get"]
+        schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+        assert schema == {"$ref": "#/components/schemas/ActivityOverviewResponse"}
+        detail = next(item for item in operation["parameters"] if item["name"] == "detail")
+        assert detail["schema"]["default"] == "lightweight"
+        assert detail["schema"]["enum"] == ["lightweight", "full"]
+    snapshot_schema = document["components"]["schemas"]["ChatSnapshot"]
+    assert snapshot_schema["properties"]["activity_overview"]["anyOf"][0] == {
+        "$ref": "#/components/schemas/ActivityOverviewResponse"
+    }
+    overview_schema = document["components"]["schemas"]["ActivityOverviewResponse"]
+    assert "overview_revision" in overview_schema["required"]
+    assert overview_schema["properties"]["detail"]["default"] == "lightweight"
+    assert overview_schema["properties"]["recent_work"]["$ref"] == (
+        "#/components/schemas/ActivityRecentWork"
+    )
+    workstream_schema = document["components"]["schemas"]["WorkstreamRef"]
+    for field in (
+        "agent_display_name",
+        "agent_avatar_url",
+        "backing_session_count",
+        "backing_session_ids",
+    ):
+        assert field in workstream_schema["properties"]
+    conversation_schema = document["components"]["schemas"]["ConversationResponse"]
+    assert "root_controller_conversation_id" in conversation_schema["properties"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["session", "task_step"])
+async def test_scoped_snapshots_embed_the_same_activity_overview_service(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    snapshot = SimpleNamespace(model_copy=lambda *, update: SimpleNamespace(**update))
+    overview = SimpleNamespace(overview_revision=f"revision-{kind}")
+    monkeypatch.setattr(chat_v2_routes, "build_chat_snapshot", AsyncMock(return_value=snapshot))
+    build_overview = AsyncMock(return_value=overview)
+    monkeypatch.setattr(chat_v2_routes, "_build_activity_overview", build_overview)
+    scope = (
+        TimelineScope(key="session:id", kind="session", session_id="id")
+        if kind == "session"
+        else TimelineScope(
+            key="task_step:id",
+            kind="task_step",
+            task_id="task-id",
+            step_run_id="id",
+        )
+    )
+    context = {"scope": scope}
+    request = cast(Any, SimpleNamespace())
+
+    result = await chat_v2_routes._build_scoped_snapshot(request, context)
+
+    assert result.activity_overview is overview
+    assert build_overview.await_args.args == (request, context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route_name", "loader_name"),
+    [
+        ("chat_v2_conversation_activity_overview", "_load_read_context"),
+        ("chat_v2_session_activity_overview", "_load_session_context"),
+        ("chat_v2_task_step_activity_overview", "_load_task_step_context"),
+    ],
+)
+async def test_activity_overview_routes_forward_explicit_full_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    route_name: str,
+    loader_name: str,
+) -> None:
+    context = SimpleNamespace()
+    expected = SimpleNamespace(detail="full")
+    monkeypatch.setattr(chat_v2_routes, loader_name, AsyncMock(return_value=context))
+    build_overview = AsyncMock(return_value=expected)
+    monkeypatch.setattr(chat_v2_routes, "_build_activity_overview", build_overview)
+
+    result = await getattr(chat_v2_routes, route_name)(
+        cast(Any, SimpleNamespace()),
+        "scope-id",
+        detail="full",
+    )
+
+    assert result is expected
+    assert build_overview.await_args.args[1] is context
+    assert build_overview.await_args.kwargs == {"detail": "full"}
+
+
+@pytest.mark.asyncio
+async def test_work_route_total_deadline_has_retryable_error_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def block(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(chat_v2_routes, "WORK_REQUEST_MAX_SECONDS", 0.01)
+    monkeypatch.setattr(chat_v2_routes, "_build_work_graph_projection_with_stages", block)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(HTTPException) as raised:
+        await chat_v2_routes._build_work_graph_projection(
+            cast(Any, SimpleNamespace()),
+            cast(Any, {}),
+            before=None,
+            limit=10,
+        )
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail["code"] == "work_request_timeout"
+    assert asyncio.get_running_loop().time() - started < 0.2
+
+
+def test_work_request_deadline_covers_database_projection_stage() -> None:
+    assert chat_v2_routes.WORK_REQUEST_MAX_SECONDS >= (chat_v2_routes.WORK_GRAPH_MAX_SECONDS + 1.0)
+    assert not hasattr(chat_v2_routes, "WORK_WATERMARK_MAX_SECONDS")
+    assert not hasattr(chat_v2_routes, "WORK_SCAN_MAX_SECONDS")
+
+
+@pytest.mark.asyncio
+async def test_conversation_work_route_reads_database_without_event_store_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'work-route.db'}")
+    session_factory = create_session_factory(engine)
+    await run_schema_bootstrap(engine)
+    async with session_factory() as session:
+        session.add(User(email="alice@example.com", name="Alice", password_hash="x", role="user"))
+        session.add(User(email="bob@example.com", name="Bob", password_hash="x", role="user"))
+        await session.flush()
+        session.add_all(
+            [
+                Agent(
+                    agent_id="agent-alice",
+                    owner_email="alice@example.com",
+                    name="Alice agent",
+                    description="Alice",
+                ),
+                Agent(
+                    agent_id="agent-bob",
+                    owner_email="bob@example.com",
+                    name="Bob agent",
+                    description="Bob",
+                ),
+            ]
+        )
+        await session.flush()
+        session.add_all(
+            [
+                Conversation(
+                    conversation_id="conv-root",
+                    user_email="alice@example.com",
+                    agent_id="agent-alice",
+                    context_type="web",
+                    title_source="unset",
+                    active_session_id="session-root",
+                ),
+                Conversation(
+                    conversation_id="conv-child",
+                    user_email="alice@example.com",
+                    agent_id="agent-alice",
+                    context_type="web",
+                    title_source="unset",
+                    active_session_id="session-child",
+                    lineage_kind="conversation",
+                    fork_source_conversation_id="conv-root",
+                    fork_source_session_id="session-root",
+                ),
+                Conversation(
+                    conversation_id="conv-foreign",
+                    user_email="bob@example.com",
+                    agent_id="agent-bob",
+                    context_type="web",
+                    title_source="unset",
+                    active_session_id="session-foreign",
+                    lineage_kind="conversation",
+                    fork_source_conversation_id="conv-root",
+                    fork_source_session_id="session-root",
+                ),
+            ]
+        )
+        await session.flush()
+        session.add_all(
+            [
+                Session(
+                    session_id="session-root",
+                    conversation_id="conv-root",
+                    user_email="alice@example.com",
+                    agent_id="agent-alice",
+                    intaris_session_id="session-root",
+                    delegation_metadata={},
+                ),
+                Session(
+                    session_id="session-child",
+                    conversation_id="conv-child",
+                    user_email="alice@example.com",
+                    agent_id="agent-alice",
+                    intaris_session_id="session-child",
+                    source_session_id="session-root",
+                    delegation_metadata={},
+                ),
+                Session(
+                    session_id="session-foreign",
+                    conversation_id="conv-foreign",
+                    user_email="bob@example.com",
+                    agent_id="agent-bob",
+                    intaris_session_id="session-foreign",
+                    source_session_id="session-root",
+                    delegation_metadata={},
+                ),
+            ]
+        )
+        await session.commit()
+
+    event_store = FakeEventStore(
+        {
+            "session-root": [],
+            "session-child": [
+                RawSessionEvent(
+                    store_id="intaris",
+                    session_id="session-child",
+                    seq=1,
+                    type="user_message",
+                    data={"content": "Create the file", "turn_id": "turn-child"},
+                ),
+                RawSessionEvent(
+                    store_id="intaris",
+                    session_id="session-child",
+                    seq=2,
+                    type="tool_call",
+                    data={
+                        "call_id": "call-child-1",
+                        "name": "write",
+                        "arguments": {"path": "child.txt"},
+                        "turn_id": "turn-child",
+                    },
+                ),
+                RawSessionEvent(
+                    store_id="intaris",
+                    session_id="session-child",
+                    seq=3,
+                    type="tool_result",
+                    data={
+                        "call_id": "call-child-1",
+                        "name": "write",
+                        "result": "saved",
+                        "turn_id": "turn-child",
+                    },
+                ),
+            ],
+        }
+    )
+    event_store.authority_token = "a" * 64
+    event_store.read_session_events = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("normal Work GET must not read Intaris")
+    )
+    event_store.read_session_high_watermark = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("normal Work GET must not read Intaris")
+    )
+
+    class _CachedEventStore:
+        def bind(self, authority: EventStoreAuthority) -> FakeEventStore:
+            assert authority.user_email == "alice@example.com"
+            return event_store
+
+    class _AgentRegistry:
+        async def get(self, agent_id: str, **_: Any) -> Any:
+            if agent_id == "agent-alice":
+                return SimpleNamespace(owner_email="alice@example.com")
+            return None
+
+    context = ConversationSnapshotContext(
+        scope=TimelineScope(
+            key="conversation:conv-root",
+            kind="conversation",
+            conversation_id="conv-root",
+            session_id="session-root",
+        ),
+        conversation=cast(Any, SimpleNamespace()),
+        session_refs=[],
+        event_store=event_store,
+        cursor_secret="route-lineage-secret",
+        queue=cast(Any, SimpleNamespace()),
+        state=cast(Any, SimpleNamespace()),
+        runtime_input=cast(Any, SimpleNamespace()),
+        session_cache=None,
+        event_post_processor=cast(Any, None),
+        owner_email="alice@example.com",
+        conversation_id="conv-root",
+    )
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", AsyncMock(return_value=context))
+    request = SimpleNamespace(
+        state=SimpleNamespace(user=AuthenticatedUser(email="alice@example.com", role="user")),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                session_factory=session_factory,
+                cached_event_store=_CachedEventStore(),
+                agent_registry=_AgentRegistry(),
+                artifact_store=None,
+                tool_registry=None,
+            )
+        ),
+    )
+
+    result = await chat_v2_conversation_work(request, "conv-root", limit=2)
+
+    workstream_ids = {item.session_id for item in result.workstreams}
+    assert workstream_ids == {"session-root"}
+    assert result.summary.mutations == 0
+    assert result.graph_fingerprint
+    assert result.before_cursor is None
+    assert result.materialization.state == "materializing"
+    event_store.read_session_events.assert_not_awaited()
+    event_store.read_session_high_watermark.assert_not_awaited()
+
+    await engine.dispose()
+
+
+def test_client_performance_contract_is_strict_and_bounded() -> None:
+    assert (
+        ClientPerformanceRequest.model_validate(
+            {"metric": "cached_restore_ms", "duration_ms": 12.5}
+        ).duration_ms
+        == 12.5
+    )
+    for payload in (
+        {"metric": "other", "duration_ms": 1.0},
+        {"metric": "timeline_fresh_ms", "duration_ms": -1.0},
+        {"metric": "timeline_fresh_ms", "duration_ms": 300_001.0},
+        {"metric": "timeline_fresh_ms", "duration_ms": float("inf")},
+        {"metric": "timeline_fresh_ms", "duration_ms": 1.0, "conversation_id": "forbidden"},
+    ):
+        with pytest.raises(ValidationError):
+            ClientPerformanceRequest.model_validate(payload)
+
+
+@pytest.mark.anyio
+async def test_client_performance_endpoint_requires_session_auth_and_bounds_body() -> None:
+    async def stream():
+        yield b'{"metric":"timeline_fresh_ms","duration_ms":42.0}'
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user=AuthenticatedUser(
+                email="user@example.com",
+                role="user",
+                name="User",
+                auth_type="session",
+            )
+        ),
+        headers={"content-length": "51"},
+        stream=stream,
+    )
+    assert await chat_v2_client_performance(cast(Any, request)) is None
+
+    request.headers = {"content-length": "257"}
+    with pytest.raises(HTTPException) as exc_info:
+        await chat_v2_client_performance(cast(Any, request))
+    assert exc_info.value.status_code == 413
+
+    request.state = SimpleNamespace()
+    with pytest.raises(HTTPException) as exc_info:
+        await chat_v2_client_performance(cast(Any, request))
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.anyio
+async def test_snapshot_boundary_records_selected_tier_once_after_hydration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: list[tuple[str, str]] = []
+    context = object()
+
+    async def load_context(_request, _conversation_id):
+        return context
+
+    async def fail_after_cache(_app, loaded, *, request_trace):
+        assert loaded is context
+        request_trace.select("l1")
+        raise RuntimeError("attachment hydration failed")
+
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load_context)
+    monkeypatch.setattr(chat_v2_routes, "build_chat_snapshot_coordinated", fail_after_cache)
+    monkeypatch.setattr(
+        chat_v2_routes.SNAPSHOT_CACHE_METRICS,
+        "request",
+        lambda tier, outcome, _seconds: observations.append((tier, outcome)),
+    )
+    request = SimpleNamespace(app=SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="attachment hydration failed"):
+        await chat_v2_snapshot(cast(Any, request), "conversation-a")
+
+    assert observations == [("l1", "error")]
+
+
+@pytest.mark.anyio
+async def test_snapshot_boundary_records_success_once_after_full_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: list[tuple[str, str]] = []
+    snapshot = object()
+
+    async def load_context(_request, _conversation_id):
+        return object()
+
+    async def build_snapshot(_app, _context, *, request_trace):
+        request_trace.select("redis")
+        return snapshot
+
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load_context)
+    monkeypatch.setattr(chat_v2_routes, "build_chat_snapshot_coordinated", build_snapshot)
+    monkeypatch.setattr(
+        chat_v2_routes.SNAPSHOT_CACHE_METRICS,
+        "request",
+        lambda tier, outcome, _seconds: observations.append((tier, outcome)),
+    )
+
+    result = await chat_v2_snapshot(
+        cast(Any, SimpleNamespace(app=SimpleNamespace())),
+        "conversation-a",
+    )
+
+    assert result is snapshot
+    assert observations == [("redis", "success")]
+
+
+@pytest.mark.anyio
+async def test_snapshot_boundary_uses_unknown_for_pre_cache_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: list[tuple[str, str]] = []
+
+    async def fail_context(_request, _conversation_id):
+        raise RuntimeError("context failed")
+
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", fail_context)
+    monkeypatch.setattr(
+        chat_v2_routes.SNAPSHOT_CACHE_METRICS,
+        "request",
+        lambda tier, outcome, _seconds: observations.append((tier, outcome)),
+    )
+
+    with pytest.raises(RuntimeError, match="context failed"):
+        await chat_v2_snapshot(cast(Any, SimpleNamespace(app=SimpleNamespace())), "conversation-a")
+
+    assert observations == [("unknown", "error")]
+
+
+@pytest.mark.anyio
+async def test_snapshot_boundary_records_bypass_once_after_exhausted_fence_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    redis = FakeRedis(clock)
+    events = make_cache(Delegate(), redis, clock)
+    bound = events.bind(AUTHORITY)
+    cache = make_snapshot_cache(events, redis, clock)
+    refs = [
+        chat_v2_routes.ConversationSessionRef(
+            session_id="session-a",
+            event_store_session_id="session-a",
+            ordinal=0,
+            reader=bound,
+            authority_token=bound.authority_token,
+        )
+    ]
+    attempts = 0
+    observations: list[tuple[str, str]] = []
+
+    async def reject_fence(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise snapshot_cache_module._FenceRejected
+
+    async def load_context(_request, _conversation_id):
+        return object()
+
+    async def build_snapshot(_app, _context, *, request_trace: SnapshotRequestTrace):
+        result = await cache.get_or_build_result(
+            authority_token=bound.authority_token,
+            scope_key="conversation:conversation-a",
+            session_refs=refs,
+            cursor_secret="cursor-secret",
+            build=lambda: build_test_snapshot(bound),
+            request_trace=request_trace,
+        )
+        assert result.snapshot is not None
+        return result.snapshot
+
+    monkeypatch.setattr(cache, "_coordinate_fill", reject_fence)
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load_context)
+    monkeypatch.setattr(chat_v2_routes, "build_chat_snapshot_coordinated", build_snapshot)
+    monkeypatch.setattr(
+        chat_v2_routes.SNAPSHOT_CACHE_METRICS,
+        "request",
+        lambda tier, outcome, _seconds: observations.append((tier, outcome)),
+    )
+
+    await chat_v2_snapshot(cast(Any, SimpleNamespace(app=SimpleNamespace())), "conversation-a")
+
+    assert attempts == 3
+    assert observations == [("bypass", "success")]
+    await cache.aclose()
+
+
 def test_cursor_secret_uses_app_state_secret() -> None:
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(chat_v2_cursor_secret="s")))
 
@@ -101,6 +787,150 @@ def test_cursor_secret_fails_closed_when_missing() -> None:
     assert exc_info.value.status_code == 500
     detail = cast(dict[str, Any], exc_info.value.detail)
     assert detail["code"] == "cursor_secret_unavailable"
+
+
+def test_chat_v2_request_paths_do_not_construct_direct_intaris_readers() -> None:
+    chat_v2_dir = Path(chat_v2_routes.__file__).parent
+    for path in (chat_v2_dir / "routes.py", chat_v2_dir / "sync.py"):
+        source = path.read_text(encoding="utf-8")
+        assert "IntarisSessionEventStore(" not in source
+    sync_source = (chat_v2_dir / "sync.py").read_text(encoding="utf-8")
+    assert "_warm_session_cache_entry" not in sync_source
+    assert "_IMMUTABLE_WATERMARK_CACHE" not in sync_source
+    assert "_IMMUTABLE_WINDOW_CACHE" not in sync_source
+
+
+@pytest.mark.asyncio
+async def test_session_read_refs_bind_each_lineage_to_exact_authority() -> None:
+    bound: list[EventStoreAuthority] = []
+    authority_tokens = iter(("a" * 64, "b" * 64))
+    request = _scoped_request("alice@example.com")
+    request.app.state.agent_registry.get = AsyncMock(
+        side_effect=lambda agent_id, **_kwargs: SimpleNamespace(
+            agent_id=agent_id,
+            owner_email=f"{agent_id}@owner.test",
+        )
+    )
+
+    request.app.state.cached_event_store.bind = lambda authority: (
+        bound.append(authority)
+        or SimpleNamespace(authority=authority, authority_token=next(authority_tokens))
+    )
+
+    first = await _session_read_ref(
+        request,
+        _session(
+            "session-1",
+            owner="alice@example.com",
+            conversation_id="conv-1",
+            agent_id="agent-one",
+        ),
+        user_email="alice@example.com",
+        role="root",
+        ordinal=0,
+    )
+    second = await _session_read_ref(
+        request,
+        _session(
+            "session-2",
+            owner="alice@example.com",
+            conversation_id="conv-1",
+            agent_id="agent-two",
+        ),
+        user_email="alice@example.com",
+        role="root",
+        ordinal=1,
+    )
+
+    assert bound == [
+        EventStoreAuthority(
+            user_email="alice@example.com",
+            agent_id="agent-one",
+            agent_owner_email="agent-one@owner.test",
+        ),
+        EventStoreAuthority(
+            user_email="alice@example.com",
+            agent_id="agent-two",
+            agent_owner_email="agent-two@owner.test",
+        ),
+    ]
+    assert first.reader.authority == bound[0]
+    assert second.reader.authority == bound[1]
+    assert first.authority_token == "a" * 64
+    assert second.authority_token == "b" * 64
+    assert "alice@example.com" not in repr((first.authority_token, second.authority_token))
+    assert "agent-one" not in repr((first.authority_token, second.authority_token))
+    assert "agent-one@owner.test" not in repr((first.authority_token, second.authority_token))
+
+
+@pytest.mark.anyio
+async def test_conversation_sync_and_backfill_forward_fresh_attachment_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = AsyncMock()
+    context = SimpleNamespace(
+        scope=object(),
+        conversation=object(),
+        session_refs=[],
+        event_store=object(),
+        cursor_secret="secret",
+        queue=object(),
+        state=object(),
+        runtime_input=object(),
+        session_cache=object(),
+        event_post_processor=processor,
+    )
+    sync_response = object()
+    timeline_response = object()
+    load = AsyncMock(return_value=context)
+    build_sync = AsyncMock(return_value=sync_response)
+    build_timeline = AsyncMock(return_value=timeline_response)
+    monkeypatch.setattr(chat_v2_routes, "_load_read_context", load)
+    monkeypatch.setattr(chat_v2_routes, "build_chat_sync_response", build_sync)
+    monkeypatch.setattr(
+        chat_v2_routes,
+        "build_timeline_backfill_response",
+        build_timeline,
+    )
+
+    assert (
+        await chat_v2_routes.chat_v2_sync(
+            cast(Any, object()),
+            "conversation-a",
+            "cursor",
+            500,
+        )
+        is sync_response
+    )
+    assert (
+        await chat_v2_routes.chat_v2_timeline(
+            cast(Any, object()),
+            "conversation-a",
+            None,
+            200,
+        )
+        is timeline_response
+    )
+    assert build_sync.await_args.kwargs["event_post_processor"] is processor
+    assert build_timeline.await_args.kwargs["event_post_processor"] is processor
+
+
+@pytest.mark.asyncio
+async def test_session_read_ref_rejects_authority_user_mismatch_before_binding() -> None:
+    request = _scoped_request("alice@example.com")
+    request.app.state.cached_event_store.bind = AsyncMock()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _session_read_ref(
+            request,
+            _session("session-1", owner="bob@example.com", conversation_id="conv-1"),
+            user_email="alice@example.com",
+            role="root",
+            ordinal=0,
+        )
+
+    assert exc_info.value.detail["code"] == "event_store_authority_unavailable"
+    request.app.state.cached_event_store.bind.assert_not_called()
 
 
 def test_retry_completion_marker_ignores_unrelated_completed_events() -> None:
@@ -161,6 +991,8 @@ async def test_send_message_claims_transaction_and_submits_once(
             "content": "hello",
             "client_message_id": "client-1",
             "chat_mode": None,
+            "idempotency_scope": "chat-v2:conv-1:user@test.com",
+            "idempotency_key": "txn-1",
         }
     ]
 
@@ -242,6 +1074,8 @@ async def test_send_message_accepts_unknown_slash_prefixed_text(
             "content": "/not-a-command should be plain text",
             "client_message_id": "msg-1",
             "chat_mode": None,
+            "idempotency_scope": "chat-v2:conv-1:user@test.com",
+            "idempotency_key": "txn-1",
         }
     ]
 
@@ -292,7 +1126,7 @@ async def test_send_message_duplicate_replays_without_submit(
 
 
 @pytest.mark.asyncio
-async def test_send_message_duplicate_pending_is_not_acknowledged(
+async def test_send_message_duplicate_pending_reconciles_durable_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduler = _Scheduler()
@@ -320,16 +1154,31 @@ async def test_send_message_duplicate_pending_is_not_acknowledged(
     async def _claim(*_args: object, **_kwargs: object) -> tuple[Any, bool]:
         return tx, False
 
+    async def _complete(_request: object, _transaction_id: str, **kwargs: object) -> Any:
+        tx.status = kwargs["status"]
+        tx.result = kwargs.get("result")
+        return tx
+
+    async def _mark(*_args: object, **_kwargs: object) -> None:
+        return None
+
     monkeypatch.setattr(chat_v2_routes, "_require_mutable_conversation", _require)
     monkeypatch.setattr(chat_v2_routes, "_claim_transaction", _claim)
+    monkeypatch.setattr(chat_v2_routes, "_complete_transaction", _complete)
+    monkeypatch.setattr(chat_v2_routes, "_mark_attachments_attached", _mark)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await chat_v2_send_message(cast(Any, request), "conv-1", "txn-1", payload)
+    response = await chat_v2_send_message(
+        cast(Any, request),
+        "conv-1",
+        "txn-1",
+        payload,
+    )
 
-    assert exc_info.value.status_code == 409
-    detail = cast(dict[str, Any], exc_info.value.detail)
-    assert detail["code"] == "client_txn_pending"
-    assert scheduler.submitted == []
+    assert response.status == "accepted"
+    assert tx.status == "accepted"
+    assert len(scheduler.submitted) == 1
+    assert scheduler.submitted[0]["idempotency_scope"] == "chat-v2:conv-1:user@test.com"
+    assert scheduler.submitted[0]["idempotency_key"] == "txn-1"
 
 
 @pytest.mark.asyncio
@@ -757,6 +1606,64 @@ async def test_session_context_rejects_session_conversation_owner_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_child_session_context_reads_complete_rotation_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    original = _session(
+        "child-original",
+        owner="alice@example.com",
+        conversation_id="conv-1",
+        parent_session_id="root-1",
+    )
+    original.status = "completed"
+    successor = _session(
+        "child-successor",
+        owner="alice@example.com",
+        conversation_id="conv-1",
+        parent_session_id="root-1",
+    )
+    successor.previous_session_id = original.session_id
+    successor.status = "completed"
+    conversation_row = _conversation("conv-1", owner="alice@example.com")
+    _patch_scope_queries(
+        monkeypatch,
+        session_row=original,
+        conversation_row=conversation_row,
+    )
+
+    async def get_child_chain(_session: Any, _session_id: str) -> tuple[list[Any], bool]:
+        return [original, successor], False
+
+    async def session_read_ref(
+        _request: Any,
+        row: Any,
+        **_kwargs: Any,
+    ) -> str:
+        return row.session_id
+
+    async def runtime_input(**_kwargs: Any) -> RuntimeOverlayInput:
+        return RuntimeOverlayInput(
+            runtime_epoch="child-lineage",
+            runtime_revision=0,
+            active_turn=None,
+        )
+
+    monkeypatch.setattr(chat_v2_routes, "get_child_session_continuation_chain", get_child_chain)
+    monkeypatch.setattr(chat_v2_routes, "_session_read_ref", session_read_ref)
+    monkeypatch.setattr(chat_v2_routes, "runtime_input_from_scheduler", runtime_input)
+
+    context = await _load_session_context(request, original.session_id)
+
+    assert context["session_refs"] == [
+        "child-original",
+        "child-successor",
+    ]
+    assert context["scope"].session_id == "child-original"
+    assert context["scope"].status == "completed"
+
+
+@pytest.mark.asyncio
 async def test_task_step_route_denies_task_owner_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1153,6 +2060,11 @@ def _request(scheduler: object) -> SimpleNamespace:
 
 
 def _scoped_request(email: str) -> SimpleNamespace:
+    reader = SimpleNamespace(
+        read_session_events=AsyncMock(),
+        read_session_high_watermark=AsyncMock(),
+        authority_token="c" * 64,
+    )
     return SimpleNamespace(
         state=SimpleNamespace(user=AuthenticatedUser(email=email, role="user")),
         app=SimpleNamespace(
@@ -1162,6 +2074,15 @@ def _scoped_request(email: str) -> SimpleNamespace:
                 session_factory=lambda: _SessionContext(),
                 turn_scheduler=None,
                 session_cache=None,
+                agent_registry=SimpleNamespace(
+                    get=AsyncMock(
+                        return_value=SimpleNamespace(
+                            agent_id="agent",
+                            owner_email=email,
+                        )
+                    )
+                ),
+                cached_event_store=SimpleNamespace(bind=lambda _authority: reader),
             )
         ),
     )
@@ -1173,6 +2094,7 @@ def _session(
     owner: str,
     conversation_id: str,
     parent_session_id: str | None = None,
+    agent_id: str = "agent",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         session_id=session_id,
@@ -1181,7 +2103,7 @@ def _session(
         parent_session_id=parent_session_id,
         intaris_session_id=session_id,
         delegation_task="delegation",
-        agent_id="agent",
+        agent_id=agent_id,
         status="active",
         completion_reason=None,
     )
@@ -1223,11 +2145,19 @@ def _patch_scope_queries(
     async def get_step(_session: Any, _step_run_id: str) -> Any:
         return step_run
 
+    async def get_child_chain(_session: Any, session_id: str) -> tuple[list[Any], bool]:
+        return (
+            [session_row]
+            if session_row is not None and session_row.session_id == session_id
+            else []
+        ), False
+
     async def get_task(_session: Any, _task_id: str) -> Any:
         return task
 
     monkeypatch.setattr(chat_v2_routes, "get_session_row", get_session)
     monkeypatch.setattr(chat_v2_routes, "get_conversation", get_conversation)
+    monkeypatch.setattr(chat_v2_routes, "get_child_session_continuation_chain", get_child_chain)
     monkeypatch.setattr(chat_v2_routes, "get_step_run", get_step)
     monkeypatch.setattr(chat_v2_routes, "get_task", get_task)
 
@@ -1317,6 +2247,8 @@ class _Scheduler:
                 "content": content,
                 "client_message_id": kwargs.get("client_message_id"),
                 "chat_mode": kwargs.get("one_shot_chat_mode"),
+                "idempotency_scope": kwargs.get("idempotency_scope"),
+                "idempotency_key": kwargs.get("idempotency_key"),
             }
         )
         return self.error
@@ -1346,4 +2278,7 @@ class _Scheduler:
         return {"queue_id": queue_id, "content": content}
 
     def queued_messages(self, _conversation_id: str) -> list[Any]:
+        return self.queued
+
+    async def get_queued_messages(self, _conversation_id: str) -> list[Any]:
         return self.queued

@@ -252,8 +252,9 @@ async def test_llm_compaction_appends_recoverable_tool_handles() -> None:
     assert cache.applied
     summary, _seq = cache.applied[0]
     assert summary.startswith("summary text")
-    assert "Recoverable tool outputs before compaction:" in summary
-    assert "read_tool_output(call_id='tool-call-3')" in summary
+    assert "## Recoverable Tool Evidence" in summary
+    assert "call_id='tool-call-3'" in summary
+    assert "Use read_tool_output for the full output" in summary
 
 
 @pytest.mark.asyncio
@@ -443,9 +444,11 @@ def test_mechanical_summary_keeps_recoverable_tool_handles() -> None:
 
     summary = _mechanical_summary(events)
 
-    assert "Recoverable tool outputs before compaction:" in summary
-    assert "grep: recover with read_tool_output(call_id='tool-call-0')" in summary
-    assert "grep: recover with read_tool_output(call_id='tool-call-11')" in summary
+    assert "## Recoverable Tool Evidence" in summary
+    assert "call_id='tool-call-7'" in summary
+    assert "call_id='tool-call-11'" in summary
+    assert "call_id='tool-call-0'" not in summary
+    assert "Use read_tool_output for the full output" in summary
 
 
 @pytest.mark.asyncio

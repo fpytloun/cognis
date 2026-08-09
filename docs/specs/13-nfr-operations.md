@@ -61,14 +61,12 @@ the sum.
 
 ### Scaling Path
 
-Phase 1 (MVP): single controller process handles all sessions.
-
-Phase 1.5 (current): single controller replica with Redis-backed L2
-session cache for restart resilience and future multi-replica readiness.
-S3-backed tool output storage for shared/persistent tool outputs.
-
-Phase 2+: multiple controller replicas with sticky WebSocket sessions,
-distributed turn scheduling, and Redis-backed shared session state.
+The same controller image supports one replica or multiple replicas. HA uses
+PostgreSQL-backed durable ownership for turns, tasks, schedules, pauses,
+channels, workers, and executor connections, plus S3-compatible artifacts/tool
+outputs and shared external crypto. Redis is an optional L2 cache, not a
+correctness dependency. WebSockets reconnect through the shared load balancer;
+sticky sessions are not required for correctness.
 
 ## Availability and Degradation
 
@@ -92,8 +90,8 @@ Degradation should be explicit and visible to users.
 | **Intaris (event record)** | Turn events not persisted | Buffer events in memory; retry on recovery. If buffer exceeds limit, fail the turn. Never silently drop recorded events. |
 | **LLM provider** | No model inference | Retry with fallback model per routing policy. If all providers down: inform user. |
 | **Executor** | No tool execution | Retry spawn. On persistent failure: inform LLM, inform user. |
-| **Redis (when used)** | No L2 cache | Fall back to L1 in-memory cache only. Higher cold-start cost on session load. Single-replica correctness preserved; multi-replica visibility lost. |
-| **MinIO/S3 (tool outputs)** | No tool output persistence | Tool outputs stored in-memory only for current session. `read_tool_output`/`search_tool_output` return "not found" for outputs from before the outage. |
+| **Redis (when used)** | No shared volatile detail or L2 event cache | Owner-local runtime detail continues. Remote clients retain the durable spinner and recover canonical Intaris state. Direct Intaris reads increase. Readiness and turn correctness are unchanged; stale-on-error canonical reads are forbidden. |
+| **MinIO/S3 (tool outputs)** | No durable tool output persistence | HA fails durable output operations closed rather than silently switching to pod-local memory. An external side effect whose output cannot be persisted may remain explicitly ambiguous. |
 | **PostgreSQL** | **Full outage** | Controller cannot function. Return 503 on all requests. |
 
 ### Circuit Breaker
@@ -191,6 +189,35 @@ cognis_session_cache_misses_total
 cognis_session_cache_size
 cognis_session_cache_evictions_total
 ```
+
+Chat v2 Redis acceleration also reports aggregate, identity-free metrics:
+
+```text
+cognis_chat_v2_runtime_relay_connected
+cognis_chat_v2_runtime_relay_enqueued_total
+cognis_chat_v2_runtime_relay_published_total
+cognis_chat_v2_runtime_relay_received_total
+cognis_chat_v2_runtime_relay_applied_total
+cognis_chat_v2_runtime_relay_publish_errors_total
+cognis_chat_v2_runtime_relay_reconnects_total
+cognis_chat_v2_runtime_relay_dropped_total{reason}
+cognis_chat_v2_runtime_relay_queue_depth
+cognis_chat_v2_runtime_relay_payload_bytes
+cognis_event_read_cache_hits_total{tier,operation}
+cognis_event_read_cache_misses_total{tier,operation}
+cognis_event_read_cache_errors_total{tier,operation}
+cognis_event_read_cache_singleflight_joins_total{operation}
+cognis_event_read_cache_upstream_reads_total{operation}
+cognis_event_read_cache_upstream_latency_seconds{operation}
+cognis_event_read_cache_invalidations_total{source}
+cognis_event_read_cache_bypassed_total{reason}
+cognis_event_read_cache_entries
+cognis_event_read_cache_bytes
+```
+
+Do not add user, conversation, session, agent, controller, Redis key/channel, or
+other identity labels. Diagnostics expose safe configured/available/connected
+booleans only. Redis is excluded from `/api/readyz`.
 
 #### Task Queue (Phase 2)
 

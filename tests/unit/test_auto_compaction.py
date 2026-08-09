@@ -20,7 +20,12 @@ from cognis.core.compaction import CompactionModelContext, CompactionResult
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.session_cache import CachedEvent, CachedSessionState
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    SessionModel,
+    SessionTransition,
+)
 from cognis.models.workflow import StepDefinition
 from cognis.store import queries
 
@@ -128,6 +133,7 @@ class _FakeSessionManager:
         current_session: SessionModel,
         intention: str,
         completion_reason: str = "compacted",
+        transition: SessionTransition = SessionTransition.COMPACT,
         compaction_summary: str | None = None,
         compaction_summary_event_data: dict[str, Any] | None = None,
         tail_events: list[Any] | None = None,
@@ -139,6 +145,7 @@ class _FakeSessionManager:
                 "old_session_id": current_session.session_id,
                 "intention": intention,
                 "completion_reason": completion_reason,
+                "transition": transition,
                 "compaction_summary_event_data": compaction_summary_event_data,
             }
         )
@@ -369,6 +376,28 @@ async def test_auto_compact_triggers_rotation_and_caches() -> None:
     assert published[1].data["previous_session_id"] == "session-1"
     assert published[1].data["session_id"] == "new-session-1"
     assert published[1].data["status"] == "compacted"
+
+
+@pytest.mark.asyncio
+async def test_zero_turn_compaction_does_not_rotate() -> None:
+    session_manager = _FakeSessionManager()
+    loop = _minimal_agent_loop(session_manager=session_manager)
+    result = CompactionResult(
+        compacted=True,
+        method="llm",
+        summary="No effective history",
+        compaction_seq=1,
+        turns_compacted=0,
+    )
+
+    rotated = await loop._rotate_after_compaction(
+        _step_context(),
+        result,
+        trigger="automatic",
+    )
+
+    assert rotated is None
+    assert session_manager.rotations == []
 
 
 @pytest.mark.asyncio
@@ -624,6 +653,7 @@ async def test_idle_checkpoint_compacts_with_ambient_prompt_and_trigger() -> Non
     assert new_session is not None
     assert compaction.calls == [("session-1", "idle_checkpoint", True)]
     assert len(session_mgr.rotations) == 1
+    assert session_mgr.rotations[0]["transition"] is SessionTransition.RENEW
     assert published[0].data["trigger"] == "idle_checkpoint"
 
 

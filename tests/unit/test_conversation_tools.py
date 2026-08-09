@@ -170,7 +170,32 @@ async def test_read_conversation_messages_returns_session_anchors_and_uses_prev_
 
     handlers = ct.build_conversation_tool_handlers(
         lambda: _SessionContext(),
-        _FakeIntaris({"int-1": [_event(1, "one"), _event(2, "two"), _event(3, "three")]}),
+        _FakeIntaris(
+            {
+                "int-1": [
+                    _event(1, "one"),
+                    _event(2, "two"),
+                    {
+                        **_event(3, "three"),
+                        "data": {
+                            "role": "user",
+                            "content": "three",
+                            "attachments": [
+                                {
+                                    "artifact_id": "img-conversation",
+                                    "kind": "image",
+                                    "mime_type": "image/png",
+                                    "filename": "conversation.png",
+                                    "size_bytes": 42,
+                                    "url": "https://provider.invalid/private",
+                                    "path": "/private/tmp/private.png",
+                                }
+                            ],
+                        },
+                    },
+                ]
+            }
+        ),
     )
 
     result = await handlers["read_conversation_messages"]({"limit": 2}, _context())
@@ -178,6 +203,15 @@ async def test_read_conversation_messages_returns_session_anchors_and_uses_prev_
     assert [event["seq"] for event in result["events"]] == [2, 3]
     assert result["events"][0]["session_id"] == "sess-1"
     assert result["events"][0]["anchor"] == "sess-1:2"
+    assert result["events"][1]["attachments"] == [
+        {
+            "artifact_id": "img-conversation",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": "conversation.png",
+            "size_bytes": 42,
+        }
+    ]
     assert result["page"]["prev_cursor"]
 
     previous = await handlers["read_conversation_messages"](

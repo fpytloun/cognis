@@ -1,0 +1,237 @@
+# HA qualification overlay.
+#
+# Prepare generated credentials first:
+#   uv run python scripts/prepare_ha_e2e.py
+#
+# Then combine this with the existing local and deterministic E2E stacks:
+#   docker compose --project-name cognis-ha-e2e \
+#     --env-file .local/cognis-ha-e2e/current/compose.env \
+#     -f compose.local.yml -f compose.e2e.yml -f compose.ha-e2e.yml up -d --build
+services:
+  qdrant:
+    ports: !reset []
+
+  mock-llm:
+    ports: !reset []
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cognis
+      POSTGRES_USER: cognis
+      POSTGRES_PASSWORD: ${COGNIS_HA_POSTGRES_PASSWORD:?run scripts/prepare_ha_e2e.py}
+    volumes:
+      - cognis-ha-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cognis -d cognis"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${COGNIS_HA_MINIO_ACCESS_KEY:?run scripts/prepare_ha_e2e.py}
+      MINIO_ROOT_PASSWORD: ${COGNIS_HA_MINIO_SECRET_KEY:?run scripts/prepare_ha_e2e.py}
+    volumes:
+      - cognis-ha-minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${COGNIS_HA_MINIO_ACCESS_KEY:?run scripts/prepare_ha_e2e.py}
+      MINIO_ROOT_PASSWORD: ${COGNIS_HA_MINIO_SECRET_KEY:?run scripts/prepare_ha_e2e.py}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing local/cognis-artifacts
+        mc mb --ignore-existing local/cognis-tool-outputs
+    restart: "no"
+
+  cognis-db-upgrade:
+    image: ${COGNIS_IMAGE:-cognis-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment: &cognis-ha-environment
+      COGNIS_DATA_DIR: /data
+      COGNIS_HOST: 0.0.0.0
+      COGNIS_PORT: 8080
+      COGNIS_RUNTIME_MODE: ha
+      COGNIS_SCHEMA_MODE: validate
+      COGNIS_REQUIRE_EXTERNAL_CRYPTO: "true"
+      DATABASE_URL: postgresql+asyncpg://cognis:${COGNIS_HA_POSTGRES_PASSWORD}@postgres:5432/cognis
+      COGNIS_JWT_PRIVATE_KEY_PATH: /run/cognis-ha/private.pem
+      COGNIS_JWT_PUBLIC_KEY_PATH: /run/cognis-ha/public.pem
+      COGNIS_SECRETS_KEY_PATH: /run/cognis-ha/secrets.key
+      COGNIS_ARTIFACT_BACKEND: s3
+      COGNIS_ARTIFACT_S3_ENDPOINT: http://minio:9000
+      COGNIS_ARTIFACT_S3_ACCESS_KEY: ${COGNIS_HA_MINIO_ACCESS_KEY}
+      COGNIS_ARTIFACT_S3_SECRET_KEY: ${COGNIS_HA_MINIO_SECRET_KEY}
+      COGNIS_ARTIFACT_S3_BUCKET: cognis-artifacts
+      COGNIS_ARTIFACT_SIGNING_SECRET: ${COGNIS_HA_ARTIFACT_SIGNING_SECRET}
+      COGNIS_TOOL_OUTPUT_BACKEND: s3
+      COGNIS_TOOL_OUTPUT_S3_ENDPOINT: http://minio:9000
+      COGNIS_TOOL_OUTPUT_S3_ACCESS_KEY: ${COGNIS_HA_MINIO_ACCESS_KEY}
+      COGNIS_TOOL_OUTPUT_S3_SECRET_KEY: ${COGNIS_HA_MINIO_SECRET_KEY}
+      COGNIS_TOOL_OUTPUT_S3_BUCKET: cognis-tool-outputs
+      COGNIS_LOG_FORMAT: ${COGNIS_LOG_FORMAT:-text}
+      COGNIS_MNEMORY_URL: http://mnemory:8050
+      COGNIS_INTARIS_URL: http://intaris:8060
+      COGNIS_LOCAL_LLM_BASE_URL: http://mock-llm:8090/v1
+      COGNIS_LOCAL_LLM_API_KEY: mock-key
+      COGNIS_DEFAULT_MEMORY_BACKEND: none
+      COGNIS_DEFAULT_GUARDRAILS_BACKEND: none
+      COGNIS_CONTROLLER_ID: migration
+      COGNIS_CONTROLLER_INTERNAL_URL: http://cognis-db-upgrade:8080
+    volumes: &cognis-ha-volumes
+      - ./.local/cognis-ha-e2e/current/keys:/run/cognis-ha:ro
+    command: ["cognis-controller", "db", "upgrade"]
+    restart: "no"
+
+  mnemory:
+    ports: !reset []
+    environment:
+      MNEMORY_JWKS_URL: http://cognis-lb:8080/.well-known/jwks.json
+
+  intaris:
+    ports: !reset []
+    environment:
+      INTARIS_JWKS_URL: http://cognis-lb:8080/.well-known/jwks.json
+
+  cognis:
+    ports: !reset []
+    depends_on:
+      cognis-db-upgrade:
+        condition: service_completed_successfully
+      mock-llm:
+        condition: service_healthy
+      mnemory:
+        condition: service_started
+      intaris:
+        condition: service_started
+    environment:
+      <<: *cognis-ha-environment
+      COGNIS_CONTROLLER_ID: controller-1
+      COGNIS_CONTROLLER_INTERNAL_URL: http://cognis:8080
+      COGNIS_PUBLIC_BASE_URL: http://localhost:${COGNIS_HA_E2E_PORT:-18080}
+    volumes: *cognis-ha-volumes
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/readyz')"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  cognis-2:
+    image: ${COGNIS_IMAGE:-cognis-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      cognis-db-upgrade:
+        condition: service_completed_successfully
+      mock-llm:
+        condition: service_healthy
+      mnemory:
+        condition: service_started
+      intaris:
+        condition: service_started
+    environment:
+      <<: *cognis-ha-environment
+      COGNIS_CONTROLLER_ID: controller-2
+      COGNIS_CONTROLLER_INTERNAL_URL: http://cognis-2:8080
+      COGNIS_PUBLIC_BASE_URL: http://localhost:${COGNIS_HA_E2E_PORT:-18080}
+    volumes: *cognis-ha-volumes
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/readyz')"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+
+  cognis-lb:
+    image: nginx:1.27-alpine
+    depends_on:
+      cognis:
+        condition: service_healthy
+      cognis-2:
+        condition: service_healthy
+    ports:
+      - "${COGNIS_HA_E2E_PORT:-18080}:8080"
+    volumes:
+      - ./docker/ha-e2e/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+  seed-e2e:
+    depends_on:
+      cognis-lb:
+        condition: service_started
+      mock-llm:
+        condition: service_healthy
+    volumes:
+      - ./.local/cognis-compose/executor-token:/run/cognis-local
+      - ./.local/cognis-ha-e2e/current/executors:/run/cognis-ha-executors
+      - ./.local/cognis-ha-e2e/current/keys:/run/cognis-ha:ro
+    environment:
+      <<: *cognis-ha-environment
+      COGNIS_CONTROLLER_ID: seed-e2e
+      COGNIS_CONTROLLER_INTERNAL_URL: http://seed-e2e:8080
+      COGNIS_PUBLIC_BASE_URL: http://cognis-lb:8080
+      COGNIS_HA_E2E_SEED: "true"
+      COGNIS_HA_EXECUTOR_TOKEN_DIR: /run/cognis-ha-executors
+    command:
+      - sh
+      - -lc
+      - python /app/scripts/local_compose_seed.py && python /app/scripts/seed_e2e.py
+
+  cognis-executor:
+    depends_on:
+      cognis-lb:
+        condition: service_started
+    environment:
+      COGNIS_CONTROLLER_URL: ws://cognis:8080/api/executor/ws
+      COGNIS_EXECUTOR_TOKEN_FILE: /run/cognis-ha-executors/executor-1.env
+    volumes:
+      - cognis-executor-home:/home/cognis
+      - ./.local/cognis-ha-e2e/current/executors:/run/cognis-ha-executors:ro
+
+  cognis-executor-2:
+    image: ${COGNIS_EXECUTOR_IMAGE:-cognis-executor-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.executor
+    depends_on:
+      cognis-2:
+        condition: service_healthy
+    environment:
+      COGNIS_CONTROLLER_URL: ws://cognis-2:8080/api/executor/ws
+      COGNIS_EXECUTOR_TOKEN_FILE: /run/cognis-ha-executors/executor-2.env
+      COGNIS_EXECUTOR_TOKEN_WAIT_SECONDS: ${COGNIS_EXECUTOR_TOKEN_WAIT_SECONDS:-180}
+      COGNIS_EXECUTOR_WORKDIR: /home/cognis/workspace
+      COGNIS_LOG_LEVEL: ${COGNIS_EXECUTOR_LOG_LEVEL:-info}
+      COGNIS_LOCAL_LLM_API_KEY: mock-key
+    volumes:
+      - cognis-ha-executor-2-home:/home/cognis
+      - ./.local/cognis-ha-e2e/current/executors:/run/cognis-ha-executors:ro
+    restart: unless-stopped
+
+volumes:
+  cognis-ha-postgres:
+  cognis-ha-minio:
+  cognis-ha-executor-2-home:

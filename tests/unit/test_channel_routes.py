@@ -39,6 +39,10 @@ class _FakeChannelManager:
     async def stop_account(self, account_id: str) -> None:
         self.stopped.append(account_id)
 
+    async def revoke_account(self, account_id: str) -> bool:
+        self.stopped.append(account_id)
+        return True
+
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
@@ -132,6 +136,56 @@ def test_create_channel_account_applies_defaults(monkeypatch: object, tmp_path: 
         assert dm_policy == "pairing"
         assert group_policy == "pairing"
         assert config["assistant_delivery_mode"] == "final_only"
+
+
+def test_create_channel_account_rejects_coerced_group_context_settings(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+        for settings, expected in (
+            (
+                {"group_context_enabled": "true"},
+                "group_context_enabled must be a boolean",
+            ),
+            (
+                {"group_context_max_messages": True},
+                "group_context_max_messages must be an integer",
+            ),
+        ):
+            response = client.post(
+                "/api/v1/channels/accounts",
+                headers=headers,
+                json={
+                    "channel_type": "telegram",
+                    "agent_id": "agent-1",
+                    "settings": settings,
+                },
+            )
+            assert response.status_code == 400
+            assert response.json()["error"]["message"] == expected
 
 
 def test_create_webhook_channel_generates_secret(monkeypatch: object, tmp_path: Path) -> None:

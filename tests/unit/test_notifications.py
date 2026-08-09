@@ -1,12 +1,110 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from cognis.core.notifications import NotificationService
+from cognis.core.agent_loop import PauseWaiter
+from cognis.core.notifications import (
+    NotificationService,
+    _user_interaction_display,
+    safe_display_arguments,
+)
+
+
+def test_user_interaction_display_maps_question_options_to_safe_labels() -> None:
+    display = _user_interaction_display(
+        notification_type="step_question",
+        notification_payload={
+            "questions": [
+                {
+                    "id": "target",
+                    "question": "Where should this deploy?",
+                    "options": [{"id": "stage", "label": "Staging"}],
+                }
+            ]
+        },
+        resolution_data={
+            "answers": [
+                {
+                    "question_id": "target",
+                    "selected_option_ids": ["stage"],
+                    "custom_answer": "Run smoke tests",
+                }
+            ]
+        },
+        decision="continue",
+    )
+
+    assert display == {
+        "title": "You answered questions",
+        "summary": None,
+        "answers": [
+            {
+                "question": "Where should this deploy?",
+                "answer": "Staging, Run smoke tests",
+            }
+        ],
+        "status": "complete",
+    }
+
+
+def test_user_interaction_display_never_includes_credential_secret_payload() -> None:
+    display = _user_interaction_display(
+        notification_type="credential_request",
+        notification_payload={"credential_id": "github_work", "kind": "token"},
+        resolution_data={
+            "credential_id": "github_work",
+            "credential_kind": "token",
+            "credential": {"token": "must-not-appear"},
+        },
+        decision="approve",
+    )
+
+    assert display["title"] == "You provided a credential"
+    assert display["summary"] == "Created or updated credential `github_work` (token)."
+    assert display["answers"] == []
+
+
+def test_safe_display_arguments_preserves_action_details_and_redacts_secrets() -> None:
+    display = safe_display_arguments(
+        {
+            "command": "uv run pytest tests/unit/test_notifications.py -q",
+            "description": "Run notification tests",
+            "env": {"API_TOKEN": "must-not-appear", "KEEP": "visible"},
+        }
+    )
+
+    assert display == {
+        "command": "uv run pytest tests/unit/test_notifications.py -q",
+        "description": "Run notification tests",
+        "env": {"API_TOKEN": "[redacted]", "KEEP": "visible"},
+    }
+
+
+def test_approved_escalation_includes_safe_arguments_and_past_tense_title() -> None:
+    display = _user_interaction_display(
+        notification_type="escalation",
+        notification_payload={
+            "tool_name": "bash",
+            "arguments_display": {"command": "uv run pytest -q"},
+            "reasoning": "The command can change repository state.",
+            "risk": "medium",
+        },
+        resolution_data={},
+        decision="approve",
+    )
+
+    assert display["title"] == "You approved the action"
+    assert display["answers"] == [
+        {"question": "Action", "answer": "bash"},
+        {"question": "Arguments", "answer": '{\n  "command": "uv run pytest -q"\n}'},
+        {"question": "Reason", "answer": "The command can change repository state."},
+        {"question": "Risk", "answer": "medium"},
+    ]
 
 
 class _FakeSession:
@@ -32,6 +130,9 @@ class _FakeSession:
             setattr(self._row, attr, value)
 
     async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
         return None
 
 
@@ -180,6 +281,35 @@ def _task_row(task_id: str, status: str) -> Any:
 
 
 @pytest.mark.asyncio
+async def test_internal_resolution_guard_rejects_stale_notification_mutation() -> None:
+    row = _notification_row()
+    event_bus = _FakeEventBus()
+    pause_waiter = _FakePauseWaiter()
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=pause_waiter,
+        event_bus=event_bus,
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    async def _stale(_session: Any) -> bool:
+        return False
+
+    resolved = await service.resolve_internal(
+        "call-1",
+        "completed",
+        {"transaction_id": "txn-1"},
+        admission_guard=_stale,
+    )
+
+    assert resolved is False
+    assert row.status == "pending"
+    assert row.resolution is None
+    assert pause_waiter.order == []
+    assert event_bus.events == []
+
+
+@pytest.mark.asyncio
 async def test_escalation_resolution_submits_before_unblocking_waiter() -> None:
     row = _notification_row()
     order: list[str] = []
@@ -286,6 +416,40 @@ async def test_escalation_resolution_accepts_concurrent_remote_reconciliation() 
     assert row.status == "resolved"
     assert row.resolution["state"] == "resolved_remote"
     assert event_bus.events == []
+
+
+@pytest.mark.asyncio
+async def test_cross_controller_resolution_wakes_db_poll_without_shared_waiter() -> None:
+    row = _notification_row()
+    owner_waiter = PauseWaiter()
+    resolver_waiter = _FakePauseWaiter(should_resolve=False)
+    owner = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=owner_waiter,
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+    resolver = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=resolver_waiter,
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    wait_task = asyncio.create_task(
+        owner.wait_for_resolution("call-1", timeout=2, poll_seconds=0.01)
+    )
+    await asyncio.sleep(0)
+    assert await resolver.resolve(
+        "call-1",
+        "approve",
+        {"note": "approved elsewhere"},
+        user_email="user@example.com",
+    )
+
+    resolution = await wait_task
+    assert resolution.decision == "approve"
+    assert resolution.data["note"] == "approved elsewhere"
 
 
 @pytest.mark.asyncio
@@ -445,7 +609,7 @@ async def test_reconcile_remote_escalation_uses_intaris_user_decision() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_pending_keeps_remote_resolution_visible_when_waiter_is_missing(
+async def test_list_pending_persists_remote_resolution_when_waiter_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     row = _notification_row()
@@ -478,10 +642,10 @@ async def test_list_pending_keeps_remote_resolution_visible_when_waiter_is_missi
 
     pending = await service.list_pending("user@example.com", conversation_id="conv-1")
 
-    assert [notification.notification_id for notification in pending] == ["call-1"]
-    assert row.status == "pending"
-    assert row.resolution["state"] == "submitted_remote"
-    assert event_bus.events == []
+    assert pending == []
+    assert row.status == "resolved"
+    assert row.resolution["state"] == "resolved_remote"
+    assert event_bus.events[-1].data["notification_id"] == "call-1"
 
 
 # ---------------------------------------------------------------------------

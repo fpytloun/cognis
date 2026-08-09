@@ -73,6 +73,39 @@ class _Provider:
         return self.connection
 
 
+@pytest.mark.asyncio
+async def test_route_image_generate_accepts_executor_normalized_payload() -> None:
+    provider = _Provider()
+
+    async def rpc_call(method: str, params: dict[str, object], timeout: float | None = None):
+        del timeout
+        assert method == "llm.image_generate"
+        assert params["images"] == [
+            {"b64_json": "first", "content_type": "image/jpeg"},
+            {"b64_json": "second", "content_type": "image/png"},
+        ]
+        return {
+            "images": [{"b64_json": "result", "content_type": "image/webp"}],
+            "model": "gpt-image-2",
+        }
+
+    provider.connection.rpc_call = rpc_call
+    router = InferenceRouter(provider)
+
+    result = await router.route_image_generate(
+        prompt="Combine the images.",
+        model="gpt-image-2",
+        executor_id="exec-1",
+        images=[
+            {"b64_json": "first", "content_type": "image/jpeg"},
+            {"b64_json": "second", "content_type": "image/png"},
+        ],
+    )
+
+    assert result.model == "gpt-image-2"
+    assert result.images[0].content_type == "image/webp"
+
+
 class _PerformanceConnection:
     async def llm_complete_stream(self, **_: object):
         yield {"content": "Hello", "tool_calls": None, "reasoning_content": None, "index": 0}
@@ -239,6 +272,46 @@ async def test_inference_router_route_generate_can_target_explicit_executor_with
 
     assert result["choices"][0]["message"]["content"] == "Hello"
     assert provider.selected_executor_id == "empty-labels"
+
+
+@pytest.mark.asyncio
+async def test_inference_router_affinity_selects_pinned_executor_and_validates_labels() -> None:
+    provider = _MultiProvider()
+    router = InferenceRouter(provider)
+
+    await router.route_generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        executor_labels={"location": "local"},
+        request_kwargs={
+            "cognis_llm_api": "responses",
+            "_cognis_executor_affinity_id": "labeled",
+        },
+    )
+
+    assert provider.selected_executor_id == "labeled"
+
+    with pytest.raises(RuntimeError, match="No executor matches"):
+        await router.route_generate(
+            messages=[{"role": "user", "content": "hi"}],
+            model="gpt-5.4",
+            executor_labels={"location": "local"},
+            request_kwargs={"_cognis_executor_affinity_id": "empty-labels"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_inference_router_unbound_label_routing_remains_load_balanced() -> None:
+    provider = _MultiProvider()
+    router = InferenceRouter(provider)
+
+    await router.route_generate(
+        messages=[{"role": "user", "content": "hi"}],
+        model="gpt-5.4",
+        executor_labels={"location": "local"},
+    )
+
+    assert provider.selected_executor_id == "labeled"
 
 
 class _StructuredConnection:

@@ -27,6 +27,7 @@ from cognis.api.chat_v2.schemas import (
     TimelineItem,
     TodoStateTimelineItem,
     ToolCallTimelineItem,
+    UserInteractionTimelineItem,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -77,6 +78,35 @@ def test_side_lane_can_be_included_when_requested() -> None:
     assert [item.id for item in projection.timeline.items] == ["user:side_1"]
 
 
+def test_legacy_attachment_without_kind_does_not_break_projection() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_legacy_attachment",
+            seq=1,
+            type="user_message",
+            data={
+                "content": "Legacy image",
+                "client_message_id": "legacy_attachment",
+                "attachments": [
+                    {
+                        "artifact_id": "img_legacy",
+                        "mime_type": "image/png",
+                        "filename": "legacy.png",
+                        "size_bytes": 512,
+                    }
+                ],
+            },
+        )
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    item = projection.timeline.items[0]
+    assert isinstance(item, MessageTimelineItem)
+    assert item.attachments[0].kind == "image"
+
+
 def test_audit_only_prompt_visibility_is_hidden() -> None:
     raw_events = [
         RawSessionEvent(
@@ -122,6 +152,41 @@ def test_turn_error_lifecycle_projects_as_error() -> None:
     assert projection.timeline.items[0].kind == "error"
     assert projection.timeline.items[0].error_code == "executor_unavailable"
     assert projection.timeline.items[0].recoverable is True
+
+
+def test_user_interaction_lifecycle_projects_a_safe_answer_card() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_interaction",
+            seq=4,
+            type="lifecycle",
+            data={
+                "event": "user_interaction_resolved",
+                "interaction_id": "notif_question",
+                "interaction_type": "step_question",
+                "origin_call_id": "call_question",
+                "title": "You answered questions",
+                "answers": [
+                    {"question": "Deployment target?", "answer": "Staging"},
+                    {"question": "Why?", "answer": "Verify the migration"},
+                ],
+                "status": "complete",
+            },
+        )
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, UserInteractionTimelineItem)
+    assert item.id == "user-interaction:notif_question"
+    assert item.origin_call_id == "call_question"
+    assert [(answer.question, answer.answer) for answer in item.answers] == [
+        ("Deployment target?", "Staging"),
+        ("Why?", "Verify the migration"),
+    ]
 
 
 def test_cancelled_turn_lifecycle_projects_as_system_message() -> None:
@@ -188,6 +253,9 @@ def test_lifecycle_and_system_events_are_hidden_from_chat_timeline() -> None:
                 "scope": "conversation",
                 "follow_up_conversation_id": "conv_follow",
                 "follow_up_session_id": "sess_follow",
+                "retry_reason": "controller_restart",
+                "retry_source_turn_id": "turn-source",
+                "attempt": 2,
                 "content": "visible notice",
             },
         ),
@@ -237,8 +305,43 @@ def test_lifecycle_and_system_events_are_hidden_from_chat_timeline() -> None:
     assert system_item.notice_id == "notice_1"
     assert system_item.notice_kind == "managed_takeover"
     assert system_item.notice_scope == "conversation"
+    assert system_item.retry_reason == "controller_restart"
+    assert system_item.retry_source_turn_id == "turn-source"
+    assert system_item.attempt == 2
     assert system_item.follow_up_conversation_id == "conv_follow"
     assert system_item.follow_up_session_id == "sess_follow"
+
+
+def test_turn_initiated_system_notice_is_transient_not_canonical_history() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_follow_up",
+            seq=1,
+            type="system_message",
+            data={
+                "notice_id": "turn-init:fup_1",
+                "kind": "turn_initiated",
+                "scope": "turn",
+                "turn_id": "turn_fup_1",
+                "content": "Turn initiated by other: Agent work finished.",
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_follow_up",
+            seq=2,
+            type="assistant_message",
+            data={"message_id": "msg_1", "content": "Current result."},
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assert [
+        (item.kind, getattr(item, "role", None), getattr(item, "content", None))
+        for item in projection.timeline.items
+    ] == [("message", "assistant", "Current result.")]
 
 
 def test_lifecycle_compaction_start_notice_is_hidden() -> None:

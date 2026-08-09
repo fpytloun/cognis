@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import inspect, text
 
 from cognis.bootstrap import (
@@ -84,6 +87,111 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert coding_skill.current_version_id is not None
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_validation_mode_seeds_without_running_schema_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "validated.db"
+    alembic_config = Config("cognis/store/migrations/alembic.ini")
+    alembic_config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    alembic_config.config_file_name = None
+    command.upgrade(alembic_config, "head")
+
+    schema_bootstrap = AsyncMock()
+    monkeypatch.setattr("cognis.bootstrap.run_schema_bootstrap", schema_bootstrap)
+    config = replace(
+        load_config(),
+        data_dir=tmp_path,
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        schema_mode="validate",
+        jwt_private_key_path=tmp_path / "keys" / "private.pem",
+        jwt_public_key_path=tmp_path / "keys" / "public.pem",
+        secrets_key_path=tmp_path / "secrets.key",
+    )
+    _, runtime_engine, factory, _ = await bootstrap_runtime(
+        config,
+        create_password_hasher(),
+    )
+    try:
+        schema_bootstrap.assert_not_awaited()
+        async with factory() as session:
+            assert len(await list_settings(session)) == len(DEFAULT_SETTINGS)
+    finally:
+        await runtime_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_adds_task_control_conversation_link_idempotently(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "task_control_bootstrap.db"
+    alembic_config = Config("cognis/store/migrations/alembic.ini")
+    alembic_config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    alembic_config.config_file_name = None
+    command.upgrade(alembic_config, "105_managed_join_handoffs")
+
+    engine = create_engine(f"sqlite+aiosqlite:///{database_path}")
+    try:
+        await run_schema_bootstrap(engine)
+        await run_schema_bootstrap(engine)
+        async with engine.begin() as conn:
+            columns = await conn.run_sync(
+                lambda sync_conn: {
+                    column["name"] for column in inspect(sync_conn).get_columns("tasks")
+                }
+            )
+            indexes = await conn.run_sync(
+                lambda sync_conn: {
+                    index["name"]: index for index in inspect(sync_conn).get_indexes("tasks")
+                }
+            )
+        assert "control_conversation_id" in columns
+        assert "control_conversation_claimed_at" in columns
+        assert indexes["ux_tasks_control_conversation_id"]["unique"] == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_adds_work_scope_revision_tables_idempotently(tmp_path: Path) -> None:
+    database_path = tmp_path / "work_scope_bootstrap.db"
+    alembic_config = Config("cognis/store/migrations/alembic.ini")
+    alembic_config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    alembic_config.config_file_name = None
+    command.upgrade(alembic_config, "110_conversation_lineage")
+
+    engine = create_engine(f"sqlite+aiosqlite:///{database_path}")
+    try:
+        await run_schema_bootstrap(engine)
+        await run_schema_bootstrap(engine)
+        async with engine.begin() as conn:
+            tables = await conn.run_sync(
+                lambda sync_conn: set(inspect(sync_conn).get_table_names())
+            )
+            stream_indexes = await conn.run_sync(
+                lambda sync_conn: {
+                    index["name"] for index in inspect(sync_conn).get_indexes("work_scope_streams")
+                }
+            )
+            session_indexes = await conn.run_sync(
+                lambda sync_conn: {
+                    index["name"] for index in inspect(sync_conn).get_indexes("sessions")
+                }
+            )
+        assert {"work_scope_states", "work_scope_streams"} <= tables
+        assert {
+            "ix_work_scope_streams_event_stream",
+            "ix_work_scope_streams_session",
+        } <= stream_indexes
+        assert {
+            "ix_sessions_owner_parent_session",
+            "ix_sessions_owner_previous_session",
+        } <= session_indexes
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -494,13 +602,139 @@ async def test_run_schema_bootstrap_upgrades_managed_conversation_lineage(
         "root_link_id",
         "depth",
         "last_result_turn_id",
+        "handoff_state",
+        "handoff_target_turn_id",
+        "handoff_controller_session_id",
+        "handoff_controller_turn_id",
+        "handoff_tool_call_id",
+        "kind",
+        "completion_policy",
+        "owner_epoch",
+        "creation_policy_snapshot",
     }.issubset(columns)
     assert {
         "ix_managed_conversation_links_parent_link",
         "ix_managed_conversation_links_root_depth",
+        "ix_managed_conversation_links_handoff_owner",
     }.issubset(indexes)
     assert row == (None, "link_1", 1)
 
+    async with engine.begin() as conn:
+        table_names = await conn.run_sync(
+            lambda sync_conn: set(inspect(sync_conn).get_table_names())
+        )
+    assert {
+        "managed_conversation_signals",
+        "managed_channel_bindings",
+        "channel_inbound_ledger",
+        "channel_context_consumptions",
+        "channel_observed_targets",
+    }.issubset(table_names)
+    async with engine.begin() as conn:
+        signal_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in inspect(sync_conn).get_columns("managed_conversation_signals")
+            }
+        )
+    assert {
+        "resume_request_id",
+        "resume_turn_id",
+        "resume_prepared_at",
+        "resume_admitted_at",
+        "resume_terminal_status",
+    }.issubset(signal_columns)
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_schema_bootstrap_upgrades_group_context_columns_twice(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy_group_context.db'}")
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "CREATE TABLE channel_inbound_ledger ("
+                "inbound_id VARCHAR PRIMARY KEY, "
+                "account_id VARCHAR NOT NULL, "
+                "chat_id VARCHAR NOT NULL, "
+                "thread_key VARCHAR NOT NULL, "
+                "message_id VARCHAR NOT NULL, "
+                "binding_id VARCHAR, "
+                "occurred_at TIMESTAMP NOT NULL, "
+                "created_at TIMESTAMP NOT NULL"
+                ")"
+            )
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO channel_inbound_ledger "
+                "(inbound_id, account_id, chat_id, thread_key, message_id, "
+                "occurred_at, created_at) "
+                "VALUES ('inbound-1', 'account-1', 'chat-1', '', 'message-1', "
+                "'2026-08-02 10:00:00', '2026-08-02 10:00:01')"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE TABLE channel_context_consumptions ("
+                "consumption_id VARCHAR PRIMARY KEY, "
+                "state VARCHAR NOT NULL, "
+                "reserved_until TIMESTAMP NOT NULL"
+                ")"
+            )
+        )
+
+    await run_schema_bootstrap(engine)
+    await run_schema_bootstrap(engine)
+
+    async with engine.begin() as conn:
+        ledger_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in inspect(sync_conn).get_columns("channel_inbound_ledger")
+            }
+        )
+        ledger_indexes = await conn.run_sync(
+            lambda sync_conn: {
+                index["name"] for index in inspect(sync_conn).get_indexes("channel_inbound_ledger")
+            }
+        )
+        consumption_columns = await conn.run_sync(
+            lambda sync_conn: {
+                column["name"]
+                for column in inspect(sync_conn).get_columns("channel_context_consumptions")
+            }
+        )
+        consumption_indexes = await conn.run_sync(
+            lambda sync_conn: {
+                index["name"]
+                for index in inspect(sync_conn).get_indexes("channel_context_consumptions")
+            }
+        )
+        backfilled = (
+            await conn.execute(
+                text(
+                    "SELECT observed_at, ordering_key, ordering_source "
+                    "FROM channel_inbound_ledger WHERE inbound_id = 'inbound-1'"
+                )
+            )
+        ).one()
+
+    assert {"observed_at", "ordering_key", "ordering_source", "retain_until"}.issubset(
+        ledger_columns
+    )
+    assert {
+        "ix_channel_inbound_ledger_context",
+        "ix_channel_inbound_ledger_retention",
+    }.issubset(ledger_indexes)
+    assert {"usage", "trigger_inbound_id", "admitted_turn_id"}.issubset(consumption_columns)
+    assert "ix_channel_context_consumptions_admission" in consumption_indexes
+    assert backfilled.observed_at is not None
+    assert backfilled.ordering_key.endswith(":inbound-1")
+    assert backfilled.ordering_source == "observed"
     await engine.dispose()
 
 

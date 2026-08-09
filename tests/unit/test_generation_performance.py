@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import monotonic
 from typing import Any
 
 import pytest
@@ -8,6 +9,7 @@ from cognis.api.chat_v2.realtime import runtime_overlay_from_items
 from cognis.core.agent_loop import StreamAccumulator
 from cognis.executor.backends.litellm import LiteLLMExecutorBackend
 from cognis.executor.inference_types import CognisInferenceRequest
+from cognis.providers.llm.litellm import _observe_llm_stream_request
 from cognis.providers.llm.performance import LocalGenerationPerformanceObserver
 
 
@@ -110,6 +112,38 @@ async def test_executor_keeps_non_ollama_stream_shape_compatible(
 
     assert output[-1]["backend_metadata"] is None
     assert output[-1]["usage"] == {"prompt_tokens": 2, "completion_tokens": 1}
+
+
+@pytest.mark.asyncio
+async def test_hosted_stream_observation_exposes_usage_and_request_performance() -> None:
+    telemetry: dict[str, Any] = {}
+
+    async with _observe_llm_stream_request(
+        provider_id="anthropic",
+        model="claude-sonnet-4",
+        llm_api="chat_completions",
+        location="controller",
+        telemetry=telemetry,
+        started_at=monotonic() - 10,
+    ) as observe_chunk:
+        observe_chunk(
+            {
+                "choices": [{"delta": {"content": "hello"}}],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+            }
+        )
+
+    performance = telemetry["performance"]
+    assert performance["is_local"] is False
+    assert performance["runtime"] == "Hosted API"
+    assert performance["provider_id"] == "anthropic"
+    assert performance["prompt_tokens"] == 120
+    assert performance["completion_tokens"] == 30
+    assert performance["time_to_first_token_seconds"] >= 10
+    assert performance["total_duration_seconds"] >= 10
+    assert performance["generation_tokens_per_second"] == pytest.approx(
+        30 / performance["total_duration_seconds"]
+    )
 
 
 def test_performance_snapshot_propagates_through_stream_and_chat_runtime() -> None:

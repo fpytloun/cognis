@@ -3,25 +3,50 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.channels.managed import build_managed_channel_developer_instruction
+from cognis.core.agent_loop import AgentLoop, SessionLock
+from cognis.core.agent_profiles import resolve_conversation_agent_profile
+from cognis.core.context import ContextAssembler
 from cognis.core.session import (
     SessionManager,
+    SessionRotationConflictError,
     _explicit_profile_for_fork,
     _map_cognis_to_intaris_status,
 )
+from cognis.core.session_cache import CachedEvent, SessionCache
+from cognis.models.agent import AgentCapabilities, AgentDefinition, AgentLLMConfig
+from cognis.models.config import ModelInfo
 from cognis.models.session import (
     ConversationContext,
+    ConversationLineage,
     ConversationModel,
     EventAppendResult,
+    EventReadResult,
     SessionEvent,
     SessionModel,
+    SessionTransition,
 )
+from cognis.providers.memory.policy import resolve_memory_policy
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Agent, Conversation, Session, User
-from cognis.store.queries import get_conversation, get_session_row, list_conversation_sessions
+from cognis.store.models import Agent, Conversation, Session, StepRun, Task, User
+from cognis.store.queries import (
+    create_conversation,
+    create_session,
+    get_child_session_continuation_chain,
+    get_conversation,
+    get_root_session_chain,
+    get_session_row,
+    list_conversation_sessions,
+    list_conversation_todos,
+    list_session_todos,
+    replace_conversation_todos,
+    replace_session_todos,
+)
 
 
 def test_fork_preserves_only_target_agent_explicit_profile() -> None:
@@ -95,10 +120,15 @@ class _Guardrails:
         status_reason: str | None = None,
         user_email: str | None = None,
     ) -> None:
-        del user_email
         if self.fail:
             raise RuntimeError("intaris unavailable")
         self.status_calls.append((session_id, status, status_reason))
+        self.status_context = (
+            user_email,
+            current_user_email.get(),
+            current_agent_id.get(),
+            current_agent_owner_email.get(),
+        )
 
     async def update_session_policy(
         self,
@@ -205,6 +235,122 @@ class _Providers:
         self.memory = object()
 
 
+class _StreamGuardrails(_Guardrails):
+    def __init__(self) -> None:
+        super().__init__()
+        self.streams: dict[str, list[dict]] = {}
+        self.idempotent_results: dict[tuple[str, str], EventAppendResult] = {}
+
+    async def create_session(
+        self,
+        session_id: str,
+        intention: str,
+        agent_id: str,
+        user_id: str | None = None,
+        parent_session_id: str | None = None,
+        policy: dict | None = None,
+        details: dict | None = None,
+    ) -> None:
+        await super().create_session(
+            session_id,
+            intention,
+            agent_id,
+            user_id,
+            parent_session_id,
+            policy,
+            details,
+        )
+        self.streams.setdefault(session_id, [])
+
+    async def record_events(
+        self,
+        session_id: str,
+        events: list[SessionEvent],
+        source: str = "cognis",
+        idempotency_key: str | None = None,
+        **kwargs: object,
+    ) -> EventAppendResult:
+        del kwargs
+        key = (session_id, idempotency_key or "")
+        if idempotency_key and key in self.idempotent_results:
+            return self.idempotent_results[key]
+        stream = self.streams.setdefault(session_id, [])
+        first_seq = len(stream) + 1
+        for index, event in enumerate(events):
+            stream.append(
+                {
+                    "seq": first_seq + index,
+                    "type": event.type,
+                    "data": dict(event.data),
+                    "source": source,
+                }
+            )
+        result = EventAppendResult(
+            ok=True,
+            count=len(events),
+            first_seq=first_seq,
+            last_seq=first_seq + len(events) - 1,
+        )
+        if idempotency_key:
+            self.idempotent_results[key] = result
+        return result
+
+    async def read_events(
+        self,
+        session_id: str,
+        after_seq: int = 0,
+        **kwargs: object,
+    ) -> EventReadResult:
+        del kwargs
+        events = [
+            dict(event)
+            for event in self.streams.get(session_id, [])
+            if int(event["seq"]) > after_seq
+        ]
+        return EventReadResult(
+            events=events,
+            last_seq=max((int(event["seq"]) for event in events), default=after_seq),
+            has_more=False,
+        )
+
+    async def get_session(self, session_id: str) -> object:
+        del session_id
+        return SimpleNamespace(
+            intention="Resolve the participant request.",
+            title="Managed participant",
+            updated_at=None,
+        )
+
+
+class _StreamProviders:
+    def __init__(self) -> None:
+        self.guardrails = _StreamGuardrails()
+        self.memory = object()
+
+
+class _ContextLLM:
+    async def resolve_model(
+        self, explicit_model: str | None = None, task_type: str = "default"
+    ) -> str:
+        del task_type
+        return explicit_model or "test-model"
+
+    async def get_model_info(self, model_id: str, **_: object) -> ModelInfo:
+        return ModelInfo(
+            model_id=model_id,
+            context_window=20_000,
+            max_output_tokens=256,
+        )
+
+    def count_tokens(self, text: str, model: str) -> int:
+        del model
+        return max(1, len(text) // 4)
+
+    def count_messages_tokens(self, messages: list[dict], model: str) -> int:
+        del model
+        return sum(max(1, len(str(message.get("content", ""))) // 4) for message in messages)
+
+
 class _Cache:
     def __init__(self) -> None:
         self.evicted: list[str] = []
@@ -237,7 +383,11 @@ async def test_seed_rotated_tail_events_skips_non_appendable_event_types(tmp_pat
         intaris_session_id="intaris-new-session",
     )
     tail_events = [
-        SimpleNamespace(seq=10, type="user_message", data={"content": "keep"}),
+        SimpleNamespace(
+            seq=10,
+            type="user_message",
+            data={"content": "keep", "intention_eligible": False},
+        ),
         SimpleNamespace(seq=11, type="tool_result_chunk", data={"content": "skip"}),
         SimpleNamespace(seq=12, type="assistant_message", data={"content": "keep too"}),
     ]
@@ -254,10 +404,37 @@ async def test_seed_rotated_tail_events_skips_non_appendable_event_types(tmp_pat
     assert idempotency_key == "new-session:compaction_tail:old-session"
     assert [event.type for event in recorded_events] == ["user_message", "assistant_message"]
     assert [event.data["source_seq"] for event in recorded_events] == [10, 12]
+    assert recorded_events[0].data["intention_eligible"] is False
     assert all(event.data["compaction_tail"] is True for event in recorded_events)
     assert all(event.data["source_session_id"] == "old-session" for event in recorded_events)
     assert len(cache.appended_events) == 1
     assert cache.appended_events[0][1] == recorded_events
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_seed_rotated_tail_events_accepts_legacy_user_message_without_eligibility(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    new_session = SessionModel(
+        session_id="new-session",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+
+    await manager._seed_rotated_tail_events(
+        new_session,
+        tail_events=[SimpleNamespace(seq=1, type="user_message", data={"content": "legacy"})],
+        previous_session_id="old-session",
+    )
+
+    recorded_event = providers.guardrails.recorded_events[0][1][0]
+    assert "intention_eligible" not in recorded_event.data
 
     await engine.dispose()
 
@@ -343,6 +520,440 @@ async def test_session_manager_creates_conversation_and_root_session_atomically(
         assert stored_session is not None
         assert stored_session.intaris_session_id == root_session.session_id
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_generic_creation_never_trusts_lineage_context_data(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="web",
+            platform_data={
+                "forked_from": "conversation",
+                "forked_from_conversation_id": "conv-source",
+                "forked_from_session_id": "session-source",
+            },
+        ),
+        title="Forged lineage",
+    )
+
+    async with session_factory() as session:
+        stored_conversation = await session.get(Conversation, conversation.conversation_id)
+        stored_session = await session.get(Session, root.session_id)
+        assert stored_conversation is not None
+        assert stored_conversation.context_data["forked_from"] == "conversation"
+        assert stored_conversation.lineage_kind is None
+        assert stored_conversation.fork_source_conversation_id is None
+        assert stored_conversation.fork_source_session_id is None
+        assert stored_session is not None
+        assert stored_session.source_session_id is None
+        direct = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+            context_data={
+                "forked_from": "task_step",
+                "task_id": "task-forged",
+                "step_run_id": "step-forged",
+                "source_session_id": root.session_id,
+            },
+        )
+        await session.commit()
+        assert direct.lineage_kind is None
+        assert direct.fork_source_session_id is None
+        assert direct.lineage_task_id is None
+        assert direct.lineage_step_run_id is None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_trusted_lineage_creation_validates_conversation_task_and_step_edges(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    source_conversation, source_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="task", ref="task-1"),
+        title="Source",
+    )
+    async with session_factory() as session:
+        session.add(
+            Task(
+                task_id="task-1",
+                title="Task",
+                status="running",
+                priority=0,
+                created_by="user@example.com",
+                agent_id="agent-1",
+                source_type="api",
+                delivery_mode="same_conversation",
+                queue_name="default",
+            )
+        )
+        await session.flush()
+        session.add(
+            StepRun(
+                step_run_id="step-1",
+                task_id="task-1",
+                step_name="implement",
+                step_type="run",
+                status="completed",
+                agent_id="agent-1",
+                conversation_id=source_conversation.conversation_id,
+                session_id=source_session.session_id,
+            )
+        )
+        await session.commit()
+
+    lineages = [
+        ConversationLineage(
+            kind="conversation",
+            source_conversation_id=source_conversation.conversation_id,
+            source_session_id=source_session.session_id,
+        ),
+        ConversationLineage(
+            kind="task",
+            source_conversation_id=source_conversation.conversation_id,
+            source_session_id=source_session.session_id,
+            task_id="task-1",
+            step_run_id="step-1",
+        ),
+        ConversationLineage(
+            kind="task_step",
+            source_conversation_id=source_conversation.conversation_id,
+            source_session_id=source_session.session_id,
+            task_id="task-1",
+            step_run_id="step-1",
+        ),
+    ]
+    created: list[tuple[ConversationModel, SessionModel]] = []
+    for lineage in lineages:
+        created.append(
+            await manager.create_conversation_with_root_session(
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context=ConversationContext(type="web"),
+                title=f"{lineage.kind} continuation",
+                lineage=lineage,
+            )
+        )
+
+    async with session_factory() as session:
+        for lineage, (conversation, root) in zip(lineages, created, strict=True):
+            stored_conversation = await session.get(Conversation, conversation.conversation_id)
+            stored_session = await session.get(Session, root.session_id)
+            assert stored_conversation is not None
+            assert stored_conversation.lineage_kind == lineage.kind
+            assert stored_conversation.fork_source_session_id == source_session.session_id
+            assert stored_session is not None
+            assert stored_session.source_session_id == source_session.session_id
+        assert (
+            await session.get(Conversation, created[0][0].conversation_id)
+        ).fork_source_conversation_id == source_conversation.conversation_id
+        assert (await session.get(Conversation, created[1][0].conversation_id)).lineage_task_id == (
+            "task-1"
+        )
+        assert (
+            await session.get(Conversation, created[2][0].conversation_id)
+        ).lineage_step_run_id == "step-1"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_canonical_conversation_fork_persists_trusted_lineage(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    source_conversation, source_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Source",
+    )
+    fork_events = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "cognis.core.session.fork_session_events",
+        fork_events,
+    )
+
+    forked_conversation, forked_session, copied = await manager.fork_into_new_conversation(
+        source_session=source_session,
+        source_conversation=source_conversation,
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent One",
+        ),
+        user_email="user@example.com",
+    )
+
+    assert copied is True
+    async with session_factory() as session:
+        stored_conversation = await session.get(Conversation, forked_conversation.conversation_id)
+        stored_session = await session.get(Session, forked_session.session_id)
+        assert stored_conversation is not None
+        assert stored_conversation.lineage_kind == "conversation"
+        assert (
+            stored_conversation.fork_source_conversation_id == source_conversation.conversation_id
+        )
+        assert stored_conversation.fork_source_session_id == source_session.session_id
+        assert stored_session is not None
+        assert stored_session.source_session_id == source_session.session_id
+        assert stored_session.activity_scope_id == stored_session.session_id
+        assert stored_session.activity_scope_id != source_session.activity_scope_id
+    event_filter = fork_events.await_args.kwargs["event_filter"]
+    assert event_filter(CachedEvent(seq=1, type="user_message", data={})) is True
+    assert event_filter(CachedEvent(seq=2, type="tool_call", data={})) is False
+    assert event_filter(CachedEvent(seq=3, type="todo_state", data={})) is False
+    assert event_filter(CachedEvent(seq=4, type="assistant_deliverable", data={})) is False
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_trusted_lineage_rejects_cross_owner_and_mismatched_task_sources(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    source_conversation, source_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="task", ref="task-1"),
+        title="Source",
+    )
+    other_conversation, other_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Other source",
+    )
+    async with session_factory() as session:
+        session.add(User(email="other@example.com", name="Other", password_hash="x", role="user"))
+        await session.flush()
+        session.add(
+            Agent(
+                agent_id="agent-other",
+                owner_email="other@example.com",
+                name="Other agent",
+                description="Other",
+            )
+        )
+        await session.flush()
+        session.add(
+            Conversation(
+                conversation_id="conv-other-owner",
+                user_email="other@example.com",
+                agent_id="agent-other",
+                context_type="web",
+                title_source="unset",
+            )
+        )
+        await session.flush()
+        session.add(
+            Session(
+                session_id="session-other-owner",
+                conversation_id="conv-other-owner",
+                user_email="other@example.com",
+                agent_id="agent-other",
+                delegation_metadata={},
+            )
+        )
+        await session.flush()
+        session.add(
+            Task(
+                task_id="task-1",
+                title="Task",
+                status="running",
+                priority=0,
+                created_by="user@example.com",
+                agent_id="agent-1",
+                source_type="api",
+                delivery_mode="same_conversation",
+                queue_name="default",
+            )
+        )
+        await session.flush()
+        session.add(
+            StepRun(
+                step_run_id="step-1",
+                task_id="task-1",
+                step_name="implement",
+                step_type="run",
+                status="completed",
+                agent_id="agent-1",
+                conversation_id=source_conversation.conversation_id,
+                session_id=source_session.session_id,
+            )
+        )
+        await session.commit()
+
+    invalid_lineages = [
+        ConversationLineage(
+            kind="conversation",
+            source_conversation_id="conv-other-owner",
+            source_session_id="session-other-owner",
+        ),
+        ConversationLineage(
+            kind="task",
+            source_conversation_id=other_conversation.conversation_id,
+            source_session_id=other_session.session_id,
+            task_id="task-1",
+            step_run_id="step-1",
+        ),
+        ConversationLineage(
+            kind="task_step",
+            source_conversation_id=source_conversation.conversation_id,
+            source_session_id=source_session.session_id,
+            task_id="task-mismatch",
+            step_run_id="step-1",
+        ),
+    ]
+    for lineage in invalid_lineages:
+        with pytest.raises(PermissionError, match="lineage source"):
+            await manager.create_conversation_with_root_session(
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context=ConversationContext(type="web"),
+                lineage=lineage,
+            )
+
+
+@pytest.mark.asyncio
+async def test_managed_policy_snapshot_rotates_once_from_creation_flow(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _StreamProviders()
+    cache = SessionCache(providers.guardrails)
+    manager = SessionManager(session_factory, providers, cache)
+    conversation, managed_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(
+            type="channel",
+            ref="mcb_test",
+            platform_data={"managed_channel": True},
+        ),
+        title="Managed participant",
+    )
+    loop = object.__new__(AgentLoop)
+    loop.providers = providers
+    loop.session_cache = cache
+    loop.session_lock = SessionLock()
+    policy = build_managed_channel_developer_instruction(
+        objective="Resolve the participant request.",
+        participant="Participant",
+        channel_type="signal",
+        safety_guidance="Do not disclose private controller context.",
+    )
+
+    await loop._record_persisted_developer_context(
+        session=managed_session,
+        content=policy,
+        source="managed_channel_policy",
+        target_agent_id="agent-1",
+    )
+
+    source_entries = cache.get_prefix_entries(managed_session.session_id)
+    assert [
+        entry.source for entry in source_entries if entry.source == "managed_channel_policy"
+    ] == ["managed_channel_policy"]
+    source_snapshots = [
+        event
+        for event in providers.guardrails.streams[managed_session.session_id]
+        if event["type"] == "context_snapshot"
+    ]
+    assert len(source_snapshots) == 1
+    assert [
+        ref["source"]
+        for ref in source_snapshots[0]["data"]["entries"]
+        if ref["source"] == "managed_channel_policy"
+    ] == ["managed_channel_policy"]
+
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        system_prompt="You are helpful.",
+        llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+        capabilities=AgentCapabilities(memory_backend="none"),
+    )
+    memory_policy = resolve_memory_policy(
+        agent,
+        resolve_conversation_agent_profile(agent, managed_session, conversation),
+    )
+    assembler = ContextAssembler(
+        memory=providers.memory,
+        guardrails=providers.guardrails,
+        llm=_ContextLLM(),
+        session_cache=cache,
+        session_manager=manager,
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    assembled = await assembler.assemble(
+        session=managed_session,
+        conversation=conversation,
+        agent=agent,
+        user_message="Start the managed participant conversation.",
+        tool_definitions=[],
+        memory_policy=memory_policy,
+    )
+    assembled_prompt = "\n".join(
+        str(message.get("content") or "") for message in assembled.messages
+    )
+    assert assembled_prompt.count(policy) == 1
+    initialized_entries = cache.get_prefix_entries(managed_session.session_id)
+    assert [
+        entry.source for entry in initialized_entries if entry.source == "managed_channel_policy"
+    ] == ["managed_channel_policy"]
+    assert cache.get_entry(managed_session.session_id).memory_policy_fingerprint == (
+        memory_policy.policy_fingerprint
+    )
+
+    rotated = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=managed_session,
+        intention="Continue the managed participant conversation.",
+        compaction_summary="The managed participant conversation remains active.",
+    )
+
+    rotated_policy_events = [
+        event
+        for event in providers.guardrails.streams[rotated.session_id]
+        if event["type"] == "developer_message"
+        and event["data"].get("source") == "managed_channel_policy"
+    ]
+    assert len(rotated_policy_events) == 1
+    rotated_snapshots = [
+        event
+        for event in providers.guardrails.streams[rotated.session_id]
+        if event["type"] == "context_snapshot"
+    ]
+    assert len(rotated_snapshots) == 1
+    assert [
+        ref["source"]
+        for ref in rotated_snapshots[0]["data"]["entries"]
+        if ref["source"] == "managed_channel_policy"
+    ] == ["managed_channel_policy"]
+    assert (
+        sum(
+            entry.source == "managed_channel_policy"
+            for entry in cache.get_prefix_entries(rotated.session_id)
+        )
+        == 1
+    )
+
+    await cache.aclose()
     await engine.dispose()
 
 
@@ -527,6 +1138,185 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
         "agent-1",
         "user@example.com",
     ) in providers.guardrails.record_event_contexts
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transition", "preserves_scope", "preserves_todos", "preserves_context"),
+    [
+        (SessionTransition.COMPACT, True, True, True),
+        (SessionTransition.RENEW, False, False, True),
+        (SessionTransition.RESET, False, False, False),
+    ],
+)
+async def test_rotate_session_transition_matrix(
+    tmp_path,
+    transition: SessionTransition,
+    preserves_scope: bool,
+    preserves_todos: bool,
+    preserves_context: bool,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Transition matrix",
+    )
+    todos = [{"content": "Finish work", "status": "in_progress"}]
+    async with session_factory() as db:
+        await replace_conversation_todos(db, conversation.conversation_id, todos)
+        await replace_session_todos(db, root_session.session_id, todos)
+        await db.commit()
+
+    tail = [SimpleNamespace(seq=2, type="user_message", data={"content": "recent"})]
+    successor = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root_session,
+        intention="Continue",
+        completion_reason=("user_reset" if transition is SessionTransition.RESET else "compacted"),
+        transition=transition,
+        compaction_summary="Prior conversational summary",
+        tail_events=tail,
+    )
+
+    assert (successor.activity_scope_id == root_session.activity_scope_id) is preserves_scope
+    async with session_factory() as db:
+        assert bool(await list_conversation_todos(db, conversation.conversation_id)) is (
+            preserves_todos
+        )
+        assert bool(await list_session_todos(db, successor.session_id)) is preserves_todos
+
+    recorded_keys = {
+        key
+        for session_id, _events, key in providers.guardrails.recorded_events
+        if session_id == successor.session_id
+    }
+    assert any("compaction_summary" in key for key in recorded_keys) is preserves_context
+    assert any("compaction_tail" in key for key in recorded_keys) is preserves_context
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_child_preserves_lane_identity_and_root_visibility(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Child rotation test",
+    )
+    metadata = {"task_id": "task-1", "depth": 1}
+    async with session_factory() as db:
+        child_row = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            agent_profile_id="developer",
+            parent_session_id=root_session.session_id,
+            delegation_mode="execute",
+            delegation_task="Implement the fix",
+            delegation_metadata=metadata,
+        )
+        await db.commit()
+        child = SessionModel.model_validate(child_row, from_attributes=True)
+
+    first_successor = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=child,
+        intention="Continue child",
+        compaction_summary="Child summary",
+    )
+    second_successor = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=first_successor,
+        intention="Continue child again",
+        compaction_summary="Second child summary",
+    )
+
+    async with session_factory() as db:
+        conv = await db.get(Conversation, conversation.conversation_id)
+        first_row = await db.get(Session, first_successor.session_id)
+        second_row = await db.get(Session, second_successor.session_id)
+        root_chain, truncated = await get_root_session_chain(
+            db,
+            conversation.conversation_id,
+            root_session.session_id,
+        )
+        child_chain, child_truncated = await get_child_session_continuation_chain(
+            db, child.session_id
+        )
+
+    assert conv is not None
+    assert conv.active_session_id == root_session.session_id
+    assert first_row is not None
+    assert second_row is not None
+    for row in (first_row, second_row):
+        assert row.parent_session_id == root_session.session_id
+        assert row.agent_profile_id == "developer"
+        assert row.delegation_mode == "execute"
+        assert row.delegation_task == "Implement the fix"
+        assert row.delegation_metadata == metadata
+    assert first_row.previous_session_id == child.session_id
+    assert second_row.previous_session_id == first_successor.session_id
+    assert [row.session_id for row in root_chain] == [root_session.session_id]
+    assert truncated is False
+    assert [row.session_id for row in child_chain] == [
+        child.session_id,
+        first_successor.session_id,
+        second_successor.session_id,
+    ]
+    assert child_truncated is False
+    assert providers.guardrails.calls[-2][2] == root_session.session_id
+    assert providers.guardrails.calls[-1][2] == root_session.session_id
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_root_rotation_has_clean_conflict(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    conversation, root_session = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Root rotation conflict test",
+    )
+
+    winner = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root_session,
+        intention="Winner",
+    )
+    create_calls = len(manager.providers.guardrails.calls)
+    event_calls = len(manager.providers.guardrails.recorded_events)
+    with pytest.raises(
+        SessionRotationConflictError,
+        match="Conversation active session changed",
+    ):
+        await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root_session,
+            intention="Stale loser",
+        )
+    assert len(manager.providers.guardrails.calls) == create_calls
+    assert len(manager.providers.guardrails.recorded_events) == event_calls
+
+    async with session_factory() as db:
+        conv = await db.get(Conversation, conversation.conversation_id)
+        rows = await list_conversation_sessions(db, conversation.conversation_id)
+
+    assert conv is not None
+    assert conv.active_session_id == winner.session_id
+    assert {row.session_id for row in rows} == {root_session.session_id, winner.session_id}
 
     await engine.dispose()
 
@@ -907,6 +1697,41 @@ async def test_intaris_sync_failure_does_not_block_mark(tmp_path) -> None:
     updated = await manager_fail.mark_idle(root.session_id)
     assert updated  # DB update succeeded despite Intaris failure
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_status_sync_uses_authoritative_session_identity_after_restart(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers(fail=False)
+    manager = SessionManager(session_factory, providers, _Cache())
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Restart identity",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+    async with session_factory() as session:
+        row = await session.get(Session, root.session_id)
+        assert row is not None
+        row.intaris_session_id = "intaris-session-1"
+        await session.commit()
+
+    await manager.mark_idle(root.session_id)
+
+    assert providers.guardrails.status_calls[-1][:2] == ("intaris-session-1", "idle")
+    assert providers.guardrails.status_context == (
+        "user@example.com",
+        "user@example.com",
+        "agent-1",
+        "user@example.com",
+    )
     await engine.dispose()
 
 
@@ -1368,6 +2193,7 @@ async def test_child_session_does_not_inherit_implicit_runtime_workdir(tmp_path)
             agent_id="agent-1",
             effective_agent_id="agent-1",
         )
+    assert child.activity_scope_id == parent.activity_scope_id
     del conversation, parent, child
 
     assert providers.guardrails.last_policy is not None

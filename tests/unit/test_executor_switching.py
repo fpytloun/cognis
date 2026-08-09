@@ -126,7 +126,7 @@ async def test_switch_to_assigned_primary_succeeds(factory_and_conv) -> None:
     assert outcome.target.executor_id == "exec-2"
     assert conv.active_executor_id == "exec-2"
     assert conv.active_executor_expires_at is None
-    assert conv.active_executor_source == "agent_switch"
+    assert conv.active_executor_source == "explicit_primary"
     payload = outcome.to_tool_result()
     assert payload["status"] == "ok"
     assert payload["is_primary"] is True
@@ -150,7 +150,7 @@ async def test_switch_to_assigned_additional_succeeds(factory_and_conv) -> None:
     assert outcome.is_primary is False
     assert conv.active_executor_id == "exec-add"
     assert conv.active_executor_expires_at is not None
-    assert conv.active_executor_source == "user_switch"
+    assert conv.active_executor_source == "additional"
     msg = outcome.to_user_message()
     assert "non-primary" in msg.lower()
     assert "not fallback capacity" in msg
@@ -203,7 +203,7 @@ async def test_switch_with_task_id_updates_task_pin(monkeypatch, factory_and_con
     )
     assert outcome.status == "ok"
     assert conv.active_executor_id == "exec-2"
-    assert task_calls == [("task-99", "exec-2", "agent_switch")]
+    assert task_calls == [("task-99", "exec-2", "explicit_primary")]
 
 
 @pytest.mark.asyncio

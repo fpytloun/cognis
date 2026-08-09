@@ -24,8 +24,9 @@ See `docs/specs/14-workflow-engine.md` — "Step Input Context Assembly" and
 
 ### Core rules
 
-1. **Every step creates its own Intaris session.** No session reuse across
-   steps. Clean audit boundaries, no contamination.
+1. **Every step creates its own StepRun audit boundary.** A step normally
+   creates a session. `input.reuse_session_from` can continue an included
+   earlier run step when the resolved primary agent and profile are identical.
 2. **Iterations within a step continue the same session.** Re-attempt after
    evaluation rejection appends feedback to the step's own session. The agent
    keeps its reasoning.
@@ -37,10 +38,14 @@ See `docs/specs/14-workflow-engine.md` — "Step Input Context Assembly" and
 ### 1. StepInputConfig Model
 
 - `cognis/models/workflow.py` (or extend existing workflow models)
-  - `StepInputConfig(type, source)`
+  - `StepInputConfig(type, source, reuse_session_from)`
   - `type`: `"null"` | `"full"` | `"summary"` | `"last"`
   - `source`: `str | list[str] | None`
+  - `reuse_session_from`: `str | None`
   - Validation: `full` only accepts single source, not a list
+  - Reuse validation: the source exists, is an earlier run step, is included
+    in the input sources, is not the target, and resolves to the same agent and
+    runtime profile.
   - Default resolution: if not specified, `type="last"` from previous step;
     if first step, `type="null"`
 
@@ -77,6 +82,14 @@ See `docs/specs/14-workflow-engine.md` — "Step Input Context Assembly" and
     ```
 
   - **Multiple sources**: assemble in order with clear provenance labels.
+    If one source owns the continued session, include only its canonical
+    StepRun, deliverable, and session references. Include other source content
+    once.
+
+  - **Reused session boundary**: omit repeated task and project blocks. Append
+    the target directive, completion contract, input references, feedback, and
+    responsibility boundary. Reset transient activated and discovered tools
+    before the target step builds its tool inventory.
 
 ### 3. Iteration Context Handler
 
@@ -108,6 +121,39 @@ See `docs/specs/14-workflow-engine.md` — "Step Input Context Assembly" and
   - Add the step input context (null/full/summary/last) BEFORE the step prompt
   - Respect the token budget — if `full` input exceeds budget, fall back to
     `summary` automatically with a warning
+
+### 4a. Composable workflow prompt contract
+
+The current implementation uses typed workflow prompt blocks. The block model
+lives in `cognis/core/workflow_prompt.py`.
+
+- Workflow and completion policy use system-role blocks.
+- Task, project, input, and feedback text use user-role blocks.
+- Each block declares its category, lifetime, source, and trust label.
+- Workflow-lifetime blocks hold the workflow, task, and project contracts.
+- Step-lifetime blocks hold the directive, input references, boundary, and
+  completion contract.
+- Attempt-lifetime blocks hold reviewer and operator feedback.
+- The hidden reminder contains only volatile completion-tool guidance.
+
+The first attempt records the composed user-role task context once. The
+controller injects the static step contract separately. A retry reuses session
+history and sends only a small retry directive plus new attempt feedback.
+
+### 4b. Context-only comment lifetime
+
+The active task owner loads each eligible context-only comment before the first
+model call. The user-role block includes the comment ID, author, target step,
+and an untrusted provenance label.
+
+The agent loop records the comment in the step session before model dispatch.
+This rule applies to primary and secondary workflow agents, including retries.
+The database marks the comment applied only after event persistence succeeds.
+The event append uses a stable key from the comment ID.
+
+If a crash occurs before acknowledgement, recovery retries the same idempotent
+append. After acknowledgement, later model cycles do not render the comment a
+second time.
 
 ### 5. Step Output Storage
 
@@ -144,6 +190,10 @@ See `docs/specs/14-workflow-engine.md` — "Step Input Context Assembly" and
 - [x] Unit tests for each input type
 - [x] Unit tests for iteration feedback injection
 - [x] Unit tests for default resolution
+- [x] Typed prompt blocks preserve role, lifetime, source, and trust ownership
+- [x] Task and prior deliverable text occur once in each composed request
+- [x] Context-only comments are available before the first model call
+- [x] Context-only comments remain durable on retry and persistence recovery
 - [x] `ruff check` and `mypy` clean
 
 ## Key References

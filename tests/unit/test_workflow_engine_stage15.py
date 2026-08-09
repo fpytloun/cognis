@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import func, select
 
 from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.core.events import EventBus, EventType
@@ -13,7 +14,7 @@ from cognis.core.workflow_engine import WorkflowEngine
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import CompletionDeliveryPolicy, StepDefinition, Workflow, WorkflowState
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Base
+from cognis.store.models import Base, ChannelDeliveryOutboxRow
 from cognis.store.queries import (
     create_agent,
     create_channel_account,
@@ -150,6 +151,115 @@ async def test_deliver_task_result_uses_latest_active_conversation_and_publishes
     assert guardrails.recorded[0][0] == "intaris-root"
     assert EventType.TASK_COMPLETED in seen
     assert EventType.FOLLOW_UP_TURN_REQUESTED in seen
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion_mode", ["default", "direct"])
+async def test_deliver_task_result_from_renewed_scope_is_historical_only(
+    tmp_path: object,
+    completion_mode: str,
+) -> None:
+    engine, session_factory = await _runtime(tmp_path)
+    guardrails = _Guardrails()
+    channel_delivery = _ChannelDelivery()
+    event_bus = EventBus()
+    seen: list[EventType] = []
+
+    async def _capture(event: object) -> None:
+        seen.append(event.type)
+
+    event_bus.subscribe_all(_capture)
+    workflow_engine = WorkflowEngine(
+        session_factory=session_factory,
+        providers=SimpleNamespace(guardrails=guardrails),
+        agent_loop=SimpleNamespace(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(),
+        event_bus=event_bus,
+        pause_waiter=SimpleNamespace(),
+        channel_delivery=channel_delivery,
+    )
+
+    async with session_factory() as session:
+        await create_user(
+            session, email="user@example.com", name="User", password_hash="hash", role="user"
+        )
+        await create_agent(
+            session, agent_id="agent-1", owner_email="user@example.com", name="Agent"
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="signal",
+            context_ref="signal:acct-1:chat-1",
+            context_data={
+                "channel_type": "signal",
+                "account_id": "acct-1",
+                "chat_id": "chat-1",
+            },
+        )
+        old_session = await create_session(
+            session,
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            activity_scope_id="scope-old",
+        )
+        current_session = await create_session(
+            session,
+            conversation_id=conversation.conversation_id,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            previous_session_id=old_session.session_id,
+            activity_scope_id="scope-current",
+        )
+        await update_conversation_active_session(
+            session, conversation.conversation_id, current_session.session_id
+        )
+        await create_task(
+            session,
+            task_id=f"task-stale-{completion_mode}",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            title="Historical task",
+            status="completed",
+            source_type="chat",
+            source_ref=conversation.conversation_id,
+            source_session_id=old_session.session_id,
+            delivery_mode="same_conversation",
+            completion_mode_family=completion_mode,
+        )
+        await session.commit()
+
+    await workflow_engine._deliver_task_result(
+        TaskModel(
+            task_id=f"task-stale-{completion_mode}",
+            title="Historical task",
+            status=TaskStatus.COMPLETED,
+            created_by="user@example.com",
+            agent_id="agent-1",
+            source_type="chat",
+            source_ref=conversation.conversation_id,
+            source_session_id=old_session.session_id,
+            delivery=TaskDelivery(mode="same_conversation"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family=completion_mode),
+            result_summary="Done",
+            result_data={"final_content": "Must stay historical"},
+            applied_completion_mode=completion_mode,
+        )
+    )
+
+    assert guardrails.recorded == []
+    assert channel_delivery.calls == []
+    assert seen == []
+    async with session_factory() as session:
+        outbox_count = (
+            await session.execute(select(func.count()).select_from(ChannelDeliveryOutboxRow))
+        ).scalar_one()
+        assert outbox_count == 0
     await engine.dispose()
 
 
@@ -1086,7 +1196,6 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
             user_email="user@example.com",
             agent_id="agent-1",
         )
-        await set_session_intaris_session_id(session, root_session.session_id, "intaris-signal")
         await update_conversation_active_session(
             session, conversation.conversation_id, root_session.session_id
         )
@@ -1137,7 +1246,7 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
 
 
 @pytest.mark.asyncio
-async def test_deliverable_channel_outbox_ignores_legacy_full_channel_content(
+async def test_default_scheduled_task_final_content_stays_agent_mediated(
     tmp_path: object,
 ) -> None:
     engine, session_factory = await _runtime(tmp_path)
@@ -1193,7 +1302,7 @@ async def test_deliverable_channel_outbox_ignores_legacy_full_channel_content(
         )
         await session.commit()
 
-    await workflow_engine._deliver_task_result(
+    await workflow_engine._deliver_task_result_default(
         TaskModel(
             task_id="task-chan-deliverable",
             title="Background task",
@@ -1202,9 +1311,9 @@ async def test_deliverable_channel_outbox_ignores_legacy_full_channel_content(
             priority=0,
             created_by="user@example.com",
             agent_id="agent-1",
-            source_type="chat",
-            source_ref=conversation.conversation_id,
-            delivery=TaskDelivery(mode="same_conversation"),
+            source_type="scheduler",
+            source_ref="schedule-1",
+            delivery=TaskDelivery(mode="preferred_channel"),
             workflow_id=None,
             result_summary="Done",
             result_data={
@@ -1213,17 +1322,25 @@ async def test_deliverable_channel_outbox_ignores_legacy_full_channel_content(
                 "final_channel_content": "FULL DELIVERABLE CONTENT MUST NOT BE STORED IN OUTBOX",
                 "final_format": "html",
             },
-        )
+        ),
+        conversation.conversation_id,
     )
 
-    turn_completed = next(event for event in captured if event.type == EventType.TURN_COMPLETED)
-    delivery_id = turn_completed.data.get("delivery_id")
+    assert not any(event.type == EventType.TURN_COMPLETED for event in captured)
+    follow_up = next(
+        event for event in captured if event.type == EventType.FOLLOW_UP_TURN_REQUESTED
+    )
+    delivery_id = follow_up.data.get("delivery_id")
     assert isinstance(delivery_id, str)
+    assert follow_up.data.get("channel_deliverable") is True
 
     async with session_factory() as session:
         row = await get_channel_delivery_outbox(session, delivery_id)
         assert row is not None
-        assert row.fallback_text == "Bounded deliverable summary"
+        assert row.session_id == root_session.session_id
+        assert row.source_type == "task_result_follow_up"
+        assert row.fallback_text.startswith('Task "Background task" completed.')
+        assert "Bounded deliverable summary" not in row.fallback_text
         assert "FULL DELIVERABLE CONTENT" not in row.fallback_text
 
     await engine.dispose()

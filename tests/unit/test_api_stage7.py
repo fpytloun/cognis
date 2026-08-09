@@ -15,7 +15,8 @@ from sqlalchemy import event as sa_event
 from cognis.api.app import create_app
 from cognis.api.middleware import AuthenticatedUser
 from cognis.api.models import TaskCreateRequest
-from cognis.api.routes.tasks import task_create
+from cognis.api.routes.sessions import _token_usage_for_session
+from cognis.api.routes.tasks import _continuation_context_event, task_create
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketConnectionManager,
@@ -51,6 +52,7 @@ from cognis.store.queries import (
     create_user,
     get_conversation,
     get_managed_conversation_link_for_target,
+    get_task,
     get_user_ui_state_value,
     set_session_intaris_session_id,
     set_session_status,
@@ -67,6 +69,31 @@ def _strip_order_key(item: dict[str, object]) -> dict[str, object]:
     stable when the orderKey encoding changes.
     """
     return {k: v for k, v in item.items() if k != "orderKey"}
+
+
+def test_session_detail_normalizes_cached_provider_token_usage() -> None:
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                session_cache=SimpleNamespace(
+                    get_context_usage=lambda session_id: {
+                        "last_llm_usage": {
+                            "prompt_tokens": 120,
+                            "completion_tokens": 30,
+                            "total_tokens": 150,
+                        }
+                    }
+                )
+            )
+        )
+    )
+
+    usage = _token_usage_for_session(request, "session-1")
+
+    assert usage is not None
+    assert usage.prompt_tokens == 120
+    assert usage.completion_tokens == 30
+    assert usage.total_tokens == 150
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -148,7 +175,7 @@ def test_managed_conversation_queue_mutations_are_read_only(
 
         conversation_id = asyncio.run(_seed_managed_conversation())
         turn_scheduler = SimpleNamespace(
-            queued_messages=lambda _conversation_id: [],
+            get_queued_messages=AsyncMock(return_value=[]),
             submit_turn=AsyncMock(),
             update_queued_message=AsyncMock(),
             cancel_queued_message=AsyncMock(),
@@ -182,6 +209,91 @@ def test_managed_conversation_queue_mutations_are_read_only(
         turn_scheduler.submit_turn.assert_not_awaited()
         turn_scheduler.update_queued_message.assert_not_awaited()
         turn_scheduler.cancel_queued_message.assert_not_awaited()
+
+
+def test_task_control_conversation_cannot_be_archived_deleted_or_purged(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> tuple[str, str]:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="owner@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                )
+                task = await create_task(
+                    session,
+                    created_by="owner@example.com",
+                    agent_id="agent-1",
+                    title="Persistent control task",
+                    status="running",
+                )
+                task.control_conversation_id = conversation.conversation_id
+                await session.commit()
+                return task.task_id, conversation.conversation_id
+
+        task_id, conversation_id = asyncio.run(_seed())
+        owner_headers = _auth_headers(client.app, email="owner@example.com")
+        admin_headers = _auth_headers(client.app, email="admin@example.com")
+
+        archive_response = client.patch(
+            f"/api/v1/conversations/{conversation_id}",
+            headers=owner_headers,
+            json={"archived": True},
+        )
+        delete_response = client.delete(
+            f"/api/v1/conversations/{conversation_id}",
+            headers=owner_headers,
+        )
+        purge_response = client.delete(
+            f"/api/v1/conversations/{conversation_id}/purge",
+            headers=owner_headers,
+        )
+        admin_delete_response = client.delete(
+            f"/api/v1/conversations/{conversation_id}",
+            headers=admin_headers,
+        )
+
+        for response in (archive_response, delete_response, purge_response):
+            assert response.status_code == 409
+            assert response.json()["error"]["code"] == "task_control_conversation_persistent"
+        assert admin_delete_response.status_code == 403
+
+        async def _verify() -> None:
+            async with client.app.state.session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+                task = await get_task(session, task_id)
+                assert conversation is not None
+                assert conversation.status == "active"
+                assert task is not None
+                assert task.control_conversation_id == conversation_id
+
+        asyncio.run(_verify())
 
 
 async def _seed_api_managed_conversation(
@@ -1093,6 +1205,8 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
                     agent_id="agent-1",
                     title="Projected task",
                     status="running",
+                    workflow_id="system:general-task",
+                    workflow_state={"current_step_index": 0, "status": "running"},
                 )
                 first = await create_step_run(
                     session,
@@ -1139,7 +1253,15 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
 
         summary = client.get(f"/api/v1/tasks/{task_id}/summary", headers=headers)
         assert summary.status_code == 200
-        assert summary.json()["step_runs"] == []
+        summary_body = summary.json()
+        assert summary_body["step_runs"] == []
+        projection = summary_body["workflow_projection"]
+        assert projection["workflow_id"] == "system:general-task"
+        assert projection["current_step_name"] == "execute"
+        assert [step["name"] for step in projection["phases"][0]["steps"]] == ["execute"]
+        assert "heavy first content" not in summary.text
+        assert "heavy second content" not in summary.text
+        assert "effective_workflow_definition" not in summary.text
 
         steps = client.get(f"/api/v1/tasks/{task_id}/steps/summary", headers=headers)
         assert steps.status_code == 200
@@ -3247,6 +3369,99 @@ def test_conversation_sidebar_projection_returns_shaped_sidebar_payload(
         assert signal_response.json()["agent_direct_chats"] == []
 
 
+def test_conversation_sidebar_task_filter_isolated_and_paginated(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                normal = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    title="Normal",
+                )
+                first_task = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    context_data={"kind": "task_control", "task_id": "task-1"},
+                    title="Task one",
+                )
+                second_task = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    context_data={"kind": "task_control", "task_id": "task-2"},
+                    title="Task two",
+                )
+                await session.commit()
+                return (
+                    normal.conversation_id,
+                    first_task.conversation_id,
+                    second_task.conversation_id,
+                )
+
+        normal_id, first_task_id, second_task_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+
+        first_page = client.get(
+            "/api/v1/conversations/sidebar?status=task&limit=1",
+            headers=headers,
+        )
+        assert first_page.status_code == 200
+        first_body = first_page.json()["conversations"]
+        assert first_body["has_more"] is True
+        assert first_body["cursor"]
+        first_ids = [item["conversation_id"] for item in first_body["items"]]
+        assert len(first_ids) == 1
+
+        second_page = client.get(
+            "/api/v1/conversations/sidebar",
+            params={"status": "task", "limit": 1, "cursor": first_body["cursor"]},
+            headers=headers,
+        )
+        assert second_page.status_code == 200
+        second_body = second_page.json()["conversations"]
+        second_ids = [item["conversation_id"] for item in second_body["items"]]
+        assert len(second_ids) == 1
+        assert second_body["has_more"] is False
+        assert set(first_ids + second_ids) == {first_task_id, second_task_id}
+
+        active = client.get("/api/v1/conversations/sidebar", headers=headers)
+        all_conversations = client.get(
+            "/api/v1/conversations/sidebar?status=all",
+            headers=headers,
+        )
+        assert active.status_code == 200
+        assert all_conversations.status_code == 200
+        assert [item["conversation_id"] for item in active.json()["conversations"]["items"]] == [
+            normal_id
+        ]
+        assert [
+            item["conversation_id"] for item in all_conversations.json()["conversations"]["items"]
+        ] == [normal_id]
+
+
 def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombstones(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -3491,7 +3706,7 @@ def test_conversation_list_defaults_to_active_and_supports_starred_and_archived_
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
-        async def _seed() -> tuple[str, str, str, str]:
+        async def _seed() -> tuple[str, str, str, str, str]:
             async with app.state.session_factory() as session:
                 await create_user(
                     session,
@@ -3538,15 +3753,24 @@ def test_conversation_list_defaults_to_active_and_supports_starred_and_archived_
                     title="Deleted",
                 )
                 deleted.status = "deleted"
+                task_control = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    context_data={"kind": "task_control", "task_id": "task-1"},
+                    title="Task control",
+                )
                 await session.commit()
                 return (
                     active.conversation_id,
                     archived.conversation_id,
                     starred.conversation_id,
                     deleted.conversation_id,
+                    task_control.conversation_id,
                 )
 
-        active_id, archived_id, starred_id, deleted_id = asyncio.run(_seed())
+        active_id, archived_id, starred_id, deleted_id, task_control_id = asyncio.run(_seed())
 
         active_response = client.get(
             "/api/v1/conversations",
@@ -3587,6 +3811,16 @@ def test_conversation_list_defaults_to_active_and_supports_starred_and_archived_
         all_ids = {item["conversation_id"] for item in all_response.json()["items"]}
         assert {active_id, archived_id, starred_id} <= all_ids
         assert deleted_id not in all_ids
+        assert task_control_id not in all_ids
+
+        task_response = client.get(
+            "/api/v1/conversations?status=task",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert task_response.status_code == 200
+        assert [item["conversation_id"] for item in task_response.json()["items"]] == [
+            task_control_id
+        ]
 
 
 def test_conversation_update_sets_and_clears_starred_at(
@@ -4364,3 +4598,16 @@ def test_signed_virtual_deliverable_route_serves_exact_content(
         assert response.content == b"# Virtual\n\nExact content."
         assert response.headers["content-type"].startswith("text/markdown")
         assert "Virtual-URL.md" in response.headers["content-disposition"]
+
+
+def test_task_continuation_context_is_not_intention_eligible() -> None:
+    event = _continuation_context_event("Task context", source="task_chat_context")
+
+    assert event.type == "user_message"
+    assert event.data == {
+        "role": "user",
+        "content": "Task context",
+        "content_type": "text",
+        "source": "task_chat_context",
+        "intention_eligible": False,
+    }

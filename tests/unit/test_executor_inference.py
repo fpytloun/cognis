@@ -7,6 +7,50 @@ import json
 import pytest
 
 from cognis.executor.inference import InferenceHandler
+from cognis.models.config import ImageInput
+
+
+@pytest.mark.asyncio
+async def test_image_generate_forwards_multiple_images_and_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = InferenceHandler()
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"data": [{"b64_json": "YWJj"}]}
+
+    async def fake_aimage_generation(**kwargs: object) -> _Response:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(
+        "cognis.executor.backends.litellm.litellm.aimage_generation",
+        fake_aimage_generation,
+    )
+
+    result = await handler.image_generate(
+        prompt="Combine the images.",
+        model="gpt-image-2",
+        images=[ImageInput(b64_json="first"), ImageInput(b64_json="second")],
+        mask=ImageInput(b64_json="mask"),
+        request_kwargs={},
+    )
+
+    assert captured["image"] == ["first", "second"]
+    assert captured["mask"] == "mask"
+    assert result == {
+        "images": [
+            {
+                "b64_json": "YWJj",
+                "url": None,
+                "content_type": "image/png",
+                "revised_prompt": None,
+            }
+        ],
+        "model": "gpt-image-2",
+    }
 
 
 @pytest.mark.asyncio
@@ -720,7 +764,7 @@ async def test_image_generate_method_still_available(monkeypatch: pytest.MonkeyP
         request_kwargs={},
     )
 
-    assert result["data"][0]["b64_json"] == "abc"
+    assert result["images"][0]["b64_json"] == "abc"
     assert "response_format" not in captured
 
 
@@ -750,7 +794,7 @@ async def test_image_generate_omits_response_format_for_gpt_image_2(
         request_kwargs={},
     )
 
-    assert result["data"][0]["b64_json"] == "abc"
+    assert result["images"][0]["b64_json"] == "abc"
     assert "response_format" not in captured
 
 

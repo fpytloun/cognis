@@ -50,6 +50,13 @@ def test_context_kwargs_skips_stealth_defaults_when_disabled() -> None:
     assert "timezone_id" not in kwargs
 
 
+def test_patchright_keeps_coherent_locale_defaults_without_stealth_stack() -> None:
+    manager = BrowserManager(runtime="patchright")
+    kwargs = manager._context_kwargs(headless=False)  # noqa: SLF001
+    assert kwargs["timezone_id"] == BROWSER_DEFAULT_TIMEZONE_ID
+    assert kwargs["extra_http_headers"] == {"Accept-Language": BROWSER_DEFAULT_ACCEPT_LANGUAGE}
+
+
 def test_context_kwargs_respects_explicit_timezone_override() -> None:
     manager = BrowserManager(timezone_id="Europe/Prague")
     kwargs = manager._context_kwargs()  # noqa: SLF001
@@ -156,6 +163,12 @@ async def test_apply_context_defaults_noop_when_stealth_disabled(
 
     await manager._apply_context_defaults(SimpleNamespace())  # noqa: SLF001
     assert instantiated == []
+
+
+def test_patchright_never_stacks_playwright_stealth_when_explicitly_enabled() -> None:
+    manager = BrowserManager(runtime="patchright", stealth_enabled=True)
+
+    assert manager._build_stealth() is None  # noqa: SLF001
 
 
 @pytest.mark.asyncio

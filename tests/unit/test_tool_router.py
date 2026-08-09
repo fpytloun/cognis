@@ -2553,6 +2553,43 @@ async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "expected_conversation_id", "expected_session_id"),
+    [
+        ("artifact_publish", None, None),
+        ("document_generate", "conv-a", "session-a"),
+    ],
+)
+async def test_inline_attachment_scope_follows_publication_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    expected_conversation_id: str | None,
+    expected_session_id: str | None,
+) -> None:
+    create_record = AsyncMock()
+    monkeypatch.setattr("cognis.core.tool_router.create_artifact_record", create_record)
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        session_factory=_session_factory(),
+    )
+
+    await router._persist_inline_attachment(  # noqa: SLF001
+        {
+            "filename": "report.pdf",
+            "mime_type": "application/pdf",
+            "content_b64": base64.b64encode(b"pdf").decode("ascii"),
+        },
+        _session(),
+        tool_name,
+    )
+
+    kwargs = create_record.await_args.kwargs
+    assert kwargs["conversation_id"] == expected_conversation_id
+    assert kwargs["session_id"] == expected_session_id
+
+
+@pytest.mark.asyncio
 async def test_tool_router_enriches_inline_attachment_output_with_artifact_guidance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

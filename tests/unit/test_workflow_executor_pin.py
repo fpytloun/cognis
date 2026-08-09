@@ -25,14 +25,22 @@ from cognis.store import queries as store_queries
 class _FakeTask:
     task_id: str = "task-1"
     active_executor_id: str | None = None
+    active_executor_assigned_at: datetime | None = None
     active_executor_expires_at: datetime | None = None
+    active_executor_source: str | None = None
+    active_executor_generation: int = 0
+    active_executor_unavailable_since: datetime | None = None
 
 
 @dataclass
 class _FakeConversation:
     conversation_id: str
     active_executor_id: str | None = None
+    active_executor_assigned_at: datetime | None = None
     active_executor_expires_at: datetime | None = None
+    active_executor_source: str | None = None
+    active_executor_generation: int = 0
+    active_executor_unavailable_since: datetime | None = None
 
 
 def _executor_row(
@@ -117,6 +125,58 @@ def _patch_runtime_queries(
         task.active_executor_id = executor_id
         return True
 
+    async def _initialize_task_and_conversation(
+        _session, *, task_id, conversation_id, active_executor_id, source="selector"
+    ):
+        fake_db.initialize_task_calls.append((task_id, active_executor_id))
+        fake_db.initialize_conv_calls.append((conversation_id, active_executor_id))
+        task = fake_db.tasks.get(task_id)
+        conversation = fake_db.conversations.get(conversation_id)
+        if task is None or conversation is None:
+            return False
+        initialized = task.active_executor_id is None
+        if initialized:
+            task.active_executor_id = active_executor_id
+            task.active_executor_source = source
+            task.active_executor_generation += 1
+        conversation.active_executor_id = task.active_executor_id
+        conversation.active_executor_assigned_at = task.active_executor_assigned_at
+        conversation.active_executor_expires_at = task.active_executor_expires_at
+        conversation.active_executor_source = task.active_executor_source
+        conversation.active_executor_generation = task.active_executor_generation
+        conversation.active_executor_unavailable_since = task.active_executor_unavailable_since
+        return initialized
+
+    async def _cas_failover(
+        _session,
+        *,
+        conversation_id,
+        task_id,
+        expected_executor_id,
+        new_executor_id,
+        expected_generation,
+        **_metadata,
+    ):
+        task = fake_db.tasks.get(task_id) if task_id else None
+        conversation = fake_db.conversations.get(conversation_id) if conversation_id else None
+        authority = task or conversation
+        if (
+            authority is None
+            or authority.active_executor_id != expected_executor_id
+            or authority.active_executor_generation != expected_generation
+        ):
+            return False, expected_generation, None
+        authority.active_executor_id = new_executor_id
+        authority.active_executor_generation += 1
+        authority.active_executor_expires_at = None
+        authority.active_executor_unavailable_since = None
+        if task is not None and conversation is not None:
+            conversation.active_executor_id = new_executor_id
+            conversation.active_executor_generation = task.active_executor_generation
+            conversation.active_executor_expires_at = None
+            conversation.active_executor_unavailable_since = None
+        return True, authority.active_executor_generation, "notice"
+
     async def _set_conv(_session, conversation_id, executor_id, **_metadata):
         fake_db.set_conv_calls.append((conversation_id, executor_id))
         conv = fake_db.conversations.get(conversation_id)
@@ -140,6 +200,12 @@ def _patch_runtime_queries(
     monkeypatch.setattr(store_queries, "get_setting_value", _get_setting_value)
     monkeypatch.setattr(store_queries, "initialize_conversation_active_executor", _initialize_conv)
     monkeypatch.setattr(store_queries, "initialize_task_active_executor", _initialize_task)
+    monkeypatch.setattr(
+        store_queries,
+        "initialize_task_and_conversation_active_executor",
+        _initialize_task_and_conversation,
+    )
+    monkeypatch.setattr(store_queries, "cas_executor_failover", _cas_failover)
     monkeypatch.setattr(store_queries, "set_conversation_active_executor", _set_conv)
     monkeypatch.setattr(store_queries, "set_task_active_executor", _set_task)
 
@@ -197,6 +263,95 @@ async def test_first_step_picks_and_persists_initial_active_on_task(
 
 
 @pytest.mark.asyncio
+async def test_initial_pin_loser_reloads_authoritative_winner_not_local_candidate(
+    monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
+) -> None:
+    loser = _executor_row("exec-loser", labels={"tier": "primary"})
+    winner = _executor_row("exec-winner", labels={"tier": "primary"})
+    _patch_runtime_queries(monkeypatch, fake_db, [loser])
+
+    async def _persist_winner(
+        _session, *, task_id, conversation_id, active_executor_id, source="selector"
+    ):
+        del task_id, conversation_id, active_executor_id
+        fake_db.tasks["task-1"].active_executor_id = "exec-winner"
+        fake_db.tasks["task-1"].active_executor_source = source
+        fake_db.tasks["task-1"].active_executor_generation = 1
+        return False
+
+    async def _get_authoritative_row(_session, executor_id, **_kwargs):
+        return winner if executor_id == "exec-winner" else loser
+
+    monkeypatch.setattr(
+        store_queries,
+        "initialize_task_and_conversation_active_executor",
+        _persist_winner,
+    )
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_authoritative_row)
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        SimpleNamespace(_session_factory=_runtime_session_factory),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_selector": {"tier": "primary"}},
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_id="conv-step-1",
+        task_id="task-1",
+    )
+
+    assert config["executor_id"] == "exec-winner"
+    assert config["config"] == winner.config
+
+
+@pytest.mark.asyncio
+async def test_initial_pin_loser_fails_when_authoritative_winner_is_unusable(
+    monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
+) -> None:
+    loser = _executor_row("exec-loser", labels={"tier": "primary"})
+    winner = _executor_row("exec-winner", labels={"tier": "primary"}, runtime_state="stopped")
+    winner.status = "stopped"
+    _patch_runtime_queries(monkeypatch, fake_db, [loser])
+
+    async def _persist_winner(
+        _session, *, task_id, conversation_id, active_executor_id, source="selector"
+    ):
+        del task_id, conversation_id, active_executor_id
+        fake_db.tasks["task-1"].active_executor_id = "exec-winner"
+        fake_db.tasks["task-1"].active_executor_source = source
+        fake_db.tasks["task-1"].active_executor_generation = 1
+        return False
+
+    async def _get_authoritative_row(_session, executor_id, **_kwargs):
+        return winner if executor_id == "exec-winner" else loser
+
+    monkeypatch.setattr(
+        store_queries,
+        "initialize_task_and_conversation_active_executor",
+        _persist_winner,
+    )
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_authoritative_row)
+
+    with pytest.raises(RuntimeError, match="unavailable or unusable"):
+        await runtime_support._resolve_eligible_executor_config(
+            SimpleNamespace(_session_factory=_runtime_session_factory),
+            AgentDefinition(
+                agent_id="agent-1",
+                owner_email="alice@example.com",
+                name="Agent",
+                execution={"executor_selector": {"tier": "primary"}},
+            ),
+            "alice@example.com",
+            ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+            conversation_id="conv-step-1",
+            task_id="task-1",
+        )
+
+
+@pytest.mark.asyncio
 async def test_second_step_reads_task_pin_when_conversation_pin_absent(
     monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
 ) -> None:
@@ -242,6 +397,7 @@ async def test_second_step_reads_task_pin_when_conversation_pin_absent(
         conversation_active_executor_expires_at=None,
         conversation_id=None,
         task_id=None,
+        **_kwargs,
     ):
         captured["pin"] = conversation_active_executor_id
         captured["conversation_id"] = conversation_id
@@ -329,6 +485,83 @@ async def test_explicit_executor_id_initialises_task_pin(
 
 
 @pytest.mark.asyncio
+async def test_explicit_executor_cas_loser_uses_authoritative_winner(
+    monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
+) -> None:
+    loser = _executor_row("exec-explicit-loser")
+    winner = _executor_row("exec-explicit-winner")
+    _patch_runtime_queries(monkeypatch, fake_db, [loser])
+    calls = 0
+
+    async def _get_executor_row(_session, executor_id, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return loser if calls == 1 and executor_id == "exec-explicit-loser" else winner
+
+    async def _persist_winner(
+        _session, *, task_id, conversation_id, active_executor_id, source="selector"
+    ):
+        del task_id, conversation_id, active_executor_id, source
+        fake_db.tasks["task-1"].active_executor_id = "exec-explicit-winner"
+        return False
+
+    monkeypatch.setattr(store_queries, "get_executor_row", _get_executor_row)
+    monkeypatch.setattr(
+        store_queries,
+        "initialize_task_and_conversation_active_executor",
+        _persist_winner,
+    )
+
+    config = await runtime_support._resolve_eligible_executor_config(
+        SimpleNamespace(_session_factory=_runtime_session_factory),
+        AgentDefinition(
+            agent_id="agent-1",
+            owner_email="alice@example.com",
+            name="Agent",
+            execution={"executor_id": "exec-explicit-loser"},
+        ),
+        "alice@example.com",
+        ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+        conversation_id="conv-step-1",
+        task_id="task-1",
+    )
+
+    assert config["executor_id"] == "exec-explicit-winner"
+
+
+@pytest.mark.asyncio
+async def test_initial_executor_persistence_failure_does_not_route_locally(
+    monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
+) -> None:
+    _patch_runtime_queries(monkeypatch, fake_db, [_executor_row("exec-only")])
+    rollback_called = False
+
+    class _FailingSession(_RuntimeSession):
+        async def commit(self) -> None:
+            raise RuntimeError("commit failed")
+
+        async def rollback(self) -> None:
+            nonlocal rollback_called
+            rollback_called = True
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await runtime_support._resolve_eligible_executor_config(
+            SimpleNamespace(_session_factory=lambda: _FailingSession()),
+            AgentDefinition(
+                agent_id="agent-1",
+                owner_email="alice@example.com",
+                name="Agent",
+                execution={"executor_id": "exec-only"},
+            ),
+            "alice@example.com",
+            ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
+            conversation_id="conv-step-1",
+            task_id="task-1",
+        )
+    assert rollback_called
+
+
+@pytest.mark.asyncio
 async def test_initialize_task_is_idempotent(
     monkeypatch: pytest.MonkeyPatch, fake_db: _FakeDB
 ) -> None:
@@ -342,6 +575,7 @@ async def test_initialize_task_is_idempotent(
 
     # Pre-existing pin: simulate a second step running after an earlier one.
     fake_db.tasks["task-1"].active_executor_id = "exec-b"
+    fake_db.tasks["task-1"].active_executor_source = "selector_primary"
     fake_db.conversations["conv-step-1"].active_executor_id = None
 
     config = await runtime_support._resolve_eligible_executor_config(
@@ -379,11 +613,23 @@ async def test_expired_additional_pin_falls_back_to_primary(
     monkeypatch.setattr(store_queries, "get_setting_value", _setting_value)
 
     expired = datetime.now(UTC) - timedelta(seconds=1)
+    fake_db.tasks["task-1"].active_executor_id = "exec-add"
+    fake_db.tasks["task-1"].active_executor_expires_at = expired
+    fake_db.tasks["task-1"].active_executor_source = "additional_explicit"
+    fake_db.tasks["task-1"].active_executor_generation = 1
+    fake_db.conversations["conv-step-1"].active_executor_id = "exec-add"
+    fake_db.conversations["conv-step-1"].active_executor_expires_at = expired
+    fake_db.conversations["conv-step-1"].active_executor_source = "additional_explicit"
+    fake_db.conversations["conv-step-1"].active_executor_generation = 1
     config = await runtime_support._resolve_eligible_executor_config(
         SimpleNamespace(
             _session_factory=_runtime_session_factory,
             executor=SimpleNamespace(
-                websocket=SimpleNamespace(get_connection=lambda _executor_id: None)
+                websocket=SimpleNamespace(
+                    get_connection=lambda executor_id: (
+                        SimpleNamespace(connected=True) if executor_id == "exec-primary" else None
+                    )
+                )
             ),
         ),
         AgentDefinition(
@@ -399,13 +645,15 @@ async def test_expired_additional_pin_falls_back_to_primary(
         ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
         conversation_active_executor_id="exec-add",
         conversation_active_executor_expires_at=expired,
+        conversation_active_executor_generation=1,
         conversation_id="conv-step-1",
         task_id="task-1",
     )
 
     assert config["executor_id"] == "exec-primary"
-    assert fake_db.set_conv_calls == [("conv-step-1", "exec-primary")]
-    assert fake_db.set_task_calls == [("task-1", "exec-primary")]
-    notice = config["executor_pin_fallback_notice"]
-    assert notice["previous_executor_id"] == "exec-add"
-    assert notice["new_executor_id"] == "exec-primary"
+    assert fake_db.set_conv_calls == []
+    assert fake_db.set_task_calls == []
+    assert fake_db.tasks["task-1"].active_executor_id == "exec-primary"
+    assert fake_db.conversations["conv-step-1"].active_executor_id == "exec-primary"
+    assert fake_db.tasks["task-1"].active_executor_generation == 2
+    assert "executor_pin_fallback_notice" not in config

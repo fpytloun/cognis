@@ -33,7 +33,7 @@ from cognis.models.tool import (
     tool_with_input_schema,
 )
 from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
-from cognis.tools.builtin.image import IMAGE_GENERATE_TOOL
+from cognis.tools.builtin.image import IMAGE_EDIT_TOOL, IMAGE_GENERATE_TOOL
 from cognis.tools.builtin.orchestration import (
     AGENT_CONVERSATION_CREATE_TOOL,
     DELEGATE_TOOL,
@@ -413,6 +413,20 @@ def test_dynamic_enrichment_rebuilds_native_declaration_and_round_trip() -> None
     assert audit_tool_descriptors([enriched]) == []
     assert enriched.native_operations is not None
     assert enriched.native_operations[0].dynamic_options[0].values == ["provider/model"]
+
+
+def test_describe_tool_exposes_multi_image_schemas() -> None:
+    generated = describe_available_tool([IMAGE_GENERATE_TOOL], "image_generate")
+    edited = describe_available_tool([IMAGE_EDIT_TOOL], "image_edit")
+
+    generated_properties = generated["descriptor"]["input_schema"]["properties"]
+    edited_schema = edited["descriptor"]["input_schema"]
+    edited_properties = edited_schema["properties"]
+
+    assert "references" in generated_properties
+    assert "images" in edited_properties
+    assert "mask_artifact_id" in edited_properties
+    assert edited_schema["required"] == ["prompt", "images"]
 
 
 def test_mcp_descriptor_preserves_live_schema_annotations_and_output_schema() -> None:

@@ -23,11 +23,17 @@ from fastapi.testclient import TestClient
 import cognis.api.websocket as websocket_module
 from cognis.api.chat_v2.realtime import (
     assistant_stream_runtime_item,
+    system_message_runtime_item,
 )
 from cognis.api.chat_v2.realtime import (
     runtime_items_from_snapshots as _runtime_items_from_snapshots,
 )
-from cognis.api.chat_v2.schemas import TimelineItem, TimelineScope
+from cognis.api.chat_v2.schemas import (
+    MessageTimelineItem,
+    TimelineItem,
+    TimelineScope,
+    ToolCallTimelineItem,
+)
 from cognis.api.timeline_visibility import is_visible_persisted_system_message
 from cognis.api.websocket import (
     DEFAULT_INBOUND_RATE_LIMIT,
@@ -47,7 +53,16 @@ from cognis.api.websocket import (
     _handle_update_queued_message,
     _has_unread_from_payload,
     _render_command_result,
+    _runtime_relay_cumulative_boundary,
     _workflow_composed_payload,
+)
+from cognis.core.chat_v2_runtime_relay import (
+    AdmissionDecision,
+    ChatV2RuntimeRelayEnvelope,
+    RelayGenerationContext,
+    RelayKind,
+    RelayOrigin,
+    RelayOwner,
 )
 from cognis.core.commands import CommandResult
 from cognis.core.events import Event, EventType
@@ -64,6 +79,28 @@ from cognis.store.queries import (
     create_managed_conversation_link,
     create_user,
 )
+
+
+def test_apply_patch_input_progress_is_not_a_relay_boundary() -> None:
+    item = ToolCallTimelineItem(
+        id="tool:patch-progress",
+        sort_key="9998:999999999999999:000000:03:000000000",
+        source_refs=[],
+        stable=False,
+        status="running",
+        call_id="patch-progress",
+        tool_name="apply_patch",
+        progress_phase="preparing_input",
+        progress_input_chars=120,
+        progress_input_lines=4,
+        progress_complete=False,
+    )
+
+    assert not _runtime_relay_cumulative_boundary([item], has_active_turn=True)
+    assert _runtime_relay_cumulative_boundary(
+        [item.model_copy(update={"progress_complete": True})],
+        has_active_turn=True,
+    )
 
 
 def _strip_order_key(item: dict[str, Any]) -> dict[str, Any]:
@@ -84,6 +121,512 @@ def test_unread_payload_normalizes_naive_and_aware_datetimes() -> None:
             "last_read_at": "2026-07-12T12:00:01+02:00",
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_relay_validation_rechecks_postgres_owner_after_takeover() -> None:
+    old_context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-a",
+        owner_incarnation_id="boot-a",
+        fencing_token=7,
+    )
+    new_context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-b",
+        owner_incarnation_id="boot-b",
+        fencing_token=8,
+    )
+    scheduler = SimpleNamespace(
+        durable_relay_generation_context=AsyncMock(side_effect=[old_context, new_context])
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(turn_scheduler=scheduler))
+    )
+    envelope = ChatV2RuntimeRelayEnvelope(
+        kind=RelayKind.RUNTIME,
+        event_id="event-1",
+        generated_at=datetime.now(UTC),
+        origin=RelayOrigin(
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            runtime_epoch="runtime-a",
+        ),
+        conversation_id="conversation-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        direct_request_id="request-1",
+        owner=RelayOwner(controller_id="controller-a", incarnation_id="boot-a"),
+        fencing_token=7,
+        source_revision=1,
+        has_active_turn=False,
+    )
+
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.ACCEPT
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.WRONG_FENCE
+    assert scheduler.durable_relay_generation_context.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_relay_validation_accepts_exact_terminal_after_settlement() -> None:
+    context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-a",
+        owner_incarnation_id="boot-a",
+        fencing_token=7,
+    )
+    scheduler = SimpleNamespace(
+        durable_relay_generation_context=AsyncMock(return_value=None),
+        durable_terminal_relay_generation_context=AsyncMock(return_value=context),
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(turn_scheduler=scheduler))
+    )
+    envelope = ChatV2RuntimeRelayEnvelope(
+        kind=RelayKind.TERMINAL,
+        event_id="event-terminal",
+        generated_at=datetime.now(UTC),
+        origin=RelayOrigin(
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            runtime_epoch="runtime-a",
+        ),
+        conversation_id="conversation-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        direct_request_id="request-1",
+        owner=RelayOwner(controller_id="controller-a", incarnation_id="boot-a"),
+        fencing_token=7,
+        source_revision=2,
+        has_active_turn=False,
+    )
+
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.ACCEPT
+    scheduler.durable_terminal_relay_generation_context.assert_awaited_once_with("request-1")
+
+    mismatched = envelope.model_copy(update={"conversation_id": "conversation-2"})
+    assert await manager.validate_relay_envelope(mismatched) == AdmissionDecision.WRONG_TURN
+
+
+@pytest.mark.asyncio
+async def test_runtime_relay_validation_does_not_fallback_past_newer_active_turn() -> None:
+    newer = RelayGenerationContext(
+        direct_request_id="request-2",
+        turn_id="turn-2",
+        session_id="session-2",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-b",
+        owner_incarnation_id="boot-b",
+        fencing_token=8,
+    )
+    scheduler = SimpleNamespace(
+        durable_relay_generation_context=AsyncMock(return_value=newer),
+        durable_terminal_relay_generation_context=AsyncMock(),
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(turn_scheduler=scheduler))
+    )
+    envelope = ChatV2RuntimeRelayEnvelope(
+        kind=RelayKind.TERMINAL,
+        event_id="old-terminal",
+        generated_at=datetime.now(UTC),
+        origin=RelayOrigin(
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            runtime_epoch="runtime-a",
+        ),
+        conversation_id="conversation-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        direct_request_id="request-1",
+        owner=RelayOwner(controller_id="controller-a", incarnation_id="boot-a"),
+        fencing_token=7,
+        source_revision=2,
+        has_active_turn=False,
+    )
+
+    assert await manager.validate_relay_envelope(envelope) == AdmissionDecision.WRONG_TURN
+    scheduler.durable_terminal_relay_generation_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_relay_classifies_message_items_without_observer_failure() -> None:
+    context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-a",
+        owner_incarnation_id="boot-a",
+        fencing_token=7,
+    )
+    scheduler = SimpleNamespace(
+        relay_generation_context=Mock(return_value=context),
+        running_turn_state=Mock(return_value={"status": "running"}),
+    )
+    envelope = object()
+    relay = SimpleNamespace(
+        make_envelope=Mock(return_value=envelope),
+        enqueue=Mock(),
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                turn_scheduler=scheduler,
+                chat_v2_runtime_relay=relay,
+            )
+        )
+    )
+    item = assistant_stream_runtime_item(
+        {
+            "content": "partial",
+            "message_id": "message-1",
+            "turn_id": "turn-1",
+        },
+        local=0,
+    )
+    assert item is not None
+
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conversation-1",
+        volatile_items=[item],
+        active_session_id="session-1",
+    )
+
+    relay.enqueue.assert_called_once_with(envelope, cumulative_boundary=False)
+
+
+@pytest.mark.asyncio
+async def test_cluster_invalidation_reaches_only_authorized_scope_owner_and_marks_session_stale() -> (
+    None
+):
+    cache = SimpleNamespace(invalidate_canonical=AsyncMock(return_value=True))
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(state=SimpleNamespace(session_cache=cache))
+    )
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value="owner@example.com"
+    )
+    owner = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={
+            "conversation:conv-1": TimelineScope(
+                key="conversation:conv-1",
+                kind="conversation",
+                conversation_id="conv-1",
+                session_id="session-1",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        user_email="foreign@example.com",
+        chat_v2_scopes={
+            "conversation:conv-2": TimelineScope(
+                key="conversation:conv-2",
+                kind="conversation",
+                conversation_id="conv-2",
+                session_id="session-2",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-1"].add("owner")  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-2"].add("foreign")  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={
+                "kind": "chat_scope_changed",
+                "revision": "42",
+                "scope": {
+                    "conversation_id": "conv-1",
+                    "session_id": "session-1",
+                },
+            },
+        )
+    )
+
+    cache.invalidate_canonical.assert_awaited_once_with("session-1")
+    owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "scope_invalidated",
+            "reason": "chat_scope_changed",
+            "revision": "42",
+            "conversation_id": "conv-1",
+            "session_id": "session-1",
+        }
+    )
+    foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_work_invalidation_reaches_only_matching_authorized_scope() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value="owner@example.com"
+    )
+    owner = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={
+            "conversation:conv-1": TimelineScope(
+                key="conversation:conv-1",
+                kind="conversation",
+                conversation_id="conv-1",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        user_email="foreign@example.com",
+        chat_v2_scopes={
+            "conversation:conv-2": TimelineScope(
+                key="conversation:conv-2",
+                kind="conversation",
+                conversation_id="conv-2",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-1"].add("owner")  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-2"].add("foreign")  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={
+                "kind": "work_invalidated",
+                "revision": "9",
+                "scope": {
+                    "owner_token": "a" * 64,
+                    "work_scope_key": "conversation:conv-1",
+                },
+            },
+        )
+    )
+
+    owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "work_invalidated",
+            "reason": "work_invalidated",
+            "revision": "9",
+            "work_scope_key": "conversation:conv-1",
+        }
+    )
+    foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscribers() -> None:
+    cache = SimpleNamespace(
+        invalidate_session_token=AsyncMock(return_value=True),
+        session_token=lambda store_id, session_id: f"{store_id}:{session_id}",
+    )
+
+    class Result:
+        def __init__(self, rows: list[object]) -> None:
+            self.rows = rows
+
+        def __iter__(self):
+            return iter(self.rows)
+
+        def scalars(self):
+            return iter(self.rows)
+
+    class DatabaseSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def execute(self, _: object) -> Result:
+            return results.pop(0)
+
+    results = [
+        Result([("conv-1", "session-2")]),
+        Result(
+            [
+                SimpleNamespace(session_id="session-2", intaris_session_id="intaris-2"),
+                SimpleNamespace(session_id="session-3", intaris_session_id="intaris-3"),
+            ]
+        ),
+    ]
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                cached_event_store=cache,
+                session_factory=DatabaseSession,
+            )
+        )
+    )
+    owner_scope = TimelineScope(
+        key="conversation:conv-1",
+        kind="conversation",
+        conversation_id="conv-1",
+        session_id="session-1",
+    )
+    foreign_scope = TimelineScope(
+        key="session:session-3",
+        kind="session",
+        conversation_id="conv-2",
+        session_id="session-3",
+    )
+    owner = SimpleNamespace(
+        chat_v2_scopes={owner_scope.key: owner_scope},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        chat_v2_scopes={foreign_scope.key: foreign_scope},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={
+                "kind": "event_store_session_invalidated",
+                "revision": "43",
+                "scope": {
+                    "event_store_id": "intaris",
+                    "event_session_token": "intaris:intaris-2",
+                },
+            },
+        )
+    )
+
+    cache.invalidate_session_token.assert_awaited_once_with(
+        "intaris:intaris-2",
+        source="cluster_signal",
+    )
+    owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "scope_invalidated",
+            "reason": "event_store_session_invalidated",
+            "revision": "43",
+        }
+    )
+    foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cluster_invalidation_saturated_client_does_not_block_other_client() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace(session_cache=None)))
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value="owner@example.com"
+    )
+    saturated = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={
+            "conversation:conv-1": TimelineScope(
+                key="conversation:conv-1",
+                kind="conversation",
+                conversation_id="conv-1",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=False),
+    )
+    healthy = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes=saturated.chat_v2_scopes,
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"saturated": saturated, "healthy": healthy}  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-1"].update(  # noqa: SLF001
+        {"saturated", "healthy"}
+    )
+
+    await asyncio.wait_for(
+        manager._handle_event(  # noqa: SLF001
+            Event(
+                type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                data={
+                    "kind": "chat_scope_changed",
+                    "revision": "43",
+                    "scope": {"conversation_id": "conv-1"},
+                },
+            )
+        ),
+        timeout=0.1,
+    )
+
+    saturated.send_scope_invalidation_nowait.assert_called_once()
+    healthy.send_scope_invalidation_nowait.assert_called_once()
+
+
+def test_scope_invalidation_coalescing_preserves_distinct_reasons() -> None:
+    chat_key = AuthenticatedWebSocket._scope_invalidation_key(  # noqa: SLF001
+        {"reason": "chat_scope_changed", "conversation_id": "conv-1"}
+    )
+    notification_key = AuthenticatedWebSocket._scope_invalidation_key(  # noqa: SLF001
+        {"reason": "notification_state_changed", "conversation_id": "conv-1"}
+    )
+
+    assert chat_key != notification_key
+
+
+@pytest.mark.asyncio
+async def test_sidebar_owner_token_routes_without_exposing_email() -> None:
+    cluster_signals = SimpleNamespace(
+        owner_token_matches=lambda email, token: email == "owner@example.com" and token == "a" * 64
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                session_cache=None,
+                cluster_signals=cluster_signals,
+            )
+        )
+    )
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value=None
+    )
+    owner = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        user_email="foreign@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+    manager._by_user["owner@example.com"].add("owner")  # noqa: SLF001
+    manager._by_user["foreign@example.com"].add("foreign")  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={
+                "kind": "sidebar_changed",
+                "revision": "44",
+                "scope": {"owner_token": "a" * 64},
+            },
+        )
+    )
+
+    owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "scope_invalidated",
+            "reason": "sidebar_changed",
+            "revision": "44",
+        }
+    )
+    foreign.send_scope_invalidation_nowait.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -553,6 +1096,7 @@ class _BlockedWebSocket:
         self.started = asyncio.Event()
         self.json_payloads: list[dict[str, Any]] = []
         self.text_payloads: list[str] = []
+        self.closed: tuple[int, str] | None = None
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.started.set()
@@ -563,6 +1107,9 @@ class _BlockedWebSocket:
         self.started.set()
         await self.release.wait()
         self.text_payloads.append(payload)
+
+    async def close(self, *, code: int, reason: str) -> None:
+        self.closed = (code, reason)
 
 
 class _RuntimeSnapshotScheduler:
@@ -758,6 +1305,110 @@ class _RecordingWebSocketManager(WebSocketConnectionManager):
 
     async def _resolve_conversation_id(self, event: Event) -> str | None:  # noqa: SLF001
         return str(event.data.get("conversation_id") or "conv-1")
+
+
+@pytest.mark.asyncio
+async def test_event_bus_system_notice_emits_chat_v2_system_runtime_item() -> None:
+    manager = _RecordingWebSocketManager()
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.SYSTEM_NOTICE,
+            data={
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "turn_id": "turn-1",
+                "message": "Paused while Intaris recovers.",
+                "notice_id": "intaris-recovery:turn-1:intaris_append",
+                "kind": "intaris_recovery",
+                "scope": "transient_retry",
+            },
+        )
+    )
+
+    item = manager.chat_v2_runtime_items[0][0]
+    assert item.kind == "message"
+    assert item.role == "system"
+    assert item.content == "Paused while Intaris recovers."
+    assert item.notice_scope == "transient_retry"
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> None:
+    runtime_frames: list[list[TimelineItem]] = []
+
+    class _LocalRuntimeManager(WebSocketConnectionManager):
+        async def _fanout_chat_v2_runtime(  # noqa: PLR0913
+            self,
+            conversation_id: str,
+            *,
+            volatile_items: list[TimelineItem],
+            has_active_turn: bool,
+            active_session_id: str | None,
+            context_usage: dict[str, Any] | None,
+            last_generation: dict[str, Any] | None,
+            active_turn: dict[str, Any] | None = None,
+        ) -> None:
+            del (
+                conversation_id,
+                has_active_turn,
+                active_session_id,
+                context_usage,
+                last_generation,
+                active_turn,
+            )
+            runtime_frames.append(volatile_items)
+
+    manager = _LocalRuntimeManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                chat_v2_runtime_relay=None,
+                turn_scheduler=SimpleNamespace(
+                    relay_generation_context=lambda _conversation_id: SimpleNamespace(
+                        turn_id="turn-1"
+                    )
+                ),
+            )
+        )
+    )
+    notice = system_message_runtime_item(
+        notice_id="intaris-recovery:turn-1:intaris_append",
+        content="Paused while Intaris recovers.",
+        turn_id="turn-1",
+        session_id="sess-1",
+        timestamp=datetime.now(UTC).isoformat(),
+        notice_kind="intaris_recovery",
+        notice_scope="transient_retry",
+    )
+    assistant = MessageTimelineItem(
+        id="message:assistant-1:phase:0",
+        sort_key="9998:999999999999999:000000:02:000000000",
+        source_refs=[],
+        stable=False,
+        status="running",
+        role="assistant",
+        content="Still working.",
+        message_id="assistant-1",
+        turn_id="turn-1",
+        attachments=[],
+        partial=True,
+    )
+
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-1",
+        volatile_items=[assistant],
+        active_session_id="sess-1",
+    )
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-1",
+        volatile_items=[notice],
+        active_session_id="sess-1",
+    )
+
+    assert {item.id for item in runtime_frames[-1]} == {
+        assistant.id,
+        notice.id,
+    }
 
 
 @pytest.mark.asyncio
@@ -1370,6 +2021,41 @@ async def test_conversation_fanout_serializes_payload_once(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_conversation_fanout_includes_chat_v2_subscribers_when_requested() -> None:
+    app = SimpleNamespace(state=SimpleNamespace(event_bus=None, turn_scheduler=None))
+    manager = WebSocketConnectionManager(app)
+    legacy_ws = _RecordingWebSocket()
+    chat_v2_ws = _RecordingWebSocket()
+    legacy = await manager.connect(
+        cast(Any, legacy_ws), claims={"sub": "user@example.com", "role": "user"}
+    )
+    chat_v2 = await manager.connect(
+        cast(Any, chat_v2_ws), claims={"sub": "user@example.com", "role": "user"}
+    )
+    manager.subscribe(legacy, "conv-1")
+    manager.subscribe_chat_v2(
+        chat_v2,
+        TimelineScope(key="conversation:conv-1", kind="conversation", conversation_id="conv-1"),
+        cursor="cursor-1",
+    )
+
+    await manager.send_to_conversation(
+        "conv-1",
+        {"type": "escalation", "conversation_id": "conv-1", "call_id": "call-1"},
+        include_chat_v2=True,
+    )
+    await legacy.wait_outbound_drained()
+    await chat_v2.wait_outbound_drained()
+
+    assert legacy_ws.payloads == [
+        {"type": "escalation", "conversation_id": "conv-1", "call_id": "call-1"}
+    ]
+    assert chat_v2_ws.payloads == legacy_ws.payloads
+    await manager.disconnect(legacy)
+    await manager.disconnect(chat_v2)
+
+
+@pytest.mark.asyncio
 async def test_websocket_turn_observer_sends_system_message_metadata() -> None:
     manager = _RecordingManager()
     observer = WebSocketTurnObserver(manager)  # type: ignore[arg-type]
@@ -1381,6 +2067,9 @@ async def test_websocket_turn_observer_sends_system_message_metadata() -> None:
         kind="turn_initiated",
         scope="turn",
         turn_id="turn-1",
+        retry_reason="controller_restart",
+        retry_source_turn_id="turn-source",
+        attempt=2,
     )
 
     assert manager.payloads == [
@@ -1394,9 +2083,17 @@ async def test_websocket_turn_observer_sends_system_message_metadata() -> None:
                 "kind": "turn_initiated",
                 "scope": "turn",
                 "turn_id": "turn-1",
+                "retry_reason": "controller_restart",
+                "retry_source_turn_id": "turn-source",
+                "attempt": 2,
             },
         )
     ]
+    runtime_item = manager.chat_v2_runtime_items[-1][0]
+    assert runtime_item.id == "system:turn-init:fup_task_failed"
+    assert runtime_item.retry_reason == "controller_restart"
+    assert runtime_item.retry_source_turn_id == "turn-source"
+    assert runtime_item.attempt == 2
 
 
 @pytest.mark.asyncio
@@ -1844,6 +2541,7 @@ async def test_websocket_manager_sends_authoritative_runtime_snapshot() -> None:
         "queued_messages": [{"queue_id": "queue-1", "content": "queued"}],
         "queued_count": 1,
         "has_active_turn": True,
+        "active_turn": {"chat_mode": "build", "chat_mode_source": "user"},
         "active_turn_chat_mode": "build",
         "active_turn_chat_mode_source": "user",
         "active_streams": [{"message_id": "msg-1", "content": "stream"}],
@@ -2306,6 +3004,101 @@ async def test_chunk_dropped_when_buffer_full() -> None:
     assert connection._outbound_queue.qsize() == DEFAULT_OUTBOUND_BUFFER  # noqa: SLF001
     blocked_ws.release.set()
     await connection.wait_outbound_drained()
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_send_timeout_closes_transport_and_drains_queue() -> None:
+    blocked_ws = _BlockedWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="stalled",
+        websocket=cast(Any, blocked_ws),
+        user_email="user@test.com",
+        role="user",
+        send_timeout_seconds=0.01,
+    )
+
+    await connection.send_json({"type": "chat_v2_frame", "conversation_id": "conv-1"})
+    await blocked_ws.started.wait()
+    await connection.send_json({"type": "chat_v2_frame", "conversation_id": "conv-1"})
+    await asyncio.wait_for(connection.wait_outbound_drained(), timeout=1)
+
+    assert connection._closed  # noqa: SLF001
+    assert blocked_ws.closed == (1013, "WebSocket send timeout")
+    assert connection._outbound_queue.empty()  # noqa: SLF001
+    await connection.send_json({"type": "chat_v2_frame", "conversation_id": "conv-1"})
+    assert connection._outbound_queue.empty()  # noqa: SLF001
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_send_timeout_releases_blocked_producer_without_residue() -> None:
+    blocked_ws = _BlockedWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="stalled-full",
+        websocket=cast(Any, blocked_ws),
+        user_email="user@test.com",
+        role="user",
+        send_timeout_seconds=0.05,
+    )
+    await connection.send_json({"type": "chat_v2_frame", "conversation_id": "conv-1"})
+    await blocked_ws.started.wait()
+    for index in range(DEFAULT_OUTBOUND_BUFFER):
+        await connection.send_json(
+            {
+                "type": "chat_v2_frame",
+                "conversation_id": "conv-1",
+                "index": index,
+            }
+        )
+    blocked_producer = asyncio.create_task(
+        connection.send_json({"type": "chat_v2_frame", "conversation_id": "conv-1"})
+    )
+    await asyncio.sleep(0)
+    assert not blocked_producer.done()
+
+    await asyncio.wait_for(blocked_producer, timeout=1)
+    await asyncio.wait_for(connection.wait_outbound_drained(), timeout=1)
+    assert connection._outbound_queue.empty()  # noqa: SLF001
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_writer_send_timeout_releases_more_waiters_than_queue_capacity() -> None:
+    blocked_ws = _BlockedWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="stalled-many",
+        websocket=cast(Any, blocked_ws),
+        user_email="user@test.com",
+        role="user",
+        send_timeout_seconds=0.05,
+    )
+    await connection.send_json({"type": "chat_v2_frame", "conversation_id": "conv-1"})
+    await blocked_ws.started.wait()
+    for index in range(DEFAULT_OUTBOUND_BUFFER):
+        await connection.send_json(
+            {
+                "type": "chat_v2_frame",
+                "conversation_id": "conv-1",
+                "index": index,
+            }
+        )
+    producers = [
+        asyncio.create_task(
+            connection.send_json(
+                {
+                    "type": "chat_v2_frame",
+                    "conversation_id": "conv-1",
+                    "producer": index,
+                }
+            )
+        )
+        for index in range(DEFAULT_OUTBOUND_BUFFER + 1)
+    ]
+
+    await asyncio.wait_for(asyncio.gather(*producers), timeout=1)
+    await asyncio.wait_for(connection.wait_outbound_drained(), timeout=1)
+    assert connection._outbound_queue.empty()  # noqa: SLF001
     await connection.close()
 
 
@@ -2874,7 +3667,8 @@ async def test_turn_observer_tool_result_includes_file_diffs() -> None:
     kwargs = manager.send_chat_v2_runtime_to_conversation.await_args.kwargs
     items = cast(list[TimelineItem], kwargs["volatile_items"])
     assert [
-        file_diff.model_dump(mode="json", exclude_none=True) for file_diff in items[0].file_diffs
+        file_diff.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+        for file_diff in items[0].file_diffs
     ] == file_diffs
 
 
@@ -2926,7 +3720,12 @@ async def test_ws_first_slash_command_bootstraps_root_session(
             client.app,
             manager,  # type: ignore[arg-type]
             connection,
-            {"type": "message", "conversation_id": conversation_id, "content": "/plan"},
+            {
+                "type": "message",
+                "conversation_id": conversation_id,
+                "content": "/plan",
+                "client_message_id": "slash-plan-1",
+            },
         )
 
         async with client.app.state.session_factory() as session:
@@ -2958,7 +3757,12 @@ async def test_ws_message_does_not_send_queue_snapshot_before_authorization(
             client.app,
             manager,  # type: ignore[arg-type]
             connection,
-            {"type": "message", "conversation_id": conversation_id, "content": "hello"},
+            {
+                "type": "message",
+                "conversation_id": conversation_id,
+                "content": "hello",
+                "client_message_id": "forbidden-1",
+            },
         )
 
         assert manager.errors[-1]["code"] == "forbidden"
@@ -3083,6 +3887,7 @@ async def test_ws_managed_conversation_cannot_send_cancel_or_update_queued_messa
                 "type": "message",
                 "conversation_id": conversation_id,
                 "content": "direct target send",
+                "client_message_id": "direct-target-1",
             },
         )
         await _handle_cancel_queued_message(

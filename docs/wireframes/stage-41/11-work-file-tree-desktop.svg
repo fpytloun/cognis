@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="820" viewBox="0 0 1160 820" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .add{fill:#4fd1a5}.del{fill:#f2657f}.mod{fill:#e2b25a}.ren{fill:#5cc2f2}
+      .sel{fill:#12314a;stroke:#38bdf8;stroke-width:1.5}
+      .diffadd{fill:#0f2a1e}.diffdel{fill:#2a1016}
+      .ok{fill:#4fd1a5}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="820"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">11 · Work view — HIERARCHICAL FILE TREE + diff (GitHub-PR style), derived client-side</text>
+  <text x="28" y="54" class="m" font-size="12">Wraps the existing "Changed files" region. Tree is folded from the authorized Work projection paths — no backend change by default.</text>
+
+  <!-- deliverable hero (unchanged, above) -->
+  <rect x="28" y="72" width="1104" height="46" class="panel" rx="10" stroke="#4fd1a5"/>
+  <text x="48" y="100" class="ok" font-size="12" font-weight="700">✓ Final result (canonical deliverable) — unchanged, stays above the changed-files region</text>
+
+  <!-- tabs -->
+  <rect x="28" y="130" width="120" height="30" rx="8" class="acbg"/><text x="46" y="150" class="ac" font-size="11" font-weight="700">Changed files 23</text>
+  <rect x="156" y="130" width="110" height="30" rx="8" class="sub"/><text x="174" y="150" class="m" font-size="11">Commands 4</text>
+  <rect x="274" y="130" width="120" height="30" rx="8" class="sub"/><text x="292" y="150" class="m" font-size="11">Other mutations 2</text>
+  <circle cx="384" cy="145" r="10" class="callout"/><text x="380" y="149" class="cnum" font-size="11">6</text>
+
+  <!-- TREE PANE (left, resizable) -->
+  <rect x="28" y="172" width="330" height="560" class="panel" rx="10"/>
+  <!-- filter -->
+  <rect x="44" y="186" width="298" height="30" rx="8" class="sub"/><text x="58" y="206" class="m" font-size="11">⌕ Filter files / status…</text>
+  <circle cx="360" cy="201" r="10" class="callout"/><text x="356" y="205" class="cnum" font-size="11">3</text>
+  <!-- tree rows -->
+  <text x="52" y="242" class="m" font-size="12">▾ 📁 cognis/api</text><text x="330" y="242" class="mod" font-size="10" text-anchor="end">± 3</text>
+  <text x="72" y="266" class="t" font-size="12">▾ 📁 chat_v2</text><text x="330" y="266" class="mod" font-size="10" text-anchor="end">± 2</text>
+  <!-- selected file -->
+  <rect x="44" y="276" width="298" height="26" rx="7" class="sel"/>
+  <rect x="92" y="283" width="4" height="12" class="mod"/><text x="104" y="294" class="t" font-size="12">projector.py</text><text x="330" y="294" class="mod" font-size="10" text-anchor="end">+18 −4</text>
+  <rect x="92" y="308" width="4" height="12" class="add"/><text x="104" y="319" class="t" font-size="12">store.py</text><text x="330" y="319" class="add" font-size="10" text-anchor="end">+40</text>
+  <text x="52" y="344" class="m" font-size="12">▾ 📁 ui/src/lib/work</text><text x="330" y="344" class="add" font-size="10" text-anchor="end">± 4</text>
+  <rect x="72" y="352" width="4" height="12" class="add"/><text x="86" y="363" class="t" font-size="12">WorkFileTree.svelte</text><text x="330" y="363" class="add" font-size="10" text-anchor="end">new</text>
+  <rect x="72" y="376" width="4" height="12" class="ren"/><text x="86" y="387" class="t" font-size="12">fileTree.ts</text><text x="330" y="387" class="ren" font-size="10" text-anchor="end">renamed</text>
+  <rect x="72" y="400" width="4" height="12" class="del"/><text x="86" y="411" class="t" font-size="12">legacyList.ts</text><text x="330" y="411" class="del" font-size="10" text-anchor="end">deleted</text>
+  <rect x="72" y="424" width="4" height="12" class="m"/><text x="86" y="435" class="m" font-size="12">logo.png</text><text x="330" y="435" class="m" font-size="10" text-anchor="end">binary</text>
+  <rect x="72" y="448" width="4" height="12" class="mod"/><text x="86" y="459" class="m" font-size="12">bundle.min.js</text><text x="330" y="459" class="m" font-size="10" text-anchor="end">truncated</text>
+  <text x="52" y="486" class="m" font-size="12">▸ 📁 tests  (collapsed)</text><text x="330" y="486" class="mod" font-size="10" text-anchor="end">± 11</text>
+  <circle cx="360" cy="290" r="10" class="callout"/><text x="356" y="294" class="cnum" font-size="11">2</text>
+  <circle cx="360" cy="430" r="10" class="callout"/><text x="356" y="434" class="cnum" font-size="11">5</text>
+  <text x="52" y="700" class="cap" font-size="10">Folders show aggregate ± counts; 40+ files collapse by default.</text>
+  <text x="52" y="716" class="cap" font-size="10">Keyboard: ↑/↓ select · ←/→ fold · Enter open · / filter.</text>
+
+  <!-- splitter -->
+  <rect x="360" y="172" width="6" height="560" fill="#26323f"/><rect x="360" y="430" width="6" height="44" class="ac"/>
+  <circle cx="363" cy="200" r="10" class="callout"/><text x="359" y="204" class="cnum" font-size="11">4</text>
+
+  <!-- DIFF PANE (right) -->
+  <rect x="372" y="172" width="760" height="560" class="panel" rx="10"/>
+  <rect x="372" y="172" width="760" height="40" class="sub" rx="10"/>
+  <text x="392" y="197" class="lbl" font-size="12">cognis/api/chat_v2/projector.py</text>
+  <text x="1112" y="197" class="mod" font-size="11" text-anchor="end">+18 −4  ⧉ copy path</text>
+  <circle cx="392" cy="228" r="10" class="callout"/><text x="388" y="232" class="cnum" font-size="11">1</text>
+  <!-- diff hunks -->
+  <rect x="388" y="240" width="728" height="20" class="diffdel" rx="3"/><text x="400" y="255" class="del" font-size="11" font-family="monospace">- band = 9997</text>
+  <rect x="388" y="262" width="728" height="20" class="diffadd" rx="3"/><text x="400" y="277" class="add" font-size="11" font-family="monospace">+ band = SETTLE_BAND</text>
+  <rect x="388" y="284" width="728" height="20" class="sub" rx="3"/><text x="400" y="299" class="m" font-size="11" font-family="monospace">  return sort_key(band, seq, phase)</text>
+  <rect x="388" y="320" width="728" height="260" class="sub" rx="6"/><text x="404" y="344" class="m" font-size="11">…more hunks (lazy)…</text>
+  <text x="404" y="372" class="ac" font-size="11">Full output ↗ (ToolOutputDrawer for truncated / large)</text>
+  <text x="404" y="600" class="cap" font-size="10">Scrolling the diff highlights the active file in the tree; clicking a tree node scrolls the diff to it (synchronized).</text>
+  <circle cx="1102" cy="600" r="10" class="callout"/><text x="1098" y="604" class="cnum" font-size="11">7</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="758" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="778" class="note" font-size="12">1 Client-side derivation: fileTree.ts folds file_diffs[].path on "/" into folders + files, carrying status &amp; aggregate ± counts. Only authorized</text>
+  <text x="44" y="794" class="note" font-size="12">paths appear (redaction-safe). · 2 Selection ↔ diff. · 3 Filter/search by path + status. · 4 Resizable splitter (persisted). · 5 Edge cases:</text>
+  <text x="28" y="812" class="note" font-size="12">renamed (old→new, needs B3), deleted, binary (no preview), truncated (Full output). · 6 Commands/Other mutations stay sibling tabs; non-git mutations never enter the tree. · 7 Synchronized scroll.</text>
+</svg>

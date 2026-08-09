@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="800" viewBox="0 0 1160 800" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}.amber{fill:#f5b544}
+      .user{fill:#0e6ba8}.pribtn{fill:#38bdf8}.ok{fill:#4fd1a5}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="800"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">09 · Task Agent Dock — FULL-SCREEN expansion (existing Chat v2 window mode, still task-scoped)</text>
+  <text x="28" y="54" class="m" font-size="12">"Expand" swaps the docked panel for the full Chat v2 experience — the same route the current build already uses (?window=1&amp;taskControl=1).</text>
+
+  <!-- full-screen chat frame -->
+  <rect x="28" y="72" width="1104" height="560" class="panel" rx="12" stroke="#38bdf8" stroke-width="2"/>
+  <!-- header -->
+  <rect x="28" y="72" width="1104" height="64" class="sub" rx="12"/>
+  <text x="52" y="100" class="lbl" font-size="14">Agent · Release safety review</text>
+  <rect x="52" y="108" width="210" height="22" rx="11" class="acbg"/><text x="66" y="123" class="ac" font-size="9" font-weight="700">Task detail · Release safety review (t_8821)</text>
+  <!-- tabs Chat/Work/Search/Info (Star/Archive/Delete suppressed) -->
+  <rect x="620" y="98" width="58" height="26" rx="8" class="acbg"/><text x="634" y="115" class="ac" font-size="10" font-weight="700">Chat</text>
+  <rect x="684" y="98" width="58" height="26" rx="8" class="sub"/><text x="700" y="115" class="m" font-size="10">Work</text>
+  <rect x="748" y="98" width="64" height="26" rx="8" class="sub"/><text x="762" y="115" class="m" font-size="10">Search</text>
+  <rect x="818" y="98" width="50" height="26" rx="8" class="sub"/><text x="832" y="115" class="m" font-size="10">Info</text>
+  <!-- return-to-task + dock / minimize controls -->
+  <rect x="888" y="98" width="128" height="26" rx="8" class="pribtn"/><text x="902" y="115" class="bg" font-size="10" font-weight="700">↩ Return to task</text>
+  <rect x="1022" y="98" width="92" height="26" rx="8" class="panel" stroke="#38bdf8"/><text x="1032" y="115" class="ac" font-size="10" font-weight="700">⤡ Dock · ⌄ Min</text>
+  <circle cx="952" cy="88" r="10" class="callout"/><text x="948" y="92" class="cnum" font-size="11">3</text>
+  <circle cx="808" cy="90" r="10" class="callout"/><text x="804" y="94" class="cnum" font-size="11">2</text>
+
+  <!-- pinned decision banner -->
+  <rect x="52" y="150" width="1056" height="60" class="att" rx="10"/>
+  <text x="72" y="174" class="amber" font-size="11" font-weight="700">GATE · Approve this release for production?</text>
+  <text x="72" y="194" class="ok" font-size="10">✓ 12 tests · 1 file changed · review loop 1/5</text>
+  <rect x="812" y="164" width="150" height="32" rx="8" class="pribtn"/><text x="840" y="185" class="bg" font-size="11" font-weight="700">Approve &amp; continue</text>
+  <rect x="972" y="164" width="118" height="32" rx="8" class="panel" stroke="#f5b544"/><text x="984" y="185" class="amber" font-size="10">Reject / revise</text>
+  <circle cx="1102" cy="150" r="10" class="callout"/><text x="1098" y="154" class="cnum" font-size="11">1</text>
+
+  <!-- transcript area -->
+  <rect x="760" y="228" width="348" height="40" rx="10" class="user"/><text x="778" y="252" class="t" font-size="11">Show me the diff and the test run.</text>
+  <rect x="52" y="278" width="520" height="70" rx="10" class="sub"/>
+  <text x="72" y="302" class="t" font-size="11">Here is the change and the passing run. Deterministic evidence is in the Work tab;</text>
+  <text x="72" y="320" class="t" font-size="11">nothing is blocking except your approval above.</text>
+  <text x="72" y="338" class="ac" font-size="11">↗ Open Work</text>
+  <rect x="52" y="360" width="1056" height="210" class="sub" rx="10"/><text x="72" y="386" class="m" font-size="12">Full transcript, tool calls, thinking, queued messages — the complete Chat v2 timeline (scoped ChatV2 store).</text>
+
+  <!-- composer -->
+  <rect x="52" y="586" width="1056" height="40" rx="20" class="sub"/><text x="74" y="610" class="m" font-size="12">Message the agent…   (Ctrl/⌘+Enter to send)</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="670" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="692" class="note" font-size="12">1 The decision stays PINNED at the top even at full width — the user can still act without hunting. Same decision component as WF 02/08.</text>
+  <text x="28" y="714" class="note" font-size="12">2 Reuses the current build's full experience and tab set (Chat · Work · Search · Info). Star / Archive / Delete stay suppressed in</text>
+  <text x="44" y="732" class="note" font-size="12">task-control mode (existing persistence contract). This is NOT a new screen — it is the existing ?window=1&amp;taskControl=1 route.</text>
+   <text x="28" y="756" class="note" font-size="12">3 "Dock" returns to WF 08's docked panel; "Min" returns to WF 07's FAB; "↩ Return to task" exits window mode back to the task-detail route. Full-screen stays task-scoped; it is NOT a global assistant.</text>
+  <text x="28" y="778" class="note" font-size="12">Focus is trapped in full-screen mode (like the current chat window); docked mode is non-modal and does not trap focus.</text>
+</svg>

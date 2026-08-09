@@ -46,6 +46,7 @@ def test_immutable_prefix_repair_cooldown_allows_zero() -> None:
 def test_new_runtime_defaults_are_registered() -> None:
     assert DEFAULT_SETTINGS["session.step_timeout_seconds"] == ("session", 14400)
     assert DEFAULT_SETTINGS["session.max_tool_calls_per_turn"] == ("session", 500)
+    assert DEFAULT_SETTINGS["session.max_llm_cycles_per_turn"] == ("session", 150)
 
 
 def test_every_exposed_setting_has_metadata_and_runtime_semantics() -> None:

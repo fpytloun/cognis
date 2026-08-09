@@ -68,8 +68,8 @@ decision into the controller's hot path.
 ### 2. `system:general-task` remains the unstructured execution envelope
 
 `system:general-task` is still useful. It is the right shape for bounded work
-that does not justify step decomposition but still benefits from semantic
-evaluation.
+that does not justify step decomposition. It uses required completion metadata
+and a canonical deliverable instead of a generic semantic evaluator.
 
 Examples:
 

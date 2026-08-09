@@ -4,22 +4,38 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
+from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
+from cognis.models.local_models import LocalModelOperationAction, OllamaRuntimeStartRequest
 from cognis.models.tool import ExecutorCapabilities, ExecutorConfig, ExecutorHandle, ToolCall
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.executor import websocket as websocket_module
 from cognis.providers.executor.websocket import (
+    ExecutorDeliveryError,
     ExecutorDisconnectedError,
     WebSocketExecutorConnection,
     WebSocketExecutorProvider,
     executor_reconnect_retry_budget_seconds,
 )
+from cognis.store.coordination import Lease
+
+
+def _connection_owner(*, epoch: int = 1) -> ExecutorConnectionOwner:
+    return ExecutorConnectionOwner(
+        executor_id="exec-1",
+        lease=Lease(
+            resource_key="executor_connection:exec-1",
+            owner_id="controller-a:boot-a",
+            fencing_token=epoch,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        ),
+    )
 
 
 def test_executor_token_expired_helper_requires_valid_future_exp() -> None:
@@ -122,13 +138,205 @@ class FakeWebSocket:
     async def receive_json(self) -> dict[str, Any]:
         return await self._receive_queue.get()
 
+    async def close(self, code: int = 1000, reason: str | None = None) -> None:
+        del code, reason
+        self.closed = True
+
     def inject_message(self, data: dict[str, Any]) -> None:
         self._receive_queue.put_nowait(data)
+
+
+class BlockingSendWebSocket(FakeWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_send_started = asyncio.Event()
+        self.release_first_send = asyncio.Event()
+
+    async def send_json(self, data: dict[str, Any]) -> None:
+        if not self.sent:
+            self.first_send_started.set()
+            await self.release_first_send.wait()
+        await super().send_json(data)
+
+
+@pytest.mark.asyncio
+async def test_submitted_physical_tool_timeout_is_accepted_unknown_and_cancelled() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+    conn.start_receiver()
+    with pytest.raises(ExecutorDeliveryError) as exc:
+        await conn.rpc_call(
+            "tool.execute",
+            {"call_id": "physical-1"},
+            timeout=0.01,
+        )
+    assert exc.value.delivery_state == "accepted_unknown"
+    assert any(
+        frame["method"] == "tool.cancel" and frame["params"] == {"call_id": "physical-1"}
+        for frame in ws.sent
+    )
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_physical_cancel_does_not_wait_behind_blocked_second_send() -> None:
+    ws = BlockingSendWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+    conn.start_receiver()
+    first_send = asyncio.create_task(
+        conn.rpc_call("tool.execute", {"call_id": "physical-1"}, timeout=10)
+    )
+    await asyncio.wait_for(ws.first_send_started.wait(), timeout=1)
+
+    started = asyncio.get_running_loop().time()
+    await conn._cancel_physical_call("tool.execute", {"call_id": "physical-1"})
+    assert asyncio.get_running_loop().time() - started < 1.5
+    assert ws.sent == []
+
+    ws.release_first_send.set()
+    first_send.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_send
+    await conn.close()
 
 
 class DisconnectingWebSocket(FakeWebSocket):
     async def receive_json(self) -> dict[str, Any]:
         raise WebSocketDisconnect(code=1011, reason="heartbeat timeout")
+
+
+class QueuedDisconnectWebSocket(FakeWebSocket):
+    async def receive_json(self) -> dict[str, Any]:
+        item = await self._receive_queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+@pytest.mark.asyncio
+async def test_replay_safe_unary_reuses_id_only_across_reconnect_retry() -> None:
+    old_ws = QueuedDisconnectWebSocket()
+    replacement_ws = FakeWebSocket()
+    replacement = WebSocketExecutorConnection(
+        replacement_ws,
+        "exec-1",
+        ExecutorCapabilities(),
+    )
+    replacement.start_receiver()
+
+    async def resolve_replacement(
+        executor_id: str,
+        previous: WebSocketExecutorConnection,
+        timeout: float,
+    ) -> WebSocketExecutorConnection:
+        assert executor_id == "exec-1"
+        assert previous is old
+        assert timeout > 0
+        return replacement
+
+    old = WebSocketExecutorConnection(
+        old_ws,
+        "exec-1",
+        ExecutorCapabilities(),
+        replay_connection_resolver=resolve_replacement,
+    )
+    old.start_receiver()
+
+    retried = asyncio.create_task(old.list_tools())
+    while not old_ws.sent:
+        await asyncio.sleep(0)
+    old_ws._receive_queue.put_nowait(
+        WebSocketDisconnect(code=1011, reason="response lost after execution")
+    )
+    while not replacement_ws.sent:
+        await asyncio.sleep(0)
+
+    first = old_ws.sent[0]
+    retry = replacement_ws.sent[0]
+    assert first["id"] != retry["id"]
+    assert first["params"]["_cognis_unary_call_id"] == retry["params"]["_cognis_unary_call_id"]
+    replacement_ws.inject_message(
+        {"jsonrpc": "2.0", "result": {"tools": [{"name": "bash"}]}, "id": retry["id"]}
+    )
+    assert await retried == [{"name": "bash"}]
+
+    fresh = asyncio.create_task(replacement.list_tools())
+    while len(replacement_ws.sent) < 2:
+        await asyncio.sleep(0)
+    second = replacement_ws.sent[1]
+    assert second["params"]["_cognis_unary_call_id"] != retry["params"]["_cognis_unary_call_id"]
+    replacement_ws.inject_message({"jsonrpc": "2.0", "result": {"tools": []}, "id": second["id"]})
+    assert await fresh == []
+    await old.close()
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_local_model_rpc_replay_boundary_keeps_operations_ordinary() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+    conn.start_receiver()
+
+    async def complete_call(call: Any, result: dict[str, Any]) -> dict[str, Any]:
+        sent_count = len(ws.sent)
+        task = asyncio.create_task(call)
+        while len(ws.sent) == sent_count:
+            await asyncio.sleep(0)
+        frame = ws.sent[-1]
+        ws.inject_message({"jsonrpc": "2.0", "result": result, "id": frame["id"]})
+        await task
+        return frame
+
+    status_frame = await complete_call(
+        conn.local_model_status(),
+        {
+            "management_enabled": True,
+            "reachable": True,
+        },
+    )
+    show_frame = await complete_call(
+        conn.local_model_show("qwen3:8b"),
+        {"model": "qwen3:8b"},
+    )
+    operation_result = {
+        "operation_id": "operation",
+        "action": "pull",
+        "runtime_name": "qwen3:8b",
+        "request_hash": "sha256:request",
+        "state": "running",
+    }
+    start_frame = await complete_call(
+        conn.local_model_operation_start(
+            OllamaRuntimeStartRequest(
+                operation_id="operation",
+                action=LocalModelOperationAction.PULL,
+                runtime_name="qwen3:8b",
+                request_hash="sha256:request",
+            )
+        ),
+        operation_result,
+    )
+    operation_status_frame = await complete_call(
+        conn.local_model_operation_status("operation"),
+        operation_result,
+    )
+    cancel_frame = await complete_call(
+        conn.local_model_operation_cancel("operation"),
+        {"acknowledged": True, "rollback_guaranteed": False},
+    )
+
+    for frame in (status_frame, show_frame):
+        assert frame["params"]["_cognis_replay_safe_unary"] is True
+        assert frame["params"]["_cognis_unary_call_id"]
+        assert frame["params"]["_cognis_unary_payload_digest"]
+    assert show_frame["params"]["runtime_name"] == "qwen3:8b"
+
+    for frame in (start_frame, operation_status_frame, cancel_frame):
+        assert not any(key.startswith("_cognis_") for key in frame["params"])
+    assert start_frame["method"] == "local_model.operation.start"
+    assert operation_status_frame["method"] == "local_model.operation.status"
+    assert cancel_frame["method"] == "local_model.operation.cancel"
+    await conn.close()
 
 
 class CloseTrackingConnection:
@@ -312,6 +520,234 @@ async def test_heartbeat_dispatches_resource_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_closes_connection_after_ownership_loss() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+
+    async def _lost(_received_at: datetime) -> bool:
+        return False
+
+    conn.register_heartbeat_callback(_lost)
+    conn.start_receiver()
+    ws.inject_message({"jsonrpc": "2.0", "method": "executor.heartbeat", "params": {}})
+    await conn.wait_until_closed()
+
+    assert ws.closed is True
+    assert conn.connected is False
+    assert conn.close_metadata == {
+        "close_code": 4409,
+        "close_reason": "Executor connection ownership lost",
+        "error_type": "ExecutorOwnershipLost",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ownership_watchdog_closes_socket_without_fresh_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cognis.providers.executor.websocket.EXECUTOR_CONNECTION_LEASE_TTL_SECONDS",
+        0.02,
+    )
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+
+    async def _renew(_received_at: datetime) -> bool:
+        return True
+
+    conn.register_heartbeat_callback(_renew)
+    conn.start_receiver()
+    await asyncio.wait_for(conn.wait_until_closed(), timeout=1.0)
+
+    assert ws.closed is True
+    assert conn.close_metadata["error_type"] == "ExecutorOwnershipLost"
+
+
+@pytest.mark.asyncio
+async def test_rpc_rejects_stale_owner_before_physical_send() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+
+    async def _stale() -> bool:
+        return False
+
+    conn.register_ownership_check_callback(_stale)
+
+    with pytest.raises(ExecutorDisconnectedError, match="ownership lost"):
+        await conn.rpc_call("tool.list", {})
+    assert ws.sent == []
+    assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_response_does_not_resolve_pending_waiter() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(),
+        connection_owner=_connection_owner(),
+    )
+    checks = iter((True, False))
+
+    async def _ownership_is_current() -> bool:
+        return next(checks)
+
+    conn.register_ownership_check_callback(_ownership_is_current)
+    conn.start_receiver()
+    pending = asyncio.create_task(conn.rpc_call("tool.list", {}, timeout=5.0))
+    while not ws.sent:
+        await asyncio.sleep(0)
+    ws.inject_message(
+        {
+            "jsonrpc": "2.0",
+            "result": {"tools": [{"name": "stale"}]},
+            "id": ws.sent[0]["id"],
+        }
+    )
+
+    with pytest.raises(ExecutorDisconnectedError, match="ownership lost"):
+        await asyncio.wait_for(pending, timeout=1.0)
+    assert ws.closed is True
+
+
+@pytest.mark.parametrize("frame_kind", ["response", "llm.chunk", "llm.done"])
+@pytest.mark.asyncio
+async def test_takeover_between_frame_check_and_effect_blocks_dispatch(
+    frame_kind: str,
+) -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(),
+        connection_owner=_connection_owner(),
+    )
+    effect_started = asyncio.Event()
+    release_effect = asyncio.Event()
+
+    async def _current() -> bool:
+        return True
+
+    async def _stale_effect(_owner: Any, _effect: Any) -> bool:
+        effect_started.set()
+        await release_effect.wait()
+        return False
+
+    conn.register_ownership_check_callback(_current)
+    conn.register_owned_effect_dispatcher(_stale_effect)
+    conn.start_receiver()
+    pending: asyncio.Task[dict[str, Any]] | None = None
+    if frame_kind == "response":
+        pending = asyncio.create_task(conn.rpc_call("tool.list", {}, timeout=5.0))
+        while not ws.sent:
+            await asyncio.sleep(0)
+        frame = {
+            "jsonrpc": "2.0",
+            "result": {"tools": [{"name": "stale"}]},
+            "id": ws.sent[0]["id"],
+        }
+    else:
+        conn._inference_queues["request-1"] = asyncio.Queue()
+        frame = {
+            "jsonrpc": "2.0",
+            "method": frame_kind,
+            "params": {"request_id": "request-1", "content": "stale"},
+        }
+    ws.inject_message(frame)
+    await asyncio.wait_for(effect_started.wait(), timeout=1.0)
+
+    # The effect dispatcher models an epoch takeover after the receiver's
+    # initial validation but before waiter/queue mutation.
+    release_effect.set()
+    await asyncio.wait_for(conn.wait_until_closed(), timeout=1.0)
+    if pending is not None:
+        with pytest.raises(ExecutorDisconnectedError, match="ownership lost"):
+            await pending
+    assert conn._inference_queues == {}
+    assert ws.closed is True
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("tool.progress", {"call_id": "call-1", "delta": "stale"}),
+        ("llm.chunk", {"request_id": "request-1", "content": "stale"}),
+        (
+            "executor.heartbeat",
+            {
+                "resource_snapshot": {
+                    "observed_at": "2026-07-13T10:00:00Z",
+                    "os": "linux",
+                }
+            },
+        ),
+        ("shell.background_completed", {"call_id": "call-1"}),
+        (
+            "channel.message",
+            {"account_id": "account-1", "message": {"text": "stale"}},
+        ),
+        (
+            "channel.status",
+            {"account_id": "account-1", "status": {"status": "connected"}},
+        ),
+        (
+            "oauth.loopback_callback",
+            {"listener_id": "listener-1", "state": "stale"},
+        ),
+        (
+            "local_model.progress",
+            {
+                "operation_id": "operation-1",
+                "phase": "pulling",
+                "progress_seq": 1,
+                "progress_bytes": 1,
+            },
+        ),
+        (
+            "local_model.completed",
+            {"operation_id": "operation-1", "state": "succeeded"},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stale_owner_notifications_are_not_dispatched(
+    method: str,
+    params: dict[str, Any],
+) -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(),
+        connection_owner=_connection_owner(),
+    )
+    dispatched = asyncio.Event()
+
+    async def _stale() -> bool:
+        return False
+
+    async def _callback(*_args: Any) -> None:
+        dispatched.set()
+
+    conn.register_ownership_check_callback(_stale)
+    conn._tool_chunk_callbacks["call-1"] = _callback
+    conn._inference_queues["request-1"] = asyncio.Queue()
+    conn.register_resource_snapshot_callback(_callback)
+    conn.register_background_shell_completed_callback(_callback)
+    conn.register_channel_callback("account-1", _callback, _callback)
+    conn.register_oauth_loopback_callback(_callback)
+    conn.register_local_model_callbacks(on_progress=_callback, on_completed=_callback)
+    conn.start_receiver()
+    ws.inject_message({"jsonrpc": "2.0", "method": method, "params": params})
+    await asyncio.wait_for(conn.wait_until_closed(), timeout=1.0)
+
+    assert not dispatched.is_set()
+    assert conn._inference_queues == {}
+    assert ws.closed is True
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_resource_snapshots_are_coalesced_and_rate_limited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -456,6 +892,194 @@ async def test_close_fails_pending_rpcs() -> None:
 
     with pytest.raises(ExecutorDisconnectedError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_physical_disconnect_terminates_inference_stream_promptly() -> None:
+    ws = QueuedDisconnectWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities(inference=True))
+    conn.start_receiver()
+    stream = conn.llm_complete_stream("request-1", [], "model-1")
+    next_chunk = asyncio.create_task(anext(stream))
+
+    while not ws.sent:
+        await asyncio.sleep(0)
+    ws.inject_message(
+        {
+            "jsonrpc": "2.0",
+            "result": {"status": "streaming"},
+            "id": ws.sent[0]["id"],
+        }
+    )
+    await ws._receive_queue.put(WebSocketDisconnect(code=1011, reason="owner lost"))
+
+    chunk = await asyncio.wait_for(next_chunk, timeout=1.0)
+    assert chunk == {
+        "error": "Executor disconnected",
+        "mid_stream_failure": True,
+    }
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_physical_disconnect_replaces_full_inference_queue_with_terminal_error() -> None:
+    ws = FakeWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities(inference=True))
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=2)
+    queue.put_nowait({"content": "stale-1"})
+    queue.put_nowait({"content": "stale-2"})
+    conn._inference_queues["request-1"] = queue
+
+    await asyncio.wait_for(conn._terminate_pending("Executor disconnected"), timeout=1)
+
+    assert await queue.get() == {"error": "Executor disconnected", "done": True}
+    assert conn._inference_queues == {}
+
+
+@pytest.mark.asyncio
+async def test_physical_disconnect_cancels_inflight_notification_callbacks() -> None:
+    ws = QueuedDisconnectWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _blocking_callback(_executor_id: str, _params: dict[str, Any]) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    conn.register_background_shell_completed_callback(_blocking_callback)
+    conn.start_receiver()
+    ws.inject_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "shell.background_completed",
+            "params": {"call_id": "call-1"},
+        }
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await ws._receive_queue.put(WebSocketDisconnect(code=1011, reason="owner lost"))
+    await asyncio.wait_for(conn.wait_until_closed(), timeout=1.0)
+
+    assert cancelled.is_set()
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("tool.progress", {"call_id": "call-1", "delta": "chunk"}),
+        (
+            "local_model.progress",
+            {
+                "operation_id": "operation-1",
+                "phase": "pulling",
+                "progress_seq": 1,
+                "progress_bytes": 1,
+            },
+        ),
+        (
+            "local_model.completed",
+            {"operation_id": "operation-1", "state": "succeeded"},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_blocking_progress_callbacks_do_not_delay_disconnect(
+    method: str,
+    params: dict[str, Any],
+) -> None:
+    ws = QueuedDisconnectWebSocket()
+    conn = WebSocketExecutorConnection(ws, "exec-1", ExecutorCapabilities())
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def _blocking_callback(*_args: Any) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    conn._tool_chunk_callbacks["call-1"] = _blocking_callback
+    conn.register_local_model_callbacks(
+        on_progress=_blocking_callback,
+        on_completed=_blocking_callback,
+    )
+    conn.start_receiver()
+    ws.inject_message({"jsonrpc": "2.0", "method": method, "params": params})
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await ws._receive_queue.put(WebSocketDisconnect(code=1011, reason="physical disconnect"))
+
+    await asyncio.wait_for(conn.wait_until_closed(), timeout=1.0)
+    assert cancelled.is_set()
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        (
+            "oauth.loopback_callback",
+            {"listener_id": "listener-1", "state": "state-1"},
+        ),
+        (
+            "channel.message",
+            {"account_id": "account-1", "message": {"text": "hello"}},
+        ),
+    ],
+)
+@pytest.mark.parametrize("owner_loss", ["disconnect", "takeover"])
+@pytest.mark.asyncio
+async def test_connection_owned_callback_is_cancelled_without_mutation(
+    method: str,
+    params: dict[str, Any],
+    owner_loss: str,
+) -> None:
+    ws = QueuedDisconnectWebSocket()
+    conn = WebSocketExecutorConnection(
+        ws,
+        "exec-1",
+        ExecutorCapabilities(),
+        connection_owner=_connection_owner(),
+    )
+    current = True
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    mutated = False
+
+    async def _is_current() -> bool:
+        return current
+
+    async def _blocking_callback(*_args: Any) -> None:
+        nonlocal mutated
+        started.set()
+        try:
+            await asyncio.Event().wait()
+            mutated = True
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    conn.register_ownership_check_callback(_is_current)
+    conn.register_oauth_loopback_callback(_blocking_callback)
+    conn.register_channel_callback("account-1", _blocking_callback)
+    conn.start_receiver()
+    ws.inject_message({"jsonrpc": "2.0", "method": method, "params": params})
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    if owner_loss == "disconnect":
+        await ws._receive_queue.put(WebSocketDisconnect(code=1011, reason="physical disconnect"))
+        await asyncio.wait_for(conn.wait_until_closed(), timeout=1.0)
+    else:
+        current = False
+        await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+        await conn.close()
+
+    assert cancelled.is_set()
+    assert mutated is False
 
 
 @pytest.mark.asyncio
@@ -700,16 +1324,16 @@ async def test_tool_execute_disconnected_returns_retryable_metadata() -> None:
     )
 
     assert result.is_error is True
-    assert result.metadata == {
-        "code": "executor_disconnected",
-        "executor_id": "exec-1",
-        "retryable": True,
-        "same_executor_only": True,
-    }
+    assert result.metadata is not None
+    assert result.metadata["code"] == "executor_disconnected"
+    assert result.metadata["delivery_state"] == "not_sent"
+    assert result.metadata["executor_id"] == "exec-1"
+    assert result.metadata["retryable"] is True
+    assert result.metadata["same_executor_only"] is True
 
 
 @pytest.mark.asyncio
-async def test_tool_execute_cancelled_is_not_retryable_disconnect() -> None:
+async def test_tool_execute_cancelled_after_submission_remains_cancellation() -> None:
     ws = FakeWebSocket()
     conn = WebSocketExecutorConnection(
         ws,
@@ -731,10 +1355,8 @@ async def test_tool_execute_cancelled_is_not_retryable_disconnect() -> None:
     )
     asyncio.create_task(respond())
 
-    result = await task
-
-    assert result.is_error is True
-    assert result.metadata == {"code": "tool_execution_cancelled", "retryable": False}
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio

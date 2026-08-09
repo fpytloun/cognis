@@ -9,22 +9,26 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from PIL import Image
+from sqlalchemy import delete
 from starlette.testclient import TestClient
 
 from cognis.api.routes import deliverables as deliverable_routes
+from cognis.core.artifact_maintenance import ArtifactMaintenanceService
 from cognis.core.deliverable_links import _sign_share_token, signed_deliverable_view_link
-from cognis.core.deliverable_media import _image_dimensions
+from cognis.core.deliverable_media import _image_dimensions, resolve_deliverable_media
 from cognis.models.deliverable import (
     PULSE_DAILY_SKELETON,
     RichPayloadValidationError,
     normalize_rich_payload,
 )
-from cognis.store.models import Agent
+from cognis.store.models import Agent, ManagedConversationLink
 from cognis.store.queries import (
     create_artifact_record,
     create_conversation,
     create_deliverable,
     create_managed_conversation_link,
+    delete_conversation,
+    delete_sessions_for_conversation,
     get_artifact_record,
 )
 from cognis.tools.builtin.workflow import WRITE_DELIVERABLE_TOOL
@@ -48,7 +52,7 @@ async def _artifact(
     factory,
     *,
     artifact_id: str,
-    owner: str,
+    owner: str | None,
     conversation_id: str | None,
     content: bytes | None = None,
 ) -> None:
@@ -430,6 +434,225 @@ async def test_managed_descendant_media_allowed_and_sibling_denied(
                 artifact_store=task_continuation_db.artifact_store,
             )
     assert exc_info.value.reason == "rich_media_not_accessible"
+
+
+@pytest.mark.asyncio
+async def test_private_media_forwards_accessor_conversation_to_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = SimpleNamespace()
+    row = SimpleNamespace(deliverable_id="dlv_managed_media")
+    captured: dict[str, object] = {}
+
+    async def authorized(
+        received_request,
+        deliverable_id: str,
+        *,
+        accessor_conversation_id: str | None = None,
+        allow_unscoped_ref: bool = True,
+    ):
+        captured.update(
+            request=received_request,
+            deliverable_id=deliverable_id,
+            accessor_conversation_id=accessor_conversation_id,
+            allow_unscoped_ref=allow_unscoped_ref,
+        )
+        return row
+
+    async def media_response(
+        received_request,
+        received_row,
+        media_key: str,
+        *,
+        cache_control: str,
+    ):
+        captured.update(
+            media_request=received_request,
+            row=received_row,
+            media_key=media_key,
+            cache_control=cache_control,
+        )
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(deliverable_routes, "_authorized_deliverable", authorized)
+    monkeypatch.setattr(deliverable_routes, "_media_response", media_response)
+
+    response = await deliverable_routes.deliverable_media(
+        request,
+        "dlv_managed_media",
+        "media_0123456789abcdef01234567",
+        accessor_conversation_id="conv-controller",
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "request": request,
+        "deliverable_id": "dlv_managed_media",
+        "accessor_conversation_id": "conv-controller",
+        "allow_unscoped_ref": True,
+        "media_request": request,
+        "row": row,
+        "media_key": "media_0123456789abcdef01234567",
+        "cache_control": "private, max-age=60",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cross_conversation_media_is_rehomed_before_child_purge(
+    task_continuation_db,
+) -> None:
+    await _seed_managed_rich_deliverable(task_continuation_db)
+    await _artifact(
+        task_continuation_db,
+        artifact_id="att_child_media_rehomed",
+        owner="owner@example.com",
+        conversation_id="conv-grandchild",
+    )
+
+    async with task_continuation_db() as session:
+        deliverable = await create_deliverable(
+            session,
+            deliverable_id="dlv_child_media_rehomed",
+            conversation_id="conv-controller",
+            content="Fallback",
+            format="rich",
+            rich={
+                "blocks": [
+                    {
+                        "type": "card",
+                        "media": {"ref": "att_child_media_rehomed", "alt": "Child image"},
+                    }
+                ]
+            },
+            artifact_store=task_continuation_db.artifact_store,
+        )
+        media_key = deliverable.rich_payload["blocks"][0]["media"]["key"]
+        artifact = await get_artifact_record(session, "att_child_media_rehomed")
+        assert artifact is not None
+        assert artifact.conversation_id == "conv-controller"
+        assert artifact.status == "attached"
+        await session.execute(
+            delete(ManagedConversationLink).where(
+                ManagedConversationLink.target_conversation_id == "conv-grandchild"
+            )
+        )
+        await delete_sessions_for_conversation(session, "conv-grandchild")
+        await delete_conversation(session, "conv-grandchild")
+        await session.commit()
+
+    maintenance = ArtifactMaintenanceService(
+        session_factory=task_continuation_db,
+        artifact_store=task_continuation_db.artifact_store,
+    )
+    await maintenance.run_once()
+
+    async with task_continuation_db() as session:
+        artifact = await get_artifact_record(session, "att_child_media_rehomed")
+        assert artifact is not None
+        resolved = await resolve_deliverable_media(
+            session,
+            task_continuation_db.artifact_store,
+            deliverable,
+            media_key,
+        )
+    assert resolved is not None
+    assert resolved[0] == _png()
+
+
+@pytest.mark.asyncio
+async def test_owner_global_media_is_retained_by_the_deliverable_conversation(
+    task_continuation_db,
+) -> None:
+    await _seed_managed_rich_deliverable(task_continuation_db)
+    await _artifact(
+        task_continuation_db,
+        artifact_id="att_owner_global_media",
+        owner=None,
+        conversation_id=None,
+    )
+
+    async with task_continuation_db() as session:
+        await create_deliverable(
+            session,
+            deliverable_id="dlv_owner_global_media",
+            conversation_id="conv-controller",
+            content="Fallback",
+            format="rich",
+            rich={"blocks": [{"type": "figure", "media": {"ref": "att_owner_global_media"}}]},
+            artifact_store=task_continuation_db.artifact_store,
+        )
+        artifact = await get_artifact_record(session, "att_owner_global_media")
+        assert artifact is not None
+        assert artifact.conversation_id == "conv-controller"
+        assert artifact.status == "attached"
+        assert artifact.expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_private_media_enforces_managed_descendant_accessor_scope(
+    task_continuation_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _seed_managed_rich_deliverable(task_continuation_db)
+    await _artifact(
+        task_continuation_db,
+        artifact_id="att_managed_route_media",
+        owner="owner@example.com",
+        conversation_id="conv-grandchild",
+    )
+    async with task_continuation_db() as session:
+        session.add(
+            Agent(agent_id="agent-route-sibling", owner_email="owner@example.com", name="Sibling")
+        )
+        await session.flush()
+        await create_conversation(
+            session,
+            "owner@example.com",
+            "agent-route-sibling",
+            "agent_work",
+            conversation_id="conv-route-sibling",
+        )
+        row = await create_deliverable(
+            session,
+            deliverable_id="dlv_managed_route_media",
+            conversation_id="conv-grandchild",
+            content="Fallback",
+            format="rich",
+            rich={
+                "blocks": [
+                    {
+                        "type": "card",
+                        "media": {"ref": "att_managed_route_media", "alt": "Managed image"},
+                    }
+                ]
+            },
+            artifact_store=task_continuation_db.artifact_store,
+        )
+        media_key = row.rich_payload["blocks"][0]["media"]["key"]
+        await session.commit()
+
+    media_url = f"/api/v1/deliverables/dlv_managed_route_media/media/{media_key}"
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        allowed = client.get(
+            media_url,
+            params={"accessor_conversation_id": "conv-controller"},
+        )
+        unscoped = client.get(media_url)
+        sibling = client.get(
+            media_url,
+            params={"accessor_conversation_id": "conv-route-sibling"},
+        )
+    with _client(task_continuation_db, monkeypatch, email="other@example.com") as client:
+        other_user = client.get(
+            media_url,
+            params={"accessor_conversation_id": "conv-controller"},
+        )
+
+    assert allowed.status_code == 200
+    assert allowed.content == _png()
+    assert unscoped.status_code == 404
+    assert sibling.status_code == 404
+    assert other_user.status_code == 404
 
 
 @pytest.mark.asyncio

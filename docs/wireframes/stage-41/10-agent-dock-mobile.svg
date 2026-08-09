@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="800" viewBox="0 0 1160 800" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}.amber{fill:#f5b544}
+      .user{fill:#0e6ba8}.pribtn{fill:#38bdf8}.ok{fill:#4fd1a5}
+      .phone{fill:#0e1722;stroke:#2b3a48;stroke-width:2}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .fab{fill:#0f2333;stroke:#38bdf8;stroke-width:2.5}.tab{fill:#0b1220;stroke:#22303c;stroke-width:1}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="800"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">10 · Task Agent Dock — MOBILE states: minimized FAB → bottom sheet → full-screen (task-detail only)</text>
+  <text x="28" y="54" class="m" font-size="12">Reuses the app's Sheet. FAB clears the BottomTabBar; the sheet fixes the truncated title (F12) and pins the decision at the top.</text>
+
+  <!-- PHONE A: minimized FAB above bottom tab bar -->
+  <rect x="60" y="80" width="300" height="600" rx="26" class="phone"/>
+  <text x="80" y="112" class="lbl" font-size="12">A · Minimized (task detail)</text>
+  <rect x="76" y="126" width="268" height="40" class="sub" rx="8"/><text x="92" y="151" class="m" font-size="11">‹  Release safety review · t_8821</text>
+  <rect x="76" y="176" width="268" height="360" class="sub" rx="8"/><text x="92" y="204" class="m" font-size="11">Task-detail Cockpit (mobile)…</text>
+  <!-- FAB -->
+  <circle cx="308" cy="556" r="26" class="fab"/><text x="308" y="562" class="ac" font-size="17" text-anchor="middle" font-weight="700">◐</text>
+  <circle cx="325" cy="538" r="9" class="amber"/><text x="325" y="542" class="bg" font-size="9" text-anchor="middle" font-weight="700">!</text>
+  <!-- bottom tab bar -->
+  <rect x="76" y="600" width="268" height="56" class="tab" rx="8"/>
+  <text x="98" y="632" class="m" font-size="10">Chat</text><text x="158" y="632" class="m" font-size="10">Tasks</text><text x="218" y="632" class="m" font-size="10">Flows</text><text x="286" y="632" class="m" font-size="10">More</text>
+  <circle cx="308" cy="516" r="10" class="callout"/><text x="304" y="520" class="cnum" font-size="11">1</text>
+
+  <!-- PHONE B: open bottom sheet ~88dvh -->
+  <rect x="430" y="80" width="300" height="600" rx="26" class="phone"/>
+  <text x="450" y="112" class="lbl" font-size="12">B · Open (bottom sheet ≈88dvh)</text>
+  <rect x="446" y="150" width="268" height="514" rx="16" class="panel" stroke="#38bdf8" stroke-width="2"/>
+  <!-- grabber + compact title with scope -->
+  <rect x="560" y="160" width="40" height="5" rx="3" class="m"/>
+  <text x="464" y="192" class="lbl" font-size="12">Agent</text>
+  <rect x="464" y="200" width="220" height="22" rx="11" class="acbg"/><text x="478" y="215" class="ac" font-size="9" font-weight="700">Release safety review · t_8821</text>
+  <circle cx="700" cy="190" r="9" class="callout"/><text x="696" y="194" class="cnum" font-size="10">2</text>
+  <!-- tabs -->
+  <rect x="464" y="232" width="70" height="24" rx="8" class="acbg"/><text x="482" y="248" class="ac" font-size="9" font-weight="700">Chat</text>
+  <rect x="542" y="232" width="70" height="24" rx="8" class="sub"/><text x="564" y="248" class="m" font-size="9">Work</text>
+  <!-- decision card pinned -->
+  <rect x="464" y="266" width="234" height="120" class="att" rx="10"/>
+  <text x="478" y="286" class="amber" font-size="9" font-weight="700">GATE · DECIDE HERE</text>
+  <text x="478" y="306" class="t" font-size="11" font-weight="700">Approve release?</text>
+  <text x="478" y="324" class="ok" font-size="9">✓ 12 tests · 1 file · loop 1/5</text>
+  <rect x="478" y="334" width="120" height="30" rx="8" class="pribtn"/><text x="492" y="354" class="bg" font-size="10" font-weight="700">Approve</text>
+  <rect x="606" y="334" width="82" height="30" rx="8" class="panel" stroke="#f5b544"/><text x="616" y="354" class="amber" font-size="9">Revise</text>
+  <circle cx="710" cy="290" r="9" class="callout"/><text x="706" y="294" class="cnum" font-size="10">3</text>
+  <!-- transcript + composer -->
+  <rect x="500" y="398" width="198" height="34" rx="9" class="user"/><text x="514" y="420" class="t" font-size="10">What's blocking?</text>
+  <rect x="464" y="440" width="210" height="44" rx="9" class="sub"/><text x="478" y="462" class="t" font-size="10">Only your approval above.</text>
+  <rect x="464" y="612" width="234" height="36" rx="18" class="sub"/><text x="484" y="635" class="m" font-size="11">Message… ▲</text>
+
+  <!-- PHONE C: full-screen -->
+  <rect x="800" y="80" width="300" height="600" rx="26" class="phone"/>
+  <text x="820" y="112" class="lbl" font-size="12">C · Full-screen (Chat v2)</text>
+  <rect x="816" y="126" width="268" height="530" rx="10" class="panel" stroke="#38bdf8" stroke-width="2"/>
+  <rect x="816" y="126" width="268" height="52" class="sub" rx="10"/>
+  <text x="832" y="150" class="lbl" font-size="11">Release safety review</text>
+  <text x="832" y="167" class="ac" font-size="9">Scoped to this task</text>
+  <text x="1064" y="152" class="m" font-size="13" text-anchor="end">⌄</text>
+  <rect x="832" y="190" width="236" height="46" class="att" rx="9"/>
+  <text x="846" y="210" class="amber" font-size="9" font-weight="700">GATE · Approve release?</text>
+  <rect x="846" y="214" width="90" height="16" rx="8" class="pribtn"/><text x="858" y="226" class="bg" font-size="8" font-weight="700">Approve</text>
+  <rect x="944" y="214" width="70" height="16" rx="8" class="panel" stroke="#f5b544"/><text x="952" y="226" class="amber" font-size="8">Revise</text>
+  <rect x="832" y="248" width="236" height="330" class="sub" rx="9"/><text x="848" y="274" class="m" font-size="10">Full timeline + Work tab</text>
+  <rect x="832" y="612" width="236" height="34" rx="17" class="sub"/><text x="850" y="634" class="m" font-size="10">Message…</text>
+  <circle cx="1072" cy="152" r="9" class="callout"/><text x="1068" y="156" class="cnum" font-size="10">4</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="710" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="730" class="note" font-size="12">1 FAB sits ABOVE the BottomTabBar (never covers its hit targets) using the shell offset + safe-area insets; design option: a tab-bar</text>
+  <text x="44" y="746" class="note" font-size="12">center action on ≤sm (Appendix C.10). The FAB shows ONLY on task detail — leaving the task unmounts it. · 2 Compact title row shows the task (fixes F12).</text>
+  <text x="28" y="766" class="note" font-size="12">3 Decision card pinned at the top of the sheet — approve/revise without scrolling. · 4 "⌄" returns full-screen → sheet → FAB; scope persists.</text>
+  <text x="28" y="786" class="note" font-size="12">Swipe-down or Esc collapses the sheet; blocking modals suppress the dock; reduced-motion disables slide/pulse.</text>
+</svg>

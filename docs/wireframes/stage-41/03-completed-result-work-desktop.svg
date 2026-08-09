@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="840" viewBox="0 0 1160 840" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .ok{fill:#4fd1a5}.okbg{fill:#0d2419;stroke:#4fd1a5;stroke-width:2}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .add{fill:#173a2a}.del{fill:#3a1720}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="840"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">03 · Task Cockpit — COMPLETED result + Work (desktop ≥ lg)</text>
+  <text x="28" y="54" class="m" font-size="12">State: terminal success. The canonical write_deliverable is the hero, INLINE (not hidden behind an "Explore" modal). Work is inline evidence.</text>
+
+  <!-- HEADER -->
+  <rect x="28" y="70" width="800" height="72" class="panel" rx="10"/>
+  <text x="44" y="98" class="h" font-size="10">TASK COCKPIT</text>
+  <text x="44" y="120" class="t" font-size="18" font-weight="700">Release safety review</text>
+  <rect x="686" y="82" width="70" height="24" rx="12" class="okbg"/><text x="698" y="98" class="ok" font-size="11" font-weight="700">COMPLETED</text>
+  <rect x="600" y="112" width="120" height="26" rx="8" class="acbg"/><text x="616" y="130" class="ac" font-size="11">Re-run task</text>
+  <rect x="726" y="112" width="64" height="26" rx="8" class="sub"/><text x="737" y="130" class="m" font-size="13">···</text>
+
+  <!-- RESULT HERO (canonical deliverable, inline) -->
+  <rect x="28" y="152" width="800" height="196" class="okbg" rx="12"/>
+  <text x="44" y="176" class="ok" font-size="11" font-weight="700" letter-spacing="1.5">FINAL RESULT · write_deliverable (canonical)</text>
+  <text x="44" y="204" class="t" font-size="20" font-weight="700">Release approved</text>
+  <text x="44" y="228" class="t" font-size="13">All deterministic checks passed. The release is approved.</text>
+  <text x="44" y="252" class="cap" font-size="11">Rendered deliverable (markdown/rich) shown in full; long content scrolls within the card.</text>
+  <!-- action row on the hero -->
+  <rect x="44" y="296" width="120" height="30" rx="8" class="acbg"/><text x="60" y="316" class="ac" font-size="11">Open full</text>
+  <rect x="172" y="296" width="90" height="30" rx="8" class="sub"/><text x="188" y="316" class="m" font-size="11">Share</text>
+  <rect x="270" y="296" width="90" height="30" rx="8" class="sub"/><text x="286" y="316" class="m" font-size="11">Copy</text>
+  <rect x="368" y="296" width="110" height="30" rx="8" class="sub"/><text x="384" y="316" class="m" font-size="11">Download</text>
+  <circle cx="806" cy="200" r="10" class="callout"/><text x="802" y="204" class="cnum" font-size="11">1</text>
+
+  <!-- WORK (inline evidence) -->
+  <rect x="28" y="360" width="800" height="360" class="panel" rx="10"/>
+  <text x="44" y="384" class="h" font-size="10">WORK · persisted evidence</text>
+  <rect x="740" y="370" width="76" height="26" rx="8" class="sub"/><text x="756" y="387" class="m" font-size="11">Refresh</text>
+  <!-- metric tiles -->
+  <rect x="44" y="398" width="182" height="58" class="sub" rx="8"/><text x="60" y="424" class="t" font-size="18" font-weight="700">1</text><text x="60" y="444" class="cap" font-size="10">CHANGED FILES</text>
+  <rect x="234" y="398" width="182" height="58" class="sub" rx="8"/><text x="250" y="424" class="t" font-size="18" font-weight="700">1</text><text x="250" y="444" class="cap" font-size="10">COMMANDS</text>
+  <rect x="424" y="398" width="182" height="58" class="sub" rx="8"/><text x="440" y="424" class="t" font-size="18" font-weight="700">2</text><text x="440" y="444" class="cap" font-size="10">MUTATIONS</text>
+  <rect x="614" y="398" width="182" height="58" class="sub" rx="8"/><text x="630" y="424" class="t" font-size="18" font-weight="700">0</text><text x="630" y="444" class="cap" font-size="10">ARTIFACTS</text>
+  <circle cx="806" cy="427" r="10" class="callout"/><text x="802" y="431" class="cnum" font-size="11">2</text>
+  <!-- changed files -->
+  <text x="44" y="482" class="lbl" font-size="12">▾ Changed files</text>
+  <rect x="44" y="492" width="752" height="96" class="sub" rx="8"/>
+  <text x="60" y="514" class="t" font-size="11">release/manifest.yaml · YAML</text><text x="740" y="514" class="ok" font-size="11" text-anchor="end">+1 −1</text>
+  <rect x="60" y="524" width="720" height="20" class="del" rx="3"/><text x="72" y="538" class="t" font-size="11">− candidate</text>
+  <rect x="60" y="548" width="720" height="20" class="add" rx="3"/><text x="72" y="562" class="t" font-size="11">+ approved</text>
+  <!-- commands -->
+  <text x="44" y="612" class="lbl" font-size="12">▾ Commands</text>
+  <rect x="44" y="622" width="752" height="82" class="sub" rx="8"/>
+  <circle cx="64" cy="646" r="5" class="ok"/><text x="80" y="650" class="t" font-size="11">$ uv run pytest tests/release -q</text>
+  <rect x="680" y="634" width="100" height="24" rx="7" class="sub"/><text x="694" y="650" class="m" font-size="10">Full output</text>
+  <text x="80" y="668" class="cap" font-size="10">/workspace · 842 ms · exit 0</text>
+  <rect x="80" y="676" width="500" height="20" class="bg" rx="3"/><text x="90" y="690" class="ok" font-size="11">12 passed</text>
+
+  <!-- RIGHT RAIL -->
+  <rect x="844" y="70" width="288" height="278" class="panel" rx="10"/>
+  <text x="860" y="94" class="h" font-size="10">AT A GLANCE</text>
+  <text x="860" y="118" class="cap" font-size="11">Completed 2m ago · 20h 30m total</text>
+  <text x="860" y="150" class="h" font-size="10">RUN HEALTH</text>
+  <text x="860" y="172" class="t" font-size="11">Steps 4/4 · Retries 1 · Reviews 1 · Skips 1</text>
+  <text x="860" y="204" class="h" font-size="10">RESULT</text>
+  <text x="860" y="226" class="ok" font-size="12" font-weight="700">Release approved</text>
+  <text x="860" y="246" class="cap" font-size="10">Jumps to inline hero ↑</text>
+  <circle cx="1110" cy="215" r="10" class="callout"/><text x="1106" y="219" class="cnum" font-size="11">3</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="748" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="768" class="note" font-size="11.5">1 The completed Work modal is the strongest existing screen — promote it. The canonical result renders INLINE as the hero (green), immediately below the header, satisfying the e2e contract "canonical result appears before progress".</text>
+  <text x="28" y="787" class="note" font-size="11.5">2 Work becomes an inline section (same WorkView component) instead of only a modal behind "Explore". "Open full" still offers the focused dialog for deep inspection. Metric tiles + collapsible diff/commands reused verbatim.</text>
+  <text x="28" y="806" class="note" font-size="11.5">3 Rail "Result" is a mini that scrolls to the hero — it never contradicts it (current build shows "no final result yet" in the rail while the modal shows the result). Single source of truth.</text>
+</svg>

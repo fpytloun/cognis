@@ -67,23 +67,28 @@ def test_migration_graph_has_single_linear_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["095_channel_delivery_dlv_id"]
-    revisions = list(script.walk_revisions("base", "095_channel_delivery_dlv_id"))
-    assert [revision.revision for revision in revisions[:12]] == [
-        "095_channel_delivery_dlv_id",
-        "094_artifact_tool_source_id",
-        "093_canonical_chart_payloads",
-        "092_local_model_byte_bigint",
-        "091_channel_default_profile",
-        "090_local_model_provider_domain",
-        "089_local_model_capacity_bigint",
-        "088_local_model_runtime",
-        "087_local_model_foundation",
-        "086_channel_delivery_attachments",
-        "085_channel_delivery_inflight",
-        "084_channel_delivery_progress",
+    assert script.get_heads() == ["120_schedule_fire_kinds"]
+    revisions = list(script.walk_revisions("base", "120_schedule_fire_kinds"))
+    assert [revision.revision for revision in revisions[:17]] == [
+        "120_schedule_fire_kinds",
+        "119_work_scope_revisions",
+        "118_channel_delivery_receipts",
+        "117_group_context",
+        "116_managed_resume_prepared",
+        "115_managed_channel_resume",
+        "114_managed_channel_fences",
+        "113_managed_channel_lifecycle",
+        "112_channel_observed_targets",
+        "111_managed_channel_foundation",
+        "110_conversation_lineage",
+        "109_task_control_conversation",
+        "108_kb_active_metadata",
+        "107_knowledgebase_grants",
+        "106_kb_index_lifecycle",
+        "105_managed_join_handoffs",
+        "104_channel_direct_turn_delivery",
     ]
-    assert all(len(revision.revision) <= 32 for revision in revisions[:12])
+    assert all(len(revision.revision) <= 32 for revision in revisions[:16])
 
 
 def test_artifact_source_migration_backfills_legacy_identity() -> None:
@@ -128,6 +133,12 @@ def test_revision_chain_fits_postgresql_alembic_version() -> None:
         "093_canonical_chart_payloads",
         "094_artifact_tool_source_id",
         "095_channel_delivery_dlv_id",
+        "096_coordination_leases",
+        "097_direct_turn_requests",
+        "098_schedule_fires",
+        "099_controller_instances",
+        "100_mcp_oauth_terminal_cleanup",
+        "101_mcp_oauth_cleanup_dispatch",
     ]
 
     assert version_column.type.length == 32
@@ -157,6 +168,33 @@ def test_lineage_migration_upgrade_downgrade_sqlite(tmp_path: Path) -> None:
         command.upgrade(config, "094_artifact_tool_source_id")
         command.downgrade(config, "076_repair_legacy_deliverable_content_nullable")
         command.upgrade(config, "094_artifact_tool_source_id")
+
+
+def test_managed_join_handoff_migration_upgrades_104_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "managed-join-handoffs.db"
+    config = Config("cognis/store/migrations/alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
+
+    with _preserve_logging_state():
+        command.upgrade(config, "104_channel_direct_turn_delivery")
+        command.upgrade(config, "105_managed_join_handoffs")
+        command.upgrade(config, "105_managed_join_handoffs")
+
+    sync_engine = sa.create_engine(f"sqlite:///{database_path}")
+    try:
+        inspector = sa.inspect(sync_engine)
+        columns = {column["name"] for column in inspector.get_columns("managed_conversation_links")}
+        indexes = {index["name"] for index in inspector.get_indexes("managed_conversation_links")}
+        assert {
+            "handoff_state",
+            "handoff_target_turn_id",
+            "handoff_controller_session_id",
+            "handoff_controller_turn_id",
+            "handoff_tool_call_id",
+        }.issubset(columns)
+        assert "ix_managed_conversation_links_handoff_owner" in indexes
+    finally:
+        sync_engine.dispose()
 
 
 def test_artifact_source_identity_094_upgrades_093_rows(tmp_path: Path) -> None:

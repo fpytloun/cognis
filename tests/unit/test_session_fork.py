@@ -135,6 +135,47 @@ async def test_fork_session_events_preserves_copied_event_payloads() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fork_session_events_can_require_durable_source_history() -> None:
+    cache = _SessionCache()
+    cache.events = [CachedEvent(seq=1, type="user_message", data={"content": "stale"})]
+
+    class _DurableGuardrails(_Guardrails):
+        async def read_events(self, **kwargs: object) -> object:
+            self.read_kwargs.append(dict(kwargs))
+            return SimpleNamespace(
+                events=[
+                    {"seq": 1, "type": "user_message", "data": {"content": "one"}},
+                    {"seq": 2, "type": "assistant_message", "data": {"content": "two"}},
+                ]
+            )
+
+    guardrails = _DurableGuardrails()
+
+    copied = await fork_session_events(
+        providers=SimpleNamespace(guardrails=guardrails),
+        session_cache=cache,
+        source_cognis_session_id="source-session",
+        source_intaris_session_id="source-intaris",
+        target_session=SimpleNamespace(
+            session_id="target-session", intaris_session_id="target-intaris"
+        ),
+        source_label="reuse_recovery",
+        copy_prefix=False,
+        prefer_durable_source=True,
+    )
+
+    assert copied is True
+    assert guardrails.read_kwargs == [
+        {
+            "session_id": "source-intaris",
+            "after_seq": 0,
+            "allow_missing_stream": False,
+        }
+    ]
+    assert [event.data["content"] for event in guardrails.recorded_events] == ["one", "two"]
+
+
+@pytest.mark.asyncio
 async def test_fork_session_events_copies_source_events_in_intaris_sized_batches() -> None:
     cache = _SessionCache()
     cache.events = [

@@ -1,0 +1,46 @@
+# Opt-in Redis extension for the existing Redis-free HA qualification overlay.
+#
+# Combine after compose.ha-e2e.yml. The local Redis URL is intentionally
+# credential-free; this file is test-only and does not describe production
+# Redis security.
+services:
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  cognis-db-upgrade:
+    environment:
+      COGNIS_REDIS_URL: redis://redis:6379/0
+
+  cognis:
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      COGNIS_REDIS_URL: redis://redis:6379/0
+
+  cognis-2:
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      COGNIS_REDIS_URL: redis://redis:6379/0
+
+  seed-e2e:
+    environment:
+      COGNIS_REDIS_URL: redis://redis:6379/0

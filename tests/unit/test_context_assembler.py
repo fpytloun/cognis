@@ -30,7 +30,10 @@ from cognis.core.followups import (
     FollowUpStatus,
     TaskResultFollowUp,
 )
-from cognis.core.immutable_prefix import ImmutablePrefixEntry
+from cognis.core.immutable_prefix import (
+    ImmutablePrefixEntry,
+    build_prefix_message_events,
+)
 from cognis.core.message_markers import (
     AUDIT_METADATA,
     IMMUTABLE_PREFIX,
@@ -57,7 +60,12 @@ from cognis.models.agent import (
     AgentRuntimeProfile,
 )
 from cognis.models.config import ModelInfo
-from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    SessionEvent,
+    SessionModel,
+)
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolSource
 from cognis.models.workflow import StepDefinition, StepProfileMode
@@ -1609,6 +1617,127 @@ def test_events_to_messages_replays_only_marked_developer_context_injections() -
     )
 
 
+def test_events_to_messages_replays_managed_policy_as_developer_once() -> None:
+    policy = {
+        "type": "developer_message",
+        "data": {
+            "role": "developer",
+            "source": "managed_channel_policy",
+            "content": "Immutable managed-channel policy.",
+            "context_injection": True,
+            "replayable": True,
+            "replay_scope": "conversation",
+            "visibility": "agent_context",
+            "model_role": "developer",
+            "trust": "trusted",
+            "context_key": "managed_channel_policy:conversation-1",
+        },
+    }
+
+    messages = events_to_messages([policy])
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "developer"
+    assert messages[0]["content"] == "Immutable managed-channel policy."
+    assert messages[0]["_audit_metadata"]["replay_scope"] == "conversation"
+
+
+def test_rotated_prefix_preserves_managed_policy_replay_metadata() -> None:
+    events = build_prefix_message_events(
+        [
+            ImmutablePrefixEntry(
+                source="managed_channel_policy",
+                role="developer",
+                content="Immutable managed-channel policy.",
+            )
+        ]
+    )
+
+    assert len(events) == 1
+    assert events[0].data["context_injection"] is True
+    assert events[0].data["replay_scope"] == "conversation"
+    assert events[0].data["visibility"] == "agent_context"
+    assert events[0].data["model_role"] == "developer"
+    replayed = events_to_messages([events[0]])
+    assert len(replayed) == 1
+    assert replayed[0]["role"] == "developer"
+    assert replayed[0]["content"] == "Immutable managed-channel policy."
+
+
+@pytest.mark.asyncio
+async def test_managed_policy_is_visible_first_reload_and_rotated_prefix() -> None:
+    policy_event = SessionEvent(
+        type="developer_message",
+        data={
+            "role": "developer",
+            "source": "managed_channel_policy",
+            "content": "Immutable managed-channel policy.",
+            "context_injection": True,
+            "replayable": True,
+            "replay_scope": "conversation",
+            "visibility": "agent_context",
+            "model_role": "developer",
+            "trust": "trusted",
+            "context_key": "managed_channel_policy:conversation-1",
+        },
+    )
+
+    async def assemble(cache: _SessionCache) -> list[dict[str, object]]:
+        assembler = ContextAssembler(
+            memory=_Memory(),
+            guardrails=_Guardrails(),
+            llm=_LLM(),
+            session_cache=cache,
+            session_manager=_SessionManager(),
+            max_context_tokens=4096,
+            compaction_threshold=0.85,
+        )
+        return (
+            await assembler.assemble(
+                session=_session(),
+                conversation=_conversation(),
+                agent=_agent(),
+                user_message="Continue",
+                tool_definitions=[],
+            )
+        ).messages
+
+    first_cache = _SessionCache()
+    first_cache.history_events = [policy_event]
+    first = await assemble(first_cache)
+
+    reload_cache = _SessionCache(cold=True)
+    reload_cache.history_events = [policy_event]
+    reloaded = await assemble(reload_cache)
+
+    rotated_cache = _SessionCache()
+    rotated_cache.prefix_entries = [
+        ImmutablePrefixEntry(
+            source="managed_channel_policy",
+            role="developer",
+            content="Immutable managed-channel policy.",
+            seq=7,
+        )
+    ]
+    rotated_cache.history_events = [
+        {
+            "seq": 7,
+            "type": policy_event.type,
+            "data": dict(policy_event.data),
+        }
+    ]
+    rotated = await assemble(rotated_cache)
+
+    for messages in (first, reloaded, rotated):
+        policy_messages = [
+            message
+            for message in messages
+            if "Immutable managed-channel policy." in str(message.get("content", ""))
+        ]
+        assert len(policy_messages) == 1, messages
+        assert policy_messages[0]["role"] in {"developer", "system"}
+
+
 def test_events_to_messages_uses_agent_context_for_visible_system_notice() -> None:
     messages = events_to_messages(
         [
@@ -1713,7 +1842,10 @@ async def test_reasoning_only_profile_switch_preserves_immutable_prefix() -> Non
         for message in memoryless.messages
     )
     assert any(
-        message.get("content") == "Extracted attachment content." for message in memoryless.messages
+        message.get("role") == "user"
+        and "Extracted attachment content." in str(message.get("content"))
+        and str(message.get("content")).endswith("</message>")
+        for message in memoryless.messages
     )
     assert any(
         message.get("content") == "Attachment format required extraction."
@@ -1842,7 +1974,7 @@ async def test_context_assembler_skip_memory_degrades_on_warm_cache_event_failur
     )
 
     assert "events" in result.degraded_sources
-    assert result.messages[-1]["content"] == "warm failure"
+    assert result.messages[-1]["content"].endswith(">warm failure</message>")
 
 
 @pytest.mark.asyncio
@@ -2742,7 +2874,11 @@ async def test_context_assembler_injects_routing_reminder_before_attachment_noti
     contents = [str(message.get("content", "")) for message in result.messages]
     reminder_index = contents.index(reminder)
     attachment_index = contents.index("Attachment notice")
-    user_index = contents.index("Implement auth")
+    user_index = next(
+        index
+        for index, content in enumerate(contents)
+        if content.endswith(">Implement auth</message>")
+    )
 
     assert reminder_index < attachment_index < user_index
 
@@ -2806,6 +2942,104 @@ async def test_context_assembler_preserves_current_turn_native_attachments_when_
         if isinstance(part, dict) and part.get("type") == "text"
     ]
     assert any("artifact_id=att-1" in text for text in text_parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_memory", [False, True])
+async def test_recorded_attachment_context_replaces_replayed_text_without_duplicates(
+    skip_memory: bool,
+) -> None:
+    attachment = {
+        "artifact_id": "att-history",
+        "kind": "image",
+        "mime_type": "image/png",
+        "filename": "context.png",
+        "size_bytes": 12,
+        "url": "https://example.com/context.png",
+    }
+    metadata = {
+        "ts": "2026-08-01T10:15:00Z",
+        "channel": "matrix",
+        "sender": "Alice",
+        "untrusted": True,
+    }
+    contextual_messages = [
+        {
+            "content": "Thread root context",
+            "message_metadata": {
+                "ts": "2026-08-01T10:10:00Z",
+                "channel": "matrix",
+                "sender": "Bob",
+                "untrusted": True,
+            },
+        }
+    ]
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_VisionLLM(),
+        session_cache=_HistorySessionCache(
+            [
+                {
+                    "type": "user_message",
+                    "data": {
+                        "content": "Primary request",
+                        "message_metadata": metadata,
+                        "context_messages": contextual_messages,
+                        "attachments": [attachment],
+                    },
+                }
+            ]
+        ),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Primary request",
+        user_message_metadata=metadata,
+        contextual_messages=contextual_messages,
+        user_attachments=[attachment],
+        attachment_context="Extracted attachment context",
+        tool_definitions=[],
+        skip_memory=skip_memory,
+    )
+
+    user_messages = [message for message in result.messages if message.get("role") == "user"]
+    text_blocks = [
+        str(part.get("text") or "")
+        for message in user_messages
+        for part in (
+            message.get("content", [])
+            if isinstance(message.get("content"), list)
+            else [{"type": "text", "text": message.get("content", "")}]
+        )
+        if isinstance(part, dict) and part.get("type") == "text"
+    ]
+    model_text = "\n".join(text_blocks)
+    native_blocks = [
+        part
+        for message in user_messages
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    ]
+
+    assert model_text.count("Thread root context") == 1
+    assert model_text.count("Extracted attachment context") == 1
+    assert model_text.count("Primary request") == 1
+    assert model_text.count("artifact_id=att-history") == 1
+    assert model_text.count("<message ") == model_text.count("</message>") == 3
+    assert model_text.index("Thread root context") < model_text.index(
+        "Extracted attachment context"
+    )
+    assert model_text.index("Extracted attachment context") < model_text.index("Primary request")
+    assert model_text.rstrip().endswith("</message>")
+    assert len(native_blocks) == 1
 
 
 @pytest.mark.asyncio
@@ -3262,6 +3496,12 @@ async def test_policy_fingerprint_transition_replaces_stale_memory_prefix(
             content="STALE CORE MEMORY",
             seq=11,
         ),
+        ImmutablePrefixEntry(
+            role="developer",
+            source="managed_channel_policy",
+            content="PERSISTED MANAGED CHANNEL POLICY",
+            seq=12,
+        ),
     ]
     if cold:
         cache.prefix_entries_after_refresh = stale_entries
@@ -3308,6 +3548,7 @@ async def test_policy_fingerprint_transition_replaces_stale_memory_prefix(
     prompt = "\n".join(str(message.get("content") or "") for message in result.messages)
     assert "STALE FULL AUTO MEMORY INSTRUCTIONS" not in prompt
     assert "STALE CORE MEMORY" not in prompt
+    assert prompt.count("PERSISTED MANAGED CHANNEL POLICY") == 1
     if expected_instruction:
         assert expected_instruction in prompt
     else:
@@ -3315,3 +3556,91 @@ async def test_policy_fingerprint_transition_replaces_stale_memory_prefix(
     assert ("prefers Python" in prompt) is expects_core
     assert cache.entry is not None
     assert cache.entry.memory_policy_fingerprint == policy.policy_fingerprint
+    assert [
+        entry.source for entry in cache.prefix_entries if entry.source == "managed_channel_policy"
+    ] == ["managed_channel_policy"]
+
+
+@pytest.mark.asyncio
+async def test_persisted_message_metadata_prevents_timestamp_boundary_duplicate() -> None:
+    metadata = {"ts": "2026-08-01T10:15:00Z"}
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_HistorySessionCache(
+            [
+                {
+                    "type": "user_message",
+                    "ts": "2026-08-01T10:15:01Z",
+                    "data": {"content": "workflow prompt", "message_metadata": metadata},
+                }
+            ]
+        ),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="workflow prompt",
+        user_message_metadata=metadata,
+        tool_definitions=[],
+    )
+
+    matching = [
+        message
+        for message in result.messages
+        if message.get("role") == "user" and "workflow prompt" in str(message.get("content"))
+    ]
+    assert len(matching) == 1
+
+
+@pytest.mark.asyncio
+async def test_current_untrusted_attachment_text_is_inside_envelope() -> None:
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    metadata = {
+        "ts": "2026-08-01T10:15:00Z",
+        "channel": "signal",
+        "sender": "Alice",
+        "untrusted": True,
+    }
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="",
+        user_message_metadata=metadata,
+        attachment_context="Extracted attachment text",
+        user_attachments=[
+            {
+                "artifact_id": "att_1",
+                "kind": "file",
+                "mime_type": "application/pdf",
+                "filename": "report.pdf",
+                "size_bytes": 123,
+            }
+        ],
+        tool_definitions=[],
+    )
+
+    user_text = "\n".join(
+        str(message.get("content", ""))
+        for message in result.messages
+        if message.get("role") == "user"
+    )
+    assert 'untrusted="true"' in user_text
+    assert "Extracted attachment text" in user_text
+    assert user_text.rstrip().endswith("</message>")

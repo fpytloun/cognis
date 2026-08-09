@@ -1,0 +1,36 @@
+mode: ha
+replicaCount: 3
+database:
+  type: postgresql
+  existingSecret: cognis-database
+crypto:
+  requireExternal: true
+  existingSecret: cognis-crypto
+artifacts:
+  backend: s3
+  s3:
+    endpoint: https://s3.example.com
+    bucket: cognis-artifacts
+    existingSecret: cognis-object-storage
+toolOutputs:
+  backend: s3
+  s3:
+    endpoint: https://s3.example.com
+    bucket: cognis-tool-outputs
+    existingSecret: cognis-object-storage
+redis:
+  existingSecret: cognis-redis
+  secretKey: redis-url
+migration:
+  enabled: true
+persistence:
+  enabled: false
+podDisruptionBudget:
+  enabled: true
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: cognis

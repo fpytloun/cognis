@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="760" viewBox="0 0 1160 760" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .phone{fill:#0e1722;stroke:#2b3a48;stroke-width:2}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .add{fill:#4fd1a5}.del{fill:#f2657f}.mod{fill:#e2b25a}.ren{fill:#5cc2f2}
+      .sel{fill:#12314a;stroke:#38bdf8;stroke-width:1.5}
+      .diffadd{fill:#0f2a1e}.diffdel{fill:#2a1016}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="760"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">12 · Work file navigation — MOBILE: files list/drawer → full-width diff</text>
+  <text x="28" y="54" class="m" font-size="12">One column. The Work tab opens on the tree as a full-width list; tapping a file pushes the diff; a back affordance returns to the list.</text>
+
+  <!-- PHONE A: files list -->
+  <rect x="120" y="80" width="320" height="620" rx="26" class="phone"/>
+  <text x="140" y="112" class="lbl" font-size="12">A · Files list (tree, full width)</text>
+  <rect x="140" y="126" width="280" height="40" class="sub" rx="8"/><text x="156" y="151" class="lbl" font-size="12">Work · Changed files 23</text>
+  <rect x="140" y="174" width="280" height="32" rx="8" class="sub"/><text x="156" y="195" class="m" font-size="11">⌕ Filter files / status…</text>
+  <circle cx="436" cy="190" r="10" class="callout"/><text x="432" y="194" class="cnum" font-size="11">2</text>
+  <!-- rows -->
+  <text x="156" y="232" class="m" font-size="12">▾ 📁 cognis/api/chat_v2</text><text x="408" y="232" class="mod" font-size="10" text-anchor="end">± 2</text>
+  <rect x="140" y="242" width="280" height="30" rx="7" class="sub"/>
+  <rect x="176" y="250" width="4" height="14" class="mod"/><text x="190" y="262" class="t" font-size="12">projector.py</text><text x="408" y="262" class="mod" font-size="10" text-anchor="end">+18 −4</text>
+  <rect x="140" y="276" width="280" height="30" rx="7" class="sub"/>
+  <rect x="176" y="284" width="4" height="14" class="add"/><text x="190" y="296" class="t" font-size="12">store.py</text><text x="408" y="296" class="add" font-size="10" text-anchor="end">+40</text>
+  <text x="156" y="330" class="m" font-size="12">▾ 📁 ui/src/lib/work</text><text x="408" y="330" class="add" font-size="10" text-anchor="end">± 4</text>
+  <rect x="140" y="340" width="280" height="30" rx="7" class="sub"/>
+  <rect x="176" y="348" width="4" height="14" class="ren"/><text x="190" y="360" class="t" font-size="12">fileTree.ts</text><text x="408" y="360" class="ren" font-size="10" text-anchor="end">renamed</text>
+  <rect x="140" y="374" width="280" height="30" rx="7" class="sub"/>
+  <rect x="176" y="382" width="4" height="14" class="del"/><text x="190" y="394" class="m" font-size="12">legacyList.ts</text><text x="408" y="394" class="del" font-size="10" text-anchor="end">deleted</text>
+  <rect x="140" y="408" width="280" height="30" rx="7" class="sub"/>
+  <rect x="176" y="416" width="4" height="14" class="m"/><text x="190" y="428" class="m" font-size="12">logo.png</text><text x="408" y="428" class="m" font-size="10" text-anchor="end">binary</text>
+  <text x="156" y="464" class="m" font-size="12">▸ 📁 tests (collapsed)</text><text x="408" y="464" class="mod" font-size="10" text-anchor="end">± 11</text>
+  <text x="156" y="672" class="cap" font-size="10">Folders collapsible; 40+ files collapse by default; large diffs lazy.</text>
+  <circle cx="436" cy="257" r="10" class="callout"/><text x="432" y="261" class="cnum" font-size="11">1</text>
+
+  <!-- PHONE B: full-width diff -->
+  <rect x="700" y="80" width="320" height="620" rx="26" class="phone"/>
+  <text x="720" y="112" class="lbl" font-size="12">B · Diff (full width, after tap)</text>
+  <rect x="720" y="126" width="280" height="44" class="sub" rx="8"/>
+  <text x="736" y="153" class="ac" font-size="12">‹ Files</text>
+  <text x="990" y="153" class="mod" font-size="10" text-anchor="end">+18 −4</text>
+  <circle cx="742" cy="118" r="10" class="callout"/><text x="738" y="122" class="cnum" font-size="11">3</text>
+  <text x="736" y="188" class="lbl" font-size="11" font-family="monospace">projector.py</text>
+  <rect x="720" y="200" width="280" height="22" class="diffdel" rx="3"/><text x="732" y="216" class="del" font-size="10" font-family="monospace">- band = 9997</text>
+  <rect x="720" y="224" width="280" height="22" class="diffadd" rx="3"/><text x="732" y="240" class="add" font-size="10" font-family="monospace">+ band = SETTLE_BAND</text>
+  <rect x="720" y="248" width="280" height="22" class="sub" rx="3"/><text x="732" y="264" class="m" font-size="10" font-family="monospace">  return sort_key(...)</text>
+  <rect x="720" y="278" width="280" height="360" class="sub" rx="8"/><text x="736" y="304" class="m" font-size="11">…more hunks (lazy)…</text>
+  <text x="736" y="332" class="ac" font-size="11">Full output ↗</text>
+  <text x="736" y="672" class="cap" font-size="10">Swipe/back returns to the list; scroll position preserved.</text>
+  <circle cx="1006" cy="118" r="10" class="callout"/><text x="1002" y="122" class="cnum" font-size="11">4</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="716" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="736" class="note" font-size="12">1 Tap a file → push the diff (list→detail), the standard mobile master/detail. · 2 Filter/search pinned at top; status glyphs match desktop.</text>
+  <text x="28" y="754" class="note" font-size="12">3 "‹ Files" returns to the tree with scroll preserved. · 4 Same edge-case handling as desktop (rename/deleted/binary/truncated). Same WorkView data; no new model.</text>
+</svg>

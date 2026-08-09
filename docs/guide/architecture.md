@@ -26,6 +26,12 @@ This gives you a deployment shape that matches the work:
 - scale disposable executors for short-lived tasks
 - use persistent executor homes only when runtime state should survive
 
+The controller can run as one process or as an HA Deployment. HA does not split
+schedulers or workers into separate services: PostgreSQL-backed ownership
+coordinates identical replicas. One public Service/Ingress fronts them, while
+an internal headless Service supplies per-pod DNS for authenticated controller
+forwarding. See [High availability](high-availability.md).
+
 ## Controller versus executor
 
 ![Controller and executor split](../assets/images/cognis-controller-executor-split.svg)

@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+import io
+import zipfile
+
 import pytest
 
 from cognis.knowledgebase.chunking import KnowledgebaseChunkLimitExceeded, chunk_document
-from cognis.knowledgebase.extraction import ExtractedDocument, SourceSpan
-from cognis.knowledgebase.indexer import _resolve_chunking_settings
+from cognis.knowledgebase.extraction import (
+    ExtractedDocument,
+    KnowledgebaseExtractionLimitExceeded,
+    KnowledgebaseExtractionTimeout,
+    KnowledgebaseMetadataEnvelopeError,
+    SourceSpan,
+    extract_artifact_bytes,
+    extract_artifact_bytes_bounded,
+)
+from cognis.knowledgebase.indexer import _merge_extracted_metadata, _resolve_chunking_settings
 from cognis.knowledgebase.service import (
     KnowledgebaseRequestError,
     _apply_filters,
@@ -31,6 +42,330 @@ class _Hit:
     def __init__(self, point_id: str, payload: dict[str, object]) -> None:
         self.point_id = point_id
         self.payload = payload
+
+
+def test_all_advertised_extractor_families_are_supported() -> None:
+    from pypdf import PdfWriter
+
+    pdf = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.write(pdf)
+
+    cases = [
+        (b"plain", "source.txt", "text/plain", "text"),
+        (b'{"key":"value"}', "source.json", "application/json", "text"),
+        (
+            b"1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+            "source.srt",
+            "application/x-subrip",
+            "transcript",
+        ),
+        (pdf.getvalue(), "source.pdf", "application/octet-stream", "pdf"),
+    ]
+    for content, filename, mime_type, expected_method in cases:
+        extracted = extract_artifact_bytes(content, filename=filename, mime_type=mime_type)
+        assert extracted.extraction_method == expected_method
+
+
+def test_docx_extractor_when_optional_dependency_is_installed() -> None:
+    docx_module = pytest.importorskip("docx")
+    document = docx_module.Document()
+    document.add_paragraph("DOCX content")
+    content = io.BytesIO()
+    document.save(content)
+
+    extracted = extract_artifact_bytes(
+        content.getvalue(),
+        filename="source.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    assert extracted.extraction_method == "docx"
+
+
+def test_text_extraction_rejects_excessive_source_spans_before_splitting() -> None:
+    with pytest.raises(KnowledgebaseExtractionLimitExceeded):
+        extract_artifact_bytes(
+            b"\n" * 100_001,
+            filename="many-lines.txt",
+            mime_type="text/plain",
+        )
+
+
+def test_markdown_frontmatter_is_bounded_metadata_and_body_only() -> None:
+    extracted = extract_artifact_bytes(
+        b"---\ntitle: Guide\ntags: [one, two]\ncount: 2\n---\n# Body\nText",
+        filename="guide.md",
+        mime_type="text/markdown",
+    )
+    assert extracted.extraction_method == "markdown_frontmatter_v1"
+    assert extracted.metadata == {"title": "Guide", "tags": ["one", "two"], "count": 2}
+    assert "\n".join(span.text for span in extracted.spans) == "# Body\nText"
+    assert extracted.spans[0].locator["char_start"] == 0
+    assert extracted.spans[0].locator["line_start"] == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"---\n- not-a-mapping\n---\nBody",
+        b"---\na: &x value\nb: *x\n---\nBody",
+        b"---\n!!python/object:bad {}\n---\nBody",
+        b"---\ntitle: missing delimiter",
+    ],
+)
+def test_markdown_frontmatter_malformed_envelope_fails_closed(content: bytes) -> None:
+    with pytest.raises(KnowledgebaseMetadataEnvelopeError):
+        extract_artifact_bytes(content, filename="guide.md", mime_type="text/markdown")
+
+
+def test_arbitrary_metadata_heading_remains_body_text() -> None:
+    extracted = extract_artifact_bytes(
+        b"# Body\n\nMetadata:\ncategory: lesson",
+        filename="guide.md",
+        mime_type="text/markdown",
+    )
+    assert extracted.metadata == {}
+    assert "Metadata:" in "\n".join(span.text for span in extracted.spans)
+
+
+def test_frontmatter_metadata_merge_rejects_conflicts_reserved_keys_and_schema_mismatch() -> None:
+    schema = {
+        "fields": {
+            "title": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        }
+    }
+    assert _merge_extracted_metadata(
+        extracted={"title": "Guide", "tags": ["one"]},
+        attached={"title": "Guide", "category": "docs"},
+        metadata_schema=schema,
+    ) == {"title": "Guide", "tags": ["one"], "category": "docs"}
+    with pytest.raises(RuntimeError, match="conflicts"):
+        _merge_extracted_metadata(
+            extracted={"title": "Other"},
+            attached={"title": "Guide"},
+            metadata_schema=schema,
+        )
+    with pytest.raises(RuntimeError, match="reserved"):
+        _merge_extracted_metadata(
+            extracted={"owner_email": "attacker@example.com"},
+            attached={},
+            metadata_schema=schema,
+        )
+    with pytest.raises(RuntimeError, match="type mismatch"):
+        _merge_extracted_metadata(
+            extracted={"tags": "not-a-list"},
+            attached={},
+            metadata_schema=schema,
+        )
+
+
+def test_docx_extraction_rejects_extreme_compression_before_decompression() -> None:
+    content = io.BytesIO()
+    with zipfile.ZipFile(content, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"x" * (2 * 1024 * 1024))
+
+    with pytest.raises(KnowledgebaseExtractionLimitExceeded, match="compression ratio"):
+        extract_artifact_bytes(
+            content.getvalue(),
+            filename="bomb.docx",
+            mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+
+@pytest.mark.asyncio
+async def test_heavy_extraction_timeout_terminates_child_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Process:
+        alive = True
+        terminated = False
+        killed = False
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout: float) -> None:
+            del timeout
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.alive = False
+            self.killed = True
+
+    process = _Process()
+
+    class _Context:
+        def Process(self, **kwargs: object) -> _Process:
+            del kwargs
+            return process
+
+    monkeypatch.setattr(
+        "cognis.knowledgebase.extraction.multiprocessing.get_context",
+        lambda method: _Context(),
+    )
+    with pytest.raises(KnowledgebaseExtractionTimeout):
+        await extract_artifact_bytes_bounded(
+            b"%PDF",
+            filename="slow.pdf",
+            mime_type="application/pdf",
+            timeout_seconds=0,
+        )
+    assert process.terminated
+    assert process.killed
+
+
+@pytest.mark.asyncio
+async def test_heavy_extraction_start_failure_removes_result_file(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    from pathlib import Path
+
+    result_path = Path(str(tmp_path)) / "extract-result"
+
+    class _Process:
+        def start(self) -> None:
+            raise OSError("spawn failed")
+
+        def is_alive(self) -> bool:
+            return False
+
+    class _Context:
+        def Process(self, **kwargs: object) -> _Process:
+            del kwargs
+            return _Process()
+
+    def fake_mkstemp(*, prefix: str) -> tuple[int, str]:
+        del prefix
+        descriptor = os.open(result_path, os.O_CREAT | os.O_RDWR)
+        return descriptor, str(result_path)
+
+    monkeypatch.setattr(
+        "cognis.knowledgebase.extraction.multiprocessing.get_context",
+        lambda method: _Context(),
+    )
+    monkeypatch.setattr("cognis.knowledgebase.extraction.tempfile.mkstemp", fake_mkstemp)
+    with pytest.raises(OSError, match="spawn failed"):
+        await extract_artifact_bytes_bounded(
+            b"%PDF",
+            filename="failed.pdf",
+            mime_type="application/pdf",
+        )
+    assert not result_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_heavy_extraction_terminates_child_and_releases_slot(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    import os
+    from pathlib import Path
+
+    result_path = Path(str(tmp_path)) / "cancelled-result"
+    started = asyncio.Event()
+
+    class _LiveProcess:
+        alive = True
+        terminated = False
+
+        def start(self) -> None:
+            started.set()
+
+        def join(self, timeout: float) -> None:
+            del timeout
+            if self.alive:
+                import time
+
+                time.sleep(0.05)
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.alive = False
+            self.terminated = True
+
+    process = _LiveProcess()
+
+    class _Context:
+        def Process(self, **kwargs: object) -> _LiveProcess:
+            del kwargs
+            return process
+
+    def fake_mkstemp(*, prefix: str) -> tuple[int, str]:
+        del prefix
+        descriptor = os.open(result_path, os.O_CREAT | os.O_RDWR)
+        return descriptor, str(result_path)
+
+    monkeypatch.setattr(
+        "cognis.knowledgebase.extraction.multiprocessing.get_context",
+        lambda method: _Context(),
+    )
+    monkeypatch.setattr("cognis.knowledgebase.extraction.tempfile.mkstemp", fake_mkstemp)
+    task = asyncio.create_task(
+        extract_artifact_bytes_bounded(
+            b"%PDF",
+            filename="cancelled.pdf",
+            mime_type="application/pdf",
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert process.terminated
+    assert not result_path.exists()
+
+    class _StartFailureContext:
+        def Process(self, **kwargs: object) -> object:
+            del kwargs
+
+            class _StartFailure:
+                def start(self) -> None:
+                    raise OSError("second extraction reached process slot")
+
+                def is_alive(self) -> bool:
+                    return False
+
+            return _StartFailure()
+
+    monkeypatch.setattr(
+        "cognis.knowledgebase.extraction.multiprocessing.get_context",
+        lambda method: _StartFailureContext(),
+    )
+    with pytest.raises(OSError, match="second extraction reached process slot"):
+        await asyncio.wait_for(
+            extract_artifact_bytes_bounded(
+                b"%PDF",
+                filename="second.pdf",
+                mime_type="application/pdf",
+            ),
+            timeout=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_plain_text_extraction_does_not_spawn_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cognis.knowledgebase.extraction.multiprocessing.get_context",
+        lambda method: (_ for _ in ()).throw(AssertionError(method)),
+    )
+    extracted = await extract_artifact_bytes_bounded(
+        b"plain text",
+        filename="plain.txt",
+        mime_type="text/plain",
+    )
+    assert extracted.extraction_method == "text"
 
 
 def test_chunk_ids_are_stable_chunk_ids_not_qdrant_point_ids() -> None:
@@ -248,26 +583,26 @@ def test_metadata_filters_accept_json_schema_string_arrays() -> None:
     assert [chunk.chunk_id for chunk in filtered] == ["c1"]
 
 
-def test_production_metadata_fields_are_filterable_by_default() -> None:
+def test_generic_metadata_fields_are_filterable_by_default() -> None:
     schema = _metadata_schema_with_defaults({})
     filters = [
-        KnowledgebaseFilter(field="category", op="eq", value="mistnosti-domova"),
-        KnowledgebaseFilter(field="lesson_no", op="eq", value=62),
-        KnowledgebaseFilter(field="filename", op="eq", value="62-loznice.md"),
-        KnowledgebaseFilter(field="tags", op="overlap", value=["kuchyň"]),
+        KnowledgebaseFilter(field="category", op="eq", value="reference"),
+        KnowledgebaseFilter(field="filename", op="eq", value="guide.md"),
+        KnowledgebaseFilter(field="tags", op="overlap", value=["manual"]),
+        KnowledgebaseFilter(field="source_path", op="eq", value="docs/guide.md"),
     ]
 
     _validate_filters(filters, schema)
     assert _filterable_fields({})["category"] == "keyword"
-    assert _filterable_fields({})["lesson_no"] == "number"
     assert _filterable_fields({})["tags"] == "string[]"
+    assert _filterable_fields({})["source_path"] == "string"
     assert _vector_filters(owner_email="u", knowledgebase_id="kb", filters=filters) == {
         "owner_email": "u",
         "knowledgebase_id": "kb",
-        "category": "mistnosti-domova",
-        "lesson_no": 62,
-        "filename": "62-loznice.md",
-        "tags": ["kuchyň"],
+        "category": "reference",
+        "filename": "guide.md",
+        "tags": ["manual"],
+        "source_path": "docs/guide.md",
     }
     assert not _has_residual_filters(filters)
 
@@ -392,6 +727,17 @@ def test_vector_filters_are_scoped_to_resolved_owner_and_kb() -> None:
 
     assert filters["owner_email"] == "owner@example.com"
     assert filters["knowledgebase_id"] == "kb_1"
+
+
+def test_vector_filters_restrict_search_to_active_sql_chunk_ids() -> None:
+    filters = _vector_filters(
+        owner_email="owner@example.com",
+        knowledgebase_id="kb_1",
+        filters=[],
+        active_chunk_ids=["active-1", "active-2"],
+    )
+
+    assert filters["chunk_id"] == ["active-1", "active-2"]
 
 
 @pytest.mark.asyncio

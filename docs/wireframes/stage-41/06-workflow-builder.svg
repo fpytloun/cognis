@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="1010" viewBox="0 0 1160 1010" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .tool{fill:#123047}.agent{fill:#1a2f14}.cond{fill:#2b2412}.gate{fill:#241c0d}.done{fill:#0d2419}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="1010"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">06 · Workflow Builder — phase/step canvas + advanced inspector (progressive disclosure)</text>
+  <text x="28" y="54" class="m" font-size="12">Vertical phase→step list is the primary surface. Common fields inline; deterministic routing, tools, evaluator, policy in a right inspector. Reduces the 500+ line flat form to a scannable outline.</text>
+
+  <!-- registry -->
+  <rect x="28" y="70" width="220" height="700" class="panel" rx="10"/>
+  <text x="44" y="94" class="h" font-size="10">WORKFLOWS</text>
+  <rect x="44" y="106" width="188" height="30" class="acbg" rx="8"/><text x="58" y="126" class="ac" font-size="11">Release review</text>
+  <rect x="44" y="142" width="188" height="26" class="sub" rx="8"/><text x="58" y="160" class="m" font-size="11">system:general-task</text>
+  <rect x="44" y="174" width="188" height="26" class="sub" rx="8"/><text x="58" y="192" class="m" font-size="11">Software development</text>
+  <text x="44" y="226" class="cap" font-size="10">□ show ephemeral</text>
+  <rect x="44" y="700" width="188" height="30" class="sub" rx="8"/><text x="58" y="720" class="m" font-size="11">Import YAML</text>
+
+  <!-- canvas -->
+  <rect x="264" y="70" width="560" height="700" class="panel" rx="10"/>
+  <text x="280" y="94" class="lbl" font-size="14">Release review</text>
+  <rect x="660" y="78" width="70" height="26" rx="8" class="sub"/><text x="676" y="96" class="m" font-size="11">Export</text>
+  <rect x="738" y="78" width="70" height="26" rx="8" class="acbg"/><text x="752" y="96" class="ac" font-size="11" font-weight="700">Save</text>
+  <text x="280" y="118" class="cap" font-size="11">Phases organize contiguous steps for people. Execution stays step-based.</text>
+
+  <!-- Phase: Prepare -->
+  <rect x="280" y="132" width="528" height="86" class="sub" rx="8"/>
+  <text x="296" y="154" class="lbl" font-size="12">▾ Prepare</text><text x="360" y="154" class="cap" font-size="10">Frame the release decision · 1 step</text>
+  <rect x="296" y="164" width="496" height="42" class="agent" rx="7" stroke="#3a5a2c"/>
+  <text x="310" y="182" class="t" font-size="11">✷ scope</text><text x="380" y="182" class="cap" font-size="10">Agent run</text>
+  <text x="310" y="198" class="cap" font-size="9">Prompt: frame the go/no-go decision…</text>
+  <circle cx="812" cy="185" r="10" class="callout"/><text x="808" y="189" class="cnum" font-size="11">1</text>
+
+  <!-- Phase: Investigate -->
+  <rect x="280" y="228" width="528" height="164" class="sub" rx="8"/>
+  <text x="296" y="250" class="lbl" font-size="12">▾ Investigate</text><text x="382" y="250" class="cap" font-size="10">Fetch evidence and route · 3 steps</text>
+  <!-- tool step (selected) -->
+  <rect x="296" y="260" width="496" height="42" class="tool" rx="7" stroke="#38bdf8"/>
+  <text x="310" y="278" class="t" font-size="11" font-weight="600">◆ fetch</text><text x="380" y="278" class="cap" font-size="10">Tool call (deterministic)</text>
+  <text x="310" y="294" class="cap" font-size="9">builtin:web_fetch · Fail on error · redact: token,password</text>
+  <text x="770" y="286" class="ac" font-size="14">›</text>
+  <!-- condition -->
+  <rect x="296" y="308" width="496" height="38" class="cond" rx="7" stroke="#5a4a1e"/>
+  <text x="310" y="331" class="t" font-size="11">⋔ route</text><text x="380" y="331" class="cap" font-size="10">Condition · true→investigate, false→no_changes</text>
+  <!-- agent -->
+  <rect x="296" y="352" width="496" height="34" class="agent" rx="7" stroke="#3a5a2c"/>
+  <text x="310" y="374" class="t" font-size="11">✷ investigate</text><text x="400" y="374" class="cap" font-size="10">Agent run · reviewer profile</text>
+
+  <!-- Phase: Review -->
+  <rect x="280" y="402" width="528" height="120" class="sub" rx="8"/>
+  <text x="296" y="424" class="lbl" font-size="12">▾ Review</text><text x="356" y="424" class="cap" font-size="10">Human approval &amp; completion · 2 steps</text>
+  <rect x="296" y="434" width="496" height="36" class="gate" rx="7" stroke="#5a481e"/>
+  <text x="310" y="457" class="t" font-size="11">⛉ approve</text><text x="390" y="457" class="cap" font-size="10">Gate · "Approve this release for production?"</text>
+  <rect x="296" y="476" width="496" height="36" class="done" rx="7" stroke="#2f5a44"/>
+  <text x="310" y="499" class="t" font-size="11">◼ finish</text><text x="380" y="499" class="cap" font-size="10">Complete · silent · terminal=success</text>
+
+  <!-- add controls -->
+  <rect x="280" y="534" width="150" height="30" class="sub" rx="8"/><text x="296" y="554" class="m" font-size="11">+ Add step</text>
+  <rect x="440" y="534" width="150" height="30" class="sub" rx="8"/><text x="456" y="554" class="m" font-size="11">+ Add phase</text>
+  <circle cx="812" cy="452" r="10" class="callout"/><text x="808" y="456" class="cnum" font-size="11">2</text>
+
+  <!-- INSPECTOR -->
+  <rect x="840" y="70" width="292" height="700" class="panel" rx="10"/>
+  <text x="856" y="94" class="h" font-size="10">STEP INSPECTOR · fetch</text>
+  <text x="856" y="118" class="cap" font-size="11">Type</text>
+  <rect x="856" y="124" width="260" height="30" class="sub" rx="7"/><text x="870" y="144" class="t" font-size="11">Tool call (deterministic) ▾</text>
+  <text x="856" y="176" class="lbl" font-size="11">Common</text>
+  <text x="856" y="196" class="cap" font-size="10">Name · Phase · When (run condition)</text>
+  <!-- disclosure groups -->
+  <rect x="856" y="208" width="260" height="30" class="acbg" rx="7"/><text x="872" y="228" class="ac" font-size="11">▾ Tool &amp; arguments</text>
+  <text x="872" y="252" class="cap" font-size="10">Tool name: builtin:web_fetch</text>
+  <text x="872" y="270" class="cap" font-size="10">Arguments (JSON) · Output mapping</text>
+  <rect x="856" y="286" width="260" height="30" class="sub" rx="7"/><text x="872" y="306" class="m" font-size="11">▸ Deterministic routing &amp; recovery</text>
+  <rect x="856" y="324" width="260" height="30" class="sub" rx="7"/><text x="872" y="344" class="m" font-size="11">▸ Safety (fail/side-effects/redact)</text>
+  <rect x="856" y="362" width="260" height="30" class="sub" rx="7"/><text x="872" y="382" class="m" font-size="11">▸ Input &amp; source steps</text>
+  <rect x="856" y="400" width="260" height="30" class="sub" rx="7"/><text x="872" y="420" class="m" font-size="11">▸ Evaluator &amp; retries (run only)</text>
+  <rect x="856" y="438" width="260" height="30" class="sub" rx="7"/><text x="872" y="458" class="m" font-size="11">▸ Outcome routing</text>
+  <circle cx="1116" cy="223" r="10" class="callout"/><text x="1112" y="227" class="cnum" font-size="11">3</text>
+  <!-- validation -->
+  <rect x="856" y="486" width="260" height="60" class="sub" rx="8"/>
+  <text x="872" y="508" class="lbl" font-size="11">Validation</text>
+  <text x="872" y="528" class="cap" font-size="10">✓ tool exists · ✓ next-step targets resolve</text>
+  <circle cx="1116" cy="516" r="10" class="callout"/><text x="1112" y="520" class="cnum" font-size="11">4</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="810" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="834" class="note" font-size="11.5">1 Steps are color/icon-typed (✷ Agent · ◆ Tool · ⋔ Condition · ⛉ Gate · ◼ Complete) so a scan reveals the shape of the workflow — matches the runtime step vocabulary in the cockpit for a consistent mental model.</text>
+  <text x="28" y="856" class="note" font-size="11.5">2 The canvas shows only names + a one-line summary per step. This replaces the current fully-expanded 500+ line form where every step dumps all deterministic/tool/JSON fields inline (overwhelming, error-prone).</text>
+  <text x="28" y="878" class="note" font-size="11.5">3 Advanced configuration moves to a right inspector with collapsible groups (Spec 37 §Advanced inspector). Only the selected step's fields load; run-only groups (evaluator/retries) hide for deterministic types.</text>
+  <text x="28" y="900" class="note" font-size="11.5">4 Inline validation of tool names and routing targets before save (Spec 37 "validate targets and templates before save"); YAML import/export and system-override behavior preserved.</text>
+  <text x="28" y="926" class="note" font-size="11.5">Mobile: registry and canvas are mutually-exclusive screens (kept); the inspector opens as a full-screen Sheet. Unsaved-change protection retained.</text>
+  <text x="28" y="948" class="note" font-size="11.5">Non-goals honored: no free-position graph canvas, no parallel DAG authoring, no hidden auto-generated steps, no change to canonical step order.</text>
+</svg>

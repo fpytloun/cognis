@@ -482,6 +482,9 @@ async def test_retry_seeded_todos_sync_to_session_state_before_compaction(
                 user_email="user@test.com",
                 agent_id="agent-1",
             )
+            conversation = await session.get(Conversation, "conv_1")
+            assert conversation is not None
+            conversation.active_session_id = "sess_retry"
             await replace_session_todos(
                 session,
                 "sess_retry",
@@ -543,6 +546,58 @@ async def test_new_backing_session_loads_conversation_todos(tmp_path: object) ->
         assert ctx.todos == [{"content": "carry across user turn", "status": "in_progress"}]
         async with factory() as session:
             assert await list_session_todos(session, "sess_new") == ctx.todos
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_old_scope_todo_write_cannot_replace_current_conversation_todos(
+    tmp_path: object,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/stale-scope-todos.db")
+    await run_schema_bootstrap(engine)
+    factory = create_session_factory(engine)
+    try:
+        async with factory() as session:
+            await _seed_conversation(session)
+            await create_session(
+                session,
+                session_id="sess_old",
+                conversation_id="conv_1",
+                user_email="user@test.com",
+                agent_id="agent-1",
+                activity_scope_id="scope_old",
+            )
+            await create_session(
+                session,
+                session_id="sess_current",
+                conversation_id="conv_1",
+                user_email="user@test.com",
+                agent_id="agent-1",
+                previous_session_id="sess_old",
+                activity_scope_id="scope_current",
+            )
+            conversation = await session.get(Conversation, "conv_1")
+            assert conversation is not None
+            conversation.active_session_id = "sess_current"
+            await replace_conversation_todos(
+                session,
+                "conv_1",
+                [{"content": "current", "status": "in_progress"}],
+                source_session_id="sess_current",
+            )
+            await replace_conversation_todos(
+                session,
+                "conv_1",
+                [{"content": "stale", "status": "completed"}],
+                source_session_id="sess_old",
+            )
+            await session.commit()
+
+        async with factory() as session:
+            assert await list_conversation_todos(session, "conv_1") == [
+                {"content": "current", "status": "in_progress"}
+            ]
     finally:
         await engine.dispose()
 

@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="900" viewBox="0 0 1160 900" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}.acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .ok{fill:#4fd1a5}.amber{fill:#f5b544}.run{fill:#38bdf8}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}
+      .note{fill:#9fb0be}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="900"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">01 · Task Cockpit — RUNNING (desktop ≥ lg)</text>
+  <text x="28" y="54" class="m" font-size="12">State: multi-workstream task in progress, no action required. Primary column carries understanding; rail carries at-a-glance context.</text>
+
+  <!-- HEADER -->
+  <rect x="28" y="70" width="800" height="86" class="panel" rx="10"/>
+  <circle cx="58" cy="104" r="14" class="acbg"/><text x="53" y="109" class="ac" font-size="12">A</text>
+  <text x="82" y="98" class="h" font-size="10">TASK COCKPIT</text>
+  <text x="82" y="120" class="t" font-size="18" font-weight="700">Release safety review</text>
+  <text x="82" y="140" class="m" font-size="11">agent-stage39 · P8 · Release review · started 20h ago</text>
+  <rect x="690" y="84" width="60" height="24" rx="12" class="run" opacity="0.18"/><text x="700" y="100" class="run" font-size="11" font-weight="700">RUNNING</text>
+  <rect x="618" y="120" width="126" height="28" rx="8" class="acbg"/><text x="636" y="139" class="ac" font-size="11" font-weight="700">Pause task</text>
+  <rect x="752" y="120" width="34" height="28" rx="8" class="sub"/><text x="763" y="139" class="m" font-size="13">···</text>
+  <circle cx="806" cy="134" r="10" class="callout"/><text x="802" y="138" class="cnum" font-size="11">1</text>
+
+  <!-- OBJECTIVE -->
+  <rect x="28" y="166" width="800" height="70" class="panel" rx="10"/>
+  <text x="44" y="188" class="h" font-size="10">OBJECTIVE</text>
+  <text x="44" y="210" class="t" font-size="12">Verify the deterministic release workflow and approve the production handoff.</text>
+  <text x="44" y="228" class="m" font-size="11">Expected: an evidence-backed go/no-go decision with complete audit context.  ▸ Technical metadata</text>
+
+  <!-- ACTIVITY STRIP (calm live status, replaces buried attention when none) -->
+  <rect x="28" y="246" width="800" height="52" class="sub" rx="10"/>
+  <circle cx="52" cy="272" r="5" class="run"/><text x="66" y="270" class="t" font-size="12" font-weight="600">Investigate · Independent evidence review</text>
+  <text x="66" y="286" class="cap" font-size="11">agent-reviewer · running 4m 21s · 0/1 todos · last: reading release/manifest.yaml</text>
+  <rect x="712" y="258" width="100" height="28" rx="8" class="sub"/><text x="726" y="277" class="m" font-size="11">Watch live →</text>
+  <circle cx="806" cy="272" r="10" class="callout"/><text x="802" y="276" class="cnum" font-size="11">2</text>
+
+  <!-- WORKFLOW -->
+  <rect x="28" y="308" width="800" height="470" class="panel" rx="10"/>
+  <text x="44" y="332" class="h" font-size="10">WORKFLOW</text>
+  <!-- phase rail -->
+  <rect x="44" y="344" width="150" height="26" rx="13" class="acbg"/><text x="66" y="361" class="ac" font-size="10">Prepare · completed</text>
+  <rect x="202" y="344" width="170" height="26" rx="13" class="acbg"/><text x="224" y="361" class="ac" font-size="10">Investigate · active</text>
+  <rect x="380" y="344" width="130" height="26" rx="13" class="sub"/><text x="402" y="361" class="m" font-size="10">Conclude · pending</text>
+  <circle cx="806" cy="357" r="10" class="callout"/><text x="802" y="361" class="cnum" font-size="11">3</text>
+
+  <!-- phase: Investigate (active, expanded) -->
+  <rect x="44" y="384" width="768" height="222" class="sub" rx="8"/>
+  <text x="60" y="408" class="lbl" font-size="13">Investigate</text><text x="150" y="408" class="cap" font-size="11">Fetch evidence and route deterministically</text>
+  <rect x="726" y="392" width="72" height="22" rx="11" class="run" opacity="0.18"/><text x="738" y="407" class="run" font-size="10" font-weight="700">ACTIVE</text>
+  <!-- step card: tool (done) -->
+  <rect x="60" y="422" width="736" height="46" class="panel" rx="7"/>
+  <circle cx="80" cy="445" r="7" class="ok"/><text x="98" y="442" class="t" font-size="12">fetch</text>
+  <text x="98" y="458" class="cap" font-size="10">◆ Tool call · builtin:web_fetch · completed · 3.4s · 2 attempts</text>
+  <rect x="640" y="432" width="66" height="24" rx="7" class="sub"/><text x="654" y="448" class="m" font-size="10">Output</text>
+  <rect x="714" y="432" width="66" height="24" rx="7" class="sub"/><text x="730" y="448" class="m" font-size="10">Logs</text>
+  <!-- step card: condition (done) -->
+  <rect x="60" y="474" width="736" height="40" class="panel" rx="7"/>
+  <circle cx="80" cy="494" r="7" class="ok"/><text x="98" y="491" class="t" font-size="12">route</text>
+  <text x="98" y="505" class="cap" font-size="10">⋔ Condition · completed · 1.2s · branch=true</text>
+  <!-- step card: agent (running, selected) -->
+  <rect x="60" y="520" width="736" height="72" class="acbg" rx="7"/>
+  <circle cx="80" cy="548" r="7" class="run"/><text x="98" y="545" class="t" font-size="12" font-weight="600">investigate</text>
+  <text x="98" y="561" class="cap" font-size="10">✷ Agent run · running · 4m 21s · agent-reviewer (managed, running →)</text>
+  <text x="98" y="579" class="cap" font-size="10">Todos: ◐ Collect deterministic evidence · ○ Obtain human approval</text>
+  <rect x="632" y="532" width="72" height="26" rx="7" class="acbg"/><text x="646" y="549" class="ac" font-size="10">Inspect</text>
+  <rect x="712" y="532" width="72" height="26" rx="7" class="sub"/><text x="726" y="549" class="m" font-size="10">Open chat</text>
+  <circle cx="806" cy="556" r="10" class="callout"/><text x="802" y="560" class="cnum" font-size="11">4</text>
+
+  <!-- collapsed phases -->
+  <rect x="44" y="616" width="768" height="34" class="sub" rx="8"/>
+  <text x="60" y="637" class="m" font-size="12">▸ Prepare — 1 step · completed</text>
+  <rect x="44" y="658" width="768" height="34" class="sub" rx="8"/>
+  <text x="60" y="679" class="m" font-size="12">▸ Conclude — 2 steps · pending (Gate: Approve release, Complete: Finish)</text>
+
+  <!-- task context collapsed -->
+  <rect x="44" y="702" width="768" height="60" class="sub" rx="8"/>
+  <text x="60" y="724" class="lbl" font-size="12">▸ Task context</text>
+  <text x="60" y="744" class="cap" font-size="11">Collaboration notes · dependencies · configuration &amp; delivery · activity. Collapsed by default.</text>
+  <circle cx="806" cy="732" r="10" class="callout"/><text x="802" y="736" class="cnum" font-size="11">6</text>
+
+  <!-- RIGHT RAIL -->
+  <rect x="844" y="70" width="288" height="368" class="panel" rx="10"/>
+  <text x="860" y="94" class="h" font-size="10">AT A GLANCE</text>
+  <text x="860" y="118" class="cap" font-size="11">Source · manual</text>
+  <text x="860" y="138" class="cap" font-size="11">Created 20h ago · Duration 20h 28m</text>
+  <text x="860" y="170" class="h" font-size="10">RUN HEALTH</text>
+  <text x="860" y="192" class="t" font-size="11">Steps 3/4 · Retries 1</text>
+  <text x="860" y="210" class="t" font-size="11">Review loops 1 · Skipped 1</text>
+  <text x="860" y="228" class="cap" font-size="10">(each term has a hover definition)</text>
+  <text x="860" y="260" class="h" font-size="10">RESULT</text>
+  <text x="860" y="282" class="cap" font-size="11">No final result yet.</text>
+  <circle cx="1110" cy="182" r="10" class="callout"/><text x="1106" y="186" class="cnum" font-size="11">5</text>
+  <rect x="860" y="360" width="256" height="60" class="acbg" rx="8"/>
+  <text x="876" y="384" class="ac" font-size="12" font-weight="700">Task control chat</text>
+  <text x="876" y="404" class="cap" font-size="10">Opens docked drawer (Chat · Work)</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="806" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="826" class="note" font-size="11.5">1 One contextual primary action (Pause) + overflow menu. No 5-button row. 2 Calm live "activity strip" replaces the empty attention slot so RUNNING reads as progress, not absence.</text>
+  <text x="28" y="845" class="note" font-size="11.5">3 Backend-owned phase rail; only the active phase auto-expands. 4 Agent vs Tool vs Condition steps are visually distinct (✷ / ◆ / ⋔); managed child work links out to the Control drawer, not a separate iframe.</text>
+  <text x="28" y="864" class="note" font-size="11.5">5 "Statistics" → "Run health" in plain language with definitions. 6 Collaboration/comments demoted to collapsed Task context; the composer posts notes only and never duplicates decision controls.</text>
+  <text x="28" y="883" class="note" font-size="11.5">Reduces first-screen height ~40% vs current build and satisfies Spec 37: "active/waiting state and required user action visible above the fold."</text>
+</svg>

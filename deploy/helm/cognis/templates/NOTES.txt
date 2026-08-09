@@ -1,0 +1,10 @@
+{{- if .Values.ingress.enabled }}
+Cognis is exposed through the configured Ingress and the single public Service
+{{ include "cognis.fullname" . }}.
+{{- else }}
+Forward the single public Service locally:
+  kubectl port-forward service/{{ include "cognis.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+{{- end }}
+
+The headless {{ include "cognis.fullname" . }}-internal Service exists only for
+controller discovery. It is not a second external entrypoint.

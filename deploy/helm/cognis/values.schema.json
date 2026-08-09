@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "mode": {"type": "string", "enum": ["simple", "production", "ha"]},
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "database": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string", "enum": ["sqlite", "postgresql"]},
+        "existingSecret": {"type": "string"},
+        "secretKey": {"type": "string", "minLength": 1}
+      },
+      "required": ["type", "existingSecret", "secretKey"]
+    },
+    "crypto": {
+      "type": "object",
+      "properties": {
+        "requireExternal": {"type": "boolean"},
+        "existingSecret": {"type": "string"}
+      },
+      "required": ["requireExternal", "existingSecret"]
+    },
+    "artifacts": {
+      "type": "object",
+      "properties": {
+        "backend": {"type": "string", "enum": ["filesystem", "s3"]},
+        "s3": {
+          "type": "object",
+          "properties": {
+            "endpoint": {"type": "string"},
+            "bucket": {"type": "string"},
+            "existingSecret": {"type": "string"}
+          },
+          "required": ["endpoint", "bucket", "existingSecret"]
+        }
+      },
+      "required": ["backend", "s3"]
+    },
+    "toolOutputs": {
+      "type": "object",
+      "properties": {
+        "backend": {"type": "string", "enum": ["filesystem", "s3"]},
+        "s3": {
+          "type": "object",
+          "properties": {
+            "endpoint": {"type": "string"},
+            "bucket": {"type": "string"},
+            "existingSecret": {"type": "string"}
+          },
+          "required": ["endpoint", "bucket", "existingSecret"]
+        }
+      },
+      "required": ["backend", "s3"]
+    },
+    "migration": {
+      "type": "object",
+      "properties": {"enabled": {"type": "boolean"}},
+      "required": ["enabled"]
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {"enabled": {"type": "boolean"}},
+      "required": ["enabled"]
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {"enabled": {"type": "boolean"}},
+      "required": ["enabled"]
+    },
+    "topologySpreadConstraints": {
+      "type": "array"
+    }
+  },
+  "required": [
+    "mode",
+    "replicaCount",
+    "database",
+    "crypto",
+    "artifacts",
+    "toolOutputs",
+    "migration",
+    "persistence"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "migration": {
+            "properties": {"enabled": {"const": true}},
+            "required": ["enabled"]
+          }
+        },
+        "required": ["migration"]
+      },
+      "then": {
+        "properties": {
+          "database": {
+            "properties": {
+              "type": {"const": "postgresql"},
+              "existingSecret": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"replicaCount": {"minimum": 2}}},
+      "then": {
+        "properties": {
+          "mode": {"const": "ha"},
+          "persistence": {"properties": {"enabled": {"const": false}}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"mode": {"const": "ha"}}},
+      "then": {
+        "properties": {
+          "replicaCount": {"minimum": 2},
+          "database": {
+            "properties": {
+              "type": {"const": "postgresql"},
+              "existingSecret": {"type": "string", "minLength": 1}
+            }
+          },
+          "crypto": {
+            "properties": {
+              "requireExternal": {"const": true},
+              "existingSecret": {"type": "string", "minLength": 1}
+            }
+          },
+          "artifacts": {
+            "properties": {
+              "backend": {"const": "s3"},
+              "s3": {
+                "properties": {
+                  "endpoint": {"type": "string", "minLength": 1},
+                  "bucket": {"type": "string", "minLength": 1},
+                  "existingSecret": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          },
+          "toolOutputs": {
+            "properties": {
+              "backend": {"const": "s3"},
+              "s3": {
+                "properties": {
+                  "endpoint": {"type": "string", "minLength": 1},
+                  "bucket": {"type": "string", "minLength": 1},
+                  "existingSecret": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          },
+          "migration": {"properties": {"enabled": {"const": true}}},
+          "persistence": {"properties": {"enabled": {"const": false}}},
+          "podDisruptionBudget": {"properties": {"enabled": {"const": true}}},
+          "topologySpreadConstraints": {"minItems": 1}
+        }
+      }
+    }
+  ]
+}

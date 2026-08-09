@@ -186,3 +186,19 @@ This means:
 - Use skills for reusable operating instructions and tool bundles instead of copying them into each agent definition.
 - Import existing Claude Code skills from GitHub to bootstrap agent capabilities.
 - Use the tool registry to verify naming, categories, and source before troubleshooting agent permissions.
+
+## Image generation and editing
+
+Use `image_generate` to create a new image from a prompt. It optionally accepts
+an ordered `references` array of Cognis image or artifact IDs. Use the prompt to
+state how each reference should influence the result.
+
+Use `image_edit` to modify or combine existing images. Its required `images`
+array is ordered and passed to the selected model as supplied. An optional
+`mask_artifact_id` identifies the region for masked editing when the selected
+model supports masks.
+
+For both tools, publish executor-local images as Cognis artifacts first, then
+pass their IDs. Models have different limits and editing capabilities; an
+unsupported reference count or mask is returned as an error and is never
+silently converted into a text-only generation request.

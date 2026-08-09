@@ -222,9 +222,17 @@ async def test_autoconsent_bundle_includes_multilingual_heuristics() -> None:
     assert "rozumim a souhlasim" in payload
     assert "pouze nezbytne cookies" in payload
     assert "alle akzeptieren" in payload
+    assert "einverstanden" in payload
+    assert "cookie-erklarung" in payload
     assert "tout accepter" in payload
     assert "aceptar todo" in payload
     assert "acceptar" in payload
+    assert "Element.prototype.attachShadow" in payload
+    assert 'mode: "open"' in payload
+    assert "queryAllDeep" in payload
+    assert "queryOneDeep" in payload
+    assert "restoreAttachShadow" in payload
+    assert "attemptRoots" in payload
 
 
 @pytest.mark.asyncio

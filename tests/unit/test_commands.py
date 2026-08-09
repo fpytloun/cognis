@@ -148,6 +148,7 @@ class _SessionCache:
         self.tool_runtime_info = tool_runtime_info
         self.performance = performance
         self.reasoning_effort_override: str | None = None
+        self.fast_mode_override: bool | None = None
         self.model_override: str | None = None
         self.model_override_provider_id: str | None = None
 
@@ -180,6 +181,12 @@ class _SessionCache:
 
     def set_reasoning_effort_override(self, _: str, effort: str | None) -> None:
         self.reasoning_effort_override = effort
+
+    def get_fast_mode_override(self, _: str) -> bool | None:
+        return self.fast_mode_override
+
+    def set_fast_mode_override(self, _: str, enabled: bool | None) -> None:
+        self.fast_mode_override = enabled
 
 
 class _GuardrailsProvider:
@@ -256,7 +263,10 @@ class _LLMProvider:
 
     async def get_model_info(self, model_id: str) -> object:
         del model_id
-        return SimpleNamespace(reasoning_efforts=["low", "medium", "high"])
+        return SimpleNamespace(
+            reasoning_efforts=["low", "medium", "high"],
+            supports_fast_mode=True,
+        )
 
 
 class _RecordingGuardrailsProvider:
@@ -503,6 +513,7 @@ def test_system_slash_command_boundary_matrix() -> None:
         "/fork",
         "/model",
         "/thinking",
+        "/fast",
         "/profile",
         "/skill",
         "/executor",
@@ -1064,6 +1075,51 @@ async def test_manual_compact_resolves_same_session_model_from_default_route() -
     model_context = cast(Any, strategy.calls[0]["model_context"])
     assert model_context.model == "default-model"
     assert model_context.provider_id == "default-provider"
+
+
+@pytest.mark.asyncio
+async def test_manual_zero_turn_compaction_does_not_rotate() -> None:
+    strategy = _CompactionStrategy()
+    strategy.compact = AsyncMock(
+        return_value=SimpleNamespace(
+            compacted=True,
+            method="llm",
+            summary="No effective history",
+            turns_compacted=0,
+        )
+    )
+    rotate_session = AsyncMock()
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=SimpleNamespace(rotate_session=rotate_session),
+        session_cache=_SessionCache(),
+        compaction_strategy=strategy,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                resolve_model_target=AsyncMock(
+                    return_value=(
+                        "default-model",
+                        SimpleNamespace(provider_id="default-provider"),
+                    )
+                )
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/compact",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert result.text == "Not enough conversation history to compact."
+    rotate_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2911,6 +2967,66 @@ async def test_thinking_command_rejects_override_for_non_reasoning_model() -> No
         "Current model 'gpt-4o-mini' does not support thinking effort overrides."
     )
     assert cache.reasoning_effort_override is None
+
+
+@pytest.mark.asyncio
+async def test_fast_command_sets_session_override_only_when_supported() -> None:
+    cache = _SessionCache({"model": "gpt-5.4", "provider_id": "chatgpt"})
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(return_value=SimpleNamespace(supports_fast_mode=True))
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/fast on",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text == "Fast mode enabled.\nTakes effect on next message."
+    assert cache.fast_mode_override is True
+
+
+@pytest.mark.asyncio
+async def test_fast_command_rejects_unsupported_model() -> None:
+    cache = _SessionCache({"model": "gpt-4o-mini"})
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=None,
+        session_cache=cache,
+        compaction_strategy=None,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                get_model_info=AsyncMock(return_value=SimpleNamespace(supports_fast_mode=False))
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+    )
+
+    result = await dispatcher.dispatch(
+        "/fast on",
+        conversation=_conversation(),
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.text == "Current model 'gpt-4o-mini' does not support fast mode."
+    assert cache.fast_mode_override is None
 
 
 @pytest.mark.asyncio

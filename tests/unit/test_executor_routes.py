@@ -545,3 +545,61 @@ def test_persistent_token_generation_rejects_non_websocket_executors(
 
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "validation_error"
+
+
+def test_admin_mutations_revoke_current_executor_connection_ownership(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> dict[str, object]:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                for executor_id in ("status-exec", "token-exec", "delete-exec"):
+                    await create_executor(
+                        session,
+                        executor_id=executor_id,
+                        name=executor_id,
+                        executor_type="websocket",
+                        owner_email="user@example.com",
+                    )
+                await session.commit()
+            ownership = client.app.state.executor_connection_ownership
+            return {
+                executor_id: await ownership.takeover_validated(
+                    executor_id,
+                    token_version=0,
+                )
+                for executor_id in ("status-exec", "token-exec", "delete-exec")
+            }
+
+        owners = asyncio.run(_seed())
+        assert all(owner is not None for owner in owners.values())
+        headers = _auth_headers(client.app, email="user@example.com")
+
+        status_response = client.put(
+            "/api/v1/executors/status-exec",
+            headers=headers,
+            json={"status": "inactive"},
+        )
+        token_response = client.post("/api/v1/executors/token-exec/token", headers=headers)
+        delete_response = client.delete("/api/v1/executors/delete-exec", headers=headers)
+
+        assert status_response.status_code == 200
+        assert token_response.status_code == 200
+        assert delete_response.status_code == 204
+
+        async def _assert_fenced() -> None:
+            ownership = client.app.state.executor_connection_ownership
+            for owner in owners.values():
+                assert owner is not None
+                assert not await ownership.is_current(owner)
+
+        asyncio.run(_assert_fenced())

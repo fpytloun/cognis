@@ -80,7 +80,8 @@ def test_signal_like_markdown_projection_preserves_full_document_and_links() -> 
     assert "[primary source](https://source.example/report)" in rendered
     assert "| Metric | Value |" in rendered
     assert "curl /health" in rendered
-    assert "## Sources" in rendered
+    assert "## Sources" not in rendered
+    assert rendered.count("https://source.example/report") == 1
     assert rendered.endswith(f"[Open full version]({VIEW_URL})")
     assert "_Rich deliverable preview_" not in rendered
     assert '{"blocks"' not in rendered
@@ -471,8 +472,8 @@ def test_pulse_uses_the_same_canonical_markdown_renderer() -> None:
         unicode=False,
     )
     rendered = "\n".join(chunks)
-    assert "Signals" in rendered
-    assert "◈ Signals" in rendered
+    assert "Weather: 18 C" in rendered
+    assert "Signals" not in rendered
 
 
 @pytest.mark.parametrize(
@@ -756,8 +757,9 @@ def test_channel_media_manifest_does_not_render_attachment_status_text() -> None
         fallback_text="fallback",
     )
 
-    assert "Image: Station overview" in unmaterialized
-    assert "Image: Station overview" in materialized
+    assert "<!--cognis-rich-media:station:Station overview-->" in unmaterialized
+    assert "<!--cognis-rich-media:station:Station overview-->" in materialized
+    assert "Image: Station overview" not in materialized
     assert "Attached image" not in materialized
     assert "Artifact ref" not in materialized
 
@@ -815,7 +817,107 @@ def test_channel_cards_project_dek_icon_href_tone_and_source_ids_accessibly() ->
     assert "🛰️" in rendered
     assert "The concise standfirst." in rendered
     assert "[Read more](https://news.example/story)" in rendered
-    assert "Sources: [Primary report](https://news.example/story)" in rendered
+    assert rendered.count("https://news.example/story") == 1
+    assert "Sources:" not in rendered
+
+
+def test_generic_editorial_cards_deduplicate_links_sources_and_keep_media_anchors() -> None:
+    first_url = "https://news.example/first"
+    second_url = "https://news.example/second"
+    payload = {
+        "sources": [
+            {"id": "first", "title": "First source", "url": first_url},
+            {"id": "second", "title": "Second source", "url": second_url},
+        ],
+        "assets": [
+            {"id": "first-image", "artifact_id": "img_first", "mime_type": "image/jpeg"},
+            {"id": "second-image", "artifact_id": "img_second", "mime_type": "image/jpeg"},
+        ],
+        "blocks": [
+            {
+                "type": "card",
+                "title": "First article",
+                "content": f"First summary. [Read article]({first_url})",
+                "href": first_url,
+                "source_ids": ["first"],
+                "media": {"ref": "first-image", "alt": "First photo"},
+            },
+            {
+                "type": "card",
+                "title": "Second article",
+                "content": "Second summary.",
+                "href": second_url,
+                "source_ids": ["second"],
+                "media": {"ref": "second-image", "alt": "Second photo"},
+            },
+            {"type": "source_list"},
+        ],
+    }
+
+    rendered = render_rich_markdown(
+        payload,
+        title="Editorial report",
+        full_view_link=VIEW_LINK,
+        deliverable_id="dlv_editorial",
+        fallback_text="fallback",
+    )
+
+    assert rendered.count(first_url) == 1
+    assert rendered.count(second_url) == 1
+    assert "Sources:" not in rendered
+    assert "## Sources" not in rendered
+    first_marker = "<!--cognis-rich-media:first-image:First photo-->"
+    second_marker = "<!--cognis-rich-media:second-image:Second photo-->"
+    assert rendered.index("First summary.") < rendered.index(first_marker)
+    assert rendered.index(first_marker) < rendered.index("Second article")
+    assert rendered.index("Second summary.") < rendered.index(second_marker)
+
+
+def test_source_list_before_card_does_not_duplicate_the_card_primary_link() -> None:
+    url = "https://news.example/story"
+    rendered = render_rich_markdown(
+        {
+            "sources": [{"id": "story", "title": "Story source", "url": url}],
+            "blocks": [
+                {"type": "source_list"},
+                {
+                    "type": "card",
+                    "title": "Story",
+                    "content": "Summary.",
+                    "href": url,
+                    "source_ids": ["story"],
+                },
+            ],
+        },
+        title="Report",
+        full_view_link=VIEW_LINK,
+        deliverable_id="dlv_order",
+        fallback_text="fallback",
+    )
+
+    assert rendered.count(url) == 1
+    assert "[Read more]" in rendered
+    assert "## Sources" not in rendered
+
+
+def test_rich_media_marker_normalizes_multiline_alt_text() -> None:
+    rendered = render_rich_markdown(
+        {
+            "assets": [{"id": "image", "artifact_id": "img_1", "mime_type": "image/png"}],
+            "blocks": [
+                {
+                    "type": "figure",
+                    "media": {"ref": "image", "alt": "First line\nSecond line"},
+                }
+            ],
+        },
+        title="Report",
+        full_view_link=VIEW_LINK,
+        deliverable_id="dlv_alt",
+        fallback_text="fallback",
+    )
+
+    assert "<!--cognis-rich-media:image:First line Second line-->" in rendered
 
 
 def test_channel_chart_preserves_canonical_multi_series() -> None:

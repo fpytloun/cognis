@@ -81,6 +81,63 @@ def test_workflow_detail_supports_system_workflow(monkeypatch: object, tmp_path:
         assert body["owner_email"] is None
 
 
+def test_workflow_presentation_create_round_trip_and_explicit_removal(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        asyncio.run(_seed_user(client.app))
+        headers = _auth_headers(client.app, email="user@example.com")
+        payload = {
+            "name": "Phased",
+            "steps": [
+                {
+                    "name": "collect",
+                    "type": "run",
+                    "objective": "Collect the required evidence.",
+                    "responsibilities": ["Read the sources", "Record provenance"],
+                    "defer_to": ["finish"],
+                },
+                {"name": "finish", "type": "run"},
+            ],
+            "presentation": {
+                "phases": [
+                    {
+                        "id": "all",
+                        "title": "All",
+                        "step_names": ["collect", "finish"],
+                    }
+                ]
+            },
+        }
+
+        created = client.post("/api/v1/workflows", headers=headers, json=payload)
+
+        assert created.status_code == 200
+        workflow_id = created.json()["workflow_id"]
+        assert created.json()["presentation"]["phases"][0]["id"] == "all"
+        fetched = client.get(f"/api/v1/workflows/{workflow_id}", headers=headers)
+        assert fetched.status_code == 200
+        assert fetched.json()["presentation"]["phases"][0]["step_names"] == [
+            "collect",
+            "finish",
+        ]
+        assert fetched.json()["steps"][0]["objective"] == "Collect the required evidence."
+        assert fetched.json()["steps"][0]["responsibilities"] == [
+            "Read the sources",
+            "Record provenance",
+        ]
+        assert fetched.json()["steps"][0]["defer_to"] == ["finish"]
+
+        removed = client.put(
+            f"/api/v1/workflows/{workflow_id}",
+            headers=headers,
+            json={"presentation": None},
+        )
+
+        assert removed.status_code == 200
+        assert "presentation" not in removed.json()
+
+
 def test_workflow_duplicate_supports_system_workflow(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         asyncio.run(_seed_user(client.app))

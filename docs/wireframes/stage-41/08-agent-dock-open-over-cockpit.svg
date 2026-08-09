@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="820" viewBox="0 0 1160 820" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}.amber{fill:#f5b544}
+      .user{fill:#0e6ba8}.pribtn{fill:#38bdf8}.ok{fill:#4fd1a5}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#38bdf8}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="820"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">08 · Task Agent Dock — OPEN (docked) over the Cockpit, task-scoped, gate resolvable in place</text>
+  <text x="28" y="54" class="m" font-size="12">The docked-open state = the former "right drawer", now one state of the task-scoped dock. The Cockpit stays live behind it.</text>
+
+  <!-- cockpit behind (still interactive) -->
+  <rect x="28" y="72" width="700" height="720" class="panel" rx="10"/>
+  <text x="48" y="104" class="m" font-size="13">Task Cockpit — remains mounted, scrollable, and interactive (non-modal dock)</text>
+  <rect x="48" y="120" width="660" height="54" class="sub" rx="8"/><text x="64" y="152" class="m" font-size="12">Header · status · one primary action · overflow</text>
+  <rect x="48" y="186" width="660" height="120" class="att" rx="8"/><text x="64" y="212" class="amber" font-size="11" font-weight="700">ATTENTION HERO (same decision component as the dock card)</text>
+  <text x="64" y="234" class="cap" font-size="11">The gate lives here AND mirrors into the dock — one decision, two entry points, never two controls.</text>
+  <rect x="48" y="318" width="660" height="140" class="sub" rx="8"/><text x="64" y="346" class="m" font-size="12">Workflow phases · typed step cards</text>
+  <rect x="48" y="470" width="660" height="120" class="sub" rx="8"/><text x="64" y="498" class="m" font-size="12">Result / Work (inline)</text>
+
+  <!-- DOCK (right docked, accented, cockpit NOT dimmed) -->
+  <rect x="744" y="72" width="388" height="720" class="panel" rx="12" stroke="#38bdf8" stroke-width="2.5"/>
+  <!-- dock header with scope + window controls -->
+  <rect x="744" y="72" width="388" height="84" class="sub" rx="12"/>
+  <text x="762" y="98" class="lbl" font-size="13">Agent</text>
+  <!-- task-title header (scope = route, no menu) -->
+  <rect x="762" y="108" width="230" height="28" rx="14" class="acbg"/>
+  <text x="778" y="126" class="ac" font-size="10" font-weight="700">Release safety review · t_8821</text>
+  <circle cx="1016" cy="122" r="10" class="callout"/><text x="1012" y="126" class="cnum" font-size="11">2</text>
+  <!-- window controls: minimize / expand / close -->
+  <text x="1046" y="98" class="m" font-size="14">⌄</text><text x="1078" y="98" class="m" font-size="14">⤢</text><text x="1110" y="98" class="m" font-size="14">✕</text>
+  <text x="1038" y="150" class="cap" font-size="9">min</text><text x="1068" y="150" class="cap" font-size="9">expand</text><text x="1102" y="150" class="cap" font-size="9">close</text>
+  <circle cx="1078" cy="86" r="10" class="callout"/><text x="1074" y="90" class="cnum" font-size="11">5</text>
+
+  <!-- tabs -->
+  <rect x="762" y="166" width="80" height="28" rx="8" class="acbg"/><text x="784" y="185" class="ac" font-size="11" font-weight="700">Chat</text>
+  <rect x="850" y="166" width="80" height="28" rx="8" class="sub"/><text x="874" y="185" class="m" font-size="11">Work</text>
+  <circle cx="912" cy="180" r="10" class="callout"/><text x="908" y="184" class="cnum" font-size="11">1</text>
+
+  <!-- inline decision card -->
+  <rect x="762" y="206" width="352" height="158" class="att" rx="10"/>
+  <text x="778" y="228" class="amber" font-size="10" font-weight="700" letter-spacing="1.5">GATE · DECIDE HERE</text>
+  <text x="778" y="250" class="t" font-size="13" font-weight="700">Approve this release for production?</text>
+  <text x="778" y="270" class="ok" font-size="10">✓ 12 tests · 1 file changed · review loop 1/5</text>
+  <rect x="778" y="282" width="320" height="26" rx="7" class="sub"/><text x="792" y="299" class="m" font-size="10">Optional instruction…</text>
+  <rect x="778" y="318" width="160" height="32" rx="8" class="pribtn"/><text x="806" y="339" class="bg" font-size="11" font-weight="700">Approve &amp; continue</text>
+  <rect x="948" y="318" width="100" height="32" rx="8" class="panel" stroke="#f5b544"/><text x="960" y="339" class="amber" font-size="10">Reject / revise</text>
+  <circle cx="1112" cy="230" r="10" class="callout"/><text x="1108" y="234" class="cnum" font-size="11">3</text>
+
+  <!-- chat transcript -->
+  <rect x="892" y="384" width="222" height="40" rx="10" class="user"/><text x="908" y="408" class="t" font-size="11">What's left before release?</text>
+  <rect x="762" y="434" width="300" height="56" rx="10" class="sub"/>
+  <text x="778" y="456" class="t" font-size="11">Only your approval. Deterministic</text>
+  <text x="778" y="472" class="t" font-size="11">checks passed; see Work ↗ for the diff.</text>
+
+  <!-- composer -->
+  <rect x="762" y="736" width="352" height="40" rx="20" class="sub"/>
+  <text x="784" y="760" class="m" font-size="12">Message the agent…</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="626" class="h" font-size="11">ANNOTATIONS</text>
+  <text x="28" y="648" class="note" font-size="12">1 One dock, two tabs (Chat · Work). The Work tab hosts the SAME WorkView + file tree (WF 11). No duplicate "Full chat / Work" links.</text>
+  <text x="28" y="670" class="note" font-size="12">2 The header shows the current TASK TITLE. Scope = the /tasks/[taskId] route: no scope-switch, no detach menu, no cross-task chooser.</text>
+  <text x="28" y="692" class="note" font-size="12">3 The pause is resolvable INSIDE the dock (fixes F3). Same decision component as the Cockpit Attention hero — one source of truth.</text>
+  <text x="28" y="714" class="note" font-size="12">4 NON-MODAL: the Cockpit behind is NOT dimmed and stays interactive; app nav stays visible. Suppressed only under a blocking modal.</text>
+  <text x="28" y="736" class="note" font-size="12">5 Window controls: ⌄ minimize → FAB (WF 07) · ⤢ expand → full-screen Chat v2 (WF 09, reuses ?window=1&amp;taskControl=1) · ✕ close.</text>
+  <text x="28" y="762" class="note" font-size="12">Task-detail only: leaving /tasks/[taskId] unmounts this dock; the persistent conversation reopens on return; task A→B rebinds to B.</text>
+</svg>

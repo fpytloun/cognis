@@ -342,3 +342,11 @@ def test_request_credential_schema_rejects_invalid_kind() -> None:
     assert isinstance(error, ToolArgumentError)
     assert error.reason == "schema_violation"
     assert any("kind" in line and "username_password" in line for line in error.errors)
+
+
+def test_request_credential_schema_explains_approval_continuation() -> None:
+    description = REQUEST_CREDENTIAL_TOOL.description
+
+    assert "suspends the current turn" in description
+    assert "granted to the current agent before this call returns" in description
+    assert "do not ask the user for the same credential again" in description

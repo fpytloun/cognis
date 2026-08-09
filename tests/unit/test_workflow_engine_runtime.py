@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 
 import cognis.core.workflow_engine as workflow_engine_module
-from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
+from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause, StepContext
 from cognis.core.runtime import TransientExecutorUnavailable
+from cognis.core.session_cache import CachedEvent
 from cognis.core.workflow_engine import (
     TRANSIENT_EXECUTOR_MAX_DEFERRALS,
     WorkflowEngine,
@@ -27,6 +29,7 @@ from cognis.models.workflow import (
     OutcomeRoute,
     StepDefinition,
     StepEvaluation,
+    StepInputConfig,
     StepOutcome,
     StepOutput,
     Workflow,
@@ -138,6 +141,68 @@ async def test_create_step_session_passes_task_project_id(
         "workspace_root": None,
         "working_directory": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_task_control_direct_turn_admits_and_executes_with_injected_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = SimpleNamespace(
+        task_id="task-1",
+        created_by="user@example.com",
+        control_conversation_id="conv-control",
+        session_policy={"executor_id": "executor-1"},
+    )
+    runtime = SimpleNamespace(
+        tool_registry=SimpleNamespace(),
+        executor_connection=SimpleNamespace(),
+        executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user"),
+        executor_pool=None,
+        active_executor_id="executor-1",
+        runtime_info={},
+        cleanup=AsyncMock(),
+    )
+    step_output = StepOutput(summary="Task control response", content="Task control response")
+    run_step = AsyncMock(return_value=step_output)
+    resolve_runtime = AsyncMock(return_value=runtime)
+    engine._agent_loop = SimpleNamespace(run_step=run_step)
+    monkeypatch.setattr("cognis.store.queries.get_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(engine, "_resolve_step_runtime", resolve_runtime)
+
+    result = await engine.run_direct_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-control",
+            context=ConversationContext(
+                type="web",
+                ref="web:task_control:task-1",
+                platform_data={"kind": "task_control", "task_id": "task-1"},
+            ),
+        ),
+        session=SimpleNamespace(
+            session_id="session-control",
+            user_email="user@example.com",
+            parent_session_id=None,
+            delegation_mode=None,
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+        ),
+        user_message="Report task status.",
+    )
+
+    assert result is step_output
+    access_context = resolve_runtime.await_args.kwargs["access_context"]
+    assert access_context.task_id == "task-1"
+    assert access_context.control_surface == "task_control"
+    assert access_context.session_policy == {"executor_id": "executor-1"}
+    run_step.assert_awaited_once()
+    step_context = run_step.await_args.args[0]
+    assert step_context.controller_tool_surface == "task_control"
+    assert current_runtime_access_context.get() is None
+    runtime.cleanup.assert_awaited_once()
 
 
 def test_resolve_task_execution_paths_defaults_unassigned_task_to_executor_home() -> None:
@@ -481,6 +546,58 @@ async def test_build_result_data_uses_final_deliverable(
     assert result is not None
     assert result["final_deliverable_id"] == "dlv-final"
     assert result["final_content"] == "# Final result"
+
+
+@pytest.mark.asyncio
+async def test_final_deliverable_does_not_fall_back_to_plan_when_final_step_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        status="completed",
+    )
+    workflow = Workflow(
+        workflow_id="wf:test",
+        name="Deliverable Workflow",
+        steps=[
+            StepDefinition(name="plan", type="run", require_deliverable=True),
+            StepDefinition(name="final_summary", type="run", require_deliverable=True),
+        ],
+    )
+    state = WorkflowState(
+        step_outputs={
+            "plan": {"summary": "planned", "deliverable_id": "dlv-plan"},
+            "final_summary": {"summary": "async work spawned"},
+        }
+    )
+
+    async def _no_step_run(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _no_step_run,
+    )
+
+    assert await engine._resolve_final_deliverable(task, state, workflow) is None
+
+
+def test_required_deliverable_backstop_rejects_alternate_step_exit() -> None:
+    step = StepDefinition(name="research", type="run", require_deliverable=True)
+
+    assert WorkflowEngine._missing_required_deliverable(
+        step,
+        StepOutput(summary="Async orchestration spawned"),
+    )
+    assert not WorkflowEngine._missing_required_deliverable(
+        step,
+        StepOutput(summary="Complete", deliverable_id="dlv-final"),
+    )
 
 
 @pytest.mark.asyncio
@@ -904,9 +1021,11 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
     engine = _build_engine()
     resumed_session = SimpleNamespace(session_id="sess-2", intaris_session_id="sess-2")
     fork_calls: list[tuple[str | None, str | None, str]] = []
+    query_kwargs: dict[str, object] = {}
 
     async def _latest_step_run(*args: object, **kwargs: object) -> SimpleNamespace:
-        del args, kwargs
+        del args
+        query_kwargs.update(kwargs)
         return SimpleNamespace(
             step_run_id="run-1",
             session_id="sess-1",
@@ -968,7 +1087,11 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
 
     conversation, session, seeded = await engine._reuse_or_create_step_session(
         TaskModel(
-            task_id="task-1", title="Task", created_by="user@example.com", agent_id="agent-1"
+            task_id="task-1",
+            title="Task",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            attempt_number=3,
         ),
         StepDefinition(name="plan", type="run", prompt="Plan"),
         AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
@@ -978,6 +1101,11 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
     assert session is resumed_session
     assert seeded is True
     assert fork_calls == [("sess-1", "sess-1", "plan:resume")]
+    assert query_kwargs == {
+        "attempt_number": 3,
+        "current_revision_only": True,
+        "eligible_statuses": {"approved", "rejected", "failed", "running", "paused"},
+    }
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1179,406 @@ async def test_reuse_or_create_step_session_reports_unseeded_resume_when_fork_fa
     )
 
     assert seeded is False
+
+
+@pytest.mark.asyncio
+async def test_reuse_fallback_preserves_profile_and_session_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    captured: dict[str, object] = {}
+
+    async def _no_prior_run(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def _create_step_session(
+        *args: object, **kwargs: object
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        del args
+        captured.update(kwargs)
+        return SimpleNamespace(conversation_id="conv-new"), SimpleNamespace(session_id="sess-new")
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_step_run_for_task_step",
+        _no_prior_run,
+    )
+    monkeypatch.setattr(engine, "_create_step_session", _create_step_session)
+    policy = {"allow_policies": ["read only"]}
+
+    conversation, session, seeded = await engine._reuse_or_create_step_session(
+        TaskModel(
+            task_id="task-1",
+            title="Task",
+            created_by="user@example.com",
+            agent_id="agent-1",
+        ),
+        StepDefinition(name="research", type="run", prompt="Research"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        agent_profile_id="developer-senior",
+        session_policy=policy,
+    )
+
+    assert (conversation.conversation_id, session.session_id, seeded) == (
+        "conv-new",
+        "sess-new",
+        False,
+    )
+    assert captured == {
+        "agent_profile_id": "developer-senior",
+        "session_policy": policy,
+    }
+
+
+@pytest.mark.asyncio
+async def test_reuse_source_step_session_reattaches_current_approved_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    source_run = SimpleNamespace(
+        step_run_id="sr-plan",
+        session_id="sess-plan",
+        intaris_session_id="intaris-plan",
+        conversation_id="conv-plan",
+        agent_id="agent-1",
+        agent_profile_id="developer",
+    )
+
+    async def _approved(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return source_run
+
+    async def _get_session_row(_session: object, session_id: str) -> SimpleNamespace:
+        assert session_id == "sess-plan"
+        return SimpleNamespace(
+            session_id="sess-plan",
+            conversation_id="conv-plan",
+            parent_session_id=None,
+            previous_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            agent_profile_id="developer",
+            delegation_mode="primary",
+            delegation_task=None,
+            delegation_metadata={},
+            status="idle",
+            completion_reason=None,
+            intaris_session_id="intaris-plan",
+            mnemory_session_id=None,
+            started_at=None,
+            idle_since=None,
+            completed_at=None,
+            result_summary=None,
+            result_content=None,
+            updated_at=None,
+        )
+
+    async def _get_conversation(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            conversation_id="conv-plan",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            agent_profile_id="developer",
+            title="Task / plan",
+            title_source="manual",
+            context_type="task",
+            context_ref="task-1",
+            context_data={},
+            memory_labels={},
+            active_session_id="sess-plan",
+            status="active",
+            last_message_at=None,
+            created_at=None,
+            updated_at=None,
+        )
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_approved_step_run_for_task_step",
+        _approved,
+    )
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
+    monkeypatch.setattr("cognis.store.queries.get_conversation", _get_conversation)
+
+    conversation, session, selected_run, recovery = await engine._reuse_source_step_session(
+        TaskModel(
+            task_id="task-1",
+            title="Task",
+            created_by="user@example.com",
+            agent_id="agent-1",
+        ),
+        StepDefinition(name="implement", type="run"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        source_name="plan",
+        agent_profile_id="developer",
+        session_policy={},
+    )
+
+    assert conversation.conversation_id == "conv-plan"
+    assert session.session_id == "sess-plan"
+    assert selected_run is source_run
+    assert recovery["reason"] == "reattached"
+
+
+@pytest.mark.asyncio
+async def test_reuse_source_step_session_rejects_profile_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+
+    async def _approved(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(
+            step_run_id="sr-plan",
+            agent_id="agent-1",
+            agent_profile_id="architect",
+        )
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_approved_step_run_for_task_step",
+        _approved,
+    )
+
+    with pytest.raises(RuntimeError, match="runtime profile differs"):
+        await engine._reuse_source_step_session(
+            TaskModel(
+                task_id="task-1",
+                title="Task",
+                created_by="user@example.com",
+                agent_id="agent-1",
+            ),
+            StepDefinition(name="implement", type="run"),
+            AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+            source_name="plan",
+            agent_profile_id="developer",
+            session_policy={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_reuse_source_step_session_rejects_missing_current_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+
+    async def _approved(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_approved_step_run_for_task_step",
+        _approved,
+    )
+
+    with pytest.raises(RuntimeError, match="No current approved StepRun"):
+        await engine._reuse_source_step_session(
+            TaskModel(
+                task_id="task-1",
+                title="Task",
+                created_by="user@example.com",
+                agent_id="agent-1",
+            ),
+            StepDefinition(name="implement", type="run"),
+            AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+            source_name="plan",
+            agent_profile_id="developer",
+            session_policy={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_reuse_source_step_session_follows_compacted_active_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _build_engine()
+    source_run = SimpleNamespace(
+        step_run_id="sr-plan",
+        session_id="sess-old",
+        intaris_session_id="intaris-old",
+        conversation_id="conv-plan",
+        agent_id="agent-1",
+        agent_profile_id="developer",
+    )
+    old_session = SimpleNamespace(
+        session_id="sess-old",
+        conversation_id="conv-plan",
+        status="completed",
+        intaris_session_id="intaris-old",
+    )
+    compacted_session = SimpleNamespace(
+        session_id="sess-compacted",
+        conversation_id="conv-plan",
+        status="active",
+        intaris_session_id="intaris-compacted",
+    )
+    conversation = SimpleNamespace(
+        conversation_id="conv-plan",
+        active_session_id="sess-compacted",
+    )
+
+    async def _approved(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return source_run
+
+    async def _get_session_row(_session: object, session_id: str) -> SimpleNamespace:
+        return compacted_session if session_id == "sess-compacted" else old_session
+
+    async def _get_conversation(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return conversation
+
+    monkeypatch.setattr(
+        "cognis.core.workflow_engine.get_latest_approved_step_run_for_task_step",
+        _approved,
+    )
+    monkeypatch.setattr("cognis.store.queries.get_session_row", _get_session_row)
+    monkeypatch.setattr("cognis.store.queries.get_conversation", _get_conversation)
+    monkeypatch.setattr("cognis.core.session._to_conversation_model", lambda row: row)
+    monkeypatch.setattr("cognis.core.session._to_session_model", lambda row: row)
+
+    _, session, _, recovery = await engine._reuse_source_step_session(
+        TaskModel(
+            task_id="task-1",
+            title="Task",
+            created_by="user@example.com",
+            agent_id="agent-1",
+        ),
+        StepDefinition(name="implement", type="run"),
+        AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        source_name="plan",
+        agent_profile_id="developer",
+        session_policy={},
+    )
+
+    assert session is compacted_session
+    assert recovery == {
+        "reason": "conversation_active_session",
+        "source_session_id": "sess-old",
+        "selected_session_id": "sess-compacted",
+    }
+
+
+def test_session_lifecycle_keeps_only_reachable_continuations_idle() -> None:
+    workflow = Workflow(
+        workflow_id="wf:reuse",
+        name="Reuse",
+        steps=[
+            StepDefinition(name="plan", type="run"),
+            StepDefinition(
+                name="implement",
+                type="run",
+                input=StepInputConfig(
+                    type="last",
+                    source="plan",
+                    reuse_session_from="plan",
+                ),
+            ),
+            StepDefinition(name="review", type="run"),
+        ],
+    )
+    state = WorkflowState(
+        step_outputs={
+            "plan": StepOutput(
+                summary="plan",
+                content="plan",
+                session_id="sess-shared",
+            ).model_dump(mode="json")
+        }
+    )
+
+    assert WorkflowEngine._session_needed_by_future_reuse(
+        workflow,
+        state,
+        current_step_index=0,
+        current_step_name="plan",
+        session_id="sess-shared",
+    )
+    assert not WorkflowEngine._session_needed_by_future_reuse(
+        workflow,
+        state,
+        current_step_index=1,
+        current_step_name="implement",
+        session_id="sess-shared",
+    )
+    assert not WorkflowEngine._session_needed_by_reuse_from_index(
+        workflow,
+        state,
+        start_step_index=2,
+        session_id="sess-shared",
+    )
+
+
+def test_reuse_recovery_strips_provider_private_reasoning_state() -> None:
+    event = CachedEvent(
+        seq=7,
+        type="tool_call",
+        data={
+            "name": "apply_patch",
+            "responses_output_items": [{"type": "reasoning", "id": "rs_1"}],
+            "anthropic_native_envelope": {"content": [{"type": "thinking"}]},
+            "reasoning_content": "private",
+        },
+        source="cognis",
+        ts=None,
+    )
+
+    sanitized = WorkflowEngine._sanitize_reuse_recovery_event(event)
+
+    assert sanitized is not None
+    assert sanitized.data == {"name": "apply_patch"}
+    assert (
+        WorkflowEngine._sanitize_reuse_recovery_event(
+            CachedEvent(
+                seq=8,
+                type="assistant_thinking",
+                data={"content": "private"},
+                source="cognis",
+                ts=None,
+            )
+        )
+        is None
+    )
+
+
+def test_reuse_restart_detects_durable_prompt_boundary() -> None:
+    engine = _build_engine()
+    engine._session_cache = SimpleNamespace(
+        get_entry=lambda _session_id: SimpleNamespace(
+            events=[
+                CachedEvent(
+                    seq=12,
+                    type="user_message",
+                    data={"turn_id": "sr-implement", "content": "continued input"},
+                    source="cognis",
+                    ts=None,
+                )
+            ]
+        )
+    )
+
+    assert engine._step_prompt_boundary_recorded("sess-plan", "sr-implement")
+    assert not engine._step_prompt_boundary_recorded("sess-plan", "sr-other")
+
+
+@pytest.mark.asyncio
+async def test_reuse_boundary_requires_authoritative_durable_stream() -> None:
+    engine = _build_engine()
+    session = SimpleNamespace(session_id="sess-plan", intaris_session_id="intaris-plan")
+    engine._session_cache = SimpleNamespace(
+        refresh=lambda _session: asyncio.sleep(
+            0,
+            result=SimpleNamespace(last_event_seq=4),
+        )
+    )
+
+    async def _read_events(**kwargs: object) -> object:
+        del kwargs
+        raise RuntimeError("missing durable stream")
+
+    engine._providers.guardrails = SimpleNamespace(read_events=_read_events)
+
+    with pytest.raises(RuntimeError, match="missing durable stream"):
+        await engine._refresh_reused_session_authoritatively(session, "implement")
 
 
 @pytest.mark.asyncio
@@ -1394,7 +1922,12 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
         workspace_root="/workspace",
         working_directory="/workspace",
     )
-    step_def = StepDefinition(name="execute", type="run", prompt="Do work")
+    step_def = StepDefinition(
+        name="execute",
+        type="run",
+        prompt="Do work",
+        require_deliverable=False,
+    )
     workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
     conversation = SimpleNamespace(conversation_id="conv-1")
     session = SimpleNamespace(
@@ -1490,7 +2023,12 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         agent_id="agent-1",
         workflow_state=WorkflowState(),
     )
-    step_def = StepDefinition(name="execute", type="run", prompt="Do work")
+    step_def = StepDefinition(
+        name="execute",
+        type="run",
+        prompt="Do work",
+        require_deliverable=False,
+    )
     workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
     conversation = SimpleNamespace(conversation_id="conv-1")
     session = SimpleNamespace(
@@ -1501,6 +2039,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         delegation_mode="primary",
     )
     refreshed: list[tuple[str | None, str | None]] = []
+    observed: dict[str, object] = {}
 
     async def _resolve_step_agents(
         *args: object, **kwargs: object
@@ -1543,8 +2082,11 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         del args, kwargs
         return True
 
-    async def _run_step(*args: object, **kwargs: object) -> StepOutput:
-        del args, kwargs
+    async def _run_step(ctx: StepContext, **kwargs: object) -> StepOutput:
+        del kwargs
+        observed["orchestration_mode"] = ctx.orchestration_mode.value
+        observed["has_boundary_consumer"] = ctx.consume_boundary_batch is not None
+        observed["has_cooperative_wait_input"] = ctx.wait_for_boundary_input is not None
         return StepOutput(summary="done", content="done")
 
     async def _refresh(_session: object) -> None:
@@ -1569,6 +2111,11 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
 
     assert output is not None
     assert refreshed == [("/home/user/src/cognis", "/home/user/src/cognis")]
+    assert observed == {
+        "orchestration_mode": "task_primary",
+        "has_boundary_consumer": True,
+        "has_cooperative_wait_input": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -1588,6 +2135,7 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         type="run",
         prompt="Do work",
         agent_override="system:implement",
+        require_deliverable=False,
     )
     workflow = Workflow(workflow_id="wf:test", name="Test", steps=[step_def])
     conversation = SimpleNamespace(conversation_id="conv-1")
@@ -1649,7 +2197,7 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         del args, kwargs
         return None
 
-    async def _run_step(ctx: object, **kwargs: object) -> StepOutput:
+    async def _run_step(ctx: StepContext, **kwargs: object) -> StepOutput:
         del kwargs
         observed["ctx_agent_id"] = getattr(getattr(ctx, "agent", None), "agent_id", None)
         observed["ctx_executor_agent_id"] = getattr(
@@ -1664,6 +2212,8 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         observed["runtime_access_agent_type"] = (
             runtime_access.agent_type if runtime_access is not None else None
         )
+        observed["orchestration_mode"] = ctx.orchestration_mode.value
+        observed["has_boundary_consumer"] = ctx.consume_boundary_batch is not None
         return StepOutput(summary="done", content="done")
 
     monkeypatch.setattr(engine, "_resolve_step_agents", _resolve_step_agents)
@@ -1690,6 +2240,8 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         "runtime_agent_owner_email": "user@example.com",
         "runtime_access_agent_id": "agent-b",
         "runtime_access_agent_type": "primary",
+        "orchestration_mode": "none",
+        "has_boundary_consumer": False,
     }
 
 
@@ -1793,9 +2345,14 @@ async def test_execute_workflow_defers_transient_executor_unavailable_then_succe
         del args, kwargs
         return None
 
+    async def _persist_task_final(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
     monkeypatch.setattr(workflow_engine_module, "defer_running_task", _defer_running_task)
     monkeypatch.setattr(engine, "_execute_run_step", _transient_step)
     monkeypatch.setattr(engine, "_persist_workflow_state", _persist_workflow_state)
+    monkeypatch.setattr(engine, "_persist_task_final", _persist_task_final)
 
     first_result = await engine.execute_workflow(task, workflow)
 
@@ -1894,6 +2451,41 @@ async def test_evaluate_step_includes_actual_session_tool_events(
     assert session_events["tool_call_count"] == 2
     assert session_events["tool_result_count"] == 1
     assert [item["name"] for item in session_events["tool_calls"]] == ["read", "apply_patch"]
+
+
+@pytest.mark.asyncio
+async def test_step_execution_evidence_uses_recorded_step_boundaries() -> None:
+    engine = _build_engine()
+    observed_after_seq: list[int] = []
+
+    async def _read_events(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args
+        observed_after_seq.append(int(kwargs["after_seq"]))
+        return SimpleNamespace(
+            events=[
+                {"seq": 4, "type": "tool_call", "data": {"name": "planning_tool"}},
+                {"seq": 5, "type": "tool_call", "data": {"name": "implementation_tool"}},
+                {"seq": 6, "type": "tool_call", "data": {"name": "review_tool"}},
+            ]
+        )
+
+    engine._providers.guardrails = SimpleNamespace(read_events=_read_events)
+
+    evidence = await engine._build_step_execution_evidence(
+        StepOutput(
+            summary="done",
+            content="done",
+            intaris_session_id="intaris-session-1",
+        ),
+        event_start_seq=5,
+        event_end_seq=5,
+    )
+
+    assert observed_after_seq == [4]
+    session_events = evidence["session_events"]
+    assert [item["name"] for item in session_events["tool_calls"]] == ["implementation_tool"]
+    assert session_events["event_start_seq"] == 5
+    assert session_events["event_end_seq"] == 5
 
 
 @pytest.mark.asyncio

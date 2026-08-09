@@ -18,7 +18,12 @@ from sqlalchemy import select
 import cognis.providers.llm.codex as codex_support  # type: ignore[import-not-found]
 import cognis.providers.llm.litellm as litellm_provider_module
 from cognis.core.tool_exposure import ToolDiscoveryMode
-from cognis.models.config import DEFAULT_MODEL_INFO, ModelInfo, normalize_reasoning_level
+from cognis.models.config import (
+    DEFAULT_MODEL_INFO,
+    ImageInput,
+    ModelInfo,
+    normalize_reasoning_level,
+)
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm import retry as llm_retry
 from cognis.providers.llm.errors import (
@@ -217,10 +222,14 @@ def test_direct_codex_responses_defaults_force_store_false() -> None:
     )
 
     result = _apply_responses_request_defaults(
-        {"store": True}, provider=provider, resolved_model="gpt-5.5", instructions="stable prefix"
+        {"store": True, "max_output_tokens": 700},
+        provider=provider,
+        resolved_model="gpt-5.5",
+        instructions="stable prefix",
     )
 
     assert result["store"] is False
+    assert "max_output_tokens" not in result
     assert result["instructions"] == "stable prefix"
 
 
@@ -627,12 +636,14 @@ async def test_chatgpt_generate_uses_direct_codex_transport_by_default(
         model="gpt-5.3-codex",
         provider_id="chatgpt",
         cognis_session_id="session-123",
+        max_tokens=700,
     )
 
     assert captured["auth_provider_id"] == "chatgpt"
     assert captured["model"] == "gpt-5.3-codex"
     assert captured["input"] == [{"role": "user", "content": "hi"}]
     assert captured["store"] is False
+    assert "max_output_tokens" not in captured
     assert result["choices"][0]["message"]["content"] == "hello"
     await engine.dispose()
 
@@ -2473,6 +2484,100 @@ async def test_litellm_provider_image_generate_omits_response_format_for_gpt_ima
 
 
 @pytest.mark.asyncio
+async def test_litellm_provider_forwards_all_openai_images_and_mask(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="openai",
+                display_name="OpenAI",
+                location="controller",
+                backend="litellm",
+                config={"preset": "openai", "default_model": "gpt-image-2"},
+                status="active",
+            )
+        )
+        await session.commit()
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        data = [{"b64_json": "YWJj"}]
+        usage = None
+
+    async def fake_with_llm_retry(_func: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.retry.with_llm_retry", fake_with_llm_retry)
+
+    await provider.image_generate(
+        prompt="Combine the images.",
+        model="gpt-image-2",
+        images=[ImageInput(b64_json="first"), ImageInput(b64_json="second")],
+        mask=ImageInput(b64_json="mask"),
+    )
+
+    assert captured["image"] == ["first", "second"]
+    assert captured["mask"] == "mask"
+    assert captured["operation"] == "image_edit(gpt-image-2)"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_litellm_provider_forwards_ordered_gemini_image_parts(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="gemini",
+                display_name="Gemini",
+                location="controller",
+                backend="litellm",
+                config={"preset": "gemini", "default_model": "gemini-3-pro-image-preview"},
+                status="active",
+            )
+        )
+        await session.commit()
+    provider = LiteLLMProvider(session_factory)
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def model_dump(self) -> dict[str, object]:
+            return {"choices": [], "usage": {}}
+
+    async def fake_with_llm_retry(_func: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("cognis.providers.llm.retry.with_llm_retry", fake_with_llm_retry)
+
+    with pytest.raises(RuntimeError, match="returned no image data"):
+        await provider.image_generate(
+            prompt="Combine the images.",
+            model="gemini-3-pro-image-preview",
+            images=[ImageInput(b64_json="first"), ImageInput(b64_json="second")],
+        )
+
+    messages = captured["messages"]
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,first"}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,second"}},
+                {"type": "text", "text": "Combine the images."},
+            ],
+        }
+    ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_litellm_provider_image_generate_keeps_response_format_for_other_models(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3646,6 +3751,69 @@ async def test_litellm_provider_merges_extra_headers(tmp_path: object) -> None:
         "x-provider": "configured",
         "anthropic-beta": "tool-search-tool-2025-10-19",
     }
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_controller_provider_strips_executor_affinity_before_litellm(
+    tmp_path: object,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="default",
+                display_name="Controller",
+                location="controller",
+                backend="litellm",
+                config={"default_model": "openai/gpt-4o-mini"},
+                status="active",
+            )
+        )
+        await session.commit()
+
+    captured: list[dict[str, object]] = []
+
+    async def _fake_completion(**kwargs: object) -> object:
+        captured.append(dict(kwargs))
+        if kwargs.get("stream"):
+
+            async def _stream():
+                yield {
+                    "choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {},
+                }
+
+            return _stream()
+
+        class _Response:
+            def model_dump(self) -> dict[str, object]:
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        return _Response()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.acompletion", _fake_completion)
+    try:
+        provider = LiteLLMProvider(session_factory)
+        await provider.generate(
+            messages=[{"role": "user", "content": "hi"}],
+            _cognis_executor_affinity_id="exec-pinned",
+            cognis_llm_api="chat_completions",
+        )
+        _ = [
+            chunk
+            async for chunk in provider.stream_generate(
+                messages=[{"role": "user", "content": "hi"}],
+                _cognis_executor_affinity_id="exec-pinned",
+                cognis_llm_api="chat_completions",
+            )
+        ]
+    finally:
+        monkeypatch.undo()
+
+    assert len(captured) == 2
+    assert all("_cognis_executor_affinity_id" not in call for call in captured)
     await engine.dispose()
 
 
@@ -8375,3 +8543,20 @@ def test_is_prompt_cache_key_rejected_matches_known_messages() -> None:
     )
     assert not _is_prompt_cache_key_rejected(Exception("Some other error"))
     assert not _is_prompt_cache_key_rejected(ValueError("prompt_cache_key is fine here"))
+
+
+def test_fast_mode_rejection_requires_requested_service_tier() -> None:
+    from cognis.providers.llm.litellm import _fast_mode_rejection_reason
+
+    rejected = _ProviderError("Unknown parameter: 'service_tier'", status_code=400)
+    assert _fast_mode_rejection_reason(rejected, {"service_tier": "priority"}) == (
+        "service_tier_rejected"
+    )
+    assert _fast_mode_rejection_reason(rejected, {}) is None
+    assert (
+        _fast_mode_rejection_reason(
+            _ProviderError("Unknown parameter: 'service_tier'", status_code=503),
+            {"service_tier": "priority"},
+        )
+        is None
+    )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -11,7 +13,12 @@ import pytest
 from cognis.channels.adapters.matrix import MatrixAdapter
 from cognis.channels.protocol import NonRetryableChannelError
 from cognis.channels.registry import MATRIX_META
-from cognis.models.channel import ChannelAccountConfig, MediaAttachment, OutboundMessage
+from cognis.models.channel import (
+    AgentProfile,
+    ChannelAccountConfig,
+    MediaAttachment,
+    OutboundMessage,
+)
 
 
 def _config(settings: dict[str, Any] | None = None) -> ChannelAccountConfig:
@@ -32,6 +39,7 @@ def _adapter(settings: dict[str, Any] | None = None) -> MatrixAdapter:
     adapter._user_id = "@bot:example.org"  # noqa: SLF001
     adapter._display_name = "Cognis Bot"  # noqa: SLF001
     adapter._require_mention = settings.get("require_mention") in {True, "true"}  # noqa: SLF001
+    adapter._group_context_enabled = settings.get("group_context_enabled") is True  # noqa: SLF001
     adapter._live_sync_established = True  # noqa: SLF001
     adapter._started_at_ms = int(datetime.now(UTC).timestamp() * 1000)  # noqa: SLF001
     return adapter
@@ -83,6 +91,28 @@ class _SyncClient:
         return httpx.Response(200, json={"event_id": "$joined"}, request=request)
 
 
+class _ProfileSyncClient:
+    def __init__(self, *, put_status_codes: list[int] | None = None) -> None:
+        self.post_calls: list[tuple[str, bytes | None, dict[str, str] | None]] = []
+        self.put_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.put_status_codes = put_status_codes or []
+
+    async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+        self.post_calls.append((path, kwargs.get("content"), kwargs.get("headers")))
+        request = httpx.Request("POST", f"https://matrix.example.org{path}")
+        return httpx.Response(
+            200,
+            json={"content_uri": f"mxc://example.org/avatar-{len(self.post_calls)}"},
+            request=request,
+        )
+
+    async def put(self, path: str, **kwargs: Any) -> httpx.Response:
+        self.put_calls.append((path, kwargs.get("json")))
+        request = httpx.Request("PUT", f"https://matrix.example.org{path}")
+        status_code = self.put_status_codes.pop(0) if self.put_status_codes else 200
+        return httpx.Response(status_code, json={}, request=request)
+
+
 async def _collect(
     adapter: MatrixAdapter,
     event: dict[str, Any],
@@ -124,7 +154,7 @@ def test_matrix_registry_matches_adapter_capabilities() -> None:
     assert MATRIX_META.capabilities.supports_read_receipts is True
     assert MATRIX_META.capabilities.supports_reactions is False
     assert MATRIX_META.capabilities.supports_edits is False
-    assert MATRIX_META.capabilities.max_message_length == 4000
+    assert MATRIX_META.capabilities.max_message_length is None
 
 
 def test_matrix_registry_exposes_thread_conversation_settings() -> None:
@@ -146,6 +176,66 @@ def test_matrix_registry_exposes_thread_conversation_settings() -> None:
     assert fields["thread_start_mode"].field_type == "select"
     assert fields["thread_start_mode"].default == "fork"
     assert fields["thread_start_mode"].options == ["fork", "fresh"]
+
+
+@pytest.mark.asyncio
+async def test_sync_profile_skips_unchanged_avatar_and_display_name_updates() -> None:
+    adapter = _adapter()
+    client = _ProfileSyncClient()
+    adapter._client = client  # type: ignore[assignment] # noqa: SLF001
+
+    initial = AgentProfile(
+        name="Cognis Bot",
+        avatar_bytes=b"first-avatar",
+        avatar_content_type="image/png",
+    )
+    await adapter.sync_profile(initial)
+    await adapter.sync_profile(initial)
+
+    assert len(client.post_calls) == 1
+    assert client.put_calls == [
+        (
+            "/_matrix/client/v3/profile/@bot:example.org/avatar_url",
+            {"avatar_url": "mxc://example.org/avatar-1"},
+        )
+    ]
+
+    changed_avatar = initial.model_copy(update={"avatar_bytes": b"second-avatar"})
+    await adapter.sync_profile(changed_avatar)
+    assert len(client.post_calls) == 2
+    assert client.put_calls[-1] == (
+        "/_matrix/client/v3/profile/@bot:example.org/avatar_url",
+        {"avatar_url": "mxc://example.org/avatar-2"},
+    )
+
+    renamed = changed_avatar.model_copy(update={"display_name": "Renamed Bot"})
+    await adapter.sync_profile(renamed)
+    await adapter.sync_profile(renamed)
+
+    assert len(client.post_calls) == 2
+    assert client.put_calls[-1] == (
+        "/_matrix/client/v3/profile/@bot:example.org/displayname",
+        {"displayname": "Renamed Bot"},
+    )
+    assert len(client.put_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_sync_profile_retries_failed_avatar_update() -> None:
+    adapter = _adapter()
+    client = _ProfileSyncClient(put_status_codes=[500, 200])
+    adapter._client = client  # type: ignore[assignment] # noqa: SLF001
+    profile = AgentProfile(
+        name="Cognis Bot",
+        avatar_bytes=b"avatar",
+        avatar_content_type="image/png",
+    )
+
+    await adapter.sync_profile(profile)
+    await adapter.sync_profile(profile)
+
+    assert len(client.post_calls) == 2
+    assert len(client.put_calls) == 2
 
 
 @pytest.mark.asyncio
@@ -235,6 +325,38 @@ async def test_handle_event_require_mention_does_not_drop_direct_room_messages()
     assert messages[0].chat_type == "direct"
     assert messages[0].chat_name == "Alice Example"
     assert messages[0].was_mentioned is False
+
+
+@pytest.mark.asyncio
+async def test_group_context_dispatches_live_unmentioned_group_message_without_backfill() -> None:
+    adapter = _adapter({"require_mention": True, "group_context_enabled": True})
+    client = _EventLookupClient(
+        {
+            "event_id": "$root",
+            "sender": "@alice:example.org",
+            "content": {"msgtype": "m.text", "body": "root"},
+        }
+    )
+    adapter._client = client  # type: ignore[assignment] # noqa: SLF001
+
+    messages = await _collect(
+        adapter,
+        _message_event(
+            event_id="$reply",
+            content={
+                "msgtype": "m.text",
+                "body": "quiet chatter",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
+            },
+        ),
+        room_data={"summary": {"m.joined_member_count": 3}},
+    )
+
+    assert len(messages) == 1
+    assert messages[0].was_mentioned is False
+    assert messages[0].platform_data["_cognis_ordering_source"] == "provider"
+    assert "thread_root" not in messages[0].platform_data
+    assert all("/rooms/" not in path for path in client.paths)
 
 
 @pytest.mark.parametrize("require_mention", [False, True])
@@ -760,13 +882,146 @@ async def test_send_message_formats_matrix_html_mentions_and_thread_relations() 
         await adapter._client.aclose()  # noqa: SLF001
 
     assert event_id == "$sent"
-    payload = requests[0].read()
-    assert b'"format":"org.matrix.custom.html"' in payload
-    assert b"<strong>Matrix</strong>" in payload
-    assert b'"m.mentions":{"user_ids":["@alice:example.org"]}' in payload
-    assert b'"rel_type":"m.thread"' in payload
-    assert b'"m.in_reply_to":{"event_id":"$reply"}' in payload
+    payload = json.loads(requests[0].read())
+    assert payload["format"] == "org.matrix.custom.html"
+    assert "<strong>Matrix</strong>" in payload["formatted_body"]
+    assert payload["m.mentions"] == {"user_ids": ["@alice:example.org"]}
+    assert payload["m.relates_to"]["rel_type"] == "m.thread"
+    assert payload["m.relates_to"]["m.in_reply_to"] == {"event_id": "$reply"}
+    assert "url_previews" not in payload
     assert requests[0].url.path.endswith("/txn-stable-chunk-0")
+
+
+@pytest.mark.asyncio
+async def test_send_message_keeps_ordinary_direct_room_replies_top_level() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"event_id": "$sent"})
+
+    adapter = _adapter()
+    adapter._direct_rooms.add("!dm:example.org")  # noqa: SLF001
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        event_id = await adapter.send_message(
+            OutboundMessage(
+                channel_type="matrix",
+                account_id="matrix-account",
+                chat_id="!dm:example.org",
+                content="Hello",
+                reply_to_id="$inbound",
+            )
+        )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    assert event_id == "$sent"
+    payload = json.loads(requests[0].read())
+    assert "m.relates_to" not in payload
+
+
+@pytest.mark.asyncio
+async def test_send_message_preserves_direct_room_thread_relations() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"event_id": "$sent"})
+
+    adapter = _adapter()
+    adapter._direct_rooms.add("!dm:example.org")  # noqa: SLF001
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await adapter.send_message(
+            OutboundMessage(
+                channel_type="matrix",
+                account_id="matrix-account",
+                chat_id="!dm:example.org",
+                content="Hello",
+                thread_id="$thread",
+                reply_to_id="$inbound",
+            )
+        )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    payload = json.loads(requests[0].read())
+    assert payload["m.relates_to"] == {
+        "rel_type": "m.thread",
+        "event_id": "$thread",
+        "is_falling_back": True,
+        "m.in_reply_to": {"event_id": "$inbound"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_message_keeps_inferred_direct_room_replies_top_level() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"event_id": "$sent"})
+
+    adapter = _adapter()
+    adapter._room_type_cache["!dm:example.org"] = "direct"  # noqa: SLF001
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await adapter.send_message(
+            OutboundMessage(
+                channel_type="matrix",
+                account_id="matrix-account",
+                chat_id="!dm:example.org",
+                content="Hello",
+                reply_to_id="$inbound",
+            )
+        )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    payload = json.loads(requests[0].read())
+    assert "m.relates_to" not in payload
+
+
+@pytest.mark.asyncio
+async def test_send_message_preserves_group_replies_when_direct_room_is_stale() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"event_id": "$sent"})
+
+    adapter = _adapter()
+    adapter._direct_rooms.add("!room:example.org")  # noqa: SLF001
+    adapter._group_rooms.add("!room:example.org")  # noqa: SLF001
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await adapter.send_message(
+            OutboundMessage(
+                channel_type="matrix",
+                account_id="matrix-account",
+                chat_id="!room:example.org",
+                content="Hello",
+                reply_to_id="$inbound",
+            )
+        )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    payload = json.loads(requests[0].read())
+    assert payload["m.relates_to"] == {"m.in_reply_to": {"event_id": "$inbound"}}
 
 
 @pytest.mark.asyncio
@@ -829,6 +1084,7 @@ async def test_send_message_embeds_inline_rich_image_in_the_text_event() -> None
                 account_id="matrix-account",
                 chat_id="!room:example.org",
                 content="Daily brief",
+                platform_data={"canonical_rich_markdown": True},
                 media=[
                     MediaAttachment(
                         filename="brief.png",
@@ -845,9 +1101,75 @@ async def test_send_message_embeds_inline_rich_image_in_the_text_event() -> None
     assert len(requests) == 2
     assert requests[0].url.path == "/_matrix/media/v3/upload"
     assert requests[1].url.path.startswith("/_matrix/client/v3/rooms/")
-    payload = requests[1].read()
-    assert b'<img src=\\"mxc://example.org/inline\\" alt=\\"brief.png\\">' in payload
-    assert b'"msgtype":"m.image"' not in payload
+    payload = json.loads(requests[1].read())
+    assert '<img src="mxc://example.org/inline" alt="brief.png">' in payload["formatted_body"]
+    assert payload["msgtype"] != "m.image"
+    assert payload["url_previews"] == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_preserves_rich_image_positions_and_plain_alt_text() -> None:
+    requests: list[httpx.Request] = []
+    upload_index = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upload_index
+        requests.append(request)
+        if request.url.path == "/_matrix/media/v3/upload":
+            upload_index += 1
+            return httpx.Response(200, json={"content_uri": f"mxc://example.org/{upload_index}"})
+        return httpx.Response(200, json={"event_id": "$sent"})
+
+    adapter = _adapter()
+    adapter._client = httpx.AsyncClient(  # noqa: SLF001
+        base_url="https://matrix.example.org",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        await adapter.send_message(
+            OutboundMessage(
+                channel_type="matrix",
+                account_id="matrix-account",
+                chat_id="!room:example.org",
+                content=(
+                    "Literal COGNISRICHMEDIA0 stays text.\n\n"
+                    "## First\n\nFirst summary.\n\n"
+                    "<!--cognis-rich-media:first:First image-->\n\n"
+                    "## Second\n\nSecond summary.\n\n"
+                    "<!--cognis-rich-media:second:Second image-->"
+                ),
+                media=[
+                    MediaAttachment(
+                        filename="first.png",
+                        mime_type="image/png",
+                        content_b64=base64.b64encode(b"first").decode(),
+                        disposition="inline",
+                        media_ref="first",
+                    ),
+                    MediaAttachment(
+                        filename="second.png",
+                        mime_type="image/png",
+                        content_b64=base64.b64encode(b"second").decode(),
+                        disposition="inline",
+                        media_ref="second",
+                    ),
+                ],
+            )
+        )
+    finally:
+        await adapter._client.aclose()  # noqa: SLF001
+
+    payload = json.loads(requests[-1].read())
+    formatted = payload["formatted_body"]
+    assert formatted.index("First summary.") < formatted.index("mxc://example.org/1")
+    assert formatted.index("mxc://example.org/1") < formatted.index("Second")
+    assert formatted.index("Second summary.") < formatted.index("mxc://example.org/2")
+    assert formatted.count("COGNISRICHMEDIA0") == 1
+    assert formatted.count("mxc://example.org/1") == 1
+    assert formatted.count("mxc://example.org/2") == 1
+    assert payload["body"].count("First image") == 1
+    assert payload["body"].count("Second image") == 1
+    assert re.search(r"COGNISRICHMEDIA[0-9a-f]{32}", payload["body"]) is None
 
 
 @pytest.mark.asyncio

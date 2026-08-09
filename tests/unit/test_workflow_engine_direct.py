@@ -86,6 +86,59 @@ async def test_run_direct_turn_enables_questions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_direct_turn_injects_recovery_as_system_context() -> None:
+    captured: dict[str, object] = {}
+
+    class _AgentLoop:
+        async def run_step(self, ctx: object, **_: object) -> str:
+            captured["ctx"] = ctx
+            return "ok"
+
+    async def _runtime_factory(**_: object) -> ResolvedStepRuntime:
+        async def _cleanup() -> None:
+            return None
+
+        return ResolvedStepRuntime(
+            tool_registry="registry",
+            executor_connection="executor",
+            cleanup=_cleanup,
+            executor_environment=build_local_executor_environment(),
+        )
+
+    engine = WorkflowEngine(
+        session_factory=_SessionFactory(),
+        providers=SimpleNamespace(),
+        agent_loop=_AgentLoop(),
+        step_evaluator=SimpleNamespace(),
+        workflow_registry=SimpleNamespace(),
+        session_manager=SimpleNamespace(refresh_intaris_session_policy=_noop_refresh_policy),
+        event_bus=EventBus(),
+        pause_waiter=PauseWaiter(),
+        step_runtime_factory=_runtime_factory,
+    )
+
+    await engine.run_direct_turn(
+        conversation=SimpleNamespace(
+            conversation_id="conv-1",
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
+        ),
+        session=SimpleNamespace(user_email="user@example.com"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        user_message="Continue the operation",
+        recovery_context="The prior attempt was interrupted. Verify external state.",
+    )
+
+    ctx = captured["ctx"]
+    assert ctx.prior_context == [
+        {
+            "role": "system",
+            "content": "The prior attempt was interrupted. Verify external state.",
+            "_prior_context": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_direct_turn_threads_follow_up_metadata() -> None:
     captured: dict[str, object] = {}
 

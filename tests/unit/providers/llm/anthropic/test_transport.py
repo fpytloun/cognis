@@ -464,6 +464,39 @@ async def test_unsupported_payload_value_fails_before_http_request() -> None:
     assert sent_requests == 0
 
 
+@pytest.mark.asyncio
+async def test_http_rate_limit_preserves_retry_after() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "23"},
+            json={
+                "error": {
+                    "type": "rate_limit_error",
+                    "message": "This request would exceed your account's rate limit.",
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = AnthropicMessagesClient(
+            lambda _reference: _resolved_credential("secret"),
+            http_client=http_client,
+        )
+        with pytest.raises(AnthropicTransportError) as exc_info:
+            await client.complete(
+                _context(AnthropicAuthPolicy.API_KEY),
+                {"messages": [{"role": "user", "content": "hello"}]},
+                _bundle(),
+                provider_fingerprint="provider",
+                model_fingerprint="model",
+            )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.to_payload()["category"] == "rate_limit"
+    assert exc_info.value.to_payload()["retry_after_seconds"] == 23
+
+
 async def _resolved_credential(value: str) -> str:
     return value
 

@@ -10,11 +10,13 @@ import pytest
 
 from cognis.core import local_model_runtime
 from cognis.core.local_model_reconciler import LocalModelReconciler
-from cognis.core.local_model_runtime import LocalModelRuntimeManager
+from cognis.core.local_model_runtime import LocalModelRuntimeManager, LocalModelRuntimeUnavailable
 from cognis.core.local_model_service import resolve_authorized_deployment_executors
 from cognis.executor.ollama_runtime import OllamaRuntimeHandler
 from cognis.models.local_models import (
+    LocalModelOperationAction,
     LocalModelOperationResponse,
+    LocalModelTargetState,
     LocalModelTargetStatusResponse,
     OllamaRuntimeConfig,
     OllamaRuntimeOperationStatus,
@@ -1874,6 +1876,230 @@ async def test_retry_deadline_schedules_reconcile_wake(
         await reconciler.stop()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_retry_attempts_survive_consumed_deadlines_and_back_off(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, session_factory = await _database(tmp_path, "retry-sequence.db")
+    runtime = _RuntimeManager()
+    now = [100.0]
+    monkeypatch.setattr(
+        "cognis.core.local_model_reconciler.monotonic",
+        lambda: now[0],
+    )
+    monkeypatch.setattr(
+        "cognis.core.local_model_reconciler.random.uniform",
+        lambda low, high: (low + high) / 2,
+    )
+    try:
+        async with session_factory() as session:
+            await _seed_provider_scoped_runtime(
+                session,
+                suffix="retry-sequence",
+                include_operation=False,
+            )
+        reconciler = LocalModelReconciler(session_factory, runtime)  # type: ignore[arg-type]
+        target = LocalModelTargetStatus(
+            target_id="lmt-retry-sequence",
+            deployment_id="lmd-retry-sequence",
+            executor_id="exec-a",
+            generation=1,
+            state=LocalModelTargetState.ERROR.value,
+        )
+
+        delays: list[float] = []
+        for expected_attempt in (1, 2, 3):
+            await reconciler._target_failed(  # noqa: SLF001
+                target.target_id,
+                target.generation,
+                RuntimeError("temporary failure"),
+            )
+            assert reconciler._retry_attempts[target.target_id] == (  # noqa: SLF001
+                target.generation,
+                expected_attempt,
+            )
+            ready_at = reconciler._retry_deadlines[target.target_id][1]  # noqa: SLF001
+            delays.append(ready_at - now[0])
+            assert reconciler._retry_ready(target) is False  # noqa: SLF001
+            now[0] = ready_at
+            assert reconciler._retry_ready(target) is True  # noqa: SLF001
+            assert reconciler._retry_attempts[target.target_id][1] == expected_attempt  # noqa: SLF001
+            assert target.target_id not in reconciler._retry_deadlines  # noqa: SLF001
+
+        assert delays == [2.0, 4.0, 8.0]
+
+        reconciler._retry_attempts[target.target_id] = (target.generation, 20)  # noqa: SLF001
+        await reconciler._target_failed(  # noqa: SLF001
+            target.target_id,
+            target.generation,
+            RuntimeError("still failing"),
+        )
+        assert reconciler._retry_deadlines[target.target_id][1] - now[0] == 300.0  # noqa: SLF001
+        await reconciler.stop()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_operation_dispatch_failures_back_off_until_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, session_factory = await _database(tmp_path, "retry-dispatch.db")
+    runtime = _RuntimeManager()
+    now = [100.0]
+    dispatch_attempts = 0
+
+    async def dispatch(operation_id: str) -> bool:
+        nonlocal dispatch_attempts
+        dispatch_attempts += 1
+        runtime.dispatched.append(operation_id)
+        if dispatch_attempts <= 3:
+            raise LocalModelRuntimeUnavailable("executor unavailable")
+        return True
+
+    runtime.dispatch = dispatch  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "cognis.core.local_model_reconciler.monotonic",
+        lambda: now[0],
+    )
+    monkeypatch.setattr(
+        "cognis.core.local_model_reconciler.random.uniform",
+        lambda low, high: (low + high) / 2,
+    )
+    try:
+        async with session_factory() as session:
+            await _seed_provider_scoped_runtime(
+                session,
+                suffix="retry-dispatch",
+                include_operation=False,
+            )
+        reconciler = LocalModelReconciler(session_factory, runtime)  # type: ignore[arg-type]
+        target = LocalModelTargetStatus(
+            target_id="lmt-retry-dispatch",
+            deployment_id="lmd-retry-dispatch",
+            executor_id="exec-a",
+            generation=1,
+            state=LocalModelTargetState.ERROR.value,
+        )
+
+        for expected_attempt, expected_delay in ((1, 2.0), (2, 4.0), (3, 8.0)):
+            await reconciler._start_operation(  # noqa: SLF001
+                target.deployment_id,
+                target.target_id,
+                LocalModelOperationAction.PULL,
+            )
+            assert reconciler._retry_attempts[target.target_id] == (  # noqa: SLF001
+                target.generation,
+                expected_attempt,
+            )
+            ready_at = reconciler._retry_deadlines[target.target_id][1]  # noqa: SLF001
+            assert ready_at - now[0] == expected_delay
+            now[0] = ready_at
+            assert reconciler._retry_ready(target) is True  # noqa: SLF001
+
+        await reconciler._start_operation(  # noqa: SLF001
+            target.deployment_id,
+            target.target_id,
+            LocalModelOperationAction.PULL,
+        )
+        assert dispatch_attempts == 4
+        assert target.target_id not in reconciler._retry_attempts  # noqa: SLF001
+        assert target.target_id not in reconciler._retry_deadlines  # noqa: SLF001
+        assert target.target_id not in reconciler._retry_handles  # noqa: SLF001
+        await reconciler.stop()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        LocalModelTargetState.PENDING,
+        LocalModelTargetState.READY,
+        LocalModelTargetState.ABSENT,
+        LocalModelTargetState.BLOCKED,
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_error_target_state_clears_retry_records(
+    state: LocalModelTargetState,
+    tmp_path: Path,
+) -> None:
+    engine, session_factory = await _database(tmp_path, f"retry-reset-{state.value}.db")
+    runtime = _RuntimeManager()
+    try:
+        async with session_factory() as session:
+            await _seed_provider_scoped_runtime(
+                session,
+                suffix=f"retry-reset-{state.value}",
+                include_operation=False,
+            )
+        reconciler = LocalModelReconciler(session_factory, runtime)  # type: ignore[arg-type]
+        target_id = f"lmt-retry-reset-{state.value}"
+        reconciler._retry_attempts[target_id] = (1, 3)  # noqa: SLF001
+        reconciler._retry_deadlines[target_id] = (1, 120.0)  # noqa: SLF001
+        handle = asyncio.get_running_loop().call_later(60, lambda: None)
+        reconciler._retry_handles[target_id] = handle  # noqa: SLF001
+
+        await reconciler._set_target(target_id, 1, state)  # noqa: SLF001
+
+        assert target_id not in reconciler._retry_attempts  # noqa: SLF001
+        assert target_id not in reconciler._retry_deadlines  # noqa: SLF001
+        assert target_id not in reconciler._retry_handles  # noqa: SLF001
+        assert handle.cancelled()
+        await reconciler.stop()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_generation_change_removal_and_shutdown_clear_retry_records() -> None:
+    reconciler = LocalModelReconciler(SimpleNamespace(), _RuntimeManager())  # type: ignore[arg-type]
+    loop = asyncio.get_running_loop()
+
+    generation_target = LocalModelTargetStatus(
+        target_id="lmt-generation",
+        deployment_id="lmd-generation",
+        executor_id="exec-a",
+        generation=2,
+        state=LocalModelTargetState.ERROR.value,
+    )
+    reconciler._retry_attempts[generation_target.target_id] = (1, 3)  # noqa: SLF001
+    reconciler._retry_deadlines[generation_target.target_id] = (1, 120.0)  # noqa: SLF001
+    generation_handle = loop.call_later(60, lambda: None)
+    reconciler._retry_handles[generation_target.target_id] = generation_handle  # noqa: SLF001
+
+    assert reconciler._retry_ready(generation_target) is True  # noqa: SLF001
+    assert generation_target.target_id not in reconciler._retry_attempts  # noqa: SLF001
+    assert generation_target.target_id not in reconciler._retry_deadlines  # noqa: SLF001
+    assert generation_target.target_id not in reconciler._retry_handles  # noqa: SLF001
+    assert generation_handle.cancelled()
+
+    removed_target_id = "lmt-removed"
+    reconciler._retry_attempts[removed_target_id] = (1, 2)  # noqa: SLF001
+    reconciler._retry_deadlines[removed_target_id] = (1, 120.0)  # noqa: SLF001
+    removed_handle = loop.call_later(60, lambda: None)
+    reconciler._retry_handles[removed_target_id] = removed_handle  # noqa: SLF001
+    reconciler._prune_retry_state(set())  # noqa: SLF001
+    assert removed_target_id not in reconciler._retry_attempts  # noqa: SLF001
+    assert removed_target_id not in reconciler._retry_deadlines  # noqa: SLF001
+    assert removed_target_id not in reconciler._retry_handles  # noqa: SLF001
+    assert removed_handle.cancelled()
+
+    shutdown_target_id = "lmt-shutdown"
+    reconciler._retry_attempts[shutdown_target_id] = (1, 1)  # noqa: SLF001
+    reconciler._retry_deadlines[shutdown_target_id] = (1, 120.0)  # noqa: SLF001
+    shutdown_handle = loop.call_later(60, lambda: None)
+    reconciler._retry_handles[shutdown_target_id] = shutdown_handle  # noqa: SLF001
+    await reconciler.stop()
+    assert reconciler._retry_attempts == {}  # noqa: SLF001
+    assert reconciler._retry_deadlines == {}  # noqa: SLF001
+    assert reconciler._retry_handles == {}  # noqa: SLF001
+    assert shutdown_handle.cancelled()
 
 
 @pytest.mark.asyncio

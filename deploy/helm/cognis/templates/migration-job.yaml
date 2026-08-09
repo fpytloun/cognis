@@ -1,0 +1,83 @@
+{{- if .Values.migration.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "cognis.fullname" . }}-db-upgrade
+  labels:
+    {{- include "cognis.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.migration.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "cognis.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      serviceAccountName: default
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: db-upgrade
+          image: {{ include "cognis.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              case "$DATABASE_URL" in
+                postgresql+asyncpg://*) exec cognis-controller db upgrade ;;
+                *) echo "Migration Job requires postgresql+asyncpg DATABASE_URL" >&2; exit 1 ;;
+              esac
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: COGNIS_CONTROLLER_ID
+              value: migration-hook
+            - name: COGNIS_CONTROLLER_INTERNAL_URL
+              value: http://migration-hook.invalid
+            {{- include "cognis.commonEnv" . | nindent 12 }}
+            {{- if .Values.crypto.existingSecret }}
+            - name: COGNIS_JWT_PRIVATE_KEY_PATH
+              value: /var/run/cognis/crypto/private.pem
+            - name: COGNIS_JWT_PUBLIC_KEY_PATH
+              value: /var/run/cognis/crypto/public.pem
+            - name: COGNIS_SECRETS_KEY_PATH
+              value: /var/run/cognis/crypto/secrets.key
+            {{- end }}
+          {{- with .Values.config.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.crypto.existingSecret }}
+          volumeMounts:
+            - name: crypto
+              mountPath: /var/run/cognis/crypto
+              readOnly: true
+          {{- end }}
+      {{- if .Values.crypto.existingSecret }}
+      volumes:
+        - name: crypto
+          secret:
+            secretName: {{ .Values.crypto.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.crypto.jwtPrivateKeyKey }}
+                path: private.pem
+              - key: {{ .Values.crypto.jwtPublicKeyKey }}
+                path: public.pem
+              - key: {{ .Values.crypto.secretsKeyKey }}
+                path: secrets.key
+      {{- end }}
+{{- end }}

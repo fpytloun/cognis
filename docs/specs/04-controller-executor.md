@@ -640,26 +640,30 @@ or missing tool), but the controller does not dispatch tool calls to them.
 
 #### Active Executor Recovery
 
-The controller checks the active executor before each model cycle and before
-each executor-routed tool call. If the active executor is no longer usable:
+The controller evaluates executor recovery at a new admission boundary, never
+by silently moving an in-flight model stream or tool call. If a
+selector-selected primary executor remains unavailable after its reconnect
+grace:
 
-1. Switch back to a usable primary executor if one exists.
-2. Inject a hidden reminder explaining the forced switch and the previous
-   executor state.
-3. Continue only if the work can safely continue on the primary executor.
-4. If the failed executor is required for the requested work, notify the user
-   and cancel the turn instead of continuing on the wrong host.
+1. Atomically switch the durable pin to another usable primary matching the
+   same selector.
+2. Persist one system notice describing the previous and replacement
+   executors and warning that local state may differ.
+3. Start later admitted work on the replacement.
+4. Keep explicit primary pins fixed. Additional executors remain explicit-only
+   and are not failover capacity.
+
+An in-flight call whose outcome is unknown is recorded as ambiguous rather than
+replayed on another executor. A partially emitted model stream is not restarted
+silently.
 
 Reminder shape:
 
 ```text
-<executor_context_reminder>
-The previously active executor "infra-runner" is no longer usable.
-Observed state: offline.
-The controller switched active execution back to primary executor "local-macbook".
-Continue only if the remaining work can safely run on the primary executor.
-If this work requires "infra-runner", notify the user and stop the turn.
-</executor_context_reminder>
+The selector-selected primary executor "infra-runner" remained unavailable
+after reconnect grace. The controller switched later admissions to matching
+primary executor "local-macbook". Files, working directory, tools, and local
+state may differ. No ambiguous in-flight operation was replayed.
 ```
 
 The reminder must be factual. It must not speculate about why the executor is
@@ -675,7 +679,7 @@ offline.
 | Executor exceeds resource limits | Executor self-enforces and reports error |
 | Controller goes down (tool-only run) | Executor detects disconnect, exits cleanly |
 | Controller goes down (runtime-hosted run) | Executor keeps the runtime lease for a grace period, buffers events locally, then marks the run orphaned if the controller does not reclaim it |
-| Active additional executor goes offline before next model call | Switch to a usable primary executor, inject a factual reminder, and continue only if safe |
+| Active additional executor is unavailable at a later admission boundary | After reconnect grace, return later admitted work to a usable primary, persist a factual notice, and never replay an ambiguous in-flight call |
 | Required executor is offline or lacks the requested tool | Notify the user and cancel the turn; do not run the work on another host |
 
 ## Executor Implementations
@@ -1063,16 +1067,16 @@ Phase 2:
   Multiple executor pools with label selectors
   Channel adapters may run on executors for user-local services
 
-Phase 3:
-  Multiple controller instances (sticky WebSocket sessions)
-  Decompose: cognis-api, cognis-orchestrator, cognis-inference
-  Each component scales independently
+Current HA:
+  Multiple identical controller replicas behind one public Service/Ingress
+  PostgreSQL-backed ownership and authenticated controller bridge
+  One controller Deployment/image; no scheduler/worker microservice split
 ```
 
-For channel adapters in multi-controller deployments, the intended model is:
+For channel adapters in multi-controller deployments, the implemented model is:
 
 - **Webhook channels** stay effectively stateless on the controller side.
-- **Long-lived controller-hosted adapters** will require DB-based lease
-  ownership so only one controller replica polls a given account.
+- **Long-lived controller-hosted adapters** use DB-based lease ownership so
+  only one controller replica polls a given account.
 - **Executor-hosted adapters** do not need controller-side leader election;
   the selected executor owns the live platform connection.

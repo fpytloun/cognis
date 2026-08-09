@@ -30,10 +30,48 @@ Do NOT put tokens in query params.
 GET    /api/bootstrap-status      → Report whether first-run setup is still available
 POST   /api/setup                → Create first admin user (one-time, token-gated)
 GET    /.well-known/jwks.json    → JWKS public keys for JWT validation
+GET    /.well-known/cognis-client.json → Discover the native-client server contract
 ```
 
 The setup endpoint is only available when no users exist. It requires a
 one-time token printed to stdout on first start (15 min TTL).
+
+Native and other pluggable clients should discover a server through
+`/.well-known/cognis-client.json` before authentication. The response uses
+root-relative paths so the client retains the configured server origin and
+derives `ws` or `wss` from its HTTP scheme:
+
+```json
+{
+  "schema_version": 1,
+  "product": {"id": "cognis", "display_name": "Cognis"},
+  "protocol": {"id": "cognis-client", "version": 1},
+  "server": {
+    "id": "cognis:<jwt-public-key-fingerprint>",
+    "version": "0.11.2",
+    "build_id": "<public Cognis package version>"
+  },
+  "paths": {
+    "api_v1": "/api/v1",
+    "login": "/api/auth/login",
+    "refresh": "/api/auth/refresh",
+    "logout": "/api/auth/logout",
+    "current_user": "/api/auth/me",
+    "chat_v2": "/api/v1/chat/v2",
+    "realtime": "/api/ws",
+    "jwks": "/.well-known/jwks.json"
+  },
+  "capabilities": {"authentication": 1, "chat": 2, "realtime": 1}
+}
+```
+
+Capability integers version each advertised contract independently.
+`server.id` is a connection identity hint derived from the public JWT key,
+not a permanent global identifier; reinstalling the server or rotating its JWT
+key changes it. Clients should require confirmation before replacing a saved
+connection when the identity hint changes. The endpoint returns
+`Cache-Control: no-store` and does not expose deployment configuration, users,
+provider URLs, or secrets.
 
 ### Auth
 
@@ -628,6 +666,7 @@ GET    /api/health/providers                  → Provider status
 GET    /api/v1/system/diagnostics             → Admin diagnostics and readiness summary
 GET    /api/metrics                           → Prometheus metrics
 GET    /.well-known/jwks.json                 → Public keys for JWT validation
+GET    /.well-known/cognis-client.json        → Public native-client discovery contract
 GET    /.well-known/agent.json                → Default agent card (A2A; deferred unless public discovery metadata is configured)
 ```
 

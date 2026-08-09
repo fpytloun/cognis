@@ -9,12 +9,14 @@ from cognis.channels.remote import RemoteChannelAdapterProxy
 from cognis.models.channel import (
     ChannelAccountConfig,
     ChannelCapabilities,
+    ChannelRecipient,
     ChannelStatus,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
-from cognis.providers.executor.websocket import ExecutorDisconnectedError
+from cognis.providers.executor.websocket import ExecutorDisconnectedError, ExecutorRPCError
 
 
 class FakeConnection:
@@ -57,6 +59,206 @@ async def test_start_sends_channel_start_rpc() -> None:
     assert params["account_id"] == "acct-1"
     assert params["credentials"]["token"] == "secret"
     assert timeout == 30.0
+
+
+@pytest.mark.asyncio
+async def test_start_narrows_runtime_capabilities_and_omitted_metadata_is_compatible() -> None:
+    capabilities = ChannelCapabilities(
+        supports_media=True,
+        supports_typing=True,
+        recipient_capabilities={
+            "address_kinds": ["signal_e164", "signal_uuid"],
+            "supports_resolution": True,
+        },
+    )
+    advertised = capabilities.model_dump(mode="json")
+    advertised["supports_media"] = False
+    advertised["supports_typing"] = True
+    advertised["recipient_capabilities"] = {
+        "address_kinds": ["signal_e164"],
+        "chat_kinds": ["direct"],
+        "supports_resolution": True,
+        "supports_creation": False,
+    }
+    conn = FakeConnection({"status": "started", "capabilities": advertised})
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=capabilities,
+        account_id="acct-1",
+    )
+    await proxy.start(_config(), {}, None)
+    assert proxy.capabilities.supports_media is False
+    assert proxy.capabilities.supports_typing is True
+    assert proxy.capabilities.recipient_capabilities.address_kinds == ["signal_e164"]
+
+    legacy = FakeConnection({"status": "started"})
+    legacy_proxy = RemoteChannelAdapterProxy(
+        connection=legacy,
+        channel_type="signal",
+        capabilities=capabilities,
+        account_id="acct-1",
+    )
+    await legacy_proxy.start(_config(), {}, None)
+    assert legacy_proxy.capabilities == capabilities
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_wire_shape_and_result() -> None:
+    target = ResolvedChannelTarget(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        chat_kind="direct",
+        display_name="Contact",
+    )
+    conn = FakeConnection(target.model_dump(mode="json"))
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    recipient = ChannelRecipient(
+        channel_type="signal",
+        address="+420111222333",
+        address_kind="signal_e164",
+        chat_kind="direct",
+        allow_resolution=True,
+    )
+    result = await proxy.resolve_recipient(recipient, resolution_key="opaque-resolution-key")
+    assert result == target
+    method, params, timeout = conn.calls[0]
+    assert method == "channel.resolve_recipient"
+    assert params == {
+        "account_id": "acct-1",
+        "recipient": recipient.model_dump(mode="json"),
+        "resolution_key": "opaque-resolution-key",
+    }
+    assert timeout == 30.0
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_structured_error_is_safe_and_transport_errors_raise() -> None:
+    raw_address = "+420999888777"
+    conn = FakeConnection(
+        {
+            "error": {
+                "code": "provider_rejected",
+                "message": "Recipient resolution failed",
+                "retryable": False,
+                "side_effect_certainty": "none",
+            }
+        }
+    )
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        await proxy.resolve_recipient(
+            ChannelRecipient(channel_type="signal", address=raw_address),
+            resolution_key="key",
+        )
+    assert exc_info.value.code == "provider_rejected"
+    assert raw_address not in str(exc_info.value)
+
+    disconnected = RemoteChannelAdapterProxy(
+        connection=FakeConnection(error=ExecutorDisconnectedError("connection lost")),
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    with pytest.raises(ExecutorDisconnectedError):
+        await disconnected.resolve_recipient(
+            ChannelRecipient(channel_type="signal", address=raw_address),
+            resolution_key="key",
+        )
+
+    timed_out = RemoteChannelAdapterProxy(
+        connection=FakeConnection(error=TimeoutError()),
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    with pytest.raises(TimeoutError):
+        await timed_out.resolve_recipient(
+            ChannelRecipient(channel_type="signal", address=raw_address),
+            resolution_key="key",
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_protocol_error_data_matches_result_envelope() -> None:
+    raw_address = "+420999888777"
+    data = {
+        "code": "provider_rejected",
+        "message": f"leaked {raw_address}",
+        "retryable": True,
+        "side_effect_certainty": "uncertain",
+    }
+    recipient = ChannelRecipient(channel_type="signal", address=raw_address)
+
+    protocol_error = RemoteChannelAdapterProxy(
+        connection=FakeConnection(
+            error=ExecutorRPCError(-32000, f"leaked {raw_address}", data=data)
+        ),
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    envelope_error = RemoteChannelAdapterProxy(
+        connection=FakeConnection({"error": data}),
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+
+    with pytest.raises(RuntimeError) as protocol_exc:
+        await protocol_error.resolve_recipient(recipient, resolution_key="key")
+    with pytest.raises(RuntimeError) as envelope_exc:
+        await envelope_error.resolve_recipient(recipient, resolution_key="key")
+
+    assert type(protocol_exc.value) is type(envelope_exc.value)
+    assert protocol_exc.value.code == envelope_exc.value.code == "provider_rejected"
+    assert protocol_exc.value.retryable is envelope_exc.value.retryable is True
+    assert (
+        protocol_exc.value.side_effect_certainty
+        == envelope_exc.value.side_effect_certainty
+        == "uncertain"
+    )
+    assert raw_address not in str(protocol_exc.value)
+    assert raw_address not in str(envelope_exc.value)
+
+
+@pytest.mark.asyncio
+async def test_resolve_recipient_invalid_protocol_error_data_is_safe() -> None:
+    raw_address = "+420999888777"
+    proxies = [
+        RemoteChannelAdapterProxy(
+            connection=FakeConnection(
+                error=ExecutorRPCError(-32000, raw_address, data={"message": raw_address})
+            ),
+            channel_type="signal",
+            capabilities=ChannelCapabilities(),
+            account_id="acct-1",
+        ),
+        RemoteChannelAdapterProxy(
+            connection=FakeConnection({"error": {"message": raw_address}}),
+            channel_type="signal",
+            capabilities=ChannelCapabilities(),
+            account_id="acct-1",
+        ),
+    ]
+    for proxy in proxies:
+        with pytest.raises(RuntimeError) as exc_info:
+            await proxy.resolve_recipient(
+                ChannelRecipient(channel_type="signal", address=raw_address),
+                resolution_key="key",
+            )
+        assert raw_address not in str(exc_info.value)
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -20,9 +20,17 @@ from cognis.tools.executor.web.backends import (
     resolve_fetch_backend,
     resolve_search_backend,
 )
-from cognis.tools.executor.web.backends.direct import DirectBackend, _ddg_search
+from cognis.tools.executor.web.backends.direct import (
+    DirectBackend,
+    _ddg_search,
+    _request_error_result,
+)
 from cognis.tools.executor.web.backends.tavily import TavilyBackend
-from cognis.tools.executor.web.handlers import _concurrency_controller
+from cognis.tools.executor.web.handlers import (
+    _collect_optional_options,
+    _concurrency_controller,
+    _result_is_browser_fallback_candidate,
+)
 from cognis.tools.executor.web.headers import (
     BROWSER_HEADERS,
     clamp_timeout,
@@ -61,6 +69,103 @@ def test_web_concurrency_controller_is_shared_across_per_call_metadata() -> None
 
     assert first_controller is second_controller
     assert first_controller.settings.cap_for("direct") == 2
+
+
+def test_controller_web_metrics_preserve_each_retry_failure_category() -> None:
+    from cognis.core import agent_loop
+
+    execution_child = MagicMock()
+    retry_child = MagicMock()
+    execution_counter = MagicMock()
+    retry_counter = MagicMock()
+    search_outcome_counter = MagicMock()
+    execution_counter.labels.return_value = execution_child
+    retry_counter.labels.return_value = retry_child
+    result = ToolResult(
+        output="recovered",
+        metadata={
+            "backend": "direct",
+            "attempts": 3,
+            "retry_failure_categories": ["timeout", "rate_limited"],
+        },
+    )
+
+    with (
+        patch.object(agent_loop, "WEB_TOOL_EXECUTIONS", execution_counter),
+        patch.object(agent_loop, "WEB_SEARCH_RETRIES", retry_counter),
+        patch.object(agent_loop, "WEB_SEARCH_OUTCOMES", search_outcome_counter),
+    ):
+        agent_loop._observe_web_tool_execution("web_search", result, "success")
+
+    execution_counter.labels.assert_called_once_with(
+        tool_name="web_search",
+        backend="direct",
+        outcome="success",
+        failure_category="none",
+        browser_fallback="false",
+    )
+    assert retry_counter.labels.call_args_list == [
+        call(backend="direct", failure_category="timeout"),
+        call(backend="direct", failure_category="rate_limited"),
+    ]
+    assert retry_child.inc.call_count == 2
+    search_outcome_counter.labels.assert_called_once_with(
+        backend="direct",
+        outcome="healthy_results",
+    )
+
+
+def test_any_time_range_is_omitted_from_backend_options() -> None:
+    assert _collect_optional_options(
+        {"time_range": "any", "result_type": "repository"},
+        ("time_range", "result_type"),
+    ) == {"result_type": "repository"}
+
+
+def test_controller_web_search_metrics_distinguish_quality_and_empty_results() -> None:
+    from cognis.core import agent_loop
+
+    execution_counter = MagicMock()
+    search_outcome_counter = MagicMock()
+    with (
+        patch.object(agent_loop, "WEB_TOOL_EXECUTIONS", execution_counter),
+        patch.object(agent_loop, "WEB_SEARCH_OUTCOMES", search_outcome_counter),
+    ):
+        agent_loop._observe_web_tool_execution(
+            "web_search",
+            ToolResult(
+                output="No search results found.",
+                metadata={
+                    "backend": "searxng",
+                    "search_quality": "healthy",
+                    "returned_result_count": 0,
+                },
+            ),
+            "success",
+        )
+        agent_loop._observe_web_tool_execution(
+            "web_search",
+            ToolResult(
+                output="[[result:1]]\n[1] recovered",
+                metadata={
+                    "backend": "searxng",
+                    "search_quality": "degraded",
+                    "returned_result_count": 1,
+                },
+            ),
+            "success",
+        )
+        agent_loop._observe_web_tool_execution(
+            "web_search",
+            ToolResult(output="network error", is_error=True, metadata={"backend": "searxng"}),
+            "error",
+        )
+
+    assert search_outcome_counter.labels.call_args_list == [
+        call(backend="searxng", outcome="healthy_empty"),
+        call(backend="searxng", outcome="degraded_results"),
+        call(backend="searxng", outcome="failed"),
+    ]
 
 
 _CONTEXT_WITH_TAVILY = ToolExecutionContext(
@@ -190,6 +295,31 @@ class TestHtmlConversion:
         assert "requires verification" in result.output
         assert (result.metadata or {}).get("direct_fetch_blocked") is True
         assert (result.metadata or {}).get("direct_fetch_block_signal") == "verification"
+
+    def test_format_response_result_preserves_redirect_provenance(self) -> None:
+        response = httpx.Response(
+            200,
+            content=(
+                b"<html><title>Redirected article</title><body><article><p>"
+                b"This is substantive article content with enough words to represent a real "
+                b"body rather than a title or navigation shell.</p></article></body></html>"
+            ),
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/final"),
+        )
+
+        result = format_response_result(
+            response,
+            "markdown",
+            requested_url="https://example.com/start",
+            source_url="https://example.com/final",
+        )
+
+        metadata = result.metadata or {}
+        assert metadata["requested_url"] == "https://example.com/start"
+        assert metadata["fetched_url"] == "https://example.com/final"
+        document = metadata["extracted_document"]
+        assert document["url_provenance"]["requested_url"] == "https://example.com/start"
 
     def test_format_response_result_provider_error_page_is_error(self) -> None:
         response = httpx.Response(
@@ -409,8 +539,17 @@ class TestDynamicWebDefinitions:
         assert "topic" not in props
         assert props["include_images"]["type"] == "boolean"
         assert props["image_limit"]["maximum"] == 50
+        assert props["time_range"]["enum"] == ["any", "day", "week", "month", "year"]
+        assert "default: any" in props["time_range"]["description"]
+        assert props["search_mode"]["enum"] == ["web", "news", "images", "videos"]
+        assert props["result_type"]["enum"] == [
+            "paper",
+            "repository",
+            "discussion",
+            "document",
+        ]
 
-    def test_tavily_adds_backend_and_params(self) -> None:
+    def test_tavily_adds_params_without_backend_override(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
         defs = web_tool_definitions(
@@ -421,7 +560,7 @@ class TestDynamicWebDefinitions:
         )
         search = next(d for d in defs if d.name == "web_search")
         props = search.parameters.get("properties", {})
-        assert "backend" in props
+        assert "backend" not in props
         assert "search_depth" in props
         assert "include_answer" in props
         assert "include_domains" in props
@@ -431,11 +570,7 @@ class TestDynamicWebDefinitions:
         assert "start_date" in props
         assert "end_date" in props
         assert "topic" in props
-        backend_enum = props["backend"]["enum"]
-        assert "direct" in backend_enum
-        assert "tavily" in backend_enum
-        assert "default: tavily" in props["backend"]["description"]
-        assert "Advanced override" in props["backend"]["description"]
+        assert "using Tavily" in search.description
 
     def test_fetch_uses_configured_default_backend_in_description(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -449,8 +584,8 @@ class TestDynamicWebDefinitions:
         )
         fetch = next(d for d in defs if d.name == "web_fetch")
         props = fetch.parameters.get("properties", {})
-        assert "backend" in props
-        assert "default: tavily" in props["backend"]["description"]
+        assert "backend" not in props
+        assert "configured tavily fetch backend" in fetch.description
 
     def test_invalid_default_backend_falls_back_to_first_available(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -467,8 +602,10 @@ class TestDynamicWebDefinitions:
         search_props = search.parameters.get("properties", {})
         # When the supplied default isn't in either axis, we land on the
         # first axis-relevant option (direct here).
-        assert "default: direct" in fetch_props["backend"]["description"]
-        assert "default: direct" in search_props["backend"]["description"]
+        assert "backend" not in fetch_props
+        assert "backend" not in search_props
+        assert "configured direct fetch backend" in fetch.description
+        assert "using DuckDuckGo" in search.description
 
     def test_fetch_brave_default_falls_back_to_direct_description(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -508,10 +645,13 @@ class TestDynamicWebDefinitions:
     def test_brave_adds_search_params(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
-        defs = web_tool_definitions(["direct", "brave"])
+        defs = web_tool_definitions(
+            ["direct", "brave"],
+            default_search_backend="brave",
+        )
         search = next(d for d in defs if d.name == "web_search")
         props = search.parameters.get("properties", {})
-        assert "backend" in props
+        assert "backend" not in props
         assert "freshness" in props
         assert "extra_snippets" in props
         assert "safesearch" in props
@@ -589,7 +729,7 @@ class TestWebFetchHandler:
             )
 
             assert not result.is_error
-            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata, None)
+            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata)
             mock_backend.fetch.assert_awaited_once()
 
 
@@ -632,9 +772,26 @@ class TestWebSearchHandler:
             result = await handle_web_search({"query": "test query"}, _CONTEXT_WITH_TAVILY)
 
             assert not result.is_error
-            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata, None)
+            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata)
             mock_backend.search.assert_awaited_once()
             assert result.metadata["tavily_query_normalized"] is False
+
+    @pytest.mark.asyncio()
+    async def test_search_ignores_stale_backend_override(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        with patch("cognis.tools.executor.web.handlers.resolve_search_backend") as mock_resolve:
+            mock_backend = AsyncMock(spec=TavilyBackend)
+            mock_backend.search.return_value = ToolResult(output="search results")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_search(
+                {"query": "test query", "backend": "direct"},
+                _CONTEXT_WITH_TAVILY,
+            )
+
+            assert not result.is_error
+            mock_resolve.assert_called_once_with(_CONTEXT_WITH_TAVILY.runtime_metadata)
 
     @pytest.mark.asyncio()
     async def test_search_passes_options(self) -> None:
@@ -938,7 +1095,7 @@ class TestWebSearchHandler:
 
             call_args = mock_backend.search.call_args
             assert call_args.args[0] == "site:example.com compliance"
-            assert result.metadata is None
+            assert result.metadata == {"attempts": 1, "backend": "direct"}
 
     @pytest.mark.asyncio()
     async def test_search_does_not_rewrite_complex_boolean_tavily_query(self) -> None:
@@ -1131,8 +1288,10 @@ class TestDirectBackend:
         mock_response.text = "<p>Hello</p>"
         mock_response.status_code = 200
 
-        with patch("cognis.tools.executor.web.backends.direct._fetch_breaker") as mock_breaker:
+        with patch("cognis.tools.executor.web.backends.direct._origin_breaker") as breaker_factory:
+            mock_breaker = MagicMock()
             mock_breaker.call = AsyncMock(return_value=mock_response)
+            breaker_factory.return_value = mock_breaker
             result = await backend.fetch("https://example.com", output_format="text")
             assert not result.is_error
             assert "Hello" in result.output
@@ -1220,10 +1379,75 @@ class TestDirectBackend:
         backend = DirectBackend()
         error_result = ToolResult(output="Request timed out", is_error=True)
 
-        with patch("cognis.tools.executor.web.backends.direct._fetch_breaker") as mock_breaker:
+        with patch("cognis.tools.executor.web.backends.direct._origin_breaker") as breaker_factory:
+            mock_breaker = MagicMock()
             mock_breaker.call = AsyncMock(return_value=error_result)
+            breaker_factory.return_value = mock_breaker
             result = await backend.fetch("https://example.com")
             assert result.is_error
+
+    @pytest.mark.parametrize(
+        ("message", "category", "output_fragment"),
+        [
+            (
+                "[Errno -3] Temporary failure in name resolution",
+                "dns_resolution_failed",
+                "Could not resolve host historypark.cz",
+            ),
+            (
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "Hostname mismatch, certificate is not valid for 'www.majalandpraha.cz'",
+                "tls_certificate_invalid",
+                "TLS certificate validation failed for www.majalandpraha.cz",
+            ),
+        ],
+    )
+    def test_terminal_transport_failures_are_precise_and_skip_browser(
+        self,
+        message: str,
+        category: str,
+        output_fragment: str,
+    ) -> None:
+        request = httpx.Request("GET", f"https://{output_fragment.split()[-1]}/")
+        error = httpx.ConnectError(message, request=request)
+        result = _request_error_result(error, url=str(request.url), timeout=30)
+
+        assert result.is_error
+        assert output_fragment in result.output
+        assert result.metadata["failure_category"] == category
+        assert result.metadata["browser_fallback_recommended"] is False
+        assert _result_is_browser_fallback_candidate(result) is False
+
+    def test_generic_network_failure_still_recommends_browser(self) -> None:
+        request = httpx.Request("GET", "https://example.com/")
+        error = httpx.ConnectError("connection reset by peer", request=request)
+        result = _request_error_result(error, url=str(request.url), timeout=30)
+
+        assert result.metadata["failure_category"] == "network_error"
+        assert result.metadata["browser_fallback_recommended"] is True
+        assert _result_is_browser_fallback_candidate(result) is True
+
+    @pytest.mark.asyncio()
+    async def test_repeated_dns_failures_do_not_open_origin_breaker(self) -> None:
+        from cognis.tools.executor.web.backends import direct
+
+        direct._fetch_breakers.clear()
+        request = httpx.Request("GET", "https://historypark.cz/")
+        error = httpx.ConnectError(
+            "[Errno -3] Temporary failure in name resolution",
+            request=request,
+        )
+        with patch(
+            "cognis.tools.executor.web.backends.direct.fetch_with_retry",
+            new=AsyncMock(side_effect=error),
+        ):
+            for _ in range(8):
+                result = await DirectBackend().fetch(str(request.url))
+                assert result.metadata["failure_category"] == "dns_resolution_failed"
+
+        breaker = direct._origin_breaker(str(request.url))
+        assert breaker.failures == 0
+        assert breaker.state.value == "closed"
 
     @pytest.mark.asyncio()
     async def test_search_defaults_to_us_en_region(self) -> None:
@@ -1251,8 +1475,148 @@ class TestDirectBackend:
             safesearch="moderate",
             timelimit=None,
             include_images=False,
+            mode="web",
+            options={},
+            preferred_type=None,
             image_limit=10,
         )
+        assert result.metadata["backend"] == "direct"
+        assert result.metadata["provider"] == "duckduckgo"
+        assert result.metadata["requested_search_mode"] == "web"
+
+    @pytest.mark.asyncio()
+    async def test_image_search_mode_selects_direct_image_search(self) -> None:
+        backend = DirectBackend()
+
+        async def _call(fn):
+            return await fn()
+
+        with (
+            patch("cognis.tools.executor.web.backends.direct._search_breaker") as mock_breaker,
+            patch(
+                "cognis.tools.executor.web.backends.direct._ddg_search",
+                new=AsyncMock(return_value=ToolResult(output="[[media:1]]")),
+            ) as mock_ddg_search,
+        ):
+            mock_breaker.call = AsyncMock(side_effect=_call)
+            result = await backend.search(
+                "mountain lake",
+                options={"search_mode": "images"},
+            )
+
+        assert not result.is_error
+        mock_ddg_search.assert_awaited_once_with(
+            "mountain lake",
+            max_results=8,
+            region="us-en",
+            safesearch="moderate",
+            timelimit=None,
+            include_images=False,
+            mode="images",
+            options={"search_mode": "images"},
+            preferred_type=None,
+            image_limit=10,
+        )
+
+    @pytest.mark.asyncio()
+    async def test_search_retries_transient_ddg_failure(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        backend = AsyncMock(spec=DirectBackend)
+        backend.search.side_effect = [
+            ToolResult(
+                output="DuckDuckGo search failed (timeout).",
+                is_error=True,
+                metadata={"backend": "direct", "failure_category": "timeout"},
+            ),
+            ToolResult(output="recovered", metadata={"backend": "direct"}),
+        ]
+        controller = MagicMock()
+        gate = MagicMock()
+        gate.__aenter__ = AsyncMock(return_value=None)
+        gate.__aexit__ = AsyncMock(return_value=None)
+        controller.acquire.return_value = gate
+
+        with (
+            patch(
+                "cognis.tools.executor.web.handlers.resolve_search_backend", return_value=backend
+            ),
+            patch(
+                "cognis.tools.executor.web.handlers._concurrency_controller",
+                return_value=controller,
+            ),
+            patch(
+                "cognis.tools.executor.web.handlers.asyncio.sleep",
+                new=AsyncMock(),
+            ) as mock_sleep,
+        ):
+            result = await handle_web_search({"query": "retry me"}, _DUMMY_CONTEXT)
+
+        assert not result.is_error
+        assert backend.search.await_count == 2
+        assert controller.acquire.call_count == 2
+        mock_sleep.assert_awaited_once()
+        assert (result.metadata or {}).get("attempts") == 2
+        assert (result.metadata or {}).get("retry_failure_categories") == ["timeout"]
+
+    @pytest.mark.asyncio()
+    async def test_search_reports_typed_error_after_retries(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        backend = AsyncMock(spec=DirectBackend)
+        backend.search.return_value = ToolResult(
+            output="DuckDuckGo search failed (rate limited).",
+            is_error=True,
+            metadata={
+                "backend": "direct",
+                "provider": "duckduckgo",
+                "failure_category": "rate_limited",
+                "exception_type": "RuntimeError",
+            },
+        )
+
+        with (
+            patch(
+                "cognis.tools.executor.web.handlers.resolve_search_backend", return_value=backend
+            ),
+            patch(
+                "cognis.tools.executor.web.handlers.asyncio.sleep",
+                new=AsyncMock(),
+            ),
+        ):
+            result = await handle_web_search({"query": "retry me"}, _DUMMY_CONTEXT)
+
+        assert result.is_error
+        assert backend.search.await_count == 3
+        assert result.metadata == {
+            "backend": "direct",
+            "provider": "duckduckgo",
+            "attempts": 3,
+            "failure_category": "rate_limited",
+            "exception_type": "RuntimeError",
+            "retry_failure_categories": ["rate_limited", "rate_limited"],
+        }
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_retry_non_transient_ddg_failure(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_search
+
+        backend = AsyncMock(spec=DirectBackend)
+        backend.search.return_value = ToolResult(
+            output="DuckDuckGo search failed (invalid response).",
+            is_error=True,
+            metadata={"backend": "direct", "failure_category": "invalid_response"},
+        )
+
+        with patch(
+            "cognis.tools.executor.web.handlers.resolve_search_backend",
+            return_value=backend,
+        ):
+            result = await handle_web_search({"query": "retry me"}, _DUMMY_CONTEXT)
+
+        assert result.is_error
+        backend.search.assert_awaited_once()
+        assert (result.metadata or {}).get("attempts") == 1
 
     @pytest.mark.asyncio()
     async def test_ddg_search_uses_bounded_request_timeout(
@@ -1301,9 +1665,10 @@ class TestDirectBackend:
 
         monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
 
-        result = await _ddg_search("example chart", include_images=True)
+        result = await _ddg_search("example chart", include_images=True, mode="images")
 
         assert "[[media:1]]" in result.output
+        assert "Article" not in result.output
         assert "tool_artifact:<tool_call_id>:media:1" in result.output
         anchors = (result.metadata or {}).get("output_anchors")
         assert isinstance(anchors, list)
@@ -1340,6 +1705,69 @@ class TestTavilyBackend:
         assert isinstance(stored_output, str)
         assert "[[answer]]" in stored_output
 
+    def test_search_scores_query_relevance_and_preserves_provider_rank(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _format_brave_results
+
+        result = _format_brave_results(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Generic game portal",
+                            "url": "https://example.com/games",
+                            "description": "General gaming coverage.",
+                        },
+                        {
+                            "title": "Gothic Remake one-handed weapon locations",
+                            "url": "https://guide.example/gothic-remake/weapons",
+                            "description": "Locations and stats for one-handed weapons.",
+                        },
+                    ]
+                }
+            },
+            query="Gothic Remake one-handed weapon locations",
+            preferred_type="document",
+        )
+
+        normalized = result.metadata.get("normalized_results") if result.metadata else None
+        assert isinstance(normalized, list)
+        assert normalized[0]["title"] == "Gothic Remake one-handed weapon locations"
+        assert float(normalized[0]["cognis_score"]) > float(normalized[1]["cognis_score"]) > 0
+        assert normalized[0]["provider_rank"] == 2
+
+    def test_brave_normalizes_site_path_operator_without_losing_terms(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _normalize_brave_query
+
+        assert (
+            _normalize_brave_query("site:game8.co/games/Gothic-1-Remake/archives weapon locations")
+            == "site:game8.co games Gothic Remake archives weapon locations"
+        )
+
+    def test_brave_normalized_results_match_post_freshness_output(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _format_brave_results
+
+        result = _format_brave_results(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Old result",
+                            "url": "https://example.com/old",
+                            "description": "An old indexed result.",
+                            "age": "5 years ago",
+                        }
+                    ]
+                }
+            },
+            query="current result",
+            options={"time_range": "day"},
+        )
+
+        assert "[[result:1]]" not in result.output
+        assert result.metadata is not None
+        assert result.metadata["normalized_results"] == []
+        assert result.metadata["returned_result_count"] == 0
+
     def test_search_preserves_tavily_image_references_as_lazy_artifacts(self) -> None:
         from cognis.tools.executor.web.backends.tavily import _format_tavily_search
 
@@ -1356,6 +1784,74 @@ class TestTavilyBackend:
         assert isinstance(anchors, list)
         media_anchor = next(anchor for anchor in anchors if anchor["anchor"] == "media:1")
         assert media_anchor["artifact_candidate"]["metadata"]["source_tool"] == "web_search"
+
+    @pytest.mark.asyncio()
+    async def test_image_search_mode_enables_tavily_images(self) -> None:
+        backend = TavilyBackend(api_key="test")
+        backend._safe_call = AsyncMock(
+            return_value={
+                "results": [],
+                "images": [{"url": "https://cdn.example.com/image.jpg"}],
+            }
+        )
+
+        result = await backend.search(
+            "mountain lake",
+            options={"search_mode": "images"},
+        )
+
+        assert "[[media:1]]" in result.output
+        body = backend._safe_call.await_args.args[1]
+        assert body["include_images"] is True
+
+    @pytest.mark.asyncio()
+    async def test_video_search_mode_reports_tavily_web_fallback(self) -> None:
+        backend = TavilyBackend(api_key="test")
+        backend._safe_call = AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "title": "Video result",
+                        "url": "https://example.com/video",
+                        "content": "Fallback result",
+                    }
+                ]
+            }
+        )
+
+        result = await backend.search("video query", options={"search_mode": "videos"})
+
+        assert result.metadata["requested_search_mode"] == "videos"
+        assert result.metadata["effective_search_mode"] == "web"
+        assert result.metadata["native_mode_support"] is False
+        assert result.metadata["search_degraded"] is True
+
+    @pytest.mark.asyncio()
+    async def test_explicit_search_mode_overrides_tavily_topic(self) -> None:
+        backend = TavilyBackend(api_key="test")
+        backend._safe_call = AsyncMock(return_value={"results": []})
+
+        await backend.search(
+            "news",
+            options={"search_mode": "news", "topic": "general"},
+        )
+
+        assert backend._safe_call.await_args.args[1]["topic"] == "news"
+
+    @pytest.mark.asyncio()
+    async def test_tavily_image_mode_preserves_metadata_when_no_images(self) -> None:
+        backend = TavilyBackend(api_key="test")
+        backend._safe_call = AsyncMock(
+            return_value={
+                "results": [{"title": "Text", "url": "https://example.com", "content": "x"}]
+            }
+        )
+
+        result = await backend.search("image", options={"search_mode": "images"})
+
+        assert result.output == "No image results found."
+        assert result.metadata["requested_search_mode"] == "images"
+        assert result.metadata["effective_search_mode"] == "images"
 
     @pytest.mark.asyncio()
     async def test_search_compacts_noisy_result_content(self) -> None:
@@ -1480,6 +1976,412 @@ class TestBraveBackend:
         result = await backend.search("")
         assert result.is_error
 
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        ("mode", "endpoint_suffix", "payload"),
+        [
+            ("web", "/web/search", {"web": {"results": []}}),
+            ("news", "/news/search", {"results": []}),
+            ("images", "/images/search", {"results": []}),
+            ("videos", "/videos/search", {"results": []}),
+        ],
+    )
+    async def test_search_mode_selects_native_brave_endpoint(
+        self,
+        mode: str,
+        endpoint_suffix: str,
+        payload: dict[str, object],
+    ) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(return_value=payload)
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            result = await backend.search("query", options={"search_mode": mode})
+
+        assert backend._get.await_args.args[0].endswith(endpoint_suffix)
+        assert result.metadata["requested_search_mode"] == mode
+        assert result.metadata["effective_search_mode"] == mode
+
+    @pytest.mark.asyncio()
+    async def test_search_retries_rejected_country_with_global_targeting(self) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+        rejected = httpx.Response(
+            422,
+            request=request,
+            json={"detail": "Invalid country parameter"},
+        )
+        error = httpx.HTTPStatusError(
+            "Unprocessable Entity",
+            request=request,
+            response=rejected,
+        )
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(
+            side_effect=[
+                error,
+                {
+                    "web": {
+                        "results": [
+                            {
+                                "title": "Global result",
+                                "url": "https://example.com",
+                                "description": "Fallback succeeded",
+                            }
+                        ]
+                    }
+                },
+            ]
+        )
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            result = await backend.search("query", options={"country": "DE"})
+
+        assert backend._get.await_count == 2
+        assert backend._get.await_args_list[0].args[1]["country"] == "DE"
+        assert backend._get.await_args_list[1].args[1]["country"] == "ALL"
+        assert result.is_error is False
+        assert "Search degraded" in result.output
+        assert "retried with global country targeting" in result.output
+        assert result.metadata["country_requested"] == "DE"
+        assert result.metadata["country_effective"] == "ALL"
+        assert result.metadata["country_filter_applied"] is False
+
+    @pytest.mark.asyncio()
+    async def test_brave_uses_provider_domain_constraint_and_czech_language_fallback(
+        self,
+    ) -> None:
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(return_value={"web": {"results": []}})
+        result = await backend.search(
+            "aktuální počasí",
+            options={
+                "country": "CZ",
+                "include_domains": ["chmi.cz"],
+                "search_lang": "sk",
+            },
+        )
+
+        params = backend._get.await_args.args[1]
+        assert "site:chmi.cz" in params["q"]
+        assert "country" not in params
+        assert params["search_lang"] == "sk"
+        assert "ui_lang" not in params
+        assert result.metadata["search_language_effective"] == "sk"
+
+    def test_brave_domain_operator_bounds_include_and_exclude_domains(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _provider_query
+
+        query = _provider_query(
+            "zprávy",
+            {
+                "include_domains": ["a.cz", "b.cz", "c.cz", "d.cz"],
+                "exclude_domains": ["x.cz", "y.cz", "z.cz", "q.cz", "r.cz", "s.cz"],
+            },
+        )
+        assert query.count("site:") == 8
+        assert "(site:a.cz OR site:b.cz OR site:c.cz)" in query
+        assert "site:d.cz" not in query
+        assert "-site:z.cz" not in query
+
+    @pytest.mark.asyncio()
+    async def test_brave_country_fallback_freshness_retry_reuses_effective_country(
+        self,
+    ) -> None:
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+        rejected = httpx.Response(
+            422,
+            request=request,
+            json={"detail": "Invalid country parameter"},
+        )
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(
+            side_effect=[
+                httpx.HTTPStatusError(
+                    "Unprocessable Entity",
+                    request=request,
+                    response=rejected,
+                ),
+                {"web": {"results": []}},
+                {
+                    "web": {
+                        "results": [
+                            {
+                                "title": "Recovered",
+                                "url": "https://example.com/recovered",
+                                "description": "Recovered after bounded retry.",
+                            }
+                        ]
+                    }
+                },
+            ]
+        )
+        result = await backend.search(
+            "current news",
+            options={"country": "DE", "time_range": "day"},
+        )
+
+        assert backend._get.await_count == 3
+        assert backend._get.await_args_list[2].args[1]["country"] == "ALL"
+        assert "freshness" not in backend._get.await_args_list[2].args[1]
+        assert result.metadata["freshness_relaxed"] is True
+
+    @pytest.mark.asyncio()
+    async def test_brave_relaxes_freshness_once_after_domain_scoped_empty(self) -> None:
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(
+            side_effect=[
+                {"web": {"results": []}},
+                {
+                    "web": {
+                        "results": [
+                            {
+                                "title": "Aktuální zpráva",
+                                "url": "https://novinky.cz/clanek",
+                                "description": "Aktuální česká zpráva s dostatečným popisem.",
+                            }
+                        ]
+                    }
+                },
+            ]
+        )
+        result = await backend.search(
+            "aktuální zprávy",
+            options={"include_domains": ["novinky.cz"], "time_range": "day"},
+        )
+
+        assert backend._get.await_count == 2
+        assert backend._get.await_args_list[0].args[1]["freshness"] == "pd"
+        assert "freshness" not in backend._get.await_args_list[1].args[1]
+        assert result.metadata["freshness_relaxed"] is True
+        assert result.metadata["returned_result_count"] == 1
+
+    def test_brave_news_penalizes_press_releases_and_taxonomy_pages(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _format_brave_results
+
+        result = _format_brave_results(
+            {
+                "results": [
+                    {
+                        "title": "Hospital ranking press release",
+                        "url": "https://prnewswire.com/news/hospitals",
+                        "description": "PR Newswire press release about a commercial ranking.",
+                        "age": "1 hour ago",
+                    },
+                    {
+                        "title": "World event confirmed by officials",
+                        "url": "https://news.example/world/event",
+                        "description": "Officials confirmed a major world event after independent reporting.",
+                        "age": "2 hours ago",
+                    },
+                    {
+                        "title": "World topic page",
+                        "url": "https://other.example/tag/world/",
+                        "description": "A list of links.",
+                    },
+                ]
+            },
+            mode="news",
+            query="top world news",
+        )
+        normalized = result.metadata["normalized_results"]
+        assert normalized[0]["title"] == "World event confirmed by officials"
+        assert normalized[-1]["title"] == "World topic page"
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_retry_422_unrelated_to_country(self) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+        rejected = httpx.Response(
+            422,
+            request=request,
+            json={"detail": "Invalid result_filter"},
+        )
+        error = httpx.HTTPStatusError(
+            "Unprocessable Entity",
+            request=request,
+            response=rejected,
+        )
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(side_effect=error)
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            result = await backend.search("query", options={"country": "US"})
+
+        assert backend._get.await_count == 1
+        assert result.is_error is True
+        assert "Invalid result_filter" in result.output
+        assert result.metadata["http_status"] == 422
+
+    @pytest.mark.asyncio()
+    async def test_search_does_not_retry_global_country(self) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+        rejected = httpx.Response(
+            422,
+            request=request,
+            json={"detail": "Invalid country parameter"},
+        )
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(
+            side_effect=httpx.HTTPStatusError(
+                "Unprocessable Entity",
+                request=request,
+                response=rejected,
+            )
+        )
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            result = await backend.search("query", options={"country": "ALL"})
+
+        assert backend._get.await_count == 1
+        assert result.is_error is True
+        assert result.metadata["http_status"] == 422
+
+    @pytest.mark.asyncio()
+    async def test_search_country_fallback_retries_only_once(self) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+        rejected = httpx.Response(
+            422,
+            request=request,
+            json={"detail": "Invalid country parameter"},
+        )
+        error = httpx.HTTPStatusError(
+            "Unprocessable Entity",
+            request=request,
+            response=rejected,
+        )
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(side_effect=[error, error])
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            result = await backend.search("query", options={"country": "DE"})
+
+        assert backend._get.await_count == 2
+        assert backend._get.await_args_list[1].args[1]["country"] == "ALL"
+        assert result.is_error is True
+        assert result.metadata["http_status"] == 422
+
+    def test_brave_rate_limit_error_keeps_status_and_bounded_detail(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _brave_http_error_result
+
+        request = httpx.Request("GET", "https://api.search.brave.com/res/v1/web/search")
+        response = httpx.Response(
+            429,
+            request=request,
+            json={"detail": "x" * 400},
+        )
+        result = _brave_http_error_result(
+            httpx.HTTPStatusError(
+                "Too Many Requests",
+                request=request,
+                response=response,
+            )
+        )
+
+        assert result.is_error is True
+        assert result.output.startswith("Brave Search rate limit exceeded.")
+        assert result.metadata["http_status"] == 429
+        assert (
+            len(result.output) <= len("Brave Search rate limit exceeded. Try again later. — ") + 300
+        )
+
+    @pytest.mark.asyncio()
+    async def test_image_search_maps_shared_moderate_safesearch_to_strict(self) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(return_value={"results": []})
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            await backend.search(
+                "mountain lake",
+                options={"search_mode": "images", "safesearch": "moderate"},
+            )
+
+        params = backend._get.await_args.args[1]
+        assert params["safesearch"] == "strict"
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize("safesearch", ["off", "strict"])
+    async def test_image_search_preserves_supported_safesearch(
+        self,
+        safesearch: str,
+    ) -> None:
+        from cognis.tools.executor.web.backends import brave as brave_module
+        from cognis.tools.executor.web.backends.brave import BraveBackend
+
+        backend = BraveBackend(api_key="test")
+        backend._get = AsyncMock(return_value={"results": []})
+
+        async def _call(fn):
+            return await fn()
+
+        with patch.object(brave_module._breaker, "call", new=AsyncMock(side_effect=_call)):
+            await backend.search(
+                "mountain lake",
+                options={"search_mode": "images", "safesearch": safesearch},
+            )
+
+        params = backend._get.await_args.args[1]
+        assert params["safesearch"] == safesearch
+
+    def test_brave_image_mode_returns_media_artifact(self) -> None:
+        from cognis.tools.executor.web.backends.brave import _format_brave_results
+
+        result = _format_brave_results(
+            {
+                "results": [
+                    {
+                        "title": "Lake",
+                        "url": "https://example.com/lake",
+                        "properties": {"url": "https://cdn.example.com/lake.jpg"},
+                    }
+                ]
+            },
+            mode="images",
+        )
+
+        assert "[[media:1]]" in result.output
+        assert "[[result:1]]" not in result.output
+
 
 class TestRetryLogic:
     """Test the retry and error handling in fetch_with_retry."""
@@ -1494,7 +2396,10 @@ class TestRetryLogic:
 
         with patch("cognis.tools.executor.web.headers.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.get.return_value = mock_response
+            stream_context = MagicMock()
+            stream_context.__aenter__ = AsyncMock(return_value=mock_response)
+            stream_context.__aexit__ = AsyncMock(return_value=None)
+            mock_client.stream = MagicMock(return_value=stream_context)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_cls.return_value = mock_client
@@ -1519,7 +2424,10 @@ class TestRetryLogic:
 
         with patch("cognis.tools.executor.web.headers.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
-            mock_client.get.return_value = mock_response
+            stream_context = MagicMock()
+            stream_context.__aenter__ = AsyncMock(return_value=mock_response)
+            stream_context.__aexit__ = AsyncMock(return_value=None)
+            mock_client.stream = MagicMock(return_value=stream_context)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_cls.return_value = mock_client
@@ -1533,6 +2441,32 @@ class TestRetryLogic:
                 "cloudflare_blocked": True,
                 "direct_fetch_blocked": True,
             }
+
+    @pytest.mark.asyncio()
+    async def test_streaming_fetch_rejects_oversized_content_length(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from cognis.tools.executor.web.headers import fetch_with_retry
+
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-length": "1000"},
+                request=request,
+            )
+        )
+        client = httpx.AsyncClient(transport=transport)
+        monkeypatch.setattr("cognis.tools.executor.web.headers._MAX_RESPONSE_SIZE", 100)
+        with patch(
+            "cognis.tools.executor.web.headers.httpx.AsyncClient",
+            return_value=client,
+        ):
+            result = await fetch_with_retry("https://example.com", max_retries=1)
+        assert isinstance(result, ToolResult)
+        assert result.is_error
+        assert result.metadata["failure_category"] == "response_too_large"
+        assert result.metadata["source_limit_bytes"] == 100
 
 
 class TestSettingsSchema:

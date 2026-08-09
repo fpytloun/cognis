@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -128,6 +129,18 @@ class _CountingLLM:
         return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
 
 
+class _BlockingClassifierLLM(_CountingLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def generate(self, messages, **kwargs):
+        self.started.set()
+        await self.release.wait()
+        return await super().generate(messages, **kwargs)
+
+
 class _OwnerScopedCacheLLM:
     def __init__(self) -> None:
         self.calls: list[str | None] = []
@@ -237,6 +250,102 @@ async def _process_due_classifications_once(queue: ToolClassificationQueue) -> N
     claimed = await queue._claim_due_items(10)
     assert claimed
     await queue._process_batch(claimed, asyncio.Semaphore(1))
+
+
+@pytest.mark.asyncio
+async def test_old_classifier_result_cannot_overwrite_new_fingerprint(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classification-fence.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    tool = _dynamic_tool()
+    queue = ToolClassificationQueue(session_factory=session_factory, llm_provider=_CountingLLM())
+    await queue.enqueue_tools([tool], owner_email=None)
+    claimed = await queue._claim_due_items(1)
+    assert len(claimed) == 1
+
+    replacement = tool.model_copy(update={"description": "Changed tool description"})
+    await queue.enqueue_tools([replacement], owner_email=None)
+    await queue._process_batch(claimed, asyncio.Semaphore(1))
+
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(ToolClassificationRow))
+        assert row is not None
+        assert row.fingerprint == tool_fingerprint(replacement)
+        assert row.status == "pending"
+        assert row.category is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_slow_classifier_claim_is_renewed_across_workers(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classification-renew.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    llm = _BlockingClassifierLLM()
+    first = ToolClassificationQueue(
+        session_factory=session_factory, llm_provider=llm, lease_seconds=1
+    )
+    second = ToolClassificationQueue(
+        session_factory=session_factory, llm_provider=_CountingLLM(), lease_seconds=1
+    )
+    tool = _dynamic_tool_named("mcp_github__slow_search", "slow/search")
+    await first.enqueue_tools([tool], owner_email=None)
+    claimed = await first._claim_due_items(1)
+    processing = asyncio.create_task(first._process_batch(claimed, asyncio.Semaphore(1)))
+    await llm.started.wait()
+    await asyncio.sleep(1.2)
+
+    assert await second._claim_due_items(1) == []
+    llm.release.set()
+    await processing
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(ToolClassificationRow))
+        assert row is not None
+        assert row.status == "ready"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_classifier_renewal_loss_leaves_claim_recoverable(tmp_path):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classification-renew-loss.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+    llm = _BlockingClassifierLLM()
+    first = ToolClassificationQueue(
+        session_factory=session_factory, llm_provider=llm, lease_seconds=1
+    )
+    tool = _dynamic_tool_named("mcp_github__renew_loss", "renew/loss")
+    await first.enqueue_tools([tool], owner_email=None)
+    claimed = await first._claim_due_items(1)
+
+    async def lose_ownership(items, stop, ownership_lost):
+        del items, stop
+        await llm.started.wait()
+        ownership_lost.set()
+
+    first._renew_claims = lose_ownership
+    processing = asyncio.create_task(first._process_batch(claimed, asyncio.Semaphore(1)))
+    await llm.started.wait()
+    llm.release.set()
+    await processing
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(ToolClassificationRow))
+        assert row is not None
+        assert row.status == "running"
+        row.last_attempt_at = row.last_attempt_at - timedelta(seconds=2)
+        await session.commit()
+
+    second = ToolClassificationQueue(
+        session_factory=session_factory, llm_provider=_CountingLLM(), lease_seconds=1
+    )
+    reclaimed = await second._claim_due_items(1)
+    assert len(reclaimed) == 1
+    await second._process_batch(reclaimed, asyncio.Semaphore(1))
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(ToolClassificationRow))
+        assert row is not None
+        assert row.status == "ready"
+    await engine.dispose()
 
 
 @pytest.mark.asyncio

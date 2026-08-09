@@ -18,6 +18,9 @@
 DOCKER_COMPOSE := $(shell which docker-compose 2>/dev/null || echo "docker compose")
 COMPOSE_BASE := $(DOCKER_COMPOSE) -f compose.local.yml
 COMPOSE_E2E  := $(COMPOSE_BASE) -f compose.e2e.yml
+HA_E2E_PROJECT ?= cognis-ha-e2e
+COMPOSE_HA_E2E := $(DOCKER_COMPOSE) --project-name $(HA_E2E_PROJECT) --env-file .local/cognis-ha-e2e/current/compose.env -f compose.local.yml -f compose.e2e.yml -f compose.ha-e2e.yml
+COMPOSE_REDIS_HA_E2E := $(COMPOSE_HA_E2E) -f compose.redis-ha-e2e.yml
 PYTHON ?= python3
 
 # ---------------------------------------------------------------------------
@@ -142,6 +145,47 @@ test-ui:
 lint:
 	uv run ruff check cognis/ tests/
 	uv run ruff format --check cognis/ tests/
+
+.PHONY: deployment-validate
+deployment-validate:
+	./scripts/validate_deployment.sh
+
+.PHONY: ha-e2e-prepare
+ha-e2e-prepare:
+	uv run python scripts/prepare_ha_e2e.py
+
+.PHONY: ha-e2e-up
+ha-e2e-up: ha-e2e-prepare
+	$(COMPOSE_HA_E2E) up -d --build
+
+.PHONY: ha-e2e-down
+ha-e2e-down:
+	$(COMPOSE_HA_E2E) down
+
+.PHONY: redis-ha-e2e-up
+redis-ha-e2e-up: ha-e2e-prepare
+	$(COMPOSE_REDIS_HA_E2E) up -d --build
+
+.PHONY: redis-ha-e2e-down
+redis-ha-e2e-down:
+	$(COMPOSE_REDIS_HA_E2E) down
+
+.PHONY: redis-ha-e2e-clean
+redis-ha-e2e-clean:
+	$(COMPOSE_REDIS_HA_E2E) down --volumes --remove-orphans
+
+.PHONY: redis-ha-e2e-config
+redis-ha-e2e-config: ha-e2e-prepare
+	$(COMPOSE_REDIS_HA_E2E) config
+
+.PHONY: redis-ha-e2e-qualify
+redis-ha-e2e-qualify:
+	COGNIS_REDIS_HA_E2E_URL=http://localhost:$${COGNIS_HA_E2E_PORT:-18080} \
+		uv run pytest tests/e2e/test_redis_ha_live.py -m e2e -v --tb=short
+
+.PHONY: ha-e2e-qualify
+ha-e2e-qualify:
+	./scripts/qualify_ha_e2e.sh
 
 .PHONY: typecheck
 typecheck:

@@ -132,6 +132,40 @@ Put Cognis behind a reverse proxy for public deployments. The proxy should suppo
 
 Remote executors should connect to `wss://<host>/api/executor/ws`.
 
+## Kubernetes and high availability
+
+The Helm chart at [`deploy/helm/cognis`](../../deploy/helm/cognis/) supports the
+same image in simple, production single-replica, and HA configurations. HA uses
+two or more controllers behind one public Service and Ingress; a headless
+Service exists only for controller discovery.
+
+HA requires PostgreSQL, S3-compatible artifact and tool-output storage, shared
+external crypto/signing material, and a successful migration Job. Redis remains
+optional and is configured only through `COGNIS_REDIS_URL`. It is recommended
+for full realtime multi-controller UX and lower Intaris read amplification, but
+is not part of readiness or correctness. The supported Redis-free profile shows
+remote durable progress and recovers final canonical content from Intaris; the
+Redis-enabled profile additionally relays volatile runtime detail and shares the
+raw event cache. See [High availability](high-availability.md).
+
+Canonical event-cache retention and compression are configurable independently
+of the Redis URL. Defaults keep hot conversations warm for one sliding hour and
+compress JSON values of at least 64 KiB before applying the 2 MiB stored-value
+limit:
+
+```text
+COGNIS_EVENT_CACHE_TTL_SECONDS=3600
+COGNIS_EVENT_CACHE_SLIDING_TTL=true
+COGNIS_EVENT_CACHE_COMPRESSION_ENABLED=true
+COGNIS_EVENT_CACHE_COMPRESSION_THRESHOLD_BYTES=65536
+COGNIS_EVENT_CACHE_MAX_VALUE_BYTES=2097152
+```
+
+Compression uses a bounded versioned wire format and a hard 16 MiB
+decompressed-value limit. Disabling Redis retains the configured local L1
+policy; Redis and codec failures remain cache misses rather than readiness or
+request failures.
+
 ## Multi-user hardening
 
 For shared deployments, prefer WebSocket executors and disable local executor modes:
@@ -159,13 +193,22 @@ The secrets encryption key is required to decrypt stored secrets. Losing it make
 
 ## Upgrades
 
-Cognis runs schema bootstrap on startup for normal deployments. Alembic migrations are kept for formal migration history and rollback workflows.
+Simple mode runs schema bootstrap on startup. Production can instead run
+`cognis-controller db upgrade` before starting with
+`COGNIS_SCHEMA_MODE=validate`. HA requires that migration/validation split.
+
+Revision `110_conversation_lineage` is additive. It backfills only canonical
+top-level fork/task provenance and adds owner-scoped lookup indexes. Apply it
+before controllers aggregate transitive Work evidence.
 
 Before upgrading production:
 
 - back up Cognis, Mnemory, and Intaris data
 - review release notes for schema or executor changes
 - restart executors after controller upgrades when tool schemas or browser settings changed
+
+Helm rollback does not reverse a completed database migration. Use
+expand-contract migrations so old and new controllers can overlap safely.
 
 ## Systemd
 

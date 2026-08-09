@@ -747,6 +747,18 @@ def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path:
                 return schedule.schedule_id
 
         schedule_id = asyncio.run(_seed())
+        original_trigger_now = app.state.scheduler.trigger_now
+        trigger_now_calls: list[str] = []
+
+        async def _trigger_now(schedule_id: str) -> str | None:
+            trigger_now_calls.append(schedule_id)
+            return await original_trigger_now(schedule_id)
+
+        async def _private_fire_must_not_run(_schedule_id: str) -> str | None:
+            raise AssertionError("API manual trigger used _fire_schedule")
+
+        app.state.scheduler.trigger_now = _trigger_now
+        app.state.scheduler._fire_schedule = _private_fire_must_not_run
 
         response = client.post(
             f"/api/v1/schedules/{schedule_id}/trigger",
@@ -758,6 +770,7 @@ def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path:
         assert body["task_id"].startswith("task_")
         assert body["schedule_id"] == schedule_id
         assert body["last_run_status"] in {"queued", "ready", "running"}
+        assert trigger_now_calls == [schedule_id]
 
         async def _load_task_profile(task_id: str) -> str | None:
             async with app.state.session_factory() as session:

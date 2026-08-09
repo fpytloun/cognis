@@ -102,6 +102,8 @@ def test_bootstrap_uses_timezone_aware_postgres_refresh_timestamps(
     monkeypatch.setattr(MCPOAuthTransactionRow.__table__, "create", lambda *_args, **_kwargs: None)
     for index in MCPOAuthTokenRow.__table__.indexes:
         monkeypatch.setattr(index, "create", lambda *_args, **_kwargs: None)
+    for index in MCPOAuthTransactionRow.__table__.indexes:
+        monkeypatch.setattr(index, "create", lambda *_args, **_kwargs: None)
 
     bootstrap_module._ensure_mcp_oauth_schema(connection)
 
@@ -805,9 +807,13 @@ class _MemorySession:
         self.token = token
         self.server = server
         self.commits = 0
+        self.rollbacks = 0
 
     async def commit(self) -> None:
         self.commits += 1
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
 
     async def flush(self) -> None:
         return None
@@ -1373,8 +1379,9 @@ async def test_executor_loopback_callback_rejects_executor_mismatch(
 ) -> None:
     key_path = tmp_path / "key"
     key_path.write_bytes(base64.urlsafe_b64encode(b"2" * 32))
+    memory_session = _MemorySession()
     service = MCPOAuthService(
-        session_factory=_MemorySessionFactory(_MemorySession()),
+        session_factory=_MemorySessionFactory(memory_session),
         key_path=str(key_path),
         public_base_url="https://cognis.example",
     )
@@ -1402,6 +1409,7 @@ async def test_executor_loopback_callback_rejects_executor_mismatch(
         user_email="alice@example.com",
         redirect_uri="http://127.0.0.1:4567/oauth/callback",
         client_id="client",
+        issuer="https://issuer.example",
         resource=None,
         scopes=[],
     )
@@ -1428,7 +1436,12 @@ async def test_executor_loopback_callback_rejects_executor_mismatch(
     monkeypatch.setattr(
         service,
         "discover_metadata",
-        AsyncMock(return_value={"issuer": "https://issuer.example", "token_endpoint": "x"}),
+        AsyncMock(
+            return_value={
+                "issuer": "https://issuer.example",
+                "token_endpoint": "http://127.0.0.1/token",
+            }
+        ),
     )
 
     with pytest.raises(MCPOAuthError, match="executor mismatch"):
@@ -1465,6 +1478,367 @@ async def test_executor_loopback_callback_rejects_executor_mismatch(
             error="access_denied",
         )
     assert row.status == "completed"
+
+    row.status = "pending"
+    row.used_at = None
+    exchange_started = asyncio.Event()
+
+    async def blocked_exchange(**_kwargs):
+        exchange_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_exchange_code", blocked_exchange)
+    callback = asyncio.create_task(
+        service.complete_loopback_callback(
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code="code",
+        )
+    )
+    exchange_waiter = asyncio.create_task(exchange_started.wait())
+    done, _pending = await asyncio.wait(
+        {callback, exchange_waiter},
+        timeout=1.0,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if callback in done:
+        await callback
+    assert exchange_waiter in done
+    assert row.status == "exchanging"
+    callback.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await callback
+    assert row.status == "failed"
+    assert row.error_code == "callback_cancelled"
+
+    row.status = "pending"
+    row.used_at = None
+    admission_commit_started = asyncio.Event()
+    original_commit = memory_session.commit
+    block_commit_once = True
+
+    async def blocked_admission_commit() -> None:
+        nonlocal block_commit_once
+        if block_commit_once:
+            block_commit_once = False
+            admission_commit_started.set()
+            await asyncio.Event().wait()
+        await original_commit()
+
+    monkeypatch.setattr(memory_session, "commit", blocked_admission_commit)
+    callback = asyncio.create_task(
+        service.complete_loopback_callback(
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code="code",
+        )
+    )
+    await asyncio.wait_for(admission_commit_started.wait(), timeout=1.0)
+    callback.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await callback
+    assert row.status != "exchanging"
+
+    row.status = "pending"
+    row.used_at = None
+    monkeypatch.setattr(
+        service,
+        "_exchange_code",
+        AsyncMock(
+            return_value={
+                "access_token": "stale-access-token",
+                "token_type": "Bearer",
+                "expires_in": 900,
+            }
+        ),
+    )
+    ownership_check = AsyncMock(side_effect=[True, False, False])
+    monkeypatch.setattr(
+        "cognis.core.executor_connection_ownership.ExecutorConnectionOwnership.lock_current",
+        ownership_check,
+    )
+    upsert = AsyncMock()
+    monkeypatch.setattr("cognis.core.mcp_oauth.upsert_mcp_oauth_token", upsert)
+
+    with pytest.raises(MCPOAuthError, match="ownership changed"):
+        await service.complete_loopback_callback(
+            connection_owner=object(),
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code="code",
+        )
+
+    upsert.assert_not_awaited()
+    assert row.status != "completed"
+
+    notification_mutations: list[str] = []
+
+    async def guarded_notification_resolve(
+        _notification_id,
+        decision,
+        _data,
+        *,
+        admission_guard=None,
+    ):
+        if admission_guard is not None and not await admission_guard(memory_session):
+            return False
+        notification_mutations.append(decision)
+        return True
+
+    service._notification_service = SimpleNamespace(  # noqa: SLF001
+        resolve_internal=guarded_notification_resolve
+    )
+    row.notification_id = "notif-1"
+    row.status = "pending"
+    row.used_at = None
+    row.error_code = None
+    row.error_description = None
+    exchange_started = asyncio.Event()
+
+    async def blocked_owned_exchange(**_kwargs):
+        exchange_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(service, "_exchange_code", blocked_owned_exchange)
+    cancellation_owner_checks = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(
+        "cognis.core.executor_connection_ownership.ExecutorConnectionOwnership.lock_current",
+        cancellation_owner_checks,
+    )
+    upsert.reset_mock()
+    callback = asyncio.create_task(
+        service.complete_loopback_callback(
+            connection_owner=object(),
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code="code",
+        )
+    )
+    await asyncio.wait_for(exchange_started.wait(), timeout=1.0)
+    callback.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await callback
+
+    upsert.assert_not_awaited()
+    assert row.status == "exchanging"
+    assert row.error_code is None
+    assert notification_mutations == []
+
+    row.status = "pending"
+    row.used_at = None
+    row.error_code = None
+    row.error_description = None
+    final_upsert_started = asyncio.Event()
+
+    async def blocked_final_upsert(*_args, **_kwargs):
+        final_upsert_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        service,
+        "_exchange_code",
+        AsyncMock(
+            return_value={
+                "access_token": "current-access-token",
+                "token_type": "Bearer",
+                "expires_in": 900,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.core.executor_connection_ownership.ExecutorConnectionOwnership.lock_current",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "cognis.core.mcp_oauth.upsert_mcp_oauth_token",
+        blocked_final_upsert,
+    )
+    rollback_count = memory_session.rollbacks
+    callback = asyncio.create_task(
+        service.complete_loopback_callback(
+            connection_owner=object(),
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code="code",
+        )
+    )
+    await asyncio.wait_for(final_upsert_started.wait(), timeout=1.0)
+    callback.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(callback, timeout=1.0)
+
+    assert memory_session.rollbacks > rollback_count
+    assert row.status == "failed"
+    assert row.error_code == "callback_cancelled"
+    assert notification_mutations == []
+
+    row.status = "pending"
+    row.used_at = None
+    upsert = AsyncMock()
+    monkeypatch.setattr("cognis.core.mcp_oauth.upsert_mcp_oauth_token", upsert)
+    monkeypatch.setattr(
+        service,
+        "_exchange_code",
+        AsyncMock(
+            return_value={
+                "access_token": "current-access-token",
+                "token_type": "Bearer",
+                "expires_in": 900,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "cognis.core.executor_connection_ownership.ExecutorConnectionOwnership.lock_current",
+        AsyncMock(side_effect=[True, True, False, False]),
+    )
+    upsert.reset_mock()
+
+    await service.complete_loopback_callback(
+        connection_owner=object(),
+        executor_id="exec-1",
+        listener_id="listener-1",
+        redirect_uri="http://127.0.0.1:4567/oauth/callback",
+        state=state,
+        code="code",
+    )
+
+    upsert.assert_awaited_once()
+    assert row.status == "completed"
+    assert notification_mutations == []
+
+    row.status = "pending"
+    row.used_at = None
+    row.error_code = None
+    row.error_description = None
+    monkeypatch.setattr(
+        "cognis.core.executor_connection_ownership.ExecutorConnectionOwnership.lock_current",
+        AsyncMock(return_value=False),
+    )
+    with pytest.raises(MCPOAuthError, match="ownership changed"):
+        await service.complete_loopback_callback(
+            connection_owner=object(),
+            executor_id="exec-1",
+            listener_id="listener-1",
+            redirect_uri="http://127.0.0.1:4567/oauth/callback",
+            state=state,
+            code=None,
+            error="access_denied",
+        )
+    assert row.status == "pending"
+    assert row.error_code is None
+    assert notification_mutations == []
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+@pytest.mark.asyncio
+async def test_terminal_callback_cleanup_recovers_once_for_current_owner(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_status: str,
+) -> None:
+    key_path = tmp_path / "key"
+    key_path.write_bytes(base64.urlsafe_b64encode(b"7" * 32))
+    session = _MemorySession()
+    owner = object()
+    notification_resolutions: list[str] = []
+    generation_bumps: list[str] = []
+    notification_service = SimpleNamespace()
+
+    async def resolve_internal(
+        _notification_id,
+        decision,
+        _data,
+        *,
+        admission_guard=None,
+    ):
+        assert admission_guard is not None
+        assert await admission_guard(session)
+        notification_resolutions.append(decision)
+        return True
+
+    notification_service.resolve_internal = resolve_internal
+    service = MCPOAuthService(
+        session_factory=_MemorySessionFactory(session),
+        key_path=str(key_path),
+        public_base_url="https://cognis.example",
+        notification_service=notification_service,
+        executor_provider=SimpleNamespace(
+            get_connection=lambda _executor_id: SimpleNamespace(connection_owner=owner)
+        ),
+    )
+    row = SimpleNamespace(
+        transaction_id=f"txn-{terminal_status}",
+        status=terminal_status,
+        terminal_cleanup_required=True,
+        notification_id=f"notif-{terminal_status}",
+        terminal_notification_resolved_at=None,
+        terminal_reconfigure_applied_at=None,
+        terminal_reconfigure_completed_at=None,
+        encrypted_payload=service._encrypt(
+            {
+                "callback_mode": "executor_loopback",
+                "oauth_executor_id": "exec-1",
+            }
+        ),
+        updated_at=datetime.now(UTC),
+    )
+
+    async def fake_list_cleanup(_session):
+        return [row]
+
+    async def fake_get_transaction(_session, transaction_id):
+        assert transaction_id == row.transaction_id
+        return row
+
+    async def apply_generation(
+        transaction_id,
+        *,
+        admission_guard=None,
+        terminal_cleanup=False,
+    ):
+        assert transaction_id == row.transaction_id
+        assert admission_guard is not None
+        assert terminal_cleanup is True
+        assert await admission_guard(session)
+        if row.terminal_reconfigure_applied_at is None:
+            generation_bumps.append(transaction_id)
+            row.terminal_reconfigure_applied_at = datetime.now(UTC)
+        row.terminal_reconfigure_completed_at = datetime.now(UTC)
+
+    service._on_authorization_completed = apply_generation
+    monkeypatch.setattr(
+        "cognis.core.mcp_oauth.list_mcp_oauth_transactions_pending_terminal_cleanup",
+        fake_list_cleanup,
+    )
+    monkeypatch.setattr(
+        "cognis.core.mcp_oauth.get_mcp_oauth_transaction",
+        fake_get_transaction,
+    )
+    monkeypatch.setattr(
+        "cognis.core.executor_connection_ownership.ExecutorConnectionOwnership.lock_current",
+        AsyncMock(return_value=True),
+    )
+
+    first = await service.recover_terminal_callback_cleanup()
+    second = await service.recover_terminal_callback_cleanup()
+
+    assert first == 1
+    assert second == 1
+    assert notification_resolutions == ["completed" if terminal_status == "completed" else "failed"]
+    assert generation_bumps == [row.transaction_id]
+    assert row.terminal_notification_resolved_at is not None
+    assert row.terminal_reconfigure_applied_at is not None
+    assert row.terminal_reconfigure_completed_at is not None
 
 
 @pytest.mark.asyncio
@@ -1591,6 +1965,7 @@ def test_app_lifespan_wires_mcp_oauth_recovery_and_shutdown() -> None:
 
     assert "on_authorization_completed=_on_mcp_oauth_completed" in source
     assert "await mcp_oauth_service.recover_pending_device_authorizations()" in source
+    assert "await mcp_oauth_service.recover_terminal_callback_cleanup()" in source
     assert "await mcp_oauth_service.shutdown()" in source
 
 
@@ -3168,6 +3543,7 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     class _Executor:
         executor_id = "olorin"
         desired_config_version = 4
+        applied_config_version = 4
 
     class _Session:
         committed = False
@@ -3181,16 +3557,40 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         async def commit(self) -> None:
             self.committed = True
 
+        async def rollback(self) -> None:
+            return None
+
+        async def scalar(self, _statement: object) -> object:
+            return cleanup_transaction
+
     session = _Session()
+    cleanup_transaction = SimpleNamespace(
+        status="completed",
+        terminal_cleanup_required=True,
+        terminal_reconfigure_applied_at=None,
+        terminal_reconfigure_completed_at=None,
+    )
+    executor = _Executor()
     runtime_updates = []
     scheduled = []
+    inject_late_generation = False
 
-    async def fake_list_executors(_session: object, server_id: str) -> list[_Executor]:
+    async def fake_list_executors(
+        _session: object,
+        server_id: str,
+        *,
+        for_update: bool = False,
+    ) -> list[_Executor]:
+        nonlocal inject_late_generation
+        if for_update and inject_late_generation:
+            inject_late_generation = False
+            executor.desired_config_version += 1
         assert server_id == "mcp-1"
-        return [_Executor()]
+        return [executor]
 
     async def fake_bump_runtime(_session: object, executor_id: str, *, runtime_state: str) -> bool:
         runtime_updates.append((executor_id, runtime_state))
+        executor.desired_config_version += 1
         return True
 
     monkeypatch.setattr(
@@ -3224,6 +3624,110 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     assert session.committed is True
     assert scheduled == ["olorin"]
     assert result == ["olorin"]
+
+    runtime_updates.clear()
+    scheduled.clear()
+    result = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="stale-callback",
+        admission_guard=AsyncMock(return_value=False),
+    )
+
+    assert result is None
+    assert runtime_updates == []
+    assert scheduled == []
+
+    result = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="terminal-cleanup",
+        terminal_cleanup_transaction_id="txn-1",
+    )
+    assert cleanup_transaction.terminal_reconfigure_completed_at is None
+    executor.applied_config_version = executor.desired_config_version
+    repeated = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="terminal-cleanup-retry",
+        terminal_cleanup_transaction_id="txn-1",
+    )
+
+    assert result == ["olorin"]
+    assert repeated == []
+    assert runtime_updates == [("olorin", "reconfiguring")]
+    assert scheduled == ["olorin"]
+    assert cleanup_transaction.terminal_reconfigure_applied_at is not None
+    assert cleanup_transaction.terminal_reconfigure_completed_at is not None
+
+    cleanup_transaction.terminal_reconfigure_applied_at = None
+    cleanup_transaction.terminal_reconfigure_completed_at = None
+    executor.desired_config_version = 4
+    executor.applied_config_version = 4
+    runtime_updates.clear()
+    scheduled.clear()
+
+    def crash_before_schedule(_app: object, _executor_id: str) -> None:
+        raise RuntimeError("controller crashed before dispatch")
+
+    monkeypatch.setattr(
+        "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
+        crash_before_schedule,
+    )
+    with pytest.raises(RuntimeError, match="crashed before dispatch"):
+        await schedule_mcp_server_executor_reconfigure_for_app(
+            app,
+            server_id="mcp-1",
+            reason="terminal-cleanup-crash",
+            terminal_cleanup_transaction_id="txn-1",
+        )
+
+    assert cleanup_transaction.terminal_reconfigure_applied_at is not None
+    assert cleanup_transaction.terminal_reconfigure_completed_at is None
+    assert executor.desired_config_version == 5
+    assert runtime_updates == [("olorin", "reconfiguring")]
+
+    monkeypatch.setattr(
+        "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
+        lambda _app, executor_id: scheduled.append(executor_id),
+    )
+    recovered = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="terminal-cleanup-recovery",
+        terminal_cleanup_transaction_id="txn-1",
+    )
+    assert cleanup_transaction.terminal_reconfigure_completed_at is None
+    executor.applied_config_version = executor.desired_config_version
+    inject_late_generation = True
+    late_recovery = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="terminal-cleanup-late-generation",
+        terminal_cleanup_transaction_id="txn-1",
+    )
+    assert cleanup_transaction.terminal_reconfigure_completed_at is None
+    executor.applied_config_version = executor.desired_config_version
+    completed = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="terminal-cleanup-reconcile-evidence",
+        terminal_cleanup_transaction_id="txn-1",
+    )
+    repeated = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="terminal-cleanup-recovery-retry",
+        terminal_cleanup_transaction_id="txn-1",
+    )
+
+    assert recovered == ["olorin"]
+    assert late_recovery == ["olorin"]
+    assert completed == []
+    assert repeated == []
+    assert runtime_updates == [("olorin", "reconfiguring")]
+    assert scheduled == ["olorin", "olorin"]
+    assert cleanup_transaction.terminal_reconfigure_completed_at is not None
 
 
 @pytest.mark.asyncio
@@ -3276,6 +3780,27 @@ async def test_oauth_completion_schedules_reconfigure_and_emits_status(
         }
     ]
     assert emitted_status == [{"user_email": "alice@example.com", "server_id": "mcp-1"}]
+
+    scheduled.clear()
+    emitted_status.clear()
+
+    async def reject_stale_owner(_app: object, **kwargs: object) -> None:
+        scheduled.append(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        "cognis.api.routes.mcp_oauth.schedule_mcp_server_executor_reconfigure_for_app",
+        reject_stale_owner,
+    )
+    await schedule_mcp_executor_reconfigure_for_app(
+        app,
+        transaction_id="txn-1",
+        admission_guard=AsyncMock(return_value=False),
+        terminal_cleanup=True,
+    )
+
+    assert len(scheduled) == 1
+    assert emitted_status == []
 
 
 @pytest.mark.asyncio

@@ -165,7 +165,7 @@ def test_runtime_profile_crud_clear_default_and_audit_sanitization(tmp_path: Pat
             },
         )
         assert deleted["status"] == "deleted"
-        assert len(event_bus.events) == 5
+        assert event_bus.events == []
         async with deps.session_factory() as session:
             audit_rows = (await session.execute(AuditLog.__table__.select())).all()
         assert all("never store this in audit" not in str(row) for row in audit_rows)

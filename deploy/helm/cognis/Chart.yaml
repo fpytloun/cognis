@@ -1,0 +1,9 @@
+apiVersion: v2
+name: cognis
+description: Cognis controller deployment for simple, production, and HA modes
+type: application
+version: 0.1.0
+appVersion: "0.13.0"
+home: https://github.com/fpytloun/cognis
+sources:
+  - https://github.com/fpytloun/cognis

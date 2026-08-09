@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="880" viewBox="0 0 1160 880" font-family="Inter, system-ui, sans-serif">
+  <defs>
+    <style>
+      .bg{fill:#0b1220}.panel{fill:#111a26;stroke:#26323f;stroke-width:1.5}
+      .sub{fill:#0e1722;stroke:#22303c;stroke-width:1}
+      .t{fill:#d5dee7}.m{fill:#7d8b99}.ac{fill:#38bdf8}
+      .acbg{fill:#0f2333;stroke:#38bdf8;stroke-width:1.5}
+      .att{fill:#241c0d;stroke:#f5b544;stroke-width:2}
+      .amber{fill:#f5b544}.danger{fill:#f2657f}.ok{fill:#4fd1a5}
+      .h{fill:#8fb7cf;font-weight:700;letter-spacing:1.5px}.lbl{fill:#d5dee7;font-weight:600}.cap{fill:#7d8b99}
+      .callout{fill:#f5b544}.cnum{fill:#0b1220;font-weight:700}.note{fill:#9fb0be}
+      .pribtn{fill:#38bdf8}
+    </style>
+  </defs>
+  <rect class="bg" width="1160" height="880"/>
+  <text x="28" y="34" class="t" font-size="18" font-weight="700">02 · Task Cockpit — ACTION REQUIRED (desktop ≥ lg)</text>
+  <text x="28" y="54" class="m" font-size="12">State: PAUSED at a gate. ONE unified Attention/Decision panel is the hero. Fixes the current triple-composer duplication.</text>
+
+  <!-- HEADER -->
+  <rect x="28" y="70" width="800" height="80" class="panel" rx="10"/>
+  <text x="44" y="98" class="h" font-size="10">TASK COCKPIT</text>
+  <text x="44" y="122" class="t" font-size="18" font-weight="700">Release safety review</text>
+  <text x="44" y="142" class="m" font-size="11">agent-stage39 · Release review · Attempt #1</text>
+  <rect x="686" y="82" width="64" height="24" rx="12" class="att"/><text x="698" y="98" class="amber" font-size="11" font-weight="700">PAUSED</text>
+  <rect x="600" y="116" width="150" height="30" rx="8" class="att"/><text x="614" y="136" class="amber" font-size="11" font-weight="700">▲ Review the gate</text>
+  <rect x="756" y="116" width="34" height="30" rx="8" class="sub"/><text x="767" y="136" class="m" font-size="13">···</text>
+  <circle cx="806" cy="131" r="10" class="callout"/><text x="802" y="135" class="cnum" font-size="11">1</text>
+
+  <!-- OBJECTIVE (condensed) -->
+  <rect x="28" y="160" width="800" height="44" class="panel" rx="10"/>
+  <text x="44" y="187" class="cap" font-size="11">Objective: verify the deterministic release workflow and approve the production handoff. ▸ details</text>
+
+  <!-- ATTENTION HERO -->
+  <rect x="28" y="214" width="800" height="330" class="att" rx="12"/>
+  <text x="44" y="240" class="amber" font-size="11" font-weight="700" letter-spacing="1.5">ACTION REQUIRED · WORKFLOW GATE</text>
+  <text x="44" y="266" class="t" font-size="17" font-weight="700">Approve this release for production?</text>
+  <text x="44" y="288" class="cap" font-size="12">Review the latest attempt, give optional guidance, then continue or stop the workflow.</text>
+
+  <!-- evidence-at-decision: inline result/work summary so user can decide without leaving -->
+  <rect x="44" y="300" width="768" height="86" class="sub" rx="8"/>
+  <text x="60" y="322" class="h" font-size="10">WHAT THE AGENT PRODUCED (decide with evidence, in place)</text>
+  <text x="60" y="343" class="t" font-size="12">✓ Deterministic checks passed · 12 tests passed · 1 file changed (release/manifest.yaml: candidate → approved)</text>
+  <rect x="60" y="352" width="120" height="26" rx="7" class="acbg"/><text x="76" y="369" class="ac" font-size="10">View diff</text>
+  <rect x="188" y="352" width="150" height="26" rx="7" class="acbg"/><text x="204" y="369" class="ac" font-size="10">Open Work / Chat →</text>
+  <circle cx="806" cy="343" r="10" class="callout"/><text x="802" y="347" class="cnum" font-size="11">2</text>
+
+  <!-- single optional instruction -->
+  <text x="44" y="410" class="lbl" font-size="12">Optional instruction for the next attempt</text>
+  <rect x="44" y="418" width="768" height="52" class="panel" rx="8"/>
+  <text x="58" y="448" class="m" font-size="11">e.g. "Approve, but tighten the final summary and validate edge cases before finishing."</text>
+  <circle cx="806" cy="444" r="10" class="callout"/><text x="802" y="448" class="cnum" font-size="11">3</text>
+
+  <!-- decision buttons: priority explicit -->
+  <rect x="44" y="482" width="250" height="42" rx="9" class="pribtn"/><text x="140" y="508" class="bg" font-size="13" font-weight="700">Approve &amp; continue</text>
+  <rect x="304" y="482" width="200" height="42" rx="9" class="panel" stroke="#f5b544"/><text x="360" y="508" class="amber" font-size="12" font-weight="600">Reject / revise</text>
+  <rect x="514" y="482" width="150" height="42" rx="9" class="sub"/><text x="546" y="508" class="m" font-size="12">Stop task</text>
+  <circle cx="806" cy="503" r="10" class="callout"/><text x="802" y="507" class="cnum" font-size="11">4</text>
+
+  <!-- WORKFLOW (below the fold, waiting) -->
+  <rect x="28" y="556" width="800" height="150" class="panel" rx="10"/>
+  <text x="44" y="580" class="h" font-size="10">WORKFLOW</text>
+  <rect x="44" y="592" width="150" height="24" rx="12" class="acbg"/><text x="66" y="608" class="ac" font-size="10">Prepare · completed</text>
+  <rect x="202" y="592" width="170" height="24" rx="12" class="acbg"/><text x="224" y="608" class="ac" font-size="10">Investigate · completed</text>
+  <rect x="380" y="592" width="130" height="24" rx="12" class="att"/><text x="402" y="608" class="amber" font-size="10">Review · waiting</text>
+  <rect x="44" y="626" width="768" height="66" class="sub" rx="8"/>
+  <text x="60" y="650" class="lbl" font-size="12">Review</text><text x="120" y="650" class="cap" font-size="11">Human approval and terminal completion</text>
+  <rect x="60" y="660" width="736" height="24" class="att" rx="6" opacity="0.5"/>
+  <circle cx="76" cy="672" r="6" class="amber"/><text x="94" y="676" class="amber" font-size="11">⛉ approve — Gate · waiting for you (this is the gate resolved above)</text>
+  <circle cx="806" cy="649" r="10" class="callout"/><text x="802" y="653" class="cnum" font-size="11">5</text>
+
+  <!-- RIGHT RAIL -->
+  <rect x="844" y="70" width="288" height="474" class="panel" rx="10"/>
+  <text x="860" y="94" class="h" font-size="10">AT A GLANCE</text>
+  <text x="860" y="118" class="cap" font-size="11">Source manual · Attempt #1 · 20h 28m</text>
+  <text x="860" y="150" class="h" font-size="10">RUN HEALTH</text>
+  <text x="860" y="172" class="t" font-size="11">Steps 3/4 · Retries 1 · Reviews 1</text>
+  <text x="860" y="204" class="h" font-size="10">RESULT</text>
+  <text x="860" y="226" class="cap" font-size="11">Pending your decision.</text>
+  <rect x="860" y="470" width="256" height="60" class="acbg" rx="8"/>
+  <text x="876" y="494" class="ac" font-size="12" font-weight="700">Ask about this decision</text>
+  <text x="876" y="514" class="cap" font-size="10">Docked drawer keeps the gate buttons</text>
+
+  <!-- ANNOTATIONS -->
+  <text x="28" y="736" class="h" font-size="11">ANNOTATIONS — this screen removes the current triple-duplication</text>
+  <text x="28" y="756" class="note" font-size="11.5">1 Header primary action becomes "▲ Review the gate" (amber), which focuses the hero. Removes the separate header "Answer and resume".</text>
+  <text x="28" y="775" class="note" font-size="11.5">2 Decide WITH evidence in place: inline result + diff + test summary, so the user need not scroll to a separate Work panel to judge.</text>
+  <text x="28" y="794" class="note" font-size="11.5">3 ONE optional-instruction field (was two textareas: "Answer for the current pause" AND "Optional instruction for the next attempt").</text>
+  <text x="28" y="813" class="note" font-size="11.5">4 Explicit action priority: primary Approve, secondary Reject/revise, tertiary Stop. Replaces four equal-weight tabs (Note / Guide next agent cycle / Answer pause / Request revision).</text>
+  <text x="28" y="832" class="note" font-size="11.5">5 The gate step in the phase rail highlights but is NOT a second control — it deep-links up to the hero. Single source of truth for the pending decision.</text>
+  <text x="28" y="856" class="note" font-size="11.5">Result: the required action is the first and largest thing on screen (Spec 37 §UX rules), and there is exactly one place to resolve the pause.</text>
+</svg>

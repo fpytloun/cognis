@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -177,7 +178,7 @@ class _FakeManager:
             navigation_status=self._navigation_status,
         )
 
-    async def close_session(self, session_id: str) -> None:
+    async def close_session(self, session_id: str, **_kwargs: Any) -> None:
         self.closed.append(session_id)
 
     def record_navigation_response(
@@ -233,6 +234,121 @@ class _ConsentRedirectManager(_FakeManager):
         return self.session
 
 
+class _StickyConsentPage(_ConsentRedirectPage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.clicks = 0
+
+    async def evaluate(self, *_args: Any, **_kwargs: Any) -> bool:
+        self.evaluate_calls += 1
+        self.clicks += 1
+        if self.clicks >= 2:
+            self.url = "https://shop.example/product"
+        return True
+
+    async def goto(self, _url: str, **_kwargs: Any) -> Any:
+        if self.clicks < 2:
+            self.url = "https://cmp.example/consent"
+            return SimpleNamespace(url=self.url, status=200, ok=True)
+        self.url = "https://shop.example/product"
+        return SimpleNamespace(url=self.url, status=200, ok=True)
+
+
+@pytest.mark.asyncio
+async def test_consent_redirect_retries_within_same_fetch_attempt() -> None:
+    manager = _FakeManager()
+    backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
+    page = _StickyConsentPage()
+    page.url = "https://cmp.example/consent"
+    session = SimpleNamespace(
+        page=page,
+        navigation_url=page.url,
+        navigation_status=200,
+        navigation_ok=True,
+    )
+
+    recovered = await backend._recover_consent_redirect(  # noqa: SLF001
+        session,
+        requested_url="https://shop.example/product",
+    )
+    assert recovered is True
+    assert page.clicks == 2
+    assert page.url == "https://shop.example/product"
+
+
+@pytest.mark.asyncio
+async def test_consent_redirect_rejects_wrong_final_page() -> None:
+    manager = _FakeManager()
+    backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
+    page = _StickyConsentPage()
+    page.url = "https://cmp.example/consent"
+
+    async def _wrong_goto(_url: str, **_kwargs: Any) -> Any:
+        page.url = "https://shop.example/"
+        return SimpleNamespace(url=page.url, status=200, ok=True)
+
+    page.goto = _wrong_goto  # type: ignore[method-assign]
+    session = SimpleNamespace(
+        page=page,
+        navigation_url=page.url,
+        navigation_status=200,
+        navigation_ok=True,
+    )
+
+    recovered = await backend._recover_consent_redirect(  # noqa: SLF001
+        session,
+        requested_url="https://shop.example/product",
+    )
+    assert recovered is False
+    assert page.url == "https://shop.example/"
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_fails_when_consent_recovery_ends_on_wrong_page() -> None:
+    class _WrongConsentManager(_FakeManager):
+        async def open_session(self, **kwargs: Any) -> Any:
+            self.opened.append(kwargs)
+            page = _StickyConsentPage()
+            page.url = "https://cmp.example/consent"
+
+            async def _wrong_goto(_url: str, **_kwargs: Any) -> Any:
+                page.url = "https://shop.example/"
+                return SimpleNamespace(url=page.url, status=200, ok=True)
+
+            page.goto = _wrong_goto  # type: ignore[method-assign]
+            return SimpleNamespace(
+                page=page,
+                navigation_url=page.url,
+                navigation_status=200,
+                navigation_ok=True,
+            )
+
+    backend = BrowserFetchBackend(_WrongConsentManager())  # type: ignore[arg-type]
+    result = await backend.fetch("https://shop.example/product")
+    assert result.is_error is True
+    assert result.metadata["browser_failure_category"] == "consent_redirect"
+    assert result.metadata["final_url"] == "https://shop.example/"
+
+
+def test_consent_navigation_preserves_material_query_parameters() -> None:
+    from cognis.tools.executor.web.backends.browser import _consent_navigation_matches
+
+    assert (
+        _consent_navigation_matches(
+            "https://shop.example/search?q=phone&utm_source=test",
+            "https://shop.example/search?q=phone",
+        )
+        is True
+    )
+    assert (
+        _consent_navigation_matches(
+            "https://shop.example/search?q=phone",
+            "https://shop.example/search",
+        )
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_browser_fetch_returns_markdown_via_trafilatura() -> None:
     manager = _FakeManager(html="<html><body><h1>Headline</h1><p>Body text here.</p></body></html>")
@@ -243,6 +359,9 @@ async def test_browser_fetch_returns_markdown_via_trafilatura() -> None:
     assert manager.opened[0]["wait_for_slot"] is True
     assert manager.opened[0]["headless"] is True
     assert manager.opened[0]["lifecycle"] == "ephemeral"
+    assert manager.opened[0]["profile_mode"] == "persistent_local"
+    assert manager.opened[0]["profile_id"].startswith("web-fetch-")
+    assert manager.opened[0]["owner"].user_email == "anonymous"
     assert manager.opened[0]["navigation_timeout_seconds"] == 60.0
     assert manager.opened[0]["wait_until"] == "domcontentloaded"
     assert manager.opened[0]["network_idle_after_dom_seconds"] == 3.0
@@ -281,6 +400,210 @@ def test_classify_browser_extract_quality_flags_interstitial() -> None:
         "Verify you are human before continuing. Cloudflare Turnstile challenge page.",
     )
     assert signal == "interstitial"
+
+
+def test_access_denied_remains_blocked_despite_long_extractable_content() -> None:
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "trafilatura_recall",
+            "extraction_score": 1200.0,
+            "title": "Zugriff verweigert / Access denied",
+            "url": "https://www.mobile.de/",
+        },
+        "Access denied. " + "Your request was rejected. Disable VPN or proxy and retry. " * 100,
+        requested_url="https://www.mobile.de/",
+        final_url="https://www.mobile.de/",
+    )
+    assert signal == "interstitial"
+
+
+def test_access_denied_documentation_article_is_not_blocked() -> None:
+    signal = _classify_browser_extract_quality(
+        {
+            "extractor": "trafilatura_recall",
+            "extraction_score": 1200.0,
+            "title": "Troubleshooting access denied errors",
+            "url": "https://docs.example/access-denied",
+        },
+        "This article explains why an access denied error can occur and how an "
+        "administrator can update application permissions. " * 50,
+        requested_url="https://docs.example/access-denied",
+        final_url="https://docs.example/access-denied",
+    )
+    assert signal is None
+
+
+def test_browser_fetch_profile_is_stable_per_user_and_hostname() -> None:
+    backend = BrowserFetchBackend(_FakeManager())  # type: ignore[arg-type]
+    owner_a = {
+        "_browser_profile_owner": {
+            "execution_scope_id": "scope-a",
+            "user_email": "user@example.com",
+        }
+    }
+    owner_b = {
+        "_browser_profile_owner": {
+            "execution_scope_id": "scope-b",
+            "user_email": "other@example.com",
+        }
+    }
+    profile_1, _ = backend._persistent_profile("https://shop.example/a", owner_a)  # noqa: SLF001
+    profile_2, _ = backend._persistent_profile("https://shop.example/b", owner_a)  # noqa: SLF001
+    other_user, _ = backend._persistent_profile("https://shop.example/a", owner_b)  # noqa: SLF001
+    other_host, _ = backend._persistent_profile("https://other.example/a", owner_a)  # noqa: SLF001
+    assert profile_1 == profile_2
+    assert profile_1 != other_user
+    assert profile_1 != other_host
+
+
+@pytest.mark.asyncio
+async def test_accessibility_consent_click_reaches_closed_shadow_control() -> None:
+    class _Client:
+        detached = False
+
+        async def send(self, method: str, _params: Any = None) -> dict[str, Any]:
+            if method == "Accessibility.getFullAXTree":
+                return {
+                    "nodes": [
+                        {
+                            "role": {"value": "button"},
+                            "name": {"value": "Agree"},
+                            "backendDOMNodeId": 22,
+                        }
+                    ]
+                }
+            assert method == "DOM.getBoxModel"
+            return {"model": {"content": [10, 20, 110, 20, 110, 60, 10, 60]}}
+
+        async def detach(self) -> None:
+            self.detached = True
+
+    class _Context:
+        def __init__(self, client: _Client) -> None:
+            self.client = client
+
+        async def new_cdp_session(self, _page: Any) -> _Client:
+            return self.client
+
+    class _Mouse:
+        def __init__(self) -> None:
+            self.clicks: list[tuple[float, float]] = []
+
+        async def move(self, _x: float, _y: float, **_kwargs: Any) -> None:
+            return None
+
+        async def click(self, x: float, y: float) -> None:
+            self.clicks.append((x, y))
+
+    client = _Client()
+    page = SimpleNamespace(context=_Context(client), mouse=_Mouse())
+    backend = BrowserFetchBackend(_FakeManager())  # type: ignore[arg-type]
+
+    assert await backend._click_accessible_consent(page) is True  # noqa: SLF001
+    assert page.mouse.clicks == [(60.0, 40.0)]
+    assert client.detached is True
+
+
+@pytest.mark.asyncio
+async def test_browser_challenge_waits_for_real_content_before_http_rejection() -> None:
+    class _ChallengePage:
+        url = "https://shop.example/"
+
+        def __init__(self) -> None:
+            self.snapshots = [
+                {
+                    "title": "Just a moment...",
+                    "text": "Checking your browser. Please wait for verification.",
+                },
+                {
+                    "title": "Shop",
+                    "text": (
+                        "Current products and prices are ready for comparison. "
+                        "The catalog contains complete descriptions, availability, and offers."
+                    ),
+                },
+            ]
+            self.goto_calls = 0
+
+        async def evaluate(self, _script: str) -> dict[str, str]:
+            return self.snapshots.pop(0) if len(self.snapshots) > 1 else self.snapshots[0]
+
+        async def goto(self, *_args: Any, **_kwargs: Any) -> None:
+            self.goto_calls += 1
+
+    page = _ChallengePage()
+    session = SimpleNamespace(page=page)
+    backend = BrowserFetchBackend(_FakeManager())  # type: ignore[arg-type]
+
+    attempted, resolved = await backend._resolve_browser_challenge(  # noqa: SLF001
+        session,
+        requested_url=page.url,
+    )
+    assert (attempted, resolved) == (True, True)
+    assert page.goto_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_blank_initial_403_gets_bounded_challenge_transition_wait() -> None:
+    class _SilentChallengePage:
+        url = "https://shop.example/"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.session: Any = None
+
+        async def evaluate(self, _script: str) -> dict[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"title": "", "text": ""}
+            self.session.navigation_status = 200
+            return {
+                "title": "Shop",
+                "text": (
+                    "Products are now available after the silent browser verification "
+                    "completed and replaced the initial response."
+                ),
+            }
+
+        async def goto(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("transition should resolve without an explicit reload")
+
+    page = _SilentChallengePage()
+    session = SimpleNamespace(page=page, navigation_status=403)
+    page.session = session
+    backend = BrowserFetchBackend(_FakeManager())  # type: ignore[arg-type]
+
+    attempted, resolved = await backend._resolve_browser_challenge(  # noqa: SLF001
+        session,
+        requested_url=page.url,
+    )
+    assert (attempted, resolved) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_inline_consent_requires_dialog_scope() -> None:
+    class _Page:
+        async def evaluate(self, _script: str) -> list[dict[str, Any]]:
+            return [
+                {
+                    "text": (
+                        "Newsletter signup: Continue to receive offers from our partners. "
+                        "By continuing, you agree to our privacy policy."
+                    ),
+                    "strongScope": False,
+                }
+            ]
+
+    backend = BrowserFetchBackend(_FakeManager())  # type: ignore[arg-type]
+    assert await backend._page_has_consent_context(_Page()) is False  # noqa: SLF001
+
+
+def test_consent_disabled_domain_matches_subdomains() -> None:
+    manager = _FakeManager()
+    manager.auto_consent_disabled_domains = ["example.com"]
+    backend = BrowserFetchBackend(manager)  # type: ignore[arg-type]
+    assert backend._consent_disabled("https://shop.example.com/") is True  # noqa: SLF001
+    assert backend._consent_disabled("https://other.test/") is False  # noqa: SLF001
 
 
 def test_classify_browser_extract_quality_flags_ebay_error_page() -> None:
@@ -497,7 +820,7 @@ async def test_browser_fetch_recovers_consent_redirect_and_renavigates() -> None
     assert not result.is_error
     assert "HiPP BIO Snackie" in result.output
     assert manager.session is not None
-    assert manager.session.page.evaluate_calls == 1
+    assert manager.session.page.evaluate_calls >= 1
     assert manager.session.page.goto_calls[0]["url"] == (
         "https://maso-zeleninove-prikrmy.heureka.cz/hipp-bio-snackie/"
     )
@@ -647,12 +970,26 @@ async def test_headed_browser_fetch_uses_native_browser_identity() -> None:
     result = await backend.fetch("https://example.com")
 
     assert not result.is_error
-    assert manager.opened[0]["browser_settings"] == {
-        "stealth_enabled": False,
-        "fingerprint_hardening": False,
-    }
+    assert manager.opened[0]["browser_settings"] == {"auto_consent": "off"}
     extracted = (result.metadata or {}).get("extracted_document") or {}
     assert extracted.get("browser_fetch_mode") == "headed"
+
+
+def test_browser_navigation_error_never_exposes_internal_runtime_url() -> None:
+    manager = _FakeManager()
+    backend = BrowserFetchBackend(manager, headed=True)  # type: ignore[arg-type]
+    session = SimpleNamespace(
+        navigation_status=401,
+        navigation_url="https://patchright-init-script-inject.internal/",
+    )
+    result = backend._navigation_http_error(  # noqa: SLF001
+        session,
+        requested_url="https://www.reuters.com/world/article",
+    )
+    assert result is not None and result.is_error
+    assert "patchright-init-script-inject.internal" not in result.output
+    assert "https://www.reuters.com/world/article" in result.output
+    assert result.metadata["browser_failure_category"] == "browser_navigation_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +1062,27 @@ class _FakeContext:
     ) -> None:
         self.runtime_metadata = runtime_metadata
         self.shared_runtime_metadata = shared_runtime_metadata or {}
+
+
+def test_web_fetch_identity_uses_authenticated_runtime_access_across_scopes() -> None:
+    from cognis.tools.executor.web.handlers import _web_fetch_user_identity
+
+    first = _FakeContext(
+        {"runtime_access": {"user_email": "User@Example.com"}},
+    )
+    first.execution_scope_id = "scope-one"
+    second = _FakeContext(
+        {"runtime_access": {"user_email": "User@Example.com"}},
+    )
+    second.execution_scope_id = "scope-two"
+    other = _FakeContext(
+        {"runtime_access": {"user_email": "other@example.com"}},
+    )
+    other.execution_scope_id = "scope-one"
+
+    assert _web_fetch_user_identity(first) == "user@example.com"
+    assert _web_fetch_user_identity(second) == "user@example.com"
+    assert _web_fetch_user_identity(other) == "other@example.com"
 
 
 @pytest.mark.asyncio
@@ -875,6 +1233,103 @@ async def test_handle_web_fetch_empty_verification_page_attempts_browser_fallbac
     assert not result.is_error
     assert browser_used is True
     assert "rendered content" in result.output
+
+
+@pytest.mark.asyncio
+async def test_handle_web_fetch_preserves_partial_primary_when_browser_fallback_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Useful primary content that remains incomplete.",
+                metadata={
+                    "primary_backend": "direct",
+                    "extracted_document": {
+                        "semantic_quality": {"status": "partial", "score": 45.0}
+                    },
+                },
+            )
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Access denied",
+                is_error=True,
+                metadata={"browser_blocked": True},
+            )
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_fetch_backend",
+        lambda *args, **kwargs: _FakePrimary(),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda metadata: _FakeBrowser(),
+    )
+
+    result = await handlers.handle_web_fetch(
+        {"url": "https://example.com/article"},
+        _FakeContext(
+            {
+                "web_fetch_backend": "direct",
+                "web_fetch_fallback_browser": True,
+            }
+        ),
+    )
+
+    assert not result.is_error
+    assert "Useful primary content" in result.output
+    metadata = result.metadata or {}
+    assert metadata["browser_fallback_selection"] == "primary_preserved"
+    assert metadata["browser_fallback_success"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_web_fetch_reserves_deadline_for_browser_after_primary_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+
+    class _SlowPrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            await asyncio.sleep(5)
+            return ToolResult(output="late primary")
+
+    class _FastBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Rendered article body with enough substantive words to be useful.",
+                metadata={
+                    "extracted_document": {
+                        "semantic_quality": {"status": "complete", "score": 80.0}
+                    }
+                },
+            )
+
+    monkeypatch.setattr(handlers, "resolve_fetch_backend", lambda *_args, **_kwargs: _SlowPrimary())
+    monkeypatch.setattr(
+        handlers,
+        "get_headed_browser_fetch_backend",
+        lambda _metadata: _FastBrowser(),
+    )
+    result = await handlers.handle_web_fetch(
+        {"url": "https://example.com/article", "timeout": 2},
+        _FakeContext(
+            {
+                "web_fetch_backend": "direct",
+                "web_fetch_fallback_browser": True,
+                "web_browser_fetch_headed_fallback_enabled": True,
+            }
+        ),
+    )
+    assert not result.is_error
+    assert "Rendered article body" in result.output
+    assert (result.metadata or {})["browser_fallback_mode"] == "headed"
 
 
 @pytest.mark.asyncio
@@ -1049,20 +1504,72 @@ async def test_handle_web_fetch_retries_provider_error_page_through_browser(
 
 
 @pytest.mark.asyncio
-async def test_explicit_browser_backend_without_manager_returns_clear_error() -> None:
+async def test_handle_web_fetch_skips_browser_for_terminal_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cognis.tools.executor.web import handlers
-    from cognis.tools.executor.web.backends import resolve_fetch_backend
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            return ToolResult(
+                output="Could not resolve host dead.example; DNS returned no usable address.",
+                is_error=True,
+                metadata={
+                    "failure_category": "dns_resolution_failed",
+                    "browser_fallback_recommended": False,
+                },
+            )
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            raise AssertionError("terminal DNS failure must not launch browser")
+
+    monkeypatch.setattr(
+        handlers,
+        "resolve_fetch_backend",
+        lambda *args, **kwargs: _FakePrimary(),  # noqa: ARG005
+    )
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda metadata: _FakeBrowser(),
+    )
+    ctx = _FakeContext(
+        {
+            "web_fetch_backend": "direct",
+            "web_fetch_fallback_browser": True,
+        }
+    )
+
+    result = await handlers.handle_web_fetch({"url": "https://dead.example/"}, ctx)
+
+    assert result.is_error
+    assert "Could not resolve host" in result.output
+    assert (result.metadata or {}).get("browser_fallback_recommended") is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_ignores_stale_backend_override_and_uses_configured_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
 
     metadata: dict[str, Any] = {"web_fetch_backend": "direct"}
-    backend = resolve_fetch_backend(metadata, "browser")
-    assert type(backend).__name__ == "_UnavailableBrowserBackend"
+
+    class _FakeDirect:
+        async def fetch(self, *_args: object, **_kwargs: object) -> ToolResult:
+            return ToolResult(output="configured direct")
+
+    resolver = MagicMock(return_value=_FakeDirect())
+    monkeypatch.setattr(handlers, "resolve_fetch_backend", resolver)
 
     ctx = _FakeContext(metadata)
     result = await handlers.handle_web_fetch(
         {"url": "https://example.com", "backend": "browser"}, ctx
     )
-    assert result.is_error
-    assert "Browser fetch backend is unavailable" in result.output
+    assert not result.is_error
+    assert "configured direct" in result.output
+    resolver.assert_called_once_with(metadata)
 
 
 @pytest.mark.asyncio

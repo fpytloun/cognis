@@ -1,0 +1,22 @@
+mode: production
+replicaCount: 1
+database:
+  type: postgresql
+  existingSecret: cognis-database
+  secretKey: database-url
+crypto:
+  requireExternal: true
+  existingSecret: cognis-crypto
+migration:
+  enabled: true
+persistence:
+  enabled: true
+  size: 20Gi
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: cognis.example.com
+      paths:
+        - path: /
+          pathType: Prefix

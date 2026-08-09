@@ -316,6 +316,134 @@ def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_p
         }
 
 
+def test_nonterminal_turn_completion_does_not_create_push_payload(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> tuple[dict[str, str] | None, dict[str, str] | None]:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_nonterminal",
+                    owner_email="user@example.com",
+                    name="Agent",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_nonterminal",
+                    context_type="web",
+                    conversation_id="conv_nonterminal",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+            )
+            continuation = await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={
+                        "conversation_id": "conv_nonterminal",
+                        "managed_continuation_pending": True,
+                    },
+                )
+            )
+            partial = await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_COMPLETED,
+                    data={
+                        "conversation_id": "conv_nonterminal",
+                        "partial": True,
+                        "finish_reason": "user_cancelled",
+                    },
+                )
+            )
+            return continuation, partial
+
+        continuation, partial = asyncio.run(_run())
+
+        assert continuation is None
+        assert partial is None
+
+
+def test_turn_error_web_chat_creates_push_payload(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        import asyncio
+
+        async def _run() -> tuple[dict[str, str] | None, dict[str, str] | None]:
+            await _seed_user(client)
+            async with client.app.state.session_factory() as session:
+                await create_agent(
+                    session,
+                    agent_id="agent_error",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    display_name="Research Agent",
+                )
+                await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent_error",
+                    context_type="web",
+                    conversation_id="conv_error",
+                    title="Launch planning",
+                )
+                await session.commit()
+            service = WebPushService(
+                session_factory=client.app.state.session_factory,
+                event_bus=EventBus(),
+                config=WebPushRuntimeConfig(
+                    enabled=True,
+                    public_key="public",
+                    private_key="private",
+                    subject="mailto:test@example.com",
+                ),
+            )
+            failed = await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_ERROR,
+                    data={
+                        "conversation_id": "conv_error",
+                        "error_code": "step_failed",
+                    },
+                )
+            )
+            stopped = await service._event_payload(  # noqa: SLF001
+                Event(
+                    type=EventType.TURN_ERROR,
+                    data={
+                        "conversation_id": "conv_error",
+                        "error_code": "queued_turn_cancelled",
+                    },
+                )
+            )
+            return failed, stopped
+
+        failed, stopped = asyncio.run(_run())
+
+        assert failed == {
+            "user_email": "user@example.com",
+            "title": "Research Agent",
+            "body": "Reply failed in Launch planning.",
+            "url": "/chat/conv_error",
+            "tag": "conv_error",
+            "kind": "message",
+            "conversation_id": "conv_error",
+        }
+        assert stopped is not None
+        assert stopped["body"] == "Reply stopped in Launch planning."
+
+
 def test_turn_completed_push_payload_omits_avatar_when_signing_fails(
     monkeypatch: object, tmp_path: Path
 ) -> None:

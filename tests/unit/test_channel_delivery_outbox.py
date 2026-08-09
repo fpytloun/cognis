@@ -15,32 +15,49 @@ from sqlalchemy import create_engine as create_sync_engine
 from sqlalchemy import inspect
 
 from cognis.channels import delivery as delivery_module
+from cognis.channels.constants import CHANNEL_TOOL_CONVERSATION_PREFIX
 from cognis.channels.delivery import (
     ChannelDeliveryService,
     ChannelDeliveryStatus,
     ChannelProjection,
+    prepare_media_attachments,
 )
+from cognis.core.artifact_inputs import authorize_outbound_artifact_refs_in_session
 from cognis.core.events import Event, EventBus, EventType
-from cognis.models.channel import ChannelCapabilities, MediaAttachment, OutboundMessage
+from cognis.models.artifact import AttachmentRef
+from cognis.models.channel import (
+    ChannelCapabilities,
+    ChannelDeliveryDescriptor,
+    MediaAttachment,
+    OutboundMessage,
+)
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Base
+from cognis.store.direct_turns import DirectTurnStore
+from cognis.store.models import Base, ChannelAccountRow, DirectTurnRequestRow
 from cognis.store.queries import (
     claim_channel_delivery_outbox,
     create_agent,
     create_artifact_record,
+    create_channel_account,
     create_channel_delivery_outbox,
     create_conversation,
     create_managed_conversation_link,
+    create_session,
+    create_task,
     create_user,
     ensure_follow_up_result_delivery,
+    get_artifact_record,
     get_channel_delivery_outbox,
     get_channel_delivery_outbox_for_source,
+    get_managed_conversation_link_for_target,
     list_channel_delivery_outbox_stale_sending,
     mark_channel_delivery_chunk_inflight,
     mark_channel_delivery_chunk_sent,
+    mark_channel_delivery_permanent_failure,
     mark_channel_delivery_sent,
     recover_stale_channel_delivery,
     renew_channel_delivery_lease,
+    update_conversation_active_session,
 )
 
 
@@ -95,7 +112,141 @@ async def _outbox(factory: Any, delivery_id: str = "cdel-real") -> None:
         await session.commit()
 
 
-async def _matrix_follow_up(factory: Any, *, delivery_id: str) -> str:
+@pytest.mark.asyncio
+async def test_fenced_direct_turn_loads_request_by_public_request_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, factory = await _database(tmp_path, "direct-turn-request-id.db")
+    request_id = "dtr_public_identifier"
+    try:
+        async with factory() as session:
+            await create_agent(
+                session,
+                agent_id="agent-direct-turn",
+                owner_email="user@example.com",
+                name="Agent",
+            )
+            conversation = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-direct-turn",
+                context_type="matrix",
+                context_ref="matrix:acct-direct:room-direct",
+                context_data={
+                    "channel_type": "matrix",
+                    "account_id": "acct-direct",
+                    "chat_id": "room-direct",
+                },
+                title="Direct turn",
+            )
+            session.add(
+                DirectTurnRequestRow(
+                    request_id=request_id,
+                    turn_id="turn_direct_request",
+                    conversation_id=conversation.conversation_id,
+                    session_id=None,
+                    agent_id="agent-direct-turn",
+                    user_id="user@example.com",
+                    idempotency_scope="channel:test",
+                    idempotency_key="direct-request",
+                    admission_hash="admission-hash",
+                    payload_hash="payload-hash",
+                    payload_version=1,
+                    payload={"schema_version": 1},
+                    status="running",
+                )
+            )
+            await session.commit()
+
+        create_delivery = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            DirectTurnStore,
+            "create_fenced_channel_delivery",
+            create_delivery,
+        )
+        service = ChannelDeliveryService(
+            session_factory=factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: None,
+        )
+
+        status = await service.deliver_fenced_direct_turn(
+            request_id=request_id,
+            lease=object(),
+            descriptor=ChannelDeliveryDescriptor(
+                channel_type="matrix",
+                account_id="acct-direct",
+                chat_id="room-direct",
+            ),
+            content="Reply",
+            attachments=None,
+        )
+
+        assert status == ChannelDeliveryStatus.UNAVAILABLE
+        create_delivery.assert_awaited_once()
+        assert create_delivery.await_args.kwargs["request_id"] == request_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_permanent_delivery_settlement_requires_current_lease(
+    tmp_path: Path,
+) -> None:
+    engine, factory = await _database(tmp_path, "permanent-lease.db")
+    try:
+        await _outbox(factory, "cdel-permanent")
+        async with factory() as session:
+            row = await claim_channel_delivery_outbox(
+                session,
+                delivery_id="cdel-permanent",
+                lease_token="lease-current",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            )
+            await session.commit()
+            assert row is not None
+        async with factory() as session:
+            assert (
+                await mark_channel_delivery_permanent_failure(
+                    session,
+                    delivery_id="cdel-permanent",
+                    lease_token="lease-stale",
+                    last_error="nonretryable_channel_failure",
+                )
+                is False
+            )
+            await session.commit()
+            row = await get_channel_delivery_outbox(session, "cdel-permanent")
+            assert row is not None
+            assert row.status == "sending"
+            assert row.lease_token == "lease-current"
+        async with factory() as session:
+            assert (
+                await mark_channel_delivery_permanent_failure(
+                    session,
+                    delivery_id="cdel-permanent",
+                    lease_token="lease-current",
+                    last_error="nonretryable_channel_failure",
+                )
+                is True
+            )
+            await session.commit()
+            row = await get_channel_delivery_outbox(session, "cdel-permanent")
+            assert row is not None
+            assert row.status == "suppressed"
+            assert row.attempt_count == 1
+            assert row.lease_token is None
+    finally:
+        await engine.dispose()
+
+
+async def _matrix_follow_up(
+    factory: Any,
+    *,
+    delivery_id: str,
+    source_type: str = "follow_up",
+) -> str:
     async with factory() as session:
         await create_agent(
             session,
@@ -123,7 +274,7 @@ async def _matrix_follow_up(factory: Any, *, delivery_id: str) -> str:
             user_email="user@example.com",
             conversation_id=conversation.conversation_id,
             session_id="sess-follow-up",
-            source_type="follow_up",
+            source_type=source_type,
             source_id="fup-real",
             channel_type="matrix",
             account_id="acct-follow-up",
@@ -146,6 +297,136 @@ def _successful_route_sender(calls: list[dict[str, Any]]) -> Any:
         return ChannelDeliveryStatus.SENT
 
     return send
+
+
+@pytest.mark.asyncio
+async def test_recipient_send_rechecks_revoked_account_before_adapter_call(
+    tmp_path: Path,
+) -> None:
+    engine, factory = await _database(tmp_path, "recipient-revocation.db")
+    try:
+        async with factory() as session:
+            await create_agent(
+                session,
+                agent_id="agent-recipient",
+                owner_email="user@example.com",
+                name="Recipient",
+            )
+            await create_channel_account(
+                session,
+                account_id="acct-recipient",
+                channel_type="matrix",
+                display_name="Matrix",
+                agent_id="agent-recipient",
+                user_email="user@example.com",
+            )
+            await session.commit()
+
+        class _Adapter:
+            capabilities = ChannelCapabilities(max_message_length=200)
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def send_message(self, _message: OutboundMessage) -> str:
+                self.calls += 1
+                return "unexpected"
+
+        adapter = _Adapter()
+        service = ChannelDeliveryService(
+            session_factory=factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: _Manager(adapter),
+        )
+
+        async def revoke_route(
+            _chunk_index: int,
+            _chunk_count: int,
+            _digest: str,
+            _idempotent: bool,
+        ) -> bool:
+            async with factory() as session:
+                account = await session.get(ChannelAccountRow, "acct-recipient")
+                assert account is not None
+                account.enabled = False
+                await session.commit()
+            return True
+
+        status = await service._send_to_route(  # noqa: SLF001
+            channel_type="matrix",
+            account_id="acct-recipient",
+            chat_id="room-recipient",
+            thread_id=None,
+            content="hello",
+            on_chunk_start=revoke_route,
+            delivery_owner_email="user@example.com",
+            reject_active_managed_binding=True,
+        )
+
+        assert status == ChannelDeliveryStatus.PERMANENT
+        assert adapter.calls == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recipient_send_rechecks_managed_binding_before_adapter_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, factory = await _database(tmp_path, "recipient-managed-race.db")
+    try:
+        async with factory() as session:
+            await create_agent(
+                session,
+                agent_id="agent-recipient",
+                owner_email="user@example.com",
+                name="Recipient",
+            )
+            await create_channel_account(
+                session,
+                account_id="acct-recipient",
+                channel_type="matrix",
+                display_name="Matrix",
+                agent_id="agent-recipient",
+                user_email="user@example.com",
+            )
+            await session.commit()
+
+        class _Adapter:
+            capabilities = ChannelCapabilities(max_message_length=200)
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def send_message(self, _message: OutboundMessage) -> str:
+                self.calls += 1
+                return "unexpected"
+
+        async def active_binding(_session: object, **_kwargs: object) -> str:
+            return "binding-created-after-admission"
+
+        monkeypatch.setattr(delivery_module, "active_managed_binding_id", active_binding)
+        adapter = _Adapter()
+        service = ChannelDeliveryService(
+            session_factory=factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: _Manager(adapter),
+        )
+        status = await service._send_to_route(  # noqa: SLF001
+            channel_type="matrix",
+            account_id="acct-recipient",
+            chat_id="room-recipient",
+            thread_id=None,
+            content="hello",
+            delivery_owner_email="user@example.com",
+            reject_active_managed_binding=True,
+        )
+
+        assert status == ChannelDeliveryStatus.PERMANENT
+        assert adapter.calls == 0
+    finally:
+        await engine.dispose()
 
 
 def test_channel_delivery_migrations_apply_progress_and_inflight_columns(tmp_path: Path) -> None:
@@ -174,6 +455,9 @@ def test_channel_delivery_migrations_apply_progress_and_inflight_columns(tmp_pat
         "inflight_idempotent",
         "attachments_json",
         "deliverable_id",
+        "reply_to_id",
+        "direct_turn_request_id",
+        "direct_turn_fencing_token",
     } <= columns
 
 
@@ -439,6 +723,7 @@ async def test_multipart_send_heartbeat_renews_lease_while_adapter_is_active(
             event_bus=EventBus(),
             channel_manager_ref=lambda: _Manager(_SlowAdapter()),
         )
+
         sending = asyncio.create_task(
             service._deliver_outbox(  # noqa: SLF001
                 delivery_id="cdel-real",
@@ -796,7 +1081,14 @@ async def test_direct_task_delivery_uses_outbox_and_resumes_partial_failure(
             assert row is not None
             assert row.status == "sent"
             assert row.completed_chunk_count == row.projected_chunk_count
-            assert row.attachments_json == attachments
+            assert row.attachments_json == [{**attachments[0], "size_bytes": 5}]
+            assert [receipt["content"] for receipt in row.delivery_receipts_json] == [
+                "first block",
+                "second block",
+                "third block",
+            ]
+            assert row.first_delivered_at is not None
+            assert row.last_delivered_at is not None
     finally:
         await engine.dispose()
 
@@ -1035,14 +1327,136 @@ async def test_attachment_materialization_allows_direct_and_managed_descendant_a
             event_bus=EventBus(),
             channel_manager_ref=lambda: manager,
         )
+        grants: dict[str, dict[str, Any]] = {}
         for artifact_id in ("artifact-direct", "artifact-descendant"):
+            async with factory() as session:
+                authorized = await authorize_outbound_artifact_refs_in_session(
+                    session,
+                    [
+                        AttachmentRef(
+                            artifact_id=artifact_id,
+                            kind="file",
+                            mime_type="text/plain",
+                            filename=f"{artifact_id}.txt",
+                            size_bytes=2,
+                        )
+                    ],
+                    user_email="user@example.com",
+                    conversation_id=root.conversation_id,
+                )
+            grants[artifact_id] = authorized[0]
             media, _fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
-                {"artifact_id": artifact_id},
+                authorized[0],
                 owner_email="user@example.com",
                 conversation_id=root.conversation_id,
             )
             assert materialized is True
             assert media is not None and media.content_b64 == "b2s="
+        async with factory() as session:
+            direct_record = await get_artifact_record(session, "artifact-direct")
+            assert direct_record is not None
+            direct_record.size_bytes = 3
+            await session.commit()
+        _media, _fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+            grants["artifact-direct"],
+            owner_email="user@example.com",
+            conversation_id=root.conversation_id,
+        )
+        assert materialized is False
+        async with factory() as session:
+            link = await get_managed_conversation_link_for_target(
+                session,
+                target_conversation_id=child.conversation_id,
+            )
+            assert link is not None
+            link.conversation_state = "closed"
+            await session.commit()
+        _media, _fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+            grants["artifact-descendant"],
+            owner_email="user@example.com",
+            conversation_id=root.conversation_id,
+        )
+        assert materialized is False
+        _media, _fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+            {"artifact_id": "artifact-direct"},
+            owner_email="user@example.com",
+            conversation_id=root.conversation_id,
+        )
+        assert materialized is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_attachment_materialization_allows_owned_one_shot_artifact(
+    tmp_path: Path,
+) -> None:
+    engine, factory = await _database(tmp_path, "one-shot-artifact.db")
+    try:
+        async with factory() as session:
+            await create_agent(
+                session,
+                agent_id="agent-one-shot",
+                owner_email="user@example.com",
+                name="One shot",
+            )
+            conversation = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-one-shot",
+                context_type="web",
+                context_ref="web:one-shot",
+                context_data={},
+                title="One shot",
+            )
+            await create_artifact_record(
+                session,
+                artifact_id="artifact-one-shot",
+                namespace="artifacts",
+                object_id="artifact-one-shot",
+                filename="photo.png",
+                owner_email="user@example.com",
+                purpose="chat_input",
+                kind="image",
+                mime_type="image/png",
+                size_bytes=2,
+                status="attached",
+            )
+            await session.commit()
+            authorized = await authorize_outbound_artifact_refs_in_session(
+                session,
+                [
+                    AttachmentRef(
+                        artifact_id="artifact-one-shot",
+                        kind="image",
+                        mime_type="image/png",
+                        filename="photo.png",
+                        size_bytes=2,
+                    )
+                ],
+                user_email="user@example.com",
+                conversation_id=conversation.conversation_id,
+            )
+
+        class _Store:
+            async def async_load(self, *_args: object) -> tuple[bytes, str]:
+                return b"ok", "image/png"
+
+        manager = _Manager(object())
+        manager._artifact_store = _Store()
+        service = ChannelDeliveryService(
+            session_factory=factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: manager,
+        )
+        media, fallback, materialized = await service._materialize_media_attachment(  # noqa: SLF001
+            authorized[0],
+            owner_email="user@example.com",
+            conversation_id=f"{CHANNEL_TOOL_CONVERSATION_PREFIX}owner",
+        )
+        assert materialized is True
+        assert fallback is None
+        assert media is not None and media.content_b64 == "b2s="
     finally:
         await engine.dispose()
 
@@ -1241,12 +1655,43 @@ async def test_partial_attachment_materialization_retries_without_duplicate_text
 
 
 @pytest.mark.asyncio
+async def test_materialization_rejects_unsafe_aggregate_before_loading() -> None:
+    store = AsyncMock()
+    media, fallback, failed = await prepare_media_attachments(
+        [
+            {
+                "artifact_id": f"artifact-{index}",
+                "kind": "file",
+                "mime_type": "application/pdf",
+                "filename": f"{index}.pdf",
+                "size_bytes": 20 * 1024 * 1024,
+            }
+            for index in range(3)
+        ],
+        session_factory=AsyncMock(),
+        artifact_store=store,
+        owner_email="user@example.com",
+        conversation_id="conv-owner",
+    )
+    assert media == []
+    assert fallback == []
+    assert failed is True
+    store.async_load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_type", ["follow_up", "task_result_follow_up"])
 async def test_follow_up_completion_before_grace_sends_only_detailed_result(
     tmp_path: Path,
+    source_type: str,
 ) -> None:
     engine, factory = await _database(tmp_path)
     try:
-        conversation_id = await _matrix_follow_up(factory, delivery_id="cdel-grace-before")
+        conversation_id = await _matrix_follow_up(
+            factory,
+            delivery_id="cdel-grace-before",
+            source_type=source_type,
+        )
         service = ChannelDeliveryService(
             session_factory=factory,
             event_bus=EventBus(),
@@ -1281,6 +1726,93 @@ async def test_follow_up_completion_before_grace_sends_only_detailed_result(
             )
         assert grace is not None and grace.status == "suppressed"
         assert result is not None and result.status == "sent"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_due_task_follow_up_sends_only_generic_grace_notice(tmp_path: Path) -> None:
+    engine, factory = await _database(tmp_path, "task-grace.db")
+    try:
+        async with factory() as session:
+            await create_agent(
+                session,
+                agent_id="agent-task-grace",
+                owner_email="user@example.com",
+                name="Agent",
+            )
+            conversation = await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-task-grace",
+                context_type="matrix",
+                context_ref="matrix:acct-task-grace:room-task-grace",
+                context_data={
+                    "channel_type": "matrix",
+                    "account_id": "acct-task-grace",
+                    "chat_id": "room-task-grace",
+                },
+                title="Matrix",
+            )
+            active_session = await create_session(
+                session,
+                conversation_id=conversation.conversation_id,
+                user_email="user@example.com",
+                agent_id="agent-task-grace",
+            )
+            await update_conversation_active_session(
+                session,
+                conversation.conversation_id,
+                active_session.session_id,
+            )
+            task = await create_task(
+                session,
+                task_id="task-grace",
+                created_by="user@example.com",
+                agent_id="agent-task-grace",
+                title="Scheduled report",
+                status="completed",
+                source_type="scheduler",
+                source_ref="schedule-grace",
+                delivery_mode="preferred_channel",
+            )
+            task.result_data = {
+                "final_content": "Raw task output must remain agent-mediated.",
+                "attachments": [{"artifact_id": "raw-task-attachment"}],
+            }
+            await create_channel_delivery_outbox(
+                session,
+                delivery_id="cdel-task-grace-due",
+                user_email="user@example.com",
+                conversation_id=conversation.conversation_id,
+                session_id=active_session.session_id,
+                source_type="task_result_follow_up",
+                source_id=task.task_id,
+                channel_type="matrix",
+                account_id="acct-task-grace",
+                chat_id="room-task-grace",
+                thread_id=None,
+                fallback_text="Agent follow-up is unavailable. Open the conversation for details.",
+                next_attempt_at=datetime.now(UTC) - timedelta(seconds=1),
+            )
+            await session.commit()
+
+        service = ChannelDeliveryService(
+            session_factory=factory,
+            event_bus=EventBus(),
+            channel_manager_ref=lambda: None,
+        )
+        calls: list[dict[str, Any]] = []
+        service._send_to_route = AsyncMock(side_effect=_successful_route_sender(calls))  # type: ignore[method-assign]
+
+        await service.recover_pending_deliveries()
+
+        service._send_to_route.assert_awaited_once()
+        assert calls[0]["content"] == (
+            "Agent follow-up is unavailable. Open the conversation for details."
+        )
+        assert calls[0]["media"] is None
+        assert "Raw task output" not in calls[0]["content"]
     finally:
         await engine.dispose()
 

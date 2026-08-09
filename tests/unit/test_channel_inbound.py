@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -19,12 +19,19 @@ from cognis.channels.inbound import (
     _stt_passthrough_target,
     _stt_supported_audio_mime_types,
 )
+from cognis.channels.managed import GroupContextReservation, ManagedInboundAdmission
 from cognis.channels.remote import RemoteChannelAdapterProxy
 from cognis.core.commands import CommandResult
+from cognis.core.message_envelope import render_user_message
 from cognis.core.turn_scheduler import TurnResult
 from cognis.executor.channel_handler import ChannelHandler
 from cognis.models.artifact import ArtifactKind, AttachmentRef
-from cognis.models.channel import ChannelAccountConfig, InboundMessage, MediaAttachment
+from cognis.models.channel import (
+    ChannelAccountConfig,
+    ChannelDeliveryDescriptor,
+    InboundMessage,
+    MediaAttachment,
+)
 
 
 class _FakeAdapter:
@@ -47,6 +54,56 @@ class _FakeManager:
         return self._adapter
 
 
+def _group_context_pipeline() -> tuple[
+    InboundPipeline,
+    MagicMock,
+    MagicMock,
+]:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    scheduler = MagicMock()
+    scheduler.submit_turn = AsyncMock(return_value=None)
+    scheduler.has_active_turn = MagicMock(return_value=False)
+    context_service = MagicMock()
+    context_service.admit_inbound = AsyncMock(return_value=None)
+    context_service.capture_group_message = AsyncMock(
+        return_value=SimpleNamespace(inbound_id="inbound-trigger")
+    )
+    context_service.reserve_group_context = AsyncMock(
+        return_value=GroupContextReservation(
+            token="reservation-1",
+            contextual_messages=[
+                {
+                    "content": "preceding chatter",
+                    "message_metadata": {
+                        "ts": "2026-08-02T10:00:00Z",
+                        "channel": "signal",
+                        "sender": "Alice",
+                        "untrusted": True,
+                    },
+                    "intention_eligible": False,
+                }
+            ],
+        )
+    )
+    context_service.settle_group_context = AsyncMock()
+    context_service.settle_group_context_in_session = AsyncMock()
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=scheduler,
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+        command_dispatcher=MagicMock(),
+        managed_channel_service=context_service,
+    )
+    pipeline._resolve_user = AsyncMock(return_value="owner@example.com")  # type: ignore[method-assign]
+    pipeline._resolve_conversation = AsyncMock(return_value="conv-1")  # type: ignore[method-assign]
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([], 0))  # type: ignore[method-assign]
+    pipeline._try_command_dispatch = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    return pipeline, scheduler, context_service
+
+
 def _event(seq: int, data: dict) -> SimpleNamespace:
     return SimpleNamespace(seq=seq, data=data)
 
@@ -57,6 +114,312 @@ def test_normalize_assistant_delivery_mode_preserves_legacy_final_semantics() ->
     assert _normalize_assistant_delivery_mode("concatenated") == "concatenated"
     assert _normalize_assistant_delivery_mode("immediate") == "immediate"
     assert _normalize_assistant_delivery_mode("unknown") == "concatenated"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chat_type", "chat_id"),
+    [("direct", "signal-direct"), ("group", "signal-group")],
+)
+async def test_authenticated_signal_inbound_records_target_before_managed_consumption(
+    chat_type: str,
+    chat_id: str,
+) -> None:
+    recorder = MagicMock()
+    recorder.record = AsyncMock()
+    managed = MagicMock()
+    managed.admit_inbound = AsyncMock(return_value=True)
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=MagicMock(),
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: MagicMock(),
+        observed_target_recorder=recorder,
+        managed_channel_service=managed,
+    )
+    pipeline._resolve_user = AsyncMock(return_value="owner@example.com")  # type: ignore[method-assign]
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="signal-account",
+        message_id=f"message-{chat_type}",
+        sender_id="allowed-sender",
+        sender_name="Allowed sender",
+        chat_id=chat_id,
+        chat_type=chat_type,
+        chat_name="Allowed chat",
+        content="Hello",
+        timestamp=datetime.now(UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="signal-account",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-owner",
+        user_email="owner@example.com",
+        dm_policy="open",
+        group_policy="open",
+    )
+
+    await pipeline.process(message, config)
+
+    recorder.record.assert_awaited_once_with(message, config)
+    managed.admit_inbound.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_group_context_silently_captures_authorized_unmentioned_signal_message() -> None:
+    pipeline, scheduler, context_service = _group_context_pipeline()
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="chatter-1",
+        sender_id="sender-1",
+        chat_id="group-1",
+        chat_type="group",
+        content="preceding chatter",
+        was_mentioned=False,
+        timestamp=datetime.now(UTC),
+        platform_data={
+            "_cognis_ordering_key": "00000000000000000001",
+            "_cognis_ordering_source": "provider",
+        },
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-1",
+        user_email="owner@example.com",
+        group_policy="mention",
+        settings={"group_context_enabled": True},
+    )
+
+    await pipeline.process(message, config)
+
+    context_service.admit_inbound.assert_not_awaited()
+    context_service.capture_group_message.assert_awaited_once()
+    scheduler.submit_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_context_normalizes_media_before_silent_capture() -> None:
+    pipeline, scheduler, context_service = _group_context_pipeline()
+    attachment = AttachmentRef(
+        artifact_id="img-silent-group",
+        kind=ArtifactKind.IMAGE,
+        mime_type="image/png",
+        filename="group.png",
+        size_bytes=19,
+    )
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([attachment], 0))  # type: ignore[method-assign]
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="media-chatter",
+        sender_id="sender-1",
+        chat_id="group-1",
+        chat_type="group",
+        content="",
+        media=[
+            MediaAttachment(
+                content_b64=base64.b64encode(b"image").decode(),
+                mime_type="image/png",
+                filename="group.png",
+            )
+        ],
+        was_mentioned=False,
+        timestamp=datetime.now(UTC),
+        platform_data={
+            "_cognis_ordering_key": "00000000000000000001",
+            "_cognis_ordering_source": "provider",
+        },
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-1",
+        user_email="owner@example.com",
+        group_policy="mention",
+        settings={"group_context_enabled": True},
+    )
+
+    await pipeline.process(message, config)
+
+    pipeline._normalize_media_attachments.assert_awaited_once_with(  # type: ignore[attr-defined]
+        message=message,
+        conversation_id=None,
+        user_email="owner@example.com",
+    )
+    context_service.capture_group_message.assert_awaited_once_with(
+        message,
+        user_email="owner@example.com",
+        policy=ANY,
+        attachments=[attachment],
+    )
+    scheduler.submit_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_active_managed_image_only_inbound_is_normalized_before_admission() -> None:
+    pipeline, scheduler, context_service = _group_context_pipeline()
+    attachment = AttachmentRef(
+        artifact_id="img-managed-inbound",
+        kind=ArtifactKind.IMAGE,
+        mime_type="image/png",
+        filename="managed.png",
+        size_bytes=19,
+    )
+    pipeline._normalize_media_attachments = AsyncMock(return_value=([attachment], 0))  # type: ignore[method-assign]
+    context_service.admit_inbound.return_value = ManagedInboundAdmission(
+        binding_id="binding-managed",
+        conversation_id="conv-managed-child",
+        user_email="owner@example.com",
+        content="",
+        message_id="managed-image-only",
+        version=4,
+        owner_epoch=2,
+        contextual_messages=[],
+        attachments=[
+            {
+                "artifact_id": "img-managed-inbound",
+                "kind": "image",
+                "mime_type": "image/png",
+                "filename": "managed.png",
+                "size_bytes": 19,
+            }
+        ],
+    )
+    context_service.observer.return_value = MagicMock()
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="managed-image-only",
+        sender_id="owner",
+        chat_id="managed-direct",
+        chat_type="direct",
+        content="",
+        media=[
+            MediaAttachment(
+                content_b64=base64.b64encode(b"image").decode(),
+                mime_type="image/png",
+                filename="managed.png",
+            )
+        ],
+        timestamp=datetime.now(UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-1",
+        user_email="owner@example.com",
+        settings={},
+    )
+
+    await pipeline.process(message, config)
+
+    pipeline._normalize_media_attachments.assert_awaited_once_with(  # type: ignore[attr-defined]
+        message=message,
+        conversation_id=None,
+        user_email="owner@example.com",
+        executor_connection_owner=None,
+    )
+    context_service.admit_inbound.assert_awaited_once_with(
+        message,
+        user_email="owner@example.com",
+        attachments=[attachment],
+    )
+    scheduler.submit_turn.assert_awaited_once()
+    kwargs = scheduler.submit_turn.await_args.kwargs
+    assert kwargs["attachments"] == context_service.admit_inbound.return_value.attachments
+    assert kwargs["user_message_metadata"]["untrusted"] is True
+    assert scheduler.submit_turn.await_args.args[:2] == ("conv-managed-child", "")
+
+
+@pytest.mark.asyncio
+async def test_group_context_first_mention_attaches_context_and_primary_last_contract() -> None:
+    pipeline, scheduler, context_service = _group_context_pipeline()
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="trigger-1",
+        sender_id="sender-1",
+        sender_name="Alice",
+        chat_id="group-1",
+        chat_type="group",
+        content="@agent summarize",
+        was_mentioned=True,
+        timestamp=datetime.now(UTC),
+        platform_data={
+            "_cognis_ordering_key": "00000000000000000002",
+            "_cognis_ordering_source": "provider",
+        },
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-1",
+        user_email="owner@example.com",
+        group_policy="mention",
+        settings={"group_context_enabled": True},
+    )
+
+    await pipeline.process(message, config)
+
+    scheduler.submit_turn.assert_awaited_once()
+    call = scheduler.submit_turn.await_args
+    assert call.args[:2] == ("conv-1", "@agent summarize")
+    assert call.kwargs["contextual_messages"][0]["content"] == "preceding chatter"
+    assert call.kwargs["contextual_messages"][0]["intention_eligible"] is False
+    assert call.kwargs["user_message_metadata"]["untrusted"] is True
+    assert call.kwargs["intention_eligible"] is False
+    rendered = render_user_message(
+        call.args[1],
+        call.kwargs["user_message_metadata"],
+        call.kwargs["contextual_messages"],
+    ).splitlines()
+    assert rendered[0].endswith('sender="Alice" untrusted="true">preceding chatter</message>')
+    assert rendered[-1].endswith('sender="Alice" untrusted="true">@agent summarize</message>')
+    assert isinstance(call.kwargs["turn_id"], str)
+    assert callable(call.kwargs["admission_transaction_participant"])
+    context_service.settle_group_context.assert_awaited_once_with(
+        "reservation-1",
+        turn_id=call.kwargs["turn_id"],
+        succeeded=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_context_disabled_does_not_retain_unmentioned_body() -> None:
+    pipeline, scheduler, context_service = _group_context_pipeline()
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="private-1",
+        sender_id="sender-1",
+        chat_id="group-1",
+        chat_type="group",
+        content="must not persist",
+        was_mentioned=False,
+        timestamp=datetime.now(UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-1",
+        user_email="owner@example.com",
+        group_policy="mention",
+        settings={},
+    )
+
+    await pipeline.process(message, config)
+
+    context_service.capture_group_message.assert_not_awaited()
+    scheduler.submit_turn.assert_not_awaited()
 
 
 def test_channel_conversation_context_carries_assistant_delivery_mode() -> None:
@@ -78,6 +441,50 @@ def test_channel_conversation_context_carries_assistant_delivery_mode() -> None:
 
     assert context.type == "signal"
     assert context.platform_data["assistant_delivery_mode"] == "final_only"
+
+
+@pytest.mark.asyncio
+async def test_stale_executor_inbound_is_rejected_before_any_mutation() -> None:
+    turn_scheduler = MagicMock()
+    turn_scheduler.submit_turn = AsyncMock()
+    session_manager = MagicMock()
+    pairing_service = MagicMock()
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=turn_scheduler,
+        session_manager=session_manager,
+        pairing_service=pairing_service,
+        channel_manager_ref=MagicMock(),
+    )
+    pipeline._admit_executor_inbound = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    pipeline._resolve_user = AsyncMock()  # type: ignore[method-assign]
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="msg-stale",
+        sender_id="sender-1",
+        chat_id="chat-1",
+        content="stale",
+        timestamp=datetime.now(UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="signal",
+        display_name="Signal",
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline.process(
+        message,
+        config,
+        executor_connection_owner=object(),
+    )
+
+    pipeline._resolve_user.assert_not_awaited()
+    turn_scheduler.submit_turn.assert_not_awaited()
+    assert session_manager.mock_calls == []
+    assert pairing_service.mock_calls == []
 
 
 def test_channel_delivery_mode_refresh_matches_only_same_channel_context_type() -> None:
@@ -133,6 +540,7 @@ async def test_channel_inbound_refreshes_existing_channel_delivery_mode() -> Non
         conversation_id="conv-existing",
         channel_type="signal",
         assistant_delivery_mode="final_only",
+        executor_connection_owner=None,
     )
 
 
@@ -172,6 +580,7 @@ async def test_channel_inbound_refreshes_default_conversation_delivery_mode() ->
         conversation_id="conv-default",
         channel_type="signal",
         assistant_delivery_mode="concatenated",
+        executor_connection_owner=None,
     )
 
 
@@ -1147,8 +1556,13 @@ async def test_channel_inbound_fresh_thread_context_includes_root_excerpt() -> N
         thread_id="$root",
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
         platform_data={
+            "_sender_verified_owner": True,
             "fresh_thread_context": True,
-            "thread_root": {"sender": "@filip:fpy.cz", "body": "original message"},
+            "thread_root": {
+                "sender": "@filip:fpy.cz",
+                "body": "original message",
+                "timestamp": "2026-08-01T10:00:00Z",
+            },
         },
     )
     config = ChannelAccountConfig(
@@ -1163,9 +1577,12 @@ async def test_channel_inbound_fresh_thread_context_includes_root_excerpt() -> N
     await pipeline.process(message, config)
 
     submitted_content = turn_scheduler.submit_turn.await_args.args[1]
-    assert "Thread started from:" in submitted_content
-    assert "@filip:fpy.cz: original message" in submitted_content
-    assert "User continuation:\ncontinuation" in submitted_content
+    assert submitted_content == "continuation"
+    assert turn_scheduler.submit_turn.await_args.kwargs["intention_eligible"] is True
+    contextual_messages = turn_scheduler.submit_turn.await_args.kwargs["contextual_messages"]
+    assert contextual_messages[0]["content"] == "original message"
+    assert contextual_messages[0]["intention_eligible"] is False
+    assert contextual_messages[0]["message_metadata"]["sender"] == "@filip:fpy.cz"
 
 
 @pytest.mark.asyncio
@@ -1213,6 +1630,7 @@ async def test_channel_inbound_mark_read_failure_is_non_fatal() -> None:
 
     adapter.mark_read.assert_awaited_once_with("chat-1", "msg-1")
     turn_scheduler.submit_turn.assert_awaited_once()
+    assert turn_scheduler.submit_turn.await_args.kwargs["intention_eligible"] is False
 
 
 @pytest.mark.asyncio
@@ -2026,6 +2444,38 @@ def test_channel_turn_observer_absorbs_latest_reply_anchor() -> None:
 
     assert active.absorb_queued_observer(queued) is True
     assert active._reply_to_id == "msg-3"
+
+
+@pytest.mark.asyncio
+async def test_durable_channel_observer_never_sends_terminal_error_directly() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    observer = ChannelTurnObserver(
+        channel_type="matrix",
+        account_id="acct-1",
+        chat_id="!room:example.com",
+        thread_id="$thread",
+        conversation_id="conv-1",
+        turn_scheduler=MagicMock(),
+        reply_to_id="$inbound",
+        channel_manager_ref=lambda: manager,
+        assistant_delivery_mode="final",
+        channel_delivery=ChannelDeliveryDescriptor(
+            channel_type="matrix",
+            account_id="acct-1",
+            chat_id="!room:example.com",
+            thread_id="$thread",
+            reply_to_id="$inbound",
+        ),
+    )
+    observer._turn_active = True
+
+    await observer.on_turn_error(
+        "conv-1",
+        SimpleNamespace(message="The turn could not be completed."),
+    )
+
+    adapter.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

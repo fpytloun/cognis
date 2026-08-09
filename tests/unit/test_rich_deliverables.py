@@ -27,6 +27,7 @@ from cognis.store.queries import (
     create_step_run,
     create_task,
     get_accessible_conversation_deliverable,
+    get_artifact_record,
     list_deliverables_for_conversation_scope,
 )
 
@@ -957,7 +958,14 @@ async def test_conversation_scoped_deliverable_access_checks_owner(tmp_path) -> 
             format="rich",
             rich={"blocks": [{"type": "markdown", "content": "private"}]},
             artifact_store=store,
+            published_owner_email="owner@example.com",
         )
+        published = await get_artifact_record(session, row.deliverable_id)
+        assert published is not None
+        assert published.owner_email == "owner@example.com"
+        assert published.conversation_id is None
+        assert published.session_id is None
+        assert published.purpose == "conversation_deliverable"
         assert (
             await get_accessible_conversation_deliverable(
                 session, row.deliverable_id, "owner@example.com"
@@ -968,6 +976,23 @@ async def test_conversation_scoped_deliverable_access_checks_owner(tmp_path) -> 
                 session, row.deliverable_id, "other@example.com"
             )
         ) is None
+        replacement = await create_deliverable(
+            session,
+            conversation_id="conv",
+            session_id="sess",
+            turn_id="turn",
+            content="Replacement",
+            format="markdown",
+            artifact_store=store,
+            published_owner_email="owner@example.com",
+        )
+        old_published = await get_artifact_record(session, row.deliverable_id)
+        new_published = await get_artifact_record(session, replacement.deliverable_id)
+        assert old_published is not None
+        assert old_published.status == "deleted"
+        assert old_published.deleted_at is not None
+        assert new_published is not None
+        assert new_published.status == "attached"
 
     await engine.dispose()
 
@@ -1050,6 +1075,7 @@ async def test_workflow_task_rich_deliverable_and_lightweight_projection(tmp_pat
             rich=large_payload,
             artifact_store=store,
         )
+        assert await get_artifact_record(session, row.deliverable_id) is None
 
     await engine.dispose()
 

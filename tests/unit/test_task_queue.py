@@ -8,13 +8,15 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.core.agent_registry import AgentRegistry
-from cognis.core.task_queue import TaskQueue, TaskRerunResult
+from cognis.core.task_queue import TaskQueue, TaskRerunResult, _row_to_task_model
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.models.task import TaskModel, TaskStatus
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
     add_task_dependency,
+    create_conversation,
+    create_session,
     create_skill,
     create_skill_version,
     create_step_run,
@@ -28,6 +30,7 @@ from cognis.store.queries import (
     list_tasks_for_agent,
     pick_ready_task,
     set_current_version,
+    update_conversation_active_session,
     update_step_run,
     update_task_status,
     update_task_workflow_state,
@@ -77,6 +80,243 @@ async def test_create_and_get_task(tmp_path: object) -> None:
             assert task is not None
             assert task.title == "Test Task"
             assert task.status == "draft"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_pages", "expected"),
+    [
+        (
+            [[]],
+            "ambiguous_tool_execution",
+        ),
+        (
+            [
+                [
+                    {
+                        "type": "tool_call",
+                        "data": {"call_id": "call-1", "name": "bash"},
+                    }
+                ]
+            ],
+            "ambiguous_tool_execution",
+        ),
+        (
+            [
+                [{"_stalled": True}],
+                [
+                    {
+                        "type": "tool_call",
+                        "seq": 501,
+                        "data": {"call_id": "call-unseen", "name": "bash"},
+                    }
+                ],
+            ],
+            "ambiguous_tool_execution",
+        ),
+        (
+            [
+                [
+                    {
+                        "type": "tool_call",
+                        "data": {"call_id": "call-1", "name": "bash"},
+                    },
+                    {
+                        "type": "tool_result",
+                        "data": {"call_id": "call-1", "name": "bash"},
+                    },
+                ]
+            ],
+            "recoverable_completed_tool_calls",
+        ),
+        (
+            [
+                [
+                    {
+                        "type": "tool_call",
+                        "seq": 1,
+                        "data": {"call_id": "call-1", "name": "read"},
+                    },
+                    {
+                        "type": "tool_result",
+                        "seq": 2,
+                        "data": {"call_id": "call-1", "name": "read"},
+                    },
+                ],
+                [
+                    {
+                        "type": "tool_call",
+                        "seq": 501,
+                        "data": {"call_id": "call-later", "name": "bash"},
+                    }
+                ],
+            ],
+            "ambiguous_tool_execution",
+        ),
+    ],
+)
+async def test_crash_recovery_classifies_tool_event_pairs(
+    tmp_path: object,
+    event_pages: list[list[dict[str, object]]],
+    expected: str,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                task_id="task-recovery",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Recovery",
+                status="running",
+            )
+            await create_step_run(
+                session,
+                task_id="task-recovery",
+                step_name="run",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="step-recovery",
+                status="running",
+            )
+            step = await get_step_run(session, "step-recovery")
+            assert step is not None
+            step.intaris_session_id = "intaris-recovery"
+            await session.commit()
+            row = await get_task(session, "task-recovery")
+            assert row is not None
+
+        class _Guardrails:
+            async def read_events(self, **kwargs: object) -> object:
+                after_seq = int(kwargs.get("after_seq", 0))
+                page_index = 0 if after_seq == 0 else 1
+                events = event_pages[page_index]
+                stalled = any(event.get("_stalled") for event in events)
+                return SimpleNamespace(
+                    events=events,
+                    has_more=page_index < len(event_pages) - 1,
+                    last_seq=after_seq if stalled else (500 if page_index == 0 else 501),
+                    missing_stream_fallback_used=not events,
+                )
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(_providers=SimpleNamespace(guardrails=_Guardrails())),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(),
+        )
+        classification, _ = await queue._classify_crash_recovery(  # noqa: SLF001
+            _row_to_task_model(row)
+        )
+        assert classification == expected
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runtime_info", "persisted_output", "expected"),
+    [
+        (
+            {
+                "deterministic_step": True,
+                "deterministic_substate": "rendering",
+            },
+            None,
+            "safe_before_tool_dispatch",
+        ),
+        (
+            {
+                "deterministic_step": True,
+                "deterministic_substate": "executing",
+                "tool_read_only": True,
+                "tool_name": "read",
+            },
+            None,
+            "retry_read_only_deterministic_tool",
+        ),
+        (
+            {
+                "deterministic_step": True,
+                "deterministic_substate": "executing",
+                "tool_read_only": False,
+                "tool_name": "mutate",
+            },
+            None,
+            "ambiguous_tool_execution",
+        ),
+        (
+            {
+                "deterministic_step": True,
+                "deterministic_substate": "executing",
+                "tool_name": "unclassified",
+            },
+            None,
+            "ambiguous_tool_execution",
+        ),
+        (
+            {
+                "deterministic_step": True,
+                "deterministic_substate": "persisted",
+                "terminal_status": "approved",
+            },
+            {"summary": "Persisted", "outputs": {}, "metadata": {}, "claims": []},
+            "recoverable_persisted_deterministic_output",
+        ),
+    ],
+)
+async def test_crash_recovery_uses_deterministic_substate_without_intaris_session(
+    tmp_path: object,
+    runtime_info: dict[str, object],
+    persisted_output: dict[str, object] | None,
+    expected: str,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                task_id="task-deterministic-recovery",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Deterministic recovery",
+                status="running",
+            )
+            await create_step_run(
+                session,
+                task_id="task-deterministic-recovery",
+                step_name="fetch",
+                step_type="tool_call",
+                agent_id="agent-1",
+                step_run_id="step-deterministic-recovery",
+                status="running",
+                runtime_info=runtime_info,
+            )
+            if persisted_output is not None:
+                await update_step_run(
+                    session,
+                    "step-deterministic-recovery",
+                    output=persisted_output,
+                )
+            await session.commit()
+            row = await get_task(session, "task-deterministic-recovery")
+            assert row is not None
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(_providers=SimpleNamespace()),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(),
+        )
+        classification, details = await queue._classify_crash_recovery(  # noqa: SLF001
+            _row_to_task_model(row)
+        )
+
+        assert classification == expected
+        assert details["step_run_id"] == "step-deterministic-recovery"
     finally:
         await engine.dispose()
 
@@ -169,6 +409,24 @@ async def test_rerun_task_clones_terminal_task_with_dependencies(tmp_path: objec
     engine, factory = await _bootstrap_db(tmp_path)
     try:
         async with factory() as session:
+            conversation = await create_conversation(
+                session,
+                user_email="user@test.com",
+                agent_id="agent-1",
+                context_type="web",
+                conversation_id="conv-1",
+            )
+            source_session = await create_session(
+                session,
+                conversation_id=conversation.conversation_id,
+                user_email="user@test.com",
+                agent_id="agent-1",
+            )
+            await update_conversation_active_session(
+                session,
+                conversation.conversation_id,
+                source_session.session_id,
+            )
             dependency = await create_task(
                 session,
                 created_by="user@test.com",
@@ -584,6 +842,43 @@ async def test_pick_ready_task_cas(tmp_path: object) -> None:
 
 
 @pytest.mark.asyncio
+async def test_queue_refetches_task_after_claiming_detached_session_row(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    launched: list[TaskModel] = []
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                task_id="task-detached-claim",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Claimed task",
+                status="ready",
+            )
+            await session.commit()
+
+        async def _publish(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(),
+            workflow_registry=SimpleNamespace(),
+            event_bus=SimpleNamespace(publish=_publish),
+        )
+        queue._launch_claimed_task_run = (  # type: ignore[method-assign]
+            lambda task, _claim: launched.append(task)
+        )
+
+        await queue._try_pick_and_run()  # noqa: SLF001
+
+        assert [task.task_id for task in launched] == ["task-detached-claim"]
+        assert launched[0].status == TaskStatus.RUNNING
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_task_dependencies_cycle_detection(tmp_path: object) -> None:
     engine, factory = await _bootstrap_db(tmp_path)
     try:
@@ -912,8 +1207,8 @@ async def test_recover_paused_tasks_step_input_awaiting_user(tmp_path: object) -
 
         recovered = await queue.recover_paused_tasks()
         assert recovered == ["task_awaiting"]
-        # No persisted response → task stays paused, waiter registered.
-        assert queue.launch_calls == []  # type: ignore[attr-defined]
+        # No persisted response → takeover relaunches the authoritative DB wait.
+        assert [task.task_id for task in queue.launch_calls] == ["task_awaiting"]  # type: ignore[attr-defined]
         assert "input_2" in waiter.registered
     finally:
         await engine.dispose()
@@ -1037,9 +1332,9 @@ async def test_recover_paused_tasks_credential_pending_stays_paused(tmp_path: ob
 
         recovered = await queue.recover_paused_tasks()
         assert recovered == ["task_cred_pending"]
-        # Not resolved → waiter registered, task NOT launched.
+        # Not resolved → waiter registered and takeover relaunches the DB wait.
         assert "cred_2" in waiter.registered
         assert waiter.resolved == []
-        assert queue.launch_calls == []  # type: ignore[attr-defined]
+        assert [task.task_id for task in queue.launch_calls] == ["task_cred_pending"]  # type: ignore[attr-defined]
     finally:
         await engine.dispose()
