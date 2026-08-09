@@ -47,16 +47,24 @@ shape for work in Cognis.
   without a durable background boundary.
 - Use a delegate for one bounded terminal result such as independent
   exploration, specialist advice, or scope-locked review.
-- Before starting a fresh delegate, inspect existing child sessions. For the same
-  problem, use `follow_up_subsession` to continue with full prior context or
-  `fork_subsession` for an independent branch from that context. Start fresh
-  only for genuinely new scope, deliberate independence, incompatible execution
-  requirements, or demonstrably stale/polluted context.
+- Before starting a fresh delegate, inspect existing child sessions. Reuse or
+  fork a child only when the same problem, specialist role, tool/authority
+  scope, and expected output remain compatible. Follow-up and fork preserve the
+  source child's agent identity and capabilities; they do not change specialist.
+  For the same compatible line of work, use `follow_up_subsession`; use
+  `fork_subsession` for an independent branch. Start fresh with the appropriate
+  specialist when the next work needs a different role, tools, authority, or
+  output contract.
 - Use a managed conversation for visible, inspectable, iterative work that may
   need follow-up. Reuse a relevant managed conversation with
   `agent_conversation_get` and `agent_conversation_send` instead of creating a
   duplicate; use `agent_conversation_fork` when the new work should branch from
   that context.
+- Every new managed-conversation contract must state `Working mode: execute` or
+  `Working mode: coordinate`. Execute means the target completes the assigned
+  core work itself and does not split or delegate it; bounded exploration,
+  research, consultation, or independent review remains allowed. Coordinate
+  permits independent workstreams while retaining integration and acceptance.
 - Use a task when work needs durable background ownership, status, pause/resume,
   or later retrieval but not a custom workflow definition.
 - Use a workflow only when an explicit durable step, deliverable, evaluation, or
@@ -168,6 +176,14 @@ Workflow step objectives and controller completion contracts override this skill
 - Before introducing a dependency, verify the project already uses it or that adding it is explicitly required.
 - Preserve user-facing prose in the target language, including correct diacritics. Do not force natural-language documents to ASCII.
 - Keep code identifiers, code comments, and commit messages in English unless the user or project explicitly requires otherwise.
+- Use Conventional Commits v1.0.0 for task-owned commits unless the repository
+  defines a different commit convention or the user explicitly requests one.
+  Format the subject as `<type>[optional scope][!]: <short description>`.
+  Choose the type from the actual change, for example `feat`, `fix`,
+  `refactor`, `test`, `docs`, `perf`, `build`, `ci`, or `chore`. Keep the
+  subject concise and in English. Add a body or `BREAKING CHANGE` footer only
+  when it carries useful context. Do not invent scopes, issue IDs, or breaking
+  markers.
 - Add comments sparingly, only when they explain non-obvious intent or constraints.
 
 # Workspace Hygiene
@@ -194,6 +210,11 @@ Workflow step objectives and controller completion contracts override this skill
   Architect Todos track those durable workstreams or milestones; developer
   Todos track granular implementation, test, and acceptance steps.
 - If directly assigned as the implementer, own one bounded scope and inspect, implement, and test it yourself. Do not delegate that same implementation scope, delegate implementation further, or redelegate the same scope.
+- When assigning a primary-agent workstream, state `Working mode: execute` or
+  `Working mode: coordinate`. In execute mode, the target completes the core
+  work itself and does not split or delegate it. Use coordinate mode only when
+  the target is expected to decompose independent workstreams and retain
+  integration and acceptance.
 - Prefer delegation for bounded independent exploration or review. Parallel implementation is appropriate only when the plan and integration contracts are stable, workstreams have separate ownership, dependencies are not sequential, each worker has clear acceptance criteria and an isolated workspace, and one coordinator owns final integration and review.
 - Keep work direct when workers would touch the same hotspots, interfaces are still evolving, one slice depends on decisions from another, or coordination costs more than the implementation.
 - After a failed check or concrete review finding, make one evidence-based
@@ -201,10 +222,11 @@ Workflow step objectives and controller completion contracts override this skill
   remains, stop repeating fixes and replan or escalate to a more suitable
   profile.
 - Reuse context generically, not only for review. Before any fresh delegation,
-  check whether an existing child context already owns the same problem. Continue
-  it for the same line of work or branch from it for an independent alternative.
-  Start fresh only for genuinely new scope, deliberate independence,
-  incompatible execution requirements, or demonstrably stale/polluted context.
+  check whether an existing child context has the same problem, specialist role,
+  tool/authority scope, and expected output. Continue or branch from it only
+  when all remain compatible, because follow-up and fork preserve the source
+  child's agent identity and capabilities. Start fresh with the appropriate
+  specialist when any of those change.
 - Keep implementation fixes with the original implementer. For review, start the
   first genuinely independent review fresh, then continue or fork that reviewer
   context after fixes instead of rebuilding review context from scratch.
@@ -352,7 +374,8 @@ Use this skill when the user wants the main chat agent to inspect or manage Cogn
 1. Use `list_workflows` or `get_workflow` before mutating a workflow.
 2. Confirm whether the workflow is system-owned or user-owned.
 3. Inspect current steps, references, loop targets, and outcome routes before editing.
-4. If a workflow is referenced by active tasks, treat it as protected and avoid destructive edits.
+4. Inspect presentation phases and preserve their complete, contiguous step coverage.
+5. If a workflow is referenced by active tasks, treat it as protected and avoid destructive edits.
 
 # Safe Mutation Rules
 
@@ -361,6 +384,24 @@ Use this skill when the user wants the main chat agent to inspect or manage Cogn
 - Do not attempt to modify system workflows.
 - Do not delete or overwrite a workflow referenced by active tasks.
 - Prefer duplicating a workflow before heavy edits when the user wants to preserve the original.
+- Author concise presentation phases for meaningful stages. Every step must appear
+  exactly once, and phase membership must follow canonical contiguous step order.
+
+# Deterministic Step Authoring
+
+- Use `tool_call` only for one mechanical tool invocation, `condition` only for
+  strict-boolean branching, and `complete` for terminal no-LLM completion.
+- A deterministic step must contain exactly one matching config. Do not mix
+  agent, input, completion, review, question, or outcome-route fields into it.
+- `when` and `condition.if` are constrained Jinja expressions and must evaluate
+  to a boolean. A single `{{ expression }}` preserves native argument/output
+  types; summaries and content render as text.
+- Branches and `next` reference existing steps. Never create self-jumps or
+  deterministic jump cycles.
+- Tool calls default to read-only behavior. Set `allow_side_effects=true` only
+  for intentionally authorized mutations. Never render credentials or secrets.
+- Prefer deterministic fetch/check/branch/no-op logic; keep judgment,
+  synthesis, writing, and ambiguous intent interpretation in `run` steps.
 
 # Tool Usage
 
@@ -379,7 +420,8 @@ Use this skill when the user wants the main chat agent to inspect or manage Cogn
 
 # Examples
 
-- "Create a workflow that plans, implements, reviews, and commits changes."
+- "Create a workflow with Plan, Build, Verify, and Deliver phases that plans,
+  implements, reviews, and commits changes."
 - "Duplicate the software-development workflow and tailor it for docs-only tasks."
 - "Inspect this workflow and explain why it loops back to plan."
 """,
@@ -474,10 +516,10 @@ over this skill for paid users who want a turnkey multi-source report.
    `web_fetch` also materializes PDFs, images, and other binary files as
    artifacts. PDFs return extracted page text and keep the original PDF
    attached for later use.
-4. **Do not force a backend unless you mean to.** Normally omit the
-   optional `backend` parameter on `web_search` and `web_fetch` so the
-   configured defaults apply. For fetches, omitting `backend` also keeps
-   the automatic browser fallback available.
+4. **Use configured backend policy.** `web_search` and `web_fetch` select
+   their backends from system settings. Fetches keep the configured automatic
+   browser fallback available; do not bypass native web tools by calling
+   browser tools directly after a failure.
 5. **Cross-check.** When sources disagree, surface the disagreement;
    never paper over it. When they agree, you can compress.
 6. **Cite.** Every non-trivial claim in the synthesis should reference
@@ -489,9 +531,9 @@ over this skill for paid users who want a turnkey multi-source report.
    and a browser fallback failure in the same error, the controller already
    exhausted the configured browser retry. When
    `web.browser_fetch.headed_fallback_enabled` and `browser.headed_allowed`
-   are both enabled, fallback and explicit `backend='browser'` prefer a
-   headed browser; otherwise they use headless. Pick a different source or
-   escalate to the user instead of retrying mechanically.
+   are both enabled, fallback prefers a headed browser; otherwise it uses
+   headless. Pick a different source or escalate to the user instead of
+   retrying mechanically.
 8. **Stop at "enough".** Quit when adding another source would be
    redundant. Five high-quality citations beat fifteen low-quality ones.
 

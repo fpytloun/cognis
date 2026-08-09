@@ -14,6 +14,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
+from cognis.core.agent_registry import SYSTEM_AGENTS
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpPolicy
 from cognis.core.immutable_prefix import (
@@ -29,10 +30,12 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import (
     ConversationContext,
+    ConversationLineage,
     ConversationModel,
     SessionEvent,
     SessionModel,
     SessionStatus,
+    SessionTransition,
     with_session_events_turn_id,
 )
 from cognis.models.workflow import merge_session_policies
@@ -46,6 +49,10 @@ from cognis.runtime_context import (
 from cognis.store import queries
 
 logger = get_logger(__name__)
+
+
+class SessionRotationConflictError(RuntimeError):
+    """The conversation root changed before a root rotation could commit."""
 
 
 def _agent_direct_title(agent: AgentDefinition) -> str:
@@ -737,6 +744,10 @@ class SessionManager:
         initial_active_executor_expires_at: datetime | None = None,
         initial_active_executor_source: str | None = None,
         project_id: str | None = None,
+        admission_guard: Any | None = None,
+        conversation_id: str | None = None,
+        lineage: ConversationLineage | None = None,
+        activity_scope_id: str | None = None,
     ) -> tuple[ConversationModel, SessionModel]:
         """Create a conversation and root session atomically.
 
@@ -748,8 +759,15 @@ class SessionManager:
 
         async with self.session_factory() as db_session:
             try:
+                if admission_guard is not None and not await admission_guard(db_session):
+                    raise PermissionError("Conversation admission ownership changed")
                 agent = await self._require_agent(db_session, agent_id)
-                conversation = await queries.create_conversation(
+                create_conversation = (
+                    queries.create_lineage_conversation
+                    if lineage is not None
+                    else queries.create_conversation
+                )
+                conversation = await create_conversation(
                     db_session,
                     user_email=user_email,
                     agent_id=agent_id,
@@ -761,6 +779,8 @@ class SessionManager:
                     context_data=context.platform_data,
                     memory_labels=dict(context.memory_labels),
                     project_id=project_id,
+                    conversation_id=conversation_id,
+                    **({"lineage": lineage} if lineage is not None else {}),
                 )
                 # Stage 36: seed the conversation's active_executor_id from
                 # the task-level pin (if provided). The runtime factory
@@ -777,6 +797,8 @@ class SessionManager:
                     user_email=user_email,
                     agent_id=agent_id,
                     agent_profile_id=agent_profile_id,
+                    source_session_id=lineage.source_session_id if lineage else None,
+                    activity_scope_id=activity_scope_id,
                 )
                 resolved_intention = _normalize_intention(
                     intention or self._build_root_intention(agent, title)
@@ -837,6 +859,8 @@ class SessionManager:
         snapshot_extras: dict[str, Any] | None = None,
         max_source_seq: int | None = None,
         event_filter: Any | None = None,
+        admission_guard: Any | None = None,
+        lineage: ConversationLineage | None = None,
     ) -> tuple[ConversationModel, SessionModel, bool]:
         """Fork a source session into a new web conversation."""
 
@@ -858,6 +882,16 @@ class SessionManager:
             source_conversation,
             target_agent_id=agent.agent_id,
         )
+        canonical_lineage = lineage or ConversationLineage(
+            kind="conversation",
+            source_conversation_id=source_conversation.conversation_id,
+            source_session_id=source_session.session_id,
+        )
+        if (
+            canonical_lineage.source_conversation_id != source_conversation.conversation_id
+            or canonical_lineage.source_session_id != source_session.session_id
+        ):
+            raise ValueError("Lineage source does not match the fork source")
         conversation, session = await self.create_conversation_with_root_session(
             user_email=user_email,
             agent_id=agent.agent_id,
@@ -866,6 +900,11 @@ class SessionManager:
             title=fork_title,
             title_source="manual",
             intention=intention or source_session.result_summary or fork_title,
+            admission_guard=admission_guard,
+            lineage=canonical_lineage,
+            # A fork inherits conversational context, not source activity.
+            # The new root session becomes the new activity scope.
+            activity_scope_id=None,
         )
         copied = await fork_session_events(
             providers=self.providers,
@@ -884,7 +923,11 @@ class SessionManager:
             extra_prefix_entries=extra_prefix_entries,
             extra_history_events=extra_history_events,
             max_source_seq=max_source_seq,
-            event_filter=event_filter,
+            event_filter=(
+                _fork_context_event
+                if event_filter is None
+                else lambda event: _fork_context_event(event) and event_filter(event)
+            ),
         )
         return conversation, session, copied
 
@@ -1230,6 +1273,7 @@ class SessionManager:
                     agent_id=agent_id,
                     agent_profile_id=agent_profile_id,
                     parent_session_id=parent_session.session_id,
+                    activity_scope_id=parent_session.activity_scope_id,
                     delegation_mode=mode,
                     delegation_task=task_description,
                     delegation_metadata=delegation_metadata,
@@ -1323,20 +1367,37 @@ class SessionManager:
 
         resolved_user_email = user_email
         target_session_id = session_id
-        if resolved_user_email is None:
+        agent_id: str | None = None
+        agent_owner_email: str | None = None
+        try:
             async with self.session_factory() as db_session:
                 session_row = await queries.get_session_row(db_session, session_id)
                 if session_row is not None:
                     resolved_user_email = session_row.user_email
                     target_session_id = session_row.intaris_session_id or session_row.session_id
-
-        try:
-            await self.providers.guardrails.update_session_status(
-                target_session_id,
-                intaris_status,
-                status_reason,
+                    agent_id = session_row.agent_id
+                    agent_row = await queries.get_agent(db_session, agent_id)
+                    system_agent = SYSTEM_AGENTS.get(agent_id)
+                    agent_owner_email = (
+                        agent_row.owner_email
+                        if agent_row is not None
+                        else system_agent.owner_email
+                        if system_agent is not None
+                        else None
+                    )
+            if resolved_user_email is None or agent_id is None or agent_owner_email is None:
+                raise RuntimeError("Session identity is unavailable for Intaris status sync")
+            with scoped_runtime_context(
                 user_email=resolved_user_email,
-            )
+                agent_id=agent_id,
+                agent_owner_email=agent_owner_email,
+            ):
+                await self.providers.guardrails.update_session_status(
+                    target_session_id,
+                    intaris_status,
+                    status_reason,
+                    user_email=resolved_user_email,
+                )
         except Exception:
             logger.warning(
                 "session: failed to sync status to Intaris",
@@ -1512,14 +1573,16 @@ class SessionManager:
         current_session: SessionModel,
         intention: str,
         completion_reason: str = "compacted",
+        transition: SessionTransition = SessionTransition.COMPACT,
         compaction_summary: str | None = None,
         compaction_summary_event_data: dict[str, Any] | None = None,
         tail_events: list[Any] | None = None,
     ) -> SessionModel:
-        """Create a new root session, completing the current one.
+        """Create a successor in the current session lane.
 
-        This is used for compaction (new clean context window) and for
-        explicit session reset.  The new session starts with
+        Root successors advance the conversation's active-session pointer.
+        Child successors retain the same parent and delegation identity and
+        never change that pointer. The new session starts with
         ``mnemory_session_id=None`` so the first recall creates a fresh
         Mnemory session and reconstructs the full immutable prefix
         (core memories + instructions) from scratch.  This intentionally
@@ -1528,12 +1591,14 @@ class SessionManager:
         """
 
         logger.info(
-            "session: rotating root session",
+            "session: rotating session",
             extra={
                 "extra_data": {
                     "conversation_id": conversation_id,
                     "old_session_id": current_session.session_id,
                     "completion_reason": completion_reason,
+                    "transition": transition.value,
+                    "parent_session_id": current_session.parent_session_id,
                 }
             },
         )
@@ -1545,7 +1610,19 @@ class SessionManager:
 
         async with self.session_factory() as db_session:
             try:
-                # 1. Create new root session (fresh Mnemory session — the
+                if current_session.parent_session_id is None:
+                    conversation = await queries.get_conversation_for_update(
+                        db_session, conversation_id
+                    )
+                    if (
+                        conversation is None
+                        or conversation.active_session_id != current_session.session_id
+                    ):
+                        raise SessionRotationConflictError(
+                            "Conversation active session changed during root rotation"
+                        )
+
+                # 1. Create a successor in the same lane (fresh Mnemory session — the
                 #    first recall will create a new Mnemory session and
                 #    reconstruct the full immutable prefix from scratch)
                 new_session_row = await queries.create_session(
@@ -1553,9 +1630,37 @@ class SessionManager:
                     conversation_id=conversation_id,
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
+                    agent_profile_id=current_session.agent_profile_id,
+                    parent_session_id=current_session.parent_session_id,
                     previous_session_id=current_session.session_id,
+                    delegation_mode=current_session.delegation_mode,
+                    delegation_task=current_session.delegation_task,
+                    delegation_metadata=dict(current_session.delegation_metadata),
                     mnemory_session_id=None,
+                    activity_scope_id=(
+                        current_session.activity_scope_id
+                        if transition is SessionTransition.COMPACT
+                        else None
+                    ),
                 )
+                if transition is SessionTransition.COMPACT:
+                    await queries.copy_session_todos(
+                        db_session,
+                        source_session_id=current_session.session_id,
+                        target_session_id=new_session_row.session_id,
+                    )
+                else:
+                    await queries.replace_conversation_todos(
+                        db_session,
+                        conversation_id,
+                        [],
+                        source_session_id=current_session.session_id,
+                    )
+                    await queries.replace_session_todos(
+                        db_session,
+                        new_session_row.session_id,
+                        [],
+                    )
 
                 # 2. Create Intaris session for the new root
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
@@ -1574,6 +1679,7 @@ class SessionManager:
                         intention=_normalize_intention(intention),
                         agent_id=current_session.agent_id,
                         user_id=current_session.user_email,
+                        parent_session_id=current_session.parent_session_id,
                         details=_intaris_session_details(workdir),
                         policy=_intaris_session_policy(workdir, project_paths=project_paths),
                     )
@@ -1636,10 +1742,20 @@ class SessionManager:
                     completion_reason=completion_reason,
                 )
 
-                # 5. Update conversation root
-                await queries.update_conversation_active_session(
-                    db_session, conversation_id, new_session_row.session_id
-                )
+                # 5. Only root-lane rotation advances the conversation pointer.
+                #    Compare-and-set prevents a stale concurrent rotation from
+                #    replacing a newer root.
+                if current_session.parent_session_id is None:
+                    advanced = await queries.compare_and_set_conversation_active_session(
+                        db_session,
+                        conversation_id,
+                        expected_session_id=current_session.session_id,
+                        active_session_id=new_session_row.session_id,
+                    )
+                    if not advanced:
+                        raise SessionRotationConflictError(
+                            "Conversation active session changed during root rotation"
+                        )
 
                 await db_session.commit()
             except Exception:
@@ -1651,7 +1767,7 @@ class SessionManager:
 
         # Sync old session status to Intaris (best-effort)
         await self._sync_intaris_status(
-            current_session.intaris_session_id or current_session.session_id,
+            current_session.session_id,
             "completed",
             user_email=current_session.user_email,
             completion_reason=completion_reason,
@@ -1672,7 +1788,7 @@ class SessionManager:
         rotated_prefix: list[ImmutablePrefixEntry] = [
             entry for entry in prefix_entries if entry.source != "compaction_summary"
         ]
-        if compaction_summary:
+        if transition is not SessionTransition.RESET and compaction_summary:
             rotated_prefix.append(
                 ImmutablePrefixEntry(
                     role="developer",
@@ -1706,7 +1822,7 @@ class SessionManager:
                 ],
                 None,
             )
-            if compaction_summary
+            if transition is not SessionTransition.RESET and compaction_summary
             else []
         )
         summary_result: Any | None = None
@@ -1816,7 +1932,7 @@ class SessionManager:
             if callable(append_recorded_events):
                 await append_recorded_events(new_session, durable_summary_events, summary_result)
 
-        if tail_events:
+        if transition is not SessionTransition.RESET and tail_events:
             await self._seed_rotated_tail_events(
                 new_session,
                 tail_events=tail_events,
@@ -1952,20 +2068,15 @@ class SessionManager:
 
         for recovered_id in recovered_ids:
             await self._evict_session_state(recovered_id)
-        # Best-effort sync to Intaris for all recovered sessions (after commit)
-        for stale_session in stale_sessions:
-            if stale_session.session_id not in recovered_ids:
-                continue
-            if stale_session.parent_session_id is None:
-                await self._sync_intaris_status(
-                    stale_session.intaris_session_id or stale_session.session_id,
-                    "idle",
-                )
-            else:
-                await self._sync_intaris_status(
-                    stale_session.intaris_session_id or stale_session.session_id,
-                    "failed",
-                )
+        # Re-read committed rows so recursively recovered descendants are synced too.
+        for recovered_id in recovered_ids:
+            await self._sync_intaris_status(
+                recovered_id,
+                "idle"
+                if recovered_id
+                in {row.session_id for row in stale_sessions if row.parent_session_id is None}
+                else "failed",
+            )
         if recovered_ids:
             logger.info(
                 "Recovered stale sessions",
@@ -2005,6 +2116,7 @@ class SessionManager:
                             type=EventType.FOLLOW_UP_TURN_REQUESTED,
                             data={
                                 "conversation_id": child_session.conversation_id,
+                                "origin_session_id": child_session.parent_session_id,
                                 "follow_up": follow_up.model_dump(mode="json"),
                                 "channel_deliverable": False,
                                 "delivery_id": None,
@@ -2097,7 +2209,7 @@ class SessionManager:
             await self._evict_session_state(session_row.session_id)
         for session_row in sessions_to_sync:
             await self._sync_intaris_status(
-                session_row.intaris_session_id or session_row.session_id,
+                session_row.session_id,
                 "completed",
                 completion_reason=f"conversation_{conversation_status}",
             )
@@ -2214,12 +2326,34 @@ def _to_conversation_model(row: Any) -> ConversationModel:
     )
 
 
+_FORK_ACTIVITY_EVENT_TYPES = {
+    "artifact",
+    "assistant_deliverable",
+    "background_job",
+    "background_job_update",
+    "todo_state",
+    "tool_call",
+    "tool_output_chunk",
+    "tool_progress",
+    "tool_result",
+    "tool_result_chunk",
+}
+
+
+def _fork_context_event(event: CachedEvent) -> bool:
+    """Keep conversational history while resetting fork-local activity."""
+
+    return event.type not in _FORK_ACTIVITY_EVENT_TYPES
+
+
 def _to_session_model(row: Any) -> SessionModel:
     return SessionModel(
         session_id=row.session_id,
+        activity_scope_id=getattr(row, "activity_scope_id", None) or row.session_id,
         conversation_id=row.conversation_id,
         parent_session_id=row.parent_session_id,
         previous_session_id=getattr(row, "previous_session_id", None),
+        source_session_id=getattr(row, "source_session_id", None),
         user_email=row.user_email,
         agent_id=row.agent_id,
         agent_profile_id=getattr(row, "agent_profile_id", None),

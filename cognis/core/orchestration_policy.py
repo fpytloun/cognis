@@ -188,6 +188,19 @@ def build_orchestration_capability_guidance(
                 "the step remains workflow-driven."
             )
         return "\n".join(lines)
+    if orchestration_mode is OrchestrationMode.TASK_PRIMARY:
+        if has_delegate:
+            lines.append("- Joined specialist delegation is available for bounded support work.")
+        if has_managed:
+            lines.append(
+                "- Task-owned managed conversations are available for primary-agent "
+                "workstreams. Keep children linked to this step and join required results."
+            )
+        lines.append(
+            "- Task and workflow creation, delivery changes, profile changes, and "
+            "unrelated conversation control are unavailable."
+        )
+        return "\n".join(lines)
 
     if policy.surface is OrchestrationSurface.MANAGED_AGENT_CONVERSATION:
         if has_managed:

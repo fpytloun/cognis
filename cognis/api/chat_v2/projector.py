@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterable
 from typing import Any, Literal, cast
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from cognis.api.chat_v2.cycles import cycle_states_from_items
 from cognis.api.chat_v2.item_keys import (
@@ -42,7 +42,10 @@ from cognis.api.chat_v2.schemas import (
     TimelineWindow,
     TodoStateTimelineItem,
     ToolCallTimelineItem,
+    UserInteractionAnswer,
+    UserInteractionTimelineItem,
 )
+from cognis.models.artifact import ArtifactKind, AttachmentRef
 
 ThinkingStatus = Literal["running", "complete", "failed"]
 QuestionStatus = Literal["waiting", "complete", "cancelled"]
@@ -200,6 +203,12 @@ def _project_event(
     if event.kind == "assistant_message":
         return _message_item(event, role="assistant")
     if event.kind == "system_message":
+        # Follow-up admission emits this notice live, before the controller turn
+        # starts. It is a transient turn-boundary signal, not conversation
+        # history. Keeping it in the canonical projection makes delayed
+        # backfills look like new work.
+        if event.data.get("kind") == "turn_initiated" and event.data.get("scope") == "turn":
+            return HIDDEN_EVENT
         return _message_item(event, role="system")
     if event.kind == "thinking":
         return _thinking_item(event)
@@ -236,6 +245,8 @@ def _project_event(
         return _auth_challenge_item(event)
     if event.kind == "credential_request":
         return _credential_request_item(event)
+    if event.kind == "user_interaction":
+        return _user_interaction_item(event)
     if event.kind == "todo_state":
         return _todo_state_item(event)
     if event.kind == "artifact":
@@ -277,6 +288,8 @@ def _message_item(event: NormalizedChatEvent, *, role: str) -> MessageTimelineIt
         notice_id=_str_or_none(data.get("notice_id")),
         notice_kind=_str_or_none(data.get("kind")),
         notice_scope=_str_or_none(data.get("scope")),
+        retry_reason=_str_or_none(data.get("retry_reason")),
+        retry_source_turn_id=_str_or_none(data.get("retry_source_turn_id")),
         reason_class=_str_or_none(data.get("reason_class")),
         provider_id=_str_or_none(data.get("provider_id")),
         model=_str_or_none(data.get("model")),
@@ -292,7 +305,7 @@ def _message_item(event: NormalizedChatEvent, *, role: str) -> MessageTimelineIt
         follow_up_conversation_id=_str_or_none(data.get("follow_up_conversation_id")),
         follow_up_session_id=_str_or_none(data.get("follow_up_session_id")),
         partial=bool(data.get("partial", False)),
-        attachments=list(data.get("attachments") or []),
+        attachments=_attachments(data.get("attachments")),
         chat_mode=_chat_mode(data),
         chat_mode_source=_str_or_none(data.get("chat_mode_source")),
     )
@@ -435,7 +448,7 @@ def _tool_result_item(
         streamed_output=_str_or_none(data.get("streamed_output")),
         is_error=is_error,
         duration_ms=_int_or_none(data.get("duration_ms")),
-        attachments=list(data.get("attachments") or []),
+        attachments=_attachments(data.get("attachments")),
         file_diffs=_file_diffs(data.get("file_diffs")),
         output_size=_int_or_none(data.get("output_size")),
         truncated=bool(data.get("truncated", False)),
@@ -743,6 +756,43 @@ def _credential_request_item(event: NormalizedChatEvent) -> CredentialRequestTim
         description=_str_or_none(data.get("description")),
         required_fields=[str(value) for value in data.get("required_fields") or []],
         status=_request_status(data),
+    )
+
+
+def _user_interaction_item(event: NormalizedChatEvent) -> UserInteractionTimelineItem:
+    data = event.data
+    interaction_id = str(data.get("interaction_id") or _fallback_id(event))
+    answers: list[UserInteractionAnswer] = []
+    for value in data.get("answers") or []:
+        if not isinstance(value, dict):
+            continue
+        answer = _str_or_none(value.get("answer"))
+        if answer is None:
+            continue
+        answers.append(
+            UserInteractionAnswer(
+                question=_str_or_none(value.get("question")),
+                answer=answer,
+            )
+        )
+    status = str(data.get("status") or "complete")
+    if status not in {"complete", "cancelled", "denied", "failed"}:
+        status = "complete"
+    return UserInteractionTimelineItem(
+        id=f"user-interaction:{interaction_id}",
+        sort_key=_sort_key(event),
+        source_refs=[event.source_ref],
+        created_at=event.timestamp,
+        updated_at=event.timestamp,
+        stable=True,
+        interaction_id=interaction_id,
+        interaction_type=str(data.get("interaction_type") or "interaction"),
+        origin_call_id=_str_or_none(data.get("origin_call_id")),
+        origin_tool_name=_str_or_none(data.get("origin_tool_name")),
+        title=str(data.get("title") or "You completed an interaction"),
+        summary=_str_or_none(data.get("summary")),
+        answers=answers,
+        status=cast(Any, status),
     )
 
 
@@ -1116,6 +1166,38 @@ def _task_status(event: NormalizedChatEvent) -> TimelineItemStatus:
     return "running"
 
 
+def _attachments(value: Any) -> list[AttachmentRef]:
+    """Normalize legacy attachment rows without failing the containing event."""
+
+    if not isinstance(value, list):
+        return []
+    result: list[AttachmentRef] = []
+    for item in value:
+        if isinstance(item, AttachmentRef):
+            result.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        candidate = dict(item)
+        if not candidate.get("kind"):
+            mime_type = str(candidate.get("mime_type") or "").lower()
+            if mime_type.startswith("image/"):
+                candidate["kind"] = ArtifactKind.IMAGE
+            elif mime_type.startswith("audio/"):
+                candidate["kind"] = ArtifactKind.AUDIO
+            elif mime_type.startswith("video/"):
+                candidate["kind"] = ArtifactKind.VIDEO
+            elif mime_type == "application/pdf":
+                candidate["kind"] = ArtifactKind.PDF
+            else:
+                candidate["kind"] = ArtifactKind.FILE
+        try:
+            result.append(AttachmentRef.model_validate(candidate))
+        except ValidationError:
+            continue
+    return result
+
+
 def _file_diffs(value: Any) -> list[FileDiffRef]:
     if not isinstance(value, list):
         return []
@@ -1126,6 +1208,12 @@ def _file_diffs(value: Any) -> list[FileDiffRef]:
                 FileDiffRef(
                     path=str(item.get("path") or item.get("file_path") or ""),
                     diff=str(item.get("diff") or item.get("patch") or ""),
+                    status=_str_or_none(item.get("status")),
+                    old_path=_str_or_none(item.get("old_path")),
+                    binary=item.get("binary") is True,
+                    generated=item.get("generated") is True,
+                    truncated=item.get("truncated") is True,
+                    preview_omitted=item.get("preview_omitted") is True,
                 )
             )
     return result

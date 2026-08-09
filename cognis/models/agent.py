@@ -279,6 +279,7 @@ class AgentLLMConfig(BaseModel):
     top_p: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    fast_mode: bool | None = None
     model_routing: dict[str, str] | None = None
     voice: str | None = None  # Per-agent TTS voice override
 
@@ -315,6 +316,7 @@ class AgentRuntimeProfile(BaseModel):
         default=None,
         validation_alias=AliasChoices("reasoning_effort", "thinking_effort"),
     )
+    fast_mode: bool | None = None
     system_prompt_extra: str | None = None
     memory_enabled: bool | None = None
     memory_backend_options: dict[str, Any] = Field(default_factory=dict)

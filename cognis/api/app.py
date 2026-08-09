@@ -10,22 +10,34 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from cognis.api.chat_v2.cached_event_store import (
+    CachedSessionEventStore,
+    EventCacheBounds,
+    EventCachePolicy,
+)
 from cognis.api.chat_v2.e2e_control import router as chat_v2_e2e_control_router
+from cognis.api.chat_v2.event_store import IntarisSessionEventStore
 from cognis.api.chat_v2.routes import router as chat_v2_router
+from cognis.api.chat_v2.shared_snapshot_cache import SharedChatSnapshotCache
 from cognis.api.common import error_response
 from cognis.api.executor_runtime import schedule_executor_reconfigure
 from cognis.api.mcp_reconfigure import (
     schedule_mcp_server_executor_reconfigure_for_app,
 )
-from cognis.api.middleware import AuthenticationMiddleware
+from cognis.api.middleware import (
+    AuthenticationMiddleware,
+    KnowledgebaseDocumentUploadLimitMiddleware,
+)
 from cognis.api.routes.agents import router as agents_router
 from cognis.api.routes.artifacts import router as artifacts_router
 from cognis.api.routes.auth import router as auth_router
@@ -64,19 +76,22 @@ from cognis.api.routes.tts import router as tts_router
 from cognis.api.routes.users import router as users_router
 from cognis.api.routes.workflows import router as workflows_router
 from cognis.api.runtime_support import build_shared_runtime, build_step_runtime_factory
-from cognis.api.websocket import handle_websocket
+from cognis.api.websocket import WebSocketConnectionManager, handle_websocket
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import load_config
 from cognis.core.agent_loop import AgentLoop, PauseWaiter, SessionLock
 from cognis.core.agent_registry import AgentRegistry
+from cognis.core.chat_v2_runtime_relay import ChatV2RuntimeRedisRelay
 from cognis.core.compaction import CompactionStrategy
 from cognis.core.context import ContextAssembler
 from cognis.core.decision import DecisionEngine
-from cognis.core.events import EventBus
+from cognis.core.event_append_invalidation import EventAppendInvalidationDispatcher
+from cognis.core.events import EventBus, EventType
 from cognis.core.local_model_catalog import LocalModelCatalog
 from cognis.core.local_model_reconciler import LocalModelReconciler
 from cognis.core.local_model_runtime import LocalModelRuntimeManager
 from cognis.core.mcp_oauth import MCPOAuthError, MCPOAuthService
+from cognis.core.redis_service import RedisService
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
 from cognis.core.session import SessionManager
@@ -94,6 +109,7 @@ from cognis.models.config import ProviderHealth
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.registry import ProviderRegistry, build_provider_registry
 from cognis.security import LoginRateLimiter, RequestRateLimiter, create_password_hasher
+from cognis.store.database import pool_snapshot
 from cognis.ui_assets import SPAMiddleware, resolve_ui_build_dir
 
 STARTUP_HEALTH_ATTEMPTS = 3
@@ -212,6 +228,80 @@ async def _print_startup_status(
 logger = get_logger(__name__)
 
 
+class _PendingAppendWarmState:
+    """Compare-and-remove state for overlapping event append resolutions."""
+
+    def __init__(self, max_sessions: int) -> None:
+        self._max_sessions = max_sessions
+        self._pending: dict[str, tuple[str, int, str]] = {}
+
+    def __len__(self) -> int:
+        return len(self._pending)
+
+    def claim(self, session_token: str) -> tuple[str, int, str] | None:
+        return self._pending.get(session_token)
+
+    def put(
+        self,
+        session_token: str,
+        value: tuple[str, int, str],
+    ) -> bool:
+        current = self._pending.get(session_token)
+        if current is not None and value[1] < current[1]:
+            return False
+        overflowed = session_token not in self._pending and len(self._pending) >= self._max_sessions
+        if overflowed:
+            self._pending.pop(next(iter(self._pending)))
+        self._pending[session_token] = value
+        return overflowed
+
+    def complete(
+        self,
+        session_token: str,
+        processed: tuple[str, int, str],
+    ) -> bool:
+        """Remove only the exact claim. Return True when newer work remains."""
+
+        current = self._pending.get(session_token)
+        if current == processed:
+            self._pending.pop(session_token, None)
+            return False
+        return current is not None
+
+    def finish(
+        self,
+        session_token: str,
+        processed: tuple[str, int, str],
+        *,
+        succeeded: bool,
+    ) -> bool:
+        """Keep failed exact claims; remove only successfully processed claims."""
+
+        if not succeeded:
+            return self._pending.get(session_token) is not None
+        return self.complete(session_token, processed)
+
+    def clear(self) -> None:
+        self._pending.clear()
+
+
+async def _drain_turn_scheduler(
+    turn_scheduler: Any,
+    *,
+    drain_timeout_seconds: float,
+    cancel_timeout_seconds: float,
+) -> dict[str, int]:
+    result: dict[str, int] = await turn_scheduler.drain_active_turns(
+        timeout_seconds=drain_timeout_seconds
+    )
+    if result["timed_out"]:
+        cancellation = await turn_scheduler.interrupt_active_turns_and_wait(
+            reason="controller_restart", timeout_seconds=cancel_timeout_seconds
+        )
+        result.update({f"cancellation_{key}": value for key, value in cancellation.items()})
+    return result
+
+
 def create_app() -> FastAPI:
     config = load_config()
     setup_logging(config.log_level, config.log_format)
@@ -235,16 +325,50 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        from cognis.core.controller_directory import ControllerInstanceDirectory
+        from cognis.core.controller_runtime import ControllerRuntime
+        from cognis.core.executor_connection_ownership import ExecutorConnectionOwnership
+        from cognis.store.schema import expected_schema_heads
+
+        controller_runtime = ControllerRuntime(config.controller_id)
+        app.state.controller_runtime = controller_runtime
+        app.state.expected_schema_heads = expected_schema_heads()
         password_hasher = create_password_hasher()
         config_runtime, engine, session_factory, setup_token_manager = await bootstrap_runtime(
             config, password_hasher
         )
+        controller_directory = ControllerInstanceDirectory(
+            session_factory,
+            controller_runtime,
+            internal_url=config_runtime.controller_internal_url or None,
+        )
+        app.state.controller_directory = controller_directory
+        executor_connection_ownership = ExecutorConnectionOwnership(
+            session_factory,
+            controller_runtime.owner_id,
+        )
+        app.state.executor_connection_ownership = executor_connection_ownership
         auth_provider = JWTAuthProvider(
             config_runtime.jwt_private_key_path, config_runtime.jwt_public_key_path
         )
         providers = build_provider_registry(config_runtime, session_factory, auth_provider)
+        await providers.executor.websocket.configure_cluster(
+            enabled=config_runtime.runtime_mode == "ha",
+            session_factory=session_factory,
+            controller_directory=controller_directory,
+            controller_runtime=controller_runtime,
+            auth_provider=auth_provider,
+        )
         local_model_catalog = LocalModelCatalog()
         event_bus = EventBus()
+        from cognis.core.executor_pin_notice_dispatch import ExecutorPinNoticeDispatcher
+
+        executor_pin_notice_dispatcher = ExecutorPinNoticeDispatcher(
+            session_factory=session_factory,
+            guardrails=providers.guardrails,
+            event_bus=event_bus,
+        )
+        providers.executor_pin_notice_dispatcher = executor_pin_notice_dispatcher
         remember_queue = RememberRetryQueue(
             providers.memory,
             session_factory=session_factory,
@@ -301,10 +425,11 @@ def create_app() -> FastAPI:
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
         session_lock_sweeper_task: asyncio.Task[None] | None = None
+        redis_service = RedisService(config_runtime.redis_url)
         session_cache = SessionCache(
             providers.guardrails,
             max_entries=cache_max_entries,
-            redis_url=config_runtime.redis_url,
+            redis_service=redis_service,
         )
         session_manager = SessionManager(
             session_factory,
@@ -367,6 +492,7 @@ def create_app() -> FastAPI:
             config_runtime.artifact_signing_secret
             or _ensure_artifact_signing_secret(config_runtime)
         )
+        providers.channel_target_ref_secret = artifact_signing_secret
         artifact_store = ArtifactStore(
             ArtifactStoreConfig(
                 backend=config_runtime.artifact_backend,
@@ -442,6 +568,10 @@ def create_app() -> FastAPI:
             vector_backend=kb_vector_backend,
             enabled=knowledgebase_backend_enabled,
             disabled_notes=kb_notes,
+            max_artifact_size_bytes=config_runtime.knowledgebase_max_artifact_size_bytes,
+            max_chunks_per_artifact=config_runtime.knowledgebase_max_chunks_per_artifact,
+            chunk_target_tokens=config_runtime.knowledgebase_chunk_target_tokens,
+            chunk_overlap_tokens=config_runtime.knowledgebase_chunk_overlap_tokens,
         )
         knowledgebase_indexer = KnowledgebaseIndexer(
             session_factory=session_factory,
@@ -455,6 +585,7 @@ def create_app() -> FastAPI:
             chunk_target_tokens=config_runtime.knowledgebase_chunk_target_tokens,
             chunk_overlap_tokens=config_runtime.knowledgebase_chunk_overlap_tokens,
             embedding_batch_size=config_runtime.knowledgebase_embedding_batch_size,
+            controller_owner_id=controller_runtime.owner_id,
         )
         await knowledgebase_indexer.start()
 
@@ -498,6 +629,11 @@ def create_app() -> FastAPI:
                 "session.max_tool_calls_per_turn",
                 500,
             )
+            max_llm_cycles_per_turn = await get_setting_value(
+                session,
+                "session.max_llm_cycles_per_turn",
+                150,
+            )
             llm_stream_idle_timeout_seconds = await get_setting_value(
                 session,
                 "session.llm_stream_idle_timeout_seconds",
@@ -532,6 +668,9 @@ def create_app() -> FastAPI:
             ),
             default_max_tool_calls_per_turn=(
                 int(max_tool_calls_per_turn) if isinstance(max_tool_calls_per_turn, int) else 500
+            ),
+            default_max_llm_cycles_per_turn=(
+                int(max_llm_cycles_per_turn) if isinstance(max_llm_cycles_per_turn, int) else 150
             ),
             default_llm_stream_idle_timeout_seconds=(
                 int(llm_stream_idle_timeout_seconds)
@@ -568,6 +707,7 @@ def create_app() -> FastAPI:
             event_bus=event_bus,
             agent_registry=agent_registry,
             llm_provider=providers.llm,
+            controller_owner_id=controller_runtime.owner_id,
         )
         tool_router._task_queue = task_queue
         agent_loop.set_task_queue(task_queue)
@@ -583,8 +723,18 @@ def create_app() -> FastAPI:
             providers=providers,
         )
 
-        async def _on_mcp_oauth_completed(transaction_id: str) -> None:
-            await schedule_mcp_executor_reconfigure_for_app(app, transaction_id=transaction_id)
+        async def _on_mcp_oauth_completed(
+            transaction_id: str,
+            *,
+            admission_guard: Any | None = None,
+            terminal_cleanup: bool = False,
+        ) -> None:
+            await schedule_mcp_executor_reconfigure_for_app(
+                app,
+                transaction_id=transaction_id,
+                admission_guard=admission_guard,
+                terminal_cleanup=terminal_cleanup,
+            )
 
         async def _on_mcp_oauth_token_state_changed(
             user_email: str,
@@ -613,6 +763,7 @@ def create_app() -> FastAPI:
             if hasattr(providers.executor, "websocket")
             else None,
             refresh_timeout_seconds=config_runtime.mcp_oauth_refresh_timeout_seconds,
+            controller_owner_id=controller_runtime.owner_id,
         )
         providers.mcp_oauth_service = mcp_oauth_service  # type: ignore[attr-defined]
         tool_router._mcp_oauth_service = mcp_oauth_service  # noqa: SLF001
@@ -641,18 +792,20 @@ def create_app() -> FastAPI:
         if hasattr(providers.executor, "websocket"):
 
             async def _on_mcp_oauth_loopback_callback(
+                connection_owner: Any,
                 executor_id: str,
                 payload: dict[str, Any],
             ) -> None:
                 try:
                     await mcp_oauth_service.complete_loopback_callback(
+                        connection_owner=connection_owner,
                         executor_id=executor_id,
                         listener_id=str(payload.get("listener_id") or ""),
                         redirect_uri=str(payload.get("redirect_uri") or ""),
                         state=str(payload.get("state") or ""),
                         code=str(payload.get("code") or "") or None,
                         error=str(payload.get("error") or "") or None,
-                        error_description=str(payload.get("error_description") or "") or None,
+                        error_description=(str(payload.get("error_description") or "") or None),
                     )
                 except MCPOAuthError:
                     logger.warning(
@@ -660,6 +813,8 @@ def create_app() -> FastAPI:
                         extra={"extra_data": {"executor_id": executor_id}},
                         exc_info=True,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     logger.exception(
                         "mcp oauth: unexpected executor loopback callback failure",
@@ -684,7 +839,19 @@ def create_app() -> FastAPI:
         # Reconcile pending notifications from before restart (re-registers
         # PauseWaiters from DB so gates/escalations/step-questions survive).
         await notification_service.reconcile_pending()
+        await executor_pin_notice_dispatcher.dispatch_pending()
+
+        async def _executor_pin_notice_worker() -> None:
+            while True:
+                await asyncio.sleep(2.0)
+                try:
+                    await executor_pin_notice_dispatcher.dispatch_pending(limit=50)
+                except Exception:
+                    logger.exception("executor pin notice recovery pass failed")
+
+        executor_pin_notice_worker_task = asyncio.create_task(_executor_pin_notice_worker())
         await mcp_oauth_service.recover_pending_device_authorizations()
+        await mcp_oauth_service.recover_terminal_callback_cleanup()
 
         # TurnScheduler — core-layer turn orchestration, no WebSocket dependency.
         # Must be registered BEFORE task_queue.start() so recovered tasks
@@ -698,6 +865,7 @@ def create_app() -> FastAPI:
             task_queue=task_queue,
             session_manager=session_manager,
             session_cache=session_cache,
+            redis_service=redis_service,
             compaction_strategy=compaction_strategy,
             agent_loop=agent_loop,
             pause_waiter=pause_waiter,
@@ -707,16 +875,26 @@ def create_app() -> FastAPI:
             workflow_registry=workflow_registry,
             event_bus=event_bus,
             tool_output_spool=tool_output_spool,
+            controller_runtime=controller_runtime,
+            runtime_mode=config_runtime.runtime_mode,
         )
         agent_loop.set_turn_scheduler(turn_scheduler)
 
+        from cognis.channels.managed import ManagedChannelService
         from cognis.core.managed_conversation_maintenance import (
             ManagedConversationMaintenanceService,
         )
 
+        managed_channel_service = ManagedChannelService(
+            session_factory,
+            turn_scheduler=turn_scheduler,
+            notification_service=notification_service,
+        )
+        providers.managed_channel_service = managed_channel_service
         managed_conversation_maintenance = ManagedConversationMaintenanceService(
             session_factory=session_factory,
             turn_scheduler=turn_scheduler,
+            managed_channel_service=managed_channel_service,
         )
 
         # CommandDispatcher — transport-agnostic slash command handling.
@@ -815,6 +993,7 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             task_queue=task_queue,
             event_bus=event_bus,
+            controller_owner_id=controller_runtime.owner_id,
         )
         await scheduler.start()
         tool_router._scheduler = scheduler
@@ -863,6 +1042,7 @@ def create_app() -> FastAPI:
         app.state.ui_build_dir = str(ui_build_dir) if ui_build_dir is not None else None
         app.state.user_facing_url = _build_user_facing_url(config_runtime)
         app.state.jwt_public_key_fingerprint = _key_fingerprint(config_runtime.jwt_public_key_path)
+        app.state.redis_service = redis_service
         app.state.session_cache = session_cache
         app.state.session_manager = session_manager
         app.state.context_assembler = context_assembler
@@ -891,6 +1071,7 @@ def create_app() -> FastAPI:
         app.state.startup_invariant_reports = [report.as_dict() for report in invariant_reports]
 
         app.state.notification_service = notification_service
+        app.state.executor_pin_notice_dispatcher = executor_pin_notice_dispatcher
         app.state.mcp_oauth_service = mcp_oauth_service
         app.state.web_push_service = web_push_service
         app.state.turn_scheduler = turn_scheduler
@@ -899,9 +1080,330 @@ def create_app() -> FastAPI:
         app.state.tool_output_maintenance = tool_output_maintenance
         app.state.command_dispatcher = command_dispatcher
 
+        ws_manager = WebSocketConnectionManager(app)
+        app.state.ws_manager = ws_manager
+        from cognis.core.cluster_signals import ClusterEventStoreId, ClusterSignalService
+
+        intaris_event_store = IntarisSessionEventStore(providers.guardrails)
+        event_cache_policy = EventCachePolicy(
+            ttl_seconds=config_runtime.event_cache_ttl_seconds,
+            sliding_expiration=config_runtime.event_cache_sliding_ttl,
+            compression_enabled=config_runtime.event_cache_compression_enabled,
+            compression_threshold_bytes=config_runtime.event_cache_compression_threshold_bytes,
+            redis_value_max_bytes=config_runtime.event_cache_max_value_bytes,
+            redis_page_values_enabled=False,
+        )
+        event_cache_bounds = EventCacheBounds()
+        cached_event_store = CachedSessionEventStore(
+            intaris_event_store,
+            redis_service,
+            artifact_signing_secret,
+            policy=event_cache_policy,
+            bounds=event_cache_bounds,
+        )
+        shared_chat_snapshot_cache = SharedChatSnapshotCache(
+            event_store=cached_event_store,
+            redis_service=redis_service,
+            policy=event_cache_policy,
+            bounds=event_cache_bounds,
+            clock=monotonic,
+        )
+        app.state.intaris_event_store = intaris_event_store
+        app.state.cached_event_store = cached_event_store
+        app.state.shared_chat_snapshot_cache = shared_chat_snapshot_cache
+
+        cluster_signals = ClusterSignalService(
+            database_url=config_runtime.database_url,
+            controller_id=controller_runtime.owner_id,
+            session_factory=session_factory,
+            event_bus=event_bus,
+            scope_provider=ws_manager.subscribed_cluster_scopes,
+            enabled=config_runtime.runtime_mode == "ha",
+            event_store=cached_event_store,
+            owner_token_secret=artifact_signing_secret,
+        )
+        app.state.cluster_signals = cluster_signals
+        notification_service.cluster_signals = cluster_signals
+        task_queue.cluster_signals = cluster_signals
+        workflow_engine.cluster_signals = cluster_signals
+        turn_scheduler.cluster_signals = cluster_signals
+        executor_pin_notice_dispatcher.cluster_signals = cluster_signals
+
+        async def _publish_event_append_invalidation(session_token: str, revision: int) -> bool:
+            return await cluster_signals.publish_event_store_invalidation(
+                store_id=ClusterEventStoreId.INTARIS,
+                session_token=session_token,
+                revision=revision,
+            )
+
+        from cognis.api.chat_v2.background_event_reads import BackgroundEventReadAdmission
+        from cognis.api.chat_v2.post_projection_warms import PostProjectionWarmRevisions
+        from cognis.api.chat_v2.snapshot_activity import (
+            conversation_needs_snapshot_warm,
+            iter_active_snapshot_conversation_ids,
+            resolve_event_session_conversation_id,
+        )
+        from cognis.api.chat_v2.snapshot_coordinator import (
+            admit_background_snapshot_reads,
+            load_conversation_snapshot_context,
+            warm_chat_snapshot_coordinated,
+        )
+        from cognis.api.chat_v2.snapshot_metrics import SNAPSHOT_CACHE_METRICS
+        from cognis.api.chat_v2.snapshot_warmer import (
+            ChatSnapshotActiveReconciler,
+            ChatSnapshotWarmer,
+            WarmResult,
+        )
+        from cognis.store.models import Conversation
+
+        background_event_reads = BackgroundEventReadAdmission()
+        app.state.background_event_read_admission = background_event_reads
+        post_projection_warms = PostProjectionWarmRevisions(
+            event_cache_bounds.generation_max_sessions
+        )
+
+        async def _warm_chat_snapshot(conversation_id: str) -> WarmResult:
+            forced_revision = post_projection_warms.current(conversation_id)
+            if not shared_chat_snapshot_cache.warming_configured:
+                post_projection_warms.complete(conversation_id, forced_revision)
+                return "skipped", None
+            if not shared_chat_snapshot_cache.warming_available:
+                return "retry", "redis_unavailable"
+            async with session_factory() as session:
+                conversation = await session.get(Conversation, conversation_id)
+            if conversation is None or conversation.status == "deleted":
+                post_projection_warms.complete(conversation_id, forced_revision)
+                return "skipped", "context_missing"
+            forced = forced_revision is not None
+            if not forced and not await conversation_needs_snapshot_warm(
+                session_factory, shared_chat_snapshot_cache, conversation_id
+            ):
+                return "skipped", None
+            context = await load_conversation_snapshot_context(
+                app,
+                user_email=conversation.user_email,
+                conversation_id=conversation_id,
+            )
+            context = admit_background_snapshot_reads(context, background_event_reads)
+            result = await warm_chat_snapshot_coordinated(app, context)
+            if result[0] != "retry":
+                post_projection_warms.complete(conversation_id, forced_revision)
+            return result
+
+        snapshot_warmer = ChatSnapshotWarmer(
+            _warm_chat_snapshot,
+            max_pending=event_cache_bounds.generation_max_sessions,
+        )
+        await snapshot_warmer.start()
+        app.state.chat_snapshot_warmer = snapshot_warmer
+        app.state.enqueue_chat_snapshot_warm = snapshot_warmer.enqueue
+
+        def _enqueue_post_projection_warm(conversation_id: str) -> None:
+            if not post_projection_warms.admit(conversation_id, snapshot_warmer.enqueue):
+                SNAPSHOT_CACHE_METRICS.overflow("warmer")
+
+        pending_warm_sessions = _PendingAppendWarmState(event_cache_bounds.generation_max_sessions)
+        active_snapshot_resolvers = 0
+        snapshot_resolve_queue: asyncio.Queue[str] = asyncio.Queue(
+            maxsize=event_cache_bounds.generation_max_sessions
+        )
+
+        def _warm_after_generation_advanced(work: Any) -> None:
+            if pending_warm_sessions.claim(work.session_token) is None:
+                return
+            try:
+                snapshot_resolve_queue.put_nowait(work.session_token)
+            except asyncio.QueueFull:
+                SNAPSHOT_CACHE_METRICS.overflow("resolver")
+
+        async def _resolve_append_warms() -> None:
+            nonlocal active_snapshot_resolvers
+            while True:
+                session_token = await snapshot_resolve_queue.get()
+                active_snapshot_resolvers += 1
+                SNAPSHOT_CACHE_METRICS.resolver_active(active_snapshot_resolvers)
+                session_id: str | None = None
+                processed: tuple[str, int, str] | None = None
+                succeeded = False
+                try:
+                    processed = pending_warm_sessions.claim(session_token)
+                    if processed is None:
+                        continue
+                    session_id, last_seq, user_email = processed
+                    async with session_factory() as session:
+                        conversation_id = await resolve_event_session_conversation_id(
+                            session,
+                            session_id,
+                        )
+                        from cognis.api.chat_v2.work_revisions import (
+                            advance_work_revisions_for_stream,
+                        )
+
+                        work_invalidations = await advance_work_revisions_for_stream(
+                            session,
+                            user_email=user_email,
+                            event_store_id="intaris",
+                            event_store_session_id=session_id,
+                            last_seq=last_seq,
+                            include_current=True,
+                        )
+                        await session.commit()
+                    if conversation_id:
+                        snapshot_warmer.enqueue(str(conversation_id))
+                    for invalidation in work_invalidations:
+                        published = await cluster_signals.publish_work_invalidation(
+                            scope_key=invalidation.scope_key,
+                            user_email=invalidation.user_email,
+                            revision=invalidation.work_revision,
+                        )
+                        if not published:
+                            raise RuntimeError("Work invalidation publication failed")
+                    succeeded = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "chat_v2: append warm resolution failed",
+                        exc_info=True,
+                    )
+                finally:
+                    requeue = bool(
+                        processed is not None
+                        and pending_warm_sessions.finish(
+                            session_token,
+                            processed,
+                            succeeded=succeeded,
+                        )
+                    )
+                    SNAPSHOT_CACHE_METRICS.append_mapping(len(pending_warm_sessions))
+                    if requeue:
+                        try:
+                            snapshot_resolve_queue.put_nowait(session_token)
+                        except asyncio.QueueFull:
+                            SNAPSHOT_CACHE_METRICS.overflow("resolver")
+                    active_snapshot_resolvers -= 1
+                    SNAPSHOT_CACHE_METRICS.resolver_active(active_snapshot_resolvers)
+                    snapshot_resolve_queue.task_done()
+
+        snapshot_resolver_workers = [
+            asyncio.create_task(
+                _resolve_append_warms(),
+                name=f"chat-snapshot-append-resolver-{index}",
+            )
+            for index in range(4)
+        ]
+        active_snapshot_reconciler = ChatSnapshotActiveReconciler(
+            lambda: iter_active_snapshot_conversation_ids(session_factory),
+            snapshot_warmer.enqueue,
+            interval_seconds=event_cache_policy.ttl_seconds / 2,
+        )
+
+        async def _stop_snapshot_background() -> None:
+            await active_snapshot_reconciler.stop()
+            for worker in snapshot_resolver_workers:
+                worker.cancel()
+            await asyncio.gather(*snapshot_resolver_workers, return_exceptions=True)
+            pending_warm_sessions.clear()
+            post_projection_warms.clear()
+            SNAPSHOT_CACHE_METRICS.append_mapping(0)
+            SNAPSHOT_CACHE_METRICS.resolver_active(0)
+
+        event_append_invalidation_dispatcher = EventAppendInvalidationDispatcher(
+            event_store=cached_event_store,
+            publish_invalidation=_publish_event_append_invalidation,
+            on_cache_advanced=_warm_after_generation_advanced,
+        )
+        await event_append_invalidation_dispatcher.start()
+        app.state.event_append_invalidation_dispatcher = event_append_invalidation_dispatcher
+
+        from cognis.api.chat_v2.event_store import IntarisSessionEventStore as WorkRepairEventStore
+        from cognis.api.chat_v2.work_materializer import WorkMaterializer
+
+        work_materializer = WorkMaterializer(
+            session_factory=session_factory,
+            event_store=WorkRepairEventStore(providers.guardrails),
+            tool_definitions=lambda: {
+                definition.name: definition
+                for definition in shared_runtime.tool_registry.list_tools()
+            },
+            event_read_admission=background_event_reads,
+            on_projection_caught_up=_enqueue_post_projection_warm,
+        )
+        work_materializer.start()
+        app.state.work_materializer = work_materializer
+
+        from cognis.api.chat_v2.append_listener import EventAppendListenerFastPath
+
+        _handle_event_append = EventAppendListenerFastPath(
+            event_store=cached_event_store,
+            pending_warms=pending_warm_sessions,
+            invalidation_dispatcher=event_append_invalidation_dispatcher,
+            work_materializer=work_materializer,
+            on_mapping_size=SNAPSHOT_CACHE_METRICS.append_mapping,
+            on_mapping_overflow=lambda: SNAPSHOT_CACHE_METRICS.overflow("append_mapping"),
+        )
+
+        async def _handle_cluster_chat_change(event: Any) -> None:
+            if event.type != EventType.CLUSTER_SCOPE_INVALIDATED:
+                return
+            if event.data.get("kind") not in {
+                "chat_scope_changed",
+                "task_progress_changed",
+            }:
+                return
+            scope = event.data.get("scope")
+            conversation_id = scope.get("conversation_id") if isinstance(scope, dict) else None
+            if isinstance(conversation_id, str):
+                snapshot_warmer.enqueue(conversation_id)
+
+        async def _handle_durable_activity(event: Any) -> None:
+            conversation_id = event.data.get("conversation_id")
+            if isinstance(conversation_id, str):
+                snapshot_warmer.enqueue(conversation_id)
+
+        event_bus.subscribe(
+            EventType.CLUSTER_SCOPE_INVALIDATED,
+            _handle_cluster_chat_change,
+        )
+        for event_type in (
+            EventType.TURN_STARTED,
+            EventType.TASK_QUEUED,
+            EventType.TASK_STARTED,
+        ):
+            event_bus.subscribe(event_type, _handle_durable_activity)
+
+        intaris_provider = providers.guardrails
+        intaris_provider.add_event_append_listener(_handle_event_append)
+        app.state.event_append_listener = _handle_event_append
+
+        def _remove_event_append_listener() -> None:
+            remove_listener = getattr(
+                intaris_provider,
+                "remove_event_append_listener",
+                None,
+            )
+            if callable(remove_listener):
+                remove_listener(_handle_event_append)
+
+        chat_v2_runtime_relay = (
+            ChatV2RuntimeRedisRelay(
+                redis_service=redis_service,
+                shared_secret=artifact_signing_secret,
+                controller_id=controller_runtime.controller_id,
+                incarnation_id=controller_runtime.incarnation_id,
+                durable_validator=ws_manager.validate_relay_envelope,
+                apply_callback=ws_manager.apply_relayed_runtime,
+                has_subscriber=ws_manager.has_chat_v2_subscriber,
+            )
+            if redis_service.configured
+            else None
+        )
+        app.state.chat_v2_runtime_relay = chat_v2_runtime_relay
+
         local_model_runtime_manager = LocalModelRuntimeManager(
             session_factory,
             providers.executor.websocket,
+            controller_runtime.owner_id,
         )
         local_model_reconciler = LocalModelReconciler(
             session_factory,
@@ -913,9 +1415,11 @@ def create_app() -> FastAPI:
         await local_model_reconciler.start()
 
         # Channel manager — lifecycle orchestration for channel adapters.
+        from cognis.channels.bindings import DatabaseManagedChannelBindingLookup
         from cognis.channels.delivery import ChannelDeliveryService
         from cognis.channels.inbound import InboundPipeline
         from cognis.channels.manager import ChannelManager
+        from cognis.channels.observed_targets import DatabaseObservedTargetRecorder
         from cognis.channels.pairing import PairingService
 
         # Use a lazy ref to avoid circular dependency
@@ -928,7 +1432,6 @@ def create_app() -> FastAPI:
             session_factory=session_factory,
             channel_manager_ref=_get_channel_manager,
         )
-
         inbound_pipeline = InboundPipeline(
             session_factory=session_factory,
             turn_scheduler=turn_scheduler,
@@ -939,6 +1442,8 @@ def create_app() -> FastAPI:
             command_dispatcher=command_dispatcher,
             notification_service=notification_service,
             credentials_provider=providers.credentials,
+            observed_target_recorder=DatabaseObservedTargetRecorder(session_factory),
+            managed_channel_service=managed_channel_service,
         )
         channel_manager = ChannelManager(
             session_factory=session_factory,
@@ -946,11 +1451,21 @@ def create_app() -> FastAPI:
             secrets_provider=providers.secrets,
             artifact_store=artifact_store,
             event_bus=event_bus,
+            controller_owner_id=controller_runtime.owner_id,
             ws_provider=providers.executor.websocket
             if hasattr(providers.executor, "websocket")
             else None,
         )
         _channel_manager_holder[0] = channel_manager
+        providers.channel_manager_ref = _get_channel_manager
+        from cognis.channels.recipients import RecipientResolutionService
+        from cognis.channels.target_refs import ChannelTargetRefCodec
+
+        providers.recipient_resolution_service = RecipientResolutionService(
+            session_factory,
+            codec=ChannelTargetRefCodec(providers.channel_target_ref_secret or ""),
+            channel_manager_ref=_get_channel_manager,
+        )
 
         channel_delivery = ChannelDeliveryService(
             session_factory=session_factory,
@@ -959,6 +1474,10 @@ def create_app() -> FastAPI:
             turn_scheduler=turn_scheduler,
             public_base_url=config_runtime.public_base_url,
         )
+        providers.channel_binding_lookup = DatabaseManagedChannelBindingLookup(session_factory)
+        channel_delivery.set_recipient_resolution_service(providers.recipient_resolution_service)
+        managed_channel_service.set_delivery_service(channel_delivery)
+        turn_scheduler.set_channel_delivery_service(channel_delivery)
         workflow_engine._channel_delivery = channel_delivery  # noqa: SLF001
 
         app.state.channel_manager = channel_manager
@@ -992,15 +1511,92 @@ def create_app() -> FastAPI:
         mcp_oauth_service.start_refresh_maintenance()
         await tool_output_maintenance.start()
 
+        await redis_service.start()
+        if chat_v2_runtime_relay is not None:
+            await chat_v2_runtime_relay.start()
+            turn_scheduler.add_global_observer(ws_manager._observer)
+        await controller_directory.start()
+        await cluster_signals.start()
+        try:
+            controller_runtime.mark_schema_compatible()
+            await turn_scheduler.start_direct_turn_runtime()
+            async for conversation_id in iter_active_snapshot_conversation_ids(session_factory):
+                snapshot_warmer.enqueue(conversation_id)
+            await active_snapshot_reconciler.start()
+            controller_runtime.mark_ready()
+            await controller_directory.mark_ready()
+        except BaseException:
+            event_bus.unsubscribe(
+                EventType.CLUSTER_SCOPE_INVALIDATED,
+                _handle_cluster_chat_change,
+            )
+            for event_type in (
+                EventType.TURN_STARTED,
+                EventType.TASK_QUEUED,
+                EventType.TASK_STARTED,
+            ):
+                event_bus.unsubscribe(event_type, _handle_durable_activity)
+            await snapshot_warmer.stop(drain_timeout_seconds=0.25)
+            await _stop_snapshot_background()
+            _remove_event_append_listener()
+            await work_materializer.stop(timeout_seconds=0.25)
+            await event_append_invalidation_dispatcher.stop(drain_timeout_seconds=0.25)
+            await cluster_signals.stop()
+            await controller_directory.stop()
+            if chat_v2_runtime_relay is not None:
+                turn_scheduler.remove_global_observer(ws_manager._observer)
+                await chat_v2_runtime_relay.stop(drain_timeout_seconds=0.25)
+            raise
         yield
 
+        controller_runtime.begin_draining()
+        await controller_directory.begin_draining()
+        await turn_scheduler.begin_drain()
+        await scheduler.stop()
+        await turn_scheduler.stop_follow_up_recovery()
+        drain_result = await _drain_turn_scheduler(
+            turn_scheduler,
+            drain_timeout_seconds=config_runtime.shutdown_drain_timeout_seconds,
+            cancel_timeout_seconds=config_runtime.shutdown_cancel_timeout_seconds,
+        )
+        if drain_result.get("cancellation_abandoned"):
+            logger.warning(
+                "shutdown: forced abandonment after cancellation settlement timeout",
+                extra={"extra_data": drain_result},
+            )
+        else:
+            logger.info(
+                "shutdown: direct turn drain finished",
+                extra={"extra_data": drain_result},
+            )
+        await turn_scheduler.stop_direct_turn_runtime()
+        event_bus.unsubscribe(
+            EventType.CLUSTER_SCOPE_INVALIDATED,
+            _handle_cluster_chat_change,
+        )
+        for event_type in (
+            EventType.TURN_STARTED,
+            EventType.TASK_QUEUED,
+            EventType.TASK_STARTED,
+        ):
+            event_bus.unsubscribe(event_type, _handle_durable_activity)
+        await snapshot_warmer.stop(drain_timeout_seconds=2.0)
+        await _stop_snapshot_background()
+        _remove_event_append_listener()
+        await work_materializer.stop(timeout_seconds=2.0)
+        await event_append_invalidation_dispatcher.stop(drain_timeout_seconds=2.0)
+        if chat_v2_runtime_relay is not None:
+            turn_scheduler.remove_global_observer(ws_manager._observer)
+            await chat_v2_runtime_relay.stop(drain_timeout_seconds=1.0)
         if session_lock_sweeper_task is not None:
             session_lock_sweeper_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await session_lock_sweeper_task
+        executor_pin_notice_worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await executor_pin_notice_worker_task
         await local_model_reconciler.stop()
         await local_model_runtime_manager.stop()
-        await turn_scheduler.stop_follow_up_recovery()
         await tool_output_maintenance.stop()
         await managed_conversation_maintenance.stop()
         await knowledgebase_indexer.stop()
@@ -1009,20 +1605,26 @@ def create_app() -> FastAPI:
         await channel_delivery.stop()
         await mcp_oauth_service.shutdown()
         await channel_manager.stop_all()
-        await scheduler.stop()
         await task_queue.stop()
         await shared_runtime.cleanup()
         await remember_queue.stop()
         await tool_classification_queue.stop()
         await providers.executor.cleanup()
+        await cluster_signals.begin_drain()
+        await cluster_signals.stop()
         await providers.llm.aclose()
         await session_cache.aclose()
+        await shared_chat_snapshot_cache.aclose()
+        await cached_event_store.aclose()
+        await redis_service.aclose()
         await providers.memory.client.aclose()
         await providers.guardrails.client.aclose()
         await local_model_catalog.aclose()
+        await controller_directory.stop()
         await engine.dispose()
+        controller_runtime.mark_stopped()
 
-    app = FastAPI(title="Cognis", version="0.12.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.13.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -1036,6 +1638,18 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    app.add_middleware(
+        KnowledgebaseDocumentUploadLimitMiddleware,
+        max_body_bytes=(
+            min(
+                config.knowledgebase_max_artifact_size_bytes * 4,
+                100 * 1024 * 1024,
+            )
+            + 1024 * 1024
+        ),
+        max_files=25,
+        max_parts=52,
     )
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(auth_router)
@@ -1099,7 +1713,19 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-        logger.exception("Unhandled API exception")
+        if isinstance(exc, SQLAlchemyTimeoutError):
+            engine = getattr(request.app.state, "engine", None)
+            logger.exception(
+                "Database connection pool exhausted",
+                extra={
+                    "extra_data": {
+                        "path": request.url.path,
+                        **(pool_snapshot(engine) if engine is not None else {}),
+                    }
+                },
+            )
+        else:
+            logger.exception("Unhandled API exception")
         return error_response(500, "internal_error", "Internal server error")
 
     @app.websocket("/api/ws")
@@ -1117,6 +1743,12 @@ def create_app() -> FastAPI:
             app.state.providers,
             app.state.session_factory,
         )
+
+    @app.websocket("/api/internal/executor-bridge")
+    async def controller_executor_bridge(websocket: WebSocket) -> None:
+        from cognis.api.controller_ws import handle_controller_executor_websocket
+
+        await handle_controller_executor_websocket(websocket)
 
     # NOTE: SPA serving moved to SPAMiddleware (added above) which runs
     # before the FastAPI router, avoiding the 404 exception handler

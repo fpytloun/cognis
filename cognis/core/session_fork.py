@@ -72,6 +72,8 @@ async def fork_session_events(
     copy_prefix: bool = True,
     max_source_seq: int | None = None,
     event_filter: Callable[[CachedEvent], bool] | None = None,
+    event_transform: Callable[[CachedEvent], CachedEvent | None] | None = None,
+    prefer_durable_source: bool = False,
     record_source: str = "cognis:fork",
 ) -> bool:
     """Copy one session's event history into another session.
@@ -83,7 +85,7 @@ async def fork_session_events(
     source_events: list[CachedEvent] = []
     prefix_entries: list[ImmutablePrefixEntry] = []
 
-    if source_cognis_session_id:
+    if source_cognis_session_id and not prefer_durable_source:
         cache_entry = session_cache.get_entry(source_cognis_session_id)
         if cache_entry is not None and cache_entry.initialized and cache_entry.events:
             source_events = [
@@ -98,7 +100,7 @@ async def fork_session_events(
             event_read = await providers.guardrails.read_events(
                 session_id=source_intaris_session_id,
                 after_seq=0,
-                allow_missing_stream=True,
+                allow_missing_stream=not prefer_durable_source,
             )
             for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0))):
                 event_type = str(raw_event.get("type") or "")
@@ -129,6 +131,13 @@ async def fork_session_events(
         source_events = [event for event in source_events if event.seq <= max_source_seq]
     if event_filter is not None:
         source_events = [event for event in source_events if event_filter(event)]
+    if event_transform is not None:
+        transformed_events: list[CachedEvent] = []
+        for event in source_events:
+            transformed = event_transform(event)
+            if transformed is not None:
+                transformed_events.append(transformed)
+        source_events = transformed_events
 
     prefix_entries = _dedupe_prefix_entries(
         [

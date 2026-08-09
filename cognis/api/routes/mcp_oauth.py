@@ -333,17 +333,29 @@ async def _schedule_mcp_executor_reconfigure(request: Request, *, transaction_id
     await schedule_mcp_executor_reconfigure_for_app(request.app, transaction_id=transaction_id)
 
 
-async def schedule_mcp_executor_reconfigure_for_app(app: Any, *, transaction_id: str) -> None:
+async def schedule_mcp_executor_reconfigure_for_app(
+    app: Any,
+    *,
+    transaction_id: str,
+    admission_guard: Any | None = None,
+    terminal_cleanup: bool = False,
+) -> None:
     async with app.state.session_factory() as session:
         transaction = await get_mcp_oauth_transaction(session, transaction_id)
         if transaction is None:
             return
         user_email = transaction.user_email
         server_id = transaction.mcp_server_id
-    await schedule_mcp_server_executor_reconfigure_for_app(
-        app,
-        server_id=server_id,
-        reason="mcp_oauth_authorization",
-        log_context={"transaction_id": transaction_id},
-    )
+    schedule_kwargs: dict[str, Any] = {
+        "server_id": server_id,
+        "reason": "mcp_oauth_authorization",
+        "log_context": {"transaction_id": transaction_id},
+    }
+    if admission_guard is not None:
+        schedule_kwargs["admission_guard"] = admission_guard
+    if terminal_cleanup:
+        schedule_kwargs["terminal_cleanup_transaction_id"] = transaction_id
+    scheduled = await schedule_mcp_server_executor_reconfigure_for_app(app, **schedule_kwargs)
+    if scheduled is None:
+        return
     await _emit_mcp_oauth_status_changed(app, user_email=user_email, server_id=server_id)

@@ -52,6 +52,7 @@ class ResolvedAgentProfile:
     provider_id: str | None
     model: str | None
     reasoning_effort: str | None
+    fast_mode: bool | None
     system_prompt_extra: str | None
     memory_enabled: bool | None
     memory_backend_options: dict[str, object]
@@ -74,6 +75,7 @@ class ResolvedAgentProfile:
             "agent_profile_provider_id": self.provider_id,
             "agent_profile_model": self.model,
             "agent_profile_reasoning_effort": self.reasoning_effort,
+            "agent_profile_fast_mode": self.fast_mode,
             "agent_profile_prompt_extra_hash": self.system_prompt_extra_hash,
             "agent_profile_synthetic": self.synthetic,
         }
@@ -199,6 +201,7 @@ def _synthetic_default(
         provider_id=llm_config.provider_id if llm_config else None,
         model=llm_config.model if llm_config else None,
         reasoning_effort=llm_config.reasoning_effort if llm_config else None,
+        fast_mode=llm_config.fast_mode if llm_config else None,
         system_prompt_extra=None,
         memory_enabled=None,
         memory_backend_options={},
@@ -227,6 +230,7 @@ def _resolved_from_profile(
         provider_id=profile.provider_id,
         model=profile.model,
         reasoning_effort=profile.reasoning_effort,
+        fast_mode=profile.fast_mode,
         system_prompt_extra=profile.system_prompt_extra,
         memory_enabled=profile.memory_enabled,
         memory_backend_options=dict(profile.memory_backend_options),

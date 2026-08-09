@@ -160,10 +160,19 @@ async def deliverable_pdf(request: Request, deliverable_id: str) -> Response:
 
 
 @router.get("/{deliverable_id}/media/{media_key}")
-async def deliverable_media(request: Request, deliverable_id: str, media_key: str) -> Response:
+async def deliverable_media(
+    request: Request,
+    deliverable_id: str,
+    media_key: str,
+    accessor_conversation_id: str | None = None,
+) -> Response:
     """Serve one manifest-referenced image to an authenticated deliverable reader."""
 
-    row = await _authorized_deliverable(request, deliverable_id)
+    row = await _authorized_deliverable(
+        request,
+        deliverable_id,
+        accessor_conversation_id=accessor_conversation_id,
+    )
     return await _media_response(
         request,
         row,

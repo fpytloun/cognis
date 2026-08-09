@@ -32,6 +32,10 @@ KNOWN_CHANNEL_TYPES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 
+def _default_recipient_chat_kinds() -> list[Literal["direct", "group"]]:
+    return ["direct", "group"]
+
+
 class ChannelCapabilities(BaseModel):
     """Declares what a channel adapter can do."""
 
@@ -48,7 +52,22 @@ class ChannelCapabilities(BaseModel):
     supports_inline_media: bool = False
     supports_buttons: bool = False
     supports_idempotent_send: bool = False
-    max_message_length: int = 4096
+    inbound_ordering: Literal["provider", "observed"] = "observed"
+    max_message_length: int | None = 4096
+    recipient_capabilities: ChannelRecipientCapabilities = Field(
+        default_factory=lambda: ChannelRecipientCapabilities()
+    )
+
+
+class ChannelRecipientCapabilities(BaseModel):
+    """Address forms and resolution operations supported by an adapter."""
+
+    address_kinds: list[str] = Field(default_factory=list)
+    chat_kinds: list[Literal["direct", "group"]] = Field(
+        default_factory=_default_recipient_chat_kinds
+    )
+    supports_resolution: bool = False
+    supports_creation: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +177,7 @@ class MediaAttachment(BaseModel):
     size_bytes: int | None = None
     content_b64: str | None = None
     disposition: Literal["attachment", "inline"] = "attachment"
+    media_ref: str | None = None
 
 
 class InboundMessage(BaseModel):
@@ -194,6 +214,71 @@ class InboundMessage(BaseModel):
 
     # Was the bot explicitly mentioned (for group policy)
     was_mentioned: bool = False
+    is_bot_output: bool = False
+
+
+class ChannelDeliveryDescriptor(BaseModel):
+    """Durable channel route captured at direct-turn admission."""
+
+    model_config = {"extra": "forbid"}
+
+    channel_type: str
+    account_id: str
+    chat_id: str
+    thread_id: str | None = None
+    reply_to_id: str | None = None
+
+
+class ChannelRecipient(BaseModel):
+    """Explicit, user-authorized destination supplied to outbound tools."""
+
+    model_config = {"extra": "forbid"}
+
+    channel_type: str
+    address: str
+    account_ref: str | None = None
+    address_kind: str | None = None
+    chat_kind: Literal["direct", "group"] | None = None
+    allow_resolution: bool = False
+    allow_creation: bool = False
+
+
+class ResolvedChannelTarget(BaseModel):
+    """Provider destination resolved from an explicit recipient."""
+
+    model_config = {"extra": "forbid"}
+
+    channel_type: str
+    account_id: str
+    chat_id: str
+    chat_kind: Literal["direct", "group"]
+    display_name: str | None = None
+    thread_id: str | None = None
+
+
+class ChannelRecipientError(BaseModel):
+    """PII-safe structured recipient failure."""
+
+    model_config = {"extra": "forbid"}
+
+    code: str
+    message: str
+    retryable: bool = False
+
+
+class ChannelRecipientResult(BaseModel):
+    """Serializable result of recipient admission or resolution."""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal[
+        "queued", "sent", "resolving", "resolved", "blocked", "failed", "uncertain", "conflict"
+    ]
+    intent_id: str | None = None
+    delivery_id: str | None = None
+    target_ref: str | None = None
+    target: ResolvedChannelTarget | None = None
+    error: ChannelRecipientError | None = None
 
 
 class OutboundMessage(BaseModel):

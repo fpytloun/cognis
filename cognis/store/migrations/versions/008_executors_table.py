@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column("enabled_tool_groups", sa.JSON(), nullable=True),
         sa.Column("config", sa.JSON(), nullable=True),
         sa.Column("status", sa.String(), nullable=False, server_default="active"),
-        sa.Column("is_default", sa.Boolean(), nullable=False, server_default="0"),
+        sa.Column("is_default", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column(
             "owner_email",
             sa.String(),

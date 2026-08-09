@@ -298,7 +298,7 @@ def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
         normalized["workflow_id"] = "wf_validation"
     workflow = Workflow.model_validate(normalized)
     _validate_workflow(workflow)
-    payload = workflow.model_dump(mode="json")
+    payload = workflow.model_dump(mode="json", exclude_none=True)
     if restore_missing_id:
         payload.pop("workflow_id", None)
     return payload

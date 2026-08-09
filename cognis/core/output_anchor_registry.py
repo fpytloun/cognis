@@ -17,7 +17,8 @@ from cognis.core.output_anchors import (
 )
 
 _KEY_RE = re.compile(r"[^A-Za-z0-9._:-]+")
-_MAX_ANCHORS = 64
+_NATURAL_PART_RE = re.compile(r"(\d+)")
+_MAX_ANCHORS = 256
 
 
 def _safe_key(value: object) -> str | None:
@@ -116,6 +117,23 @@ def _locator(
             locator["columns"] = [str(column)[:120] for column in columns[:50]]
         return locator, "read_rows"
     artifact_part = item.get("artifact_part")
+    start_line, end_line = item.get("start_line"), item.get("end_line")
+    valid_lines = (
+        isinstance(start_line, int) and isinstance(end_line, int) and 1 <= start_line <= end_line
+    )
+    if (
+        item.get("format") == "pdf"
+        and isinstance(artifact_part, dict)
+        and isinstance(artifact_part.get("page"), int)
+        and valid_lines
+    ):
+        return {
+            "type": "stored_pdf_page",
+            "format": "pdf",
+            "page": artifact_part["page"],
+            "start_line": start_line,
+            "end_line": end_line,
+        }, "read_lines"
     if isinstance(artifact_part, dict):
         safe_part = {
             key: value
@@ -124,14 +142,21 @@ def _locator(
             and isinstance(value, (str, int))
         }
         return {"type": "artifact_part", **safe_part}, "read_artifact_part"
-    start_line, end_line = item.get("start_line"), item.get("end_line")
-    if isinstance(start_line, int) and isinstance(end_line, int) and 1 <= start_line <= end_line:
+    if valid_lines:
         return {
             "type": "stored_lines",
             "start_line": start_line,
             "end_line": end_line,
         }, default_operation
     return None, default_operation
+
+
+def _natural_key(value: str) -> tuple[object, ...]:
+    return tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in _NATURAL_PART_RE.split(value)
+        if part
+    )
 
 
 def _default_priority(key: str, kind: str) -> int:
@@ -152,7 +177,12 @@ def _prefix(*prefixes: str) -> Callable[[str, dict[str, Any]], bool]:
 
 _ADAPTERS: Sequence[AnchorAdapter] = (
     AnchorAdapter("search-v1", _prefix("answer", "result:", "citation:"), "search", "search"),
-    AnchorAdapter("web-v1", _prefix("page:", "media:", "heading:"), "web", "web"),
+    AnchorAdapter(
+        "web-v1",
+        _prefix("page:", "media:", "heading:", "transcript:", "item:"),
+        "web",
+        "web",
+    ),
     AnchorAdapter(
         "json-v1",
         lambda _tool, item: isinstance(item.get("json_pointer"), str),
@@ -223,7 +253,18 @@ def build_anchor_manifest(
         if anchor is None or anchor.anchor_id in seen_ids:
             continue
         if anchor.key in seen_keys:
-            anchor = replace(anchor, key=f"{anchor.key}:{anchor.anchor_id[-8:]}")
+            key = f"{anchor.key}:{anchor.anchor_id[-8:]}"
+            anchor = replace(
+                anchor,
+                key=key,
+                anchor_id=stable_anchor_id(
+                    call_id,
+                    adapter.adapter_id,
+                    format_name=anchor.format,
+                    key=key,
+                    locator=anchor.locator,
+                ),
+            )
         candidate = item.get("artifact_candidate")
         candidate_dict = candidate if isinstance(candidate, dict) else None
         candidate_allowed = candidate_dict is not None and (
@@ -245,9 +286,25 @@ def build_anchor_manifest(
         adapter_ids.append(adapter.adapter_id)
         if len(public) >= _MAX_ANCHORS:
             break
+    all_line_located = all(isinstance(anchor.locator.get("start_line"), int) for anchor in public)
     order = sorted(
         range(len(public)),
-        key=lambda index: (-public[index].priority, public[index].key, public[index].anchor_id),
+        key=(
+            lambda index: (
+                (
+                    public[index].locator.get("start_line", 0),
+                    public[index].locator.get("end_line", 0),
+                    public[index].key,
+                    public[index].anchor_id,
+                )
+                if all_line_located
+                else (
+                    -public[index].priority,
+                    _natural_key(public[index].key),
+                    public[index].anchor_id,
+                )
+            )
+        ),
     )
     public = [public[index] for index in order]
     private = [private[index] for index in order]

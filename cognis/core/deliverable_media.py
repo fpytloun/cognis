@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.core.artifact_access import artifact_authorized_for_conversation
 from cognis.models.deliverable import RICH_DELIVERABLE_MAX_BYTES, RichPayloadValidationError
-from cognis.store.queries import get_artifact_record
+from cognis.store.queries import get_artifact_record, mark_artifacts_attached
 
 RICH_MEDIA_MAX_BYTES = 10 * 1024 * 1024
 RICH_MEDIA_MAX_DIMENSION = 16_384
@@ -245,14 +245,19 @@ async def authorize_rich_media(
                 persisted_size,
                 "rich_payload_too_large",
             )
-        # Reuse the artifact attachment lifecycle as the retention hook. Explicit
-        # deletion remains authoritative and the media resolver then degrades to 404.
+        # Re-home retained media to the deliverable's conversation. Managed
+        # ancestor access permits a controller to reference a child artifact,
+        # but leaving the artifact scoped to that child makes it orphaned when
+        # the child conversation is purged while the deliverable survives.
+        # Explicit deletion remains authoritative and the media resolver then
+        # degrades to 404.
         if retain:
-            for artifact_id in retained:
-                row = await get_artifact_record(session, artifact_id)
-                if row is not None:
-                    row.status = "attached"
-                    row.expires_at = None
+            await mark_artifacts_attached(
+                session,
+                sorted(retained),
+                conversation_id=accessor_conversation_id,
+                message_role="assistant",
+            )
     return payload, sorted(retained)
 
 

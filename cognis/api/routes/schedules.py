@@ -639,7 +639,7 @@ async def trigger_schedule_route(
     # Use the scheduler to fire it
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
-        task_id = await scheduler._fire_schedule(schedule_id)
+        task_id = await scheduler.trigger_now(schedule_id)
     else:
         raise api_exception(503, "scheduler_unavailable", "Scheduler is not running")
 

@@ -26,10 +26,12 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.core.notifications import NotificationService, NotificationType
 from cognis.logging import get_logger
 from cognis.models.tool import effective_mcp_auth_config
+from cognis.store.coordination import DatabaseLeaseStore, Lease
 from cognis.store.models import MCPOAuthTokenRow, MCPServerRow
 from cognis.store.queries import (
     create_mcp_oauth_transaction,
@@ -40,6 +42,7 @@ from cognis.store.queries import (
     get_mcp_server,
     list_due_mcp_oauth_tokens,
     list_executors,
+    list_mcp_oauth_transactions_pending_terminal_cleanup,
     list_pending_mcp_oauth_transactions,
     mark_mcp_oauth_token_status,
     mcp_oauth_resource_key,
@@ -56,6 +59,7 @@ _REFRESH_SKEW_SECONDS = 60
 _REFRESH_MAINTENANCE_INTERVAL_SECONDS = 15.0
 _REFRESH_BACKOFF_BASE_SECONDS = 5
 _REFRESH_BACKOFF_MAX_SECONDS = 5 * 60
+_OAUTH_LEASE_SECONDS = 150.0
 _DYNAMIC_CLIENT_NAME = "Cognis MCP"
 _DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code"
 _DEVICE_DCR_REDIRECT_URI = "http://127.0.0.1/oauth/callback"
@@ -207,6 +211,10 @@ def _b64url(data: bytes) -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _sanitize_provider_description(value: str) -> str:
@@ -491,11 +499,12 @@ class MCPOAuthService:
         key_path: str,
         public_base_url: str,
         notification_service: NotificationService | None = None,
-        on_authorization_completed: Callable[[str], Awaitable[None]] | None = None,
+        on_authorization_completed: Callable[..., Awaitable[None]] | None = None,
         on_token_state_changed: Callable[[str, str, str], Awaitable[None]] | None = None,
         executor_provider: Any | None = None,
         refresh_timeout_seconds: float = _TOKEN_TIMEOUT,
         refresh_maintenance_interval_seconds: float = _REFRESH_MAINTENANCE_INTERVAL_SECONDS,
+        controller_owner_id: str = "local-controller",
     ) -> None:
         self._session_factory = session_factory
         self._public_base_url = public_base_url.rstrip("/")
@@ -512,6 +521,12 @@ class MCPOAuthService:
         self._refresh_maintenance_task: asyncio.Task[None] | None = None
         self._refresh_shutdown = asyncio.Event()
         self._device_poll_tasks: dict[str, asyncio.Task[None]] = {}
+        self._controller_owner_id = controller_owner_id
+        self._lease_store = (
+            DatabaseLeaseStore(session_factory)
+            if isinstance(session_factory, async_sessionmaker)
+            else None
+        )
         with open(key_path, "rb") as key_file:
             self._key = base64.urlsafe_b64decode(key_file.read())
 
@@ -1600,6 +1615,7 @@ class MCPOAuthService:
     async def complete_loopback_callback(
         self,
         *,
+        connection_owner: Any | None = None,
         executor_id: str,
         listener_id: str,
         redirect_uri: str,
@@ -1610,6 +1626,7 @@ class MCPOAuthService:
     ) -> str:
         if error:
             await self._mark_callback_error(
+                connection_owner=connection_owner,
                 state=state,
                 error_code="provider_error",
                 error_description=error_description or error,
@@ -1621,6 +1638,7 @@ class MCPOAuthService:
         if not code:
             raise MCPOAuthError("OAuth callback is missing authorization code")
         return await self.complete_callback(
+            connection_owner=connection_owner,
             state=state,
             code=code,
             source_executor_id=executor_id,
@@ -1631,6 +1649,7 @@ class MCPOAuthService:
     async def _mark_callback_error(
         self,
         *,
+        connection_owner: Any | None = None,
         state: str,
         error_code: str,
         error_description: str,
@@ -1645,6 +1664,17 @@ class MCPOAuthService:
             raise MCPOAuthError("Invalid OAuth state") from exc
         state_hash = hashlib.sha256(state.encode()).hexdigest()
         async with self._session_factory() as session:
+            if connection_owner is not None:
+                from cognis.core.executor_connection_ownership import (
+                    ExecutorConnectionOwnership,
+                )
+
+                if not await ExecutorConnectionOwnership.lock_current(
+                    session,
+                    connection_owner,
+                ):
+                    await session.rollback()
+                    raise MCPOAuthError("OAuth callback executor ownership changed")
             row = await get_mcp_oauth_transaction(session, transaction_id)
             if row is None or not hmac.compare_digest(row.state_hash, state_hash):
                 raise MCPOAuthError("Invalid OAuth transaction")
@@ -1659,15 +1689,14 @@ class MCPOAuthService:
                 callback_redirect_uri=callback_redirect_uri,
             )
             row.status = "failed"
+            row.terminal_cleanup_required = True
             row.error_code = error_code
             row.error_description = error_description[:500]
             await session.commit()
-            if row.notification_id and self._notification_service is not None:
-                await self._notification_service.resolve_internal(
-                    row.notification_id,
-                    "failed",
-                    {"transaction_id": transaction_id, "provider": "mcp"},
-                )
+        await self.reconcile_terminal_cleanup(
+            transaction_id,
+            connection_owner=connection_owner,
+        )
         return transaction_id
 
     def _validate_callback_source(
@@ -1707,6 +1736,7 @@ class MCPOAuthService:
     async def complete_callback(
         self,
         *,
+        connection_owner: Any | None = None,
         state: str,
         code: str,
         source_executor_id: str | None = None,
@@ -1719,12 +1749,21 @@ class MCPOAuthService:
         except Exception as exc:
             raise MCPOAuthError("Invalid OAuth state") from exc
         state_hash = hashlib.sha256(state.encode()).hexdigest()
-        notification_id = None
         async with self._session_factory() as session:
+            if connection_owner is not None:
+                from cognis.core.executor_connection_ownership import (
+                    ExecutorConnectionOwnership,
+                )
+
+                if not await ExecutorConnectionOwnership.lock_current(
+                    session,
+                    connection_owner,
+                ):
+                    await session.rollback()
+                    raise MCPOAuthError("OAuth callback executor ownership changed")
             row = await get_mcp_oauth_transaction(session, transaction_id)
             if row is None or not hmac.compare_digest(row.state_hash, state_hash):
                 raise MCPOAuthError("Invalid OAuth transaction")
-            notification_id = row.notification_id
             now = _utcnow()
             if row.status != "pending" or row.used_at is not None or row.expires_at < now:
                 raise MCPOAuthError("OAuth transaction is expired or already used")
@@ -1739,11 +1778,10 @@ class MCPOAuthService:
                 listener_id=listener_id,
                 callback_redirect_uri=callback_redirect_uri,
             )
-            row.status = "exchanging"
-            row.used_at = now
-            await session.commit()
-
             try:
+                row.status = "exchanging"
+                row.used_at = now
+                await session.commit()
                 server = await get_mcp_server(
                     session, row.mcp_server_id, owner_email=row.user_email, include_shared=True
                 )
@@ -1771,6 +1809,25 @@ class MCPOAuthService:
                 if isinstance(token_response.get("expires_in"), int):
                     expires_at = now + timedelta(seconds=int(token_response["expires_in"]))
                 token_response = _record_absolute_refresh_token_expiry(token_response, now)
+                if connection_owner is not None:
+                    # Metadata discovery and code exchange can be slow. Start a
+                    # fresh transaction and fence the token/completion write
+                    # against the exact originating socket immediately before
+                    # persisting either effect.
+                    await session.rollback()
+                    from cognis.core.executor_connection_ownership import (
+                        ExecutorConnectionOwnership,
+                    )
+
+                    if not await ExecutorConnectionOwnership.lock_current(
+                        session,
+                        connection_owner,
+                    ):
+                        await session.rollback()
+                        raise MCPOAuthError("OAuth callback executor ownership changed")
+                    row = await get_mcp_oauth_transaction(session, transaction_id)
+                    if row is None or row.status != "exchanging":
+                        raise MCPOAuthError("OAuth callback transaction is no longer exchanging")
                 await upsert_mcp_oauth_token(
                     session,
                     user_email=row.user_email,
@@ -1784,30 +1841,217 @@ class MCPOAuthService:
                     encrypted_payload=self._encrypt(token_response),
                 )
                 row.status = "completed"
+                row.terminal_cleanup_required = True
                 await session.commit()
+            except asyncio.CancelledError:
+                # The final token transaction may already hold the executor
+                # lease row. Release it before cleanup opens a fresh session
+                # and reacquires the same exact-owner fence.
+                await session.rollback()
+                cleanup = asyncio.create_task(
+                    self._mark_cancelled_callback(
+                        transaction_id,
+                        connection_owner=connection_owner,
+                    ),
+                    name=f"mcp-oauth-cancelled-{transaction_id}",
+                )
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+                raise
             except Exception as exc:
-                row.status = "failed"
-                row.error_code = "token_exchange_failed"
-                row.error_description = "OAuth token exchange failed"
-                await session.commit()
-                if notification_id and self._notification_service is not None:
-                    await self._notification_service.resolve_internal(
-                        notification_id,
-                        "failed",
-                        {"transaction_id": transaction_id, "provider": "mcp"},
+                await session.rollback()
+                failure_persisted = await self._mark_exchange_failure(
+                    transaction_id,
+                    connection_owner=connection_owner,
+                )
+                if failure_persisted:
+                    await self.reconcile_terminal_cleanup(
+                        transaction_id,
+                        connection_owner=connection_owner,
                     )
                 if isinstance(exc, MCPOAuthError):
                     raise
                 raise MCPOAuthError("OAuth token exchange failed") from exc
-        if notification_id and self._notification_service is not None:
+        await self.reconcile_terminal_cleanup(
+            transaction_id,
+            connection_owner=connection_owner,
+        )
+        return transaction_id
+
+    async def _mark_exchange_failure(
+        self,
+        transaction_id: str,
+        *,
+        connection_owner: Any | None,
+    ) -> bool:
+        """Persist failure only while the originating executor still owns the callback."""
+
+        async with self._session_factory() as session:
+            guard = self._callback_owner_guard(connection_owner)
+            if guard is not None and not await guard(session):
+                await session.rollback()
+                return False
+            row = await get_mcp_oauth_transaction(session, transaction_id)
+            if row is None or row.status != "exchanging":
+                return False
+            row.status = "failed"
+            row.terminal_cleanup_required = True
+            row.error_code = "token_exchange_failed"
+            row.error_description = "OAuth token exchange failed"
+            await session.commit()
+            return True
+
+    async def _mark_cancelled_callback(
+        self,
+        transaction_id: str,
+        *,
+        connection_owner: Any | None,
+    ) -> None:
+        """Terminalize only a callback whose exchanging admission committed."""
+
+        async with self._session_factory() as session:
+            guard = self._callback_owner_guard(connection_owner)
+            if guard is not None and not await guard(session):
+                await session.rollback()
+                return
+            row = await get_mcp_oauth_transaction(session, transaction_id)
+            if row is None or row.status != "exchanging":
+                return
+            row.status = "failed"
+            row.terminal_cleanup_required = True
+            row.error_code = "callback_cancelled"
+            row.error_description = "OAuth callback processing was interrupted"
+            await session.commit()
+        await self.reconcile_terminal_cleanup(
+            transaction_id,
+            connection_owner=connection_owner,
+        )
+
+    @staticmethod
+    def _callback_owner_guard(connection_owner: Any | None) -> Any | None:
+        if connection_owner is None:
+            return None
+
+        async def _guard(session: Any) -> bool:
+            from cognis.core.executor_connection_ownership import (
+                ExecutorConnectionOwnership,
+            )
+
+            return bool(
+                await ExecutorConnectionOwnership.lock_current(
+                    session,
+                    connection_owner,
+                )
+            )
+
+        return _guard
+
+    async def _resolve_callback_notification(
+        self,
+        *,
+        notification_id: str | None,
+        decision: str,
+        transaction_id: str,
+        connection_owner: Any | None,
+    ) -> bool:
+        if notification_id is None or self._notification_service is None:
+            return False
+        return bool(
             await self._notification_service.resolve_internal(
                 notification_id,
-                "completed",
+                decision,
                 {"transaction_id": transaction_id, "provider": "mcp"},
+                admission_guard=self._callback_owner_guard(connection_owner),
             )
-        if self._on_authorization_completed is not None:
-            await self._on_authorization_completed(transaction_id)
-        return transaction_id
+        )
+
+    async def reconcile_terminal_cleanup(
+        self,
+        transaction_id: str,
+        *,
+        connection_owner: Any | None = None,
+    ) -> bool:
+        """Idempotently finish one terminal callback's required durable cleanup."""
+
+        async with self._session_factory() as session:
+            guard = self._callback_owner_guard(connection_owner)
+            if guard is not None and not await guard(session):
+                await session.rollback()
+                return False
+            row = await get_mcp_oauth_transaction(session, transaction_id)
+            if (
+                row is None
+                or row.status not in {"completed", "failed"}
+                or not getattr(row, "terminal_cleanup_required", False)
+            ):
+                return False
+            status = row.status
+            notification_id = row.notification_id
+            notification_done = getattr(row, "terminal_notification_resolved_at", None) is not None
+            reconfigure_done = getattr(row, "terminal_reconfigure_completed_at", None) is not None
+            await session.commit()
+
+        if not notification_done:
+            decision = "completed" if status == "completed" else "failed"
+            if notification_id is None or await self._resolve_callback_notification(
+                notification_id=notification_id,
+                decision=decision,
+                transaction_id=transaction_id,
+                connection_owner=connection_owner,
+            ):
+                notification_done = await self._mark_terminal_cleanup_step(
+                    transaction_id,
+                    field="terminal_notification_resolved_at",
+                    connection_owner=connection_owner,
+                )
+
+        if not reconfigure_done:
+            if self._on_authorization_completed is None:
+                reconfigure_done = await self._mark_terminal_cleanup_step(
+                    transaction_id,
+                    field="terminal_reconfigure_completed_at",
+                    connection_owner=connection_owner,
+                )
+            else:
+                await self._on_authorization_completed(
+                    transaction_id,
+                    admission_guard=self._callback_owner_guard(connection_owner),
+                    terminal_cleanup=True,
+                )
+                async with self._session_factory() as session:
+                    row = await get_mcp_oauth_transaction(session, transaction_id)
+                    reconfigure_done = bool(
+                        row is not None
+                        and getattr(row, "terminal_reconfigure_completed_at", None) is not None
+                    )
+
+        return notification_done and reconfigure_done
+
+    async def _mark_terminal_cleanup_step(
+        self,
+        transaction_id: str,
+        *,
+        field: str,
+        connection_owner: Any | None,
+    ) -> bool:
+        async with self._session_factory() as session:
+            guard = self._callback_owner_guard(connection_owner)
+            if guard is not None and not await guard(session):
+                await session.rollback()
+                return False
+            row = await get_mcp_oauth_transaction(session, transaction_id)
+            if (
+                row is None
+                or row.status not in {"completed", "failed"}
+                or not getattr(row, "terminal_cleanup_required", False)
+            ):
+                return False
+            if getattr(row, field, None) is None:
+                setattr(row, field, _utcnow())
+                await session.commit()
+            return True
 
     async def _request_device_authorization(
         self,
@@ -1908,6 +2152,46 @@ class MCPOAuthService:
                 if payload.get("flow") == "device_code":
                     self._ensure_device_poll_task(row.transaction_id)
 
+    async def recover_terminal_callback_cleanup(self) -> int:
+        """Reconcile terminal callback cleanup owned by this controller."""
+
+        async with self._session_factory() as session:
+            rows = await list_mcp_oauth_transactions_pending_terminal_cleanup(session)
+        completed = 0
+        for row in rows:
+            eligible, owner = self._terminal_cleanup_owner(row)
+            if not eligible:
+                continue
+            try:
+                if await self.reconcile_terminal_cleanup(
+                    row.transaction_id,
+                    connection_owner=owner,
+                ):
+                    completed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "mcp oauth: terminal cleanup reconciliation failed",
+                    extra={"extra_data": {"transaction_id": row.transaction_id}},
+                    exc_info=True,
+                )
+        return completed
+
+    def _terminal_cleanup_owner(self, row: Any) -> tuple[bool, Any | None]:
+        try:
+            payload = self._decrypt(row.encrypted_payload)
+        except Exception:
+            return False, None
+        if payload.get("callback_mode") != "executor_loopback":
+            return True, None
+        executor_id = str(payload.get("oauth_executor_id") or "")
+        if not executor_id or self._executor_provider is None:
+            return False, None
+        connection = self._executor_provider.get_connection(executor_id)
+        owner = getattr(connection, "connection_owner", None) if connection is not None else None
+        return owner is not None, owner
+
     def start_refresh_maintenance(self) -> None:
         """Start the controller-owned proactive OAuth refresh loop once."""
 
@@ -1939,8 +2223,8 @@ class MCPOAuthService:
                 await asyncio.gather(*pending, return_exceptions=True)
         tasks = list(self._device_poll_tasks.values())
         self._device_poll_tasks.clear()
-        for task in tasks:
-            task.cancel()
+        for device_task in tasks:
+            device_task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1994,6 +2278,8 @@ class MCPOAuthService:
     async def _refresh_maintenance_loop(self) -> None:
         while not self._refresh_shutdown.is_set():
             try:
+                await self.recover_terminal_callback_cleanup()
+                await self.recover_pending_device_authorizations()
                 await self.run_refresh_maintenance_once()
             except asyncio.CancelledError:
                 raise
@@ -2007,15 +2293,54 @@ class MCPOAuthService:
             except TimeoutError:
                 continue
 
-    async def _poll_device_authorization(self, transaction_id: str) -> None:
+    async def _poll_device_authorization(
+        self,
+        transaction_id: str,
+        lease: Lease | None = None,
+        lease_lost: asyncio.Event | None = None,
+    ) -> None:
+        if lease is None and self._lease_store is not None:
+            lease = await self._lease_store.acquire(
+                f"mcp-oauth-device:{transaction_id}",
+                self._controller_owner_id,
+                ttl_seconds=_OAUTH_LEASE_SECONDS,
+            )
+            if lease is None:
+                return
+            lease_lost = asyncio.Event()
+            renewal = asyncio.create_task(self._renew_oauth_lease(lease, lease_lost))
+            try:
+                await self._poll_device_authorization(transaction_id, lease, lease_lost)
+            finally:
+                renewal.cancel()
+                try:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await renewal
+                finally:
+                    try:
+                        await self._lease_store.release(lease)
+                    except Exception:
+                        logger.warning(
+                            "mcp oauth: device lease release failed",
+                            extra={"extra_data": {"resource_key": lease.resource_key}},
+                            exc_info=True,
+                        )
+            return
         interval = 5
         while True:
+            if lease_lost is not None and lease_lost.is_set():
+                return
             async with self._session_factory() as session:
                 row = await get_mcp_oauth_transaction(session, transaction_id)
                 if row is None or row.status != "pending":
                     return
                 now = _utcnow()
-                if row.expires_at <= now:
+                expires_at = _as_utc(row.expires_at)
+                if expires_at <= now:
+                    if not await self._oauth_lease_is_current(session, lease):
+                        return
+                    if lease_lost is not None and lease_lost.is_set():
+                        return
                     row.status = "expired"
                     row.error_code = "expired_token"
                     row.error_description = "OAuth device authorization expired"
@@ -2031,14 +2356,20 @@ class MCPOAuthService:
                 if payload.get("flow") != "device_code":
                     return
                 interval = int(payload.get("interval") or interval)
-                sleep_for = min(max(interval, 1), max((row.expires_at - now).total_seconds(), 0))
+                sleep_for = min(max(interval, 1), max((expires_at - now).total_seconds(), 0))
             await asyncio.sleep(sleep_for)
+            if lease_lost is not None and lease_lost.is_set():
+                return
             async with self._session_factory() as session:
                 row = await get_mcp_oauth_transaction(session, transaction_id)
                 if row is None or row.status != "pending":
                     return
                 now = _utcnow()
-                if row.expires_at <= now:
+                if _as_utc(row.expires_at) <= now:
+                    if not await self._oauth_lease_is_current(session, lease):
+                        return
+                    if lease_lost is not None and lease_lost.is_set():
+                        return
                     row.status = "expired"
                     row.error_code = "expired_token"
                     row.error_description = "OAuth device authorization expired"
@@ -2054,12 +2385,20 @@ class MCPOAuthService:
                 device_code = payload.get("device_code")
                 token_endpoint = payload.get("token_endpoint")
                 if not isinstance(device_code, str) or not isinstance(token_endpoint, str):
+                    if not await self._oauth_lease_is_current(session, lease):
+                        return
+                    if lease_lost is not None and lease_lost.is_set():
+                        return
                     row.status = "failed"
                     row.error_code = "invalid_device_transaction"
                     row.error_description = "OAuth device transaction payload is invalid"
                     await session.commit()
                     return
                 try:
+                    if not await self._oauth_lease_is_current(session, lease):
+                        return
+                    if lease_lost is not None and lease_lost.is_set():
+                        return
                     token_response = await self._exchange_device_code(
                         token_endpoint=_safe_url(token_endpoint),
                         device_code=device_code,
@@ -2073,6 +2412,10 @@ class MCPOAuthService:
                     if exc.reason == "authorization_pending":
                         continue
                     if exc.reason == "slow_down":
+                        if not await self._oauth_lease_is_current(session, lease):
+                            return
+                        if lease_lost is not None and lease_lost.is_set():
+                            return
                         interval += 5
                         payload["interval"] = interval
                         row.encrypted_payload = self._encrypt(payload)
@@ -2084,6 +2427,10 @@ class MCPOAuthService:
                             extra={"extra_data": {"transaction_id": transaction_id}},
                         )
                         continue
+                    if not await self._oauth_lease_is_current(session, lease):
+                        return
+                    if lease_lost is not None and lease_lost.is_set():
+                        return
                     row.status = "failed"
                     row.error_code = exc.reason or "token_exchange_failed"
                     row.error_description = str(exc)[:500]
@@ -2105,10 +2452,16 @@ class MCPOAuthService:
                 token_response["token_endpoint"] = token_endpoint
                 if payload.get("client_secret"):
                     token_response["client_secret"] = payload.get("client_secret")
-                expires_at = None
+                access_expires_at = None
                 if isinstance(token_response.get("expires_in"), int):
-                    expires_at = now + timedelta(seconds=int(token_response["expires_in"]))
+                    access_expires_at = now + timedelta(seconds=int(token_response["expires_in"]))
                 token_response = _record_absolute_refresh_token_expiry(token_response, now)
+                if lease_lost is not None and lease_lost.is_set():
+                    return
+                if not await self._oauth_lease_is_current(session, lease):
+                    return
+                if lease_lost is not None and lease_lost.is_set():
+                    return
                 await upsert_mcp_oauth_token(
                     session,
                     user_email=row.user_email,
@@ -2118,7 +2471,7 @@ class MCPOAuthService:
                     client_id=row.client_id,
                     scopes=row.scopes or [],
                     token_type=str(token_response.get("token_type") or "Bearer"),
-                    expires_at=expires_at,
+                    expires_at=access_expires_at,
                     encrypted_payload=self._encrypt(token_response),
                 )
                 row.status = "completed"
@@ -2133,6 +2486,39 @@ class MCPOAuthService:
                 if self._on_authorization_completed is not None:
                     await self._on_authorization_completed(transaction_id)
                 return
+
+    async def _oauth_lease_is_current(self, session: Any, lease: Lease | None) -> bool:
+        return (
+            True
+            if self._lease_store is None or lease is None
+            else await self._lease_store.is_current_in_session(session, lease)
+        )
+
+    async def _renew_oauth_lease(
+        self, lease: Lease | None, lease_lost: asyncio.Event | None = None
+    ) -> None:
+        if self._lease_store is None or lease is None:
+            return
+        try:
+            current = lease
+            while True:
+                await asyncio.sleep(_OAUTH_LEASE_SECONDS / 3)
+                renewed = await self._lease_store.renew(current, ttl_seconds=_OAUTH_LEASE_SECONDS)
+                if renewed is None:
+                    if lease_lost is not None:
+                        lease_lost.set()
+                    return
+                current = renewed
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if lease_lost is not None:
+                lease_lost.set()
+            logger.warning(
+                "mcp oauth: lease renewal failed; operation settlement is fenced",
+                extra={"extra_data": {"resource_key": lease.resource_key}},
+                exc_info=True,
+            )
 
     async def _exchange_code(
         self,
@@ -2321,35 +2707,220 @@ class MCPOAuthService:
                 )
             issuer = str(existing.issuer or "").rstrip("/")
             resource = auth_config.resource or existing.resource or server.url
+        baseline_version = None
+        baseline_refresh_at = None
+        if self._lease_store is not None:
+            async with self._session_factory() as session:
+                baseline_row = (
+                    await self._token_row_by_id(session, token_id)
+                    if token_id is not None
+                    else await get_mcp_oauth_token_for_server(
+                        session,
+                        user_email=user_email,
+                        mcp_server_id=server.server_id,
+                    )
+                )
+                baseline_version = (
+                    int(getattr(baseline_row, "version", 0) or 0)
+                    if baseline_row is not None
+                    else None
+                )
+                baseline_refresh_at = (
+                    getattr(baseline_row, "last_refresh_at", None)
+                    if baseline_row is not None
+                    else None
+                )
         key = (user_email, server.server_id, issuer, mcp_oauth_resource_key(resource))
-        existing_task = self._refresh_tasks.get(key)
-        if existing_task is not None:
-            return await asyncio.shield(existing_task)
-        task = asyncio.create_task(
-            self._refresh_token_for_server_once(
-                user_email=user_email,
-                server=server,
-                issuer=issuer,
-                resource=resource,
-                token_id=token_id,
-                force=force,
-                reason=reason,
-            ),
-            name=f"mcp-oauth-refresh-{server.server_id}",
+        lock = self._refresh_lock(
+            user_email=user_email,
+            server_id=server.server_id,
+            issuer=issuer,
+            resource=resource,
         )
-        self._refresh_tasks[key] = task
-        task.add_done_callback(
-            lambda completed, refresh_key=key: (
-                self._refresh_tasks.pop(refresh_key, None)
-                if self._refresh_tasks.get(refresh_key) is completed
-                else None
-            )
-        )
+        async with lock:
+            task = self._refresh_tasks.get(key)
+            if task is None:
+                lease_key = hashlib.sha256(
+                    json.dumps(key, separators=(",", ":")).encode()
+                ).hexdigest()
+                lease = (
+                    await self._lease_store.acquire(
+                        f"mcp-oauth-refresh:{lease_key}",
+                        self._controller_owner_id,
+                        ttl_seconds=_OAUTH_LEASE_SECONDS,
+                    )
+                    if self._lease_store is not None
+                    else None
+                )
+                if lease is None and self._lease_store is not None:
+                    observed, lease = await self._wait_for_distributed_refresh(
+                        token_id=token_id,
+                        user_email=user_email,
+                        server_id=server.server_id,
+                        baseline_version=baseline_version,
+                        baseline_refresh_at=baseline_refresh_at,
+                        lease_key=f"mcp-oauth-refresh:{lease_key}",
+                    )
+                    if observed is not None:
+                        return observed
+                task = asyncio.create_task(
+                    self._refresh_token_with_lease(
+                        user_email=user_email,
+                        server=server,
+                        issuer=issuer,
+                        resource=resource,
+                        token_id=token_id,
+                        force=force,
+                        reason=reason,
+                        lease=lease,
+                    ),
+                    name=f"mcp-oauth-refresh-{server.server_id}",
+                )
+                self._refresh_tasks[key] = task
+                task.add_done_callback(
+                    lambda completed, refresh_key=key: (
+                        self._refresh_tasks.pop(refresh_key, None)
+                        if self._refresh_tasks.get(refresh_key) is completed
+                        else None
+                    )
+                )
         try:
             return await asyncio.shield(task)
         finally:
             if self._refresh_tasks.get(key) is task and task.done():
                 self._refresh_tasks.pop(key, None)
+
+    async def _wait_for_distributed_refresh(
+        self,
+        *,
+        token_id: str | None,
+        user_email: str,
+        server_id: str,
+        baseline_version: int | None,
+        baseline_refresh_at: datetime | None,
+        lease_key: str,
+    ) -> tuple[bool | None, Lease | None]:
+        assert self._lease_store is not None
+        deadline = asyncio.get_running_loop().time() + (
+            _OAUTH_LEASE_SECONDS + self._refresh_timeout_seconds
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+            async with self._session_factory() as session:
+                row = (
+                    await self._token_row_by_id(session, token_id)
+                    if token_id is not None
+                    else await get_mcp_oauth_token_for_server(
+                        session,
+                        user_email=user_email,
+                        mcp_server_id=server_id,
+                    )
+                )
+                if row is None:
+                    return False, None
+                current_version = int(getattr(row, "version", 0) or 0)
+                if (
+                    baseline_version is not None
+                    and current_version != baseline_version
+                    and (
+                        row.status == "active"
+                        and getattr(row, "last_refresh_at", None) is not None
+                        and getattr(row, "last_refresh_at", None) != baseline_refresh_at
+                        and not getattr(row, "last_refresh_error_code", None)
+                    )
+                ):
+                    return True, None
+                if (
+                    baseline_version is not None
+                    and current_version != baseline_version
+                    and row.status == "active"
+                    and row.next_refresh_attempt_at is not None
+                ):
+                    raise MCPOAuthError(
+                        "OAuth token refresh is waiting for bounded retry backoff",
+                        reason=row.last_refresh_error_code or "refresh_backoff",
+                        retryable=True,
+                    )
+                if baseline_version is not None and current_version != baseline_version:
+                    raise MCPOAuthError(
+                        "OAuth refresh completed without an active token",
+                        reason=str(row.status or "authorization_required"),
+                        authorization_required=row.status in {"invalid", "refresh_outcome_unknown"},
+                        outcome_unknown=row.status == "refresh_outcome_unknown",
+                    )
+            lease = await self._lease_store.acquire(
+                lease_key,
+                self._controller_owner_id,
+                ttl_seconds=_OAUTH_LEASE_SECONDS,
+            )
+            if lease is not None:
+                async with self._session_factory() as session:
+                    row = (
+                        await self._token_row_by_id(session, token_id)
+                        if token_id is not None
+                        else await get_mcp_oauth_token_for_server(
+                            session,
+                            user_email=user_email,
+                            mcp_server_id=server_id,
+                        )
+                    )
+                    if row is None:
+                        await self._lease_store.release(lease)
+                        return False, None
+                    current_version = int(getattr(row, "version", 0) or 0)
+                    if baseline_version is not None and current_version != baseline_version:
+                        await self._lease_store.release(lease)
+                        if (
+                            row.status == "active"
+                            and getattr(row, "last_refresh_at", None) is not None
+                            and getattr(row, "last_refresh_at", None) != baseline_refresh_at
+                            and not getattr(row, "last_refresh_error_code", None)
+                        ):
+                            return True, None
+                        if row.status == "active" and row.next_refresh_attempt_at is not None:
+                            raise MCPOAuthError(
+                                "OAuth token refresh is waiting for bounded retry backoff",
+                                reason=row.last_refresh_error_code or "refresh_backoff",
+                                retryable=True,
+                            )
+                        raise MCPOAuthError(
+                            "OAuth refresh completed without an active token",
+                            reason=str(row.status or "authorization_required"),
+                            authorization_required=row.status
+                            in {"invalid", "refresh_outcome_unknown"},
+                            outcome_unknown=row.status == "refresh_outcome_unknown",
+                        )
+                return None, lease
+        raise MCPOAuthError(
+            "OAuth refresh is owned by another controller",
+            reason="refresh_contention",
+            retryable=True,
+        )
+
+    async def _refresh_token_with_lease(self, *, lease: Lease | None, **kwargs: Any) -> bool:
+        lease_lost = asyncio.Event()
+        renewal = asyncio.create_task(self._renew_oauth_lease(lease, lease_lost))
+        try:
+            return await self._refresh_token_for_server_once(
+                lease=lease,
+                lease_lost=lease_lost,
+                **kwargs,
+            )
+        finally:
+            renewal.cancel()
+            try:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await renewal
+            finally:
+                if self._lease_store is not None and lease is not None:
+                    try:
+                        await self._lease_store.release(lease)
+                    except Exception:
+                        logger.warning(
+                            "mcp oauth: refresh lease release failed",
+                            extra={"extra_data": {"resource_key": lease.resource_key}},
+                            exc_info=True,
+                        )
 
     async def _refresh_token_for_server_once(
         self,
@@ -2361,6 +2932,8 @@ class MCPOAuthService:
         token_id: str | None,
         force: bool,
         reason: str,
+        lease: Lease | None,
+        lease_lost: asyncio.Event,
     ) -> bool:
         auth_config = effective_mcp_auth_config(server.auth_config, server.headers)
         async with self._session_factory() as session:
@@ -2394,13 +2967,14 @@ class MCPOAuthService:
                     outcome_unknown=getattr(row, "status", None) == "refresh_outcome_unknown",
                 )
             now = _utcnow()
-            due = row.expires_at is not None and row.expires_at <= now + timedelta(
+            normalized_expires_at = _as_utc(row.expires_at) if row.expires_at is not None else None
+            due = normalized_expires_at is not None and normalized_expires_at <= now + timedelta(
                 seconds=_REFRESH_SKEW_SECONDS
             )
             if not force and not due:
                 return False
             next_attempt = getattr(row, "next_refresh_attempt_at", None)
-            if next_attempt is not None and next_attempt > now:
+            if next_attempt is not None and _as_utc(next_attempt) > now:
                 raise MCPOAuthError(
                     "OAuth token refresh is waiting for bounded retry backoff",
                     reason=getattr(row, "last_refresh_error_code", None) or "refresh_backoff",
@@ -2410,7 +2984,7 @@ class MCPOAuthService:
             refresh_token = payload.get("refresh_token")
             token_id = row.token_id
             expected_version = int(getattr(row, "version", 0) or 0)
-            access_expired = row.expires_at is not None and row.expires_at <= now
+            access_expired = normalized_expires_at is not None and normalized_expires_at <= now
             client_id = row.client_id or auth_config.client_id or f"cognis-mcp-{server.server_id}"
             scopes = list(row.scopes or auth_config.scopes)
             token_type = row.token_type
@@ -2420,6 +2994,8 @@ class MCPOAuthService:
                 reason="refresh_token_missing",
                 authorization_required=True,
             )
+            if lease_lost.is_set():
+                raise exc
             await self._record_refresh_failure(
                 token_id=token_id,
                 expected_version=expected_version,
@@ -2427,6 +3003,8 @@ class MCPOAuthService:
                 server_id=server.server_id,
                 exc=exc,
                 notify_runtime=True,
+                lease=lease,
+                lease_lost=lease_lost,
             )
             raise exc
         token_endpoint = payload.get("token_endpoint")
@@ -2442,8 +3020,12 @@ class MCPOAuthService:
         if isinstance(payload.get("client_secret"), str):
             refresh_kwargs["client_secret"] = payload["client_secret"]
         try:
+            if lease_lost.is_set():
+                return False
             refreshed = await self._refresh_token(**refresh_kwargs)
         except MCPOAuthError as exc:
+            if lease_lost.is_set():
+                raise
             persisted = await self._record_refresh_failure(
                 token_id=token_id,
                 expected_version=expected_version,
@@ -2451,6 +3033,8 @@ class MCPOAuthService:
                 server_id=server.server_id,
                 exc=exc,
                 notify_runtime=force or access_expired or exc.authorization_required,
+                lease=lease,
+                lease_lost=lease_lost,
             )
             if persisted:
                 logger.warning(
@@ -2467,6 +3051,8 @@ class MCPOAuthService:
                         }
                     },
                 )
+                raise
+            if lease_lost.is_set():
                 raise
             return False
         now = _utcnow()
@@ -2488,6 +3074,12 @@ class MCPOAuthService:
         if isinstance(refreshed.get("expires_in"), int):
             expires_at = now + timedelta(seconds=int(refreshed["expires_in"]))
         async with self._session_factory() as session:
+            if lease_lost.is_set():
+                return False
+            if not await self._oauth_lease_is_current(session, lease):
+                return False
+            if lease_lost.is_set():
+                return False
             current = await self._token_row_by_id(session, token_id)
             if (
                 current is None
@@ -2531,9 +3123,17 @@ class MCPOAuthService:
         server_id: str,
         exc: MCPOAuthError,
         notify_runtime: bool,
+        lease: Lease | None,
+        lease_lost: asyncio.Event,
     ) -> bool:
         now = _utcnow()
         async with self._session_factory() as session:
+            if lease_lost.is_set():
+                return False
+            if not await self._oauth_lease_is_current(session, lease):
+                return False
+            if lease_lost.is_set():
+                return False
             row = await self._token_row_by_id(session, token_id)
             if (
                 row is None

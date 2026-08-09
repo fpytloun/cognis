@@ -40,8 +40,16 @@ from cognis.api.models import (
     UserPreferencesUpdateRequest,
     WebBackendUpdateRequest,
     WebConfigStatusResponse,
+    WebDefaultsUpdateRequest,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
+from cognis.api.web_reconfigure import (
+    finalize_web_executor_reconfigure_for_app,
+    run_web_mutation_cancellation_safe,
+)
+from cognis.api.web_reconfigure import (
+    web_settings_distributed_lock as _web_settings_distributed_lock,
+)
 from cognis.core.executor_resolution import labels_match
 from cognis.core.step_profiles import (
     STEP_PROFILE_CUSTOM_SETTING_KEY,
@@ -853,6 +861,64 @@ async def web_config_status(request: Request) -> WebConfigStatusResponse:
 
 
 @router.put(
+    "/api/v1/web-config/defaults",
+    response_model=WebConfigStatusResponse,
+)
+async def web_defaults_update(
+    request: Request,
+    payload: WebDefaultsUpdateRequest,
+) -> WebConfigStatusResponse:
+    """Atomically update canonical search and fetch backend defaults."""
+    user = require_admin(request)
+
+    async def _update() -> None:
+        settings_committed = False
+        try:
+            async with (
+                request.app.state.settings_update_lock,
+                _web_settings_distributed_lock(request.app.state.session_factory),
+                request.app.state.session_factory() as session,
+            ):
+                current = await web_config_status(request)
+                if payload.search_backend not in current.available_search_backends:
+                    raise api_exception(
+                        400,
+                        "validation_error",
+                        f"Search backend '{payload.search_backend}' is not configured and enabled",
+                    )
+                if payload.fetch_backend not in current.available_fetch_backends:
+                    raise api_exception(
+                        400,
+                        "validation_error",
+                        f"Fetch backend '{payload.fetch_backend}' is not configured and enabled",
+                    )
+
+                for key, value in (
+                    ("web.search_backend", payload.search_backend),
+                    ("web.fetch_backend", payload.fetch_backend),
+                ):
+                    spec = get_setting_spec(key)
+                    await upsert_setting(
+                        session,
+                        key=key,
+                        value=value,
+                        category=spec.category,
+                        updated_by=user.email,
+                    )
+                await session.commit()
+                settings_committed = True
+        finally:
+            if settings_committed:
+                await finalize_web_executor_reconfigure_for_app(
+                    request.app,
+                    reason="web_defaults_update",
+                )
+
+    await run_web_mutation_cancellation_safe(_update, reason="web_defaults_update")
+    return await web_config_status(request)
+
+
+@router.put(
     "/api/v1/web-config/backends/{backend}",
     response_model=WebConfigStatusResponse,
 )
@@ -874,94 +940,112 @@ async def web_backend_update(
 
     secrets_provider = getattr(request.app.state.providers, "secrets", None)
     secret_name = None
-    secret_configured = False
     if backend != "searxng":
         secret_name = f"{backend}_api_key"
         if secrets_provider is None:
             raise api_exception(503, "provider_unavailable", "Secrets provider is unavailable")
-        try:
-            await secrets_provider.get_secret(secret_name, SYSTEM_USER_EMAIL)
-            secret_configured = True
-        except KeyError:
-            pass
-        except Exception as exc:
-            raise api_exception(
-                503,
-                "provider_unavailable",
-                "Unable to read web backend credentials",
-            ) from exc
         api_key = (payload.api_key or "").strip()
-        if payload.enabled and not secret_configured and not api_key:
-            raise api_exception(
-                400,
-                "validation_error",
-                f"{backend.title()} requires an API key before it can be enabled",
-            )
     else:
         api_key = ""
 
-    async with request.app.state.session_factory() as session:
-        from cognis.store.queries import get_setting_value
-
-        updates: dict[str, object] = {f"web.{backend}_enabled": payload.enabled}
-        if backend == "searxng":
-            for key, submitted in (
-                ("web.searxng_url", payload.searxng_url),
-                ("web.searxng_engines", payload.searxng_engines),
-                ("web.searxng_categories", payload.searxng_categories),
-                ("web.searxng_language", payload.searxng_language),
+    async def _update() -> None:
+        settings_committed = False
+        secret_mutated = False
+        try:
+            async with (
+                request.app.state.settings_update_lock,
+                _web_settings_distributed_lock(request.app.state.session_factory),
+                request.app.state.session_factory() as session,
             ):
-                current = await get_setting_value(session, key, "")
-                if payload.remove_configuration:
-                    updates[key] = ""
-                elif submitted is not None:
-                    updates[key] = submitted.strip()
-                else:
-                    updates[key] = current if isinstance(current, str) else ""
-            if payload.enabled and not str(updates["web.searxng_url"]).strip():
-                raise api_exception(
-                    400,
-                    "validation_error",
-                    "SearXNG requires an instance URL before it can be enabled",
+                from cognis.store.queries import get_setting_value
+
+                if secret_name is not None:
+                    secret_configured = False
+                    try:
+                        await secrets_provider.get_secret(secret_name, SYSTEM_USER_EMAIL)
+                        secret_configured = True
+                    except KeyError:
+                        pass
+                    except Exception as exc:
+                        raise api_exception(
+                            503,
+                            "provider_unavailable",
+                            "Unable to read web backend credentials",
+                        ) from exc
+                    if payload.enabled and not secret_configured and not api_key:
+                        raise api_exception(
+                            400,
+                            "validation_error",
+                            f"{backend.title()} requires an API key before it can be enabled",
+                        )
+                    if api_key:
+                        await secrets_provider.set_secret(
+                            secret_name,
+                            api_key,
+                            SYSTEM_USER_EMAIL,
+                            scope="system",
+                            agent_id=None,
+                            description=f"API key for {backend.title()}",
+                        )
+                        secret_mutated = True
+
+                updates: dict[str, object] = {f"web.{backend}_enabled": payload.enabled}
+                if backend == "searxng":
+                    for key, submitted in (
+                        ("web.searxng_url", payload.searxng_url),
+                        ("web.searxng_engines", payload.searxng_engines),
+                        ("web.searxng_categories", payload.searxng_categories),
+                        ("web.searxng_language", payload.searxng_language),
+                    ):
+                        current = await get_setting_value(session, key, "")
+                        if payload.remove_configuration:
+                            updates[key] = ""
+                        elif submitted is not None:
+                            updates[key] = submitted.strip()
+                        else:
+                            updates[key] = current if isinstance(current, str) else ""
+                    if payload.enabled and not str(updates["web.searxng_url"]).strip():
+                        raise api_exception(
+                            400,
+                            "validation_error",
+                            "SearXNG requires an instance URL before it can be enabled",
+                        )
+
+                if not payload.enabled:
+                    for key in ("web.search_backend", "web.fetch_backend"):
+                        current = await get_setting_value(session, key, "direct")
+                        if current == backend:
+                            updates[key] = "direct"
+
+                for key, value in updates.items():
+                    await upsert_setting(
+                        session,
+                        key=key,
+                        value=value,
+                        category=get_setting_spec(key).category,
+                        updated_by=user.email,
+                    )
+                await session.commit()
+                settings_committed = True
+
+                if secret_name is not None and payload.remove_configuration:
+                    await secrets_provider.delete_secret(
+                        secret_name,
+                        SYSTEM_USER_EMAIL,
+                        scope="system",
+                        agent_id=None,
+                    )
+        finally:
+            if settings_committed or secret_mutated:
+                await finalize_web_executor_reconfigure_for_app(
+                    request.app,
+                    reason=f"web_backend_update:{backend}",
                 )
 
-        if not payload.enabled:
-            for key in ("web.backend", "web.search_backend", "web.fetch_backend"):
-                current = await get_setting_value(session, key, "direct")
-                if current == backend:
-                    updates[key] = "direct"
-
-        for key, value in updates.items():
-            await upsert_setting(
-                session,
-                key=key,
-                value=value,
-                category=get_setting_spec(key).category,
-                updated_by=user.email,
-            )
-        await session.commit()
-
-    # Apply credential mutations only after the settings transaction succeeds.
-    # A failed secret operation therefore leaves the backend disabled or
-    # unavailable rather than exposing a disabled credential to execution.
-    if secret_name is not None:
-        if payload.remove_configuration:
-            await secrets_provider.delete_secret(
-                secret_name,
-                SYSTEM_USER_EMAIL,
-                scope="system",
-                agent_id=None,
-            )
-        elif api_key:
-            await secrets_provider.set_secret(
-                secret_name,
-                api_key,
-                SYSTEM_USER_EMAIL,
-                scope="system",
-                agent_id=None,
-                description=f"API key for {backend.title()}",
-            )
-
+    await run_web_mutation_cancellation_safe(
+        _update,
+        reason=f"web_backend_update:{backend}",
+    )
     return await web_config_status(request)
 
 

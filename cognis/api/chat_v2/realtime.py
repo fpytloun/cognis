@@ -307,6 +307,55 @@ def assistant_completion_runtime_item(
     )
 
 
+def system_message_runtime_item(
+    *,
+    notice_id: str,
+    content: str,
+    turn_id: str | None,
+    session_id: str | None,
+    timestamp: str,
+    notice_kind: str | None,
+    notice_scope: str | None,
+    retry_reason: str | None = None,
+    retry_source_turn_id: str | None = None,
+    attempt: int | None = None,
+) -> MessageTimelineItem:
+    """Build a live system notice with the canonical projector identity."""
+
+    return MessageTimelineItem(
+        id=f"system:{notice_id}",
+        kind="message",
+        sort_key=runtime_timeline_sort_key(
+            phase=0,
+            kind_rank=KIND_RANK["system_message"],
+            local=0,
+        ),
+        source_refs=[
+            SourceRef(
+                store="runtime",
+                session_id=session_id or "runtime",
+                seq=0,
+                event_type="system_message",
+            )
+        ],
+        created_at=timestamp,
+        updated_at=timestamp,
+        status="complete",
+        stable=False,
+        role="system",
+        content=content,
+        message_id=notice_id,
+        notice_id=notice_id,
+        notice_kind=notice_kind,
+        notice_scope=notice_scope,
+        turn_id=turn_id,
+        retry_reason=retry_reason,
+        retry_source_turn_id=retry_source_turn_id,
+        attempt=attempt,
+        partial=False,
+    )
+
+
 def tool_call_runtime_item(
     *,
     session_id: str,

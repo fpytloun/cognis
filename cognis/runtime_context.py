@@ -27,6 +27,7 @@ class RuntimeAccessContext:
     workflow_step: bool = False
     interaction_mode: str | None = None
     session_policy: dict[str, Any] | None = None
+    control_surface: str | None = None
 
     @property
     def is_root_owner_primary_chat(self) -> bool:

@@ -429,7 +429,6 @@ async def _runtime_profiles_write(
         assert row is not None
 
     action = "runtime_profiles_create" if create else "runtime_profiles_update"
-    await _publish_profile_updated(deps, row.agent_id)
     await _audit(deps, actor_email, row.agent_id, action, "success", arguments)
     payload = _runtime_profiles_payload(row)
     return {
@@ -469,7 +468,6 @@ async def _runtime_profiles_default_set(
         await session.commit()
         row = await get_agent(session, row.agent_id)
         assert row is not None
-    await _publish_profile_updated(deps, row.agent_id)
     await _audit(
         deps, actor_email, row.agent_id, "runtime_profiles_default_set", "success", arguments
     )
@@ -524,7 +522,6 @@ async def _runtime_profiles_delete(
         await session.commit()
         row = await get_agent(session, row.agent_id)
         assert row is not None
-    await _publish_profile_updated(deps, row.agent_id)
     audit_arguments = {
         **arguments,
         "replacement_profile_id": replacement_profile_id,
@@ -937,7 +934,9 @@ async def _create_agent(
             session,
             owner_email=actor_email,
         )
-        available_knowledgebase_ids = {row.knowledgebase_id for row in available_knowledgebases}
+        available_knowledgebase_ids = {
+            row.knowledgebase_id for row in available_knowledgebases if row.status == "active"
+        }
         if deps.assignable_knowledgebase_ids is not None:
             available_knowledgebase_ids &= deps.assignable_knowledgebase_ids
         invalid_knowledgebases = sorted(set(assigned_knowledgebases) - available_knowledgebase_ids)
@@ -1904,6 +1903,7 @@ async def _available_knowledgebase_options(
 ) -> list[dict[str, Any]]:
     async with deps.session_factory() as session:
         rows = await list_knowledgebases(session, owner_email=actor_email)
+    rows = [row for row in rows if row.status == "active"]
     if deps.assignable_knowledgebase_ids is not None:
         rows = [row for row in rows if row.knowledgebase_id in deps.assignable_knowledgebase_ids]
     return [{"id": row.knowledgebase_id, "name": row.name, "status": row.status} for row in rows]

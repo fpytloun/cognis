@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SessionStatus(StrEnum):
@@ -20,6 +20,14 @@ class SessionStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class SessionTransition(StrEnum):
+    """Operational semantics for a session successor."""
+
+    COMPACT = "compact"
+    RENEW = "renew"
+    RESET = "reset"
 
 
 TERMINAL_STATES = frozenset(
@@ -41,6 +49,25 @@ class ConversationContext(BaseModel):
     ref: str | None = None
     platform_data: dict[str, Any] = Field(default_factory=dict)
     memory_labels: dict[str, str] = Field(default_factory=dict)
+
+
+class ConversationLineage(BaseModel):
+    """Trusted typed input for one canonical conversation lineage edge."""
+
+    kind: Literal["conversation", "task", "task_step"]
+    source_conversation_id: str
+    source_session_id: str
+    task_id: str | None = None
+    step_run_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_exact_edge(self) -> ConversationLineage:
+        if self.kind == "conversation":
+            if self.task_id is not None or self.step_run_id is not None:
+                raise ValueError("Conversation lineage cannot reference a task or step")
+        elif not self.task_id or not self.step_run_id:
+            raise ValueError("Task lineage requires task and step references")
+        return self
 
 
 class ConversationModel(BaseModel):
@@ -73,9 +100,11 @@ class SessionModel(BaseModel):
     """Session metadata stored in Cognis DB."""
 
     session_id: str
+    activity_scope_id: str = ""
     conversation_id: str
     parent_session_id: str | None = None
     previous_session_id: str | None = None
+    source_session_id: str | None = None
     user_email: str
     agent_id: str
     agent_profile_id: str | None = None
@@ -93,6 +122,12 @@ class SessionModel(BaseModel):
     result_summary: str | None = None
     result_content: str | None = None
     updated_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def default_activity_scope(self) -> SessionModel:
+        if not self.activity_scope_id:
+            self.activity_scope_id = self.session_id
+        return self
 
 
 class SessionEvent(BaseModel):

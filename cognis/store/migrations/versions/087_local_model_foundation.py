@@ -52,7 +52,7 @@ def upgrade() -> None:
         sa.Column(
             "capacity_override_acknowledged",
             sa.Boolean(),
-            server_default="0",
+            server_default=sa.false(),
             nullable=False,
         ),
         sa.Column("capacity_assessment_generation", sa.Integer(), nullable=True),

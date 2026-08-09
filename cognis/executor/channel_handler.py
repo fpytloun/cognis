@@ -12,17 +12,22 @@ import base64
 import contextlib
 import json
 import logging
+import re
 from typing import Any
 
 from cognis.channels.adapters.signal_cli_install import (
     ensure_signal_cli,
     resolve_signal_cli_runtime_config,
 )
+from cognis.channels.protocol import NonRetryableChannelError
 from cognis.models.channel import (
     ChannelAccountConfig,
+    ChannelCapabilities,
+    ChannelRecipient,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = logging.getLogger("cognis.executor.channel_handler")
@@ -99,7 +104,11 @@ class ChannelHandler:
         self._adapters[account_id] = adapter
 
         logger.info("channel_handler: started adapter %s (%s)", account_id, channel_type)
-        return {"status": "started", "account_id": account_id}
+        result: dict[str, Any] = {"status": "started", "account_id": account_id}
+        capabilities = getattr(adapter, "capabilities", None)
+        if isinstance(capabilities, ChannelCapabilities):
+            result["capabilities"] = capabilities.model_dump(mode="json")
+        return result
 
     async def stop(self, account_id: str) -> dict[str, Any]:
         """Stop a channel adapter."""
@@ -128,6 +137,80 @@ class ChannelHandler:
         )
         platform_msg_id = await adapter.send_message(outbound)
         return {"status": "sent", "platform_message_id": platform_msg_id}
+
+    async def resolve_recipient(
+        self,
+        account_id: Any,
+        recipient: Any,
+        resolution_key: Any,
+    ) -> dict[str, Any]:
+        """Resolve one typed recipient and return only safe error envelopes."""
+        if not isinstance(account_id, str) or not account_id or len(account_id) > 255:
+            return _recipient_error("malformed_request", retryable=False)
+        if not isinstance(resolution_key, str) or not resolution_key or len(resolution_key) > 255:
+            return _recipient_error("malformed_request", retryable=False)
+        try:
+            typed_recipient = ChannelRecipient.model_validate(recipient)
+        except Exception:
+            return _recipient_error("malformed_recipient", retryable=False)
+
+        adapter = self._adapters.get(account_id)
+        if adapter is None:
+            return _recipient_error("account_not_found", retryable=False)
+        capabilities = getattr(adapter, "capabilities", None)
+        recipient_capabilities = getattr(capabilities, "recipient_capabilities", None)
+        if recipient_capabilities is None:
+            return _recipient_error("unsupported_resolution", retryable=False)
+        adapter_channel_type = getattr(adapter, "channel_type", None)
+        if (
+            isinstance(adapter_channel_type, str)
+            and adapter_channel_type
+            and typed_recipient.channel_type != adapter_channel_type
+        ):
+            return _recipient_error("channel_mismatch", retryable=False)
+        if typed_recipient.address_kind not in recipient_capabilities.address_kinds:
+            return _recipient_error(
+                "unsupported_address_kind"
+                if typed_recipient.address_kind is not None
+                else "unsupported_resolution",
+                retryable=False,
+            )
+        if typed_recipient.chat_kind not in recipient_capabilities.chat_kinds:
+            return _recipient_error("unsupported_chat_kind", retryable=False)
+        if typed_recipient.allow_resolution and not recipient_capabilities.supports_resolution:
+            return _recipient_error("resolution_unsupported", retryable=False)
+        if typed_recipient.allow_creation and not recipient_capabilities.supports_creation:
+            return _recipient_error("creation_unsupported", retryable=False)
+
+        try:
+            target = await adapter.resolve_recipient(
+                typed_recipient,
+                resolution_key=resolution_key,
+            )
+            resolved = ResolvedChannelTarget.model_validate(target)
+        except NonRetryableChannelError as exc:
+            return _recipient_error(
+                _safe_error_code(exc),
+                retryable=False,
+                side_effect_certainty=_safe_side_effect_certainty(
+                    exc, allow_creation=typed_recipient.allow_creation
+                ),
+            )
+        except Exception as exc:
+            return _recipient_error(
+                _safe_error_code(exc),
+                retryable=True,
+                side_effect_certainty=_safe_side_effect_certainty(
+                    exc, allow_creation=typed_recipient.allow_creation
+                ),
+            )
+        if resolved.account_id != account_id:
+            return _recipient_error(
+                "invalid_target",
+                retryable=False,
+                side_effect_certainty=("uncertain" if typed_recipient.allow_creation else "none"),
+            )
+        return resolved.model_dump(mode="json")
 
     async def fetch_media(
         self,
@@ -283,3 +366,58 @@ def _create_adapter(channel_type: str) -> Any:
     from cognis.channels.factory import create_adapter
 
     return create_adapter(channel_type)
+
+
+_SAFE_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
+_SAFE_SIDE_EFFECT_CERTAINTIES = {"none", "uncertain", "known"}
+
+
+def _safe_error_code(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    return (
+        code if isinstance(code, str) and _SAFE_ERROR_CODE.fullmatch(code) else "resolution_failed"
+    )
+
+
+def _safe_side_effect_certainty(exc: Exception, *, allow_creation: bool) -> str:
+    certainty = getattr(exc, "side_effect_certainty", None)
+    return (
+        certainty
+        if isinstance(certainty, str) and certainty in _SAFE_SIDE_EFFECT_CERTAINTIES
+        else ("uncertain" if allow_creation else "none")
+    )
+
+
+def _recipient_error(
+    code: str,
+    *,
+    retryable: bool,
+    side_effect_certainty: str = "none",
+) -> dict[str, Any]:
+    safe_code = code if _SAFE_ERROR_CODE.fullmatch(code) else "resolution_failed"
+    return {
+        "error": {
+            "code": safe_code,
+            "message": _recipient_error_message(safe_code),
+            "retryable": retryable,
+            "side_effect_certainty": side_effect_certainty,
+        }
+    }
+
+
+def _recipient_error_message(code: str) -> str:
+    messages = {
+        "account_not_found": "Recipient account is unavailable",
+        "malformed_request": "Recipient resolution request is malformed",
+        "malformed_recipient": "Recipient data is malformed",
+        "channel_mismatch": "Recipient channel does not match the account",
+        "unsupported_address_kind": "Recipient address kind is unsupported",
+        "unsupported_chat_kind": "Recipient chat kind is unsupported",
+        "unsupported_resolution": "Recipient resolution is unsupported",
+        "resolution_not_authorized": "Recipient resolution is not authorized",
+        "resolution_unsupported": "Recipient resolution is unsupported",
+        "creation_unsupported": "Recipient creation is unsupported",
+        "invalid_target": "Executor returned an invalid recipient target",
+        "resolution_failed": "Recipient resolution failed",
+    }
+    return messages.get(code, "Recipient resolution failed")

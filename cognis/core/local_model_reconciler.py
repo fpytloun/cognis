@@ -83,7 +83,8 @@ class LocalModelReconciler:
         self._task: asyncio.Task[None] | None = None
         self._stopping = False
         self._pass_lock = asyncio.Lock()
-        self._retry: dict[str, tuple[int, float]] = {}
+        self._retry_attempts: dict[str, tuple[int, int]] = {}
+        self._retry_deadlines: dict[str, tuple[int, float]] = {}
         self._retry_handles: dict[str, asyncio.TimerHandle] = {}
         self._requested_deployments: set[str] = set()
         self._requested_executors: set[str] = set()
@@ -109,6 +110,8 @@ class LocalModelReconciler:
         for handle in self._retry_handles.values():
             handle.cancel()
         self._retry_handles.clear()
+        self._retry_attempts.clear()
+        self._retry_deadlines.clear()
 
     def trigger(
         self,
@@ -186,6 +189,9 @@ class LocalModelReconciler:
                         (target.executor_id, deployment.runtime_name) for target in targets
                     )
             delete_scan_complete = True
+        self._prune_retry_state(
+            {target.target_id for _deployment, targets in snapshots for target in targets}
+        )
 
         selected = [
             (deployment, targets)
@@ -303,9 +309,11 @@ class LocalModelReconciler:
             )
             target = await session.get(LocalModelTargetStatus, target_id)
             if deployment is None or target is None:
+                self._clear_retry_state(target_id)
                 return
             generation = deployment.generation
             if target.generation != generation:
+                self._clear_retry_state(target_id)
                 return
             executor_id = target.executor_id
             runtime_name = deployment.runtime_name
@@ -325,11 +333,14 @@ class LocalModelReconciler:
                         operation_id,
                         executor_id=executor_id,
                     )
+                    self._clear_retry_state(target_id)
                 elif operation_state in {
                     LocalModelOperationState.QUEUED.value,
                     LocalModelOperationState.INTERRUPTED.value,
                 }:
-                    await self._runtime_manager.dispatch(operation_id)
+                    dispatched = await self._runtime_manager.dispatch(operation_id)
+                    if dispatched:
+                        self._clear_retry_state(target_id)
                 return
 
         capability = self._runtime_manager.capability(executor_id)
@@ -406,7 +417,6 @@ class LocalModelReconciler:
                 digest=observed_digest,
                 size=observed_size,
             )
-            self._retry.pop(target_id, None)
             await self._runtime_manager.ensure_observed_provider_upsert(
                 deployment_id=deployment_id,
                 executor_id=executor_id,
@@ -421,7 +431,6 @@ class LocalModelReconciler:
                 LocalModelTargetState.ABSENT,
                 observed_generation=generation,
             )
-            self._retry.pop(target_id, None)
             return
         if not delete_scan_complete:
             await self._set_target(
@@ -446,7 +455,6 @@ class LocalModelReconciler:
                 LocalModelTargetState.ABSENT,
                 observed_generation=generation,
             )
-            self._retry.pop(target_id, None)
             return
         await self._start_operation(
             deployment_id,
@@ -468,6 +476,7 @@ class LocalModelReconciler:
             )
             target = await session.get(LocalModelTargetStatus, target_id)
             if deployment is None or target is None:
+                self._clear_retry_state(target_id)
                 return
             operations = await list_local_model_operations(session, deployment_id)
             matching = [
@@ -524,6 +533,7 @@ class LocalModelReconciler:
                             ),
                         )
                         await session.commit()
+                        self._clear_retry_state(target_id)
                         return
                 attempt = len(matching) + 1
                 document = {
@@ -566,9 +576,12 @@ class LocalModelReconciler:
             )
             await session.commit()
         try:
-            await self._runtime_manager.dispatch(operation_id)
+            dispatched = await self._runtime_manager.dispatch(operation_id)
         except LocalModelRuntimeUnavailable as exc:
             await self._target_failed(target_id, target.generation, exc)
+        else:
+            if dispatched:
+                self._clear_retry_state(target_id)
 
     async def _set_target(
         self,
@@ -593,6 +606,8 @@ class LocalModelReconciler:
                 last_error=error,
             )
             await session.commit()
+        if state != LocalModelTargetState.ERROR:
+            self._clear_retry_state(target_id)
 
     async def _target_failed(
         self,
@@ -601,11 +616,15 @@ class LocalModelReconciler:
         exc: BaseException,
     ) -> None:
         error = sanitize_local_model_error(str(exc))
-        attempt, _ready_at = self._retry.get(target_id, (0, 0.0))
-        attempt += 1
+        previous = self._retry_attempts.get(target_id)
+        if previous is not None and previous[0] != generation:
+            self._clear_retry_state(target_id)
+            previous = None
+        attempt = (previous[1] if previous is not None else 0) + 1
         delay = min(_MAX_RETRY_SECONDS, _BASE_RETRY_SECONDS * 2 ** min(attempt - 1, 8))
         ready_at = monotonic() + random.uniform(delay * 0.75, delay * 1.25)
-        self._retry[target_id] = (attempt, ready_at)
+        self._retry_attempts[target_id] = (generation, attempt)
+        self._retry_deadlines[target_id] = (generation, ready_at)
         self._schedule_retry_wake(target_id, ready_at)
         await self._set_target(
             target_id,
@@ -627,11 +646,17 @@ class LocalModelReconciler:
         )
 
     def _retry_ready(self, target: LocalModelTargetStatus) -> bool:
-        retry = self._retry.get(target.target_id)
-        if retry is not None:
-            if monotonic() < retry[1]:
+        attempt = self._retry_attempts.get(target.target_id)
+        deadline = self._retry_deadlines.get(target.target_id)
+        attempt_generation_changed = attempt is not None and attempt[0] != target.generation
+        deadline_generation_changed = deadline is not None and deadline[0] != target.generation
+        if attempt_generation_changed or deadline_generation_changed:
+            self._clear_retry_state(target.target_id)
+            return True
+        if deadline is not None:
+            if monotonic() < deadline[1]:
                 return False
-            self._retry.pop(target.target_id, None)
+            self._retry_deadlines.pop(target.target_id, None)
             handle = self._retry_handles.pop(target.target_id, None)
             if handle is not None:
                 handle.cancel()
@@ -639,10 +664,28 @@ class LocalModelReconciler:
         if target.state == LocalModelTargetState.ERROR.value:
             delay = random.uniform(_BASE_RETRY_SECONDS * 0.75, _BASE_RETRY_SECONDS * 1.25)
             ready_at = monotonic() + delay
-            self._retry[target.target_id] = (1, ready_at)
+            if attempt is None:
+                self._retry_attempts[target.target_id] = (target.generation, 0)
+            self._retry_deadlines[target.target_id] = (target.generation, ready_at)
             self._schedule_retry_wake(target.target_id, ready_at)
             return False
+        if attempt is not None:
+            self._clear_retry_state(target.target_id)
         return True
+
+    def _clear_retry_state(self, target_id: str) -> None:
+        self._retry_attempts.pop(target_id, None)
+        self._retry_deadlines.pop(target_id, None)
+        handle = self._retry_handles.pop(target_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _prune_retry_state(self, active_target_ids: set[str]) -> None:
+        known_target_ids = (
+            set(self._retry_attempts) | set(self._retry_deadlines) | set(self._retry_handles)
+        )
+        for target_id in known_target_ids - active_target_ids:
+            self._clear_retry_state(target_id)
 
     def _schedule_retry_wake(self, target_id: str, ready_at: float) -> None:
         previous_handle = self._retry_handles.pop(target_id, None)

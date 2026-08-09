@@ -154,7 +154,7 @@ async def workflow_update_route(
             session_factory=request.app.state.session_factory,
             workflow_id=workflow_id,
             owner_email=user.email,
-            payload=payload.model_dump(exclude_none=True, mode="json"),
+            payload=payload.model_dump(exclude_unset=True, mode="json"),
         )
     except ValueError as exc:
         message = str(exc)

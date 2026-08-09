@@ -28,8 +28,8 @@ import json
 import re
 import uuid
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from time import monotonic
@@ -42,6 +42,8 @@ from sqlalchemy import and_, case, delete, or_, select, update
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.audio.transcription import transcribe_audio_bytes
 from cognis.core.agent_direct import is_agent_direct_context
+from cognis.core.agent_registry import SYSTEM_AGENTS
+from cognis.core.artifact_inputs import authorize_outbound_artifact_refs_in_session
 from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.attachment_utils import (
     attachment_placeholder_text,
@@ -52,11 +54,20 @@ from cognis.core.attachment_utils import (
 from cognis.core.chat_modes import (
     ChatMode,
     ResolvedChatMode,
+    optional_chat_mode,
     parse_chat_mode_directive,
     resolve_chat_mode,
 )
+from cognis.core.chat_v2_runtime_relay import RelayGenerationContext
 from cognis.core.commands import is_system_slash_command_message
 from cognis.core.compaction import ROTATION_TOTAL
+from cognis.core.controller_runtime import ControllerLifecycleState, ControllerRuntime
+from cognis.core.direct_turn_runtime import (
+    DirectTurnExecutionFence,
+    DurableDirectTurnRuntime,
+    PermanentDirectTurnControllerError,
+    StaleDirectTurnOwner,
+)
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
@@ -86,6 +97,7 @@ from cognis.core.managed_conversations import (
     ManagedConversationAdmissionConflict,
     ManagedConversationTurnObserver,
 )
+from cognis.core.message_envelope import message_metadata
 from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.runtime_metadata import assistant_message_runtime_metadata
 from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
@@ -94,14 +106,23 @@ from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
+from cognis.models.channel import ChannelDeliveryDescriptor
+from cognis.models.retry import (
+    RetryReason,
+    normalize_retry_reason,
+    retry_notice_text,
+    retry_reason_from_interruption,
+)
 from cognis.models.session import (
     BLOCKED_STATES,
     ConversationModel,
     SessionEvent,
     SessionModel,
     SessionStatus,
+    SessionTransition,
 )
 from cognis.models.task import TaskDelivery
+from cognis.providers.executor.delivery import AmbiguousToolOutcome
 from cognis.providers.retry import is_retryable_http_error
 from cognis.runtime_context import (
     current_agent_id,
@@ -109,9 +130,20 @@ from cognis.runtime_context import (
     current_effective_working_directory,
     current_user_email,
     current_workspace_root,
+    scoped_runtime_context,
 )
 from cognis.store import queries
+from cognis.store.coordination import DatabaseLeaseStore, Lease
+from cognis.store.direct_turns import (
+    TERMINAL_STATUSES,
+    DirectTurnAdmissionGuard,
+    DirectTurnAdmissionRejected,
+    DirectTurnStatus,
+    DirectTurnStore,
+    MaterializedDirectTurnPayload,
+)
 from cognis.store.models import (
+    DirectTurnRequestRow,
     FollowUpDedupeRow,
     FollowUpIntentRow,
     ManagedConversationLink,
@@ -173,6 +205,10 @@ _MAX_DEFERRED_LOCKS = 200
 FOLLOW_UP_DEDUPE_TTL_SECONDS = 600.0
 FOLLOW_UP_INTENT_LEASE_SECONDS = 120.0
 FOLLOW_UP_INTENT_MAX_ATTEMPTS = 3
+# Durable direct turns should ride out short dependency outages. The runtime
+# retries at a bounded cadence, so this keeps the FIFO head recoverable for
+# roughly a minute while still surfacing persistent failures eventually.
+DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS = 120
 MAX_TURN_TOOL_CALL_LEDGERS = 4096
 
 
@@ -498,12 +534,31 @@ class ActiveToolOutputSnapshot:
             return None
 
 
+def _automatic_continuation_queue_fields(follow_up: Any) -> dict[str, str]:
+    """Return presentation metadata for an internal automatic continuation."""
+
+    if isinstance(follow_up, ContinuationFollowUp):
+        return {
+            "kind": "automatic_continuation",
+            "continuation_reason": follow_up.reason,
+        }
+    if isinstance(follow_up, dict) and follow_up.get("origin_kind") == "continuation":
+        return {
+            "kind": "automatic_continuation",
+            "continuation_reason": str(follow_up.get("reason") or ""),
+        }
+    return {}
+
+
 @dataclass(slots=True)
 class _QueuedMessage:
     """A message queued behind an active turn."""
 
     content: str
     user_email: str
+    intention_eligible: bool = True
+    user_message_metadata: dict[str, Any] | None = None
+    contextual_messages: list[dict[str, Any]] | None = None
     turn_id: str = field(default_factory=lambda: f"turn_{uuid.uuid4().hex[:12]}")
     queue_id: str = field(default_factory=lambda: f"qmsg_{uuid.uuid4().hex}")
     session_id: str | None = None
@@ -520,11 +575,16 @@ class _QueuedMessage:
     turn_observers: tuple[TurnObserver, ...] = ()
     one_shot_chat_mode: ChatMode | None = None
     channel_account_id: str | None = None
+    channel_delivery: ChannelDeliveryDescriptor | None = None
+    is_retry: bool = False
+    retry_source_turn_id: str | None = None
+    retry_reason: RetryReason | None = None
+    retry_attempt: int = 1
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
 
     def snapshot(self, position: int) -> dict[str, Any]:
-        return {
+        snapshot = {
             "queue_id": self.queue_id,
             "turn_id": self.turn_id,
             "client_message_id": self.client_message_id,
@@ -534,6 +594,8 @@ class _QueuedMessage:
             "updated_at": self.updated_at.isoformat(),
             "position": position,
         }
+        snapshot.update(_automatic_continuation_queue_fields(self.follow_up))
+        return snapshot
 
 
 @dataclass(slots=True)
@@ -553,6 +615,7 @@ class _TurnControl:
     absorbed_delivery_id: str | None = None
     absorbed_delivery_fallback_text: str | None = None
     suppressed_channel_delivery_ids: list[str] = field(default_factory=list)
+    channel_delivery: ChannelDeliveryDescriptor | None = None
 
 
 def _user_message_event_id(
@@ -657,13 +720,12 @@ def _turn_error_from_step_output(step_output: Any | None) -> TurnError | None:
         any(
             marker in lowered
             for marker in (
+                "circuit breaker",
                 "dns",
                 "connection reset",
                 "temporar",
                 "timeout",
                 "timed out",
-                "rate limit",
-                "429",
             )
         )
         or re.search(
@@ -808,6 +870,9 @@ class TurnObserver(Protocol):
         kind: str | None = None,
         scope: str | None = None,
         turn_id: str | None = None,
+        retry_reason: str | None = None,
+        retry_source_turn_id: str | None = None,
+        attempt: int | None = None,
     ) -> None: ...
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None: ...
@@ -840,6 +905,7 @@ class TurnScheduler:
         task_queue: Any,
         session_manager: Any,
         session_cache: Any,
+        redis_service: Any | None = None,
         compaction_strategy: Any,
         agent_loop: Any,
         pause_waiter: Any,
@@ -849,6 +915,8 @@ class TurnScheduler:
         workflow_registry: Any,
         event_bus: EventBus,
         tool_output_spool: ToolOutputSpool | None = None,
+        controller_runtime: ControllerRuntime | None = None,
+        runtime_mode: str = "simple",
     ) -> None:
         self._session_factory = session_factory
         self._workflow_engine = workflow_engine
@@ -856,6 +924,7 @@ class TurnScheduler:
         self._task_queue = task_queue
         self._session_manager = session_manager
         self._session_cache = session_cache
+        self._redis_service = redis_service
         self._compaction_strategy = compaction_strategy
         self._agent_loop = agent_loop
         self._pause_waiter = pause_waiter
@@ -864,7 +933,33 @@ class TurnScheduler:
         self._artifact_store = artifact_store
         self._workflow_registry = workflow_registry
         self._event_bus = event_bus
+        self._channel_delivery: Any | None = None
         self._tool_output_spool = tool_output_spool or ToolOutputSpool()
+        self._controller_runtime = controller_runtime
+        self._direct_turn_store: DirectTurnStore | None = None
+        self._direct_turn_runtime: DurableDirectTurnRuntime | None = None
+        self._durable_turn_observers: dict[str, tuple[TurnObserver, ...]] = {}
+        self._durable_queue_cache: dict[str, list[dict[str, Any]]] = {}
+        self._durable_fences: dict[str, DirectTurnExecutionFence] = {}
+        self._durable_request_by_conversation: dict[str, str] = {}
+        self._interrupted_durable_requests: set[str] = set()
+        self._relay_generation_contexts: dict[str, RelayGenerationContext] = {}
+        if controller_runtime is not None and callable(session_factory):
+            self._direct_turn_store = DirectTurnStore(session_factory)
+            self._direct_turn_runtime = DurableDirectTurnRuntime(
+                store=self._direct_turn_store,
+                lease_store=DatabaseLeaseStore(session_factory),
+                controller_id=controller_runtime.controller_id,
+                incarnation_id=controller_runtime.incarnation_id,
+                artifact_store=artifact_store,
+                execute_claimed_turn=self._execute_claimed_direct_turn,
+                reconcile_canonical_append=self._reconcile_direct_turn_append,
+                can_claim_turn=self._can_claim_direct_turn,
+                on_permanent_failure=self._handle_permanent_direct_turn_failure,
+                on_fenced_permanent_failure=self._handle_fenced_permanent_direct_turn_failure,
+                on_state_change=self._publish_durable_turn_change,
+                simple_mode=runtime_mode == "simple",
+            )
 
         # Per-conversation turn serialization
         self._active_turns: dict[str, asyncio.Task[None]] = {}
@@ -873,6 +968,16 @@ class TurnScheduler:
         self._turn_locks: dict[str, asyncio.Lock] = {}
         self._retry_admission_locks: dict[str, asyncio.Lock] = {}
         self._queued_messages: dict[str, deque[_QueuedMessage]] = defaultdict(deque)
+        self._boundary_input_events: dict[str, asyncio.Event] = {}
+        self._boundary_input_waiters: dict[str, int] = defaultdict(int)
+        self._boundary_action_generations: dict[str, int] = defaultdict(int)
+        self._turn_scope_change_events: dict[str, asyncio.Event] = {}
+        self._turn_scope_change_generations: dict[str, int] = defaultdict(int)
+        self._turn_scope_change_waiters: dict[str, int] = defaultdict(int)
+        self._accepting_turns = True
+        self._admission_drain_lock = asyncio.Lock()
+        self._queued_relaunches: dict[str, str] = {}
+        self._cancelled_queued_relaunches: set[str] = set()
         self._escalation_notice_pause_ids: dict[str, str] = {}
         self._pending_follow_ups: set[tuple[str, str]] = set()
         self._handled_follow_ups: dict[tuple[str, str], float] = {}
@@ -906,6 +1011,7 @@ class TurnScheduler:
 
         # Conversation-scoped observers (multiple allowed — e.g. multiple browser tabs)
         self._observers: dict[str, list[TurnObserver]] = defaultdict(list)
+        self._global_observers: list[TurnObserver] = []
         self._observer_failures: dict[tuple[str, int], int] = defaultdict(int)
         self._disabled_observers: set[tuple[str, int]] = set()
 
@@ -916,6 +1022,10 @@ class TurnScheduler:
         # Register for follow-up turn events
         event_bus.subscribe(EventType.FOLLOW_UP_TURN_REQUESTED, self._handle_follow_up_event)
         event_bus.subscribe(EventType.CONVERSATION_UPDATED, self._handle_conversation_updated)
+        event_bus.subscribe(
+            EventType.CLUSTER_SCOPE_INVALIDATED,
+            self._handle_cluster_scope_invalidated,
+        )
         logger.info("turn_scheduler: registered on EventBus")
         logger.info("turn_scheduler: follow-up dedupe backed by durable store when available")
 
@@ -1108,7 +1218,9 @@ class TurnScheduler:
                                     name,
                                     fingerprint,
                                 )
-                        elif event_type == "tool_result" and data.get("is_error") is False:
+                        elif event_type == "tool_result" and (
+                            data.get("is_error") is False or data.get("ambiguity") is not None
+                        ):
                             successful_call_ids_by_turn[event_turn_id].add(call_id)
                     last_seq = int(getattr(result, "last_seq", 0) or 0)
                     if not getattr(result, "has_more", False) or last_seq <= after_seq:
@@ -1161,7 +1273,23 @@ class TurnScheduler:
 
     def add_observer(self, conversation_id: str, observer: TurnObserver) -> None:
         """Register a conversation-scoped streaming observer."""
-        self._observers[conversation_id].append(observer)
+        if not any(item is observer for item in self._observers[conversation_id]):
+            self._observers[conversation_id].append(observer)
+
+    def add_global_observer(self, observer: TurnObserver) -> None:
+        """Register one configuration-owned observer for every conversation."""
+        if any(item is observer for item in self._global_observers):
+            return
+        if len(self._global_observers) >= 8:
+            raise RuntimeError("maximum global observer count reached")
+        self._global_observers.append(observer)
+
+    def remove_global_observer(self, observer: TurnObserver) -> None:
+        """Remove one global observer by identity."""
+        self._global_observers = [item for item in self._global_observers if item is not observer]
+        for key in [key for key in self._observer_failures if key[1] == id(observer)]:
+            self._observer_failures.pop(key, None)
+            self._disabled_observers.discard(key)
 
     def remove_observer(self, conversation_id: str, observer: TurnObserver) -> None:
         """Remove a streaming observer for a conversation."""
@@ -1247,7 +1375,7 @@ class TurnScheduler:
         return f"active_tool_outputs:{conversation_id}"
 
     async def _load_active_tool_output_l2(self, conversation_id: str) -> None:
-        cache = getattr(self._session_cache, "_redis", None)
+        cache = self._redis_service
         if cache is None:
             return
         try:
@@ -1275,7 +1403,7 @@ class TurnScheduler:
                 ] = snapshot
 
     async def _persist_active_tool_output_l2(self, conversation_id: str) -> None:
-        cache = getattr(self._session_cache, "_redis", None)
+        cache = self._redis_service
         if cache is None:
             return
         async with self._active_tool_outputs_lock:
@@ -1796,15 +1924,22 @@ class TurnScheduler:
         agent: AgentDefinition,
         chat_mode: str = "default",
         chat_mode_source: str = "system_default",
+        finish_reason: str = "user_cancelled",
+        clear_on_success: bool = True,
+        stream_snapshot: ActiveStreamState | None = None,
     ) -> tuple[str | None, int, int | None]:
-        """Persist already streamed assistant text when a turn is cancelled."""
+        """Persist already streamed assistant text before its local stream is discarded."""
 
-        stream = await self._pop_active_stream(
-            conversation_id=conversation_id,
-            session_id=session.session_id,
-            message_id=message_id,
-            turn_id=turn_id,
-        )
+        stream = stream_snapshot
+        if stream is None:
+            async with self._active_streams_lock:
+                stream = self._active_streams.get(conversation_id)
+                if stream is not None and (
+                    stream.session_id != session.session_id
+                    or stream.message_id != message_id
+                    or stream.turn_id != turn_id
+                ):
+                    stream = None
         if stream is None or not stream.content:
             return None, 0, None
 
@@ -1816,8 +1951,8 @@ class TurnScheduler:
                 self._tool_runtime_info(session.session_id),
             ),
             "partial": True,
-            "cancelled": True,
-            "finish_reason": "user_cancelled",
+            "cancelled": finish_reason == "user_cancelled",
+            "finish_reason": finish_reason,
             "assistant_phase_index": stream.assistant_phase_index,
             # Persist chat_mode so the history projector can stamp the
             # plan-mode marker on cancelled assistant messages after refresh.
@@ -1826,12 +1961,17 @@ class TurnScheduler:
         }
         if stream.turn_cycle_index is not None:
             event_data["turn_cycle_index"] = stream.turn_cycle_index
-        event = SessionEvent(type="assistant_message", data=event_data)
         intaris_session_id = session.intaris_session_id or session.session_id
         digest = hashlib.sha256(stream.content.encode("utf-8")).hexdigest()[:16]
+        event_data["message_id"] = (
+            turn_id or message_id
+            if finish_reason == "user_cancelled"
+            else f"{turn_id or message_id}:{finish_reason}"
+        )
+        event = SessionEvent(type="assistant_message", data=event_data)
         idempotency_key = (
             f"cancelled-active-stream:{intaris_session_id}:"
-            f"{turn_id or message_id}:{stream.chunk_count}:{digest}"
+            f"{turn_id or message_id}:{finish_reason}:{stream.chunk_count}:{digest}"
         )
         try:
             append_result = await self._providers.guardrails.record_events(
@@ -1846,6 +1986,13 @@ class TurnScheduler:
             if not append_result.ok:
                 raise RuntimeError("Intaris did not persist cancelled assistant stream")
             await self._session_cache.append_recorded_events(session, [event], append_result)
+            if clear_on_success:
+                await self._pop_active_stream(
+                    conversation_id=conversation_id,
+                    session_id=session.session_id,
+                    message_id=message_id,
+                    turn_id=turn_id,
+                )
             return stream.content, append_result.last_seq, stream.turn_cycle_index
         except Exception:
             logger.warning(
@@ -1954,12 +2101,17 @@ class TurnScheduler:
         user_email: str,
         turn_id: str,
         retry_source_turn_id: str | None,
+        retry_reason: RetryReason | str | None,
+        retry_attempt: int,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...],
     ) -> None:
         """Persist and broadcast the visible notice for a user-initiated retry turn."""
 
-        text = "Retrying turn…"
-        notice_id = f"retry:{retry_source_turn_id or turn_id}:{turn_id}"
+        reason = normalize_retry_reason(retry_reason)
+        text = retry_notice_text(reason)
+        source_turn_id = retry_source_turn_id or turn_id
+        attempt = max(1, retry_attempt)
+        notice_id = f"retry:{source_turn_id}:{turn_id}:{attempt}"
         data: dict[str, Any] = {
             "content": text,
             "text": text,
@@ -1970,13 +2122,15 @@ class TurnScheduler:
             "scope": "turn",
             "turn_id": turn_id,
             "retry_source_turn_id": retry_source_turn_id,
+            "retry_reason": reason.value,
+            "attempt": attempt,
         }
         try:
             event = SessionEvent(type="system_message", data=data)
             session_id = session.session_id
             intaris_session_id = getattr(session, "intaris_session_id", None) or session_id
             idempotency_key = (
-                f"{intaris_session_id}:retry_turn:{retry_source_turn_id or turn_id}:{turn_id}"
+                f"{intaris_session_id}:retry_turn:{source_turn_id}:{turn_id}:{attempt}"
             )
             append_result = await self._providers.guardrails.record_events(
                 session_id=intaris_session_id,
@@ -1991,15 +2145,18 @@ class TurnScheduler:
                 raise RuntimeError("Intaris did not persist retry turn notice")
             if append_result.count > 0:
                 await self._session_cache.append_recorded_events(session, [event], append_result)
-            await self._notify_observers_system_message(
-                conversation_id,
-                text,
-                notice_id=notice_id,
-                kind="model_recovery",
-                scope="turn",
-                turn_id=turn_id,
-                turn_observers=turn_observers,
-            )
+                await self._notify_observers_system_message(
+                    conversation_id,
+                    text,
+                    notice_id=notice_id,
+                    kind="model_recovery",
+                    scope="turn",
+                    turn_id=turn_id,
+                    retry_reason=reason.value,
+                    retry_source_turn_id=retry_source_turn_id,
+                    attempt=attempt,
+                    turn_observers=turn_observers,
+                )
         except Exception:
             logger.warning(
                 "turn_scheduler: failed to persist retry turn notice",
@@ -2021,45 +2178,63 @@ class TurnScheduler:
         agent: AgentDefinition,
         user_email: str,
         content: str,
+        intention_eligible: bool = True,
         attachments: list[AttachmentRef],
         turn_id: str,
         client_message_id: str | None,
         chat_mode: ResolvedChatMode,
         cancel_event: asyncio.Event,
+        intaris_session_id_override: str | None = None,
+        user_message_metadata: dict[str, Any] | None = None,
+        contextual_messages: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, int | None]:
         """Persist scheduler-owned direct-turn admission before runtime resolution."""
+        user_message_metadata = user_message_metadata or message_metadata()
 
         guardrails = getattr(self._providers, "guardrails", None)
         record_events = getattr(guardrails, "record_events", None)
         if not callable(record_events):
             return False, None
         source = "user_input"
+        hash_payload = {
+            "role": "user",
+            "content": content,
+            "source": source,
+            "message_metadata": user_message_metadata,
+            "intention_eligible": intention_eligible,
+        }
+        event_data: dict[str, Any] = {
+            "role": "user",
+            "content": content,
+            "message_metadata": user_message_metadata,
+            "content_type": "text",
+            "source": source,
+            "intention_eligible": intention_eligible,
+            "turn_id": turn_id,
+            "client_message_id": client_message_id,
+            "chat_mode": chat_mode.mode,
+            "chat_mode_source": chat_mode.source,
+            "attachments": attachment_refs_to_dicts(attachments, include_url=False),
+        }
+        if contextual_messages:
+            event_data["context_messages"] = contextual_messages
+            hash_payload["context_messages"] = contextual_messages
+        event_data["hash"] = hashlib.sha256(
+            json.dumps(
+                hash_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         event = SessionEvent(
             type="user_message",
-            data={
-                "role": "user",
-                "content": content,
-                "content_type": "text",
-                "source": source,
-                "turn_id": turn_id,
-                "client_message_id": client_message_id,
-                "chat_mode": chat_mode.mode,
-                "chat_mode_source": chat_mode.source,
-                "hash": hashlib.sha256(
-                    json.dumps(
-                        {
-                            "role": "user",
-                            "content": content,
-                            "source": source,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest(),
-                "attachments": attachment_refs_to_dicts(attachments, include_url=False),
-            },
+            data=event_data,
         )
-        intaris_session_id = getattr(session, "intaris_session_id", None) or session.session_id
+        intaris_session_id = (
+            intaris_session_id_override
+            or getattr(session, "intaris_session_id", None)
+            or session.session_id
+        )
         deadline = monotonic() + 60.0
         while True:
             try:
@@ -2083,7 +2258,14 @@ class TurnScheduler:
                 raise asyncio.CancelledError from exc
         if not append_result.ok:
             raise RuntimeError("Intaris did not persist admitted user message")
-        if append_result.count > 0 and hasattr(self._session_cache, "append_recorded_events"):
+        current_intaris_session_id = (
+            getattr(session, "intaris_session_id", None) or session.session_id
+        )
+        if (
+            append_result.count > 0
+            and intaris_session_id == current_intaris_session_id
+            and hasattr(self._session_cache, "append_recorded_events")
+        ):
             await self._session_cache.append_recorded_events(session, [event], append_result)
         return True, append_result.first_seq
 
@@ -2209,7 +2391,7 @@ class TurnScheduler:
     ) -> None:
         """Mirror scheduler-owned launches into the managed-conversation link."""
 
-        if not turn_id:
+        if not turn_id or not callable(self._session_factory):
             return
         try:
             async with self._session_factory() as db_session:
@@ -2243,6 +2425,9 @@ class TurnScheduler:
         content: str,
         *,
         user_email: str,
+        intention_eligible: bool | None = None,
+        user_message_metadata: dict[str, Any] | None = None,
+        contextual_messages: list[dict[str, Any]] | None = None,
         attachments: list[dict[str, Any]] | None = None,
         outbound_attachments: list[dict[str, Any]] | None = None,
         system_initiated: bool = False,
@@ -2258,10 +2443,25 @@ class TurnScheduler:
         one_shot_chat_mode: ChatMode | None = None,
         channel_default_agent_profile_id: str | None = None,
         channel_account_id: str | None = None,
+        channel_delivery: ChannelDeliveryDescriptor | None = None,
         is_retry: bool = False,
         retry_source_turn_id: str | None = None,
+        retry_reason: RetryReason | str | None = None,
+        retry_attempt: int = 1,
         turn_id: str | None = None,
         admission_observer: Callable[[str, bool], Awaitable[None]] | None = None,
+        admission_transaction_participant: Callable[[Any, Any, bool], Awaitable[None]]
+        | None = None,
+        allow_queue: bool = True,
+        idempotency_scope: str | None = None,
+        idempotency_key: str | None = None,
+        _durable_request_id: str | None = None,
+        durable_request_id: str | None = None,
+        durable_admission_guard: DirectTurnAdmissionGuard | None = None,
+        _durable_lease: Lease | None = None,
+        _durable_user_append_session_id: str | None = None,
+        _recovery_context: str | None = None,
+        _materialized_attachments: list[AttachmentRef] | None = None,
     ) -> TurnError | None:
         """Submit a chat turn for execution.
 
@@ -2271,15 +2471,36 @@ class TurnScheduler:
         via ``TurnObserver`` callbacks and EventBus lifecycle events.
 
         Turns are serialized per conversation. If a turn is already active,
-        the message is queued up to ``session.max_queued_messages``.
+        the message is queued up to ``session.max_queued_messages`` unless
+        ``allow_queue`` is false.
         """
+        if not self._accepting_turns and queued_message_id is None:
+            return TurnError(
+                code="controller_draining",
+                message="This controller is draining and cannot accept new turns.",
+                recoverable=True,
+                transient=True,
+                turn_id=turn_id,
+            )
         admitted_turn_id = turn_id or self.new_turn_id()
-        normalized_attachments, attachment_error = await self._resolve_attachments_for_turn(
-            user_email=user_email,
-            attachments=attachments or [],
-        )
-        if attachment_error is not None:
-            return attachment_error
+        if intention_eligible is None:
+            intention_eligible = not system_initiated
+        contextual_messages = [
+            {**item, "intention_eligible": False} for item in (contextual_messages or [])
+        ]
+        if not system_initiated and user_message_metadata is None:
+            user_message_metadata = message_metadata()
+        if _materialized_attachments is not None:
+            if _durable_request_id is None or _durable_lease is None or attachments is not None:
+                raise ValueError("materialized attachments require a fenced durable turn")
+            normalized_attachments = _materialized_attachments
+        else:
+            normalized_attachments, attachment_error = await self._resolve_attachments_for_turn(
+                user_email=user_email,
+                attachments=attachments or [],
+            )
+            if attachment_error is not None:
+                return attachment_error
 
         # Used ONLY for conversation bootstrapping (title generation, intention bootstrap).
         # All other paths use the raw content so that attachment-only messages record and
@@ -2389,7 +2610,7 @@ class TurnScheduler:
                 pause_type="escalation",
                 conversation_id=conversation_id,
             )
-            if pending_esc is not None:
+            if pending_esc is not None and self._direct_turn_store is None:
                 async with self._turn_lock(conversation_id):
                     refresh_error = await _refresh_managed_runtime_for_admission()
                     if refresh_error is not None:
@@ -2399,6 +2620,17 @@ class TurnScheduler:
                         conversation_id=conversation_id,
                     )
                     if pending_esc is not None:
+                        if not allow_queue:
+                            return TurnError(
+                                code="queueing_not_allowed",
+                                message=(
+                                    "A pending escalation prevents starting this turn. "
+                                    "Wait for it to resolve before sending another message."
+                                ),
+                                recoverable=True,
+                                transient=True,
+                                turn_id=admitted_turn_id,
+                            )
                         queue = self._queued_messages[conversation_id]
                         if client_message_id and any(
                             queued.client_message_id == client_message_id for queued in queue
@@ -2413,6 +2645,9 @@ class TurnScheduler:
                             session_id=getattr(session, "session_id", None),
                             content=content,
                             user_email=user_email,
+                            intention_eligible=intention_eligible,
+                            user_message_metadata=user_message_metadata,
+                            contextual_messages=contextual_messages,
                             client_message_id=client_message_id,
                             attachments=[
                                 item.model_dump(mode="json") for item in normalized_attachments
@@ -2427,6 +2662,12 @@ class TurnScheduler:
                             turn_observers=tuple(turn_observers or ()),
                             one_shot_chat_mode=one_shot_chat_mode,
                             channel_account_id=channel_account_id,
+                            is_retry=is_retry,
+                            retry_source_turn_id=retry_source_turn_id,
+                            retry_reason=(
+                                normalize_retry_reason(retry_reason) if is_retry else None
+                            ),
+                            retry_attempt=max(1, retry_attempt),
                         )
                         if admission_observer is not None:
                             try:
@@ -2454,7 +2695,18 @@ class TurnScheduler:
                                 )
                                 return error
                         try:
-                            queue.append(queued_message)
+                            async with self._admission_drain_lock:
+                                if not self._accepting_turns and queued_message_id is None:
+                                    return TurnError(
+                                        code="controller_draining",
+                                        message=(
+                                            "This controller is draining and cannot accept new turns."
+                                        ),
+                                        recoverable=True,
+                                        transient=True,
+                                        turn_id=admitted_turn_id,
+                                    )
+                                queue.append(queued_message)
                             await self._touch_conversation(conversation_id)
                             await self._clear_redo_on_accepted_user_turn(
                                 conversation_id,
@@ -2500,7 +2752,18 @@ class TurnScheduler:
                                     conversation_id, turn_observers=turn_observers
                                 )
                             return error
-            self._escalation_notice_pause_ids.pop(conversation_id, None)
+            if pending_esc is not None and self._direct_turn_store is not None:
+                last_notified_pause_id = self._escalation_notice_pause_ids.get(conversation_id)
+                if last_notified_pause_id != pending_esc.pause_id:
+                    self._escalation_notice_pause_ids[conversation_id] = pending_esc.pause_id
+                    await self._notify_observers_system_message(
+                        conversation_id,
+                        "Waiting for escalation resolution. "
+                        "Use /approve or /deny, or use the buttons above.",
+                        turn_observers=turn_observers,
+                    )
+            else:
+                self._escalation_notice_pause_ids.pop(conversation_id, None)
 
             pending_questions = self._pause_waiter.list_pending(
                 conversation_id=conversation_id,
@@ -2526,6 +2789,127 @@ class TurnScheduler:
 
         max_active_turns, max_queued_messages = await self._load_turn_limits()
 
+        if self._direct_turn_store is not None and _durable_request_id is None:
+            pending = await self._direct_turn_store.list_conversation_pending(conversation_id)
+            if pending and not allow_queue:
+                return TurnError(
+                    code="queueing_not_allowed",
+                    message="A turn is already active or queued for this conversation.",
+                    recoverable=True,
+                    transient=True,
+                    turn_id=admitted_turn_id,
+                )
+            if len(pending) >= max_queued_messages + 1:
+                return TurnError(
+                    code="queue_full",
+                    message="Message queue is full. Wait for the current turn to finish.",
+                    recoverable=True,
+                    transient=True,
+                )
+            stable_key = (
+                idempotency_key
+                or client_message_id
+                or delivery_id
+                or (follow_up.follow_up_id if follow_up is not None else None)
+                or f"oneshot:{uuid.uuid4().hex}"
+            )
+            scope = idempotency_scope or (
+                f"direct:{conversation_id}:{user_email}:{'system' if system_initiated else 'user'}"
+            )
+            metadata = {
+                "outbound_attachments": outbound_attachments or [],
+                "system_initiated": system_initiated,
+                "intention_eligible": intention_eligible,
+                "follow_up": follow_up.model_dump(mode="json")
+                if follow_up is not None and hasattr(follow_up, "model_dump")
+                else None,
+                "channel_deliverable": channel_deliverable,
+                "delivery_id": delivery_id,
+                "delivery_fallback_text": delivery_fallback_text,
+                "client_message_id": client_message_id,
+                "attachment_notice": attachment_notice,
+                "attachment_context": attachment_context,
+                "one_shot_chat_mode": one_shot_chat_mode,
+                "channel_default_agent_profile_id": channel_default_agent_profile_id,
+                "channel_account_id": channel_account_id,
+                "is_retry": is_retry,
+                "retry_source_turn_id": retry_source_turn_id,
+                "retry_reason": (normalize_retry_reason(retry_reason).value if is_retry else None),
+                "retry_attempt": max(1, retry_attempt),
+                "absorbable": all(
+                    getattr(observer, "supports_mid_turn_absorb", False)
+                    for observer in (turn_observers or ())
+                ),
+            }
+            if user_message_metadata is not None:
+                metadata["user_message_metadata"] = user_message_metadata
+            if contextual_messages:
+                metadata["contextual_messages"] = contextual_messages
+            async with self._admission_drain_lock:
+                if not self._accepting_turns:
+                    return TurnError(
+                        code="controller_draining",
+                        message="This controller is draining and cannot accept new turns.",
+                        recoverable=True,
+                        transient=True,
+                    )
+                try:
+                    admission = await self._direct_turn_store.admit(
+                        conversation_id=conversation_id,
+                        session_id=getattr(session, "session_id", None),
+                        agent_id=agent.agent_id,
+                        user_id=user_email,
+                        idempotency_scope=scope,
+                        idempotency_key=stable_key,
+                        payload={
+                            "schema_version": 1,
+                            "content": content,
+                            "attachments": [
+                                item.model_dump(mode="json") for item in normalized_attachments
+                            ],
+                            "metadata": metadata,
+                            "channel_delivery": (
+                                channel_delivery.model_dump(mode="json")
+                                if channel_delivery is not None
+                                else None
+                            ),
+                            "retry_reason": (
+                                normalize_retry_reason(retry_reason).value if is_retry else None
+                            ),
+                        },
+                        request_id=durable_request_id or queued_message_id,
+                        turn_id=admitted_turn_id,
+                        admission_guard=durable_admission_guard,
+                        transaction_participant=admission_transaction_participant,
+                    )
+                except DirectTurnAdmissionRejected:
+                    return TurnError(
+                        code="managed_admission_conflict",
+                        message="Managed conversation admission fence changed.",
+                        recoverable=True,
+                        transient=True,
+                        turn_id=admitted_turn_id,
+                    )
+            self._durable_turn_observers[admission.request.request_id] = tuple(turn_observers or ())
+            if admission_observer is not None and admission.created:
+                await admission_observer(admission.request.turn_id, True)
+            if not system_initiated and admission.created:
+                await self._touch_conversation(conversation_id)
+            if admission.created:
+                await self._clear_redo_on_accepted_user_turn(
+                    conversation_id,
+                    content=content,
+                    system_initiated=system_initiated,
+                )
+                await self._publish_durable_turn_change(admission.request)
+            await self._notify_queue_updated(
+                conversation_id,
+                turn_observers=turn_observers,
+            )
+            if self._direct_turn_runtime is not None:
+                await self._direct_turn_runtime.wake()
+            return None
+
         async with self._turn_lock(conversation_id):
             refresh_error = await _refresh_managed_runtime_for_admission()
             if refresh_error is not None:
@@ -2549,6 +2933,14 @@ class TurnScheduler:
                 if active.done():
                     self._active_turns.pop(conversation_id, None)
                 else:
+                    if not allow_queue:
+                        return TurnError(
+                            code="queueing_not_allowed",
+                            message="A turn is already active for this conversation.",
+                            recoverable=True,
+                            transient=True,
+                            turn_id=admitted_turn_id,
+                        )
                     if is_retry:
                         return TurnError(
                             code="active_turn_in_progress",
@@ -2577,6 +2969,9 @@ class TurnScheduler:
                         session_id=getattr(session, "session_id", None),
                         content=content,
                         user_email=user_email,
+                        intention_eligible=intention_eligible,
+                        user_message_metadata=user_message_metadata,
+                        contextual_messages=contextual_messages,
                         client_message_id=client_message_id,
                         attachments=[
                             item.model_dump(mode="json") for item in normalized_attachments
@@ -2592,6 +2987,7 @@ class TurnScheduler:
                         turn_observers=tuple(turn_observers or ()),
                         one_shot_chat_mode=one_shot_chat_mode,
                         channel_account_id=channel_account_id,
+                        channel_delivery=channel_delivery,
                     )
                     if admission_observer is not None:
                         try:
@@ -2623,7 +3019,18 @@ class TurnScheduler:
                             )
                             return error
                     try:
-                        queue.append(queued_message)
+                        async with self._admission_drain_lock:
+                            if not self._accepting_turns and queued_message_id is None:
+                                return TurnError(
+                                    code="controller_draining",
+                                    message=(
+                                        "This controller is draining and cannot accept new turns."
+                                    ),
+                                    recoverable=True,
+                                    transient=True,
+                                    turn_id=admitted_turn_id,
+                                )
+                            queue.append(queued_message)
                         if not system_initiated:
                             await self._touch_conversation(conversation_id)
                         await self._clear_redo_on_accepted_user_turn(
@@ -2770,35 +3177,68 @@ class TurnScheduler:
             try:
                 if not system_initiated:
                     await self._touch_conversation(conversation_id)
-                self._launch_turn(
-                    conversation=conversation,
-                    session=session,
-                    agent=agent,
-                    content=content,
-                    user_email=user_email,
-                    attachments=normalized_attachments,
-                    outbound_attachments=outbound_attachments,
-                    attachment_notice=attachment_notice,
-                    attachment_context=attachment_context,
-                    system_initiated=system_initiated,
-                    follow_up=follow_up,
-                    channel_deliverable=channel_deliverable,
-                    delivery_id=delivery_id,
-                    delivery_fallback_text=delivery_fallback_text,
-                    bootstrap_wait_for_intention=bootstrap_wait_for_intention,
-                    turn_observers=tuple(turn_observers or ()),
-                    client_message_id=client_message_id,
-                    queue_id=queued_message_id,
-                    one_shot_chat_mode=one_shot_chat_mode,
-                    channel_default_agent_profile_id=channel_default_agent_profile_id,
-                    is_retry=is_retry,
-                    retry_source_turn_id=retry_source_turn_id,
-                    turn_id=admitted_turn_id,
-                    checkpoint_conversation=(
-                        checkpoint_conversation if not system_initiated else None
-                    ),
-                    checkpoint_session=checkpoint_session if not system_initiated else None,
-                )
+                async with self._admission_drain_lock:
+                    if (
+                        queued_message_id is not None
+                        and queued_message_id in self._cancelled_queued_relaunches
+                    ):
+                        self._queued_relaunches.pop(queued_message_id, None)
+                        self._cancelled_queued_relaunches.discard(queued_message_id)
+                        return TurnError(
+                            code="queued_turn_cancelled",
+                            message="The queued turn was cancelled during shutdown.",
+                            recoverable=True,
+                            turn_id=admitted_turn_id,
+                        )
+                    if not self._accepting_turns and queued_message_id is None:
+                        return TurnError(
+                            code="controller_draining",
+                            message="This controller is draining and cannot accept new turns.",
+                            recoverable=True,
+                            transient=True,
+                            turn_id=admitted_turn_id,
+                        )
+                    self._launch_turn(
+                        conversation=conversation,
+                        session=session,
+                        agent=agent,
+                        content=content,
+                        user_email=user_email,
+                        intention_eligible=intention_eligible,
+                        user_message_metadata=user_message_metadata,
+                        contextual_messages=contextual_messages,
+                        attachments=normalized_attachments,
+                        outbound_attachments=outbound_attachments,
+                        attachment_notice=attachment_notice,
+                        attachment_context=attachment_context,
+                        system_initiated=system_initiated,
+                        follow_up=follow_up,
+                        channel_deliverable=channel_deliverable,
+                        delivery_id=delivery_id,
+                        delivery_fallback_text=delivery_fallback_text,
+                        bootstrap_wait_for_intention=bootstrap_wait_for_intention,
+                        turn_observers=tuple(turn_observers or ()),
+                        client_message_id=client_message_id,
+                        queue_id=queued_message_id,
+                        one_shot_chat_mode=one_shot_chat_mode,
+                        channel_default_agent_profile_id=channel_default_agent_profile_id,
+                        is_retry=is_retry,
+                        retry_source_turn_id=retry_source_turn_id,
+                        retry_reason=retry_reason,
+                        retry_attempt=retry_attempt,
+                        turn_id=admitted_turn_id,
+                        checkpoint_conversation=(
+                            checkpoint_conversation if not system_initiated else None
+                        ),
+                        checkpoint_session=checkpoint_session if not system_initiated else None,
+                        durable_request_id=_durable_request_id,
+                        durable_lease=_durable_lease,
+                        durable_user_append_session_id=_durable_user_append_session_id,
+                        recovery_context=_recovery_context,
+                        channel_delivery=channel_delivery,
+                    )
+                    if queued_message_id is not None:
+                        self._queued_relaunches.pop(queued_message_id, None)
             except Exception as exc:
                 if admission_observer is None:
                     raise
@@ -2822,6 +3262,788 @@ class TurnScheduler:
                 return error
         return None
 
+    async def begin_drain(self) -> dict[str, int]:
+        """Close admission while preserving already accepted queued turns."""
+        async with self._admission_drain_lock:
+            self._accepting_turns = False
+            queued = sum(len(queue) for queue in self._queued_messages.values())
+        await self.stop_direct_turn_claims()
+        return {"queued_preserved": queued}
+
+    async def start_direct_turn_runtime(self) -> None:
+        runtime = getattr(self, "_direct_turn_runtime", None)
+        if runtime is not None:
+            await runtime.start()
+
+    async def wake_direct_turn_runtime(self) -> None:
+        """Wake the durable worker after an externally committed queue mutation."""
+        runtime = getattr(self, "_direct_turn_runtime", None)
+        if runtime is not None:
+            await runtime.wake()
+
+    def _can_claim_direct_turn(self, row: DirectTurnRequestRow) -> bool:
+        runtime = self._controller_runtime
+        if runtime is None or not runtime.schema_compatible:
+            return False
+        if runtime.state is not ControllerLifecycleState.READY:
+            return False
+        return (
+            self._pause_waiter.find_pending(
+                pause_type="escalation",
+                conversation_id=row.conversation_id,
+            )
+            is None
+        )
+
+    async def _handle_permanent_direct_turn_failure(
+        self,
+        row: DirectTurnRequestRow,
+        exc: Exception,
+    ) -> None:
+        _, session, agent, _ = await self._load_conversation_runtime(row.conversation_id)
+        metadata = row.payload.get("metadata") or {}
+        outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        append_phase = outcome.get("user_append_phase") or outcome.get("phase")
+        user_message_already_appended = append_phase in {
+            "user_appended",
+            "recovered_model_boundary",
+            "reconciled_canonical_append",
+        }
+        chat_mode = ResolvedChatMode(mode="default", source="system_default")
+        if not user_message_already_appended:
+            payload_attachments = row.payload.get("attachments")
+            attachments = (
+                [
+                    AttachmentRef.model_validate(attachment)
+                    for attachment in payload_attachments
+                    if isinstance(attachment, dict)
+                ]
+                if isinstance(payload_attachments, list)
+                and isinstance(exc, PermanentDirectTurnControllerError)
+                else []
+            )
+            await self._persist_admitted_user_message(
+                session=session,
+                agent=agent,
+                user_email=row.user_id,
+                intention_eligible=bool(metadata.get("intention_eligible", True)),
+                content=str(row.payload.get("content") or ""),
+                attachments=attachments,
+                turn_id=row.turn_id,
+                client_message_id=metadata.get("client_message_id"),
+                chat_mode=chat_mode,
+                cancel_event=asyncio.Event(),
+            )
+        error = TurnError(
+            code=(
+                "controller_execution_failed"
+                if isinstance(exc, PermanentDirectTurnControllerError)
+                else "attachment_unavailable"
+            ),
+            message=(
+                "The message could not be processed."
+                if isinstance(exc, PermanentDirectTurnControllerError)
+                else "An attachment is no longer available."
+            ),
+            recoverable=False,
+            transient=False,
+            turn_id=row.turn_id,
+        )
+        await self._persist_turn_error_event(
+            session=session,
+            agent=agent,
+            user_email=row.user_id,
+            turn_id=row.turn_id,
+            error=error,
+            chat_mode=chat_mode.mode,
+            chat_mode_source=chat_mode.source,
+        )
+        await self._publish_turn_error(
+            row.conversation_id,
+            session.session_id,
+            error,
+            turn_id=row.turn_id,
+            turn_observers=self._durable_turn_observers.pop(row.request_id, ()),
+            durable_session=session,
+            durable_agent=agent,
+            durable_user_email=row.user_id,
+        )
+        await self._notify_queue_updated(row.conversation_id)
+
+    async def _handle_fenced_permanent_direct_turn_failure(
+        self,
+        row: DirectTurnRequestRow,
+        exc: Exception,
+        lease: Lease,
+    ) -> None:
+        await self._handle_permanent_direct_turn_failure(row, exc)
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        descriptor = payload.get("channel_delivery")
+        if isinstance(descriptor, dict):
+            await self._persist_direct_turn_terminal_delivery(
+                request_id=row.request_id,
+                lease=lease,
+                descriptor=ChannelDeliveryDescriptor.model_validate(descriptor),
+                content=str(exc),
+                attachments=None,
+                error=True,
+            )
+
+    def set_channel_delivery_service(self, service: Any) -> None:
+        """Attach the channel delivery adapter without importing it here."""
+        self._channel_delivery = service
+
+    async def _persist_direct_turn_terminal_delivery(
+        self,
+        *,
+        request_id: str,
+        lease: Lease,
+        descriptor: ChannelDeliveryDescriptor | None,
+        content: str,
+        attachments: list[dict[str, Any]] | None,
+        error: bool = False,
+    ) -> None:
+        if descriptor is None or self._channel_delivery is None:
+            return
+        await self._channel_delivery.deliver_fenced_direct_turn(
+            request_id=request_id,
+            lease=lease,
+            descriptor=descriptor,
+            content=content,
+            attachments=attachments,
+            error=error,
+        )
+
+    async def _persist_direct_turn_step_error_delivery(
+        self,
+        *,
+        request_id: str | None,
+        lease: Lease | None,
+        descriptor: ChannelDeliveryDescriptor | None,
+        error: TurnError,
+    ) -> bool:
+        """Persist a terminal step error without consuming recoverable retries."""
+        if request_id is None or lease is None or error.transient:
+            return False
+        await self._persist_direct_turn_terminal_delivery(
+            request_id=request_id,
+            lease=lease,
+            descriptor=descriptor,
+            content=error.message,
+            attachments=None,
+            error=True,
+        )
+        return descriptor is not None and self._channel_delivery is not None
+
+    async def _prepare_durable_transient_retry(
+        self,
+        *,
+        request_id: str | None,
+        lease: Lease | None,
+        error: TurnError,
+        execution_fence: DirectTurnExecutionFence | None,
+    ) -> tuple[bool, TurnError]:
+        """Suppress visibility while a fenced durable retry remains available."""
+        if (
+            not error.transient
+            or request_id is None
+            or lease is None
+            or execution_fence is None
+            or self._direct_turn_store is None
+        ):
+            return False, error
+        await execution_fence.assert_current()
+        current = await self._direct_turn_store.get(request_id)
+        if current is None:
+            raise StaleDirectTurnOwner(request_id)
+        if error.code == "executor_unavailable":
+            retry_after_seconds = (error.detail or {}).get("retry_after_seconds")
+            if isinstance(retry_after_seconds, (int, float)) and retry_after_seconds > 0:
+                execution_fence.retry_after_seconds = float(retry_after_seconds)
+        if current.attempt_count < DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS:
+            execution_fence.interruption_reason = error.code
+            return True, error
+        detail = dict(error.detail or {})
+        detail["durable_retry_exhausted"] = True
+        detail["attempts"] = current.attempt_count
+        detail["max_attempts"] = DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS
+        return (
+            False,
+            replace(
+                error,
+                recoverable=False,
+                transient=False,
+                detail=detail,
+            ),
+        )
+
+    async def _cleanup_durable_retry_attempt(
+        self,
+        *,
+        conversation_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        """Discard only process-local attempt overlays before durable reclaim."""
+        await self._reset_active_stream(conversation_id)
+        if hasattr(self._session_cache, "clear_active_thinking"):
+            self._session_cache.clear_active_thinking(session_id)
+        self._clear_assistant_phase(conversation_id, turn_id)
+
+    async def _notify_durable_retry_pending(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        error: TurnError,
+        turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None,
+    ) -> None:
+        """Show a non-terminal notice while a durable request waits for reclaim."""
+        await self._notify_observers_system_message(
+            conversation_id,
+            "Turn paused because a required service is temporarily unavailable. "
+            "Cognis will resume it automatically.",
+            notice_id=f"turn-paused:{turn_id}",
+            kind="turn_retry_pending",
+            scope="transient_retry",
+            turn_id=turn_id,
+            retry_reason=error.code,
+            turn_observers=turn_observers,
+        )
+
+    async def _settle_durable_direct_turn(
+        self,
+        *,
+        request_id: str,
+        lease: Lease,
+        turn_id: str,
+        succeeded: bool,
+        cancelled: bool,
+        transient_failure: bool,
+        transient_phase: str,
+        transient_session_id: str,
+        interruption_reason: str | None = None,
+        source_phase: str | None = None,
+        retry_after_seconds: float | None = None,
+        ambiguous: bool = False,
+        ambiguity_detail: dict[str, Any] | None = None,
+    ) -> DirectTurnStatus:
+        """Settle terminal outcomes, keeping transient failures reclaimable."""
+        store = self._direct_turn_store
+        if store is None:
+            raise StaleDirectTurnOwner(request_id)
+        current = await store.get(request_id)
+        if current is None:
+            raise StaleDirectTurnOwner(request_id)
+        if transient_failure and not cancelled:
+            recovered = await store.settle_transient_failure(
+                request_id,
+                lease=lease,
+                outcome={
+                    "phase": transient_phase,
+                    "turn_id": turn_id,
+                    "session_id": transient_session_id,
+                    "user_append_phase": transient_phase,
+                    "user_append_session_id": transient_session_id,
+                    **(
+                        {
+                            "interruption_reason": interruption_reason,
+                            "source_phase": source_phase,
+                        }
+                        if interruption_reason
+                        else {}
+                    ),
+                    **(
+                        {"retry_after_seconds": retry_after_seconds}
+                        if retry_after_seconds is not None
+                        else {}
+                    ),
+                },
+                retry_after_seconds=retry_after_seconds,
+            )
+            if recovered is None:
+                raise StaleDirectTurnOwner(request_id)
+            if recovered.cancel_requested_at is not None:
+                return DirectTurnStatus.CANCELLED
+            return DirectTurnStatus(recovered.status)
+        status = (
+            DirectTurnStatus.COMPLETED
+            if succeeded
+            else DirectTurnStatus.AMBIGUOUS
+            if ambiguous
+            else DirectTurnStatus.CANCELLED
+            if cancelled or bool(current.cancel_requested_at)
+            else DirectTurnStatus.FAILED
+        )
+        terminal = await store.mark_terminal(
+            request_id,
+            lease=lease,
+            status=status,
+            outcome={
+                "phase": "ambiguous" if ambiguous else "terminal",
+                "turn_id": turn_id,
+                "succeeded": succeeded,
+                "ambiguous": ambiguous,
+                **({"ambiguity": ambiguity_detail} if ambiguity_detail else {}),
+            },
+        )
+        if terminal is None:
+            raise StaleDirectTurnOwner(request_id)
+        return status
+
+    async def stop_direct_turn_claims(self) -> None:
+        runtime = getattr(self, "_direct_turn_runtime", None)
+        if runtime is not None:
+            await runtime.stop_claiming()
+
+    async def stop_direct_turn_runtime(self) -> None:
+        runtime = getattr(self, "_direct_turn_runtime", None)
+        if runtime is not None:
+            await runtime.stop()
+
+    async def _execute_claimed_direct_turn(
+        self,
+        row: DirectTurnRequestRow,
+        payload: MaterializedDirectTurnPayload,
+        fence: DirectTurnExecutionFence,
+    ) -> None:
+        metadata = payload.metadata
+        raw_follow_up = metadata.get("follow_up")
+        follow_up = (
+            parse_follow_up_metadata(raw_follow_up) if isinstance(raw_follow_up, dict) else None
+        )
+        raw_mode = metadata.get("one_shot_chat_mode")
+        one_shot_mode = optional_chat_mode(raw_mode)
+        durable_outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        interruption_reason = durable_outcome.get("interruption_reason")
+        recovery_context = (
+            "The previous attempt of this same turn was interrupted because "
+            f"{interruption_reason}. Continue the user's request from the durable "
+            "conversation history. Verify recent tool calls and external state before "
+            "repeating any action that may have side effects; do not assume an "
+            "in-flight action failed merely because its result is absent."
+            if isinstance(interruption_reason, str) and interruption_reason
+            else None
+        )
+        raw_append_phase = durable_outcome.get("user_append_phase")
+        append_phase = (
+            str(raw_append_phase)
+            if isinstance(raw_append_phase, str)
+            else str(durable_outcome.get("phase") or "user_append_pending")
+        )
+        durable_append_session_id = (
+            str(durable_outcome.get("user_append_session_id") or durable_outcome["session_id"])
+            if isinstance(
+                durable_outcome.get("user_append_session_id") or durable_outcome.get("session_id"),
+                str,
+            )
+            else None
+        )
+        if append_phase in {"canonical_user_append", "user_append_uncertain"}:
+            try:
+                append_phase = (
+                    "user_appended"
+                    if await self._reconcile_direct_turn_append(row)
+                    else "user_append_pending"
+                )
+            except Exception as exc:
+                direct_turn_store = self._direct_turn_store
+                if direct_turn_store is not None:
+                    await direct_turn_store.mark_recoverable(
+                        row.request_id,
+                        lease=fence.lease,
+                        outcome={**durable_outcome, "phase": "user_append_uncertain"},
+                    )
+                raise StaleDirectTurnOwner(row.request_id) from exc
+            direct_turn_store = self._direct_turn_store
+            fence.set_user_append_state(
+                append_phase,
+                session_id=durable_append_session_id,
+            )
+            if direct_turn_store is None or (
+                await direct_turn_store.checkpoint(
+                    row.request_id,
+                    lease=fence.lease,
+                    phase=append_phase,
+                    metadata=(
+                        {
+                            "session_id": durable_append_session_id,
+                            "user_append_phase": append_phase,
+                            "user_append_session_id": durable_append_session_id,
+                        }
+                        if durable_append_session_id is not None
+                        else None
+                    ),
+                )
+                is None
+            ):
+                raise StaleDirectTurnOwner(row.request_id)
+        recovered_after_user_append = append_phase in {
+            "recovered_model_boundary",
+            "reconciled_canonical_append",
+            "user_appended",
+        }
+        self._durable_request_by_conversation[row.conversation_id] = row.request_id
+        self._durable_fences[row.request_id] = fence
+        row_session_id = getattr(row, "session_id", None)
+        row_owner_controller_id = getattr(row, "owner_controller_id", None)
+        row_owner_incarnation_id = getattr(row, "owner_incarnation_id", None)
+        row_fencing_token = getattr(row, "fencing_token", None)
+        if (
+            row_session_id
+            and row.turn_id
+            and row_owner_controller_id
+            and row_owner_incarnation_id
+            and row_fencing_token is not None
+        ):
+            if not hasattr(self, "_relay_generation_contexts"):
+                self._relay_generation_contexts = {}
+            self._relay_generation_contexts[row.conversation_id] = RelayGenerationContext(
+                direct_request_id=row.request_id,
+                turn_id=row.turn_id,
+                session_id=row_session_id,
+                conversation_id=row.conversation_id,
+                owner_controller_id=row_owner_controller_id,
+                owner_incarnation_id=row_owner_incarnation_id,
+                fencing_token=row_fencing_token,
+            )
+        try:
+            error = await self.submit_turn(
+                row.conversation_id,
+                payload.content,
+                user_email=row.user_id,
+                intention_eligible=bool(metadata.get("intention_eligible", True)),
+                _materialized_attachments=payload.attachments,
+                outbound_attachments=metadata.get("outbound_attachments") or [],
+                system_initiated=bool(metadata.get("system_initiated")),
+                follow_up=follow_up,
+                channel_deliverable=bool(metadata.get("channel_deliverable")),
+                delivery_id=metadata.get("delivery_id"),
+                delivery_fallback_text=metadata.get("delivery_fallback_text"),
+                turn_observers=self._durable_turn_observers.get(row.request_id, ()),
+                client_message_id=metadata.get("client_message_id"),
+                user_message_metadata=metadata.get("user_message_metadata"),
+                contextual_messages=metadata.get("contextual_messages") or [],
+                queued_message_id=row.request_id,
+                prepared_attachment_notice=metadata.get("attachment_notice"),
+                prepared_attachment_context=metadata.get("attachment_context"),
+                one_shot_chat_mode=one_shot_mode,
+                channel_default_agent_profile_id=metadata.get("channel_default_agent_profile_id"),
+                channel_account_id=metadata.get("channel_account_id"),
+                channel_delivery=payload.channel_delivery,
+                is_retry=bool(metadata.get("is_retry")) or recovered_after_user_append,
+                retry_source_turn_id=(
+                    row.turn_id
+                    if recovery_context is not None
+                    else metadata.get("retry_source_turn_id")
+                ),
+                retry_reason=(
+                    retry_reason_from_interruption(interruption_reason)
+                    if recovery_context is not None
+                    else getattr(payload, "retry_reason", None) or metadata.get("retry_reason")
+                ),
+                retry_attempt=max(
+                    1,
+                    getattr(row, "attempt_count", 1)
+                    if recovery_context is not None
+                    else int(metadata.get("retry_attempt") or 1),
+                ),
+                turn_id=row.turn_id,
+                _durable_request_id=row.request_id,
+                _durable_lease=fence.lease,
+                _durable_user_append_session_id=durable_append_session_id,
+                _recovery_context=recovery_context,
+            )
+            if error is not None:
+                raise RuntimeError(error.message)
+            task = self._active_turns.get(row.conversation_id)
+            if task is not None:
+                await asyncio.shield(task)
+        finally:
+            getattr(self, "_relay_generation_contexts", {}).pop(row.conversation_id, None)
+            self._durable_request_by_conversation.pop(row.conversation_id, None)
+            self._durable_fences.pop(row.request_id, None)
+
+    async def _mark_durable_absorbed(self, request_id: str, lease: Lease) -> None:
+        if self._direct_turn_store is None:
+            return
+        if await self._direct_turn_store.mark_absorbed(request_id, lease=lease) is None:
+            raise StaleDirectTurnOwner(request_id)
+
+    async def _publish_durable_turn_change(self, row: DirectTurnRequestRow) -> None:
+        """Invalidate remote Chat v2 projections after a durable turn transition."""
+
+        cluster_signals = getattr(self, "cluster_signals", None)
+        if cluster_signals is None:
+            return
+        await cluster_signals.publish_chat_change(
+            row.conversation_id,
+            session_id=row.session_id,
+            revision=f"direct-turn:{row.request_id}:{row.status}:{row.updated_at.isoformat()}",
+        )
+
+    async def _checkpoint_durable_absorbed_append(
+        self,
+        request_id: str,
+        lease: Lease,
+        intaris_session_id: str,
+    ) -> None:
+        if self._direct_turn_store is None:
+            return
+        row = await self._direct_turn_store.checkpoint(
+            request_id,
+            lease=lease,
+            phase="canonical_user_append",
+            metadata={"session_id": intaris_session_id},
+        )
+        if row is None:
+            raise StaleDirectTurnOwner(request_id)
+
+    async def _assert_durable_conversation_fence(self, conversation_id: str) -> None:
+        request_id = self._durable_request_by_conversation.get(conversation_id)
+        if request_id is None:
+            return
+        fence = self._durable_fences.get(request_id)
+        if fence is None:
+            raise StaleDirectTurnOwner(request_id)
+        await fence.assert_current()
+
+    async def _reconcile_direct_turn_append(self, row: DirectTurnRequestRow) -> bool:
+        outcome = row.outcome if isinstance(row.outcome, dict) else {}
+        session_id = outcome.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        expected_types = outcome.get("event_types")
+        types = (
+            [str(item) for item in expected_types if isinstance(item, str)]
+            if isinstance(expected_types, list)
+            else ["assistant_message"]
+            if outcome.get("phase") == "model_response"
+            else ["user_message"]
+        )
+        expected_call_ids = {
+            str(item) for item in (outcome.get("call_ids") or []) if isinstance(item, str)
+        }
+        async with self._session_factory() as db_session:
+            agent = await queries.get_agent(db_session, row.agent_id)
+        system_agent = SYSTEM_AGENTS.get(row.agent_id)
+        agent_owner_email = (
+            agent.owner_email
+            if agent is not None
+            else system_agent.owner_email
+            if system_agent is not None
+            else None
+        )
+        if agent_owner_email is None:
+            raise RuntimeError("Direct-turn agent is unavailable for event-store reconciliation")
+        with scoped_runtime_context(
+            user_email=row.user_id,
+            agent_id=row.agent_id,
+            agent_owner_email=agent_owner_email,
+        ):
+            after_seq = 0
+            while True:
+                result = await self._providers.guardrails.read_events(
+                    session_id=session_id,
+                    after_seq=after_seq,
+                    limit=200,
+                    types=types,
+                    allow_missing_stream=True,
+                )
+                for event in result.events:
+                    data = event.get("data") if isinstance(event, dict) else None
+                    if not isinstance(data, dict):
+                        continue
+                    if (
+                        data.get("queue_id") == row.request_id
+                        or data.get("turn_id") == row.turn_id
+                        or data.get("call_id") in expected_call_ids
+                    ):
+                        return True
+                if not result.has_more or result.last_seq <= after_seq:
+                    return False
+
+    async def drain_active_turns(self, *, timeout_seconds: float) -> dict[str, int]:
+        """Wait for local active turns without cancelling them on timeout."""
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        initial = len([task for task in self._active_turns.values() if not task.done()])
+        while True:
+            tasks = [task for task in self._active_turns.values() if not task.done()]
+            queued = sum(len(queue) for queue in self._queued_messages.values())
+            registering = len(self._queued_relaunches)
+            if not tasks and not queued and not registering:
+                return {"active": initial, "completed": initial, "timed_out": 0}
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return {
+                    "active": initial,
+                    "completed": initial - len(tasks),
+                    "timed_out": len(tasks) + queued + registering,
+                }
+            if tasks:
+                await asyncio.wait(
+                    tasks,
+                    timeout=min(remaining, 0.1),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            else:
+                await asyncio.sleep(min(remaining, 0.01))
+
+    async def cancel_active_turns_and_wait(self, *, timeout_seconds: float) -> dict[str, int]:
+        """Request normal cancellation and bound settlement before teardown."""
+        async with self._admission_drain_lock:
+            active_conversation_ids = [
+                conversation_id
+                for conversation_id, task in self._active_turns.items()
+                if not task.done()
+            ]
+            conversation_ids = set(active_conversation_ids)
+            conversation_ids.update(
+                conversation_id for conversation_id, queue in self._queued_messages.items() if queue
+            )
+            conversation_ids.update(self._queued_relaunches.values())
+            self._cancelled_queued_relaunches.update(
+                queued.queue_id for queue in self._queued_messages.values() for queued in queue
+            )
+            self._cancelled_queued_relaunches.update(self._queued_relaunches)
+            tasks = [
+                self._active_turns[conversation_id] for conversation_id in active_conversation_ids
+            ]
+        cancellation_requests = [
+            asyncio.create_task(self.cancel_turn(conversation_id, clear_queue=True))
+            for conversation_id in conversation_ids
+        ]
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        if cancellation_requests:
+            await asyncio.wait(cancellation_requests, timeout=timeout_seconds)
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        if tasks and remaining:
+            await asyncio.wait(tasks, timeout=remaining)
+        abandoned_tasks = sum(not task.done() for task in tasks)
+        abandoned_requests = sum(not task.done() for task in cancellation_requests)
+        return {
+            "requested": len(conversation_ids),
+            "settled": len(tasks) - abandoned_tasks,
+            "abandoned": abandoned_tasks + abandoned_requests,
+        }
+
+    async def interrupt_active_turns_and_wait(
+        self,
+        *,
+        reason: str,
+        timeout_seconds: float,
+    ) -> dict[str, int]:
+        """Make active durable turns reclaimable without publishing cancellation."""
+
+        store = self._direct_turn_store
+        if store is None:
+            return await self.cancel_active_turns_and_wait(timeout_seconds=timeout_seconds)
+        interrupted = 0
+        tasks: list[asyncio.Task[None]] = []
+        async with self._admission_drain_lock:
+            active = [
+                (conversation_id, task)
+                for conversation_id, task in self._active_turns.items()
+                if not task.done()
+            ]
+            for conversation_id, task in active:
+                request_id = self._durable_request_by_conversation.get(conversation_id)
+                fence = self._durable_fences.get(request_id or "")
+                if request_id is None or fence is None:
+                    tasks.append(task)
+                    task.cancel()
+                    continue
+                async with self._active_streams_lock:
+                    stream = self._active_streams.get(conversation_id)
+                    if stream is not None and stream.content:
+                        try:
+                            conversation, session, agent, _ = await self._load_conversation_runtime(
+                                conversation_id
+                            )
+                            persisted_content, _, _ = await self._persist_cancelled_active_stream(
+                                conversation_id=conversation_id,
+                                session=session,
+                                message_id=stream.message_id,
+                                turn_id=stream.turn_id,
+                                user_email=conversation.user_email,
+                                agent=agent,
+                                finish_reason="controller_interrupted",
+                                clear_on_success=False,
+                                stream_snapshot=stream,
+                            )
+                        except Exception:
+                            persisted_content = None
+                            logger.exception(
+                                "turn_scheduler: failed to checkpoint interrupted assistant stream",
+                                extra={"extra_data": {"conversation_id": conversation_id}},
+                            )
+                        if persisted_content is None:
+                            # Never release a durable request after discarding visible
+                            # output. The controller remains owner and shutdown reports
+                            # the turn as abandoned rather than allowing a lossy retry.
+                            continue
+                        append_phase = fence.user_append_phase or "user_append_pending"
+                        recovered = await store.settle_transient_failure(
+                            request_id,
+                            lease=fence.lease,
+                            outcome={
+                                "phase": append_phase,
+                                "user_append_phase": append_phase,
+                                **(
+                                    {"user_append_session_id": fence.user_append_session_id}
+                                    if fence.user_append_session_id
+                                    else {}
+                                ),
+                                "interruption_reason": reason,
+                                "source_phase": fence.last_phase,
+                                "source_metadata": fence.last_metadata or {},
+                            },
+                        )
+                        if (
+                            recovered is None
+                            or recovered.status != DirectTurnStatus.RECOVERABLE.value
+                        ):
+                            continue
+                        self._interrupted_durable_requests.add(request_id)
+                        interrupted += 1
+                        tasks.append(task)
+                        task.cancel()
+                        self._active_streams.pop(conversation_id, None)
+                        continue
+                append_phase = fence.user_append_phase or "user_append_pending"
+                recovered = await store.settle_transient_failure(
+                    request_id,
+                    lease=fence.lease,
+                    outcome={
+                        "phase": append_phase,
+                        "user_append_phase": append_phase,
+                        **(
+                            {"user_append_session_id": fence.user_append_session_id}
+                            if fence.user_append_session_id
+                            else {}
+                        ),
+                        "interruption_reason": reason,
+                        "source_phase": fence.last_phase,
+                        "source_metadata": fence.last_metadata or {},
+                    },
+                )
+                if recovered is None or recovered.status != DirectTurnStatus.RECOVERABLE.value:
+                    continue
+                self._interrupted_durable_requests.add(request_id)
+                interrupted += 1
+                tasks.append(task)
+                task.cancel()
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+        else:
+            pending = set()
+        return {
+            "requested": len(tasks),
+            "interrupted": interrupted,
+            "settled": len(tasks) - len(pending),
+            "abandoned": len(pending),
+        }
+
     async def cancel_turn(
         self,
         conversation_id: str,
@@ -2838,6 +4060,30 @@ class TurnScheduler:
         supervising turn must not cancel healthy managed work; callers that
         explicitly interrupt a managed conversation cancel its target directly.
         """
+        durable_cancelled = False
+        cancelled_active_request_id: str | None = None
+        if self._direct_turn_store is not None:
+            active_durable_request_id = self._durable_request_by_conversation.get(conversation_id)
+            for row in await self._direct_turn_store.list_conversation_pending(conversation_id):
+                if (
+                    not clear_queue
+                    and row.status
+                    not in {
+                        DirectTurnStatus.CLAIMED.value,
+                        DirectTurnStatus.RUNNING.value,
+                        DirectTurnStatus.ABSORBING.value,
+                    }
+                    and row.request_id != active_durable_request_id
+                ):
+                    continue
+                cancel_result = await self._direct_turn_store.request_cancel(row.request_id)
+                durable_cancelled = cancel_result is not None or durable_cancelled
+                if cancel_result is not None and row.status in {
+                    DirectTurnStatus.CLAIMED.value,
+                    DirectTurnStatus.RUNNING.value,
+                    DirectTurnStatus.ABSORBING.value,
+                }:
+                    cancelled_active_request_id = row.request_id
         queued_to_cancel: list[_QueuedMessage] = []
         async with self._turn_lock(conversation_id):
             control = self._turn_controls.get(conversation_id)
@@ -2891,6 +4137,18 @@ class TurnScheduler:
         )
         if cleared_queue:
             await self._notify_queue_updated(conversation_id)
+        cluster_signals = getattr(self, "cluster_signals", None)
+        if cancelled_active_request_id is not None and cluster_signals is not None:
+            from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope
+
+            await cluster_signals.publish(
+                ClusterSignalKind.TURN_CANCEL_REQUESTED,
+                scope=ClusterSignalScope(
+                    conversation_id=conversation_id,
+                    direct_request_id=cancelled_active_request_id,
+                ),
+                revision=datetime.now(UTC),
+            )
         # Also cancel child sub-sessions via the agent loop
         if session_id:
             cancelled = await self._agent_loop.cancel_children(session_id)
@@ -2899,12 +4157,127 @@ class TurnScheduler:
                     "turn_scheduler: cancelled child sub-sessions",
                     extra={"extra_data": {"count": cancelled, "session_id": session_id}},
                 )
-        return control is not None or cleared_queue
+        return control is not None or cleared_queue or durable_cancelled
 
     def has_active_turn(self, conversation_id: str) -> bool:
         """Check if a turn is currently active for a conversation."""
         active = self._active_turns.get(conversation_id)
         return active is not None and not active.done()
+
+    def relay_generation_context(self, conversation_id: str) -> RelayGenerationContext | None:
+        """Return the immutable generation captured from the active durable claim."""
+        return self._relay_generation_contexts.get(conversation_id)
+
+    async def durable_relay_generation_context(
+        self, conversation_id: str
+    ) -> RelayGenerationContext | None:
+        """Resolve the current PostgreSQL-owned relay generation."""
+        if self._direct_turn_store is None:
+            return None
+        row = await self._direct_turn_store.get_conversation_active(conversation_id)
+        if (
+            row is None
+            or not row.session_id
+            or not row.turn_id
+            or not row.owner_controller_id
+            or not row.owner_incarnation_id
+            or row.fencing_token is None
+        ):
+            return None
+        return RelayGenerationContext(
+            direct_request_id=row.request_id,
+            turn_id=row.turn_id,
+            session_id=row.session_id,
+            conversation_id=row.conversation_id,
+            owner_controller_id=row.owner_controller_id,
+            owner_incarnation_id=row.owner_incarnation_id,
+            fencing_token=row.fencing_token,
+        )
+
+    async def durable_terminal_relay_generation_context(
+        self, request_id: str
+    ) -> RelayGenerationContext | None:
+        """Resolve one exact terminal PostgreSQL-owned relay generation."""
+        if self._direct_turn_store is None:
+            return None
+        row = await self._direct_turn_store.get(request_id)
+        try:
+            status = DirectTurnStatus(row.status) if row is not None else None
+        except (TypeError, ValueError):
+            return None
+        if (
+            row is None
+            or status not in TERMINAL_STATUSES
+            or not row.session_id
+            or not row.turn_id
+            or not row.owner_controller_id
+            or not row.owner_incarnation_id
+            or row.fencing_token is None
+        ):
+            return None
+        return RelayGenerationContext(
+            direct_request_id=row.request_id,
+            turn_id=row.turn_id,
+            session_id=row.session_id,
+            conversation_id=row.conversation_id,
+            owner_controller_id=row.owner_controller_id,
+            owner_incarnation_id=row.owner_incarnation_id,
+            fencing_token=row.fencing_token,
+        )
+
+    async def durable_running_turn_state(self, conversation_id: str) -> dict[str, Any] | None:
+        """Return cluster-authoritative active state, enriched by local runtime when owned here."""
+
+        if self._direct_turn_store is None:
+            return self.running_turn_state(conversation_id)
+        row = await self._direct_turn_store.get_conversation_active(conversation_id)
+        if row is None:
+            return None
+        return self._durable_runtime_state_from_row(row, self.running_turn_state(conversation_id))
+
+    @staticmethod
+    def _durable_runtime_state_from_row(
+        row: DirectTurnRequestRow, local: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Map one durable direct-turn row to public runtime state."""
+
+        status = (
+            "cancelling"
+            if row.cancel_requested_at is not None
+            else "starting"
+            if row.status == DirectTurnStatus.CLAIMED.value
+            else "waiting"
+            if row.status == DirectTurnStatus.ABSORBING.value
+            else "running"
+        )
+        return {
+            "turn_id": row.turn_id,
+            "session_id": row.session_id or "",
+            "status": status,
+            "chat_mode": local.get("chat_mode") if local else None,
+            "chat_mode_source": local.get("chat_mode_source") if local else None,
+            "started_at": row.started_at.isoformat() if row.started_at is not None else None,
+            "updated_at": row.updated_at.isoformat(),
+        }
+
+    async def durable_running_turn_states(
+        self, conversation_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Return cluster-authoritative active state for multiple conversations."""
+
+        if self._direct_turn_store is None:
+            return {
+                conversation_id: state
+                for conversation_id in conversation_ids
+                if (state := self.running_turn_state(conversation_id)) is not None
+            }
+        rows = await self._direct_turn_store.list_conversations_active(conversation_ids)
+        return {
+            conversation_id: self._durable_runtime_state_from_row(
+                row, self.running_turn_state(conversation_id)
+            )
+            for conversation_id, row in rows.items()
+        }
 
     def active_turn_checkpoint(self, conversation_id: str) -> dict[str, str | None] | None:
         """Return active turn identity used to fork from the last completed checkpoint."""
@@ -2969,6 +4342,159 @@ class TurnScheduler:
             with contextlib.suppress(ValueError):
                 self._turn_waiters[conversation_id].remove(future)
 
+    def turn_scope_change_generation(self, conversation_id: str) -> int:
+        """Return the local generation for durable turn-state invalidations."""
+
+        return self._turn_scope_change_generations.get(conversation_id, 0)
+
+    async def wait_for_turn_scope_change(
+        self,
+        conversation_id: str,
+        *,
+        after_generation: int,
+        timeout_seconds: float,
+    ) -> bool:
+        """Wait for a local or remote durable turn-state invalidation."""
+
+        self._turn_scope_change_waiters[conversation_id] += 1
+        event = self._turn_scope_change_events.setdefault(conversation_id, asyncio.Event())
+        try:
+            if self.turn_scope_change_generation(conversation_id) > after_generation:
+                return True
+            event.clear()
+            if self.turn_scope_change_generation(conversation_id) > after_generation:
+                return True
+            try:
+                await asyncio.wait_for(event.wait(), timeout=max(0.01, timeout_seconds))
+            except TimeoutError:
+                return False
+            return self.turn_scope_change_generation(conversation_id) > after_generation
+        finally:
+            remaining = self._turn_scope_change_waiters.get(conversation_id, 1) - 1
+            if remaining > 0:
+                self._turn_scope_change_waiters[conversation_id] = remaining
+            else:
+                self._turn_scope_change_waiters.pop(conversation_id, None)
+                self._turn_scope_change_events.pop(conversation_id, None)
+                self._turn_scope_change_generations.pop(conversation_id, None)
+
+    def _signal_turn_scope_change(self, conversation_id: str) -> None:
+        """Wake waiters that must re-read authoritative durable turn state."""
+
+        if self._turn_scope_change_waiters.get(conversation_id, 0) <= 0:
+            return
+        self._turn_scope_change_generations[conversation_id] += 1
+        event = self._turn_scope_change_events.get(conversation_id)
+        if event is not None:
+            event.set()
+
+    def boundary_action_generation(self, conversation_id: str) -> int:
+        """Return the current actionable same-turn boundary generation."""
+
+        return self._boundary_action_generations.get(conversation_id, 0)
+
+    def signal_actionable_boundary_event(self, conversation_id: str) -> None:
+        """Wake sibling joined waits without replacing the settled tool result."""
+
+        self._boundary_action_generations[conversation_id] += 1
+        self._signal_boundary_input_change(conversation_id)
+
+    async def wait_for_boundary_input(
+        self,
+        conversation_id: str,
+        *,
+        after_generation: int | None = None,
+    ) -> str:
+        """Wait for actionable queued intake or a same-turn boundary event.
+
+        Queue mutations signal an event, while the queue/store remains the
+        authority. Rechecking before and after ``clear()`` avoids a lost wakeup
+        when admission races waiter setup. Multiple joined managed waits may
+        share this primitive without consuming or leasing the queued input.
+        """
+
+        event = self._boundary_input_events.setdefault(conversation_id, asyncio.Event())
+        self._boundary_input_waiters[conversation_id] += 1
+        try:
+            while True:
+                queued_reason = await self._actionable_boundary_queue_reason(conversation_id)
+                if queued_reason is not None:
+                    return queued_reason
+                if (
+                    after_generation is not None
+                    and self.boundary_action_generation(conversation_id) > after_generation
+                ):
+                    return "managed_sibling_settled"
+                event.clear()
+                queued_reason = await self._actionable_boundary_queue_reason(conversation_id)
+                if queued_reason is not None:
+                    return queued_reason
+                if (
+                    after_generation is not None
+                    and self.boundary_action_generation(conversation_id) > after_generation
+                ):
+                    return "managed_sibling_settled"
+                await event.wait()
+        finally:
+            remaining = self._boundary_input_waiters.get(conversation_id, 1) - 1
+            if remaining > 0:
+                self._boundary_input_waiters[conversation_id] = remaining
+            else:
+                self._boundary_input_waiters.pop(conversation_id, None)
+                if self._boundary_input_events.get(conversation_id) is event:
+                    self._boundary_input_events.pop(conversation_id, None)
+
+    async def _actionable_boundary_queue_reason(self, conversation_id: str) -> str | None:
+        """Return why the next absorbable batch should resume the active turn."""
+
+        if self._direct_turn_store is not None:
+            active_request_id = self._durable_request_by_conversation.get(conversation_id)
+            rows = await self._direct_turn_store.list_conversation_pending(conversation_id)
+            for row in rows:
+                if row.request_id == active_request_id or row.status in {
+                    DirectTurnStatus.CLAIMED.value,
+                    DirectTurnStatus.RUNNING.value,
+                    DirectTurnStatus.ABSORBING.value,
+                }:
+                    continue
+                metadata = row.payload.get("metadata") or {}
+                if row.status != DirectTurnStatus.QUEUED.value or not metadata.get("absorbable"):
+                    break
+                if not metadata.get("system_initiated"):
+                    return "queued_user_input"
+                if self._follow_up_is_actionable_boundary_event(metadata.get("follow_up")):
+                    return "queued_completion"
+            return None
+
+        queue = self._queued_messages.get(conversation_id)
+        if not queue:
+            return None
+        for queued in queue:
+            if not self._queued_message_is_absorbable(queued):
+                break
+            if not queued.system_initiated:
+                return "queued_user_input"
+            if self._follow_up_is_actionable_boundary_event(queued.follow_up):
+                return "queued_completion"
+        return None
+
+    @staticmethod
+    def _follow_up_is_actionable_boundary_event(follow_up: Any) -> bool:
+        """Exclude automatic continuation noise from cooperative wait wakeups."""
+
+        if follow_up is None:
+            return False
+        if isinstance(follow_up, dict):
+            return follow_up.get("origin_kind") != FollowUpOriginKind.CONTINUATION.value
+        return getattr(follow_up, "origin_kind", None) != FollowUpOriginKind.CONTINUATION
+
+    def _signal_boundary_input_change(self, conversation_id: str) -> None:
+        """Wake local boundary-input waiters after any authoritative queue change."""
+
+        event = self._boundary_input_events.get(conversation_id)
+        if event is not None:
+            event.set()
+
     def attach_turn_observer(
         self,
         conversation_id: str,
@@ -3021,13 +4547,66 @@ class TurnScheduler:
 
     def queued_count(self, conversation_id: str) -> int:
         """Return the number of queued messages for a conversation."""
+        if self._direct_turn_store is not None:
+            return len(self._durable_queue_cache.get(conversation_id, ()))
         return len(self._queued_messages.get(conversation_id, []))
 
     def queued_messages(self, conversation_id: str) -> list[dict[str, Any]]:
         """Return safe metadata for pending queued messages."""
+        if self._direct_turn_store is not None:
+            return list(self._durable_queue_cache.get(conversation_id, ()))
         return [
             queued.snapshot(position=index + 1)
             for index, queued in enumerate(self._queued_messages.get(conversation_id, []))
+        ]
+
+    async def get_queued_messages(self, conversation_id: str) -> list[dict[str, Any]]:
+        if self._direct_turn_store is None:
+            return self.queued_messages(conversation_id)
+        rows = [
+            row
+            for row in await self._direct_turn_store.list_conversation_pending(conversation_id)
+            if row.status
+            in {
+                DirectTurnStatus.QUEUED.value,
+                DirectTurnStatus.RECOVERABLE.value,
+            }
+        ]
+        messages = [
+            {
+                "queue_id": row.request_id,
+                "request_id": row.request_id,
+                "turn_id": row.turn_id,
+                "client_message_id": (row.payload.get("metadata") or {}).get("client_message_id"),
+                "content": row.payload.get("content", ""),
+                "attachments": row.payload.get("attachments", []),
+                "queued_at": row.created_at.isoformat(),
+                "created_at": row.created_at.isoformat(),
+                "updated_at": row.updated_at.isoformat(),
+                "status": row.status,
+                "cancel_requested": row.cancel_requested_at is not None,
+                "position": index + 1,
+                **_automatic_continuation_queue_fields(
+                    (row.payload.get("metadata") or {}).get("follow_up")
+                ),
+            }
+            for index, row in enumerate(rows)
+        ]
+        self._durable_queue_cache[conversation_id] = messages
+        return messages
+
+    def _remove_durable_queue_cache_entry(
+        self,
+        conversation_id: str,
+        request_id: str,
+    ) -> None:
+        """Remove a request once durable ownership moves it out of queued state."""
+
+        cached = self._durable_queue_cache.get(conversation_id)
+        if cached is None:
+            return
+        self._durable_queue_cache[conversation_id] = [
+            item for item in cached if item.get("request_id") != request_id
         ]
 
     async def _load_turn_limits(self) -> tuple[int, int]:
@@ -3299,7 +4878,73 @@ class TurnScheduler:
         if isinstance(conversation_id, str) and isinstance(title, str) and title.strip():
             self._published_title_updates[conversation_id] = title
 
+    async def _handle_cluster_scope_invalidated(self, event: Event) -> None:
+        """Wake durable queue waiters after a remote controller chat mutation."""
+
+        scope = event.data.get("scope")
+        if not isinstance(scope, dict):
+            return
+        conversation_id = scope.get("conversation_id")
+        if isinstance(conversation_id, str) and conversation_id:
+            if event.data.get("kind") == "turn_cancel_requested":
+                request_id = scope.get("direct_request_id")
+                if isinstance(request_id, str):
+                    await self._cancel_local_active_turn(conversation_id, request_id=request_id)
+            elif event.data.get("kind") == "chat_scope_changed":
+                await self._cancel_local_turn_if_durably_requested(conversation_id)
+            self._signal_turn_scope_change(conversation_id)
+            self._signal_boundary_input_change(conversation_id)
+
+    async def _cancel_local_turn_if_durably_requested(self, conversation_id: str) -> bool:
+        """Heal a missed cancel signal from the durable direct-turn record."""
+
+        request_id = self._durable_request_by_conversation.get(conversation_id)
+        if request_id is None or self._direct_turn_store is None:
+            return False
+        get_request = getattr(self._direct_turn_store, "get", None)
+        if not callable(get_request):
+            return False
+        row = await get_request(request_id)
+        if row is None or row.cancel_requested_at is None:
+            return False
+        return await self._cancel_local_active_turn(conversation_id, request_id=request_id)
+
+    async def _cancel_local_active_turn(self, conversation_id: str, *, request_id: str) -> bool:
+        """Interrupt an active turn owned by this controller only."""
+
+        async with self._turn_lock(conversation_id):
+            if self._durable_request_by_conversation.get(conversation_id) != request_id:
+                return False
+            control = self._turn_controls.get(conversation_id)
+            if control is None:
+                return False
+            if isinstance(control, asyncio.Event):
+                control.set()
+            else:
+                control.cancel_event.set()
+            active_task = self._active_turns.get(conversation_id)
+            if active_task is not None and not active_task.done():
+                active_task.cancel()
+            return True
+
     async def cancel_queued_message(self, conversation_id: str, queue_id: str) -> bool:
+        if self._direct_turn_store is not None:
+            row = await self._direct_turn_store.get(queue_id)
+            if (
+                row is None
+                or row.conversation_id != conversation_id
+                or row.status
+                not in {
+                    DirectTurnStatus.QUEUED.value,
+                    DirectTurnStatus.RECOVERABLE.value,
+                }
+            ):
+                return False
+            result = await self._direct_turn_store.request_cancel(queue_id)
+            if result is None:
+                return False
+            await self._notify_queue_updated(conversation_id)
+            return True
         queue = self._queued_messages.get(conversation_id)
         if not queue:
             return False
@@ -3327,6 +4972,29 @@ class TurnScheduler:
     async def update_queued_message(
         self, conversation_id: str, queue_id: str, *, content: str
     ) -> dict[str, Any] | None:
+        if self._direct_turn_store is not None:
+            row = await self._direct_turn_store.get(queue_id)
+            if row is None or row.conversation_id != conversation_id:
+                return None
+            payload = dict(row.payload)
+            payload["content"] = content
+            edited = await self._direct_turn_store.edit(
+                queue_id,
+                payload=payload,
+                payload_version=row.payload_version,
+                expected_payload_hash=row.payload_hash,
+            )
+            if edited is None:
+                return None
+            await self._notify_queue_updated(conversation_id)
+            return next(
+                (
+                    item
+                    for item in await self.get_queued_messages(conversation_id)
+                    if item["queue_id"] == queue_id
+                ),
+                None,
+            )
         queue = self._queued_messages.get(conversation_id)
         if not queue:
             return None
@@ -3356,7 +5024,8 @@ class TurnScheduler:
         *,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
-        messages = self.queued_messages(conversation_id)
+        self._signal_boundary_input_change(conversation_id)
+        messages = await self.get_queued_messages(conversation_id)
         observers = self._iter_observers(conversation_id, turn_observers=turn_observers)
         await asyncio.gather(
             *(
@@ -3389,6 +5058,125 @@ class TurnScheduler:
         reason: str,
     ) -> list[dict[str, Any]]:
         """Drain the currently queued inbox batch for an active direct turn."""
+
+        if self._direct_turn_store is not None:
+            active_request_id = self._durable_request_by_conversation.get(conversation_id)
+            fence = (
+                self._durable_fences.get(active_request_id)
+                if active_request_id is not None
+                else None
+            )
+            control = self._turn_controls.get(conversation_id)
+            if fence is None or control is None or self._controller_runtime is None:
+                return []
+            rows = await self._direct_turn_store.list_conversation_pending(conversation_id)
+            durable_payloads: list[dict[str, Any]] = []
+            for row in rows:
+                if row.request_id == active_request_id:
+                    continue
+                metadata = row.payload.get("metadata") or {}
+                if row.status != DirectTurnStatus.QUEUED.value or not metadata.get("absorbable"):
+                    break
+                absorbing = await self._direct_turn_store.begin_absorb(
+                    row.request_id,
+                    lease=fence.lease,
+                    controller_id=self._controller_runtime.controller_id,
+                    incarnation_id=self._controller_runtime.incarnation_id,
+                    absorbed_by_turn_id=control.turn_id or cast(str, active_request_id),
+                    session_id=self._turn_sessions.get(conversation_id),
+                )
+                if absorbing is None:
+                    break
+                materialized = await self._direct_turn_store.materialize_claimed_payload(
+                    row.request_id,
+                    lease=fence.lease,
+                    artifact_store=self._artifact_store,
+                )
+                if materialized is None:
+                    raise StaleDirectTurnOwner(row.request_id)
+                for observer in self._durable_turn_observers.get(row.request_id, ()):
+                    if observer not in control.turn_observers:
+                        control.turn_observers.append(observer)
+                raw_follow_up = materialized.metadata.get("follow_up")
+                follow_up = (
+                    parse_follow_up_metadata(raw_follow_up)
+                    if isinstance(raw_follow_up, dict)
+                    else None
+                )
+                if follow_up is not None:
+                    control.absorbed_follow_up_ids.add(follow_up.follow_up_id)
+                outbound_attachments = materialized.metadata.get("outbound_attachments")
+                if isinstance(outbound_attachments, list):
+                    control.absorbed_outbound_attachments.extend(outbound_attachments)
+                if materialized.metadata.get("channel_deliverable"):
+                    control.absorbed_channel_deliverable = True
+                    if materialized.channel_delivery is not None:
+                        control.channel_delivery = materialized.channel_delivery
+                delivery_id = materialized.metadata.get("delivery_id")
+                delivery_fallback_text = materialized.metadata.get("delivery_fallback_text")
+                if isinstance(delivery_id, str) and delivery_id:
+                    if control.active_delivery_id or control.absorbed_delivery_id:
+                        control.suppressed_channel_delivery_ids.append(delivery_id)
+                    else:
+                        control.absorbed_delivery_id = delivery_id
+                        if isinstance(delivery_fallback_text, str):
+                            control.absorbed_delivery_fallback_text = delivery_fallback_text
+                elif (
+                    isinstance(delivery_fallback_text, str)
+                    and not control.absorbed_delivery_fallback_text
+                ):
+                    control.absorbed_delivery_fallback_text = delivery_fallback_text
+                durable_payloads.append(
+                    {
+                        "durable_request_id": row.request_id,
+                        "queue_id": row.request_id,
+                        "client_message_id": materialized.metadata.get("client_message_id"),
+                        "content": materialized.content,
+                        "attachments": materialized.attachments,
+                        "attachment_notice": materialized.metadata.get("attachment_notice"),
+                        "attachment_context": materialized.metadata.get("attachment_context"),
+                        "system_initiated": bool(materialized.metadata.get("system_initiated")),
+                        "intention_eligible": bool(
+                            materialized.metadata.get("intention_eligible", True)
+                        ),
+                        "follow_up": follow_up,
+                    }
+                )
+                attachment_notice = materialized.metadata.get("attachment_notice")
+                if isinstance(attachment_notice, str) and attachment_notice:
+                    await self._notify_observers_system_message(
+                        conversation_id,
+                        attachment_notice,
+                        turn_observers=control.turn_observers,
+                    )
+                if not materialized.metadata.get("system_initiated"):
+                    await self._event_bus.publish(
+                        Event(
+                            type=EventType.USER_MESSAGE,
+                            data=_user_message_event_payload(
+                                conversation_id=conversation_id,
+                                session_id=self._turn_sessions.get(conversation_id),
+                                content=materialized.content,
+                                attachments=strip_attachment_payload_bytes(
+                                    materialized.attachments
+                                ),
+                                queue_id=row.request_id,
+                                client_message_id=materialized.metadata.get("client_message_id"),
+                            ),
+                        )
+                    )
+            if durable_payloads:
+                await self._suppress_absorbed_channel_delivery_intents(
+                    control,
+                    selected_delivery_id=(
+                        control.active_delivery_id or control.absorbed_delivery_id
+                    ),
+                )
+                await self._notify_queue_updated(
+                    conversation_id,
+                    turn_observers=control.turn_observers,
+                )
+            return durable_payloads
 
         queue = self._queued_messages.get(conversation_id)
         if not queue:
@@ -3431,6 +5219,7 @@ class TurnScheduler:
                     "attachment_notice": queued.attachment_notice,
                     "attachment_context": queued.attachment_context,
                     "system_initiated": queued.system_initiated,
+                    "intention_eligible": queued.intention_eligible,
                     "follow_up": queued.follow_up,
                 }
             )
@@ -3828,6 +5617,29 @@ class TurnScheduler:
                 exc_info=True,
             )
             return
+        origin_session_id = event.data.get("origin_session_id")
+        if isinstance(origin_session_id, str):
+            async with self._session_factory() as db_session:
+                is_current = await queries.origin_session_is_in_active_scope(
+                    db_session,
+                    conversation_id=conversation_id,
+                    origin_session_id=origin_session_id,
+                )
+                if not is_current:
+                    intent = await self._persist_follow_up_intent(
+                        db_session,
+                        conversation_id=conversation_id,
+                        event_payload=dict(event.data),
+                    )
+                    intent.status = "submitted"
+                    intent.lease_owner = None
+                    intent.lease_expires_at = None
+                    intent.last_error = None
+                    await db_session.commit()
+                    delivery_id = event.data.get("delivery_id")
+                    if isinstance(delivery_id, str):
+                        await self._suppress_channel_delivery_ids([delivery_id])
+                    return
         # Use submit_turn for unified serialization
         # Determine user_email from the conversation
         async with self._session_factory() as db_session:
@@ -4556,9 +6368,204 @@ class TurnScheduler:
                 )
             return len(rows)
 
+    async def _managed_join_tool_result_is_durable(
+        self,
+        link: ManagedConversationLink,
+    ) -> bool:
+        """Reconcile the parent transcript before transferring fallback ownership."""
+
+        async with self._session_factory() as db_session:
+            session_row = await queries.get_session_row(
+                db_session,
+                str(link.handoff_controller_session_id),
+            )
+            agent_row = await queries.get_agent(db_session, link.controller_agent_id)
+        if session_row is None:
+            raise RuntimeError("Managed join controller session is unavailable")
+        system_agent = SYSTEM_AGENTS.get(link.controller_agent_id)
+        agent_owner_email = (
+            agent_row.owner_email
+            if agent_row is not None
+            else system_agent.owner_email
+            if system_agent is not None
+            else None
+        )
+        if agent_owner_email is None:
+            raise RuntimeError("Managed join controller agent is unavailable")
+        intaris_session_id = session_row.intaris_session_id or session_row.session_id
+        after_seq = 0
+        with scoped_runtime_context(
+            user_email=link.user_email,
+            agent_id=link.controller_agent_id,
+            agent_owner_email=agent_owner_email,
+        ):
+            while True:
+                result = await self._providers.guardrails.read_events(
+                    session_id=intaris_session_id,
+                    after_seq=after_seq,
+                    limit=200,
+                    types=["tool_result"],
+                    allow_missing_stream=True,
+                )
+                for event in result.events:
+                    data = event.get("data") if isinstance(event, dict) else None
+                    if (
+                        isinstance(data, dict)
+                        and data.get("call_id") == link.handoff_tool_call_id
+                        and data.get("turn_id") == link.handoff_controller_turn_id
+                    ):
+                        return True
+                if not result.has_more or result.last_seq <= after_seq:
+                    return False
+                after_seq = result.last_seq
+
+    async def recover_managed_join_handoffs_for_parent(
+        self,
+        *,
+        controller_session_id: str | None = None,
+        controller_turn_id: str | None = None,
+    ) -> int:
+        """Claim unacknowledged joins and create one correlated fallback when ready."""
+
+        async with self._session_factory() as db_session:
+            links = await queries.list_pending_managed_conversation_join_handoffs(
+                db_session,
+                controller_session_id=controller_session_id,
+                controller_turn_id=controller_turn_id,
+            )
+
+        recovered: list[ManagedConversationLink] = []
+        for link in links:
+            if link.handoff_state == "pending":
+                try:
+                    if await self._managed_join_tool_result_is_durable(link):
+                        async with self._session_factory() as db_session:
+                            await queries.acknowledge_managed_conversation_join_handoff(
+                                db_session,
+                                link.link_id,
+                                target_turn_id=str(link.handoff_target_turn_id),
+                                controller_session_id=str(link.handoff_controller_session_id),
+                                controller_turn_id=str(link.handoff_controller_turn_id),
+                                tool_call_id=str(link.handoff_tool_call_id),
+                            )
+                            await db_session.commit()
+                        continue
+                except Exception:
+                    logger.warning(
+                        "turn_scheduler: failed to reconcile managed join transcript",
+                        extra={"extra_data": {"link_id": link.link_id}},
+                        exc_info=True,
+                    )
+                    continue
+                async with self._session_factory() as db_session:
+                    claimed = await queries.claim_managed_conversation_join_handoff(
+                        db_session,
+                        link.link_id,
+                        target_turn_id=str(link.handoff_target_turn_id),
+                        controller_session_id=str(link.handoff_controller_session_id),
+                        controller_turn_id=str(link.handoff_controller_turn_id),
+                        tool_call_id=str(link.handoff_tool_call_id),
+                    )
+                    await db_session.commit()
+                if claimed is None:
+                    continue
+                link = claimed
+            recovered.append(link)
+
+        notified = 0
+        for link in recovered:
+            target_turn_id = str(link.handoff_target_turn_id or "")
+            if not target_turn_id:
+                continue
+            if link.active_turn_id == target_turn_id:
+                if link.turn_state in {"queued", "running"}:
+                    continue
+                already_settled = False
+            elif link.last_result_turn_id == target_turn_id:
+                already_settled = True
+            else:
+                continue
+            failed = link.turn_state in {"failed", "interrupted"}
+            await self._notify_managed_conversation_controller(
+                target_conversation_id=link.target_conversation_id,
+                target_session_id=link.target_session_id or "",
+                turn_state=link.turn_state,
+                conversation_state=link.conversation_state,
+                status=(
+                    FollowUpStatus.CANCELLED
+                    if link.turn_state == "interrupted"
+                    else FollowUpStatus.FAILED
+                    if failed
+                    else FollowUpStatus.COMPLETED
+                ),
+                summary=link.last_result_summary or link.last_error,
+                turn_id=target_turn_id,
+                error_message=link.last_error,
+                recoverable=True if failed else None,
+                already_settled=already_settled,
+            )
+            notified += 1
+        return notified
+
     async def recover_managed_conversation_notifications(self) -> int:
         """Create durable controller handoffs for startup-interrupted managed work."""
 
+        recovered_join_handoffs = await self.recover_managed_join_handoffs_for_parent()
+        fallback_notifications: list[tuple[str, str, str]] = []
+        async with self._session_factory() as db_session:
+            fallback_links = list(
+                (
+                    await db_session.execute(
+                        select(ManagedConversationLink).where(
+                            ManagedConversationLink.conversation_state == "open",
+                            ManagedConversationLink.turn_state == "interrupted",
+                            ManagedConversationLink.active_turn_id.is_(None),
+                            ManagedConversationLink.notify_on_completion.is_(True),
+                            ManagedConversationLink.handoff_state == "fallback_claimed",
+                            ManagedConversationLink.handoff_target_turn_id.is_not(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for link in fallback_links:
+                target_turn_id = str(link.handoff_target_turn_id)
+                row = await db_session.scalar(
+                    select(DirectTurnRequestRow).where(
+                        DirectTurnRequestRow.turn_id == target_turn_id,
+                        DirectTurnRequestRow.conversation_id == link.target_conversation_id,
+                        DirectTurnRequestRow.status == "completed",
+                    )
+                )
+                if row is None:
+                    continue
+                if await queries.settle_completed_fallback_managed_conversation_turn(
+                    db_session,
+                    link.link_id,
+                    target_turn_id=target_turn_id,
+                ):
+                    fallback_notifications.append(
+                        (
+                            link.target_conversation_id,
+                            link.target_session_id or row.session_id or "",
+                            target_turn_id,
+                        )
+                    )
+            await db_session.commit()
+        fallback_recovered = 0
+        for target_conversation_id, target_session_id, target_turn_id in fallback_notifications:
+            if await self._notify_managed_conversation_controller(
+                target_conversation_id=target_conversation_id,
+                target_session_id=target_session_id,
+                turn_state="completed",
+                conversation_state="completed",
+                status=FollowUpStatus.COMPLETED,
+                summary="Managed turn completed after controller restart.",
+                turn_id=target_turn_id,
+                already_settled=True,
+            ):
+                fallback_recovered += 1
         async with self._session_factory() as db_session:
             links = list(
                 (
@@ -4567,6 +6574,7 @@ class TurnScheduler:
                             ManagedConversationLink.conversation_state == "open",
                             ManagedConversationLink.turn_state == "interrupted",
                             ManagedConversationLink.notify_on_completion.is_(True),
+                            ManagedConversationLink.handoff_state.is_(None),
                         )
                     )
                 )
@@ -4607,7 +6615,7 @@ class TurnScheduler:
                 error_message=last_error,
                 recoverable=True,
             )
-        return len(notifications)
+        return recovered_join_handoffs + fallback_recovered + len(notifications)
 
     async def _ensure_follow_up_channel_delivery_intent(
         self,
@@ -4791,7 +6799,7 @@ class TurnScheduler:
             return [], None
         from cognis.store.queries import get_artifact_record
 
-        normalized: list[AttachmentRef] = []
+        prepared: list[dict[str, Any]] = []
         async with self._session_factory() as session:
             for raw in attachments:
                 artifact_id = raw.get("artifact_id") if isinstance(raw, dict) else None
@@ -4814,21 +6822,34 @@ class TurnScheduler:
                         message="Attachment access denied",
                         recoverable=False,
                     )
-                url = await self._artifact_store.async_get_public_url(
-                    row.namespace,
-                    row.object_id,
-                    row.filename,
+                prepared.append(
+                    {
+                        "artifact_id": row.artifact_id,
+                        "kind": ArtifactKind(row.kind),
+                        "mime_type": row.mime_type,
+                        "filename": row.filename,
+                        "size_bytes": row.size_bytes,
+                        "namespace": row.namespace,
+                        "object_id": row.object_id,
+                    }
                 )
-                normalized.append(
-                    AttachmentRef(
-                        artifact_id=row.artifact_id,
-                        kind=ArtifactKind(row.kind),
-                        mime_type=row.mime_type,
-                        filename=row.filename,
-                        size_bytes=row.size_bytes,
-                        url=url,
-                    )
+        normalized: list[AttachmentRef] = []
+        for artifact in prepared:
+            url = await self._artifact_store.async_get_public_url(
+                artifact["namespace"],
+                artifact["object_id"],
+                artifact["filename"],
+            )
+            normalized.append(
+                AttachmentRef(
+                    artifact_id=artifact["artifact_id"],
+                    kind=artifact["kind"],
+                    mime_type=artifact["mime_type"],
+                    filename=artifact["filename"],
+                    size_bytes=artifact["size_bytes"],
+                    url=url,
                 )
+            )
         return normalized, None
 
     async def _build_attachment_support_messages(
@@ -5085,6 +7106,9 @@ class TurnScheduler:
         agent: AgentDefinition,
         content: str,
         user_email: str,
+        intention_eligible: bool = True,
+        user_message_metadata: dict[str, Any] | None = None,
+        contextual_messages: list[dict[str, Any]] | None = None,
         attachments: list[AttachmentRef] | None = None,
         outbound_attachments: list[dict[str, Any]] | None = None,
         attachment_notice: str | None = None,
@@ -5095,21 +7119,29 @@ class TurnScheduler:
         delivery_id: str | None = None,
         delivery_fallback_text: str | None = None,
         bootstrap_wait_for_intention: bool = False,
-        turn_observers: tuple[TurnObserver, ...] = (),
+        turn_observers: Sequence[TurnObserver] = (),
         client_message_id: str | None = None,
         queue_id: str | None = None,
         one_shot_chat_mode: ChatMode | None = None,
         channel_default_agent_profile_id: str | None = None,
         is_retry: bool = False,
         retry_source_turn_id: str | None = None,
+        retry_reason: RetryReason | str | None = None,
+        retry_attempt: int = 1,
         turn_id: str | None = None,
         checkpoint_conversation: ConversationModel | None = None,
         checkpoint_session: SessionModel | None = None,
+        durable_request_id: str | None = None,
+        durable_lease: Lease | None = None,
+        durable_user_append_session_id: str | None = None,
+        recovery_context: str | None = None,
+        channel_delivery: ChannelDeliveryDescriptor | None = None,
     ) -> None:
         """Launch a turn as a background asyncio.Task."""
         conversation_id = conversation.conversation_id
         control = _TurnControl(turn_observers=list(turn_observers))
         control.active_delivery_id = delivery_id
+        control.channel_delivery = channel_delivery
         turn_id = turn_id or self.new_turn_id()
         control.turn_id = turn_id
         self._turn_controls[conversation_id] = control
@@ -5126,6 +7158,9 @@ class TurnScheduler:
                 agent=agent,
                 content=content,
                 user_email=user_email,
+                intention_eligible=intention_eligible,
+                user_message_metadata=user_message_metadata,
+                contextual_messages=contextual_messages,
                 attachments=attachments,
                 outbound_attachments=outbound_attachments,
                 attachment_notice=attachment_notice,
@@ -5145,9 +7180,16 @@ class TurnScheduler:
                 channel_default_agent_profile_id=channel_default_agent_profile_id,
                 is_retry=is_retry,
                 retry_source_turn_id=retry_source_turn_id,
+                retry_reason=retry_reason,
+                retry_attempt=retry_attempt,
                 owner_task=owner_task,
                 checkpoint_conversation=checkpoint_conversation,
                 checkpoint_session=checkpoint_session,
+                durable_request_id=durable_request_id,
+                durable_lease=durable_lease,
+                durable_user_append_session_id=durable_user_append_session_id,
+                recovery_context=recovery_context,
+                channel_delivery=channel_delivery,
             )
 
         task = asyncio.create_task(_runner())
@@ -5162,6 +7204,7 @@ class TurnScheduler:
         agent: AgentDefinition,
         content: str,
         user_email: str,
+        intention_eligible: bool = True,
         attachments: list[AttachmentRef] | None,
         outbound_attachments: list[dict[str, Any]] | None,
         attachment_notice: str | None,
@@ -5182,9 +7225,18 @@ class TurnScheduler:
         channel_default_agent_profile_id: str | None = None,
         is_retry: bool = False,
         retry_source_turn_id: str | None = None,
+        retry_reason: RetryReason | str | None = None,
+        retry_attempt: int = 1,
         owner_task: asyncio.Task[None] | None = None,
         checkpoint_conversation: ConversationModel | None = None,
         checkpoint_session: SessionModel | None = None,
+        durable_request_id: str | None = None,
+        durable_lease: Lease | None = None,
+        durable_user_append_session_id: str | None = None,
+        recovery_context: str | None = None,
+        channel_delivery: ChannelDeliveryDescriptor | None = None,
+        user_message_metadata: dict[str, Any] | None = None,
+        contextual_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         """Execute a single chat turn."""
         conversation_id = conversation.conversation_id
@@ -5194,10 +7246,19 @@ class TurnScheduler:
         start_time = asyncio.get_running_loop().time()
         turn_type = "system" if system_initiated else "user"
         turn_succeeded = False
+        turn_ambiguous = False
+        ambiguity_detail: dict[str, Any] | None = None
         turn_failure_transient = False
+        durable_retry_pending = False
+        durable_retry_notice_error: TurnError | None = None
+        durable_user_append_phase = (
+            "user_appended" if is_retry or system_initiated else "user_append_pending"
+        )
         if turn_control is None:
             turn_control = _TurnControl(turn_observers=list(turn_observers))
         turn_control.active_delivery_id = delivery_id
+        if channel_delivery is not None:
+            turn_control.channel_delivery = channel_delivery
         turn_control.turn_id = turn_id
         # Keep the mutable control-owned list so observers attached by an
         # in-flight managed wait receive subsequent child progress.
@@ -5207,7 +7268,39 @@ class TurnScheduler:
         resolved_chat_mode = ResolvedChatMode(mode="default", source="system_default")
         user_message_recorded = False
         user_message_event_seq: int | None = None
+        execution_fence = (
+            self._durable_fences.get(durable_request_id) if durable_request_id is not None else None
+        )
+        if (
+            execution_fence is None
+            and self._direct_turn_store is not None
+            and durable_request_id is not None
+            and durable_lease is not None
+        ):
+            execution_fence = DirectTurnExecutionFence(
+                self._direct_turn_store,
+                durable_request_id,
+                durable_lease,
+            )
+        if execution_fence is not None:
+            execution_fence.set_user_append_state(
+                durable_user_append_phase,
+                session_id=(
+                    durable_user_append_session_id
+                    or session.intaris_session_id
+                    or session.session_id
+                ),
+            )
         try:
+            if execution_fence is not None and durable_user_append_phase == "user_append_pending":
+                await execution_fence.checkpoint(
+                    durable_user_append_phase,
+                    session_id=(
+                        durable_user_append_session_id
+                        or session.intaris_session_id
+                        or session.session_id
+                    ),
+                )
             # Idle checkpoint compaction may require an LLM call and must not
             # hold the message-admission request open.  The turn is already
             # registered as active before this background preflight starts, so
@@ -5263,7 +7356,34 @@ class TurnScheduler:
                     ),
                 )
 
+            if durable_request_id is not None and (system_initiated or is_retry):
+                # These paths enter _run_turn after durable ownership is already
+                # established, so their request is no longer queue-visible.
+                self._remove_durable_queue_cache_entry(
+                    conversation_id,
+                    durable_request_id,
+                )
+
             if not system_initiated and not is_retry:
+                if execution_fence is not None:
+                    durable_user_append_phase = "user_append_uncertain"
+                    execution_fence.set_user_append_state(
+                        durable_user_append_phase,
+                        session_id=(
+                            durable_user_append_session_id
+                            or session.intaris_session_id
+                            or session.session_id
+                        ),
+                    )
+                    await execution_fence.checkpoint(
+                        durable_user_append_phase,
+                        intaris_timeout_seconds=30,
+                        session_id=(
+                            durable_user_append_session_id
+                            or session.intaris_session_id
+                            or session.session_id
+                        ),
+                    )
                 (
                     user_message_recorded,
                     user_message_event_seq,
@@ -5272,12 +7392,43 @@ class TurnScheduler:
                     agent=agent,
                     user_email=user_email,
                     content=content,
+                    intention_eligible=intention_eligible,
+                    user_message_metadata=user_message_metadata or message_metadata(),
+                    contextual_messages=contextual_messages,
                     attachments=attachments or [],
                     turn_id=turn_id,
                     client_message_id=client_message_id,
                     chat_mode=resolved_chat_mode,
                     cancel_event=cancel_event,
+                    intaris_session_id_override=durable_user_append_session_id,
                 )
+                if execution_fence is not None:
+                    durable_user_append_phase = "user_appended"
+                    execution_fence.set_user_append_state(
+                        durable_user_append_phase,
+                        session_id=(
+                            durable_user_append_session_id
+                            or session.intaris_session_id
+                            or session.session_id
+                        ),
+                    )
+                    await execution_fence.checkpoint(durable_user_append_phase)
+                    await execution_fence.assert_current()
+                    direct_turn_store = self._direct_turn_store
+                    if direct_turn_store is None or durable_request_id is None:
+                        raise StaleDirectTurnOwner(turn_id)
+                    marked_running = await direct_turn_store.mark_running(
+                        durable_request_id,
+                        lease=durable_lease,
+                    )
+                    if marked_running is None:
+                        raise StaleDirectTurnOwner(durable_request_id)
+                    self._remove_durable_queue_cache_entry(
+                        conversation_id,
+                        durable_request_id,
+                    )
+                    await self._publish_durable_turn_change(marked_running)
+                    await execution_fence.checkpoint("model_wait")
 
             if attachment_notice:
                 await self._notify_observers_system_message(
@@ -5314,7 +7465,7 @@ class TurnScheduler:
                 )
             )
 
-            if is_retry:
+            if is_retry and normalize_retry_reason(retry_reason) is RetryReason.MANUAL_RETRY:
                 await self._persist_retry_turn_notice(
                     conversation_id=conversation_id,
                     session=session,
@@ -5322,6 +7473,8 @@ class TurnScheduler:
                     user_email=user_email,
                     turn_id=turn_id,
                     retry_source_turn_id=retry_source_turn_id,
+                    retry_reason=retry_reason,
+                    retry_attempt=retry_attempt,
                     turn_observers=turn_observers,
                 )
 
@@ -5382,6 +7535,7 @@ class TurnScheduler:
                     created_by_agent_id=agent.agent_id,
                     source_type="chat",
                     source_ref=conversation_id,
+                    source_session_id=session.session_id,
                     delivery=TaskDelivery(mode="same_conversation"),
                     workflow_id=workflow_id,
                     project_id=getattr(conversation, "project_id", None),
@@ -5455,6 +7609,22 @@ class TurnScheduler:
                 turn_id=turn_id,
                 source_turn_id=source_turn_id,
             )
+            if platform_data.get("kind") == "task_control":
+                from cognis.core.task_control import build_task_control_turn_context
+
+                task_id = platform_data.get("task_id")
+                if not isinstance(task_id, str) or not task_id:
+                    raise PermissionError("Task control conversation is missing task scope")
+                task_control_context = await build_task_control_turn_context(
+                    self._session_factory,
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                )
+                recovery_context = (
+                    f"{task_control_context}\n\n{recovery_context}"
+                    if recovery_context
+                    else task_control_context
+                )
 
             # Execute the turn
             step_output = await self._workflow_engine.run_direct_turn(
@@ -5462,6 +7632,9 @@ class TurnScheduler:
                 session=session,
                 agent=agent,
                 user_message=content,
+                intention_eligible=intention_eligible,
+                user_message_metadata=user_message_metadata,
+                contextual_messages=contextual_messages,
                 user_attachments=attachments,
                 attachment_notice=attachment_notice,
                 attachment_context=attachment_context,
@@ -5486,6 +7659,16 @@ class TurnScheduler:
                     conversation_id,
                     reason=reason,
                 ),
+                wait_for_boundary_input=lambda after_generation=None: self.wait_for_boundary_input(
+                    conversation_id,
+                    after_generation=after_generation,
+                ),
+                get_boundary_action_generation=lambda: self.boundary_action_generation(
+                    conversation_id
+                ),
+                signal_actionable_boundary_event=lambda: self.signal_actionable_boundary_event(
+                    conversation_id
+                ),
                 get_current_assistant_phase=lambda: self._assistant_phase_by_turn.get(
                     (conversation_id, turn_id), 0
                 ),
@@ -5498,9 +7681,33 @@ class TurnScheduler:
                     conversation_id, turn_id, call_id
                 ),
                 same_turn_tool_call_ledger=same_turn_tool_call_ledger,
+                execution_fence=execution_fence,
+                recovery_context=recovery_context,
+                on_absorbed_append_start=(
+                    lambda request_id, intaris_session_id: self._checkpoint_durable_absorbed_append(
+                        request_id,
+                        durable_lease,
+                        intaris_session_id,
+                    )
+                )
+                if durable_lease is not None
+                else None,
+                on_absorbed_persisted=(
+                    lambda request_id: self._mark_durable_absorbed(
+                        request_id,
+                        durable_lease,
+                    )
+                )
+                if durable_lease is not None
+                else None,
             )
             continuation_metadata = _automatic_continuation_metadata(step_output)
             continuation_scheduled = False
+            if execution_fence is not None:
+                await execution_fence.checkpoint(
+                    "model_response",
+                    session_id=session.intaris_session_id or session.session_id,
+                )
             if (
                 continuation_metadata is not None
                 and not channel_deliverable
@@ -5521,7 +7728,17 @@ class TurnScheduler:
 
             step_error = _turn_error_from_step_output(step_output)
             if step_error is not None and not continuation_scheduled:
-                turn_failure_transient = step_error.transient
+                retry_pending, step_error = await self._prepare_durable_transient_retry(
+                    request_id=durable_request_id,
+                    lease=durable_lease,
+                    error=step_error,
+                    execution_fence=execution_fence,
+                )
+                durable_retry_pending = retry_pending
+                durable_retry_notice_error = step_error if retry_pending else None
+                turn_failure_transient = retry_pending or (
+                    step_error.transient and durable_request_id is None
+                )
                 logger.warning(
                     "turn_scheduler: turn step returned error",
                     extra={
@@ -5532,11 +7749,24 @@ class TurnScheduler:
                         }
                     },
                 )
+                if retry_pending:
+                    await self._cleanup_durable_retry_attempt(
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                    )
+                    return
                 turn_control.settled = True
                 selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
                 await self._suppress_absorbed_channel_delivery_intents(
                     turn_control,
                     selected_delivery_id=selected_delivery_id,
+                )
+                await self._persist_direct_turn_step_error_delivery(
+                    request_id=durable_request_id,
+                    lease=durable_lease,
+                    descriptor=turn_control.channel_delivery,
+                    error=step_error,
                 )
                 await self._publish_turn_error(
                     conversation_id,
@@ -5568,7 +7798,7 @@ class TurnScheduler:
 
             last_seq = 0
             try:
-                entry = await self._session_cache.refresh(session)
+                entry = await self._post_turn_cache_entry(session)
                 last_seq = entry.last_event_seq
             except Exception:
                 logger.warning(
@@ -5675,6 +7905,14 @@ class TurnScheduler:
                     retry_source_turn_id=retry_source_turn_id,
                     retry_turn_id=turn_id,
                 )
+            if durable_request_id is not None and durable_lease is not None:
+                await self._persist_direct_turn_terminal_delivery(
+                    request_id=durable_request_id,
+                    lease=durable_lease,
+                    descriptor=turn_control.channel_delivery,
+                    content=result.final_content or "",
+                    attachments=result.attachments,
+                )
             await self._publish_turn_completed(result, turn_observers=turn_observers)
             TURNS_TOTAL.labels(outcome="completed").inc()
             turn_succeeded = True
@@ -5691,6 +7929,32 @@ class TurnScheduler:
             )
 
         except asyncio.CancelledError:
+            if (
+                durable_request_id is not None
+                and durable_request_id in self._interrupted_durable_requests
+            ):
+                current = (
+                    await self._direct_turn_store.get(durable_request_id)
+                    if self._direct_turn_store is not None
+                    else None
+                )
+                self._interrupted_durable_requests.discard(durable_request_id)
+                if (
+                    current is not None
+                    and current.status == DirectTurnStatus.RECOVERABLE.value
+                    and current.cancel_requested_at is None
+                ):
+                    durable_retry_pending = True
+                    turn_failure_transient = True
+                    turn_control.settled = True
+                    await self._cleanup_durable_retry_attempt(
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                    )
+                    return
+            durable_retry_pending = False
+            turn_failure_transient = False
             turn_control.settled = True
             completed_at = datetime.now(UTC)
             selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
@@ -5791,19 +8055,90 @@ class TurnScheduler:
                 },
             )
 
-        except Exception as exc:
-            logger.exception(
-                "turn_scheduler: turn failed",
-                extra={"extra_data": {"conversation_id": conversation_id}},
+        except StaleDirectTurnOwner:
+            logger.warning(
+                "turn_scheduler: stale direct-turn owner discarded",
+                extra={"extra_data": {"conversation_id": conversation_id, "turn_id": turn_id}},
             )
+            return
+        except Exception as exc:
+            try:
+                logger.exception(
+                    "turn_scheduler: turn failed",
+                    extra={"extra_data": {"conversation_id": conversation_id}},
+                )
+                error = await self._classify_turn_error(exc)
+                if isinstance(exc, AmbiguousToolOutcome):
+                    turn_ambiguous = True
+                    ambiguity_detail = exc.detail()
+                retry_pending, error = await self._prepare_durable_transient_retry(
+                    request_id=durable_request_id,
+                    lease=durable_lease,
+                    error=error,
+                    execution_fence=execution_fence,
+                )
+                durable_retry_pending = retry_pending
+                durable_retry_notice_error = error if retry_pending else None
+                turn_failure_transient = retry_pending or (
+                    error.transient and durable_request_id is None
+                )
+                if retry_pending:
+                    await self._cleanup_durable_retry_attempt(
+                        conversation_id=conversation_id,
+                        session_id=session.session_id,
+                        turn_id=turn_id,
+                    )
+                    return
+            except asyncio.CancelledError:
+                durable_retry_pending = False
+                turn_failure_transient = False
+                cancel_event.set()
+                turn_control.settled = True
+                selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
+                await self._suppress_absorbed_channel_delivery_intents(
+                    turn_control,
+                    selected_delivery_id=selected_delivery_id,
+                )
+                await self._publish_turn_error(
+                    conversation_id,
+                    session.session_id,
+                    TurnError(
+                        code="turn_cancelled",
+                        message="The current turn was cancelled.",
+                        recoverable=True,
+                    ),
+                    turn_id=turn_id,
+                    system_initiated=system_initiated,
+                    channel_deliverable=(
+                        channel_deliverable or turn_control.absorbed_channel_deliverable
+                    ),
+                    delivery_id=selected_delivery_id,
+                    delivery_fallback_text=(
+                        turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                    ),
+                    chat_mode=resolved_chat_mode.mode,
+                    chat_mode_source=resolved_chat_mode.source,
+                    turn_observers=turn_observers,
+                    durable_session=session,
+                    durable_agent=agent,
+                    durable_user_email=user_email,
+                )
+                return
             turn_control.settled = True
-            error = await self._classify_turn_error(exc)
-            turn_failure_transient = error.transient
             selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
             await self._suppress_absorbed_channel_delivery_intents(
                 turn_control,
                 selected_delivery_id=selected_delivery_id,
             )
+            if durable_request_id is not None and durable_lease is not None and not error.transient:
+                await self._persist_direct_turn_terminal_delivery(
+                    request_id=durable_request_id,
+                    lease=durable_lease,
+                    descriptor=turn_control.channel_delivery,
+                    content=error.message,
+                    attachments=None,
+                    error=True,
+                )
             await self._publish_turn_error(
                 conversation_id,
                 session.session_id,
@@ -5827,6 +8162,92 @@ class TurnScheduler:
             TURNS_TOTAL.labels(outcome="error").inc()
 
         finally:
+            if (
+                execution_fence is not None
+                and durable_request_id is not None
+                and durable_lease is not None
+            ):
+                settled_status: DirectTurnStatus | None = None
+                with contextlib.suppress(StaleDirectTurnOwner):
+                    await execution_fence.assert_current()
+                    settled_status = await self._settle_durable_direct_turn(
+                        request_id=durable_request_id,
+                        lease=durable_lease,
+                        turn_id=turn_id,
+                        succeeded=turn_succeeded,
+                        ambiguous=turn_ambiguous,
+                        ambiguity_detail=ambiguity_detail,
+                        cancelled=cancel_event.is_set(),
+                        transient_failure=turn_failure_transient,
+                        transient_phase=durable_user_append_phase,
+                        transient_session_id=(
+                            durable_user_append_session_id
+                            or session.intaris_session_id
+                            or session.session_id
+                        ),
+                        interruption_reason=execution_fence.interruption_reason,
+                        source_phase=execution_fence.last_phase,
+                        retry_after_seconds=execution_fence.retry_after_seconds,
+                    )
+                if settled_status is DirectTurnStatus.CANCELLED and durable_retry_pending:
+                    durable_retry_pending = False
+                    durable_retry_notice_error = None
+                    turn_failure_transient = False
+                    turn_control.settled = True
+                    await self._publish_turn_error(
+                        conversation_id,
+                        session.session_id,
+                        TurnError(
+                            code="turn_cancelled",
+                            message="The current turn was cancelled.",
+                            recoverable=True,
+                        ),
+                        turn_id=turn_id,
+                        system_initiated=system_initiated,
+                        channel_deliverable=(
+                            channel_deliverable or turn_control.absorbed_channel_deliverable
+                        ),
+                        delivery_id=delivery_id or turn_control.absorbed_delivery_id,
+                        delivery_fallback_text=(
+                            turn_control.absorbed_delivery_fallback_text or delivery_fallback_text
+                        ),
+                        chat_mode=resolved_chat_mode.mode,
+                        chat_mode_source=resolved_chat_mode.source,
+                        turn_observers=turn_observers,
+                        durable_session=session,
+                        durable_agent=agent,
+                        durable_user_email=user_email,
+                    )
+                    direct_turn_store = self._direct_turn_store
+                    if direct_turn_store is None or (
+                        await direct_turn_store.mark_terminal(
+                            durable_request_id,
+                            lease=durable_lease,
+                            status=DirectTurnStatus.CANCELLED,
+                            outcome={"phase": "cancelled_during_transient_retry"},
+                        )
+                        is None
+                    ):
+                        raise StaleDirectTurnOwner(durable_request_id)
+                if (
+                    settled_status is DirectTurnStatus.RECOVERABLE
+                    and durable_retry_pending
+                    and durable_retry_notice_error is not None
+                ):
+                    await self._notify_durable_retry_pending(
+                        conversation_id=conversation_id,
+                        turn_id=turn_id,
+                        error=durable_retry_notice_error,
+                        turn_observers=turn_observers,
+                    )
+                if durable_retry_pending:
+                    self._durable_turn_observers[durable_request_id] = tuple(
+                        turn_control.turn_observers
+                    )
+                else:
+                    self._durable_turn_observers.pop(durable_request_id, None)
+                if self._direct_turn_runtime is not None:
+                    await self._direct_turn_runtime.wake()
             duration = asyncio.get_running_loop().time() - start_time
             TURN_DURATION.labels(type=turn_type).observe(duration)
             queued_to_drain: _QueuedMessage | None = None
@@ -5870,6 +8291,7 @@ class TurnScheduler:
                 if control_matches:
                     self._turn_controls.pop(conversation_id, None)
                     self._turn_sessions.pop(conversation_id, None)
+                    self._boundary_action_generations.pop(conversation_id, None)
                 if (
                     self._pause_waiter.find_pending(
                         pause_type="escalation",
@@ -5888,9 +8310,11 @@ class TurnScheduler:
                 # Only the task that still owns the active-turn slot may drain
                 # the queue.  A stale/cancelled task must never delete a newer
                 # task's ownership metadata or launch work in parallel with it.
-                queue = self._queued_messages.get(conversation_id)
-                if active_matches and control_matches and queue:
-                    queued_to_drain = queue.popleft()
+                async with self._admission_drain_lock:
+                    queue = self._queued_messages.get(conversation_id)
+                    if active_matches and control_matches and queue:
+                        queued_to_drain = queue.popleft()
+                        self._queued_relaunches[queued_to_drain.queue_id] = conversation_id
 
             while queued_to_drain is not None:
                 queued = queued_to_drain
@@ -5902,10 +8326,13 @@ class TurnScheduler:
                             account_id=getattr(queued, "channel_account_id", None),
                         )
                     )
-                    error = await self.submit_turn(
+                    queued_error = await self.submit_turn(
                         conversation_id,
                         queued.content,
                         user_email=queued.user_email,
+                        intention_eligible=getattr(queued, "intention_eligible", True),
+                        user_message_metadata=getattr(queued, "user_message_metadata", None),
+                        contextual_messages=getattr(queued, "contextual_messages", None),
                         attachments=queued.attachments,
                         outbound_attachments=queued.outbound_attachments,
                         system_initiated=queued.system_initiated,
@@ -5921,24 +8348,29 @@ class TurnScheduler:
                         one_shot_chat_mode=queued.one_shot_chat_mode,
                         channel_default_agent_profile_id=queued_channel_profile_id,
                         channel_account_id=getattr(queued, "channel_account_id", None),
+                        channel_delivery=getattr(queued, "channel_delivery", None),
                         turn_id=getattr(queued, "turn_id", None),
+                        is_retry=getattr(queued, "is_retry", False),
+                        retry_source_turn_id=getattr(queued, "retry_source_turn_id", None),
+                        retry_reason=getattr(queued, "retry_reason", None),
+                        retry_attempt=getattr(queued, "retry_attempt", 1),
                     )
-                    relaunch_accepted = error is None
+                    relaunch_accepted = queued_error is None
                     await self._notify_queue_updated(
                         conversation_id, turn_observers=queued.turn_observers
                     )
-                    if error is not None and queued.follow_up is not None:
+                    if queued_error is not None and queued.follow_up is not None:
                         await self._mark_follow_up_intent(
                             conversation_id,
                             queued.follow_up.follow_up_id,
-                            status="pending" if error.transient else "failed",
-                            error=error.message,
+                            status="pending" if queued_error.transient else "failed",
+                            error=queued_error.message,
                         )
-                    if error is not None:
+                    if queued_error is not None:
                         await self._publish_turn_error(
                             conversation_id,
                             getattr(queued, "session_id", None) or "",
-                            error,
+                            queued_error,
                             turn_id=getattr(queued, "turn_id", None),
                             system_initiated=queued.system_initiated,
                             channel_deliverable=queued.channel_deliverable,
@@ -5974,11 +8406,18 @@ class TurnScheduler:
                         "turn_scheduler: failed to load runtime for queued message",
                         extra={"extra_data": {"conversation_id": conversation_id}},
                     )
+                finally:
+                    self._queued_relaunches.pop(queued.queue_id, None)
                 if relaunch_accepted:
                     break
-                async with self._turn_lock(conversation_id):
+                async with (
+                    self._turn_lock(conversation_id),
+                    self._admission_drain_lock,
+                ):
                     queue = self._queued_messages.get(conversation_id)
                     queued_to_drain = queue.popleft() if queue else None
+                    if queued_to_drain is not None:
+                        self._queued_relaunches[queued_to_drain.queue_id] = conversation_id
 
     async def _current_channel_default_agent_profile_id(
         self,
@@ -6398,10 +8837,16 @@ class TurnScheduler:
         *,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> list[TurnObserver]:
-        observers: list[TurnObserver] = list(self._observers.get(conversation_id, []))
+        observers: list[TurnObserver] = []
+        for observer in (
+            *self._global_observers,
+            *self._observers.get(conversation_id, []),
+        ):
+            if not any(registered is observer for registered in observers):
+                observers.append(observer)
         for observer in turn_observers or ():
             if (
-                observer not in observers
+                not any(registered is observer for registered in observers)
                 and (conversation_id, id(observer)) not in self._disabled_observers
             ):
                 observers.append(observer)
@@ -6435,6 +8880,9 @@ class TurnScheduler:
         kind: str | None = None,
         scope: str | None = None,
         turn_id: str | None = None,
+        retry_reason: str | None = None,
+        retry_source_turn_id: str | None = None,
+        attempt: int | None = None,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Send a system message to all observers."""
@@ -6447,6 +8895,9 @@ class TurnScheduler:
             kind,
             scope,
             turn_id,
+            retry_reason,
+            retry_source_turn_id,
+            attempt,
             turn_observers=turn_observers,
         )
 
@@ -6457,6 +8908,7 @@ class TurnScheduler:
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
+        await self._assert_durable_conversation_fence(result.conversation_id)
         await self._reset_active_stream(result.conversation_id)
         # Clear any lingering active-thinking state for this session so that a
         # subsequent conversation_runtime_snapshot on reconnect never re-emits
@@ -6514,6 +8966,13 @@ class TurnScheduler:
                 },
             )
         )
+        cluster_signals = getattr(self, "cluster_signals", None)
+        if cluster_signals is not None:
+            await cluster_signals.publish_chat_change(
+                result.conversation_id,
+                session_id=result.session_id,
+                revision=result.last_seq,
+            )
         self._settle_turn_waiters(result.conversation_id, result)
         await asyncio.gather(
             *(
@@ -6543,8 +9002,17 @@ class TurnScheduler:
 
         async with self._session_factory() as db_session:
             grace_row = await get_channel_delivery_outbox(db_session, result.delivery_id)
-            if grace_row is not None and grace_row.source_type != "follow_up":
+            if grace_row is None or grace_row.source_type not in {
+                "follow_up",
+                "task_result_follow_up",
+            }:
                 return
+            authorized_attachments = await authorize_outbound_artifact_refs_in_session(
+                db_session,
+                result.attachments or [],
+                user_email=grace_row.user_email,
+                conversation_id=result.conversation_id,
+            )
             await ensure_follow_up_result_delivery(
                 db_session,
                 grace_delivery_id=result.delivery_id,
@@ -6552,13 +9020,90 @@ class TurnScheduler:
                 session_id=result.session_id,
                 turn_id=result.turn_id,
                 final_content=result.final_content,
-                attachments=strip_attachment_payload_bytes(result.attachments or []) or None,
+                attachments=authorized_attachments or None,
                 deliverable_id=result.final_deliverable_id,
             )
             await db_session.commit()
 
     async def _notify_managed_turn_result(self, result: TurnResult) -> bool:
         """Update managed-conversation state for a completed scheduler turn."""
+
+        if not callable(self._session_factory):
+            return False
+        from cognis.store import queries
+
+        async with self._session_factory() as db_session:
+            binding = await queries.get_managed_channel_binding_for_target(
+                db_session,
+                result.conversation_id,
+                for_update=True,
+            )
+            if binding is not None:
+                link = await queries.get_managed_conversation_link(
+                    db_session,
+                    binding.link_id,
+                    for_update=True,
+                )
+            else:
+                link = await queries.get_managed_conversation_link_for_target(
+                    db_session, result.conversation_id
+                )
+            if link is not None and link.completion_policy == "explicit":
+                if link.conversation_state != "open":
+                    return True
+                if binding is not None and link.last_result_turn_id == result.turn_id:
+                    return True
+                next_turn_state = (
+                    "waiting_controller" if link.turn_state == "waiting_controller" else "idle"
+                )
+                link.conversation_state = "open"
+                link.turn_state = next_turn_state
+                link.active_turn_id = None
+                link.notify_on_completion = False
+                link.last_result_summary = result.final_content
+                link.last_result_turn_id = result.turn_id
+                link.updated_at = datetime.now(UTC)
+                if binding is not None and next_turn_state == "idle":
+                    binding.version += 1
+                    now = datetime.now(UTC)
+                    if result.final_content or result.attachments:
+                        authorized_attachments = await authorize_outbound_artifact_refs_in_session(
+                            db_session,
+                            result.attachments or [],
+                            user_email=binding.user_email,
+                            conversation_id=link.target_conversation_id,
+                        )
+                        stable = hashlib.sha256(
+                            (
+                                f"{binding.binding_id}:{result.turn_id}:"
+                                f"{binding.version}:{link.owner_epoch}"
+                            ).encode()
+                        ).hexdigest()[:24]
+                        await queries.create_or_get_channel_delivery_outbox(
+                            db_session,
+                            delivery_id=f"cdel_mcf_{stable}",
+                            user_email=binding.user_email,
+                            conversation_id=link.target_conversation_id,
+                            session_id=result.session_id,
+                            source_type="managed_channel_final",
+                            source_id=str(result.turn_id),
+                            channel_type=binding.channel_type,
+                            account_id=binding.account_id,
+                            chat_id=binding.chat_id,
+                            thread_id=binding.thread_key or None,
+                            fallback_text=result.final_content,
+                            attachments=authorized_attachments,
+                            next_attempt_at=now,
+                            managed_binding_id=binding.binding_id,
+                            managed_binding_version=binding.version,
+                            managed_owner_epoch=link.owner_epoch,
+                        )
+                        binding.state = "delivery_pending"
+                    else:
+                        binding.state = "waiting_external"
+                    binding.updated_at = now
+                await db_session.commit()
+                return True
 
         cancelled_partial = result.partial and result.finish_reason == "user_cancelled"
         if cancelled_partial:
@@ -6608,6 +9153,7 @@ class TurnScheduler:
         durable_user_email: str | None = None,
     ) -> None:
         """Notify observers and publish lifecycle event."""
+        await self._assert_durable_conversation_fence(conversation_id)
         if getattr(error, "turn_id", None) is None:
             error.turn_id = turn_id
         if (
@@ -6677,6 +9223,13 @@ class TurnScheduler:
                 },
             )
         )
+        cluster_signals = getattr(self, "cluster_signals", None)
+        if cluster_signals is not None:
+            await cluster_signals.publish_chat_change(
+                conversation_id,
+                session_id=session_id,
+                revision=turn_id or datetime.now(UTC),
+            )
         self._settle_turn_waiters(conversation_id, error)
         await asyncio.gather(
             *(
@@ -6728,6 +9281,7 @@ class TurnScheduler:
         for future in waiters:
             if not future.done():
                 future.set_result(value)
+        self._signal_turn_scope_change(conversation_id)
 
     async def _notify_managed_conversation_controller(
         self,
@@ -6744,9 +9298,12 @@ class TurnScheduler:
         clear_active_turn: bool = True,
         notify_on_completion: bool = True,
         completed: bool | None = None,
-    ) -> None:
+        already_settled: bool = False,
+    ) -> bool:
         """Update managed-conversation state and notify the controller when requested."""
 
+        if not callable(self._session_factory):
+            return True
         follow_up: dict[str, Any] | None = None
         controller_conversation_id: str | None = None
         try:
@@ -6774,21 +9331,28 @@ class TurnScheduler:
                 control_metadata = (
                     link.control_metadata if isinstance(link.control_metadata, dict) else {}
                 )
-                settled = await queries.settle_managed_conversation_link(
-                    db_session,
-                    link.link_id,
-                    expected_active_turn_id=turn_id,
-                    conversation_state=conversation_state,
-                    turn_state=turn_state,
-                    target_session_id=target_session_id,
-                    last_result_summary=summary,
-                    last_error=error_message,
-                    clear_active_turn_id=clear_active_turn,
-                    clear_notify_on_completion=notify_on_completion,
-                    completed=completed
-                    if completed is not None
-                    else conversation_state == "completed",
-                )
+                if already_settled:
+                    settled = bool(
+                        link.handoff_state == "fallback_claimed"
+                        and link.handoff_target_turn_id == turn_id
+                        and link.last_result_turn_id == turn_id
+                    )
+                else:
+                    settled = await queries.settle_managed_conversation_link(
+                        db_session,
+                        link.link_id,
+                        expected_active_turn_id=turn_id,
+                        conversation_state=conversation_state,
+                        turn_state=turn_state,
+                        target_session_id=target_session_id,
+                        last_result_summary=summary,
+                        last_error=error_message,
+                        clear_active_turn_id=clear_active_turn,
+                        clear_notify_on_completion=notify_on_completion,
+                        completed=completed
+                        if completed is not None
+                        else conversation_state == "completed",
+                    )
                 if not settled:
                     logger.info(
                         "turn_scheduler: ignored stale managed conversation settlement",
@@ -6799,6 +9363,7 @@ class TurnScheduler:
                                 "expected_active_turn_id": turn_id,
                                 "durable_active_turn_id": link.active_turn_id,
                                 "turn_state": turn_state,
+                                "already_settled": already_settled,
                             }
                         },
                     )
@@ -6878,8 +9443,18 @@ class TurnScheduler:
                 await self._persist_follow_up_intent(
                     db_session,
                     conversation_id=link.controller_conversation_id,
-                    follow_up=follow_up,
+                    event_payload={
+                        "conversation_id": link.controller_conversation_id,
+                        "origin_session_id": link.controller_session_id,
+                        "follow_up": follow_up,
+                    },
                 )
+                if already_settled:
+                    await queries.clear_claimed_managed_conversation_join_notification(
+                        db_session,
+                        link.link_id,
+                        target_turn_id=turn_id,
+                    )
                 await db_session.commit()
         except Exception:
             logger.warning(
@@ -6895,6 +9470,7 @@ class TurnScheduler:
                         type=EventType.FOLLOW_UP_TURN_REQUESTED,
                         data={
                             "conversation_id": controller_conversation_id,
+                            "origin_session_id": link.controller_session_id,
                             "follow_up": follow_up,
                         },
                     )
@@ -6954,6 +9530,13 @@ class TurnScheduler:
 
     async def _classify_turn_error(self, error: Exception) -> TurnError:
         """Classify a turn error into a structured TurnError."""
+        if isinstance(error, AmbiguousToolOutcome):
+            return TurnError(
+                code="tool_outcome_ambiguous",
+                message=str(error),
+                recoverable=True,
+                transient=False,
+            )
         return await classify_turn_error(self._providers, error)
 
     # ------------------------------------------------------------------
@@ -7090,6 +9673,7 @@ class TurnScheduler:
                         current_session=session_model,
                         intention=intention,
                         completion_reason="compacted",
+                        transition=SessionTransition.COMPACT,
                         compaction_summary=compaction_summary,
                         tail_events=tail_events,
                     )
@@ -7229,6 +9813,17 @@ class TurnScheduler:
                 },
             )
             return None
+
+    async def _post_turn_cache_entry(self, session: Any) -> Any:
+        """Return authoritative cached state without an unnecessary Intaris read."""
+        entry = self._session_cache.get_entry(session.session_id)
+        if (
+            entry is None
+            or not bool(getattr(entry, "initialized", False))
+            or bool(getattr(entry, "canonical_stale", False))
+        ):
+            return await self._session_cache.refresh(session)
+        return entry
 
     async def _touch_conversation(
         self, conversation_id: str, *, when: datetime | None = None

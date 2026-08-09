@@ -77,6 +77,81 @@ def json_safe_inference_payload(value: Any) -> Any:
     return value
 
 
+def image_generation_result_payload(value: Any, model: str) -> dict[str, Any]:
+    """Normalize image-generation responses for the controller RPC contract."""
+    payload = json_safe_inference_payload(value)
+    if not isinstance(payload, dict):
+        return {"images": [], "model": model}
+
+    images: list[dict[str, Any]] = []
+    for item in payload.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("b64_json") or item.get("url"):
+            images.append(
+                {
+                    "b64_json": item.get("b64_json"),
+                    "url": item.get("url"),
+                    "content_type": item.get("content_type") or "image/png",
+                    "revised_prompt": item.get("revised_prompt"),
+                }
+            )
+
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        for item in message.get("images") or []:
+            if not isinstance(item, dict):
+                continue
+            image_url = item.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else item.get("url")
+            if isinstance(url, str) and url:
+                b64_json, content_type = _image_data_url_parts(url)
+                images.append(
+                    {
+                        "b64_json": b64_json,
+                        "url": None if b64_json else url,
+                        "content_type": content_type,
+                    }
+                )
+        content = message.get("content")
+        for part in content if isinstance(content, list) else []:
+            if not isinstance(part, dict):
+                continue
+            image_url = part.get("image_url")
+            url = image_url.get("url") if isinstance(image_url, dict) else None
+            inline_data = part.get("inline_data")
+            if isinstance(inline_data, dict):
+                b64_json = inline_data.get("data")
+                content_type = inline_data.get("mime_type") or "image/png"
+                if isinstance(b64_json, str) and b64_json:
+                    images.append({"b64_json": b64_json, "content_type": content_type})
+            elif isinstance(url, str) and url:
+                b64_json, content_type = _image_data_url_parts(url)
+                images.append(
+                    {
+                        "b64_json": b64_json,
+                        "url": None if b64_json else url,
+                        "content_type": content_type,
+                    }
+                )
+
+    return {"images": images, "model": model}
+
+
+def _image_data_url_parts(url: str) -> tuple[str | None, str]:
+    if not url.startswith("data:"):
+        return None, "image/png"
+    header, separator, encoded = url.partition(",")
+    if not separator:
+        return None, "image/png"
+    content_type = header[5:].split(";", 1)[0] or "image/png"
+    return encoded, content_type
+
+
 def redact_inference_request(request: CognisInferenceRequest) -> dict[str, Any]:
     """Summarize an inference request without exposing prompt or credentials."""
 

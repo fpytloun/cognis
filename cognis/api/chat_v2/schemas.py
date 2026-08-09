@@ -12,6 +12,8 @@ from cognis.models.config import GenerationPerformanceSnapshot
 SchemaVersion = Literal[2]
 ChatMode = Literal["default", "plan", "build"]
 TimelineScopeKind = Literal["conversation", "session", "task_step"]
+WorkCategory = Literal["files", "commands", "mutations", "artifacts", "deliverables"]
+ActivityOverviewDetail = Literal["lightweight", "full"]
 TimelineItemStatus = Literal[
     "pending",
     "running",
@@ -19,6 +21,7 @@ TimelineItemStatus = Literal[
     "complete",
     "failed",
     "cancelled",
+    "denied",
     "compacted",
     "skipped",
 ]
@@ -38,6 +41,18 @@ class StrictModel(BaseModel):
     """Base model for v2 public contracts."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True, strict=True)
+
+
+class ClientPerformanceRequest(StrictModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        strict=True,
+        allow_inf_nan=False,
+    )
+
+    metric: Literal["cached_restore_ms", "timeline_fresh_ms"]
+    duration_ms: float = Field(ge=0, le=300_000)
 
 
 def _ensure_canonical_timeline_items(items: list[TimelineItem]) -> None:
@@ -98,6 +113,21 @@ class FileDiffRef(StrictModel):
 
     path: str
     diff: str
+    status: str | None = None
+    old_path: str | None = None
+    binary: bool = False
+    generated: bool = False
+    truncated: bool = False
+    preview_omitted: bool = False
+    path_id: str | None = None
+    relative_path: str | None = None
+    root_label: str | None = None
+    root_name: str | None = None
+    root_id: str | None = None
+    additions: int | None = Field(default=None, ge=0)
+    deletions: int | None = Field(default=None, ge=0)
+    content_truncated: bool = False
+    source_workstream: WorkstreamRef | None = None
 
 
 class ThinkingBlock(StrictModel):
@@ -150,6 +180,8 @@ class MessageTimelineItem(TimelineItemBase):
     notice_id: str | None = None
     notice_kind: str | None = None
     notice_scope: str | None = None
+    retry_reason: str | None = None
+    retry_source_turn_id: str | None = None
     reason_class: str | None = None
     provider_id: str | None = None
     model: str | None = None
@@ -286,6 +318,27 @@ class CredentialRequestTimelineItem(TimelineItemBase):
     status: Literal["waiting", "complete", "cancelled", "failed"]
 
 
+class UserInteractionAnswer(StrictModel):
+    """One safe, user-visible answer from a resolved interaction."""
+
+    question: str | None = None
+    answer: str
+
+
+class UserInteractionTimelineItem(TimelineItemBase):
+    """A user action that resolved a non-message interaction."""
+
+    kind: Literal["user_interaction"] = "user_interaction"
+    interaction_id: str
+    interaction_type: str
+    origin_call_id: str | None = None
+    origin_tool_name: str | None = None
+    title: str
+    summary: str | None = None
+    answers: list[UserInteractionAnswer] = Field(default_factory=list)
+    status: Literal["complete", "cancelled", "denied", "failed"]
+
+
 class TodoStateTimelineItem(TimelineItemBase):
     kind: Literal["todo_state"] = "todo_state"
     todos: list[dict[str, Any]] = Field(default_factory=list)
@@ -359,6 +412,7 @@ TimelineItem = Annotated[
     | QuestionSetTimelineItem
     | AuthChallengeTimelineItem
     | CredentialRequestTimelineItem
+    | UserInteractionTimelineItem
     | TodoStateTimelineItem
     | ArtifactTimelineItem
     | AssistantDeliverableTimelineItem
@@ -473,7 +527,217 @@ class ChatSnapshot(StrictModel):
     state: ConversationStateView
     queue: QueueState
     runtime: RuntimeOverlaySnapshot
+    activity_overview: ActivityOverviewResponse | None = None
     cursor: str
+    server_time: str
+
+
+class WorkstreamRef(StrictModel):
+    key: str
+    kind: str
+    parent_key: str | None = None
+    root_key: str
+    edge_kind: str
+    ordinal: int = Field(ge=0)
+    conversation_id: str | None = None
+    session_id: str
+    event_store_session_id: str
+    task_id: str | None = None
+    step_run_id: str | None = None
+    link_id: str | None = None
+    title: str
+    agent_id: str
+    agent_profile_id: str | None = None
+    status: str
+    attempt: int | None = None
+    step_name: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    current: bool = False
+    superseded: bool = False
+    summary: WorkSummary | None = None
+    activity_state: Literal["ongoing", "active", "closed"] | None = None
+    activity_scope_id: str | None = None
+    completion_reason: str | None = None
+    completed_at: str | None = None
+    model: str | None = None
+    reasoning_effort: str | None = None
+    agent_display_name: str | None = None
+    agent_avatar_url: str | None = None
+    backing_session_count: int = Field(default=1, ge=1)
+    backing_session_ids: list[str] = Field(default_factory=list)
+
+
+class WorkDeliverable(StrictModel):
+    deliverable_id: str
+    sort_key: str = ""
+    format: str
+    title: str | None = None
+    content: str | None = None
+    content_preview_truncated: bool = False
+    recoverable: bool = True
+    render_metadata: dict[str, Any] | None = None
+    export_metadata: dict[str, Any] | None = None
+    source_workstream: WorkstreamRef | None = None
+
+
+class WorkFileStat(StrictModel):
+    path: str
+    path_id: str
+    relative_path: str | None = None
+    root_label: str | None = None
+    root_name: str | None = None
+    root_id: str | None = None
+    additions: int = Field(ge=0)
+    deletions: int = Field(ge=0)
+    preview_available: bool = False
+    source_workstream: WorkstreamRef | None = None
+
+
+class WorkMutationEvent(StrictModel):
+    id: str
+    call_id: str
+    sort_key: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    tool_name: str
+    display_name: str | None = None
+    category: str
+    operation_kind: str
+    status: TimelineItemStatus
+    duration_ms: int | None = Field(default=None, ge=0)
+    error: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result_preview: str | None = None
+    streamed_output: str | None = None
+    evaluation: dict[str, Any] | None = None
+    output_size: int | None = Field(default=None, ge=0)
+    truncated: bool = False
+    has_full_output: bool = False
+    recovery_call_id: str | None = None
+    tool_output_artifact_id: str | None = None
+    paths: list[str] = Field(default_factory=list)
+    file_stats: list[WorkFileStat] = Field(default_factory=list)
+    file_diffs: list[FileDiffRef] = Field(default_factory=list)
+    diffs_truncated: bool = False
+    total_file_count: int = Field(default=0, ge=0)
+    omitted_file_count: int = Field(default=0, ge=0)
+    omitted_file_stat_count: int = Field(default=0, ge=0)
+    file_stats_recoverable: bool = False
+    additions: int = Field(default=0, ge=0)
+    deletions: int = Field(default=0, ge=0)
+    source_workstream: WorkstreamRef | None = None
+
+
+class WorkCommandEvent(StrictModel):
+    id: str
+    call_id: str
+    sort_key: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    tool_name: str = "bash"
+    display_name: str | None = None
+    command: str | None = None
+    description: str | None = None
+    workdir: str | None = None
+    status: TimelineItemStatus
+    duration_ms: int | None = Field(default=None, ge=0)
+    exit_code: int | None = None
+    error: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    evaluation: dict[str, Any] | None = None
+    preview: str | None = None
+    preview_truncated: bool = False
+    has_full_output: bool = False
+    recovery_call_id: str | None = None
+    tool_output_artifact_id: str | None = None
+    output_size: int | None = Field(default=None, ge=0)
+    source_workstream: WorkstreamRef | None = None
+
+
+class WorkArtifact(StrictModel):
+    artifact_id: str
+    sort_key: str = ""
+    filename: str
+    mime_type: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    title: str | None = None
+    source_workstream: WorkstreamRef | None = None
+
+
+class WorkSummary(StrictModel):
+    mutations: int = Field(ge=0)
+    commands: int = Field(ge=0)
+    changed_files: int = Field(ge=0)
+    artifacts: int = Field(ge=0)
+    deliverables: int = Field(default=0, ge=0)
+    additions: int = Field(default=0, ge=0)
+    deletions: int = Field(default=0, ge=0)
+    omitted_files: int = Field(default=0, ge=0)
+
+
+class WorkMaterialization(StrictModel):
+    state: Literal["materializing", "caught_up", "repair", "failed"] = "caught_up"
+    completed_streams: int = Field(default=0, ge=0)
+    total_streams: int = Field(default=0, ge=0)
+    covered_events: int = Field(default=0, ge=0)
+    target_events: int = Field(default=0, ge=0)
+    failed_streams: int = Field(default=0, ge=0)
+    retry_after_ms: int | None = Field(default=None, ge=0)
+
+
+class ActivityRecentItem(StrictModel):
+    id: str
+    category: WorkCategory
+    session_id: str
+    occurred_at: str
+    status: TimelineItemStatus | None = None
+    title: str | None = None
+
+
+class ActivityRecentWork(StrictModel):
+    commands: list[WorkCommandEvent] = Field(default_factory=list, max_length=10)
+    mutations: list[WorkMutationEvent] = Field(default_factory=list, max_length=10)
+    files: list[WorkMutationEvent] = Field(default_factory=list, max_length=10)
+    artifacts: list[WorkArtifact] = Field(default_factory=list, max_length=10)
+    deliverables: list[WorkDeliverable] = Field(default_factory=list, max_length=10)
+
+
+class ActivityOverviewResponse(StrictModel):
+    schema_version: SchemaVersion = 2
+    detail: ActivityOverviewDetail = "lightweight"
+    projection_version: str
+    scope: TimelineScope
+    summary: WorkSummary
+    materialization: WorkMaterialization
+    workstreams: list[WorkstreamRef] = Field(default_factory=list)
+    recent: dict[WorkCategory, list[ActivityRecentItem]] = Field(default_factory=dict)
+    recent_work: ActivityRecentWork = Field(default_factory=ActivityRecentWork)
+    graph_fingerprint: str
+    overview_revision: str
+    graph_truncated: bool = False
+    server_time: str
+
+
+class WorkProjectionResponse(StrictModel):
+    schema_version: SchemaVersion = 2
+    projection_version: str
+    scope: TimelineScope
+    final_deliverable: WorkDeliverable | None = None
+    deliverables: list[WorkDeliverable] = Field(default_factory=list)
+    workstreams: list[WorkstreamRef] = Field(default_factory=list)
+    graph_fingerprint: str | None = None
+    graph_truncated: bool = False
+    work_revision: int = Field(default=0, ge=0)
+    graph_revision: int = Field(default=0, ge=0)
+    mutations: list[WorkMutationEvent] = Field(default_factory=list)
+    commands: list[WorkCommandEvent] = Field(default_factory=list)
+    removed_call_ids: list[str] = Field(default_factory=list)
+    artifacts: list[WorkArtifact] = Field(default_factory=list)
+    summary: WorkSummary
+    materialization: WorkMaterialization = Field(default_factory=WorkMaterialization)
+    has_more_before: bool = False
+    before_cursor: str | None = None
     server_time: str
 
 
@@ -575,6 +839,24 @@ class SendMessageV2Request(StrictModel):
 
 class CommandV2Request(StrictModel):
     content: str = Field(min_length=1, max_length=100_000)
+
+
+class ForkAssistantMessageV2Request(StrictModel):
+    """Identify one completed assistant message as a conversation fork point."""
+
+    source_session_id: str = Field(min_length=1, max_length=128)
+    source_seq: int = Field(ge=0)
+
+
+class ForkAssistantMessageV2Response(StrictModel):
+    """Result of forking a conversation at a completed assistant message."""
+
+    conversation_id: str
+    session_id: str
+    source_session_id: str
+    source_seq: int = Field(ge=0)
+    copied: bool
+    server_time: str
 
 
 class CommandV2Response(StrictModel):

@@ -26,7 +26,7 @@ def upgrade() -> None:
         sa.Column("tools", sa.JSON(), nullable=True),
         sa.Column("prompt_templates", sa.JSON(), nullable=True),
         sa.Column("tags", sa.JSON(), nullable=True),
-        sa.Column("auto_load", sa.Boolean(), nullable=False, server_default="0"),
+        sa.Column("auto_load", sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column("source", sa.String(), nullable=False, server_default="db"),
         sa.Column(
             "owner_email",

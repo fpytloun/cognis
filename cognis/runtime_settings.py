@@ -16,6 +16,7 @@ HOT_APPLIED_SETTING_KEYS: Final[frozenset[str]] = frozenset(
         "session.immutable_prefix_repair_cooldown_seconds",
         "session.recall_ttl_seconds",
         "session.max_tool_calls_per_turn",
+        "session.max_llm_cycles_per_turn",
         "session.max_delegation_depth",
         "session.cache_max_entries",
         "decision_engine.inline_max_length",
@@ -57,6 +58,8 @@ async def apply_runtime_setting(app: Any, key: str, value: object) -> None:
         state.context_assembler.recall_ttl_seconds = max(1, int(raw))
     elif key == "session.max_tool_calls_per_turn":
         state.agent_loop.default_max_tool_calls_per_turn = max(1, int(raw))
+    elif key == "session.max_llm_cycles_per_turn":
+        state.agent_loop.default_max_llm_cycles_per_turn = max(1, int(raw))
     elif key == "session.max_delegation_depth":
         state.decision_engine.max_delegation_depth = max(1, int(raw))
     elif key == "session.cache_max_entries":

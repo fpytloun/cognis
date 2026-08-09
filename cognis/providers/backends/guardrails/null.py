@@ -174,6 +174,7 @@ class NoGuardrailsProvider:
         limit: int = 0,
         types: list[str] | None = None,
         last_n: int | None = None,
+        before_seq: int | None = None,
         seqs: list[int] | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult:
@@ -183,12 +184,18 @@ class NoGuardrailsProvider:
             limit=limit,
             types=types,
             last_n=last_n,
+            before_seq=before_seq,
             seqs=seqs,
             allow_missing_stream=allow_missing_stream,
         )
 
-    async def get_last_seq(self, session_id: str) -> int:
-        return await self._intaris.get_last_seq(session_id)
+    async def get_last_seq(
+        self, session_id: str, *, allow_missing_stream: bool = False
+    ) -> int:
+        return await self._intaris.get_last_seq(
+            session_id,
+            allow_missing_stream=allow_missing_stream,
+        )
 
     async def call_mcp_tool(
         self,

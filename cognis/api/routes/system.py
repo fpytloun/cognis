@@ -2,19 +2,41 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
+from cognis import __version__
 from cognis.api.common import api_exception, require_admin
-from cognis.api.models import HealthResponse, SystemDiagnosticsResponse
+from cognis.api.models import (
+    ClientDiscoveryCapabilities,
+    ClientDiscoveryPaths,
+    ClientDiscoveryProduct,
+    ClientDiscoveryProtocol,
+    ClientDiscoveryResponse,
+    ClientDiscoveryServer,
+    HealthResponse,
+    ResolveAmbiguousDirectTurnRequest,
+    ResolveAmbiguousDirectTurnResponse,
+    StaleDirectTurnResponse,
+    SystemDiagnosticsResponse,
+)
+from cognis.core.controller_runtime import ControllerLifecycleState
+from cognis.store.database import check_connection
+from cognis.store.direct_turns import (
+    DirectTurnRecoveryConflict,
+    DirectTurnRecoverySnapshot,
+    DirectTurnStore,
+)
 from cognis.store.queries import list_agents, list_llm_providers
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 PWA_RESET_HTML = """<!doctype html>
 <html lang="en">
@@ -69,6 +91,128 @@ PWA_RESET_HTML = """<!doctype html>
 """
 
 
+def _optional_datetime(value: Any) -> Any:
+    if not isinstance(value, str):
+        return None
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _stale_turn_response(row: Any) -> StaleDirectTurnResponse:
+    outcome = row.outcome if isinstance(row.outcome, dict) else {}
+    raw_call_ids = outcome.get("call_ids")
+    call_ids = (
+        [item for item in raw_call_ids if isinstance(item, str)][:100]
+        if isinstance(raw_call_ids, list)
+        else []
+    )
+    call_id = outcome.get("call_id")
+    timeout = outcome.get("tool_timeout_seconds", outcome.get("timeout_seconds"))
+    return StaleDirectTurnResponse(
+        request_id=row.request_id,
+        conversation_id=row.conversation_id,
+        owner_controller_id=row.owner_controller_id,
+        owner_incarnation_id=row.owner_incarnation_id,
+        fencing_token=row.fencing_token,
+        status=row.status,
+        phase=str(outcome.get("phase") or ""),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        started_at=row.started_at,
+        phase_started_at=_optional_datetime(outcome.get("phase_started_at")),
+        call_id=call_id if isinstance(call_id, str) else None,
+        call_ids=call_ids,
+        timeout_seconds=float(timeout) if isinstance(timeout, int | float) else None,
+    )
+
+
+@router.get(
+    "/api/v1/system/direct-turns/stale",
+    response_model=dict[str, Any],
+)
+async def list_stale_direct_turns(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=32),
+) -> dict[str, Any]:
+    """List stale active direct turns without exposing durable payload content."""
+    require_admin(request)
+    try:
+        after = int(cursor) if cursor is not None else 0
+    except ValueError as exc:
+        raise api_exception(422, "invalid_cursor", "Cursor must be an admission order") from exc
+    if after < 0:
+        raise api_exception(422, "invalid_cursor", "Cursor must be non-negative")
+    store = DirectTurnStore(request.app.state.session_factory)
+    rows, has_more = await store.list_stale_active_page(
+        after_admission_order=after,
+        limit=limit,
+    )
+    return {
+        "items": [_stale_turn_response(row).model_dump(mode="json") for row in rows],
+        "cursor": str(rows[-1].admission_order) if has_more and rows else None,
+        "has_more": has_more,
+    }
+
+
+@router.post(
+    "/api/v1/system/direct-turns/{request_id}/resolve-ambiguous",
+    response_model=ResolveAmbiguousDirectTurnResponse,
+)
+async def resolve_ambiguous_direct_turn(
+    request: Request,
+    request_id: str,
+    payload: ResolveAmbiguousDirectTurnRequest,
+) -> ResolveAmbiguousDirectTurnResponse:
+    """Fence and quarantine one stale uncertain tool effect."""
+    admin = require_admin(request)
+    store = DirectTurnStore(request.app.state.session_factory)
+    try:
+        result = await store.resolve_stale_tool_ambiguous(
+            request_id,
+            actor_email=admin.email,
+            reason=payload.reason,
+            client_transaction_id=payload.client_transaction_id,
+            expected=DirectTurnRecoverySnapshot(
+                conversation_id=payload.conversation_id,
+                status=payload.status,
+                phase=payload.phase,
+                owner_controller_id=payload.owner_controller_id,
+                owner_incarnation_id=payload.owner_incarnation_id,
+                fencing_token=payload.fencing_token,
+                updated_at=payload.updated_at,
+                phase_started_at=payload.phase_started_at,
+            ),
+        )
+    except DirectTurnRecoveryConflict as exc:
+        status_code = 404 if exc.code == "not_found" else 409
+        raise api_exception(status_code, exc.code, str(exc)) from exc
+    if result.changed:
+        try:
+            await request.app.state.turn_scheduler.wake_direct_turn_runtime()
+        except Exception:
+            logger.warning(
+                "direct-turn operator recovery committed but wake failed",
+                exc_info=True,
+                extra={
+                    "request_id": result.request_id,
+                    "conversation_id": result.conversation_id,
+                },
+            )
+    return ResolveAmbiguousDirectTurnResponse(
+        request_id=result.request_id,
+        conversation_id=result.conversation_id,
+        status="ambiguous",
+        phase="ambiguous",
+        fencing_token=result.fencing_token,
+        changed=result.changed,
+    )
+
+
 def _database_summary(database_url: str) -> dict[str, str | None]:
     parsed = make_url(database_url)
     return {
@@ -76,6 +220,23 @@ def _database_summary(database_url: str) -> dict[str, str | None]:
         "database": parsed.database,
         "host": parsed.host,
         "port": str(parsed.port) if parsed.port is not None else None,
+    }
+
+
+def _redis_diagnostics(request: Request) -> dict[str, bool]:
+    redis_service = getattr(request.app.state, "redis_service", None)
+    session_cache = getattr(request.app.state, "session_cache", None)
+    event_cache = getattr(request.app.state, "cached_event_store", None)
+    runtime_relay = getattr(request.app.state, "chat_v2_runtime_relay", None)
+    return {
+        "configured": bool(getattr(redis_service, "configured", False)),
+        "available": bool(getattr(redis_service, "available", False)),
+        "session_cache": redis_service is not None
+        and getattr(session_cache, "_redis_service", None) is redis_service,
+        "event_cache": redis_service is not None
+        and getattr(event_cache, "_redis", None) is redis_service,
+        "runtime_relay": redis_service is not None
+        and getattr(runtime_relay, "redis_service", None) is redis_service,
     }
 
 
@@ -115,7 +276,7 @@ async def livez() -> dict[str, str]:
 
 
 @router.get("/api/readyz", include_in_schema=False)
-async def readyz() -> dict[str, str]:
+async def readyz(request: Request) -> JSONResponse:
     """Cheap readiness probe for Kubernetes traffic routing.
 
     Keep this endpoint independent of optional/degraded providers so transient
@@ -123,7 +284,23 @@ async def readyz() -> dict[str, str]:
     service when it can still serve traffic.
     """
 
-    return {"status": "ready"}
+    runtime = request.app.state.controller_runtime
+    if runtime.state is not ControllerLifecycleState.READY:
+        return JSONResponse(
+            {"status": "not_ready", "reason": runtime.state.value},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    if not await check_connection(request.app.state.engine):
+        return JSONResponse(
+            {"status": "not_ready", "reason": "database_unavailable"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    if not runtime.schema_compatible:
+        return JSONResponse(
+            {"status": "not_ready", "reason": "schema_incompatible"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return JSONResponse({"status": "ready"})
 
 
 @router.get("/api/health/providers")
@@ -216,6 +393,7 @@ async def diagnostics(request: Request) -> SystemDiagnosticsResponse:
             "names": [agent.name for agent in agents[:20]],
         },
         key_fingerprint=request.app.state.jwt_public_key_fingerprint,
+        redis=_redis_diagnostics(request),
     )
 
 
@@ -263,6 +441,27 @@ async def system_reconcile(request: Request) -> dict[str, Any]:
 @router.get("/.well-known/jwks.json")
 async def jwks(request: Request) -> JSONResponse:
     return JSONResponse(content=request.app.state.auth_provider.jwks())
+
+
+@router.get(
+    "/.well-known/cognis-client.json",
+    response_model=ClientDiscoveryResponse,
+)
+async def client_discovery(request: Request, response: Response) -> ClientDiscoveryResponse:
+    """Describe the stable client contract without requiring authentication."""
+
+    response.headers["Cache-Control"] = "no-store"
+    return ClientDiscoveryResponse(
+        product=ClientDiscoveryProduct(),
+        protocol=ClientDiscoveryProtocol(),
+        server=ClientDiscoveryServer(
+            id=f"cognis:{request.app.state.jwt_public_key_fingerprint}",
+            version=__version__,
+            build_id=__version__,
+        ),
+        paths=ClientDiscoveryPaths(),
+        capabilities=ClientDiscoveryCapabilities(),
+    )
 
 
 @router.get("/.well-known/agent.json")

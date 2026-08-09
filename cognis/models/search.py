@@ -33,7 +33,7 @@ class ConversationSearchFilters(SearchRequestFilters):
 
     agent_ids: list[str] | None = None
     project_id: str | None = None
-    status: Literal["active", "starred", "archived", "all"] = "active"
+    status: Literal["active", "starred", "archived", "all", "task"] = "active"
     context_type: str | None = None
     context_types: list[str] | None = None
 

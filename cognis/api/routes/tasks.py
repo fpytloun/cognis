@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Query, Request
 from sqlalchemy import func, or_, select
@@ -40,6 +42,7 @@ from cognis.api.models import (
     TaskCommentCreateRequest,
     TaskCommentResponse,
     TaskCommentUpdateRequest,
+    TaskControlChatResponse,
     TaskCreateRequest,
     TaskDetailResponse,
     TaskRerunResponse,
@@ -55,6 +58,10 @@ from cognis.api.serializers import (
     task_comment_to_response,
     task_detail_to_response,
     task_to_response,
+)
+from cognis.api.task_projection import (
+    build_task_progress_projection,
+    build_task_workflow_projection,
 )
 from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.immutable_prefix import ImmutablePrefixEntry
@@ -72,13 +79,17 @@ from cognis.core.workflow_management import (
     materialize_skill_workflow,
 )
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import ConversationContext, SessionEvent
+from cognis.models.session import ConversationContext, ConversationLineage, SessionEvent
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
+from cognis.runtime_context import RuntimeAccessContext, scoped_runtime_context
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.models import DeliverableRow, StepRun, Task
 from cognis.store.queries import (
     add_task_dependency,
+    claim_task_control_conversation,
+    clear_stale_task_control_conversation_claim,
+    clear_task_control_conversation_claim,
     create_task_comment,
     get_agent,
     get_conversation,
@@ -89,16 +100,25 @@ from cognis.store.queries import (
     get_task,
     get_task_comment,
     get_task_dependencies,
+    get_task_for_update,
     list_deliverables_for_step_run,
     list_step_run_history,
     list_step_runs_for_task,
+    list_step_runs_for_task_projection,
     list_task_comments,
+    mark_task_control_conversation_ready,
     remove_task_dependency,
     set_conversation_status,
     update_task_comment,
 )
 
 _TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+_TASK_CONTROL_CHAT_INSTRUCTION = """Task Control Chat is the persistent management surface for exactly one task.
+Keep discussion and management scoped to the task in the refreshed task-control context.
+Use context-only comments for agreed guidance that a running step should consume at its next safe boundary.
+Use pause, resume, gate/question response, revision, rerun, or cancellation only when the user clearly asks.
+Never execute code, edit files, invoke shell/process tools, mutate credentials or memory, create tasks/workflows,
+or manage implementation conversations from this chat. Heavy details remain behind the allowed read tools."""
 _TASK_BOARD_LIMIT = 20
 _TASK_BOARD_COLUMN_STATUSES: dict[str, tuple[str, ...]] = {
     "draft": ("draft",),
@@ -1096,8 +1116,19 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
                 deliverables_by_step_run.setdefault(deliverable_row.step_run_id, []).append(
                     deliverable_to_response(deliverable_row, include_rich_payload=False)
                 )
+        progress = await build_task_progress_projection(
+            session,
+            owner_email=task.created_by,
+            step_runs=step_rows,
+        )
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
+    workflow_projection = await build_task_workflow_projection(
+        task,
+        workflow_registry=request.app.state.workflow_registry,
+        step_runs=step_rows,
+        pending_pause=pending_pause,
+    )
     step_run_responses = [
         step_run_to_response(
             row,
@@ -1119,6 +1150,8 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
         step_runs=step_run_responses,
         pending_pause=pending_pause,
         workflow_run=workflow_run,
+        workflow_projection=workflow_projection,
+        progress=progress,
     )
 
 
@@ -1129,14 +1162,28 @@ async def task_summary(request: Request, task_id: str) -> TaskDetailResponse:
     task = await _require_task(request, task_id)
     async with request.app.state.session_factory() as session:
         dep_rows = await get_task_dependencies(session, task_id)
+        step_rows = await list_step_runs_for_task_projection(session, task_id)
+        progress = await build_task_progress_projection(
+            session,
+            owner_email=task.created_by,
+            step_runs=step_rows,
+        )
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
+    workflow_projection = await build_task_workflow_projection(
+        task,
+        workflow_registry=request.app.state.workflow_registry,
+        step_runs=step_rows,
+        pending_pause=pending_pause,
+    )
     return task_detail_to_response(
         task,
         dependencies=[dependency_to_response(row) for row in dep_rows],
         step_runs=[],
         pending_pause=pending_pause,
         workflow_run=workflow_run,
+        workflow_projection=workflow_projection,
+        progress=progress,
     )
 
 
@@ -1201,6 +1248,7 @@ async def task_chat(request: Request, task_id: str) -> TaskChatResponse:
                 "forked_from": "task",
                 "task_id": task_id,
                 "source_step_run_id": source_step.step_run_id,
+                "source_session_id": source_session_row.session_id,
             },
             memory_labels={},
         ),
@@ -1213,6 +1261,13 @@ async def task_chat(request: Request, task_id: str) -> TaskChatResponse:
         ],
         extra_history_events=[_continuation_context_event(briefing, source="task_chat_context")],
         snapshot_extras={"forked_from_task_id": task_id, "trigger": "ui:task_chat"},
+        lineage=ConversationLineage(
+            kind="task",
+            source_conversation_id=source_conversation_row.conversation_id,
+            source_session_id=source_session_row.session_id,
+            task_id=task_id,
+            step_run_id=source_step.step_run_id,
+        ),
     )
     if not copied:
         await _archive_failed_continuation(
@@ -1222,6 +1277,178 @@ async def task_chat(request: Request, task_id: str) -> TaskChatResponse:
     return TaskChatResponse(
         conversation_id=conversation.conversation_id,
         session_id=new_session.session_id,
+    )
+
+
+@router.get(
+    "/api/v1/tasks/{task_id}/control-chat",
+    response_model=TaskControlChatResponse,
+)
+@router.post(
+    "/api/v1/tasks/{task_id}/control-chat",
+    response_model=TaskControlChatResponse,
+)
+async def task_control_chat(request: Request, task_id: str) -> TaskControlChatResponse:
+    """Get or concurrency-safely create the task's persistent control chat."""
+
+    forbid_mutation_for_viewer(request)
+    task = await _require_task(request, task_id)
+    user = require_current_user(request)
+    agent = await request.app.state.agent_registry.get(task.agent_id, owner_email=user.email)
+    if agent is None:
+        raise api_exception(404, "not_found", "Agent not found")
+
+    candidate_id = f"conv_{uuid4().hex}"
+    creator = False
+    async with request.app.state.session_factory() as session:
+        row = await get_task(session, task_id)
+        if row is None:
+            raise api_exception(404, "not_found", "Task not found")
+        conversation_id = getattr(row, "control_conversation_id", None)
+        if conversation_id is not None:
+            conversation_row = await get_conversation(session, conversation_id)
+            claim_time = row.control_conversation_claimed_at
+            if claim_time is not None and claim_time.tzinfo is None:
+                claim_time = claim_time.replace(tzinfo=UTC)
+            if (
+                conversation_row is None
+                and claim_time is not None
+                and claim_time < datetime.now(UTC) - timedelta(seconds=30)
+            ):
+                cleared = await clear_stale_task_control_conversation_claim(
+                    session,
+                    task_id,
+                    conversation_id,
+                    claimed_before=datetime.now(UTC) - timedelta(seconds=30),
+                )
+                if cleared:
+                    conversation_id = None
+                else:
+                    await session.refresh(row)
+                    conversation_id = getattr(row, "control_conversation_id", None)
+        if conversation_id is None:
+            creator = await claim_task_control_conversation(session, task_id, candidate_id)
+            await session.commit()
+            conversation_id = candidate_id if creator else None
+            if conversation_id is None:
+                await session.refresh(row)
+                conversation_id = getattr(row, "control_conversation_id", None)
+
+    if creator:
+        task = await _require_task(request, task_id)
+        agent = await request.app.state.agent_registry.get(
+            task.agent_id,
+            owner_email=user.email,
+        )
+        if agent is None:
+            raise api_exception(404, "not_found", "Agent not found")
+        access = RuntimeAccessContext(
+            user_email=user.email,
+            agent_id=agent.agent_id,
+            agent_owner_email=agent.owner_email,
+            agent_type=agent.agent_type,
+            task_id=task_id,
+            workflow_step=False,
+            interaction_mode="step_requests",
+            session_policy=task.session_policy.model_dump(mode="json"),
+            control_surface="task_control",
+        )
+
+        async def admission_guard(db_session: Any) -> bool:
+            claimed = await get_task(db_session, task_id)
+            return bool(
+                claimed is not None
+                and claimed.created_by == user.email
+                and claimed.control_conversation_id == candidate_id
+            )
+
+        try:
+            with scoped_runtime_context(access_context=access):
+                (
+                    conversation,
+                    root_session,
+                ) = await request.app.state.session_manager.create_conversation_with_root_session(
+                    user_email=user.email,
+                    agent_id=task.agent_id,
+                    agent_profile_id=task.agent_profile_id,
+                    title=f"Task control: {task.title}",
+                    title_source="task_control",
+                    intention=f"Understand and safely manage task: {task.title}",
+                    context=ConversationContext(
+                        type="web",
+                        ref=f"web:task_control:{task_id}",
+                        platform_data={
+                            "kind": "task_control",
+                            "task_id": task_id,
+                            "control_surface": "task_control",
+                            "managed_session_policy": task.session_policy.model_dump(mode="json"),
+                        },
+                        memory_labels={"task_id": task_id, "surface": "task_control"},
+                    ),
+                    initial_active_executor_id=task.active_executor_id,
+                    initial_active_executor_assigned_at=task.active_executor_assigned_at,
+                    initial_active_executor_expires_at=task.active_executor_expires_at,
+                    initial_active_executor_source=task.active_executor_source,
+                    project_id=task.project_id,
+                    admission_guard=admission_guard,
+                    conversation_id=candidate_id,
+                )
+            async with request.app.state.session_factory() as session:
+                finalized = await mark_task_control_conversation_ready(
+                    session,
+                    task_id,
+                    candidate_id,
+                )
+                await session.commit()
+            if not finalized:
+                await request.app.state.session_manager.soft_delete_conversation(candidate_id)
+                creator = False
+                conversation_id = None
+                conversation = None
+                root_session = None
+        except Exception:
+            async with request.app.state.session_factory() as session:
+                await clear_task_control_conversation_claim(session, task_id, candidate_id)
+                await session.commit()
+            raise
+    if not creator:
+        conversation = None
+        root_session = None
+        for _ in range(100):
+            if not conversation_id:
+                async with request.app.state.session_factory() as session:
+                    row = await get_task(session, task_id)
+                    conversation_id = (
+                        getattr(row, "control_conversation_id", None) if row is not None else None
+                    )
+            if conversation_id:
+                async with request.app.state.session_factory() as session:
+                    conversation_row = await get_conversation(session, conversation_id)
+                    if conversation_row is not None:
+                        conversation = _to_conversation_model(conversation_row)
+                        if conversation_row.active_session_id:
+                            session_row = await get_session_row(
+                                session, conversation_row.active_session_id
+                            )
+                            if session_row is not None:
+                                root_session = _to_session_model(session_row)
+                                break
+            await asyncio.sleep(0.1)
+        if conversation is None or root_session is None:
+            raise api_exception(
+                409,
+                "control_chat_initializing",
+                "Task control chat is still being initialized",
+            )
+
+    return TaskControlChatResponse(
+        task_id=task_id,
+        conversation_id=conversation.conversation_id,
+        session_id=root_session.session_id,
+        agent_id=task.agent_id,
+        agent_profile_id=task.agent_profile_id,
+        task_status=str(task.status),
+        attempt_number=task.attempt_number,
     )
 
 
@@ -1295,6 +1522,13 @@ async def task_step_chat(request: Request, task_id: str, step_run_id: str) -> Ta
             "forked_from_step_run_id": step_run.step_run_id,
             "trigger": "ui:step_chat",
         },
+        lineage=ConversationLineage(
+            kind="task_step",
+            source_conversation_id=source_conversation_row.conversation_id,
+            source_session_id=source_session_row.session_id,
+            task_id=task_id,
+            step_run_id=step_run.step_run_id,
+        ),
     )
     if not copied:
         await _archive_failed_continuation(
@@ -1315,6 +1549,18 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         existing_row = await get_task(session, task_id)
         if existing_row is None:
             raise api_exception(404, "not_found", "Task not found")
+        if existing_row.control_conversation_id is not None and (
+            (payload.agent_id is not None and payload.agent_id != existing_row.agent_id)
+            or (
+                "agent_profile_id" in payload.model_fields_set
+                and payload.agent_profile_id != existing_row.agent_profile_id
+            )
+        ):
+            raise api_exception(
+                409,
+                "task_control_agent_locked",
+                "Task agent and profile cannot change after its control chat is created",
+            )
     if payload.agent_id is not None:
         await _validate_agent_access(request, payload.agent_id)
     if "agent_profile_id" in payload.model_fields_set and payload.agent_profile_id is not None:
@@ -1430,9 +1676,21 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
     )
     try:
         async with request.app.state.session_factory() as session:
-            row = await get_task(session, task_id)
+            row = await get_task_for_update(session, task_id)
             if row is None:
                 raise api_exception(404, "not_found", "Task not found")
+            if row.control_conversation_id is not None and (
+                (payload.agent_id is not None and payload.agent_id != row.agent_id)
+                or (
+                    "agent_profile_id" in payload.model_fields_set
+                    and payload.agent_profile_id != row.agent_profile_id
+                )
+            ):
+                raise api_exception(
+                    409,
+                    "task_control_agent_locked",
+                    "Task agent and profile cannot change after its control chat is created",
+                )
             if row.status in _TERMINAL_STATUSES:
                 raise api_exception(
                     409,
@@ -1937,6 +2195,7 @@ def _continuation_context_event(content: str, *, source: str) -> SessionEvent:
             "content": content,
             "content_type": "text",
             "source": source,
+            "intention_eligible": False,
         },
     )
 

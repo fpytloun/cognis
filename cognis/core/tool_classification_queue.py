@@ -49,6 +49,8 @@ class _ClaimedClassification:
     attempts: int
     last_error: str | None
     tool_payload: dict[str, Any]
+    fingerprint: str
+    claim_token: datetime
 
 
 class ToolClassificationQueue:
@@ -265,6 +267,8 @@ class ToolClassificationQueue:
                         attempts=row.attempts,
                         last_error=row.last_error,
                         tool_payload=dict(row.tool_payload or {}),
+                        fingerprint=row.fingerprint,
+                        claim_token=now,
                     )
                 )
                 if len(claimed) >= limit:
@@ -299,86 +303,164 @@ class ToolClassificationQueue:
         self, items: list[_ClaimedClassification], semaphore: asyncio.Semaphore
     ) -> None:
         async with semaphore:
+            renewal_stop = asyncio.Event()
+            ownership_lost = asyncio.Event()
+            renewal = asyncio.create_task(self._renew_claims(items, renewal_stop, ownership_lost))
             try:
-                tools = [ToolDefinition.model_validate(item.tool_payload) for item in items]
-                {stable_tool_id(tool): tool for tool in tools}
-                updates, rejected = await llm_classification_outcomes(
-                    tools,
-                    llm=self._llm_provider,
-                    acting_user_email=items[0].owner_email,
-                    allow_soft_profile_group_mismatch_for={
-                        item.tool_id for item in items if item.attempts > 0
-                    },
-                    retry_context={
-                        item.tool_id: item.last_error
-                        for item in items
-                        if item.attempts > 0 and item.last_error
-                    },
-                )
-                async with self._session_factory() as session:
-                    for item in items:
-                        row = await session.get(ToolClassificationRow, item.classification_id)
-                        if row is None:
-                            continue
-                        update = updates.get(item.tool_id)
-                        if update is not None:
-                            row.status = "ready"
-                            row.category = str(update.get("profile_group") or "development")
-                            row.capabilities = [
-                                str(capability) for capability in update.get("capabilities", [])
-                            ]
-                            row.classification_source = "llm"
-                            row.classification_confidence = float(update.get("confidence") or 0.75)
-                            row.last_error = None
-                            row.next_retry_at = None
-                            row.updated_at = _utcnow()
-                            continue
-                        attempts = item.attempts + 1
-                        backoff_seconds = min(2**attempts, self._backoff_max)
-                        row.status = "pending"
-                        row.attempts = attempts
-                        row.last_error = rejected.get(item.tool_id, "no_classification_result")
-                        row.next_retry_at = _utcnow() + timedelta(seconds=backoff_seconds)
-                        row.updated_at = _utcnow()
-                    await session.commit()
-                if rejected:
-                    logged_rejected = {
-                        tool_id: _sanitize_classifier_error_detail(reason)
-                        for tool_id, reason in rejected.items()
-                    }
+                try:
+                    tools = [ToolDefinition.model_validate(item.tool_payload) for item in items]
+                    updates, rejected = await llm_classification_outcomes(
+                        tools,
+                        llm=self._llm_provider,
+                        acting_user_email=items[0].owner_email,
+                        allow_soft_profile_group_mismatch_for={
+                            item.tool_id for item in items if item.attempts > 0
+                        },
+                        retry_context={
+                            item.tool_id: item.last_error
+                            for item in items
+                            if item.attempts > 0 and item.last_error
+                        },
+                    )
+                    if ownership_lost.is_set():
+                        return
+                    async with self._session_factory() as session:
+                        for item in items:
+                            update = updates.get(item.tool_id)
+                            if update is not None:
+                                await self._settle_claim(
+                                    session,
+                                    item,
+                                    status="ready",
+                                    category=str(update.get("profile_group") or "development"),
+                                    capabilities=[
+                                        str(capability)
+                                        for capability in update.get("capabilities", [])
+                                    ],
+                                    classification_source="llm",
+                                    classification_confidence=float(
+                                        update.get("confidence") or 0.75
+                                    ),
+                                    last_error=None,
+                                    next_retry_at=None,
+                                )
+                                continue
+                            attempts = item.attempts + 1
+                            backoff_seconds = min(2**attempts, self._backoff_max)
+                            await self._settle_claim(
+                                session,
+                                item,
+                                status="pending",
+                                attempts=attempts,
+                                last_error=rejected.get(item.tool_id, "no_classification_result"),
+                                next_retry_at=_utcnow() + timedelta(seconds=backoff_seconds),
+                            )
+                        await session.commit()
+                    if rejected:
+                        logged_rejected = {
+                            tool_id: _sanitize_classifier_error_detail(reason)
+                            for tool_id, reason in rejected.items()
+                        }
+                        logger.warning(
+                            "Tool classification batch completed with retries scheduled",
+                            extra={
+                                "extra_data": {
+                                    "batch_size": len(items),
+                                    "tool_ids": [item.tool_id for item in items],
+                                    "rejected": logged_rejected,
+                                }
+                            },
+                        )
+                except Exception as exc:
+                    if ownership_lost.is_set():
+                        return
+                    error_text = _classifier_error("tool_classification_batch_failed", exc)
                     logger.warning(
-                        "Tool classification batch completed with retries scheduled",
+                        "Tool classification batch failed",
                         extra={
                             "extra_data": {
                                 "batch_size": len(items),
                                 "tool_ids": [item.tool_id for item in items],
-                                "rejected": logged_rejected,
+                                "error": error_text,
                             }
                         },
                     )
-            except Exception as exc:
-                error_text = _classifier_error("tool_classification_batch_failed", exc)
-                logger.warning(
-                    "Tool classification batch failed",
-                    extra={
-                        "extra_data": {
-                            "batch_size": len(items),
-                            "tool_ids": [item.tool_id for item in items],
-                            "error": error_text,
-                        }
-                    },
-                )
+                    async with self._session_factory() as session:
+                        for item in items:
+                            attempts = item.attempts + 1
+                            backoff_seconds = min(2**attempts, self._backoff_max)
+                            await self._settle_claim(
+                                session,
+                                item,
+                                status="pending",
+                                attempts=attempts,
+                                last_error=error_text,
+                                next_retry_at=_utcnow() + timedelta(seconds=backoff_seconds),
+                            )
+                        await session.commit()
+            finally:
+                renewal_stop.set()
+                renewal.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await renewal
+
+    async def _renew_claims(
+        self,
+        items: list[_ClaimedClassification],
+        stop: asyncio.Event,
+        ownership_lost: asyncio.Event,
+    ) -> None:
+        try:
+            while not stop.is_set():
+                await asyncio.sleep(max(self._lease_seconds / 3, 0.05))
+                now = _utcnow()
                 async with self._session_factory() as session:
+                    renewed = 0
                     for item in items:
-                        row = await session.get(ToolClassificationRow, item.classification_id)
-                        if row is None:
-                            continue
-                        attempts = item.attempts + 1
-                        backoff_seconds = min(2**attempts, self._backoff_max)
-                        next_retry_at = _utcnow() + timedelta(seconds=backoff_seconds)
-                        row.status = "pending"
-                        row.attempts = attempts
-                        row.last_error = error_text
-                        row.next_retry_at = next_retry_at
-                        row.updated_at = _utcnow()
+                        result = await session.execute(
+                            sa.update(ToolClassificationRow)
+                            .execution_options(synchronize_session=False)
+                            .where(
+                                ToolClassificationRow.classification_id == item.classification_id,
+                                ToolClassificationRow.status == "running",
+                                ToolClassificationRow.fingerprint == item.fingerprint,
+                                ToolClassificationRow.last_attempt_at == item.claim_token,
+                            )
+                            .values(last_attempt_at=now, updated_at=now)
+                        )
+                        if result.rowcount:
+                            renewed += 1
+                            item.claim_token = now
                     await session.commit()
+                if renewed != len(items):
+                    ownership_lost.set()
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            ownership_lost.set()
+            logger.warning(
+                "Tool classification claim renewal failed; settlement is fenced",
+                extra={"extra_data": {"tool_ids": [item.tool_id for item in items]}},
+                exc_info=True,
+            )
+
+    async def _settle_claim(
+        self,
+        session: Any,
+        item: _ClaimedClassification,
+        **values: Any,
+    ) -> bool:
+        values["updated_at"] = _utcnow()
+        result = await session.execute(
+            sa.update(ToolClassificationRow)
+            .execution_options(synchronize_session=False)
+            .where(
+                ToolClassificationRow.classification_id == item.classification_id,
+                ToolClassificationRow.status == "running",
+                ToolClassificationRow.fingerprint == item.fingerprint,
+                ToolClassificationRow.last_attempt_at == item.claim_token,
+            )
+            .values(**values)
+        )
+        return bool(result.rowcount)

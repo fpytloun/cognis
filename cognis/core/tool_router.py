@@ -58,6 +58,7 @@ from cognis.models.tool import (
     tool_capabilities,
     tool_input_schema,
 )
+from cognis.providers.executor.delivery import ExecutorDeliveryError
 from cognis.runtime_context import (
     RuntimeAccessContext,
     current_agent_id,
@@ -955,6 +956,8 @@ class ToolRouter:
                     image_generation_provider=self.image_generation_provider,
                     artifact_store=self.artifact_store,
                     session_factory=self._session_factory,
+                    user_email=session.user_email,
+                    runtime_metadata=tool_call.runtime_metadata,
                 )
                 if result.attachments:
                     result = result.model_copy(
@@ -1538,6 +1541,18 @@ class ToolRouter:
             result = await self._postprocess_tool_result(result, scoped_tool_call, session)
         except CredentialAccessError as exc:
             result = self._credential_error_result(exc)
+        except ExecutorDeliveryError as exc:
+            metadata = exc.metadata()
+            metadata["code"] = metadata["error_code"]
+            metadata["executor_id"] = metadata.get("executor_id") or getattr(
+                executor, "executor_id", None
+            )
+            metadata["epoch"] = metadata.get("epoch") or getattr(executor, "epoch", None)
+            result = ToolResult(
+                output="Executor delivery failed; recovery is restricted to the same executor.",
+                is_error=True,
+                metadata=metadata,
+            )
         except TimeoutError:
             await executor.cancel_call(tool_call.call_id)
             result = ToolResult(
@@ -2770,7 +2785,9 @@ class ToolRouter:
             payload=payload,
         )
         try:
-            resolution = await self.pause_waiter.wait(pause_id, timeout=float(timeout_seconds))
+            resolution = await self.notification_service.wait_for_resolution(
+                pause_id, timeout=float(timeout_seconds)
+            )
         except TimeoutError as exc:
             if self.notification_service is not None:
                 await self.notification_service.mark_orphaned(pause_id, reason="timeout")
@@ -2918,6 +2935,9 @@ class ToolRouter:
             else None,
             session_policy=raw.get("session_policy")
             if isinstance(raw.get("session_policy"), dict)
+            else None,
+            control_surface=raw.get("control_surface")
+            if isinstance(raw.get("control_surface"), str)
             else None,
         )
 
@@ -3179,8 +3199,10 @@ class ToolRouter:
                 size_bytes=len(content),
                 status="attached",
                 expires_at=None,
-                conversation_id=session.conversation_id,
-                session_id=session.session_id,
+                conversation_id=None
+                if tool_name == "artifact_publish"
+                else session.conversation_id,
+                session_id=None if tool_name == "artifact_publish" else session.session_id,
                 message_role="assistant",
             )
             await db_session.commit()

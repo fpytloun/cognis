@@ -32,6 +32,12 @@ LONG_LIVED_CHAT_COMPACTION_ADDENDUM = (
     "background work references, user-specific context, and recent conversational "
     'continuity. Use "(none)" for task-specific sections that do not apply.'
 )
+IDLE_RENEWAL_COMPACTION_ADDENDUM = (
+    "This summary seeds a renewed activity scope after an idle checkpoint. "
+    "Preserve ambient context, standing preferences, decisions, and recent conversational "
+    "continuity. Describe prior TODOs, delegated or managed work, and task next steps only "
+    "as historical context. Do not present them as active obligations in the renewed scope."
+)
 
 COMPACTION_TOTAL = Counter(
     "cognis_session_compactions_total",
@@ -575,7 +581,9 @@ class CompactionStrategy:
             if compaction_agent and compaction_agent.system_prompt
             else "Summarize the conversation history concisely."
         )
-        if long_lived_chat:
+        if trigger == "idle_checkpoint":
+            compaction_prompt = f"{compaction_prompt}\n\n{IDLE_RENEWAL_COMPACTION_ADDENDUM}"
+        elif long_lived_chat:
             compaction_prompt = f"{compaction_prompt}\n\n{LONG_LIVED_CHAT_COMPACTION_ADDENDUM}"
 
         history_input_tokens = _budget_without_previous_summary(

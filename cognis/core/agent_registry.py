@@ -370,14 +370,13 @@ Output exactly this Markdown structure and keep every section, even when empty:
 ## Relevant Files
 - [file or directory path: why it matters, or "(none)"]
 
-## Recoverable Tool Outputs
-- [call_id and recovery hint, or "(none)"]
-
 Rules:
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, commands, error strings, call_ids, and identifiers when known.
 - For in-progress work include function names, signatures, exact commands, and error strings —
   enough to resume without re-reading files.
+- Do not inventory tool outputs. Cognis adds a small raw-evidence index separately.
+- Older conversation history remains searchable.
 - Aim for 800–1500 words for complex sessions; prune stale details rather than active state.
 - Do not mention the summary process or that context was compacted.
 - Do not invent information not present in the history."""

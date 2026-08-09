@@ -5,19 +5,25 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
+import mmap
 import re
+import tempfile
 import time
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.message import Message as EmailMessage
+from email.parser import BytesHeaderParser
+from typing import Any
 
 from argon2 import PasswordHasher
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.runtime_context import current_user_email
@@ -30,10 +36,189 @@ from cognis.store.queries import (
     touch_api_key_last_used,
 )
 
+
+class _KnowledgebaseUploadRejected(RuntimeError):
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
+class KnowledgebaseDocumentUploadLimitMiddleware:
+    """Bound document multipart bodies before Starlette parses or spools them."""
+
+    _PATH = re.compile(r"^/api/v1/knowledgebases/[^/]+/documents$")
+    _MAX_PART_HEADER_BYTES = 16 * 1024
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int,
+        max_files: int = 25,
+        max_parts: int = 52,
+    ) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+        self.max_files = max_files
+        self.max_parts = max_parts
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or self._PATH.fullmatch(str(scope.get("path") or "")) is None
+        ):
+            await self.app(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        if not headers.get(b"content-type", b"").lower().startswith(b"multipart/form-data"):
+            await self.app(scope, receive, send)
+            return
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                await self._reject(send, 400, "validation_error", "Invalid Content-Length")
+                return
+            if content_length > self.max_body_bytes:
+                await self._reject(
+                    send,
+                    413,
+                    "content_too_large",
+                    "Knowledgebase document upload body exceeds size limit",
+                )
+                return
+
+        spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)  # noqa: SIM115
+        try:
+            received = 0
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    raise _KnowledgebaseUploadRejected(
+                        400, "validation_error", "Incomplete multipart request body"
+                    )
+                body = message.get("body", b"")
+                received += len(body)
+                if received > self.max_body_bytes:
+                    raise _KnowledgebaseUploadRejected(
+                        413,
+                        "content_too_large",
+                        "Knowledgebase document upload body exceeds size limit",
+                    )
+                spool.write(body)
+                if not message.get("more_body", False):
+                    break
+            self._validate_multipart(
+                spool,
+                content_type=headers[b"content-type"],
+            )
+            spool.seek(0)
+
+            async def replay_receive() -> Message:
+                body = spool.read(1024 * 1024)
+                if body:
+                    return {
+                        "type": "http.request",
+                        "body": body,
+                        "more_body": spool.tell() < received,
+                    }
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            await self.app(scope, replay_receive, send)
+        except _KnowledgebaseUploadRejected as exc:
+            await self._reject(send, exc.status_code, exc.code, exc.message)
+        finally:
+            spool.close()
+
+    def _validate_multipart(self, spool: Any, *, content_type: bytes) -> None:
+        message = EmailMessage()
+        message["content-type"] = content_type.decode("latin-1")
+        boundary_value = message.get_param("boundary", header="content-type")
+        if not isinstance(boundary_value, str) or not boundary_value:
+            raise _KnowledgebaseUploadRejected(
+                400, "validation_error", "Multipart boundary is missing"
+            )
+        boundary = b"--" + boundary_value.encode("latin-1")
+        final_boundary = boundary + b"--"
+        parts = 0
+        files = 0
+        spool.flush()
+        if spool.tell() == 0:
+            raise _KnowledgebaseUploadRejected(
+                400, "validation_error", "Multipart request body is empty"
+            )
+        with mmap.mmap(spool.fileno(), 0, access=mmap.ACCESS_READ) as body:
+            position = 0
+            while True:
+                position = body.find(boundary, position)
+                if position < 0:
+                    break
+                before_valid = position == 0 or body[position - 2 : position] == b"\r\n"
+                after = position + len(boundary)
+                if not before_valid or body[after : after + 2] not in {b"\r\n", b"--"}:
+                    position = after
+                    continue
+                if body[position : position + len(final_boundary)] == final_boundary:
+                    break
+                header_start = after + 2
+                header_end = body.find(b"\r\n\r\n", header_start)
+                if header_end < 0 or header_end - header_start > self._MAX_PART_HEADER_BYTES:
+                    raise _KnowledgebaseUploadRejected(
+                        400, "validation_error", "Multipart part header is too large"
+                    )
+                headers = BytesHeaderParser().parsebytes(body[header_start:header_end])
+                disposition = headers.get("content-disposition")
+                if disposition is None:
+                    raise _KnowledgebaseUploadRejected(
+                        400,
+                        "validation_error",
+                        "Multipart part is missing disposition",
+                    )
+                parts += 1
+                disposition_message = EmailMessage()
+                disposition_message["content-disposition"] = disposition
+                if (
+                    disposition_message.get_param("name", header="content-disposition") == "files[]"
+                    and disposition_message.get_param("filename", header="content-disposition")
+                    is not None
+                ):
+                    files += 1
+                if parts > self.max_parts or files > self.max_files:
+                    raise _KnowledgebaseUploadRejected(
+                        400,
+                        "validation_error",
+                        "Knowledgebase document multipart contains too many parts",
+                    )
+                position = header_end + 4
+
+    @staticmethod
+    async def _reject(send: Send, status_code: int, code: str, message: str) -> None:
+        body = json.dumps(
+            {"error": {"code": code, "message": message, "details": None}},
+            separators=(",", ":"),
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status_code,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
 PUBLIC_ROUTES = {
     ("GET", "/api/bootstrap-status"),
     ("POST", "/api/setup"),
     ("GET", "/.well-known/jwks.json"),
+    ("GET", "/.well-known/cognis-client.json"),
     ("GET", "/api/health"),
     ("GET", "/api/health/providers"),
     ("GET", "/api/livez"),

@@ -93,6 +93,19 @@ class OpenAIToolSearchFallbackRequired(RuntimeError):
         )
 
 
+class FastModeFallbackRequired(RuntimeError):
+    """Signal that a rejected fast tier must be retried at the standard tier."""
+
+    def __init__(self, *, provider_id: str, model_id: str, reason: str) -> None:
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.reason = reason
+        super().__init__(
+            "fast mode is unsupported for "
+            f"provider={provider_id!r}, model={model_id!r}; reason={reason}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ToolArgumentParseFailure:
     """A streamed tool call could not be parsed into JSON arguments."""

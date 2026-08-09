@@ -27,7 +27,7 @@ def upgrade() -> None:
             "allow_silent_completion",
             sa.Boolean(),
             nullable=False,
-            server_default=sa.text("0"),
+            server_default=sa.false(),
         ),
     )
     op.add_column("tasks", sa.Column("applied_completion_mode", sa.String(), nullable=True))
@@ -43,7 +43,7 @@ def upgrade() -> None:
             "allow_silent_completion",
             sa.Boolean(),
             nullable=False,
-            server_default=sa.text("0"),
+            server_default=sa.false(),
         ),
     )
 
@@ -60,10 +60,10 @@ def upgrade() -> None:
 def downgrade() -> None:
     with op.batch_alter_table("schedules") as batch_op:
         batch_op.add_column(
-            sa.Column("suppress_empty", sa.Boolean(), nullable=False, server_default=sa.text("0"))
+            sa.Column("suppress_empty", sa.Boolean(), nullable=False, server_default=sa.false())
         )
 
-    op.execute(sa.text("UPDATE schedules SET suppress_empty = 1 WHERE allow_silent_completion = 1"))
+    op.execute(sa.text("UPDATE schedules SET suppress_empty = allow_silent_completion"))
 
     op.drop_column("schedules", "allow_silent_completion")
     op.drop_column("schedules", "completion_mode_family")

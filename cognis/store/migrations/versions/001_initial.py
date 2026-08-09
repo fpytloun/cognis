@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
+from cognis.store.migrations.versioning import ensure_alembic_version_capacity
+
 revision = "001_initial"
 down_revision = None
 branch_labels = None
@@ -12,6 +14,10 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Alembic creates version_num as VARCHAR(32) before the first migration.
+    # Expand it before this chain reaches revision identifiers longer than 32.
+    ensure_alembic_version_capacity(op.get_bind())
+
     op.create_table(
         "users",
         sa.Column("email", sa.String(), primary_key=True),

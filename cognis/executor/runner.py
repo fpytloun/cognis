@@ -26,6 +26,8 @@ from websockets.exceptions import ConnectionClosed
 from cognis.core.executor_resolution import filter_tools_by_executor
 from cognis.executor.inference_types import json_safe_inference_payload
 from cognis.executor.resources import ExecutorResourceCollector
+from cognis.executor.unary_dedup import UnaryCallConflict, UnaryDedupCache
+from cognis.models.config import ImageInput
 from cognis.models.executor_inference import resolve_executor_local_inference_config
 from cognis.models.executor_resources import ExecutorRuntimeResourceSnapshot
 from cognis.models.local_models import (
@@ -363,7 +365,7 @@ def _same_turn_tool_call_key(params: dict[str, Any]) -> str | None:
 
 
 class _SameTurnToolCallDeduplicator:
-    """Reject later exact calls within one execution scope and turn."""
+    """Reject concurrent exact calls within one execution scope and turn."""
 
     def __init__(self) -> None:
         self._seen_keys: OrderedDict[tuple[str, str], dict[str, str]] = OrderedDict()
@@ -390,6 +392,33 @@ class _SameTurnToolCallDeduplicator:
             seen_calls[duplicate_key] = call_id
         return original_call_id
 
+    def release(self, params: dict[str, Any]) -> None:
+        """Release a completed call so failed calls can be retried in the same turn.
+
+        The controller owns durable same-turn deduplication and records only
+        successful non-read-only calls. The executor can only safely suppress
+        an exact call while its original execution is still in flight.
+        """
+
+        identity = _same_turn_tool_call_identity(params)
+        if identity is None:
+            return
+        turn_scope, canonical_identity = identity
+        seen_calls = self._seen_keys.get(turn_scope)
+        if seen_calls is None:
+            return
+        duplicate_key = hashlib.blake2b(
+            canonical_identity.encode("utf-8"),
+            key=self._digest_key,
+            digest_size=16,
+        ).hexdigest()
+        call_id = str(params.get("call_id", "unknown"))
+        if seen_calls.get(duplicate_key) != call_id:
+            return
+        del seen_calls[duplicate_key]
+        if not seen_calls:
+            del self._seen_keys[turn_scope]
+
 
 class ExecutorRunner:
     """Thin remote hand for tool execution and inference proxying."""
@@ -397,6 +426,12 @@ class ExecutorRunner:
     def __init__(self, config: ExecutorConfig) -> None:
         self.config = config
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
+        self._unary_dedup = UnaryDedupCache()
+        self._unary_dedup_requests: dict[str, tuple[str, str]] = {}
+        self._replay_safe_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._replay_safe_digests: dict[str, str] = {}
+        self._replay_safe_owners: OrderedDict[str, tuple[Any, str | None]] = OrderedDict()
+        self._terminal_send_tasks: set[asyncio.Task[Any]] = set()
         self._same_turn_tool_call_deduplicator = _SameTurnToolCallDeduplicator()
         self._connection_handler_tasks: set[asyncio.Task[Any]] = set()
         self._running = True
@@ -446,6 +481,21 @@ class ExecutorRunner:
             raise
         finally:
             logger.info("Executor shutting down, cleaning up resources")
+            replay_tasks = tuple(self._replay_safe_tasks.values())
+            for task in replay_tasks:
+                task.cancel()
+            if replay_tasks:
+                await asyncio.gather(*replay_tasks, return_exceptions=True)
+            self._replay_safe_tasks.clear()
+            self._replay_safe_digests.clear()
+            terminal_send_tasks = tuple(self._terminal_send_tasks)
+            for task in terminal_send_tasks:
+                task.cancel()
+            if terminal_send_tasks:
+                await asyncio.gather(*terminal_send_tasks, return_exceptions=True)
+            self._terminal_send_tasks.clear()
+            self._replay_safe_owners.clear()
+            self._unary_dedup.cancel_inflight()
             browser_manager = self._runtime_metadata.get("browser_manager")
             if isinstance(browser_manager, BrowserManager):
                 self._browser_cleanup_retainer.retain(browser_manager)
@@ -499,7 +549,7 @@ class ExecutorRunner:
         async with websockets.connect(
             url,
             compression="deflate",
-            max_size=10 * 1024 * 1024,
+            max_size=32 * 1024 * 1024,
             ping_interval=_WS_PING_INTERVAL_SECONDS,
             ping_timeout=_WS_PING_TIMEOUT_SECONDS,
         ) as ws:
@@ -658,6 +708,54 @@ class ExecutorRunner:
             method = msg.get("method")
             msg_id = msg.get("id")
             params = msg.get("params", {})
+            replay_owner = False
+            replay_call_id = ""
+            if (
+                method
+                in {
+                    "tool.list",
+                    "lsp.status",
+                    "shell.background_status",
+                    "local_model.status",
+                    "local_model.show",
+                    "llm.discover_models",
+                }
+                and isinstance(params, dict)
+                and params.get("_cognis_replay_safe_unary") is True
+            ):
+                call_id = str(params.get("_cognis_unary_call_id") or "")
+                claimed_digest = str(params.get("_cognis_unary_payload_digest") or "")
+                clean_params = {
+                    key: value
+                    for key, value in params.items()
+                    if not key.startswith("_cognis_unary_") and key != "_cognis_replay_safe_unary"
+                }
+                digest = UnaryDedupCache.digest({"method": method, "params": clean_params})
+                if not call_id or digest != claimed_digest:
+                    await self._send_rpc_error(ws, msg_id, -32602, "Invalid unary dedup metadata")
+                    continue
+                params = clean_params
+                try:
+                    future, owner = self._unary_dedup.join_or_claim(call_id, digest)
+                except UnaryCallConflict:
+                    self._create_background_handler_task(
+                        self._send_rpc_error(ws, msg_id, -32061, "Unary call ID payload conflict"),
+                        "unary.conflict",
+                        msg_id=msg_id,
+                    )
+                    continue
+                replay_owner = owner
+                replay_call_id = call_id
+                if not owner:
+                    assert future is not None
+                    self._create_background_handler_task(
+                        self._replay_unary_future(ws, msg_id, future),
+                        "unary.replay",
+                        msg_id=msg_id,
+                    )
+                    continue
+                if msg_id is not None:
+                    self._unary_dedup_requests[str(msg_id)] = (call_id, digest)
             if method in _LOCAL_INFERENCE_START_METHODS and not self._local_inference_enabled:
                 await self._send_rpc_error(
                     ws,
@@ -671,7 +769,16 @@ class ExecutorRunner:
                 await self._handle_configure(ws, msg_id, params)
             elif method == "tool.list":
                 logger.debug("Received tool.list request")
-                await self._handle_tool_list(ws, msg_id)
+                if replay_owner:
+                    self._create_replay_safe_handler_task(
+                        self._handle_tool_list(ws, msg_id),
+                        "tool.list",
+                        call_id=replay_call_id,
+                        msg_id=msg_id,
+                        owner_ws=ws,
+                    )
+                else:
+                    await self._handle_tool_list(ws, msg_id)
             elif method == "tool.execute":
                 tool_name = params.get("tool_name", params.get("name", "?"))
                 logger.debug("Received tool.execute: %s", tool_name)
@@ -709,7 +816,7 @@ class ExecutorRunner:
                     )
                     continue
                 task = self._create_background_handler_task(
-                    self._handle_tool_execute(ws, msg_id, params),
+                    self._handle_deduplicated_tool_execute(ws, msg_id, params),
                     "tool.execute",
                     msg_id=msg_id,
                 )
@@ -717,8 +824,16 @@ class ExecutorRunner:
             elif method == "tool.cancel":
                 call_id = params.get("call_id")
                 logger.debug("Received tool.cancel: %s", call_id)
+                cancelled = False
                 if call_id and call_id in self._active_calls:
                     self._active_calls[call_id].cancel()
+                    cancelled = True
+                if msg_id is not None:
+                    await self._send_rpc_result(
+                        ws,
+                        msg_id,
+                        {"call_id": call_id, "cancelled": cancelled},
+                    )
             elif method == "browser.session_terminal":
                 self._create_background_handler_task(
                     self._handle_browser_session_terminal(ws, msg_id, params),
@@ -727,26 +842,66 @@ class ExecutorRunner:
                 )
             elif method == "llm.complete":
                 logger.debug("Received llm.complete")
-                self._create_background_handler_task(
+                request_id = str(params.get("request_id") or msg_id or "")
+                inference_key = f"llm:{request_id}"
+                task = self._create_background_handler_task(
                     self._handle_llm_complete(ws, msg_id, params), "llm.complete", msg_id=msg_id
                 )
+                self._active_calls[inference_key] = task
+                task.add_done_callback(
+                    lambda finished, key=inference_key: self._active_calls.pop(key, None)
+                )
+            elif method == "llm.cancel":
+                request_id = str(params.get("request_id") or "")
+                task = self._active_calls.get(f"llm:{request_id}")
+                cancelled = False
+                if task is not None:
+                    task.cancel()
+                    cancelled = True
+                if msg_id is not None:
+                    await self._send_rpc_result(
+                        ws,
+                        msg_id,
+                        {"request_id": request_id, "cancelled": cancelled},
+                    )
             elif method == "llm.discover_models":
                 logger.debug("Received llm.discover_models")
-                self._create_background_handler_task(
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
                     self._handle_llm_discover_models(ws, msg_id, params),
                     "llm.discover_models",
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
                     msg_id=msg_id,
                 )
             elif method == "local_model.status":
-                self._create_background_handler_task(
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
                     self._handle_local_model_status(ws, msg_id),
                     "local_model.status",
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
                     msg_id=msg_id,
                 )
             elif method == "local_model.show":
-                self._create_background_handler_task(
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
                     self._handle_local_model_show(ws, msg_id, params),
                     "local_model.show",
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
                     msg_id=msg_id,
                 )
             elif method == "local_model.operation.start":
@@ -805,6 +960,12 @@ class ExecutorRunner:
                 self._create_background_handler_task(
                     self._handle_channel_send(ws, msg_id, params), "channel.send", msg_id=msg_id
                 )
+            elif method == "channel.resolve_recipient":
+                self._create_background_handler_task(
+                    self._handle_channel_resolve_recipient(ws, msg_id, params),
+                    "channel.resolve_recipient",
+                    msg_id=msg_id,
+                )
             elif method == "channel.fetch_media":
                 self._create_background_handler_task(
                     self._handle_channel_fetch_media(ws, msg_id, params),
@@ -830,13 +991,29 @@ class ExecutorRunner:
                     msg_id=msg_id,
                 )
             elif method == "lsp.status":
-                self._create_background_handler_task(
-                    self._handle_lsp_status(ws, msg_id, params), "lsp.status", msg_id=msg_id
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
+                    self._handle_lsp_status(ws, msg_id, params),
+                    "lsp.status",
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
+                    msg_id=msg_id,
                 )
             elif method == "shell.background_status":
-                self._create_background_handler_task(
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
                     self._handle_background_shell_status(ws, msg_id, params),
                     "shell.background_status",
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
                     msg_id=msg_id,
                 )
             elif method == "oauth.loopback_start":
@@ -863,6 +1040,11 @@ class ExecutorRunner:
             logger.warning("Controller websocket closed, leaving message loop")
         else:
             logger.info("Executor message loop stopped")
+        # Let background unary handlers publish their terminal result and let
+        # reconnect joiners consume it before a finite test/fake websocket
+        # returns. A real connection teardown still cancels handlers in the
+        # connection-loop supervisor.
+        await asyncio.sleep(0)
 
     def _create_background_handler_task(
         self,
@@ -896,6 +1078,94 @@ class ExecutorRunner:
 
         task.add_done_callback(_consume_result)
         return task
+
+    def _create_replay_safe_handler_task(
+        self,
+        coro: Any,
+        method: str,
+        *,
+        call_id: str,
+        msg_id: str | None,
+        owner_ws: Any,
+    ) -> asyncio.Task[Any]:
+        """Run a replay-safe unary owner independently of one websocket."""
+
+        task = asyncio.create_task(coro)
+        self._replay_safe_tasks[call_id] = task
+        self._replay_safe_owners[call_id] = (owner_ws, msg_id)
+        dedup = self._unary_dedup_requests.get(str(msg_id))
+        if dedup is not None:
+            self._replay_safe_digests[call_id] = dedup[1]
+
+        def _consume_result(done: asyncio.Task[Any]) -> None:
+            if self._replay_safe_tasks.get(call_id) is done:
+                self._replay_safe_tasks.pop(call_id, None)
+            digest = self._replay_safe_digests.pop(call_id, None)
+            if done.cancelled() or done.exception() is not None:
+                for request_id, dedup in tuple(self._unary_dedup_requests.items()):
+                    if dedup[0] == call_id:
+                        self._unary_dedup_requests.pop(request_id, None)
+                if digest is not None:
+                    frame = self._unary_dedup.complete_error(
+                        call_id,
+                        digest,
+                        message=(
+                            "Replay-safe unary call was cancelled"
+                            if done.cancelled()
+                            else "Replay-safe unary call failed before completion"
+                        ),
+                    )
+                    self._schedule_terminal_send(call_id, frame)
+            self._replay_safe_owners.pop(call_id, None)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                logger.debug(
+                    "Replay-safe unary task cancelled",
+                    extra={"extra_data": {"method": method, "msg_id": msg_id}},
+                )
+            except Exception:
+                logger.exception(
+                    "Replay-safe unary task failed",
+                    extra={"extra_data": {"method": method, "msg_id": msg_id}},
+                )
+
+        task.add_done_callback(_consume_result)
+        while len(self._replay_safe_tasks) > self._unary_dedup.max_entries:
+            evicted_id, evicted = next(iter(self._replay_safe_tasks.items()))
+            self._replay_safe_tasks.pop(evicted_id, None)
+            if not evicted.done():
+                evicted.cancel()
+            digest = self._replay_safe_digests.get(evicted_id)
+            if digest is not None:
+                frame = self._unary_dedup.evict(evicted_id, digest)
+                self._schedule_terminal_send(evicted_id, frame)
+                self._replay_safe_owners.pop(evicted_id, None)
+        return task
+
+    def _schedule_terminal_send(self, call_id: str, frame: dict[str, Any]) -> None:
+        owner = self._replay_safe_owners.get(call_id)
+        if owner is None:
+            return
+        ws, msg_id = owner
+        task = asyncio.create_task(self._send_terminal_frame(ws, msg_id, frame))
+        self._terminal_send_tasks.add(task)
+        task.add_done_callback(self._terminal_send_tasks.discard)
+
+    async def _send_terminal_frame(
+        self, ws: Any, msg_id: str | None, frame: dict[str, Any]
+    ) -> None:
+        if msg_id is None:
+            return
+        outbound = dict(frame)
+        outbound["id"] = msg_id
+        try:
+            await asyncio.wait_for(
+                self._send_ws(ws, json.dumps(outbound, separators=(",", ":"))),
+                timeout=5.0,
+            )
+        except (asyncio.CancelledError, Exception):
+            return
 
     async def _cancel_connection_handler_tasks(self) -> None:
         """Cancel and drain RPC handlers owned by the closing connection."""
@@ -1473,6 +1743,14 @@ class ExecutorRunner:
             {"tools": [tool.model_dump(mode="json") for tool in self._configured_tool_definitions]},
         )
 
+    async def _handle_deduplicated_tool_execute(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        try:
+            await self._handle_tool_execute(ws, msg_id, params)
+        finally:
+            self._same_turn_tool_call_deduplicator.release(params)
+
     async def _handle_tool_execute(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
     ) -> None:
@@ -2013,7 +2291,16 @@ class ExecutorRunner:
                 size=params.get("size"),
                 quality=params.get("quality"),
                 response_format=str(params.get("response_format", "b64_json")),
-                image=params.get("image"),
+                images=(
+                    [ImageInput.model_validate(image) for image in params.get("images") or []]
+                    if params.get("images") is not None
+                    else None
+                ),
+                mask=(
+                    ImageInput.model_validate(params["mask"])
+                    if params.get("mask") is not None
+                    else None
+                ),
                 request_kwargs=request_kwargs,
             )
             await self._send_rpc_result(ws, msg_id, result)
@@ -2089,6 +2376,52 @@ class ExecutorRunner:
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:
             await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
+
+    async def _handle_channel_resolve_recipient(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._channel_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Channel handler unavailable")
+            return
+        if (
+            not isinstance(params, dict)
+            or not isinstance(params.get("account_id"), str)
+            or not params["account_id"]
+            or not isinstance(params.get("recipient"), dict)
+            or not isinstance(params.get("resolution_key"), str)
+            or not params["resolution_key"]
+        ):
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32602,
+                "Malformed channel recipient resolution request",
+                data={
+                    "code": "malformed_request",
+                    "retryable": False,
+                    "side_effect_certainty": "none",
+                },
+            )
+            return
+        try:
+            result = await self._channel_handler.resolve_recipient(
+                account_id=params["account_id"],
+                recipient=params["recipient"],
+                resolution_key=params["resolution_key"],
+            )
+            await self._send_rpc_result(ws, msg_id, result)
+        except Exception as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32000,
+                "Recipient resolution failed",
+                data={
+                    "code": "resolution_failed",
+                    "retryable": True,
+                    "side_effect_certainty": _recipient_resolution_failure_certainty(params, exc),
+                },
+            )
 
     async def _handle_channel_fetch_media(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -2622,7 +2955,25 @@ class ExecutorRunner:
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:
         if msg_id is None:
             return
-        await self._send_ws(ws, json.dumps({"jsonrpc": "2.0", "result": result, "id": msg_id}))
+        frame = {"jsonrpc": "2.0", "result": result, "id": msg_id}
+        dedup = self._unary_dedup_requests.pop(str(msg_id), None)
+        if dedup is not None:
+            self._unary_dedup.put(dedup[0], dedup[1], frame)
+        await self._send_ws(ws, json.dumps(frame))
+
+    async def _replay_unary_future(
+        self, ws: Any, msg_id: str | None, future: asyncio.Future[dict[str, Any]]
+    ) -> None:
+        """Reply to a reconnect duplicate when the original unary call finishes."""
+
+        if msg_id is None:
+            return
+        try:
+            frame = dict(await asyncio.shield(future))
+        except asyncio.CancelledError:
+            return
+        frame["id"] = msg_id
+        await self._send_ws(ws, json.dumps(frame, separators=(",", ":")))
 
     async def _send_rpc_error(
         self,
@@ -2638,10 +2989,11 @@ class ExecutorRunner:
         error: dict[str, Any] = {"code": code, "message": message}
         if data is not None:
             error["data"] = data
-        await self._send_ws(
-            ws,
-            json.dumps({"jsonrpc": "2.0", "error": error, "id": msg_id}),
-        )
+        frame = {"jsonrpc": "2.0", "error": error, "id": msg_id}
+        dedup = self._unary_dedup_requests.pop(str(msg_id), None)
+        if dedup is not None:
+            self._unary_dedup.put(dedup[0], dedup[1], frame)
+        await self._send_ws(ws, json.dumps(frame))
 
     async def _send_ws(self, ws: Any, payload: str) -> None:
         async with self._ws_send_lock:
@@ -2662,3 +3014,16 @@ def _normalize_result(raw: Any, duration_ms: int) -> ToolResult:
     else:
         output = str(raw)
     return ToolResult(output=output, duration_ms=duration_ms)
+
+
+def _recipient_resolution_failure_certainty(
+    params: Any,
+    exc: Exception,
+) -> str:
+    """Keep explicit certainty and otherwise account for authorized creation."""
+    explicit = getattr(exc, "side_effect_certainty", None)
+    if isinstance(explicit, str) and explicit in {"none", "uncertain", "known"}:
+        return explicit
+    recipient = params.get("recipient") if isinstance(params, dict) else None
+    allow_creation = isinstance(recipient, dict) and recipient.get("allow_creation") is True
+    return "uncertain" if allow_creation else "none"

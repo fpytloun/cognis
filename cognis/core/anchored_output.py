@@ -6,6 +6,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from html import unescape
 from typing import Any
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -13,6 +14,12 @@ _MARKDOWN_ATX_HEADING_RE = re.compile(
     r"^(?P<indent> {0,3})(?P<marks>#{1,6})(?!#)(?P<title>\s+.+?)\s*$"
 )
 _MARKDOWN_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
+_HTML_HEADING_RE = re.compile(
+    r"<h(?P<level>[1-6])(?:\s[^>]*)?>(?P<title>.*?)</h(?P=level)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_SETEXT_RE = re.compile(r"^(?P<marks>=+|-+)\s*$")
 
 
 @dataclass(slots=True)
@@ -50,7 +57,11 @@ class AnchoredTextBuilder:
             return
         start_line = len(self._lines) + 1
         self._lines.append(f"[[{anchor}]]")
-        self._lines.extend(lines)
+        for line in lines:
+            # Callers commonly pass extracted Markdown as one string. Anchor
+            # locators are physical line numbers, so embedded newlines must
+            # contribute to the builder's line count.
+            self._lines.extend(str(line).splitlines() or [""])
         end_line = len(self._lines)
         self._anchors.append(
             OutputAnchor(
@@ -66,9 +77,9 @@ class AnchoredTextBuilder:
 
     def build(self) -> tuple[str, list[dict[str, object]]]:
         text = "\n".join(self._lines).rstrip()
-        anchors = []
+        anchors: list[dict[str, object]] = []
         for item in self._anchors:
-            anchor = {
+            anchor: dict[str, object] = {
                 "anchor": item.anchor,
                 "label": item.label,
                 "kind": item.kind,
@@ -99,12 +110,12 @@ def markdown_heading_anchors(
     max_anchors: int = 100,
     max_heading_level: int = 3,
 ) -> list[dict[str, object]]:
-    """Derive line-based anchors from Markdown ATX headings.
+    """Derive line-based anchors from Markdown and HTML headings.
 
-    The extractor is intentionally conservative: it recognizes only ATX headings
-    outside fenced code blocks and does not mutate the source text. Returned
-    ranges include the heading line and continue until the next heading with the
-    same or higher level, so parent sections include their nested subsections.
+    The extractor recognizes ATX and Setext headings outside fenced code blocks,
+    plus HTML ``h1``–``h6`` elements. All candidates are returned in source order
+    and ranges include the heading through the next heading with the same or
+    higher level.
     """
 
     if not content or max_anchors <= 0 or max_heading_level <= 0:
@@ -133,10 +144,12 @@ def markdown_heading_anchors(
     headings: list[tuple[int, int, str]] = []
     fence_char: str | None = None
     fence_len = 0
+    fenced_lines: set[int] = set()
 
     for line_no, line in enumerate(lines, start=1):
         fence_match = _MARKDOWN_FENCE_RE.match(line)
         if fence_match:
+            fenced_lines.add(line_no)
             fence = fence_match.group("fence")
             char = fence[0]
             if fence_char is None:
@@ -149,20 +162,46 @@ def markdown_heading_anchors(
                 continue
 
         if fence_char is not None:
+            fenced_lines.add(line_no)
             continue
 
         match = _MARKDOWN_ATX_HEADING_RE.match(line)
-        if not match:
-            continue
-        level = len(match.group("marks"))
+        if match:
+            level = len(match.group("marks"))
+            title = re.sub(r"\s+#+\s*$", "", match.group("title").strip()).strip()
+            if level <= max_heading_level and title:
+                headings.append((line_no, level, title))
+                continue
+        if line_no > 1 and line.strip() and _SETEXT_RE.fullmatch(line):
+            title = lines[line_no - 2].strip()
+            if title and not _MARKDOWN_FENCE_RE.match(title):
+                level = 1 if line.lstrip().startswith("=") else 2
+                if level <= max_heading_level:
+                    headings.append((line_no - 1, level, title))
+
+    for match in _HTML_HEADING_RE.finditer(content):
+        level = int(match.group("level"))
         if level > max_heading_level:
             continue
-        title = match.group("title").strip()
-        title = re.sub(r"\s+#+\s*$", "", title).strip()
+        start_line = content.count("\n", 0, match.start()) + 1
+        end_line = content.count("\n", 0, match.end()) + 1
+        if any(line_number in fenced_lines for line_number in range(start_line, end_line + 1)):
+            continue
+        title = _HTML_TAG_RE.sub("", unescape(match.group("title"))).strip()
         if title:
-            headings.append((line_no, level, title))
-            if len(headings) >= max_anchors:
-                break
+            headings.append((start_line, level, title))
+
+    headings.sort(key=lambda item: (item[0], item[1], item[2]))
+    deduped: list[tuple[int, int, str]] = []
+    seen_heading_positions: set[tuple[int, int, str]] = set()
+    for heading in headings:
+        if heading in seen_heading_positions:
+            continue
+        seen_heading_positions.add(heading)
+        deduped.append(heading)
+        if len(deduped) >= max_anchors:
+            break
+    headings = deduped
 
     anchors: list[dict[str, object]] = []
     used_names = set(existing_names)

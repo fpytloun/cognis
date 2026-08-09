@@ -21,6 +21,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from sqlalchemy.exc import IntegrityError
 
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.workflow_management import (
@@ -31,6 +32,7 @@ from cognis.core.workflow_management import (
 from cognis.logging import get_logger
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import CompletionDeliveryPolicy
+from cognis.store.coordination import DatabaseLeaseStore, database_now
 from cognis.store.queries import (
     count_active_tasks_for_schedule,
     delete_schedule,
@@ -42,6 +44,7 @@ from cognis.store.queries import (
     update_schedule,
     update_schedule_fire_state,
 )
+from cognis.store.schedule_fires import ScheduleFireStore
 
 logger = get_logger(__name__)
 
@@ -73,6 +76,7 @@ class Scheduler:
         max_missed_on_startup: int = _DEFAULT_MAX_MISSED_ON_STARTUP,
         missed_stagger_seconds: int = _DEFAULT_MISSED_STAGGER_SECONDS,
         max_consecutive_errors: int = _DEFAULT_MAX_CONSECUTIVE_ERRORS,
+        controller_owner_id: str = "simple-controller",
     ) -> None:
         self._session_factory = session_factory
         self._task_queue = task_queue
@@ -86,6 +90,10 @@ class Scheduler:
         self._max_missed_on_startup = max_missed_on_startup
         self._missed_stagger_seconds = missed_stagger_seconds
         self._max_consecutive_errors = max_consecutive_errors
+        self._controller_owner_id = controller_owner_id
+        self._lease_store = DatabaseLeaseStore(session_factory)
+        self._fire_store = ScheduleFireStore(session_factory)
+        self._manual_triggers: dict[str, asyncio.Task[str | None]] = {}
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_task_terminal_event)
         event_bus.subscribe(EventType.TASK_FAILED, self._handle_task_terminal_event)
         event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_task_terminal_event)
@@ -150,6 +158,9 @@ class Scheduler:
 
     async def _tick(self) -> None:
         """Single timer tick: fire due schedules, then sleep."""
+        if hasattr(self, "_fire_store") and await self._fire_store.catchup_active():
+            await self._catch_up_missed(resume_only=True)
+            return
         now = datetime.now(UTC)
 
         async with self._db_session() as db:
@@ -199,7 +210,411 @@ class Scheduler:
     # Fire logic
     # ------------------------------------------------------------------
 
+    async def trigger_now(self, schedule_id: str) -> str | None:
+        """Run a schedule immediately without consuming its recurring occurrence."""
+        active = self._manual_triggers.get(schedule_id)
+        if active is not None:
+            return await asyncio.shield(active)
+        trigger = asyncio.create_task(
+            self._trigger_now_owned(schedule_id),
+            name=f"schedule-manual-trigger:{schedule_id}",
+        )
+        self._manual_triggers[schedule_id] = trigger
+        try:
+            return await asyncio.shield(trigger)
+        finally:
+            if self._manual_triggers.get(schedule_id) is trigger:
+                self._manual_triggers.pop(schedule_id, None)
+
+    async def _trigger_now_owned(self, schedule_id: str) -> str | None:
+        """Own one coalesced manual trigger for this controller."""
+        lease = await self._lease_store.acquire(
+            f"schedule:{schedule_id}",
+            self._controller_owner_id,
+            ttl_seconds=60,
+        )
+        if lease is None:
+            return None
+        lease_lost = asyncio.Event()
+        renew_task = asyncio.create_task(
+            self._renew_fire_lease(lease, lease_lost),
+            name=f"schedule-manual-fire-renew:{schedule_id}",
+        )
+        dispatched = False
+        try:
+            claim = await self._fire_store.claim_manual(
+                schedule_id=schedule_id,
+                lease=lease,
+            )
+            if claim is None:
+                return None
+            sched = claim.schedule
+            if claim.status == "skipped":
+                return None
+            if claim.status == "dispatched":
+                await self._activate_manual_task(claim.task_id)
+                return claim.task_id
+
+            existing = None
+            async with self._db_session() as db:
+                existing = await get_task(db, claim.task_id)
+            if existing is None:
+                if lease_lost.is_set():
+                    return None
+                try:
+                    task = await self._dispatch_claimed_fire(
+                        sched,
+                        claim.scheduled_fire_at,
+                        claim.task_id,
+                        status="draft",
+                    )
+                except IntegrityError:
+                    async with self._db_session() as db:
+                        task = await get_task(db, claim.task_id)
+                    if task is None:
+                        raise
+            else:
+                task = existing
+            if not await self._fire_store.link_manual_task(claim=claim, lease=lease):
+                return None
+            reconcile = getattr(self._task_queue, "reconcile_submitted", None)
+            if reconcile is not None:
+                reconciled = await reconcile(claim.task_id)
+                if reconciled is not None:
+                    task = reconciled
+
+            task_status = getattr(task, "status", None)
+            if getattr(task_status, "value", task_status) == "draft":
+                task = await self._activate_manual_task(claim.task_id)
+            if not await self._fire_store.settle_manual_dispatched(
+                claim=claim,
+                lease=lease,
+                one_shot_status="success",
+            ):
+                return None
+            dispatched = True
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.SCHEDULE_FIRED,
+                    data={"schedule_id": schedule_id, "task_id": claim.task_id},
+                )
+            )
+            return claim.task_id
+        except Exception as exc:
+            if "claim" in locals() and claim is not None and not dispatched:
+                async with self._db_session() as db:
+                    durable_task = await get_task(db, claim.task_id)
+                if durable_task is None:
+                    await self._fire_store.mark_manual_failed(
+                        claim=claim,
+                        lease=lease,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+            logger.exception("Schedule %s manual fire failed", schedule_id)
+            return None
+        finally:
+            renew_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renew_task
+            await self._lease_store.release(lease)
+
+    async def _activate_manual_task(self, task_id: str) -> Any:
+        async with self._db_session() as db:
+            task = await get_task(db, task_id)
+        if task is None:
+            raise RuntimeError(f"Reserved manual task {task_id} does not exist")
+        task_status = getattr(task, "status", None)
+        if getattr(task_status, "value", task_status) != "draft":
+            return task
+        submit_existing = getattr(self._task_queue, "submit_existing", None)
+        if submit_existing is None:
+            raise RuntimeError("Task queue cannot activate a reserved manual task")
+        return await submit_existing(task_id)
+
     async def _fire_schedule(self, schedule_id: str) -> str | None:
+        """Claim, dispatch, and settle one durable logical schedule fire."""
+        if not hasattr(self, "_lease_store"):
+            return await self._fire_schedule_uncoordinated(schedule_id)
+
+        lease = await self._lease_store.acquire(
+            f"schedule:{schedule_id}",
+            self._controller_owner_id,
+            ttl_seconds=60,
+        )
+        if lease is None:
+            return None
+        async with self._db_session() as db:
+            sched = await get_schedule(db, schedule_id)
+        if sched is None or not sched.enabled:
+            await self._lease_store.release(lease)
+            return None
+        scheduled_fire_at = sched.next_fire_at
+        if scheduled_fire_at is None:
+            scheduled_fire_at = datetime.now(UTC)
+            async with self._db_session() as db:
+                updated = await update_schedule(
+                    db,
+                    schedule_id,
+                    next_fire_at=scheduled_fire_at,
+                )
+                await db.commit()
+            if updated is None or not updated.enabled:
+                await self._lease_store.release(lease)
+                return None
+            async with self._db_session() as db:
+                sched = await get_schedule(db, schedule_id)
+            if sched is None or sched.next_fire_at is None:
+                await self._lease_store.release(lease)
+                return None
+            scheduled_fire_at = sched.next_fire_at
+        lease_lost = asyncio.Event()
+        renew_task = asyncio.create_task(
+            self._renew_fire_lease(lease, lease_lost),
+            name=f"schedule-fire-renew:{schedule_id}",
+        )
+        dispatched = False
+        try:
+            claim = await self._fire_store.claim(
+                schedule_id=schedule_id,
+                scheduled_fire_at=scheduled_fire_at,
+                lease=lease,
+            )
+            if claim is None:
+                return None
+            sched = claim.schedule
+            if claim.status == "skipped":
+                await self._advance_claimed_fire(
+                    sched,
+                    scheduled_fire_at,
+                    status="skipped",
+                    lease=lease,
+                )
+                return None
+            if not claim.should_dispatch:
+                await self._advance_claimed_fire(
+                    sched,
+                    scheduled_fire_at,
+                    status="success",
+                    lease=lease,
+                )
+                return claim.task_id if claim.status == "dispatched" else None
+
+            existing = None
+            async with self._db_session() as db:
+                existing = await get_task(db, claim.task_id)
+            if existing is None:
+                if lease_lost.is_set():
+                    return None
+                try:
+                    task = await self._dispatch_claimed_fire(
+                        sched,
+                        scheduled_fire_at,
+                        claim.task_id,
+                    )
+                except IntegrityError:
+                    async with self._db_session() as db:
+                        task = await get_task(db, claim.task_id)
+                    if task is None:
+                        raise
+            else:
+                task = existing
+            reconcile = getattr(self._task_queue, "reconcile_submitted", None)
+            if reconcile is not None:
+                reconciled = await reconcile(claim.task_id)
+                if reconciled is not None:
+                    task = reconciled
+
+            if not await self._fire_store.mark_dispatched(claim=claim, lease=lease):
+                return None
+            dispatched = True
+            await self._advance_claimed_fire(
+                sched,
+                scheduled_fire_at,
+                status="success",
+                lease=lease,
+            )
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.SCHEDULE_FIRED,
+                    data={"schedule_id": schedule_id, "task_id": claim.task_id},
+                )
+            )
+            return claim.task_id
+        except Exception as exc:
+            if "claim" in locals() and claim is not None and not dispatched:
+                errors = int(sched.consecutive_errors or 0) + 1
+                disabled = errors >= self._max_consecutive_errors
+                backoff = self._compute_backoff_delay(errors)
+                disabled_reason = (
+                    f"Auto-disabled after {errors} consecutive errors" if disabled else None
+                )
+                settled = await self._fire_store.mark_failed(
+                    claim=claim,
+                    lease=lease,
+                    error=f"{type(exc).__name__}: {exc}",
+                    next_fire_at=(
+                        None if disabled else datetime.now(UTC) + timedelta(seconds=backoff)
+                    ),
+                    consecutive_errors=errors,
+                    disabled_reason=disabled_reason,
+                )
+                if settled:
+                    await self._event_bus.publish(
+                        Event(
+                            type=(
+                                EventType.SCHEDULE_DISABLED
+                                if disabled
+                                else EventType.SCHEDULE_ERROR
+                            ),
+                            data={
+                                "schedule_id": schedule_id,
+                                "consecutive_errors": errors,
+                                "next_retry_seconds": backoff,
+                                "created_by": sched.created_by,
+                                "agent_id": sched.agent_id,
+                                "schedule_name": sched.name,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                **(
+                                    {"reason": disabled_reason}
+                                    if disabled_reason is not None
+                                    else {}
+                                ),
+                            },
+                        )
+                    )
+            logger.exception("Schedule %s durable fire failed", schedule_id)
+            return None
+        finally:
+            renew_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renew_task
+            await self._lease_store.release(lease)
+
+    async def _renew_fire_lease(self, lease: Any, lease_lost: asyncio.Event) -> None:
+        while True:
+            await asyncio.sleep(15)
+            try:
+                renewed = await self._lease_store.renew(lease, ttl_seconds=60)
+            except Exception:
+                renewed = None
+            if renewed is None:
+                lease_lost.set()
+                return
+
+    async def _dispatch_claimed_fire(
+        self,
+        sched: Any,
+        scheduled_fire_at: datetime,
+        task_id: str,
+        *,
+        status: str = "queued",
+    ) -> Any:
+        template: dict[str, Any] = dict(sched.task_template)
+        title = template.pop("title", sched.name)
+        description = template.pop("description", sched.description or "")
+        expected_output = template.pop("expected_output", None)
+        priority = template.pop("priority", 0)
+        template.pop("workflow_id", None)
+        template.pop("skill_id", None)
+        workflow_id = sched.workflow_id
+        created_workflow_id: str | None = None
+        workspace_root = template.pop("workspace_root", None)
+        working_directory = template.pop("working_directory", None)
+        session_policy = template.pop("session_policy", None)
+        template.pop("created_by_agent_id", None)
+        if getattr(sched, "skill_id", None):
+            async with self._db_session() as db:
+                agent_row = await get_agent(db, sched.agent_id)
+            if agent_row is None:
+                raise ValueError(f"Agent '{sched.agent_id}' not found for schedule")
+            await get_attached_skill_workflow_source(
+                session_factory=self._db_session,
+                owner_email=sched.created_by,
+                agent=agent_row,
+                skill_id=str(sched.skill_id),
+            )
+            created_workflow = await materialize_skill_workflow(
+                session_factory=self._db_session,
+                owner_email=sched.created_by,
+                skill_id=str(sched.skill_id),
+                lifecycle="ephemeral",
+                composition_source="manual",
+                composition_intent=str(description or title),
+            )
+            workflow_id = created_workflow.workflow_id
+            created_workflow_id = created_workflow.workflow_id
+
+        delivery_raw = template.pop("delivery", None)
+        delivery: TaskDelivery | None = TaskDelivery(mode="preferred_channel")
+        if isinstance(delivery_raw, dict):
+            delivery = TaskDelivery(**delivery_raw)
+        completion_delivery = CompletionDeliveryPolicy(
+            completion_mode_family=getattr(sched, "completion_mode_family", "default"),
+            allow_silent_completion=bool(getattr(sched, "allow_silent_completion", False)),
+        )
+        try:
+            return await self._task_queue.submit(
+                task_id=task_id,
+                created_by=sched.created_by,
+                agent_id=sched.agent_id,
+                agent_profile_id=getattr(sched, "agent_profile_id", None),
+                title=str(title),
+                description=str(description),
+                expected_output=expected_output,
+                priority=int(priority),
+                source_type="scheduler",
+                source_ref=sched.schedule_id,
+                delivery=delivery,
+                completion_delivery=completion_delivery,
+                interaction_mode_override=getattr(sched, "interaction_mode_override", None)
+                or "none",
+                session_policy=session_policy if isinstance(session_policy, dict) else None,
+                workflow_id=workflow_id,
+                project_id=getattr(sched, "project_id", None),
+                workspace_root=workspace_root,
+                working_directory=working_directory,
+                scheduled_for=scheduled_fire_at,
+                status=status,
+            )
+        except BaseException:
+            if created_workflow_id is not None:
+                async with self._db_session() as db:
+                    committed_task = await get_task(db, task_id)
+                if committed_task is None:
+                    with contextlib.suppress(Exception):
+                        await delete_materialized_workflow(
+                            session_factory=self._db_session,
+                            workflow_id=created_workflow_id,
+                        )
+            raise
+
+    async def _advance_claimed_fire(
+        self,
+        sched: Any,
+        scheduled_fire_at: datetime,
+        *,
+        status: str,
+        lease: Any,
+    ) -> None:
+        next_fire = (
+            None
+            if sched.schedule_type == "one_shot"
+            else self._compute_next_fire(sched, scheduled_fire_at)
+        )
+        advanced = await self._fire_store.advance_schedule(
+            schedule_id=sched.schedule_id,
+            scheduled_fire_at=scheduled_fire_at,
+            next_fire_at=next_fire,
+            status=status,
+            consecutive_errors=sched.consecutive_errors,
+            lease=lease,
+        )
+        if advanced and sched.delete_after_run and sched.schedule_type == "one_shot":
+            async with self._db_session() as db:
+                await delete_schedule(db, sched.schedule_id)
+                await db.commit()
+
+    async def _fire_schedule_uncoordinated(self, schedule_id: str) -> str | None:
         """Create a task from the schedule template and return its task id."""
         now = datetime.now(UTC)
 
@@ -417,6 +832,8 @@ class Scheduler:
             task = await get_task(db, task_id)
             if task is None or task.source_type != "scheduler" or not task.source_ref:
                 return
+            if await self._fire_store.is_manual_task(task_id):
+                return
             schedule_id = str(task.source_ref)
             sched = await get_schedule(db, schedule_id)
             if sched is None:
@@ -585,27 +1002,153 @@ class Scheduler:
                     await update_schedule(db, sched.schedule_id, next_fire_at=next_fire)
             await db.commit()
 
-    async def _catch_up_missed(self) -> None:
-        """Fire schedules that were due during downtime (capped + staggered)."""
-        now = datetime.now(UTC)
-        async with self._db_session() as db:
-            due = await list_due_schedules(db, now)
-
+    async def _catch_up_missed(self, *, resume_only: bool = False) -> None:
+        """Fire a bounded missed backlog, then jump recurring schedules forward."""
+        catchup_lease = None
+        while catchup_lease is None and not self._stop_event.is_set():
+            catchup_lease = await self._lease_store.acquire(
+                "scheduler:startup-catchup",
+                self._controller_owner_id,
+                ttl_seconds=60,
+            )
+            if catchup_lease is None:
+                await asyncio.sleep(0.2)
+        if catchup_lease is None:
+            return
+        lease_lost = asyncio.Event()
+        renew_task = asyncio.create_task(
+            self._renew_fire_lease(catchup_lease, lease_lost),
+            name="scheduler-catchup-renew",
+        )
         fired = 0
-        for sched_row in due:
-            if fired >= self._max_missed_on_startup:
-                logger.info(
-                    "Missed-job catchup capped at %d; deferring remaining",
-                    self._max_missed_on_startup,
-                )
-                break
-            await self._fire_schedule(sched_row.schedule_id)
-            fired += 1
-            if fired < len(due) and self._missed_stagger_seconds > 0:
-                await asyncio.sleep(self._missed_stagger_seconds)
+        try:
+            async with self._db_session() as db:
+                proposed_cutoff = await database_now(db)
+            catchup_state = await self._fire_store.prepare_catchup(
+                lease=catchup_lease,
+                cutoff_at=proposed_cutoff,
+                budget=self._max_missed_on_startup,
+                start_new=not resume_only,
+            )
+            if catchup_state is None:
+                if await self._fire_store.catchup_active():
+                    lease_lost.set()
+                else:
+                    return
+            cutoff, remaining_budget = catchup_state or (proposed_cutoff, 0)
+            while remaining_budget > 0 and not lease_lost.is_set():
+                async with self._db_session() as db:
+                    due = await list_due_schedules(db, cutoff)
+                if not due:
+                    break
+                for sched_row in due:
+                    if remaining_budget <= 0 or lease_lost.is_set():
+                        break
+                    reservation = await self._fire_store.reserve_catchup_fire(lease=catchup_lease)
+                    if reservation is None:
+                        lease_lost.set()
+                        break
+                    cutoff, remaining_budget = reservation
+                    original_fire = sched_row.next_fire_at
+                    if original_fire is not None and original_fire.tzinfo is None:
+                        original_fire = original_fire.replace(tzinfo=UTC)
+                    await self._fire_schedule(sched_row.schedule_id)
+                    async with self._db_session() as db:
+                        after_fire = await get_schedule(db, sched_row.schedule_id)
+                    next_fire = after_fire.next_fire_at if after_fire is not None else None
+                    if next_fire is not None and next_fire.tzinfo is None:
+                        next_fire = next_fire.replace(tzinfo=UTC)
+                    settled = (
+                        after_fire is None or not after_fire.enabled or next_fire != original_fire
+                    )
+                    if settled:
+                        fired += 1
+                    else:
+                        restored = await self._fire_store.restore_catchup_fire(lease=catchup_lease)
+                        if restored is None:
+                            lease_lost.set()
+                            break
+                        remaining_budget = restored
+                        await asyncio.sleep(0.2)
+                if remaining_budget > 0 and self._missed_stagger_seconds > 0:
+                    await asyncio.sleep(self._missed_stagger_seconds)
 
-        if fired > 0:
-            logger.info("Caught up %d missed schedule(s) on startup", fired)
+            if not lease_lost.is_set():
+                while not lease_lost.is_set():
+                    async with self._db_session() as db:
+                        fresh_now = await database_now(db)
+                        remaining_due = await list_due_schedules(db, fresh_now)
+                    pending = False
+                    for sched_row in remaining_due:
+                        normalized = await self._skip_missed_backlog(
+                            sched_row.schedule_id, fresh_now
+                        )
+                        if normalized is False:
+                            pending = True
+                    if not pending:
+                        if not await self._fire_store.complete_catchup(lease=catchup_lease):
+                            lease_lost.set()
+                        break
+                    await asyncio.sleep(0.2)
+
+            if fired > 0:
+                logger.info("Caught up %d missed schedule(s) on startup", fired)
+        finally:
+            renew_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renew_task
+            await self._lease_store.release(catchup_lease)
+        if lease_lost.is_set() and not self._stop_event.is_set():
+            await self._catch_up_missed(resume_only=True)
+
+    async def _skip_missed_backlog(self, schedule_id: str, now: datetime) -> bool | None:
+        """CAS an overdue recurring schedule to its first future occurrence."""
+        lease = await self._lease_store.acquire(
+            f"schedule:{schedule_id}",
+            self._controller_owner_id,
+            ttl_seconds=60,
+        )
+        if lease is None:
+            return False
+        try:
+            async with self._db_session() as db:
+                sched = await get_schedule(db, schedule_id)
+            current_fire = (
+                sched.next_fire_at.replace(tzinfo=UTC)
+                if sched is not None
+                and sched.next_fire_at is not None
+                and sched.next_fire_at.tzinfo is None
+                else (sched.next_fire_at if sched is not None else None)
+            )
+            if (
+                sched is None
+                or not sched.enabled
+                or current_fire is None
+                or current_fire > now
+                or sched.schedule_type == "one_shot"
+            ):
+                return None if sched is None or sched.schedule_type == "one_shot" else True
+            next_fire = self._compute_next_fire(sched, now)
+            advanced = await self._fire_store.advance_schedule(
+                schedule_id=schedule_id,
+                scheduled_fire_at=current_fire,
+                next_fire_at=next_fire,
+                status=sched.last_run_status or "skipped",
+                consecutive_errors=sched.consecutive_errors,
+                lease=lease,
+            )
+            if advanced:
+                return True
+            async with self._db_session() as db:
+                current = await get_schedule(db, schedule_id)
+            if current is None or not current.enabled:
+                return True
+            current_next = current.next_fire_at
+            if current_next is not None and current_next.tzinfo is None:
+                current_next = current_next.replace(tzinfo=UTC)
+            return bool(current_next is None or current_next > now)
+        finally:
+            await self._lease_store.release(lease)
 
     # ------------------------------------------------------------------
     # Dynamic management (called by API routes)

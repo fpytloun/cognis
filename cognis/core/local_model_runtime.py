@@ -11,6 +11,10 @@ from weakref import WeakValueDictionary
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.executor_connection_ownership import (
+    ExecutorConnectionOwner,
+    ExecutorConnectionOwnership,
+)
 from cognis.core.local_model_service import (
     list_current_local_model_delete_dependencies,
     resolve_provider_scoped_deployment_executors,
@@ -29,7 +33,7 @@ from cognis.models.local_models import (
 from cognis.providers.executor.websocket import ExecutorRPCError
 from cognis.store.local_models import (
     get_local_model_operation,
-    interrupt_active_local_model_operations,
+    interrupt_recoverable_local_model_operations,
     list_active_local_model_operations,
     lock_and_get_llm_provider,
     lock_and_get_local_model_deployment,
@@ -59,14 +63,16 @@ class LocalModelRuntimeManager:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         ws_provider: Any,
+        controller_owner_id: str = "local-controller",
     ) -> None:
         self._session_factory = session_factory
         self._ws_provider = ws_provider
+        self._controller_owner_id = controller_owner_id
         self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._on_operation_complete: Callable[[str], None] | None = None
-        self._completion_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(
-            maxsize=64
-        )
+        self._completion_queue: asyncio.Queue[
+            tuple[ExecutorConnectionOwner | None, str, dict[str, Any]]
+        ] = asyncio.Queue(maxsize=64)
         self._completion_worker: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -76,8 +82,9 @@ class LocalModelRuntimeManager:
         )
         self._ensure_completion_worker()
         async with self._session_factory() as session:
-            interrupted = await interrupt_active_local_model_operations(
+            interrupted = await interrupt_recoverable_local_model_operations(
                 session,
+                controller_owner_id=self._controller_owner_id,
                 reason="controller restarted before operation completion was observed",
             )
             await session.commit()
@@ -539,7 +546,21 @@ class LocalModelRuntimeManager:
             generation=generation,
         )
 
-    async def _handle_progress(self, executor_id: str, payload: dict[str, Any]) -> None:
+    async def _handle_progress(
+        self,
+        owner_or_executor_id: ExecutorConnectionOwner | str,
+        executor_id_or_payload: str | dict[str, Any],
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if isinstance(owner_or_executor_id, ExecutorConnectionOwner):
+            executor_id = str(executor_id_or_payload)
+            if payload is None:
+                return
+        else:
+            executor_id = owner_or_executor_id
+            if not isinstance(executor_id_or_payload, dict):
+                return
+            payload = executor_id_or_payload
         operation_id = str(payload.get("operation_id") or "")
         operation_lock = self._locks.get(operation_id)
         if operation_lock is not None and operation_lock.locked():
@@ -564,6 +585,15 @@ class LocalModelRuntimeManager:
         phase = str(phase_raw)[:120] if phase_raw is not None else None
         try:
             async with self._session_factory() as session:
+                if isinstance(
+                    owner_or_executor_id,
+                    ExecutorConnectionOwner,
+                ) and not await ExecutorConnectionOwnership.lock_current(
+                    session,
+                    owner_or_executor_id,
+                ):
+                    await session.rollback()
+                    return
                 operation = await get_local_model_operation(session, operation_id)
                 if operation is None or operation.executor_id != executor_id:
                     return
@@ -587,12 +617,28 @@ class LocalModelRuntimeManager:
                 exc_info=True,
             )
 
-    async def _handle_completed(self, executor_id: str, payload: dict[str, Any]) -> None:
+    async def _handle_completed(
+        self,
+        owner_or_executor_id: ExecutorConnectionOwner | str,
+        executor_id_or_payload: str | dict[str, Any],
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if isinstance(owner_or_executor_id, ExecutorConnectionOwner):
+            owner: ExecutorConnectionOwner | None = owner_or_executor_id
+            executor_id = str(executor_id_or_payload)
+            if payload is None:
+                return
+        else:
+            owner = None
+            executor_id = owner_or_executor_id
+            if not isinstance(executor_id_or_payload, dict):
+                return
+            payload = executor_id_or_payload
         operation_id = str(payload.get("operation_id") or "")
         if not operation_id:
             return
         self._ensure_completion_worker()
-        await self._completion_queue.put((executor_id, dict(payload)))
+        await self._completion_queue.put((owner, executor_id, dict(payload)))
 
     def _ensure_completion_worker(self) -> None:
         if self._completion_worker is None or self._completion_worker.done():
@@ -603,14 +649,15 @@ class LocalModelRuntimeManager:
 
     async def _completion_worker_loop(self) -> None:
         while True:
-            executor_id, payload = await self._completion_queue.get()
+            owner, executor_id, payload = await self._completion_queue.get()
             try:
-                await self._persist_completed_until_terminal(executor_id, payload)
+                await self._persist_completed_until_terminal(owner, executor_id, payload)
             finally:
                 self._completion_queue.task_done()
 
     async def _persist_completed_until_terminal(
         self,
+        owner: ExecutorConnectionOwner | None,
         executor_id: str,
         payload: dict[str, Any],
     ) -> None:
@@ -619,13 +666,18 @@ class LocalModelRuntimeManager:
         delay = 0.25
         while True:
             async with operation_lock:
-                persisted = await self._persist_completed(executor_id, payload)
+                persisted = await self._persist_completed(owner, executor_id, payload)
             if persisted:
                 return
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30.0)
 
-    async def _persist_completed(self, executor_id: str, payload: dict[str, Any]) -> bool:
+    async def _persist_completed(
+        self,
+        owner: ExecutorConnectionOwner | None,
+        executor_id: str,
+        payload: dict[str, Any],
+    ) -> bool:
         operation_id = str(payload.get("operation_id") or "")
         state_raw = str(payload.get("state") or "")
         target_state = {
@@ -647,6 +699,12 @@ class LocalModelRuntimeManager:
                 deployment_id = operation.deployment_id
 
             async with self._session_factory() as session:
+                if owner is not None and not await ExecutorConnectionOwnership.lock_current(
+                    session,
+                    owner,
+                ):
+                    await session.rollback()
+                    return True
                 operation = await get_local_model_operation(session, operation_id)
                 if operation is None or operation.executor_id != executor_id:
                     return True

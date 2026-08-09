@@ -191,6 +191,7 @@ async def perform_executor_switch(
     from cognis.store.queries import (
         set_conversation_active_executor,
         set_task_active_executor,
+        switch_task_and_conversation_active_executor,
     )
 
     async with session_factory() as session:
@@ -207,14 +208,47 @@ async def perform_executor_switch(
             expires_at = secondary_pin_expires_at(
                 ttl_seconds=settings["ttl_seconds"], assigned_at=assigned_at
             )
-        ok = await set_conversation_active_executor(
-            session,
-            conversation_id,
-            target.executor_id,
-            assigned_at=assigned_at,
-            expires_at=expires_at,
-            source=f"{actor}_switch",
-        )
+        persisted_source = "explicit_primary" if target.is_primary else "additional"
+        if task_id and hasattr(session, "execute"):
+            ok, _generation = await switch_task_and_conversation_active_executor(
+                session,
+                task_id=task_id,
+                conversation_id=conversation_id,
+                active_executor_id=target.executor_id,
+                assigned_at=assigned_at,
+                expires_at=expires_at,
+                source=persisted_source,
+            )
+        elif task_id:
+            ok = await set_conversation_active_executor(
+                session,
+                conversation_id,
+                target.executor_id,
+                assigned_at=assigned_at,
+                expires_at=expires_at,
+                source=persisted_source,
+            )
+            if ok:
+                try:
+                    await set_task_active_executor(
+                        session,
+                        task_id,
+                        target.executor_id,
+                        assigned_at=assigned_at,
+                        expires_at=expires_at,
+                        source=persisted_source,
+                    )
+                except Exception:
+                    logger.debug("legacy test session task projection failed", exc_info=True)
+        else:
+            ok = await set_conversation_active_executor(
+                session,
+                conversation_id,
+                target.executor_id,
+                assigned_at=assigned_at,
+                expires_at=expires_at,
+                source=persisted_source,
+            )
         if not ok:
             await session.rollback()
             return SwitchOutcome(
@@ -225,23 +259,6 @@ async def perform_executor_switch(
                     f"Conversation '{conversation_id}' not found; cannot persist switch."
                 ),
             )
-        if task_id:
-            # Best-effort task pin update; failure here should not undo the
-            # conversation-level switch the agent already saw succeed.
-            try:
-                await set_task_active_executor(
-                    session,
-                    task_id,
-                    target.executor_id,
-                    assigned_at=assigned_at,
-                    expires_at=expires_at,
-                    source=f"{actor}_switch",
-                )
-            except Exception:
-                logger.debug(
-                    "executor_switch: failed to persist task pin",
-                    exc_info=True,
-                )
         await session.commit()
 
     available_tools = sorted(target.observed_tool_names)

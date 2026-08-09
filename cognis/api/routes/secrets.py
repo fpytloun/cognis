@@ -13,10 +13,16 @@ from cognis.api.common import (
 )
 from cognis.api.models import SecretResponse, SecretUpsertRequest
 from cognis.api.serializers import secret_to_response
+from cognis.api.web_reconfigure import (
+    finalize_web_executor_reconfigure_for_app,
+    run_web_mutation_cancellation_safe,
+    web_settings_distributed_lock,
+)
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.queries import get_agent
 
 router = APIRouter(prefix="/api/v1/secrets", tags=["secrets"])
+_WEB_SYSTEM_SECRET_NAMES = frozenset({"brave_api_key", "tavily_api_key"})
 
 
 @router.get("", response_model=list[SecretResponse])
@@ -41,14 +47,39 @@ async def secret_upsert(request: Request, payload: SecretUpsertRequest) -> dict[
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
-    await request.app.state.providers.secrets.set_secret(
-        payload.name,
-        payload.value,
-        SYSTEM_USER_EMAIL if scope == "system" else user.email,
-        scope=scope,
-        agent_id=payload.agent_id,
-        description=payload.description,
-    )
+
+    async def _upsert() -> None:
+        async with (
+            request.app.state.settings_update_lock,
+            web_settings_distributed_lock(request.app.state.session_factory),
+        ):
+            await request.app.state.providers.secrets.set_secret(
+                payload.name,
+                payload.value,
+                SYSTEM_USER_EMAIL if scope == "system" else user.email,
+                scope=scope,
+                agent_id=payload.agent_id,
+                description=payload.description,
+            )
+        await finalize_web_executor_reconfigure_for_app(
+            request.app,
+            reason=f"web_secret_upsert:{payload.name}",
+        )
+
+    if scope == "system" and payload.agent_id is None and payload.name in _WEB_SYSTEM_SECRET_NAMES:
+        await run_web_mutation_cancellation_safe(
+            _upsert,
+            reason=f"web_secret_upsert:{payload.name}",
+        )
+    else:
+        await request.app.state.providers.secrets.set_secret(
+            payload.name,
+            payload.value,
+            SYSTEM_USER_EMAIL if scope == "system" else user.email,
+            scope=scope,
+            agent_id=payload.agent_id,
+            description=payload.description,
+        )
     return {"ok": True}
 
 
@@ -64,12 +95,37 @@ async def secret_delete(
     normalized_scope = "system" if scope == "global" else scope
     if normalized_scope == "system":
         require_admin(request)
-    ok = await request.app.state.providers.secrets.delete_secret(
-        name,
-        SYSTEM_USER_EMAIL if normalized_scope == "system" else user.email,
-        scope=normalized_scope,
-        agent_id=agent_id,
-    )
+
+    async def _delete() -> bool:
+        async with (
+            request.app.state.settings_update_lock,
+            web_settings_distributed_lock(request.app.state.session_factory),
+        ):
+            deleted = await request.app.state.providers.secrets.delete_secret(
+                name,
+                SYSTEM_USER_EMAIL if normalized_scope == "system" else user.email,
+                scope=normalized_scope,
+                agent_id=agent_id,
+            )
+        if deleted:
+            await finalize_web_executor_reconfigure_for_app(
+                request.app,
+                reason=f"web_secret_delete:{name}",
+            )
+        return deleted
+
+    if normalized_scope == "system" and agent_id is None and name in _WEB_SYSTEM_SECRET_NAMES:
+        ok = await run_web_mutation_cancellation_safe(
+            _delete,
+            reason=f"web_secret_delete:{name}",
+        )
+    else:
+        ok = await request.app.state.providers.secrets.delete_secret(
+            name,
+            SYSTEM_USER_EMAIL if normalized_scope == "system" else user.email,
+            scope=normalized_scope,
+            agent_id=agent_id,
+        )
     if not ok:
         raise api_exception(404, "not_found", "Secret not found")
     return {"ok": True}

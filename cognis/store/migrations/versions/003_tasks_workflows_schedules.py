@@ -19,7 +19,7 @@ def upgrade() -> None:
         sa.Column("description", sa.Text, nullable=True),
         sa.Column("version", sa.Integer, nullable=False, server_default="1"),
         sa.Column("definition", sa.JSON, nullable=False),
-        sa.Column("is_system", sa.Boolean, nullable=False, server_default=sa.text("0")),
+        sa.Column("is_system", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column("owner_email", sa.String, sa.ForeignKey("users.email"), nullable=True),
         sa.Column(
             "created_at",
@@ -77,7 +77,7 @@ def upgrade() -> None:
         "task_dependencies",
         sa.Column("task_id", sa.String, sa.ForeignKey("tasks.task_id"), primary_key=True),
         sa.Column("depends_on", sa.String, sa.ForeignKey("tasks.task_id"), primary_key=True),
-        sa.Column("required", sa.Boolean, nullable=False, server_default=sa.text("1")),
+        sa.Column("required", sa.Boolean, nullable=False, server_default=sa.true()),
     )
 
     op.create_table(
@@ -113,7 +113,7 @@ def upgrade() -> None:
         sa.Column("agent_id", sa.String, sa.ForeignKey("agents.agent_id"), nullable=False),
         sa.Column("workflow_id", sa.String, nullable=True),
         sa.Column("task_template", sa.JSON, nullable=False),
-        sa.Column("enabled", sa.Boolean, nullable=False, server_default=sa.text("1")),
+        sa.Column("enabled", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("last_fired_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("next_fire_at", sa.TIMESTAMP(timezone=True), nullable=True),
         sa.Column("created_by", sa.String, sa.ForeignKey("users.email"), nullable=False),

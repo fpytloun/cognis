@@ -233,6 +233,21 @@ def _codex_model_info_from_entry(
     modalities = raw_modalities if isinstance(raw_modalities, list) else []
     reasoning_efforts = _reasoning_efforts_from_catalog(item)
     supports_reasoning = bool(reasoning_efforts or item.get("default_reasoning_level"))
+    service_tiers = item.get("service_tiers")
+    fast_mode_tier = (
+        next(
+            (
+                str(tier.get("id"))
+                for tier in service_tiers
+                if isinstance(tier, dict)
+                and str(tier.get("id") or "").strip()
+                and str(tier.get("name") or "").strip().lower() == "fast"
+            ),
+            None,
+        )
+        if isinstance(service_tiers, list)
+        else None
+    )
     supports_tool_search = bool(item.get("supports_search_tool"))
     input_modalities = [str(value).lower() for value in modalities]
     max_input_tokens = _positive_int(item.get("context_window"), 272_000)
@@ -257,6 +272,8 @@ def _codex_model_info_from_entry(
         ),
         "supports_file_input": bool(item.get("supports_file_input")) or "file" in input_modalities,
         "supports_reasoning": supports_reasoning,
+        "supports_fast_mode": fast_mode_tier is not None,
+        "fast_mode_tier": fast_mode_tier,
         "reasoning_efforts": reasoning_efforts,
         "reasoning_summary_format": item.get("reasoning_summary_format"),
         "default_reasoning_summary": item.get("default_reasoning_summary"),

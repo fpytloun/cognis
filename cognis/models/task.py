@@ -41,6 +41,7 @@ class StepRunStatus(StrEnum):
     REJECTED = "rejected"
     PAUSED = "paused"
     FAILED = "failed"
+    SKIPPED = "skipped"
     CANCELLED = "cancelled"
     SUPERSEDED = "superseded"
 
@@ -48,7 +49,7 @@ class StepRunStatus(StrEnum):
 class TaskDelivery(BaseModel):
     """How task results are delivered to the user."""
 
-    mode: str = "same_conversation"
+    mode: str = "preferred_channel"
     # same_conversation | specific_conversation | latest_active_for_agent
     # | preferred_channel | silent
     target: str | None = None
@@ -69,6 +70,7 @@ class TaskModel(BaseModel):
     created_by_agent_id: str | None = None
     source_type: str = "api"  # "chat" | "api" | "scheduler" | "webhook"
     source_ref: str | None = None
+    source_session_id: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     interaction_mode_override: str | None = None

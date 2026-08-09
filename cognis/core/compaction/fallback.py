@@ -9,7 +9,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from cognis.core.compaction.recovery import recoverable_tool_output_lines
+from cognis.core.attachment_utils import merge_content_and_attachment_note
+from cognis.core.compaction.recovery import (
+    RECOVERY_USAGE_HINT,
+    recoverable_tool_output_lines,
+    remove_recoverable_tool_output_sections,
+)
+from cognis.core.message_envelope import render_user_event_content
 
 # How many of each message type to keep verbatim.
 _USER_MESSAGE_KEEP = 8
@@ -49,9 +55,17 @@ def build_sliding_window_summary(
         data = event.data
 
         if etype == "user_message":
-            content = data.get("content")
-            if isinstance(content, str) and content.strip():
-                cleaned = content.strip()[:_PER_MESSAGE_MAX_CHARS]
+            raw_content = merge_content_and_attachment_note(
+                str(data.get("content", "")),
+                [a for a in data.get("attachments", []) if isinstance(a, dict)],
+            )
+            user_content = render_user_event_content(
+                event,
+                content_override=raw_content,
+                max_content_chars=_PER_MESSAGE_MAX_CHARS,
+            )
+            if user_content.strip():
+                cleaned = user_content.strip()
                 if len(original_user_messages) < 2:
                     original_user_messages.append(cleaned)
                 user_messages.append(cleaned)
@@ -68,9 +82,9 @@ def build_sliding_window_summary(
             # result event is only a confirmation receipt in the real tool path.
             name = data.get("name", "")
             if name == "write_deliverable":
-                content = _extract_write_deliverable_content(data.get("arguments"))
-                if content:
-                    deliverables.append(content[:_PER_MESSAGE_MAX_CHARS])
+                deliverable_content = _extract_write_deliverable_content(data.get("arguments"))
+                if deliverable_content:
+                    deliverables.append(deliverable_content[:_PER_MESSAGE_MAX_CHARS])
 
     recoverable_lines = recoverable_tool_output_lines(events)
 
@@ -78,7 +92,7 @@ def build_sliding_window_summary(
 
     if previous_summary:
         lines.append("## Previous anchored summary (verbatim):")
-        lines.append(previous_summary.strip())
+        lines.append(remove_recoverable_tool_output_sections(previous_summary))
         lines.append("")
 
     if original_user_messages:
@@ -111,8 +125,9 @@ def build_sliding_window_summary(
 
     if recoverable_lines:
         lines.append("")
-        lines.append("Recoverable tool outputs before compaction:")
+        lines.append("## Recoverable Tool Evidence")
         lines.extend(recoverable_lines)
+        lines.append(RECOVERY_USAGE_HINT)
 
     return "\n".join(lines)
 

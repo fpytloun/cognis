@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +32,10 @@ from cognis.core.anchored_output import markdown_heading_anchors
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class ToolOutputIntegrityError(RuntimeError):
+    """Raised when a tool output cannot be saved and verified exactly."""
 
 
 @dataclass(slots=True)
@@ -170,7 +177,13 @@ def _augment_with_markdown_heading_anchors(
                 artifact_candidate=None,
             )
         )
-    return result
+    return sorted(
+        result,
+        key=lambda item: (
+            item.start_line if item.start_line is not None else 10**9,
+            item.end_line if item.end_line is not None else 10**9,
+        ),
+    )
 
 
 def _anchor_kind(anchor: str) -> str:
@@ -224,28 +237,58 @@ class FilesystemToolOutputBackend:
 
     async def save(self, call_id: str, output: str) -> None:
         path = self._path(call_id)
+        temporary_path: Path | None = None
         try:
-            path.write_text(output, encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary.write(output.encode("utf-8"))
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, path)
         except OSError:
+            if temporary_path is not None:
+                with contextlib.suppress(OSError):
+                    temporary_path.unlink()
             logger.warning(
                 "tool_output_store: failed to save output",
                 extra={"extra_data": {"call_id": call_id}},
                 exc_info=True,
             )
+            raise
 
     async def save_anchors(self, call_id: str, anchors: object) -> None:
         path = self._anchors_path(call_id)
+        temporary_path: Path | None = None
         try:
             if anchors:
-                path.write_text(json.dumps(anchors), encoding="utf-8")
+                with tempfile.NamedTemporaryFile(
+                    dir=path.parent,
+                    prefix=f".{path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary.write(json.dumps(anchors, separators=(",", ":")).encode("utf-8"))
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                    temporary_path = Path(temporary.name)
+                os.replace(temporary_path, path)
             else:
                 path.unlink(missing_ok=True)
         except OSError:
+            if temporary_path is not None:
+                with contextlib.suppress(OSError):
+                    temporary_path.unlink()
             logger.warning(
                 "tool_output_store: failed to save anchors",
                 extra={"extra_data": {"call_id": call_id}},
                 exc_info=True,
             )
+            raise
 
     async def load(self, call_id: str) -> str | None:
         path = self._path(call_id)
@@ -426,6 +469,7 @@ class S3ToolOutputBackend:
                 extra={"extra_data": {"call_id": call_id}},
                 exc_info=True,
             )
+            raise
 
     def _sync_save_anchors(self, call_id: str, anchors: object) -> None:
         if not anchors:
@@ -447,11 +491,12 @@ class S3ToolOutputBackend:
                 extra={"extra_data": {"call_id": call_id}},
                 exc_info=True,
             )
+            raise
 
     def _sync_load(self, call_id: str) -> str | None:
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=self._key(call_id))
-            return response["Body"].read().decode("utf-8")
+            return str(response["Body"].read().decode("utf-8"))
         except self._client.exceptions.NoSuchKey:
             return None
 
@@ -616,20 +661,39 @@ class ToolOutputStore:
     ) -> list[dict[str, Any]]:
         """Save output and return the anchor manifest confirmed by round trip."""
         await self._backend.save(call_id, output)
+        expected = output.encode("utf-8")
+        persisted_output = await self._backend.load(call_id)
+        if (
+            persisted_output is None
+            or len(persisted_output.encode("utf-8")) != len(expected)
+            or hashlib.sha256(persisted_output.encode("utf-8")).hexdigest()
+            != hashlib.sha256(expected).hexdigest()
+        ):
+            raise ToolOutputIntegrityError(
+                f"Stored tool output failed integrity verification for call_id {call_id!r}."
+            )
         persisted_payload: object = (
             anchor_manifest if anchor_manifest is not None else anchors or []
         )
         await self._backend.save_anchors(call_id, persisted_payload)
         if not await self._backend.exists(call_id):
-            return []
+            raise ToolOutputIntegrityError(
+                f"Stored tool output disappeared before verification for call_id {call_id!r}."
+            )
         if not anchors:
             return []
         persisted = await self._backend.load_anchors(call_id)
         if persisted != persisted_payload:
-            return []
+            raise ToolOutputIntegrityError(
+                f"Stored anchor manifest failed verification for call_id {call_id!r}."
+            )
         if isinstance(persisted, dict) and isinstance(persisted.get("anchors"), list):
-            return persisted["anchors"]
-        return persisted if isinstance(persisted, list) else []
+            return [item for item in persisted["anchors"] if isinstance(item, dict)]
+        return (
+            [item for item in persisted if isinstance(item, dict)]
+            if isinstance(persisted, list)
+            else []
+        )
 
     # ------------------------------------------------------------------
     # Read

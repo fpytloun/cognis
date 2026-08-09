@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from cognis.core.attachment_utils import merge_content_and_attachment_note
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, with_session_events_turn_id
+from cognis.providers.memory.protocol import RememberOutcomeUnknownError
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import Agent, RememberQueueRow, Session
 
@@ -224,7 +226,7 @@ class RememberRetryQueue:
                                     RememberQueueRow.next_retry_at <= now,
                                 ),
                                 sa.and_(
-                                    RememberQueueRow.status == "leased",
+                                    RememberQueueRow.status.in_(["leased", "dispatching"]),
                                     RememberQueueRow.lease_expires_at.is_not(None),
                                     RememberQueueRow.lease_expires_at <= now,
                                 ),
@@ -241,6 +243,47 @@ class RememberRetryQueue:
             )
 
             for row in rows:
+                if row.status == "dispatching":
+                    await session.execute(
+                        sa.update(RememberQueueRow)
+                        .execution_options(synchronize_session=False)
+                        .where(
+                            RememberQueueRow.item_id == row.item_id,
+                            RememberQueueRow.status == "dispatching",
+                            RememberQueueRow.lease_expires_at.is_not(None),
+                            RememberQueueRow.lease_expires_at <= now,
+                        )
+                        .values(
+                            status="ambiguous",
+                            lease_token=None,
+                            lease_expires_at=None,
+                            last_error=(
+                                "Remember worker ownership expired while provider outcome "
+                                "was unknown; automatic retry is disabled"
+                            ),
+                            updated_at=now,
+                        )
+                    )
+                    continue
+                if row.status == "leased":
+                    await session.execute(
+                        sa.update(RememberQueueRow)
+                        .execution_options(synchronize_session=False)
+                        .where(
+                            RememberQueueRow.item_id == row.item_id,
+                            RememberQueueRow.status == "leased",
+                            RememberQueueRow.lease_expires_at.is_not(None),
+                            RememberQueueRow.lease_expires_at <= now,
+                        )
+                        .values(
+                            status="pending",
+                            lease_token=None,
+                            lease_expires_at=None,
+                            next_retry_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    continue
                 lease_token = uuid.uuid4().hex
                 updated = await session.execute(
                     sa.update(RememberQueueRow)
@@ -253,7 +296,7 @@ class RememberRetryQueue:
                                 RememberQueueRow.next_retry_at <= now,
                             ),
                             sa.and_(
-                                RememberQueueRow.status == "leased",
+                                RememberQueueRow.status.in_(["leased", "dispatching"]),
                                 RememberQueueRow.lease_expires_at.is_not(None),
                                 RememberQueueRow.lease_expires_at <= now,
                             ),
@@ -288,6 +331,10 @@ class RememberRetryQueue:
 
     async def _process(self, item: RememberQueueItem, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
+            lease_lost = asyncio.Event()
+            renewal_task: asyncio.Task[None] | None = None
+            if self._session_factory is not None and item.item_id is not None:
+                renewal_task = asyncio.create_task(self._renew_durable_lease(item, lease_lost))
             try:
                 if await self._hard_memory_disable_applies(item.payload):
                     QUEUE_SUCCESS.inc()
@@ -298,6 +345,8 @@ class RememberRetryQueue:
                                 .where(
                                     RememberQueueRow.item_id == item.item_id,
                                     RememberQueueRow.lease_token == item.lease_token,
+                                    RememberQueueRow.status == "leased",
+                                    RememberQueueRow.lease_expires_at > _utcnow(),
                                 )
                                 .execution_options(synchronize_session=False)
                             )
@@ -305,6 +354,22 @@ class RememberRetryQueue:
                             await self._update_durable_depth_metric(session)
                     return
                 resolved_payload = await self._resolve_payload(item.payload)
+                if self._session_factory is not None and item.item_id is not None:
+                    async with self._session_factory() as session:
+                        dispatched = await session.execute(
+                            sa.update(RememberQueueRow)
+                            .execution_options(synchronize_session=False)
+                            .where(
+                                RememberQueueRow.item_id == item.item_id,
+                                RememberQueueRow.lease_token == item.lease_token,
+                                RememberQueueRow.status == "leased",
+                                RememberQueueRow.lease_expires_at > _utcnow(),
+                            )
+                            .values(status="dispatching", updated_at=_utcnow())
+                        )
+                        await session.commit()
+                    if not dispatched.rowcount:
+                        return
                 await self.worker.remember(**resolved_payload)
                 QUEUE_SUCCESS.inc()
                 if self._session_factory is None or item.item_id is None:
@@ -315,11 +380,49 @@ class RememberRetryQueue:
                         .where(
                             RememberQueueRow.item_id == item.item_id,
                             RememberQueueRow.lease_token == item.lease_token,
+                            RememberQueueRow.status == "dispatching",
+                            RememberQueueRow.lease_expires_at > _utcnow(),
                         )
                         .execution_options(synchronize_session=False)
                     )
                     await session.commit()
                     await self._update_durable_depth_metric(session)
+            except RememberOutcomeUnknownError as exc:
+                if self._session_factory is None or item.item_id is None:
+                    QUEUE_FAILED.inc()
+                    logger.exception("Remember queue outcome is ambiguous; retry disabled")
+                    return
+                item.attempts += 1
+                last_error = self._sanitize_failure_detail(exc)
+                async with self._session_factory() as session:
+                    result = await session.execute(
+                        sa.update(RememberQueueRow)
+                        .execution_options(synchronize_session=False)
+                        .where(
+                            RememberQueueRow.item_id == item.item_id,
+                            RememberQueueRow.lease_token == item.lease_token,
+                            RememberQueueRow.status == "dispatching",
+                            RememberQueueRow.lease_expires_at > _utcnow(),
+                        )
+                        .values(
+                            status="ambiguous",
+                            attempts=item.attempts,
+                            next_retry_at=_utcnow(),
+                            lease_token=None,
+                            lease_expires_at=None,
+                            last_error=last_error,
+                            updated_at=_utcnow(),
+                        )
+                    )
+                    await session.commit()
+                    await self._update_durable_depth_metric(session)
+                if result.rowcount:
+                    QUEUE_FAILED.inc()
+                    logger.exception(
+                        "Remember queue outcome is ambiguous; retry disabled",
+                        extra={"extra_data": {"item_id": item.item_id, "attempts": item.attempts}},
+                    )
+                    await self._record_failure_notice(item, last_error)
             except Exception as exc:
                 item.attempts += 1
                 if self._session_factory is None or item.item_id is None:
@@ -372,6 +475,8 @@ class RememberRetryQueue:
                         .where(
                             RememberQueueRow.item_id == item.item_id,
                             RememberQueueRow.lease_token == item.lease_token,
+                            RememberQueueRow.status.in_(["leased", "dispatching"]),
+                            RememberQueueRow.lease_expires_at > _utcnow(),
                         )
                         .values(
                             status=status,
@@ -387,6 +492,40 @@ class RememberRetryQueue:
                     await self._update_durable_depth_metric(session)
                 if status == "failed":
                     await self._record_failure_notice(item, last_error)
+            finally:
+                lease_lost.set()
+                if renewal_task is not None:
+                    renewal_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await renewal_task
+
+    async def _renew_durable_lease(
+        self, item: RememberQueueItem, lease_lost: asyncio.Event
+    ) -> None:
+        assert self._session_factory is not None
+        assert item.item_id is not None
+        while not lease_lost.is_set():
+            await asyncio.sleep(max(self.lease_seconds / 3, 0.01))
+            now = _utcnow()
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    sa.update(RememberQueueRow)
+                    .execution_options(synchronize_session=False)
+                    .where(
+                        RememberQueueRow.item_id == item.item_id,
+                        RememberQueueRow.lease_token == item.lease_token,
+                        RememberQueueRow.status.in_(["leased", "dispatching"]),
+                        RememberQueueRow.lease_expires_at > now,
+                    )
+                    .values(
+                        lease_expires_at=now + timedelta(seconds=self.lease_seconds),
+                        updated_at=now,
+                    )
+                )
+                await session.commit()
+            if not result.rowcount:
+                lease_lost.set()
+                return
 
     async def _hard_memory_disable_applies(self, payload: dict[str, Any]) -> bool:
         """Recheck current hard backend/profile vetoes before queued execution."""
@@ -426,7 +565,7 @@ class RememberRetryQueue:
             count = await session.scalar(
                 sa.select(sa.func.count())
                 .select_from(RememberQueueRow)
-                .where(RememberQueueRow.status.in_(["pending", "leased"]))
+                .where(RememberQueueRow.status.in_(["pending", "leased", "dispatching"]))
             )
             return bool(count)
 
@@ -434,7 +573,7 @@ class RememberRetryQueue:
         count = await session.scalar(
             sa.select(sa.func.count())
             .select_from(RememberQueueRow)
-            .where(RememberQueueRow.status.in_(["pending", "leased"]))
+            .where(RememberQueueRow.status.in_(["pending", "leased", "dispatching"]))
         )
         QUEUE_DEPTH.set(int(count or 0))
 

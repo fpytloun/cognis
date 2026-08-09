@@ -33,6 +33,7 @@ NormalizedEventKind = Literal[
     "question_set",
     "auth_challenge",
     "credential_request",
+    "user_interaction",
     "todo_state",
     "artifact",
     "assistant_deliverable",
@@ -78,6 +79,7 @@ VISIBLE_LIFECYCLE_EVENTS: frozenset[str] = frozenset(
         "workflow_composed",
         "assistant_deliverable",
         "turn_error",
+        "user_interaction_resolved",
     }
 )
 _CANCELLED_TURN_ERROR_CODES: frozenset[str] = frozenset(
@@ -237,6 +239,8 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
             if error_code in _CANCELLED_TURN_ERROR_CODES:
                 return "system_message"
             return "error"
+        if lifecycle_event == "user_interaction_resolved":
+            return "user_interaction"
         return "unknown"
 
     if event_type == "evaluation":

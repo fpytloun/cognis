@@ -17,6 +17,7 @@ from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.models import AuditLog, Conversation, DeliverableRow, StepRun, Task
 from cognis.store.queries import (
+    get_artifact_record,
     get_conversation,
     get_deliverable,
     get_managed_conversation_ancestry,
@@ -66,7 +67,10 @@ def continuation_scope_task_id(runtime_metadata: dict[str, Any] | None) -> str |
     platform_data = conversation_context.get("platform_data")
     if not isinstance(platform_data, dict):
         return None
-    if platform_data.get("forked_from") not in {"task", "task_step"}:
+    if (
+        platform_data.get("forked_from") not in {"task", "task_step"}
+        and platform_data.get("kind") != "task_control"
+    ):
         return None
     task_id = platform_data.get("task_id")
     return task_id if isinstance(task_id, str) and task_id else None
@@ -154,48 +158,61 @@ async def get_accessible_deliverable_ref(
         creator = await get_conversation(session, deliverable.conversation_id)
         if creator is None or creator.user_email != user_email:
             return None
-        if not accessor_conversation_id or not accessor_agent_id:
-            return None
-        accessor = await get_conversation(session, accessor_conversation_id)
-        if (
-            accessor is None
-            or accessor.user_email != user_email
-            or accessor.agent_id != accessor_agent_id
-        ):
-            return None
-        link = await get_managed_conversation_link_for_target(
-            session, creator.conversation_id, user_email=user_email
+        published = await get_artifact_record(session, deliverable.deliverable_id)
+        owner_published = (
+            published is not None
+            and published.owner_email == user_email
+            and published.conversation_id is None
+            and published.status != "deleted"
+            and published.deleted_at is None
+            and published.purpose == "conversation_deliverable"
         )
-        if link is None or link.depth > 2 or link.target_agent_id != creator.agent_id:
-            return None
-        try:
-            ancestry = await get_managed_conversation_ancestry(session, link, user_email=user_email)
-        except ValueError:
-            return None
-        controlling_link = next(
-            (
-                item
-                for item in ancestry
-                if item.controller_conversation_id == accessor_conversation_id
-                and item.controller_agent_id == accessor_agent_id
-            ),
-            None,
-        )
-        if controlling_link is None:
-            return None
         owner_email = creator.user_email
         creator_agent_id = creator.agent_id
-        access_audit_details = {
-            "deliverable_id": deliverable.deliverable_id,
-            "creator_agent_id": creator.agent_id,
-            "creator_conversation_id": creator.conversation_id,
-            "creator_control_link_id": link.link_id,
-            "owner_email": creator.user_email,
-            "accessor_agent_id": accessor_agent_id,
-            "accessor_conversation_id": accessor_conversation_id,
-            "control_link_id": controlling_link.link_id,
-            "managed_descendant_depth": int(link.depth) - int(controlling_link.depth) + 1,
-        }
+        access_audit_details = None
+        if not owner_published:
+            if not accessor_conversation_id or not accessor_agent_id:
+                return None
+            accessor = await get_conversation(session, accessor_conversation_id)
+            if (
+                accessor is None
+                or accessor.user_email != user_email
+                or accessor.agent_id != accessor_agent_id
+            ):
+                return None
+            link = await get_managed_conversation_link_for_target(
+                session, creator.conversation_id, user_email=user_email
+            )
+            if link is None or link.depth > 2 or link.target_agent_id != creator.agent_id:
+                return None
+            try:
+                ancestry = await get_managed_conversation_ancestry(
+                    session, link, user_email=user_email
+                )
+            except ValueError:
+                return None
+            controlling_link = next(
+                (
+                    item
+                    for item in ancestry
+                    if item.controller_conversation_id == accessor_conversation_id
+                    and item.controller_agent_id == accessor_agent_id
+                ),
+                None,
+            )
+            if controlling_link is None:
+                return None
+            access_audit_details = {
+                "deliverable_id": deliverable.deliverable_id,
+                "creator_agent_id": creator.agent_id,
+                "creator_conversation_id": creator.conversation_id,
+                "creator_control_link_id": link.link_id,
+                "owner_email": creator.user_email,
+                "accessor_agent_id": accessor_agent_id,
+                "accessor_conversation_id": accessor_conversation_id,
+                "control_link_id": controlling_link.link_id,
+                "managed_descendant_depth": int(link.depth) - int(controlling_link.depth) + 1,
+            }
     await hydrate_deliverable_payload(deliverable, artifact_store)
     content_bytes = deliverable.content.encode("utf-8")
     return DeliverableContentRef(

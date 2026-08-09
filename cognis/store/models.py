@@ -27,13 +27,19 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    func,
     text,
+    true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _session_activity_scope_default(context: Any) -> str:
+    return str(context.get_current_parameters()["session_id"])
 
 
 class Base(DeclarativeBase):
@@ -43,6 +49,144 @@ class Base(DeclarativeBase):
         dict: JSON,
         list: JSON,
     }
+
+
+class CoordinationLeaseRow(Base):
+    """Database-authoritative lease with a monotonically increasing fence."""
+
+    __tablename__ = "coordination_leases"
+
+    resource_key: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (Index("ix_coordination_leases_expires", "lease_expires_at"),)
+
+
+class ControllerInstanceRow(Base):
+    """Minimal DB-authoritative controller boot-incarnation directory."""
+
+    __tablename__ = "controller_instances"
+
+    owner_id: Mapped[str] = mapped_column(String, primary_key=True)
+    controller_id: Mapped[str] = mapped_column(String, nullable=False)
+    incarnation_id: Mapped[str] = mapped_column(String, nullable=False)
+    internal_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    lifecycle_state: Mapped[str] = mapped_column(String, nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "lifecycle_state IN ('starting', 'ready', 'draining', 'stopped')",
+            name="ck_controller_instances_lifecycle_state",
+        ),
+        Index("ix_controller_instances_controller", "controller_id"),
+        Index("ix_controller_instances_expires", "expires_at"),
+    )
+
+
+class DirectTurnRequestRow(Base):
+    """Durable admission and fenced ownership state for one direct turn request."""
+
+    __tablename__ = "direct_turn_requests"
+
+    admission_order: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    request_id: Mapped[str] = mapped_column(
+        String, nullable=False, unique=True, default=lambda: f"dtr_{uuid.uuid4().hex}"
+    )
+    turn_id: Mapped[str] = mapped_column(
+        String, nullable=False, unique=True, default=lambda: f"turn_{uuid.uuid4().hex[:12]}"
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent_id: Mapped[str] = mapped_column(String, nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("users.email", ondelete="CASCADE"),
+        nullable=False,
+    )
+    idempotency_scope: Mapped[str] = mapped_column(String, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False)
+    admission_hash: Mapped[str] = mapped_column(String, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String, nullable=False)
+    payload_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
+    owner_controller_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    owner_incarnation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    fencing_token: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    absorbed_by_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    outcome: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    terminal_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ("
+            "'queued', 'claimed', 'running', 'absorbing', 'recoverable', "
+            "'completed', 'failed', 'cancelled', 'absorbed', 'ambiguous'"
+            ")",
+            name="ck_direct_turn_requests_status",
+        ),
+        UniqueConstraint(
+            "idempotency_scope",
+            "idempotency_key",
+            name="uq_direct_turn_requests_idempotency",
+        ),
+        Index(
+            "ix_direct_turn_requests_fifo",
+            "conversation_id",
+            "status",
+            "admission_order",
+        ),
+        Index(
+            "ix_direct_turn_requests_status_due",
+            "status",
+            "next_attempt_at",
+        ),
+        Index(
+            "ix_direct_turn_requests_owner",
+            "owner_controller_id",
+            "owner_incarnation_id",
+            "status",
+        ),
+    )
 
 
 class User(Base):
@@ -55,7 +199,7 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     role: Mapped[str] = mapped_column(String, nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default="1"
+        Boolean, nullable=False, default=True, server_default=true()
     )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -159,9 +303,11 @@ class Agent(Base):
         String(20), nullable=False, default="primary", server_default="primary"
     )
     is_system: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
-    hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+    hidden: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -337,7 +483,7 @@ class SystemAgentOverride(Base):
     owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     disabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     llm_config_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     skills_override: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -373,6 +519,30 @@ class Conversation(Base):
             "agent_id",
             "context_type",
         ),
+        Index(
+            "ix_conversations_owner_fork_conversation",
+            "user_email",
+            "fork_source_conversation_id",
+            "conversation_id",
+        ),
+        Index(
+            "ix_conversations_owner_fork_session",
+            "user_email",
+            "fork_source_session_id",
+            "conversation_id",
+        ),
+        Index(
+            "ix_conversations_owner_lineage_task",
+            "user_email",
+            "lineage_task_id",
+            "conversation_id",
+        ),
+        Index(
+            "ix_conversations_owner_lineage_step",
+            "user_email",
+            "lineage_step_run_id",
+            "conversation_id",
+        ),
     )
 
     conversation_id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -385,6 +555,11 @@ class Conversation(Base):
     context_ref: Mapped[str | None] = mapped_column(String, nullable=True)
     project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     context_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    lineage_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    fork_source_conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    fork_source_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    lineage_task_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    lineage_step_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
     memory_labels: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     active_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -396,6 +571,12 @@ class Conversation(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     active_executor_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_executor_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    active_executor_unavailable_since: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     starred_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
@@ -469,8 +650,23 @@ class Session(Base):
     """
 
     __tablename__ = "sessions"
+    __table_args__ = (
+        Index("ix_sessions_owner_source_session", "user_email", "source_session_id"),
+        Index("ix_sessions_owner_parent_session", "user_email", "parent_session_id", "session_id"),
+        Index(
+            "ix_sessions_owner_previous_session",
+            "user_email",
+            "previous_session_id",
+            "session_id",
+        ),
+    )
 
     session_id: Mapped[str] = mapped_column(String, primary_key=True)
+    activity_scope_id: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default=_session_activity_scope_default,
+    )
     conversation_id: Mapped[str] = mapped_column(
         String, ForeignKey("conversations.conversation_id"), nullable=False
     )
@@ -478,6 +674,7 @@ class Session(Base):
         String, ForeignKey("sessions.session_id"), nullable=True
     )
     previous_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     user_email: Mapped[str] = mapped_column(String, nullable=False)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -495,6 +692,300 @@ class Session(Base):
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class WorkScopeState(Base):
+    """Rebuildable control-plane revision state for one authorized Work root.
+
+    Canonical Work evidence remains in Intaris. This row stores only monotonic
+    invalidation counters and the fingerprint of the derived lineage graph.
+    """
+
+    __tablename__ = "work_scope_states"
+    __table_args__ = (
+        Index("ix_work_scope_states_owner_root", "user_email", "scope_kind", "root_id"),
+    )
+
+    scope_key: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("users.email", ondelete="CASCADE"),
+        nullable=False,
+    )
+    scope_kind: Mapped[str] = mapped_column(String, nullable=False)
+    root_id: Mapped[str] = mapped_column(String, nullable=False)
+    graph_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
+    work_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    graph_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class WorkRecordRow(Base):
+    """Bounded, rebuildable Work evidence projected from one Intaris stream."""
+
+    __tablename__ = "work_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_email",
+            "source_store",
+            "source_session_id",
+            "source_seq",
+            "item_ordinal",
+            "materializer_version",
+            name="uq_work_records_source_item_version",
+        ),
+        Index(
+            "ix_work_records_owner_session_version_order",
+            "owner_email",
+            "session_id",
+            "materializer_version",
+            "occurred_at",
+            "source_seq",
+            "item_ordinal",
+            "work_record_id",
+        ),
+        Index(
+            "ix_work_records_owner_version_newest",
+            "owner_email",
+            "materializer_version",
+            "is_evidence",
+            "occurred_at",
+            "session_id",
+            "source_seq",
+            "item_ordinal",
+            "work_record_id",
+        ),
+        Index(
+            "ix_work_records_owner_category_order",
+            "owner_email",
+            "materializer_version",
+            "is_evidence",
+            "category",
+            "occurred_at",
+            "session_id",
+            "source_seq",
+            "item_ordinal",
+            "work_record_id",
+        ),
+        Index(
+            "ix_work_records_owner_category_entity",
+            "owner_email",
+            "materializer_version",
+            "category",
+            "entity_id",
+        ),
+        Index(
+            "ix_work_records_pairing",
+            "owner_email",
+            "session_id",
+            "materializer_version",
+            "call_id",
+            "pairing_key",
+        ),
+    )
+
+    work_record_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("sessions.session_id", ondelete="CASCADE"), nullable=False
+    )
+    materializer_version: Mapped[str] = mapped_column(String, nullable=False)
+    source_store: Mapped[str] = mapped_column(
+        String, nullable=False, default="intaris", server_default="intaris"
+    )
+    source_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_item_id: Mapped[str] = mapped_column(String, nullable=False)
+    item_ordinal: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    occurred_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    record_type: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[str | None] = mapped_column(String, nullable=True)
+    entity_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    file_path_ids: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    additions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    deletions: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    is_evidence: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
+    pairing_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    call_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    timeline_item: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    materialized_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+
+
+class WorkRecordFileRow(Base):
+    """Normalized file metadata for one bounded Work record."""
+
+    __tablename__ = "work_record_files"
+    __table_args__ = (
+        UniqueConstraint(
+            "work_record_id",
+            "file_ordinal",
+            name="uq_work_record_files_record_ordinal",
+        ),
+        Index(
+            "ix_work_record_files_record_order",
+            "work_record_id",
+            "file_ordinal",
+        ),
+        Index(
+            "ix_work_record_files_path",
+            "path_id",
+            "work_record_id",
+        ),
+    )
+
+    work_record_file_id: Mapped[str] = mapped_column(String, primary_key=True)
+    work_record_id: Mapped[str] = mapped_column(
+        ForeignKey("work_records.work_record_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    path_id: Mapped[str] = mapped_column(String, nullable=False)
+    additions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deletions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class WorkSessionProjectionRow(Base):
+    """Contiguous materialization state for one Cognis session and version."""
+
+    __tablename__ = "work_session_projections"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "materializer_version",
+            name="uq_work_session_projections_session_version",
+        ),
+        CheckConstraint(
+            "state IN ('pending','materializing','caught_up','repair','failed')",
+            name="ck_work_session_projections_state",
+        ),
+        CheckConstraint(
+            "target_seq >= 0 AND covered_through_seq >= 0 AND retry_count >= 0 "
+            "AND lease_fence >= 0",
+            name="ck_work_session_projections_nonnegative",
+        ),
+        Index(
+            "ix_work_session_projections_queue",
+            "materializer_version",
+            "state",
+            "priority",
+            "next_retry_at",
+        ),
+        Index(
+            "ix_work_session_projections_owner_state",
+            "owner_email",
+            "materializer_version",
+            "state",
+        ),
+        Index("ix_work_session_projections_lease", "lease_expires_at", "lease_fence"),
+    )
+
+    projection_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[str] = mapped_column(
+        String, ForeignKey("sessions.session_id", ondelete="CASCADE"), nullable=False
+    )
+    source_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    materializer_version: Mapped[str] = mapped_column(String, nullable=False)
+    target_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    covered_through_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    lease_fence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=func.now(),
+    )
+    materialized_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    head_checked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+
+class WorkScopeStream(Base):
+    """Reference-only membership and high-water state for one Work stream."""
+
+    __tablename__ = "work_scope_streams"
+    __table_args__ = (
+        Index(
+            "ix_work_scope_streams_event_stream",
+            "event_store_id",
+            "event_store_session_id",
+            "scope_key",
+        ),
+        Index("ix_work_scope_streams_session", "session_id", "scope_key"),
+    )
+
+    scope_key: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("work_scope_states.scope_key", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    session_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("sessions.session_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    event_store_id: Mapped[str] = mapped_column(String, nullable=False, default="intaris")
+    event_store_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
@@ -574,10 +1065,28 @@ class ManagedConversationLink(Base):
             "ix_managed_conversation_links_controller_conversation",
             "controller_conversation_id",
         ),
+        Index(
+            "ix_managed_conversation_links_owner_controller_session",
+            "user_email",
+            "controller_session_id",
+            "link_id",
+        ),
         Index("ix_managed_conversation_links_user_state", "user_email", "conversation_state"),
+        Index(
+            "ix_managed_conversation_links_user_kind_state",
+            "user_email",
+            "kind",
+            "conversation_state",
+        ),
         Index("ix_managed_conversation_links_target_agent", "target_agent_id"),
         Index("ix_managed_conversation_links_parent_link", "parent_link_id"),
         Index("ix_managed_conversation_links_root_depth", "root_link_id", "depth"),
+        Index(
+            "ix_managed_conversation_links_handoff_owner",
+            "handoff_state",
+            "handoff_controller_session_id",
+            "handoff_controller_turn_id",
+        ),
     )
 
     link_id: Mapped[str] = mapped_column(
@@ -609,6 +1118,16 @@ class ManagedConversationLink(Base):
     )
     target_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     title: Mapped[str | None] = mapped_column(String, nullable=True)
+    kind: Mapped[str] = mapped_column(
+        String, nullable=False, default="agent", server_default="agent"
+    )
+    completion_policy: Mapped[str] = mapped_column(
+        String, nullable=False, default="turn", server_default="turn"
+    )
+    owner_epoch: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=1, server_default="1"
+    )
+    creation_policy_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     conversation_state: Mapped[str] = mapped_column(
         String, nullable=False, default="open", server_default="open"
     )
@@ -617,11 +1136,16 @@ class ManagedConversationLink(Base):
     )
     active_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
     notify_on_completion: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     last_result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_result_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    handoff_state: Mapped[str | None] = mapped_column(String, nullable=True)
+    handoff_target_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    handoff_controller_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    handoff_controller_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    handoff_tool_call_id: Mapped[str | None] = mapped_column(String, nullable=True)
     control_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -631,6 +1155,226 @@ class ManagedConversationLink(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
+class ManagedConversationSignal(Base):
+    """Durable explicit or lifecycle signal from a managed child."""
+
+    __tablename__ = "managed_conversation_signals"
+    __table_args__ = (
+        Index("ix_managed_conversation_signals_link_state", "link_id", "state"),
+        Index("ix_managed_conversation_signals_owner", "link_id", "owner_epoch"),
+        UniqueConstraint(
+            "link_id",
+            "owner_epoch",
+            "source_turn_id",
+            "kind",
+            name="uq_managed_signal_source_turn",
+        ),
+        UniqueConstraint(
+            "resume_request_id",
+            name="uq_managed_signal_resume_request",
+        ),
+    )
+
+    signal_id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"mcsig_{uuid.uuid4().hex[:24]}"
+    )
+    link_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("managed_conversation_links.link_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    owner_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    resume_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    resume_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    resume_prepared_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    resume_admitted_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    resume_terminal_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    kind: Mapped[str] = mapped_column(
+        String, nullable=False, default="explicit", server_default="explicit"
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    wait: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    memory_eligible: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
+class ManagedChannelBinding(Base):
+    """Thin external-channel route bound to a managed conversation link."""
+
+    __tablename__ = "managed_channel_bindings"
+    __table_args__ = (
+        UniqueConstraint("link_id", name="uq_managed_channel_bindings_link"),
+        UniqueConstraint("active_route_key", name="uq_managed_channel_bindings_active_route"),
+        Index("ix_managed_channel_bindings_user_state", "user_email", "state"),
+        Index("ix_managed_channel_bindings_expires", "expires_at"),
+    )
+
+    binding_id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"mcb_{uuid.uuid4().hex[:24]}"
+    )
+    link_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("managed_conversation_links.link_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_accounts.account_id", ondelete="CASCADE"), nullable=False
+    )
+    channel_type: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    chat_id: Mapped[str] = mapped_column(String, nullable=False)
+    thread_key: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    sender_id: Mapped[str] = mapped_column(String, nullable=False)
+    active_route_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, default="provisioning", server_default="provisioning"
+    )
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1, server_default="1")
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    safety_guidance: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
+    )
+    explicit_tool_allowlist: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    terminal_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_lease_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    delivery_lease_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    delivery_lease_owner_epoch: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    delivery_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+
+class ChannelInboundLedgerRow(Base):
+    """Normalized durable inbound identity used by managed-channel consumers."""
+
+    __tablename__ = "channel_inbound_ledger"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "chat_id",
+            "thread_key",
+            "message_id",
+            name="uq_channel_inbound_ledger_message",
+        ),
+        Index(
+            "ix_channel_inbound_ledger_context",
+            "account_id",
+            "chat_id",
+            "thread_key",
+            "ordering_key",
+            "message_id",
+        ),
+        Index("ix_channel_inbound_ledger_binding_state", "binding_id", "disposition"),
+        Index("ix_channel_inbound_ledger_retention", "binding_id", "retain_until"),
+    )
+
+    inbound_id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"chin_{uuid.uuid4().hex[:24]}"
+    )
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_accounts.account_id", ondelete="CASCADE"), nullable=False
+    )
+    binding_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("managed_channel_bindings.binding_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    chat_id: Mapped[str] = mapped_column(String, nullable=False)
+    thread_key: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    message_id: Mapped[str] = mapped_column(String, nullable=False)
+    sender_id: Mapped[str] = mapped_column(String, nullable=False)
+    sender_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    ordering_key: Mapped[str] = mapped_column(String, nullable=False)
+    ordering_source: Mapped[str] = mapped_column(
+        String, nullable=False, default="observed", server_default="observed"
+    )
+    retain_until: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    is_bot_output: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    is_primary_input: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    disposition: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    platform_data: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class ChannelContextConsumptionRow(Base):
+    """Reservation or committed use of one inbound row by one conversation."""
+
+    __tablename__ = "channel_context_consumptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "consumer_conversation_id",
+            "inbound_id",
+            name="uq_channel_context_consumptions_consumer_inbound",
+        ),
+        Index("ix_channel_context_consumptions_reservation", "state", "reserved_until"),
+        Index(
+            "ix_channel_context_consumptions_admission",
+            "admitted_turn_id",
+            "state",
+        ),
+    )
+
+    consumption_id: Mapped[str] = mapped_column(
+        String, primary_key=True, default=lambda: f"chctx_{uuid.uuid4().hex[:24]}"
+    )
+    consumer_conversation_id: Mapped[str] = mapped_column(
+        String, ForeignKey("conversations.conversation_id", ondelete="CASCADE"), nullable=False
+    )
+    inbound_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_inbound_ledger.inbound_id", ondelete="CASCADE"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(
+        String, nullable=False, default="reserved", server_default="reserved"
+    )
+    usage: Mapped[str] = mapped_column(
+        String, nullable=False, default="context", server_default="context"
+    )
+    trigger_inbound_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    admitted_turn_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    reservation_token: Mapped[str] = mapped_column(String, nullable=False)
+    reserved_until: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    committed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
 
 class Setting(Base):
@@ -817,6 +1561,23 @@ class Task(Base):
             "updated_at",
             "task_id",
         ),
+        Index(
+            "ux_tasks_control_conversation_id",
+            "control_conversation_id",
+            unique=True,
+        ),
+        Index(
+            "ix_tasks_owner_source_ref",
+            "created_by",
+            "source_ref",
+            "task_id",
+        ),
+        Index(
+            "ix_tasks_owner_source_session",
+            "created_by",
+            "source_session_id",
+            "task_id",
+        ),
     )
 
     task_id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -831,16 +1592,30 @@ class Task(Base):
     created_by_agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
     source_type: Mapped[str] = mapped_column(String, nullable=False, default="api")
     source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
-    delivery_mode: Mapped[str] = mapped_column(String, nullable=False, default="same_conversation")
+    source_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    delivery_mode: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="preferred_channel",
+        server_default="preferred_channel",
+    )
     delivery_target: Mapped[str | None] = mapped_column(String, nullable=True)
     completion_mode_family: Mapped[str] = mapped_column(
         String, nullable=False, default="default", server_default="default"
     )
     allow_silent_completion: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     interaction_mode_override: Mapped[str | None] = mapped_column(String, nullable=True)
     session_policy: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    control_conversation_id: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+    control_conversation_claimed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+    )
     workflow_id: Mapped[str | None] = mapped_column(String, nullable=True)
     project_id: Mapped[str | None] = mapped_column(String, nullable=True)
     attempt_number: Mapped[int] = mapped_column(
@@ -863,6 +1638,12 @@ class Task(Base):
         TIMESTAMP(timezone=True), nullable=True
     )
     active_executor_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_executor_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    active_executor_unavailable_since: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -875,6 +1656,58 @@ class Task(Base):
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
+
+
+class ExecutorPinTransitionRow(Base):
+    """Durable CAS ledger for an executor pin generation transition."""
+
+    __tablename__ = "executor_pin_transitions"
+    transition_id: Mapped[str] = mapped_column(String, primary_key=True)
+    scope_type: Mapped[str] = mapped_column(String, nullable=False)
+    scope_id: Mapped[str] = mapped_column(String, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    old_executor_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    new_executor_id: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    state_caveat: Mapped[str] = mapped_column(Text, nullable=False)
+    notice_id: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    notice_appended_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "scope_type", "scope_id", "generation", name="uq_executor_pin_transition_generation"
+        ),
+        Index("ix_executor_pin_transitions_notice_pending", "notice_appended_at"),
+    )
+
+
+class ExecutorPinNoticeOutboxRow(Base):
+    """Recovery queue for a notice whose canonical history append failed."""
+
+    __tablename__ = "executor_pin_notice_outbox"
+    outbox_id: Mapped[str] = mapped_column(String, primary_key=True)
+    transition_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("executor_pin_transitions.transition_id", ondelete="CASCADE"),
+        unique=True,
+    )
+    conversation_id: Mapped[str] = mapped_column(String, nullable=False)
+    intaris_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    user_email: Mapped[str | None] = mapped_column(String, nullable=True)
+    agent_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    delivered_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (Index("ix_executor_pin_notice_outbox_pending", "delivered_at"),)
 
 
 class TaskDependency(Base):
@@ -928,7 +1761,7 @@ class SystemWorkflowOverride(Base):
     owner_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     workflow_id: Mapped[str] = mapped_column(String, nullable=False)
     disabled: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     step_overrides: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -1109,7 +1942,7 @@ class Schedule(Base):
         String, nullable=False, default="default", server_default="default"
     )
     allow_silent_completion: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     interaction_mode_override: Mapped[str | None] = mapped_column(
         String, nullable=True, default="none", server_default="none"
@@ -1130,6 +1963,93 @@ class Schedule(Base):
     __table_args__ = (Index("ix_schedules_enabled_next_fire", "enabled", "next_fire_at"),)
 
 
+class ScheduleFireRow(Base):
+    """Durable identity and reconciliation state for one logical schedule fire."""
+
+    __tablename__ = "schedule_fires"
+
+    fire_id: Mapped[str] = mapped_column(String, primary_key=True)
+    schedule_id: Mapped[str] = mapped_column(
+        String, ForeignKey("schedules.schedule_id", ondelete="CASCADE"), nullable=False
+    )
+    fire_kind: Mapped[str] = mapped_column(
+        String, nullable=False, default="recurring", server_default="recurring"
+    )
+    scheduled_fire_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    task_id: Mapped[str | None] = mapped_column(
+        String, ForeignKey("tasks.task_id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="claimed")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "schedule_id",
+            "fire_kind",
+            "scheduled_fire_at",
+            name="uq_schedule_fires_logical_fire",
+        ),
+        Index("ix_schedule_fires_reconcile", "status", "updated_at"),
+        Index("ix_schedule_fires_task", "task_id"),
+        CheckConstraint(
+            "status IN ('claimed', 'dispatched', 'skipped', 'failed')",
+            name="ck_schedule_fires_status",
+        ),
+        CheckConstraint(
+            "fire_kind IN ('recurring', 'manual')",
+            name="ck_schedule_fires_fire_kind",
+        ),
+    )
+
+
+class ScheduleCatchupStateRow(Base):
+    """Durable cluster-wide startup catch-up budget."""
+
+    __tablename__ = "schedule_catchup_state"
+
+    catchup_id: Mapped[str] = mapped_column(String, primary_key=True)
+    cutoff_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    remaining_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'completed')",
+            name="ck_schedule_catchup_state_status",
+        ),
+    )
+
+
+class ChannelAccountOperationRow(Base):
+    """Durable in-flight operation count for channel ownership drain."""
+
+    __tablename__ = "channel_account_operations"
+
+    account_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("channel_accounts.account_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    owner_id: Mapped[str] = mapped_column(String, nullable=False)
+    fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    active_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class TaskCommentRow(Base):
     """Human-authored task comment with explicit intent."""
 
@@ -1145,11 +2065,11 @@ class TaskCommentRow(Base):
     intent: Mapped[str] = mapped_column(
         String, nullable=False, default="record_only", server_default="record_only"
     )
-    noop: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    noop: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true())
     target_step: Mapped[str | None] = mapped_column(String, nullable=True)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     applied: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     attempt_number: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
@@ -1277,7 +2197,7 @@ class LocalModelDeployment(Base):
         nullable=True,
     )
     capacity_override_acknowledged: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     capacity_assessment_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     reconcile_requested_at: Mapped[datetime | None] = mapped_column(
@@ -1357,7 +2277,7 @@ class LocalModelOperation(Base):
     idempotency_key: Mapped[str] = mapped_column(String, nullable=False)
     request_hash: Mapped[str] = mapped_column(String, nullable=False)
     post_pull_provider_upsert: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     sanitized_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -1570,6 +2490,18 @@ class MCPOAuthTransactionRow(Base):
     used_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     error_code: Mapped[str | None] = mapped_column(String, nullable=True)
     error_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terminal_cleanup_required: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    terminal_notification_resolved_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    terminal_reconfigure_applied_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    terminal_reconfigure_completed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -1580,6 +2512,14 @@ class MCPOAuthTransactionRow(Base):
     __table_args__ = (
         Index("ix_mcp_oauth_transactions_user_server", "user_email", "mcp_server_id"),
         Index("ix_mcp_oauth_transactions_status_expiry", "status", "expires_at"),
+        Index(
+            "ix_mcp_oauth_transactions_terminal_cleanup",
+            "status",
+            "terminal_cleanup_required",
+            "terminal_notification_resolved_at",
+            "terminal_reconfigure_applied_at",
+            "terminal_reconfigure_completed_at",
+        ),
     )
 
 
@@ -1964,6 +2904,12 @@ class ChannelDeliveryOutboxRow(Base):
     account_id: Mapped[str] = mapped_column(String, nullable=False)
     chat_id: Mapped[str] = mapped_column(String, nullable=False)
     thread_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    reply_to_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    direct_turn_request_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    direct_turn_fencing_token: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    managed_binding_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    managed_binding_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    managed_owner_epoch: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     fallback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -1975,6 +2921,13 @@ class ChannelDeliveryOutboxRow(Base):
     inflight_chunk_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     inflight_idempotent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     attachments_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    delivery_receipts_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    first_delivered_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_delivered_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     deliverable_id: Mapped[str | None] = mapped_column(String, nullable=True)
     next_attempt_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
@@ -1996,6 +2949,35 @@ class ChannelDeliveryOutboxRow(Base):
         Index("ix_channel_delivery_status_due", "status", "next_attempt_at"),
         Index("ix_channel_delivery_conversation_created", "conversation_id", "created_at"),
         Index("ix_channel_delivery_source", "source_type", "source_id"),
+        Index(
+            "ix_channel_delivery_managed_fence",
+            "managed_binding_id",
+            "managed_binding_version",
+            "managed_owner_epoch",
+        ),
+    )
+
+
+class ChannelDeliveryReceiptRow(Base):
+    """One externally acknowledged outbox chunk."""
+
+    __tablename__ = "channel_delivery_receipts"
+    __table_args__ = (
+        Index("ix_channel_delivery_receipts_sent", "sent_at", "delivery_id", "chunk_index"),
+    )
+
+    delivery_id: Mapped[str] = mapped_column(
+        String,
+        ForeignKey("channel_delivery_outbox.delivery_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sent_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    external_message_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    attachments_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
 
 
@@ -2027,7 +3009,9 @@ class ChannelAccountRow(Base):
     account_id: Mapped[str] = mapped_column(String, primary_key=True)
     channel_type: Mapped[str] = mapped_column(String, nullable=False)
     display_name: Mapped[str] = mapped_column(String, nullable=False)
-    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
     agent_id: Mapped[str] = mapped_column(String, ForeignKey("agents.agent_id"), nullable=False)
     default_agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
@@ -2036,10 +3020,10 @@ class ChannelAccountRow(Base):
     # Routing
     default_conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
     allow_new_conversations: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True, server_default="1"
+        Boolean, nullable=False, default=True, server_default=true()
     )
     preferred_for_task_delivery: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     # Adapter location
     adapter_location: Mapped[str] = mapped_column(
@@ -2082,7 +3066,7 @@ class ChannelContact(Base):
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String, nullable=True)
     verified: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, server_default="0"
+        Boolean, nullable=False, default=False, server_default=false()
     )
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
@@ -2094,6 +3078,98 @@ class ChannelContact(Base):
     __table_args__ = (
         UniqueConstraint("channel_type", "sender_id", name="uq_channel_contact"),
         Index("ix_channel_contacts_lookup", "channel_type", "sender_id"),
+    )
+
+
+class ChannelObservedTargetRow(Base):
+    """Controller-observed channel destination available to outbound tools."""
+
+    __tablename__ = "channel_observed_targets"
+
+    target_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_accounts.account_id", ondelete="CASCADE"), nullable=False
+    )
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    chat_id: Mapped[str] = mapped_column(String, nullable=False)
+    thread_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    sender_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    chat_kind: Mapped[str] = mapped_column(String, nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_observed_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("account_id", "chat_id", name="uq_channel_observed_target"),
+        Index("ix_channel_observed_targets_owner", "user_email", "last_observed_at"),
+    )
+
+
+class ChannelRecipientIntentRow(Base):
+    """Durable explicit-recipient resolution and delivery intent."""
+
+    __tablename__ = "channel_recipient_intents"
+    __table_args__ = (
+        UniqueConstraint("user_email", "intent_id", name="uq_channel_recipient_intent_owner"),
+        Index("ix_channel_recipient_intents_state", "resolution_state", "updated_at"),
+        Index("ix_channel_recipient_intents_route", "account_id", "provisional_route_key"),
+    )
+
+    intent_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email", ondelete="CASCADE"))
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_accounts.account_id", ondelete="CASCADE")
+    )
+    channel_type: Mapped[str] = mapped_column(String, nullable=False)
+    address_kind: Mapped[str] = mapped_column(String, nullable=False)
+    normalized_address: Mapped[str] = mapped_column(String, nullable=False)
+    chat_kind: Mapped[str] = mapped_column(String, nullable=False)
+    allow_resolution: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    allow_creation: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    provisional_route_key: Mapped[str] = mapped_column(String, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    conversation_id: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=""
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=""
+    )
+    idempotency_scope: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=""
+    )
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    authorized_artifacts_json: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    resolution_lease_token: Mapped[str | None] = mapped_column(String, nullable=True)
+    resolution_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    resolution_state: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    side_effect_certainty: Mapped[str] = mapped_column(
+        String, nullable=False, default="none", server_default="none"
+    )
+    resolved_route_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    safe_error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
 
@@ -2193,6 +3269,42 @@ class KnowledgebaseRow(Base):
     )
 
 
+class KnowledgebaseGrantRow(Base):
+    """Direct user read/query grant for a knowledgebase."""
+
+    __tablename__ = "knowledgebase_grants"
+    __table_args__ = (
+        Index(
+            "uq_knowledgebase_grants_active_user",
+            "knowledgebase_id",
+            "grantee_user_email",
+            unique=True,
+            sqlite_where=text("revoked_at IS NULL"),
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+        Index("ix_knowledgebase_grants_grantee", "grantee_user_email"),
+        Index("ix_knowledgebase_grants_kb", "knowledgebase_id"),
+        CheckConstraint("permission = 'view'", name="ck_knowledgebase_grants_permission"),
+    )
+
+    grant_id: Mapped[str] = mapped_column(String, primary_key=True)
+    knowledgebase_id: Mapped[str] = mapped_column(
+        String, ForeignKey("knowledgebases.knowledgebase_id", ondelete="CASCADE"), nullable=False
+    )
+    grantee_user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email"), nullable=False
+    )
+    permission: Mapped[str] = mapped_column(
+        String, nullable=False, default="view", server_default="view"
+    )
+    granted_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class KnowledgebaseArtifactRow(Base):
     """Artifact attachment and indexing status for a knowledgebase."""
 
@@ -2202,13 +3314,25 @@ class KnowledgebaseArtifactRow(Base):
     knowledgebase_id: Mapped[str] = mapped_column(
         String, ForeignKey("knowledgebases.knowledgebase_id", ondelete="CASCADE"), nullable=False
     )
+    source_path: Mapped[str | None] = mapped_column(String, nullable=True)
     artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    pending_artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    pending_source_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    active_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    desired_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
     source_hash: Mapped[str | None] = mapped_column(String, nullable=True)
     source_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_mime_type: Mapped[str | None] = mapped_column(String, nullable=True)
     source_filename: Mapped[str | None] = mapped_column(String, nullable=True)
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSON, nullable=True)
+    active_metadata_json: Mapped[dict[str, Any] | None] = mapped_column(
+        "active_metadata", JSON, nullable=True
+    )
     chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     embedding_model: Mapped[str | None] = mapped_column(String, nullable=True)
     embedding_provider_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -2229,6 +3353,17 @@ class KnowledgebaseArtifactRow(Base):
     __table_args__ = (
         Index("ix_kb_artifacts_kb_status", "knowledgebase_id", "status"),
         Index("ix_kb_artifacts_artifact", "artifact_id"),
+        Index("ix_kb_artifacts_pending_artifact", "pending_artifact_id"),
+        Index(
+            "uq_kb_artifacts_live_source_path",
+            "knowledgebase_id",
+            "source_path",
+            unique=True,
+            sqlite_where=text("source_path IS NOT NULL AND status NOT IN ('detached', 'removed')"),
+            postgresql_where=text(
+                "source_path IS NOT NULL AND status NOT IN ('detached', 'removed')"
+            ),
+        ),
     )
 
 
@@ -2242,6 +3377,7 @@ class KnowledgebaseChunkRow(Base):
     kb_artifact_id: Mapped[str] = mapped_column(String, nullable=False)
     artifact_id: Mapped[str] = mapped_column(String, nullable=False)
     artifact_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
     text_hash: Mapped[str] = mapped_column(String, nullable=False)
@@ -2255,7 +3391,12 @@ class KnowledgebaseChunkRow(Base):
 
     __table_args__ = (
         Index("ix_kb_chunks_kb_artifact", "knowledgebase_id", "artifact_id"),
-        Index("ix_kb_chunks_attachment_index", "kb_artifact_id", "chunk_index"),
+        Index(
+            "ix_kb_chunks_attachment_generation_index",
+            "kb_artifact_id",
+            "generation",
+            "chunk_index",
+        ),
     )
 
 
@@ -2268,6 +3409,7 @@ class KnowledgebaseIndexJobRow(Base):
     knowledgebase_id: Mapped[str] = mapped_column(String, nullable=False)
     kb_artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
     artifact_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     job_type: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="queued")
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
@@ -2288,4 +3430,13 @@ class KnowledgebaseIndexJobRow(Base):
     __table_args__ = (
         Index("ix_kb_jobs_status_queue", "status", "priority", "queued_at"),
         Index("ix_kb_jobs_kb_status", "knowledgebase_id", "status"),
+        Index(
+            "uq_kb_jobs_live_attachment_generation_type",
+            "kb_artifact_id",
+            "generation",
+            "job_type",
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'running')"),
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
     )

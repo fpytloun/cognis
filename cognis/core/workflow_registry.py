@@ -10,6 +10,8 @@ from cognis.core.gate_conditions import validate_gate_conditions
 from cognis.logging import get_logger
 from cognis.models.workflow import (
     CompletionConfig,
+    ConditionStepConfig,
+    DeterministicOutputConfig,
     GateConfig,
     GateOption,
     InteractionMode,
@@ -22,6 +24,8 @@ from cognis.models.workflow import (
     StepProfileMode,
     Workflow,
     WorkflowDefaults,
+    WorkflowPhaseDefinition,
+    WorkflowPresentation,
     resolve_source_names,
 )
 from cognis.providers.llm.reasoning import normalize_reasoning_effort
@@ -41,182 +45,12 @@ logger = get_logger(__name__)
 # System workflows (bundled, read-only)
 # ---------------------------------------------------------------------------
 
-_SOFTWARE_PLAN_EVALUATOR_PROMPT = """\
-You are evaluating a software-development planning step.
-
-Step objective:
-{objective}
-
-Step inputs (from previous steps):
-{inputs}
-
-step_complete metadata:
-  Summary: {summary}
-  Claims: {claims}
-  Outputs: {outputs}
-  Outcome: {outcome}
-  Notification: {notification}
-
-Assistant written deliverable:
-{content}
-
-Execution evidence:
-{execution_evidence}
-
-Task context:
-{task_context}
-
-Evaluate whether the plan is proportional and complete enough for implementation.
-Approve lightweight plans for narrow bug fixes when the scope contract clearly
-marks unaffected surfaces as not applicable. Revise feature or complex plans that
-do not identify all material implementation surfaces.
-
-Required checks:
-1. The plan explains what is being implemented and why.
-2. The scope_contract metadata is present, concrete, and proportional to the task.
-3. Required backend, frontend, API, persistence, channel, workflow/runtime, tests,
-   docs, migration, commit, push, or PR work is either represented as required
-   scope or explicitly marked not applicable with a reason.
-4. Acceptance criteria and validation plan are specific enough to catch incomplete
-   implementation.
-5. Open questions or assumptions are explicit when ambiguity remains.
-
-Return "revise" if requested scope is missing, vague, or silently deferred.
-Return "approved" only when implementation can proceed without self-reducing the
-task. Respond with JSON only: {{"decision": "...", "reasoning": "...", "feedback": "..."}}
-"""
-
-_SOFTWARE_IMPLEMENT_EVALUATOR_PROMPT = """\
-You are evaluating a software-development implementation step.
-
-Step objective:
-{objective}
-
-Step inputs (from previous steps):
-{inputs}
-
-step_complete metadata:
-  Summary: {summary}
-  Claims: {claims}
-  Outputs: {outputs}
-  Outcome: {outcome}
-  Notification: {notification}
-
-Assistant written deliverable:
-{content}
-
-Execution evidence:
-{execution_evidence}
-
-Task context:
-{task_context}
-
-Evaluate whether the implementation satisfies the approved scope contract and
-step objective. Be proportional: a narrow bug fix may have a small scope, but all
-required scope items from the plan must be completed or the step must explicitly
-report a blocker/failure.
-
-Required checks:
-1. Every required scope_contract item from the plan has a matching scope_status
-   entry with concrete evidence.
-2. Originally requested or planned required work is not moved into "follow-ups".
-   Follow-ups may only contain optional hardening or future improvements.
-3. Validation is appropriate for the changed areas and reported honestly.
-4. Quality and correctness are prioritized over the smallest diff when a focused
-   refactor is needed for maintainability, DRY, or clean integration.
-5. If evaluator/review feedback is present, the code/docs/tests were fixed, not
-   merely the deliverable wording.
-
-Return "revise" for missing required scope, missing evidence, insufficient
-validation, or prose-only attempts to satisfy feedback. Respond with JSON only:
-{{"decision": "...", "reasoning": "...", "feedback": "..."}}
-"""
-
-_SOFTWARE_REVIEW_EVALUATOR_PROMPT = """\
-You are evaluating a code-review step in a software-development workflow.
-
-Step objective:
-{objective}
-
-Step inputs (from previous steps):
-{inputs}
-
-step_complete metadata:
-  Summary: {summary}
-  Claims: {claims}
-  Outputs: {outputs}
-  Outcome: {outcome}
-  Notification: {notification}
-
-Assistant written deliverable:
-{content}
-
-Execution evidence:
-{execution_evidence}
-
-Task context:
-{task_context}
-
-Evaluate review quality and routing correctness.
-
-Required checks:
-1. The review reconstructs requested/planned scope before reviewing changed code.
-2. The review checks for missing required implementation surfaces, including
-   untouched frontend/API/docs/tests when they were part of scope.
-3. Blocking findings, missing required scope, or any must-fix finding are
-   reported via step_complete.outcome.status='rejected', not as successful
-   approval text.
-4. A clean success is valid only when required_scope_complete is true,
-   missing_scope_count is 0, must_fix_count is 0, and verdict is "approve".
-   should_fix_count may be greater than 0 only when the written review makes it
-   clear those findings are non-blocking and the post-review gate should decide
-   whether to continue explicitly or revise.
-
-Return "revise" if the review omits scope completeness, structurally approves
-missing required scope or must-fix findings, or fails to route blockers back to
-implementation. Respond with JSON only:
-{{"decision": "...", "reasoning": "...", "feedback": "..."}}
-"""
-
-_SOFTWARE_FINAL_EVALUATOR_PROMPT = """\
-You are evaluating the final user-facing implementation report.
-
-Step objective:
-{objective}
-
-Step inputs (from previous steps):
-{inputs}
-
-step_complete metadata:
-  Summary: {summary}
-  Claims: {claims}
-  Outputs: {outputs}
-  Outcome: {outcome}
-  Notification: {notification}
-
-Assistant written deliverable:
-{content}
-
-Execution evidence:
-{execution_evidence}
-
-Task context:
-{task_context}
-
-Approve only if the report accurately reflects actual completion status. It must
-not claim "fully finished", "end-to-end", or "merge-ready" when required scope,
-validation, review findings, commit, push, or PR work remains incomplete.
-Follow-ups may not contain originally requested or planned required scope unless
-the user explicitly waived it.
-
-Return "revise" for overclaiming, missing validation details, unresolved review
-findings, or incomplete required scope. Respond with JSON only:
-{{"decision": "...", "reasoning": "...", "feedback": "..."}}
-"""
-
 DIRECT_WORKFLOW = Workflow(
     workflow_id="system:direct",
     name="Direct",
+    presentation=WorkflowPresentation(
+        phases=[WorkflowPhaseDefinition(id="execute", title="Execute", step_names=["execute"])]
+    ),
     description="Single-step execution. No planning or evaluation.",
     criteria="Simple questions, quick tasks, conversational messages.",
     tags=["chat", "inline"],
@@ -241,11 +75,14 @@ DIRECT_WORKFLOW = Workflow(
 GENERAL_TASK_WORKFLOW = Workflow(
     workflow_id="system:general-task",
     name="General Task",
-    description="Single-step task execution with semantic evaluation.",
-    criteria="Generic background tasks that need direct execution with evaluation but no specialized pipeline.",
-    tags=["task", "general", "evaluated"],
+    presentation=WorkflowPresentation(
+        phases=[WorkflowPhaseDefinition(id="execute", title="Execute", step_names=["execute"])]
+    ),
+    description="Single-session task execution with deterministic completion requirements.",
+    criteria="Generic background tasks that need direct execution but no specialized pipeline.",
+    tags=["task", "general"],
     interaction=InteractionMode(mode="step_requests"),
-    defaults=WorkflowDefaults(evaluate=True),
+    defaults=WorkflowDefaults(evaluate=False),
     allow_user_override=True,
     allow_user_disable=True,
     editable_fields=[
@@ -259,24 +96,34 @@ GENERAL_TASK_WORKFLOW = Workflow(
         StepDefinition(
             name="execute",
             type="run",
-            prompt=(
-                "Execute the requested task directly. Inspect the relevant context "
-                "first, keep the work focused, and verify the result before "
-                "completing the step. For coding work, prefer the smallest correct "
-                "change, preserve existing patterns, and update directly affected "
-                "docs only when needed. Write a deliverable that captures the final "
-                "result, not just the work you attempted. If the task is ambiguous "
-                "and the answer would materially affect scope, safety, acceptance "
-                "criteria, user-visible output, or irreversible side effects, ask "
-                "one targeted clarification with step_request_questions before doing "
-                "the work. Do not ask when a safe default is obvious or the task "
-                "explicitly requests fully autonomous execution."
-            ),
+            objective="Complete the requested task and return the verified result.",
+            responsibilities=[
+                "Inspect only the context needed for the task.",
+                "Perform the requested work.",
+                "Verify the result.",
+                "Produce the canonical final task deliverable.",
+            ],
+            prompt="Use one targeted question only when a material ambiguity has no safe default.",
             allow_questions=True,
             reasoning_effort="low",
             step_profile_id="system:general-task",
             input=StepInputConfig(type="null"),
-            completion=CompletionConfig(evaluate=True, max_attempts=3),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="result_status",
+                        type="string",
+                        required=True,
+                        enum=["completed", "blocked"],
+                    ),
+                    StepCompletionMetadataField(
+                        name="verification",
+                        type="object",
+                        required=True,
+                    ),
+                ]
+            ),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
@@ -287,7 +134,18 @@ GENERAL_TASK_WORKFLOW = Workflow(
 RESEARCH_WORKFLOW = Workflow(
     workflow_id="system:research",
     name="Research",
-    description="Plan, research, synthesize with evaluation.",
+    presentation=WorkflowPresentation(
+        phases=[
+            WorkflowPhaseDefinition(
+                id="plan",
+                title="Plan",
+                step_names=["plan", "pre_research_gate"],
+            ),
+            WorkflowPhaseDefinition(id="investigate", title="Investigate", step_names=["research"]),
+            WorkflowPhaseDefinition(id="deliver", title="Deliver", step_names=["synthesize"]),
+        ]
+    ),
+    description="One primary-agent research session with deterministic phase contracts.",
     criteria="Research tasks, investigation, incident analysis, audits, information gathering, and synthesis reports.",
     tags=["research", "analysis", "investigation"],
     interaction=InteractionMode(mode="step_requests"),
@@ -304,32 +162,18 @@ RESEARCH_WORKFLOW = Workflow(
         StepDefinition(
             name="plan",
             type="run",
+            objective="Create an evidence-based research plan for the requested task.",
+            responsibilities=[
+                "Define the questions, source strategy, research depth, and output format.",
+                "Resolve only ambiguities that materially affect the research plan.",
+                "Produce the research plan deliverable.",
+            ],
+            defer_to=["research", "synthesize"],
             reasoning_effort="medium",
             step_profile_id="system:research",
             prompt=(
-                "Create a research plan for this task. Identify:\n"
-                "- Key questions to answer\n"
-                "- Sources and methodology (web search, codebase, documentation)\n"
-                "- Appropriate depth: light, standard, or deep\n"
-                "- Media/artifact strategy: none, cite existing media, collect artifacts, or diagram\n"
-                "- Expected deliverables and format\n\n"
-                "For non-trivial codebase exploration use "
-                "`delegate(agent_id='system:explore', wait=True, task='...')`. "
-                "For external research use "
-                "`delegate(agent_id='system:research', wait=True, task='...')`. "
-                "Run multiple `delegate(wait=True)` calls in a single turn to "
-                "parallelise broad investigations; wait for all before synthesising. "
-                "Adapt breadth and depth to the user's request: keep light research "
-                "concise, but for explicitly deep research or high-risk/complex "
-                "topics, plan multiple query angles, primary-source checks, freshness "
-                "checks, and contradiction analysis.\n\n"
-                "If the task's intent, success criteria, scope, source preferences, or output format "
-                "are ambiguous and the answer would materially affect the research plan, ask a "
-                "small targeted question set with step_request_questions before finalizing the plan. "
-                "Planning may ask earlier than execution to turn ambiguous requests into concrete "
-                "plans, but do not ask when a safe default is obvious or the task explicitly requests "
-                "fully autonomous execution.\n\n"
-                "Write the plan itself as the step deliverable."
+                "Plan questions, depth, source selection, freshness checks, contradiction checks, "
+                "and the final output shape. Do not collect evidence or write the final narrative."
             ),
             allow_questions=True,
             metadata_contract=StepCompletionContract(
@@ -351,7 +195,7 @@ RESEARCH_WORKFLOW = Workflow(
                 ]
             ),
             input=StepInputConfig(type="null"),
-            completion=CompletionConfig(evaluate=True, max_attempts=5),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
@@ -378,52 +222,58 @@ RESEARCH_WORKFLOW = Workflow(
         StepDefinition(
             name="research",
             type="run",
-            agent_override="system:research",
+            objective="Execute the approved research plan and preserve auditable evidence.",
+            responsibilities=[
+                "Gather and cross-check evidence at the planned depth.",
+                "Use managed primary-agent workstreams for substantial independent research when useful.",
+                "Record sources, dates, confidence, gaps, and artifact references.",
+                "Produce the research evidence deliverable.",
+            ],
+            defer_to=["synthesize"],
             reasoning_effort="medium",
             step_profile_id="system:research",
             prompt=(
-                "Execute the research plan at the planned depth. For light research, "
-                "answer efficiently from a small set of high-quality sources. For "
-                "standard research, compare several credible sources and fetch the "
-                "most relevant pages directly. For deep research, run multiple "
-                "independent search angles, prefer primary and official sources, "
-                "verify important claims with direct fetches, check publication or "
-                "update dates when available, and do not stop after the first useful "
-                "result. Cross-reference findings for accuracy, identify consensus "
-                "and disagreements, and note gaps, stale evidence, or missing proof. "
-                "When relevant, capture media candidates, diagrams, tables, PDFs, "
-                "screenshots, or other artifacts by source URL or artifact ID. Write "
-                "a deliverable that preserves the gathered evidence, source URLs, "
-                "dates when available, confidence, media/artifact references, and "
-                "conclusions."
+                "Execute the approved source strategy. Prefer primary sources, preserve provenance, "
+                "and separate evidence from inference. Do not write the final user narrative."
             ),
-            input=StepInputConfig(type="last", source="plan"),
-            completion=CompletionConfig(evaluate=True, max_attempts=5),
+            input=StepInputConfig(type="last", source="plan", reuse_session_from="plan"),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(name="sources", type="array", required=True),
+                    StepCompletionMetadataField(name="evidence", type="array", required=True),
+                    StepCompletionMetadataField(name="gaps", type="array", required=True),
+                    StepCompletionMetadataField(name="confidence", type="number", required=True),
+                ]
+            ),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
         StepDefinition(
             name="synthesize",
             type="run",
+            objective="Synthesize the gathered evidence into the final research report.",
+            responsibilities=[
+                "Explain findings, disagreements, recommendations, gaps, and confidence.",
+                "Cite the supplied evidence and include useful artifact references.",
+                "Produce the final user-facing research deliverable.",
+            ],
             reasoning_effort="medium",
             step_profile_id="system:research",
-            prompt=(
-                "Synthesize the research findings into a coherent report with:\n"
-                "- Key findings and insights\n"
-                "- Areas of consensus and disagreement\n"
-                "- Actionable recommendations\n"
-                "- Gaps in available information\n"
-                "- Source notes with URLs, dates when available, and confidence\n"
-                "- Relevant media, artifacts, or inline diagrams when they clarify the subject\n\n"
-                "Use concise markdown for light research. For deeper research, include "
-                "enough structure for the reader to audit the evidence. Use Mermaid "
-                "or simple markdown diagrams only when they clarify relationships, "
-                "timelines, architectures, taxonomies, or comparisons. Reference "
-                "artifact IDs or source URLs for media rather than embedding opaque "
-                "unattributed content."
+            prompt="Synthesize only from the collected evidence. Make gaps and confidence explicit.",
+            input=StepInputConfig(
+                type="last",
+                source=["plan", "research"],
+                reuse_session_from="research",
             ),
-            input=StepInputConfig(type="last", source=["plan", "research"]),
-            completion=CompletionConfig(evaluate=True),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(name="source_count", type="number", required=True),
+                    StepCompletionMetadataField(name="confidence", type="number", required=True),
+                    StepCompletionMetadataField(name="open_gaps", type="array", required=True),
+                ]
+            ),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
@@ -434,6 +284,33 @@ RESEARCH_WORKFLOW = Workflow(
 SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
     workflow_id="system:software-development",
     name="Software Development",
+    presentation=WorkflowPresentation(
+        phases=[
+            WorkflowPhaseDefinition(
+                id="plan",
+                title="Plan",
+                step_names=[
+                    "plan",
+                    "architect_review",
+                    "architect_review_route",
+                    "pre_implement_gate",
+                ],
+            ),
+            WorkflowPhaseDefinition(
+                id="build", title="Build", step_names=["implement", "update_docs"]
+            ),
+            WorkflowPhaseDefinition(
+                id="verify",
+                title="Verify",
+                step_names=["code_review", "code_review_route", "post_review_gate"],
+            ),
+            WorkflowPhaseDefinition(
+                id="deliver",
+                title="Deliver",
+                step_names=["commit", "remember", "final_summary"],
+            ),
+        ]
+    ),
     description="Full development pipeline: plan, architect review, implement, docs, code review, commit, remember, final summary.",
     criteria="Implementation tasks, feature development, bug fixes requiring structured quality pipeline.",
     tags=["code", "development"],
@@ -451,56 +328,27 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="plan",
             type="run",
+            objective="Produce an implementation brief that later workflow steps can execute.",
+            responsibilities=[
+                "Inspect the codebase only enough to define an implementable scope contract.",
+                "Define acceptance criteria, validation, workspace, and lifecycle strategy.",
+                "Produce the implementation-plan deliverable without changing the repository.",
+            ],
+            defer_to=[
+                "architect_review",
+                "implement",
+                "update_docs",
+                "code_review",
+                "commit",
+                "remember",
+                "final_summary",
+            ],
             reasoning_effort="medium",
             step_profile_id="system:research",
             prompt=(
-                "Explore the codebase only as needed to understand the relevant "
-                "areas. For non-trivial exploration use "
-                "`delegate(agent_id='system:explore', wait=True, task='...')` — "
-                "the sub-session returns a focused report and keeps your context "
-                "budget free for synthesis. Run multiple `delegate(wait=True)` "
-                "calls in a single turn to parallelise broad explorations; wait for "
-                "all before synthesising. Reach for direct read/grep only for "
-                "narrow, targeted lookups (1-2 files). This is a read-only "
-                "planning step: identify whether later implementation could be "
-                "safely split into independent slices with clear ownership and "
-                "integration boundaries, but do not fan out implementation from "
-                "this planning step, and do not edit files, create worktrees, run tests or "
-                "builds, commit, open pull requests, or implement changes. Later "
-                "workflow steps handle implementation, verification, commit, and PR "
-                "work.\n\n"
-                "Then produce a proportional implementation brief that later workflow "
-                "steps can execute. Explain what is being implemented, what behavior/code is changing and why it is "
-                "needed, what is in scope, how success will be recognized, and how it "
-                "should be validated. Keep the brief lightweight for narrow changes: "
-                "narrow bug fixes may use a lightweight brief; do not force a broad checklist when only one or two code surfaces are "
-                "material. For broad, ambiguous, or high-risk work, cover all material "
-                "surfaces that could affect correctness or delivery, including security, "
-                "data/persistence, workflow/runtime semantics, public API/protocol "
-                "compatibility, cross-cutting architecture, external side effects, tests, "
-                "docs, migration/rollback, and publish/commit/PR lifecycle when relevant. "
-                "Do not silently reduce scope; if an expected surface is not applicable, "
-                "say why.\n\n"
-                "Include a scope contract, acceptance criteria, validation plan, material "
-                "implementation notes, and any open questions or assumptions. For non-trivial "
-                "work, explicitly cover Files to create/modify (with rationale), Environment "
-                "and workspace setup, Worktree, branch, and repository strategy, and Commit, "
-                "push, and pull request strategy. Treat "
-                "`confidence` as implementability from gathered evidence, not optimism or "
-                "lack of uncertainty. Treat `risk` as blast radius and reversibility, not "
-                "how unsure the plan feels.\n\n"
-                "If user intent, acceptance criteria, UX/API tradeoffs, migration policy, "
-                "compatibility expectations, or implementation scope are ambiguous and the answer "
-                "would materially affect the implementation plan, ask a small targeted question set "
-                "with step_request_questions before finalizing the plan. Planning may ask earlier "
-                "than implementation to turn ambiguous requests into a concrete scope contract, but "
-                "do not ask when a safe default is obvious or the task explicitly requests fully "
-                "autonomous execution.\n\n"
-                "Write the plan itself as the step deliverable. In step_complete metadata, "
-                "include a proportional `scope_contract` array. Each item should have a "
-                "stable id, area, description, required boolean, and acceptance/evidence "
-                "guidance. Include `not_applicable` or equivalent entries with reasons "
-                "for major surfaces that are intentionally out of scope."
+                "Keep this step read-only. Define a proportional scope contract, acceptance "
+                "criteria, validation plan, workspace strategy, assumptions, and lifecycle plan. "
+                "Use one targeted question only when a material ambiguity has no safe default."
             ),
             allow_questions=True,
             metadata_contract=StepCompletionContract(
@@ -539,11 +387,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 ]
             ),
             input=StepInputConfig(type="null"),
-            completion=CompletionConfig(
-                evaluate=True,
-                evaluator_prompt=_SOFTWARE_PLAN_EVALUATOR_PROMPT,
-                max_attempts=5,
-            ),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
             # Primary agent runs this — has memory, personality, project context
@@ -551,38 +395,62 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="architect_review",
             type="run",
+            objective="Review the implementation brief for material architecture and delivery risks.",
+            responsibilities=[
+                "Assess the plan against material correctness and delivery risks.",
+                "Approve it or report concise required revisions.",
+                "Produce the architecture-review deliverable without implementing changes.",
+            ],
+            defer_to=[
+                "implement",
+                "update_docs",
+                "code_review",
+                "commit",
+                "remember",
+                "final_summary",
+            ],
             agent_override="system:architect",
             reasoning_effort="medium",
             step_profile_id="system:review",
             prompt=(
-                "Review this implementation brief as a proportional architecture and "
-                "risk check. Do not redo planning or broad exploration unless the brief "
-                "contains a concrete unsupported architectural assumption. Focus on "
-                "material risks: security/auth/permissions, persistence, migration or "
-                "data loss, workflow/runtime semantics, public API or protocol "
-                "compatibility, cross-cutting architecture, external side effects, and "
-                "large ambiguous refactors. Materially review the brief but do not block on nitpicks, including routine "
-                "workspace, commit, documentation, test details, or worktree/branch/PR handling "
-                "unless they create a concrete correctness or delivery risk. If the "
-                "plan is sound and ready, complete the step normally with success. If the "
-                "review is complete and the plan needs revision, report that via "
-                "step_complete.outcome.status='rejected' with a concise reason. If the "
-                "review itself could not be completed, use outcome.status='failed'. Put "
-                "the outcome only in step_complete, not as a trailing JSON object in the "
-                "written review. The deliverable should be the actual review output."
+                "Review material architecture, security, persistence, compatibility, and delivery "
+                "risks. Return decision=approved or decision=revise. Do not implement changes."
             ),
             input=StepInputConfig(type="full", source="plan"),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="decision",
+                        type="string",
+                        required=True,
+                        enum=["approved", "revise"],
+                    ),
+                    StepCompletionMetadataField(
+                        name="must_fix_count", type="number", required=True
+                    ),
+                ]
+            ),
             completion=CompletionConfig(evaluate=False, max_attempts=3),
-            outcome_routes=[
-                OutcomeRoute(
-                    status="rejected",
-                    action="revise(plan)",
-                    max_loop_iterations=5,
-                    on_exhausted="gate",
-                ),
-                OutcomeRoute(status="failed", action="gate"),
-            ],
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
+        ),
+        StepDefinition(
+            name="architect_review_route",
+            type="condition",
+            condition=ConditionStepConfig(
+                if_=(
+                    "steps.architect_review.metadata.decision == 'revise' or "
+                    "steps.architect_review.metadata.must_fix_count > 0"
+                ),
+                then="plan",
+                else_="pre_implement_gate",
+                revision_source="architect_review",
+                max_loop_iterations=5,
+                on_exhausted="gate",
+                output=DeterministicOutputConfig(
+                    summary="Routed the architecture review decision.",
+                ),
+            ),
         ),
         StepDefinition(
             name="pre_implement_gate",
@@ -607,49 +475,25 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="implement",
             type="run",
-            agent_override="system:implement",
+            objective="Implement and verify the approved scope contract.",
+            responsibilities=[
+                "Make the smallest correct code and test changes required by the approved scope.",
+                "Run the focused validation owned by implementation and fix caused failures.",
+                "Report scope completion, validation evidence, blockers, and residual risk.",
+            ],
+            defer_to=["update_docs", "code_review", "commit", "remember", "final_summary"],
             reasoning_effort="medium",
             step_profile_id="system:coding",
             prompt=(
-                "Treat the plan's `scope_contract`, `acceptance_criteria`, and "
-                "`validation_plan` as the source of truth for implementation. Execute "
-                "that brief; do not re-plan, broaden scope, or add speculative work. "
-                "Inspect only the code and context needed to implement and verify the "
-                "brief. If code reality materially contradicts the brief, or a required "
-                "scope item cannot be completed, report the step as blocked/failed with "
-                "clear evidence instead of presenting partial work as complete. Follow "
-                "the plan step by step while preferring the smallest correct change that "
-                "satisfies the task and meets the quality bar. Do not reduce, reinterpret, "
-                "or silently defer approved required scope. Originally requested or "
-                "planned work must not be moved into follow-ups; follow-ups are only for "
-                "optional hardening or future improvements. "
-                "Use focused refactoring when it is needed for correctness, "
-                "maintainability, DRY, testability, or clean integration, but avoid "
-                "broad opportunistic rewrites. "
-                "If Revision Context or prior implementation history is present, "
-                "continue from that existing work instead of restarting from scratch; "
-                "apply the requested fixes, preserve valid prior changes, and only "
-                "re-check details that are missing, stale, or needed for the fix. "
-                "If evaluator or review feedback identifies missing implementation, "
-                "fix the code, docs, or tests; do not merely rewrite the deliverable "
-                "to sound complete. "
-                "Before editing, carry out the planned environment, workspace, "
-                "worktree, and branch setup that belongs to implementation. If project "
-                "instructions require a worktree or branch strategy, use it unless it is "
-                "unsafe or blocked, and report any blocker clearly. "
-                "Inspect project instructions, package/build files, or existing "
-                "test patterns to identify the relevant verification commands. "
-                "After implementation, run the narrowest relevant tests, linters, "
-                "type checks, or builds that prove correctness when feasible. If "
-                "verification fails because of your change, fix the issue and rerun "
-                "the relevant check. If verification cannot be run or fails for an "
-                "unrelated pre-existing reason, report the blocker clearly with the "
-                "command and evidence. The deliverable should summarize the concrete "
-                "changes made, scope item completion status with evidence, the "
-                "validation that was run, any fixes made after failed checks, and "
-                "remaining risks."
+                "Execute the approved scope contract. Own code, tests, integration, focused "
+                "validation, and managed implementation workstreams. Preserve valid prior work "
+                "during revisions. Report blockers instead of silently reducing scope."
             ),
-            input=StepInputConfig(type="last", source=["plan", "architect_review"]),
+            input=StepInputConfig(
+                type="last",
+                source=["plan", "architect_review"],
+                reuse_session_from="plan",
+            ),
             metadata_contract=StepCompletionContract(
                 fields=[
                     StepCompletionMetadataField(
@@ -671,28 +515,41 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                     ),
                 ]
             ),
-            completion=CompletionConfig(
-                evaluate=True,
-                evaluator_prompt=_SOFTWARE_IMPLEMENT_EVALUATOR_PROMPT,
-                max_attempts=5,
-            ),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
         StepDefinition(
             name="update_docs",
             type="run",
-            agent_override="system:implement",
+            objective="Update only documentation directly affected by the implementation.",
+            responsibilities=[
+                "Change directly affected documentation or explain why no change is needed.",
+                "Produce the documentation-status deliverable.",
+            ],
+            defer_to=["code_review", "commit", "remember", "final_summary"],
             reasoning_effort="low",
             step_profile_id="system:coding",
             prompt=(
-                "Update only the documentation directly affected by the changes, "
-                "such as README sections, guides, specs, API docs, configuration "
-                "examples, migration notes, or inline comments. If no documentation "
-                "updates are needed, explicitly say so instead of forcing changes. "
-                "The deliverable should state what documentation changed or why none was needed."
+                "Verify the documentation boundary. Update only directly affected documentation, "
+                "or report a no-op or an implementation boundary violation."
             ),
-            input=StepInputConfig(type="last", source="implement"),
+            input=StepInputConfig(
+                type="last",
+                source="implement",
+                reuse_session_from="implement",
+            ),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="docs_status",
+                        type="string",
+                        required=True,
+                        enum=["updated", "no_change", "boundary_violation"],
+                    ),
+                    StepCompletionMetadataField(name="changed_files", type="array", required=True),
+                ]
+            ),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
@@ -700,34 +557,19 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="code_review",
             type="run",
+            objective="Review the implementation against the approved scope and validation plan.",
+            responsibilities=[
+                "Check required scope completion before code-quality findings.",
+                "Report must-fix and should-fix findings with evidence.",
+                "Approve or reject the implementation without applying fixes.",
+            ],
+            defer_to=["commit", "remember", "final_summary"],
             agent_override="system:code-review",
             reasoning_effort="medium",
             step_profile_id="system:review",
             prompt=(
-                "Review the implementation diff against the plan's `scope_contract`, "
-                "`acceptance_criteria`, and `validation_plan`. First check required "
-                "scope completion, then review the changed code, starting with scope completeness. Do not reconstruct the "
-                "task from scratch or perform a second architecture review unless the "
-                "diff violates the brief or reveals a material risk. Missing required "
-                "implementation surfaces, including untouched frontend, API, docs, or "
-                "tests that were part of scope, are blocking findings. If the review is "
-                "complete and required scope is complete with no must-fix findings, "
-                "complete the step normally with success. "
-                "If this is a repeated review, use the prior review history, verify that "
-                "previously requested fixes were addressed, and focus on the new or changed "
-                "diff since the last review. Do not re-report findings that are already "
-                "fixed or unchanged unless they still block approval. "
-                "If the review is complete but missing scope or must-fix findings "
-                "remain, report that via "
-                "step_complete.outcome.status='rejected' with a concise reason. Do not "
-                "write approval-with-blockers while structurally approving the step. "
-                "Should-fix findings without missing required scope may structurally "
-                "approve so the post-review gate can require an explicit continue or "
-                "revise decision before commit. If the "
-                "review itself could not be completed, use outcome.status='failed'. Put "
-                "the outcome only in step_complete, not as a trailing JSON object in the "
-                "written review. The deliverable should contain scope completeness first, "
-                "then the actual review findings."
+                "Review the current diff against scope and validation. Verify prior fixes on "
+                "repeated review. Return decision=approved or decision=revise. Do not apply fixes."
             ),
             input=StepInputConfig(
                 type="last",
@@ -736,10 +578,10 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             metadata_contract=StepCompletionContract(
                 fields=[
                     StepCompletionMetadataField(
-                        name="verdict",
+                        name="decision",
                         type="string",
                         required=True,
-                        enum=["approve", "reject"],
+                        enum=["approved", "revise"],
                     ),
                     StepCompletionMetadataField(
                         name="required_scope_complete", type="boolean", required=True
@@ -755,21 +597,29 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                     ),
                 ]
             ),
-            completion=CompletionConfig(
-                evaluate=True,
-                evaluator_prompt=_SOFTWARE_REVIEW_EVALUATOR_PROMPT,
-                max_attempts=3,
-            ),
-            outcome_routes=[
-                OutcomeRoute(
-                    status="rejected",
-                    action="revise(implement)",
-                    max_loop_iterations=5,
-                    on_exhausted="gate",
-                ),
-                OutcomeRoute(status="failed", action="gate"),
-            ],
+            completion=CompletionConfig(evaluate=False),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
+        ),
+        StepDefinition(
+            name="code_review_route",
+            type="condition",
+            condition=ConditionStepConfig(
+                if_=(
+                    "steps.code_review.metadata.decision == 'revise' or "
+                    "not steps.code_review.metadata.required_scope_complete or "
+                    "steps.code_review.metadata.missing_scope_count > 0 or "
+                    "steps.code_review.metadata.must_fix_count > 0"
+                ),
+                then="implement",
+                else_="post_review_gate",
+                revision_source="code_review",
+                max_loop_iterations=5,
+                on_exhausted="gate",
+                output=DeterministicOutputConfig(
+                    summary="Routed the code review decision.",
+                ),
+            ),
         ),
         StepDefinition(
             name="post_review_gate",
@@ -788,7 +638,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 conditions=[
                     {
                         "expression": (
-                            "metadata.code_review.verdict != 'approve' or "
+                            "metadata.code_review.decision != 'approved' or "
                             "metadata.code_review.required_scope_complete == false or "
                             "metadata.code_review.missing_scope_count > 0 or "
                             "metadata.code_review.must_fix_count > 0 or "
@@ -802,20 +652,34 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="commit",
             type="run",
-            agent_override="system:committer",
+            objective="Create the authorized conventional commit and report publication status.",
+            responsibilities=[
+                "Commit only the approved task changes.",
+                "Publish or open a pull request only when explicitly authorized.",
+                "Produce the commit-result deliverable.",
+            ],
+            defer_to=["remember", "final_summary"],
             reasoning_effort="low",
             step_profile_id="system:coding",
             prompt=(
-                "Create a conventional commit for all changes. Follow the approved plan's "
-                "commit, push, and pull request strategy. Push and open a pull request only "
-                "when task or project instructions explicitly require it; otherwise do not "
-                "push and state that publishing was not requested. If commit, push, or PR "
-                "creation cannot be completed due to an operational problem such as missing "
-                "git identity, missing remote, missing authentication, unavailable GitHub "
-                "CLI, or a hook failure, report that via step_complete.outcome.status='failed' "
-                "with a concise reason instead of pretending success. Write a short "
-                "deliverable summarizing the commit result, commit message, and any publish "
-                "or PR result."
+                "Commit only approved task-owned changes with the repository convention. "
+                "Do not push, publish, or open a pull request unless explicitly authorized."
+            ),
+            input=StepInputConfig(
+                type="last",
+                source=["update_docs", "code_review"],
+                reuse_session_from="update_docs",
+            ),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="commit_status",
+                        type="string",
+                        required=True,
+                        enum=["committed", "no_changes"],
+                    ),
+                    StepCompletionMetadataField(name="commit", type="object", required=True),
+                ]
             ),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
@@ -824,22 +688,30 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="remember",
             type="run",
+            objective="Store concise reusable memory for the completed implementation.",
+            responsibilities=[
+                "Store durable implementation, validation, commit, and decision context.",
+                "Exclude secrets, transient progress, and excessive detail.",
+                "Produce the memory-status deliverable.",
+            ],
+            defer_to=["final_summary"],
             reasoning_effort="low",
             step_profile_id="system:direct-default",
-            prompt=(
-                "Store a concise durable memory summarizing what was implemented, "
-                "verified, committed, and decided. Include the implemented capability, "
-                "fix, or behavior change; useful subsystem or file context; validation "
-                "and commit result when relevant; and important architectural or project "
-                "decisions that are reusable later. Do not store excessive file lists, "
-                "transient progress, generic workflow narration, secrets, credentials, "
-                "or other sensitive values. Attach a detailed summary artifact only "
-                "when the durable context is too detailed for one concise memory. Write "
-                "a deliverable summarizing what was remembered."
-            ),
+            prompt="Store only concise reusable decisions and implementation facts. Exclude secrets and transient progress.",
             input=StepInputConfig(
                 type="last",
-                source=["plan", "implement", "code_review"],
+                source=["plan", "implement", "code_review", "commit"],
+                reuse_session_from="commit",
+            ),
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="memory_status",
+                        type="string",
+                        required=True,
+                        enum=["stored", "no_durable_memory"],
+                    )
+                ]
             ),
             completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
@@ -849,18 +721,15 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
         StepDefinition(
             name="final_summary",
             type="run",
+            objective="Produce the final evidence-backed implementation report.",
+            responsibilities=[
+                "Synthesize the approved plan and all completed downstream results.",
+                "Report changes, validation, commit status, risks, and follow-ups accurately.",
+                "Produce the final user-facing workflow deliverable.",
+            ],
             reasoning_effort="medium",
             step_profile_id="system:research",
-            prompt=(
-                "Produce the final user-facing implementation report for this workflow. "
-                "Synthesize the approved plan, implementation summary, documentation status, "
-                "code review findings, commit/publish result, and memory summary into one polished "
-                "deliverable. Focus on: what changed, what was verified, any remaining risks, "
-                "and any important follow-up notes. Do not claim the work is fully finished, "
-                "end-to-end, merge-ready, committed, pushed, or PR'd unless that is supported "
-                "by prior step outputs. Follow-ups must not contain originally requested or "
-                "planned required scope unless the user explicitly waived it."
-            ),
+            prompt="Deliver only the evidence-backed result. Do not perform more implementation work.",
             input=StepInputConfig(
                 type="last",
                 source=[
@@ -872,12 +741,19 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                     "commit",
                     "remember",
                 ],
+                reuse_session_from="remember",
             ),
-            completion=CompletionConfig(
-                evaluate=True,
-                evaluator_prompt=_SOFTWARE_FINAL_EVALUATOR_PROMPT,
-                max_attempts=3,
+            metadata_contract=StepCompletionContract(
+                fields=[
+                    StepCompletionMetadataField(
+                        name="delivery_status",
+                        type="string",
+                        required=True,
+                        enum=["complete", "incomplete"],
+                    )
+                ]
             ),
+            completion=CompletionConfig(evaluate=False),
             outcome_routes=[OutcomeRoute(status="failed", action="gate")],
             require_deliverable=True,
         ),
@@ -888,6 +764,9 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
 CREATIVE_WORKFLOW = Workflow(
     workflow_id="system:creative",
     name="Creative",
+    presentation=WorkflowPresentation(
+        phases=[WorkflowPhaseDefinition(id="create", title="Create", step_names=["generate"])]
+    ),
     description="Generate content with evaluation loop.",
     criteria="Creative writing, content generation, copywriting.",
     tags=["creative", "writing"],
@@ -1040,7 +919,7 @@ class WorkflowRegistry:
                 db_session,
                 workflow_id=workflow.workflow_id,
                 name=workflow.name,
-                definition=workflow.model_dump(mode="json"),
+                definition=workflow.model_dump(mode="json", exclude_none=True),
                 description=workflow.description,
                 version=workflow.version,
                 is_system=False,
@@ -1142,9 +1021,66 @@ def _validate_workflow(workflow: Workflow) -> None:
         seen_names.add(step.name)
 
         # Validate input source references point to earlier steps
-        for ref in resolve_source_names(step, i, workflow.steps):
+        resolved_sources = resolve_source_names(step, i, workflow.steps)
+        for ref in resolved_sources:
             if ref not in seen_names:
                 raise ValueError(f"Step {step.name!r} references unknown/later input: {ref!r}")
+
+        reuse_source = step.input.reuse_session_from if step.input is not None else None
+        if reuse_source is not None:
+            if step.type != "run":
+                raise ValueError(
+                    f"Step {step.name!r} can reuse a session only for an executable run step"
+                )
+            if reuse_source == step.name:
+                raise ValueError(f"Step {step.name!r} cannot reuse its own session")
+            if reuse_source not in step_names:
+                raise ValueError(
+                    f"Step {step.name!r} reuses unknown step session: {reuse_source!r}"
+                )
+            source_index = step_names.index(reuse_source)
+            if source_index >= i:
+                raise ValueError(
+                    f"Step {step.name!r} reuse_session_from must reference an earlier step: "
+                    f"{reuse_source!r}"
+                )
+            source_step = workflow.steps[source_index]
+            if source_step.type != "run":
+                raise ValueError(
+                    f"Step {step.name!r} cannot reuse non-run step session: {reuse_source!r}"
+                )
+            if reuse_source not in resolved_sources:
+                raise ValueError(
+                    f"Step {step.name!r} reuse_session_from must also be an input source: "
+                    f"{reuse_source!r}"
+                )
+            if (
+                source_step.agent_override is not None
+                and step.agent_override is not None
+                and source_step.agent_override != step.agent_override
+            ):
+                raise ValueError(
+                    f"Step {step.name!r} cannot reuse a session across different agents"
+                )
+            if (
+                source_step.agent_profile_id is not None
+                and step.agent_profile_id is not None
+                and source_step.agent_profile_id != step.agent_profile_id
+            ):
+                raise ValueError(
+                    f"Step {step.name!r} cannot reuse a session across different runtime profiles"
+                )
+
+        # Responsibility boundaries can defer work only to later workflow steps.
+        for target in step.defer_to:
+            if target not in step_names:
+                raise ValueError(f"Step {step.name!r} defer_to references unknown step: {target!r}")
+            target_idx = step_names.index(target)
+            if target_idx <= i:
+                relation = "itself" if target_idx == i else "an earlier step"
+                raise ValueError(
+                    f"Step {step.name!r} defer_to cannot reference {relation}: {target!r}"
+                )
 
         # Validate on_reject.target references an earlier step
         if step.on_reject is not None:
@@ -1186,6 +1122,30 @@ def _validate_workflow(workflow: Workflow) -> None:
         # Validate gate steps have gate config
         if step.type == "gate" and step.gate is None:
             raise ValueError(f"Gate step {step.name!r} must have gate configuration")
+
+        deterministic_targets = [step.next]
+        if step.condition is not None:
+            deterministic_targets.extend([step.condition.then, step.condition.else_])
+            revision_source = step.condition.revision_source
+            if revision_source is not None:
+                if revision_source not in step_names:
+                    raise ValueError(
+                        f"Step {step.name!r} references unknown revision source: "
+                        f"{revision_source!r}"
+                    )
+                source_index = step_names.index(revision_source)
+                if source_index >= i:
+                    raise ValueError(
+                        f"Step {step.name!r} revision_source must reference an earlier step, "
+                        f"but {revision_source!r} is at index {source_index}"
+                    )
+        for target in (target for target in deterministic_targets if target is not None):
+            if target not in step_names:
+                raise ValueError(
+                    f"Step {step.name!r} references unknown deterministic target: {target!r}"
+                )
+            if target == step.name:
+                raise ValueError(f"Step {step.name!r} cannot jump to itself")
 
     validate_gate_conditions(workflow)
 

@@ -112,6 +112,12 @@ async def join_session_matches(
             continue
         if conversation.status == "deleted":
             continue
+        is_task_control = (conversation.context_data or {}).get("kind") == "task_control"
+        if status == "task":
+            if not is_task_control or conversation.status != "active":
+                continue
+        elif is_task_control:
+            continue
         if project_id is not None and conversation.project_id != project_id:
             continue
         if agent_filter and conversation.agent_id not in agent_filter:
@@ -123,7 +129,7 @@ async def join_session_matches(
         starred_at = getattr(conversation, "starred_at", None)
         if status == "starred" and (starred_at is None or conversation.status != "active"):
             continue
-        if status not in {"active", "starred", "archived", "all"}:
+        if status not in {"active", "starred", "archived", "all", "task"}:
             continue
         if context_filter and getattr(conversation, "context_type", None) not in context_filter:
             continue

@@ -102,6 +102,17 @@ class ComposeAndRunWorkflowArgs(BaseModel):
     priority: int | None = None
 
 
+COMPOSED_WORKFLOW_PREVIEW_ID = "wf_composed_preview"
+
+
+def workflow_payload_for_persistence(workflow: Workflow) -> dict[str, Any]:
+    """Force every newly composed workflow to receive a unique durable ID."""
+
+    payload = workflow.model_dump(mode="json")
+    payload["workflow_id"] = None
+    return payload
+
+
 class SkillDecompositionResult(BaseModel):
     """Structured result returned by the skill decomposer."""
 
@@ -368,8 +379,13 @@ async def decompose_skill_material(
                 + refresh_block
                 + f"{_step_profile_catalog_text()}\n\n"
                 + "Return JSON with keys 'rationale' and 'steps'. Keep the rationale short and return at most 8 steps. Each step must be a valid "
-                + "Cognis StepDefinition object with name, type='run' or 'gate', prompt, and "
-                + "any relevant completion/input/deliverable fields. Use require_deliverable=false "
+                + "Cognis StepDefinition object. Use run for judgment/synthesis, gate for human "
+                + "approval, tool_call for one mechanical tool call, condition for a strict-boolean "
+                + "Jinja branch, and complete for terminal no-LLM completion. Deterministic steps "
+                + "require exactly one same-named config and cannot use agent, input, completion, "
+                + "review, question, or outcome-route fields. Named targets must exist. Run/gate "
+                + "steps may use prompt and relevant completion/input/deliverable fields. Use "
+                + "require_deliverable=false "
                 + "for obvious gather/inspect steps and true for synthesis/report/final steps. "
                 + "Important input semantics: when input is omitted, Cognis defaults to the immediately preceding run step. "
                 + "If multiple gather/collector steps depend on one earlier setup step, you must set input explicitly to that step instead of relying on defaults. "
@@ -459,7 +475,11 @@ async def compose_workflow_plan(
                 "Derived workflows must be valid Cognis Workflow objects except that workflow_id, "
                 "owner_email, is_system, lifecycle, archived_at, and lineage may be omitted because the "
                 "controller fills them in. Prefer smaller workflows over copying large templates when only "
-                "part of them is needed. Every run step should include step_profile_id, and when skill-defined tools are required you should use inline step_profile.tool_overrides.include for those tool names."
+                "part of them is needed. Add presentation.phases whenever the workflow has multiple "
+                "meaningful stages. Phases are concise user-facing labels over contiguous steps and "
+                "must cover every step exactly once in canonical order. Every run step should include "
+                "step_profile_id, and when skill-defined tools are required you should use inline "
+                "step_profile.tool_overrides.include for those tool names."
             ),
         },
     ]
@@ -520,5 +540,17 @@ def workflow_preview_payload(workflow: Workflow) -> dict[str, Any]:
         "name": workflow.name,
         "lifecycle": str(workflow.lifecycle),
         "steps": [step.name for step in workflow.steps],
+        "phases": (
+            [
+                {
+                    "id": phase.id,
+                    "title": phase.title,
+                    "step_names": phase.step_names,
+                }
+                for phase in workflow.presentation.phases
+            ]
+            if workflow.presentation is not None
+            else []
+        ),
         "lineage": workflow.lineage.model_dump(mode="json") if workflow.lineage else None,
     }

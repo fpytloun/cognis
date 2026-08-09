@@ -240,8 +240,15 @@ async def snapshot_for_conversation(
         if conversation.active_session_id
         else None
     )
+    durable_running = (
+        getattr(turn_scheduler, "durable_running_turn_state", None)
+        if turn_scheduler is not None
+        else None
+    )
     running_turn_state = (
-        turn_scheduler.running_turn_state(conversation_id)
+        await durable_running(conversation_id)
+        if callable(durable_running)
+        else turn_scheduler.running_turn_state(conversation_id)
         if turn_scheduler is not None and hasattr(turn_scheduler, "running_turn_state")
         else None
     )

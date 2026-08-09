@@ -7,6 +7,7 @@ import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
+from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -48,11 +49,26 @@ def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
         pending.add(executor_id)
         return
 
+    websocket_provider = app.state.providers.executor.websocket
+    connection = websocket_provider.get_connection(executor_id)
+    get_local_connection = getattr(websocket_provider, "get_local_connection", None)
+    local_connection = (
+        get_local_connection(executor_id) if get_local_connection is not None else connection
+    )
+    forwarded = connection is not None and local_connection is None
+
     async def _run() -> None:
         cancelled = False
         try:
             try:
-                await reconcile_executor(app, executor_id)
+                if forwarded:
+                    await connection.rpc_call(
+                        "executor.reconcile",
+                        {"executor_id": executor_id},
+                        timeout=CONFIGURE_RPC_TIMEOUT_SECONDS,
+                    )
+                else:
+                    await reconcile_executor(app, executor_id)
             except Exception as exc:
                 _logger.warning(
                     "executor_runtime: background reconcile failed for %s: %s",
@@ -128,6 +144,12 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 if getattr(row, "runtime_state", "offline") == "reconfiguring":
                     await _mark_reconcile_unavailable(app, row)
                 return False
+            if not await _connection_ownership_is_current(app, current_conn):
+                _logger.info(
+                    "executor_runtime: executor %s connection ownership is stale",
+                    executor_id,
+                )
+                return False
 
             if applied_version == target_version and getattr(row, "runtime_state", "offline") in {
                 "active",
@@ -139,23 +161,38 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     row,
                     runtime_metadata,
                 )
+                capabilities = ExecutorCapabilities(
+                    tools=[
+                        str(tool.get("name", "")) for tool in observed_tools if tool.get("name")
+                    ],
+                    inference=local_inference_enabled,
+                    local_inference=local_inference_enabled,
+                    inference_models=[],
+                    inference_type="litellm_proxy",
+                    channels=True,
+                    local_model_runtime=(
+                        _ollama_runtime_capability(runtime_metadata.get("ollama_runtime"))
+                        if local_inference_enabled
+                        else None
+                    ),
+                )
+                runtime_metadata = dict(runtime_metadata)
+                runtime_metadata["capabilities"] = capabilities.model_dump(mode="json")
+                if getattr(app.state, "executor_connection_ownership", None) is not None:
+                    persisted = await _persist_runtime_state(
+                        app,
+                        executor_id,
+                        connection=current_conn,
+                        runtime_state=str(getattr(row, "runtime_state", "active")),
+                        applied_config_version=applied_version,
+                        observed_tools=observed_tools,
+                        runtime_metadata=runtime_metadata,
+                    )
+                    if persisted is None:
+                        return False
                 app.state.providers.executor.websocket.mark_ready(
                     executor_id,
-                    ExecutorCapabilities(
-                        tools=[
-                            str(tool.get("name", "")) for tool in observed_tools if tool.get("name")
-                        ],
-                        inference=local_inference_enabled,
-                        local_inference=local_inference_enabled,
-                        inference_models=[],
-                        inference_type="litellm_proxy",
-                        channels=True,
-                        local_model_runtime=(
-                            _ollama_runtime_capability(runtime_metadata.get("ollama_runtime"))
-                            if local_inference_enabled
-                            else None
-                        ),
-                    ),
+                    capabilities,
                     metadata=_executor_connection_metadata(
                         labels=row.labels or {},
                         environment=runtime_metadata.get("environment"),
@@ -180,12 +217,17 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 applied_version,
             )
             async with app.state.session_factory() as session:
-                await update_executor_runtime_state(
+                await _update_owned_runtime_state(
+                    app,
                     session,
-                    executor_id,
+                    current_conn,
+                    executor_id=executor_id,
                     runtime_state="reconfiguring",
                 )
                 await session.commit()
+            cluster_signals = getattr(app.state, "cluster_signals", None)
+            if cluster_signals is not None:
+                await cluster_signals.publish_executor_change(executor_id)
 
             configure_metadata: dict[str, Any] = getattr(row, "runtime_metadata", None) or {}
             try:
@@ -233,6 +275,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 await _persist_runtime_state(
                     app,
                     executor_id,
+                    connection=current_conn,
                     runtime_state="blocked",
                     applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
                     observed_tools=list(getattr(row, "observed_tools", None) or []),
@@ -280,7 +323,27 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 capabilities.inference = False
                 capabilities.local_inference = False
                 capabilities.local_model_runtime = None
-            app.state.providers.executor.websocket.mark_ready(
+            runtime_metadata["capabilities"] = capabilities.model_dump(mode="json")
+            persisted = await _persist_runtime_state(
+                app,
+                executor_id,
+                connection=current_conn,
+                runtime_state=runtime_state,
+                applied_config_version=applied_version,
+                observed_tools=observed_tools,
+                runtime_metadata=runtime_metadata,
+            )
+            if persisted is None:
+                _logger.info(
+                    "executor_runtime: executor %s ownership changed before configure persisted",
+                    executor_id,
+                )
+                connection = None
+                continue
+            if not await _connection_ownership_is_current(app, current_conn):
+                connection = None
+                continue
+            marked_ready = app.state.providers.executor.websocket.mark_ready(
                 executor_id,
                 capabilities,
                 metadata=_executor_connection_metadata(
@@ -291,15 +354,11 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     owner_email=row.owner_email,
                     runtime_metadata=runtime_metadata,
                 ),
+                expected_connection=current_conn,
             )
-            await _persist_runtime_state(
-                app,
-                executor_id,
-                runtime_state=runtime_state,
-                applied_config_version=applied_version,
-                observed_tools=observed_tools,
-                runtime_metadata=runtime_metadata,
-            )
+            if marked_ready is False:
+                connection = None
+                continue
             await _invalidate_mcp_oauth_tokens_for_runtime_failures(
                 app,
                 row,
@@ -330,25 +389,42 @@ async def _persist_runtime_state(
     app: Any,
     executor_id: str,
     *,
+    connection: Any | None = None,
     runtime_state: str,
     applied_config_version: int,
     observed_tools: list[dict[str, Any]],
     runtime_metadata: dict[str, Any],
-) -> None:
+) -> Any | None:
     async with app.state.session_factory() as session:
-        row = await update_executor_runtime_state(
-            session,
-            executor_id,
-            applied_config_version=applied_config_version,
-            observed_tools=observed_tools,
-            runtime_metadata=runtime_metadata,
-            last_observed_at=datetime.now(UTC),
-            runtime_state=runtime_state,
-        )
+        if connection is None:
+            row = await update_executor_runtime_state(
+                session,
+                executor_id,
+                applied_config_version=applied_config_version,
+                observed_tools=observed_tools,
+                runtime_metadata=runtime_metadata,
+                last_observed_at=datetime.now(UTC),
+                runtime_state=runtime_state,
+            )
+        else:
+            row = await _update_owned_runtime_state(
+                app,
+                session,
+                connection,
+                executor_id=executor_id,
+                applied_config_version=applied_config_version,
+                observed_tools=observed_tools,
+                runtime_metadata=runtime_metadata,
+                last_observed_at=datetime.now(UTC),
+                runtime_state=runtime_state,
+            )
         await session.commit()
+    cluster_signals = getattr(app.state, "cluster_signals", None)
+    if cluster_signals is not None:
+        await cluster_signals.publish_executor_change(executor_id)
     queue = getattr(app.state, "tool_classification_queue", None)
     if queue is None or row is None or not observed_tools:
-        return
+        return row
     try:
         tool_defs = [
             ToolDefinition.model_validate(item) for item in observed_tools if isinstance(item, dict)
@@ -362,6 +438,7 @@ async def _persist_runtime_state(
             },
             exc_info=True,
         )
+    return row
 
 
 async def persist_executor_resource_snapshot(
@@ -416,14 +493,44 @@ async def persist_executor_resource_snapshot(
                 return False
             runtime_metadata["resource_snapshot"] = snapshot_payload
             runtime_metadata["resource_snapshot_received_at"] = received_at.isoformat()
-            await update_executor_runtime_state(
+            updated = await _update_owned_runtime_state(
+                app,
                 session,
-                executor_id,
+                connection,
+                executor_id=executor_id,
                 runtime_metadata=runtime_metadata,
                 last_observed_at=received_at,
             )
             await session.commit()
+            if updated is None:
+                return False
     return True
+
+
+async def _update_owned_runtime_state(
+    app: Any,
+    session: Any,
+    connection: Any,
+    *,
+    executor_id: str | None = None,
+    **values: Any,
+) -> Any | None:
+    """Persist socket-derived state through the exact connection fence."""
+
+    ownership = getattr(app.state, "executor_connection_ownership", None)
+    owner: ExecutorConnectionOwner | None = getattr(connection, "connection_owner", None)
+    resolved_executor_id = executor_id or getattr(connection, "executor_id", None)
+    if ownership is None or connection is None:
+        if not resolved_executor_id:
+            return None
+        return await update_executor_runtime_state(
+            session,
+            resolved_executor_id,
+            **values,
+        )
+    if owner is None:
+        return None
+    return await ownership.update_runtime_state(session, owner, **values)
 
 
 async def _invalidate_mcp_oauth_tokens_for_runtime_failures(
@@ -992,6 +1099,14 @@ def _get_executor_lock(app: Any, executor_id: str) -> asyncio.Lock:
 
 def _is_current_connection(app: Any, executor_id: str, connection: Any) -> bool:
     return app.state.providers.executor.websocket.get_connection(executor_id) is connection
+
+
+async def _connection_ownership_is_current(app: Any, connection: Any) -> bool:
+    ownership = getattr(app.state, "executor_connection_ownership", None)
+    if ownership is None:
+        return True
+    owner = getattr(connection, "connection_owner", None)
+    return owner is not None and await ownership.is_current(owner)
 
 
 def _executor_connection_metadata(

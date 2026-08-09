@@ -47,6 +47,7 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "session.immutable_prefix_repair_cooldown_seconds": ("session", 300),
     "session.recall_ttl_seconds": ("session", 86400),
     "session.max_tool_calls_per_turn": ("session", 500),
+    "session.max_llm_cycles_per_turn": ("session", 150),
     "session.idle_timeout_seconds": ("session", 1800),
     "session.long_lived_chat_idle_compaction_seconds": ("session", 21600),
     "session.long_lived_chat_idle_compaction_min_events": ("session", 20),
@@ -92,11 +93,13 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "web.concurrency.global_cap": ("web", 32),
     "web.concurrency.per_host_cap": ("web", 4),
     "web.concurrency.direct_cap": ("web", 16),
+    "web.concurrency.direct_search_cap": ("web", 2),
     "web.concurrency.tavily_cap": ("web", 8),
     "web.concurrency.brave_cap": ("web", 2),
     "web.concurrency.searxng_cap": ("web", 4),
     "web.concurrency.browser_cap": ("web", 4),
     "web.rate_limit.tavily_qps": ("web", 5.0),
+    "web.rate_limit.direct_search_qps": ("web", 1.0),
     "web.rate_limit.brave_qps": ("web", 1.0),
     "web.rate_limit.searxng_qps": ("web", 5.0),
     "executors.allow_in_process": ("executors", True),
@@ -130,6 +133,7 @@ _HOT_KEYS: Final[set[str]] = {
     "session.immutable_prefix_repair_cooldown_seconds",
     "session.recall_ttl_seconds",
     "session.max_tool_calls_per_turn",
+    "session.max_llm_cycles_per_turn",
     "session.max_delegation_depth",
     "session.cache_max_entries",
     "decision_engine.inline_max_length",
@@ -186,6 +190,7 @@ _ENUM_KEYS: Final[dict[str, tuple[str, ...]]] = {
 
 _RANGES: Final[dict[str, tuple[int | float | None, int | float | None]]] = {
     "session.compaction_threshold": (0.3, 0.99),
+    "session.max_llm_cycles_per_turn": (1, 1000),
     "search.display_min_score": (0.0, 1.0),
 }
 
@@ -198,6 +203,9 @@ _DESCRIPTIONS: Final[dict[str, str]] = {
     ),
     "session.max_tool_calls_per_turn": (
         "Default counted tool-call ceiling for normal turns; secondary delegated agents are unlimited."
+    ),
+    "session.max_llm_cycles_per_turn": (
+        "Maximum LLM request cycles within one turn before work continues automatically."
     ),
     "session.llm_stream_idle_timeout_seconds": (
         "Maximum idle interval while waiting for meaningful LLM stream activity."

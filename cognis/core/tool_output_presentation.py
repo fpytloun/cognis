@@ -174,6 +174,7 @@ class ToolOutputPresentation:
     anchor_projections: tuple[dict[str, Any], ...] = ()
     lazy_artifact_refs: tuple[str, ...] = ()
     transport_truncated: bool = False
+    producer_truncated: bool = False
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -189,6 +190,7 @@ class ToolOutputPresentation:
             "anchor_projections": [dict(item) for item in self.anchor_projections],
             "lazy_artifact_refs": list(self.lazy_artifact_refs),
             "transport_truncated": self.transport_truncated,
+            "producer_truncated": self.producer_truncated,
         }
 
     def event_fields(self) -> dict[str, Any]:
@@ -279,7 +281,9 @@ def build_transport_tool_output_preview(
 ) -> ToolOutputPresentation:
     meta = metadata or {}
     call_id = recovery_call_id or _str_or_none(meta.get("recovery_call_id"))
+    producer_call_id = _str_or_none(meta.get("call_id"))
     full = has_full_output or bool(meta.get("has_full_output"))
+    producer_truncated = meta.get("producer_truncated") is True
     artifact_id = tool_output_artifact_id or _str_or_none(meta.get("tool_output_artifact_id"))
     metadata_anchors = meta.get("anchors")
     anchor_names = safe_anchor_names(
@@ -306,6 +310,12 @@ def build_transport_tool_output_preview(
         anchors=anchor_names,
         anchors_available=anchors_available,
     )
+    if producer_truncated and producer_call_id and not full:
+        note = (
+            f"\n[Producer returned a truncated preview for call_id={producer_call_id!r}; "
+            "no controller recovery handle is available.]"
+        )
+        result = (result[: max(0, max_chars - len(note))].rstrip() + note)[-max_chars:]
     return ToolOutputPresentation(
         result=result,
         output_size=int(meta.get("output_size") or output_size(text)),
@@ -328,6 +338,7 @@ def build_transport_tool_output_preview(
         ),
         lazy_artifact_refs=tuple(safe_lazy_refs),
         transport_truncated=truncated,
+        producer_truncated=producer_truncated,
     )
 
 

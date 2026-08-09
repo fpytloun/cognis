@@ -9,8 +9,13 @@ from typing import Any
 import httpx
 import litellm
 
-from cognis.executor.inference_types import CognisInferenceRequest, json_safe_inference_payload
+from cognis.executor.inference_types import (
+    CognisInferenceRequest,
+    image_generation_result_payload,
+    json_safe_inference_payload,
+)
 from cognis.logging import get_logger
+from cognis.models.config import ImageInput
 from cognis.providers.llm.errors import build_mid_stream_error_chunk
 from cognis.providers.llm.performance import LocalGenerationPerformanceObserver
 from cognis.providers.llm.responses_bridge import (
@@ -267,7 +272,8 @@ class LiteLLMExecutorBackend:
         size: str | None = None,
         quality: str | None = None,
         response_format: str = "b64_json",
-        image: str | None = None,
+        images: list[ImageInput] | None = None,
+        mask: ImageInput | None = None,
         request_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
         """Generate an image through LiteLLM on the executor side."""
@@ -279,13 +285,25 @@ class LiteLLMExecutorBackend:
 
         if strategy == "acompletion_modalities":
             content: list[dict[str, Any]] | str
-            if image is not None:
+            if images is not None:
                 content = [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                    *[
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{image.content_type};base64,{image.b64_json}"
+                            },
+                        }
+                        for image in images
+                    ],
                     {"type": "text", "text": prompt},
                 ]
             else:
                 content = prompt
+            if mask is not None:
+                raise ValueError(
+                    "Masked image editing is not supported by Gemini image generation."
+                )
             messages = [{"role": "user", "content": content}]
             response = await litellm.acompletion(
                 model=model,
@@ -295,12 +313,15 @@ class LiteLLMExecutorBackend:
                 n=n,
                 **gen_kwargs,
             )
-            dumped = json_safe_inference_payload(response)
-            return dumped if isinstance(dumped, dict) else {}
+            return image_generation_result_payload(response, model)
 
         image_kwargs: dict[str, Any] = {}
         if _supports_image_response_format(model):
             image_kwargs["response_format"] = response_format
+        if images is not None:
+            image_kwargs["image"] = [image.b64_json for image in images]
+        if mask is not None:
+            image_kwargs["mask"] = mask.b64_json
         response = await litellm.aimage_generation(
             prompt=prompt,
             model=model,
@@ -310,8 +331,7 @@ class LiteLLMExecutorBackend:
             **image_kwargs,
             **gen_kwargs,
         )
-        dumped = response.model_dump()
-        return dumped if isinstance(dumped, dict) else {}
+        return image_generation_result_payload(response, model)
 
     async def transcribe(
         self,

@@ -59,7 +59,10 @@ class InternalChatCursorPayload(StrictModel):
     conversation_id: str | None = None
     projection_version: str
     session_watermarks: list[CursorSessionWatermark] = Field(default_factory=list)
+    before_positions: list[CursorSessionWatermark] = Field(default_factory=list)
+    ordinal_frontiers: list[int] = Field(default_factory=list)
     lineage: list[CursorLineageEntry] = Field(default_factory=list)
+    graph_fingerprint: str | None = None
     view_revision: int = Field(ge=0)
     issued_at: str
     expires_at: str | None = None

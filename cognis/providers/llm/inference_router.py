@@ -31,6 +31,35 @@ class LocalModelRolloutUnavailableError(RuntimeError):
         self.summary = summary
 
 
+def _provider_safe_kwargs(request_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    """Remove controller-only executor affinity metadata before provider RPC."""
+    return {
+        key: value
+        for key, value in (request_kwargs or {}).items()
+        if key
+        not in {
+            "executor_id",
+            "executor_labels",
+            "cognis_executor_affinity",
+            "_cognis_executor_affinity_id",
+        }
+    }
+
+
+def _provider_safe_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in (metadata or {}).items()
+        if key
+        not in {
+            "executor_id",
+            "executor_labels",
+            "cognis_executor_affinity",
+            "_cognis_executor_affinity_id",
+        }
+    }
+
+
 class InferenceRouter:
     """Proxy provider calls through a selected executor."""
 
@@ -99,6 +128,18 @@ class InferenceRouter:
         owner_email: str | None = None,
         backend_metadata: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        affinity = (request_kwargs or {}).get("_cognis_executor_affinity_id")
+        if isinstance(affinity, str) and affinity.strip():
+            pinned_id = affinity.strip()
+            if executor_id and executor_id != pinned_id:
+                yield {
+                    "error": "Frozen executor affinity conflicts with configured executor_id",
+                    "mid_stream_failure": True,
+                }
+                return
+            executor_id = pinned_id
+        request_kwargs = _provider_safe_kwargs(request_kwargs)
+        backend_metadata = _provider_safe_metadata(backend_metadata)
         try:
             selection = await self._find_executor_selection(
                 executor_id,
@@ -128,6 +169,22 @@ class InferenceRouter:
             }
             return
         assert handle is not None
+        if isinstance(affinity, str) and affinity.strip():
+            if handle.executor_id != affinity.strip():
+                yield {
+                    "error": "Resolved executor does not match frozen executor affinity",
+                    "mid_stream_failure": True,
+                }
+                return
+            if executor_labels:
+                metadata = handle.metadata if isinstance(handle.metadata, dict) else {}
+                labels = metadata.get("labels")
+                if not isinstance(labels, dict) or not labels_match(labels, executor_labels):
+                    yield {
+                        "error": "Frozen executor fails configured executor_labels",
+                        "mid_stream_failure": True,
+                    }
+                    return
 
         try:
             async for chunk in conn.llm_complete_stream(
@@ -377,7 +434,8 @@ class InferenceRouter:
         size: str | None = None,
         quality: str | None = None,
         response_format: str = "b64_json",
-        image: str | None = None,
+        images: list[dict[str, str]] | None = None,
+        mask: dict[str, str] | None = None,
         request_kwargs: dict[str, Any] | None = None,
     ) -> ImageGenerationResult:
         """Route image generation through a matching executor."""
@@ -397,7 +455,8 @@ class InferenceRouter:
                     "size": size,
                     "quality": quality,
                     "response_format": response_format,
-                    "image": image,
+                    "images": images,
+                    "mask": mask,
                     "request_kwargs": request_kwargs or {},
                 },
             )

@@ -1,7 +1,7 @@
 """Transport-agnostic slash command dispatch.
 
 CommandDispatcher handles all slash commands (``/compact``, ``/new``,
-``/model``, ``/thinking``, ``/context``, ``/info``, ``/lsp``, ``/help``,
+``/model``, ``/thinking``, ``/fast``, ``/context``, ``/info``, ``/lsp``, ``/help``,
 ``/task``, ``/research``, ``/implement``, ``/delegate``, ``/approve``,
 ``/deny``, ``/retry``, ``/continue``) without any dependency on WebSocket or
 other transport layers.
@@ -31,7 +31,13 @@ from cognis.core.notifications import NotificationType
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import NORMALIZED_REASONING_LEVELS
-from cognis.models.session import ConversationContext, ConversationModel, SessionEvent, SessionModel
+from cognis.models.session import (
+    ConversationContext,
+    ConversationModel,
+    SessionEvent,
+    SessionModel,
+    SessionTransition,
+)
 from cognis.models.task import TaskDelivery
 from cognis.providers.llm.reasoning import (
     normalize_reasoning_effort,
@@ -65,6 +71,7 @@ _PREFIX_SYSTEM_SLASH_COMMANDS = frozenset(
         "/fork",
         "/model",
         "/thinking",
+        "/fast",
         "/profile",
         "/skill",
         "/executor",
@@ -184,6 +191,7 @@ _SLASH_COMMAND_METADATA: tuple[_SlashCommandMetadata, ...] = (
     _SlashCommandMetadata("/help", "Show available commands"),
     _SlashCommandMetadata("/model", "List or switch LLM model", True, True),
     _SlashCommandMetadata("/thinking", "Set reasoning effort", True, True),
+    _SlashCommandMetadata("/fast", "Enable or disable fast model mode", True, True),
     _SlashCommandMetadata("/profile", "List or switch agent runtime profile", True, True),
     _SlashCommandMetadata("/skill", "List or load a skill into this session", True, True),
     _SlashCommandMetadata("/executor", "Show or switch active executor", True, True),
@@ -395,6 +403,23 @@ class CommandDispatcher:
             )
         if command == "/thinking":
             return await self._suggest_thinking_levels(session, partial, limit=bounded_limit)
+        if command == "/fast":
+            return [
+                SlashCommandSuggestion(
+                    kind="parameter",
+                    command="/fast",
+                    value=value,
+                    label=value,
+                    description=description,
+                    insert_text=f"/fast {value}",
+                )
+                for value, description in (
+                    ("on", "Enable fast mode when supported"),
+                    ("off", "Disable fast mode"),
+                    ("default", "Use the agent or profile setting"),
+                )
+                if _matches_suggestion(partial, value, description)
+            ][:bounded_limit]
         if command == "/profile":
             return self._suggest_profiles(
                 conversation, session, agent, partial, limit=bounded_limit
@@ -840,6 +865,14 @@ class CommandDispatcher:
             arg = stripped[9:].strip() if len(stripped) > 9 else ""
             return self._mark_command_result(await self._handle_thinking(session, arg), "/thinking")
 
+        # /fast [on|off|default]
+        if stripped == "/fast" or stripped.startswith("/fast "):
+            arg = stripped[len("/fast") :].strip()
+            return self._mark_command_result(
+                await self._handle_fast(session, agent, arg, user_email=user_email),
+                "/fast",
+            )
+
         # /profile [agent_profile_id]
         if stripped == "/profile" or stripped.startswith("/profile "):
             arg = stripped[len("/profile") :].strip() if len(stripped) > len("/profile") else ""
@@ -880,6 +913,7 @@ class CommandDispatcher:
                 command_name=command_name,
                 description=description.strip(),
                 conversation=conversation,
+                session=session,
                 agent=agent,
                 user_email=user_email,
             )
@@ -1028,7 +1062,7 @@ class CommandDispatcher:
                         data={"code": "compaction_failed"},
                     )
 
-                if not compaction_result.compacted:
+                if not compaction_result.compacted or compaction_result.turns_compacted <= 0:
                     if compaction_result.method == "llm_failed":
                         return CommandResult(
                             type="error",
@@ -1049,6 +1083,7 @@ class CommandDispatcher:
                         current_session=session,
                         intention="Continued conversation",
                         completion_reason="compacted",
+                        transition=SessionTransition.COMPACT,
                         compaction_summary=compaction_result.summary,
                         tail_events=getattr(compaction_result, "preserved_tail_events", None),
                     )
@@ -1162,6 +1197,7 @@ class CommandDispatcher:
                     current_session=session,
                     intention=f"Conversation with {agent.name}",
                     completion_reason="user_reset",
+                    transition=SessionTransition.RESET,
                 )
                 await self._clear_conversation_execution_paths(conversation)
                 if self._session_factory is not None:
@@ -1433,6 +1469,7 @@ class CommandDispatcher:
         command_name: str,
         description: str,
         conversation: ConversationModel,
+        session: SessionModel,
         agent: AgentDefinition,
         user_email: str,
     ) -> CommandResult:
@@ -1463,6 +1500,7 @@ class CommandDispatcher:
             created_by_agent_id=agent.agent_id,
             source_type="chat",
             source_ref=conversation.conversation_id,
+            source_session_id=session.session_id,
             delivery=TaskDelivery(mode="same_conversation"),
             workflow_id=workflow_id,
             project_id=conversation.project_id,
@@ -2163,6 +2201,84 @@ class CommandDispatcher:
             text=f"Thinking effort set to: {normalized_arg}\nTakes effect on next message.",
         )
 
+    async def _handle_fast(
+        self,
+        session: SessionModel,
+        agent: AgentDefinition,
+        arg: str,
+        *,
+        user_email: str | None,
+    ) -> CommandResult:
+        """Handle /fast [on|off|default] for the current session model."""
+        session_id = session.session_id
+        current_model = self._session_cache.get_model_override(session_id)
+        usage = self._session_cache.get_context_usage(session_id)
+        if not current_model:
+            current_model = str((usage or {}).get("model") or "")
+        resolved_profile = resolve_conversation_agent_profile(agent, session)
+        if not current_model:
+            current_model = resolved_profile.model or (
+                agent.llm_config.model if agent.llm_config else ""
+            )
+        provider_id = self._session_cache.get_model_override_provider_id(session_id) or (
+            str((usage or {}).get("provider_id") or "") or None
+        )
+        if provider_id is None:
+            provider_id = resolved_profile.provider_id or (
+                agent.llm_config.provider_id if agent.llm_config else None
+            )
+
+        supports_fast_mode = False
+        if current_model and self._providers is not None and getattr(self._providers, "llm", None):
+            try:
+                try:
+                    model_info = await self._providers.llm.get_model_info(
+                        current_model,
+                        provider_id=provider_id,
+                        acting_user_email=user_email,
+                    )
+                except TypeError:
+                    model_info = await self._providers.llm.get_model_info(current_model)
+                supports_fast_mode = bool(getattr(model_info, "supports_fast_mode", False))
+            except Exception:
+                logger.debug(
+                    "Failed to resolve fast-mode capability",
+                    extra={"extra_data": {"session_id": session_id, "model": current_model}},
+                    exc_info=True,
+                )
+
+        current = self._session_cache.get_fast_mode_override(session_id)
+        if not arg:
+            state = "default" if current is None else ("on" if current else "off")
+            support = "supported" if supports_fast_mode else "not supported"
+            return CommandResult(
+                type="system_message",
+                text=(
+                    f"Fast mode: {state} ({support} for {current_model or 'the current model'}).\n"
+                    "Usage: /fast <on|off|default>"
+                ),
+            )
+
+        normalized = arg.strip().lower()
+        if normalized in {"default", "reset"}:
+            self._session_cache.set_fast_mode_override(session_id, None)
+            return CommandResult(
+                type="system_message",
+                text="Fast mode reset to the agent/profile default.",
+            )
+        if normalized not in {"on", "off"}:
+            return CommandResult(type="system_message", text="Usage: /fast <on|off|default>")
+        if normalized == "on" and not supports_fast_mode:
+            return CommandResult(
+                type="system_message",
+                text=f"Current model {current_model!r} does not support fast mode.",
+            )
+        self._session_cache.set_fast_mode_override(session_id, normalized == "on")
+        return CommandResult(
+            type="system_message",
+            text=f"Fast mode {'enabled' if normalized == 'on' else 'disabled'}.\nTakes effect on next message.",
+        )
+
     async def _handle_profile(
         self,
         conversation: ConversationModel,
@@ -2216,7 +2332,7 @@ class CommandDispatcher:
             type="system_message",
             text=(
                 f"Agent profile switched to: {resolved.profile_id}\n"
-                "Cleared /model and /thinking overrides. Takes effect on next message."
+                "Cleared /model, /thinking, and /fast overrides. Takes effect on next message."
             ),
             data=resolved.audit_metadata(),
         )
@@ -3066,7 +3182,8 @@ Available commands:
   /lsp               Show LSP diagnostics status
   /executor [id]     Show active executor + assigned pool, or switch active
   /model [name]      List available models or switch model
-  /thinking [level]  Show or set reasoning effort
+   /thinking [level]  Show or set reasoning effort
+   /fast [on|off]     Enable or disable fast model mode
   /profile [id]      List or switch this agent's runtime profile
   /skill [name|id]   List available skills or load one for this session
   /context           Show context window usage

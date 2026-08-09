@@ -6,7 +6,7 @@ import asyncio
 import base64
 from collections.abc import Awaitable, Callable
 from time import perf_counter
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import httpx
 
@@ -30,12 +30,19 @@ from cognis.models.session import (
 from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.circuit_breaker import CircuitBreaker
-from cognis.providers.retry import with_retry
+from cognis.providers.guardrails.events import (
+    EventAppendListener,
+    EventAppendNotification,
+    EventStoreAuthority,
+)
+from cognis.providers.retry import is_retryable_http_error, with_retry
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 
 logger = get_logger(__name__)
 
 T = TypeVar("T")
+MAX_EVENT_APPEND_LISTENERS = 16
+DEFAULT_EVENT_APPEND_LISTENER_TIMEOUT = 0.1
 
 
 def _coerce_attachment_b64(value: str) -> str:
@@ -56,8 +63,15 @@ class IntarisProvider:
     """
 
     def __init__(
-        self, base_url: str, auth_provider: Any, user_email: str = SYSTEM_USER_EMAIL
+        self,
+        base_url: str,
+        auth_provider: Any,
+        user_email: str = SYSTEM_USER_EMAIL,
+        *,
+        event_append_listener_timeout: float = DEFAULT_EVENT_APPEND_LISTENER_TIMEOUT,
     ) -> None:
+        if event_append_listener_timeout <= 0:
+            raise ValueError("event_append_listener_timeout must be positive")
         self.base_url = base_url.rstrip("/")
         self.auth_provider = auth_provider
         self.user_email = user_email
@@ -67,9 +81,87 @@ class IntarisProvider:
         self.eval_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self.reasoning_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self.session_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
-        self.events_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.events_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            should_trip=is_retryable_http_error,
+        )
         self.mcp_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self.search_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self._event_append_listeners: list[EventAppendListener] = []
+        self._event_append_listener_timeout = event_append_listener_timeout
+
+    def add_event_append_listener(self, listener: EventAppendListener) -> bool:
+        """Register one listener by identity within the fixed provider bound."""
+        if any(registered is listener for registered in self._event_append_listeners):
+            return False
+        if len(self._event_append_listeners) >= MAX_EVENT_APPEND_LISTENERS:
+            raise RuntimeError("maximum event append listener count reached")
+        self._event_append_listeners.append(listener)
+        return True
+
+    def remove_event_append_listener(self, listener: EventAppendListener) -> bool:
+        """Remove one listener by identity."""
+        for index, registered in enumerate(self._event_append_listeners):
+            if registered is listener:
+                del self._event_append_listeners[index]
+                return True
+        return False
+
+    @staticmethod
+    def _event_store_authority(
+        *,
+        user_email: str | None,
+        agent_id: str | None,
+        agent_owner_email: str | None,
+    ) -> EventStoreAuthority | None:
+        values = (
+            user_email if user_email is not None else current_user_email.get(),
+            agent_id if agent_id is not None else current_agent_id.get(),
+            (
+                agent_owner_email
+                if agent_owner_email is not None
+                else current_agent_owner_email.get()
+            ),
+        )
+        if not all(isinstance(value, str) and value.strip() for value in values):
+            return None
+        try:
+            complete_values = cast(tuple[str, str, str], values)
+            return EventStoreAuthority(*complete_values)
+        except ValueError:
+            return None
+
+    async def _notify_event_append(self, notification: EventAppendNotification) -> None:
+        listeners = tuple(self._event_append_listeners)
+        if not listeners:
+            return
+
+        async def _invoke(listener: EventAppendListener) -> str:
+            try:
+                await asyncio.wait_for(
+                    listener(notification),
+                    timeout=self._event_append_listener_timeout,
+                )
+            except TimeoutError:
+                return "timeout"
+            except Exception:
+                return "error"
+            return "ok"
+
+        statuses = await asyncio.gather(*(_invoke(listener) for listener in listeners))
+        failed = sum(status != "ok" for status in statuses)
+        if failed:
+            logger.warning(
+                "intaris: event append listener notification incomplete",
+                extra={
+                    "extra_data": {
+                        "listener_count": len(listeners),
+                        "failed_count": failed,
+                        "timeout_count": statuses.count("timeout"),
+                    }
+                },
+            )
 
     async def _call_with_retry(
         self,
@@ -141,6 +233,13 @@ class IntarisProvider:
             },
         )
 
+        async def _verify_existing_session() -> None:
+            response = await self.client.get(
+                f"/api/v1/session/{session_id}",
+                headers=self._headers(agent_id, user_id),
+            )
+            response.raise_for_status()
+
         async def _do() -> None:
             response = await self.client.post(
                 "/api/v1/intention",
@@ -153,6 +252,20 @@ class IntarisProvider:
                 },
                 headers=self._headers(agent_id, user_id),
             )
+            if response.status_code == 409:
+                # A retry may follow a timeout after Intaris durably created
+                # the requested session. Verify that exact session rather
+                # than turning an ambiguous create into workflow failure.
+                await self._call_with_retry(
+                    _verify_existing_session,
+                    max_retries=2,
+                    operation=f"intaris verify existing session({session_id})",
+                )
+                logger.info(
+                    "intaris: session already existed after create retry",
+                    extra={"extra_data": {"session_id": session_id, "agent_id": agent_id}},
+                )
+                return
             if not response.is_success:
                 logger.error(
                     "intaris: create_session failed",
@@ -447,16 +560,20 @@ class IntarisProvider:
         agent_id: str | None = None,
         agent_owner_email: str | None = None,
     ) -> EventAppendResult:
+        authority = self._event_store_authority(
+            user_email=user_email,
+            agent_id=agent_id,
+            agent_owner_email=agent_owner_email,
+        )
         headers = {
             **self._headers(
-                agent_id=agent_id or "system",
-                user_email=user_email or current_user_email.get(),
-                agent_owner_email=agent_owner_email,
+                agent_id=authority.agent_id if authority else (agent_id or "system"),
+                user_email=authority.user_email if authority else user_email,
+                agent_owner_email=(authority.agent_owner_email if authority else agent_owner_email),
             ),
             "X-Intaris-Source": source,
         }
-        if idempotency_key is not None:
-            headers["Idempotency-Key"] = idempotency_key
+        params = {"idempotency_key": idempotency_key} if idempotency_key is not None else None
         missing_session_delays = (0.05, 0.1, 0.25) if retry_missing_session else ()
         missing_session_attempt = 0
 
@@ -466,6 +583,7 @@ class IntarisProvider:
                 f"/api/v1/session/{session_id}/events",
                 json=[event.model_dump() for event in events],
                 headers=headers,
+                params=params,
                 timeout=30.0,
             )
             if response.status_code == 404:
@@ -476,7 +594,6 @@ class IntarisProvider:
                         "intaris: record_events 404 — session not found, retrying",
                         extra={
                             "extra_data": {
-                                "session_id": session_id,
                                 "event_count": len(events),
                                 "attempt": missing_session_attempt,
                                 "delay_seconds": delay,
@@ -487,7 +604,7 @@ class IntarisProvider:
                     return await _do()
                 logger.warning(
                     "intaris: record_events 404 — session not found",
-                    extra={"extra_data": {"session_id": session_id, "event_count": len(events)}},
+                    extra={"extra_data": {"event_count": len(events)}},
                 )
                 return EventAppendResult(ok=False, count=0, first_seq=0, last_seq=0)
             response.raise_for_status()
@@ -496,19 +613,50 @@ class IntarisProvider:
         result = await self._call_with_retry(
             _do,
             max_retries=3,
-            operation=f"intaris record_events({session_id})",
+            operation="intaris record_events",
             breaker=self.events_breaker,
         )
         logger.debug(
             "intaris: events recorded",
             extra={
                 "extra_data": {
-                    "session_id": session_id,
                     "count": result.count,
                     "last_seq": result.last_seq,
                 }
             },
         )
+        if result.ok and authority is not None:
+            try:
+                notification = EventAppendNotification(
+                    authority=authority,
+                    session_id=session_id,
+                    first_seq=result.first_seq,
+                    last_seq=result.last_seq,
+                    event_count=result.count,
+                    events=tuple(events) if len(events) == result.count else (),
+                )
+            except ValueError:
+                logger.warning(
+                    "intaris: event append notification skipped",
+                    extra={
+                        "extra_data": {
+                            "listener_count": len(self._event_append_listeners),
+                            "reason": "invalid_append_range",
+                        }
+                    },
+                )
+            else:
+                await self._notify_event_append(notification)
+        elif result.ok and self._event_append_listeners:
+            logger.warning(
+                "intaris: event append notification skipped",
+                extra={
+                    "extra_data": {
+                        "listener_count": len(self._event_append_listeners),
+                        "reason": "authority_unavailable",
+                    }
+                },
+            )
         return result
 
     async def read_events(
@@ -558,8 +706,14 @@ class IntarisProvider:
             )
             if response.status_code == 404:
                 if allow_missing_stream:
+                    session_response = await self.client.get(
+                        f"/api/v1/session/{session_id}",
+                        headers=self._headers(user_email=current_user_email.get()),
+                        timeout=15.0,
+                    )
+                    session_response.raise_for_status()
                     logger.debug(
-                        "intaris: read_events 404 — new session, returning empty",
+                        "intaris: read_events 404 — verified empty session stream",
                         extra={"extra_data": {"session_id": session_id}},
                     )
                     return EventReadResult(
@@ -593,8 +747,12 @@ class IntarisProvider:
         )
         return result
 
-    async def get_last_seq(self, session_id: str) -> int:
-        result = await self.read_events(session_id=session_id, last_n=1)
+    async def get_last_seq(self, session_id: str, *, allow_missing_stream: bool = False) -> int:
+        result = await self.read_events(
+            session_id=session_id,
+            last_n=1,
+            allow_missing_stream=allow_missing_stream,
+        )
         return result.last_seq
 
     async def call_mcp_tool(

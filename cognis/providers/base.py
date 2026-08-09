@@ -9,6 +9,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.config import (
     Cost,
     ImageGenerationResult,
+    ImageInput,
     ModelInfo,
     ProviderHealth,
     SpeechToTextResult,
@@ -38,6 +39,7 @@ from cognis.models.tool import (
     ToolCall,
     ToolResult,
 )
+from cognis.providers.guardrails.events import EventAppendListener
 
 ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 
@@ -119,6 +121,9 @@ class MemoryProvider(Protocol):
 
 
 class GuardrailsProvider(Protocol):
+    def add_event_append_listener(self, listener: EventAppendListener) -> bool: ...
+    def remove_event_append_listener(self, listener: EventAppendListener) -> bool: ...
+
     async def create_session(
         self,
         session_id: str,
@@ -180,7 +185,7 @@ class GuardrailsProvider(Protocol):
         seqs: list[int] | None = None,
         allow_missing_stream: bool = False,
     ) -> EventReadResult: ...
-    async def get_last_seq(self, session_id: str) -> int: ...
+    async def get_last_seq(self, session_id: str, *, allow_missing_stream: bool = False) -> int: ...
     async def call_mcp_tool(
         self,
         session_id: str,
@@ -348,7 +353,8 @@ class ImageGenerationProvider(Protocol):
         size: str | None = None,
         quality: str | None = None,
         response_format: str = "b64_json",
-        image: str | None = None,
+        images: list[ImageInput] | None = None,
+        mask: ImageInput | None = None,
         **kwargs: Any,
     ) -> ImageGenerationResult: ...
 
@@ -371,6 +377,8 @@ class AuthProvider(Protocol):
         *,
         token_version: int = 0,
     ) -> str: ...
+    def sign_controller_jwt(self, owner_id: str, ttl_seconds: int = 30) -> str: ...
+    def verify_controller_jwt(self, token: str) -> dict[str, Any]: ...
     def sign_exchange_token(self, subject: str, target: str) -> str: ...
     def verify_jwt(self, token: str, audience: list[str] | None = None) -> dict[str, Any]: ...
     def verify_executor_token(self, token: str) -> dict[str, Any]: ...

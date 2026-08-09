@@ -30,7 +30,7 @@ def upgrade() -> None:
         sa.Column("conversation_state", sa.String(), server_default="open", nullable=False),
         sa.Column("turn_state", sa.String(), server_default="idle", nullable=False),
         sa.Column("active_turn_id", sa.String(), nullable=True),
-        sa.Column("notify_on_completion", sa.Boolean(), server_default="0", nullable=False),
+        sa.Column("notify_on_completion", sa.Boolean(), server_default=sa.false(), nullable=False),
         sa.Column("last_result_summary", sa.Text(), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("control_metadata", sa.JSON(), nullable=True),

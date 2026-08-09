@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from cognis.providers.llm.codex import CODEX_RESPONSES_URL, CodexAuth
+from cognis.providers.llm.transport import strip_controller_transport_kwargs
 
 DEFAULT_CODEX_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0)
 DEFAULT_CODEX_STREAM_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
@@ -26,6 +27,7 @@ _TRANSPORT_KWARGS = {
 
 
 def _codex_payload(kwargs: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    kwargs = strip_controller_transport_kwargs(kwargs)
     model = kwargs.get("model")
     input_items = kwargs.get("input")
     stream = bool(kwargs.get("stream"))

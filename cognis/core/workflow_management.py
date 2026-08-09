@@ -263,6 +263,8 @@ async def create_user_workflow(
         "lifecycle": payload.get("lifecycle", "persistent"),
         "lineage": payload.get("lineage"),
     }
+    if payload.get("presentation") is not None:
+        definition["presentation"] = payload["presentation"]
     if definition["lifecycle"] == "ephemeral" and not allow_ephemeral:
         raise ValueError("Ephemeral lifecycle is reserved for composed workflows")
     definition = validate_workflow_definition(definition)
@@ -313,6 +315,8 @@ async def update_user_workflow(
         assert row is not None
         definition = dict(row.definition or {})
         definition.update({key: value for key, value in payload.items() if value is not None})
+        if "presentation" in payload and payload["presentation"] is None:
+            definition.pop("presentation", None)
         definition["workflow_id"] = workflow_id
         definition["is_system"] = False
         definition["owner_email"] = owner_email
@@ -396,7 +400,7 @@ async def duplicate_visible_workflow(
         raise ValueError("Workflow not found")
 
     new_workflow_id = f"wf_{uuid.uuid4().hex[:12]}"
-    definition = workflow.model_dump(mode="json")
+    definition = workflow.model_dump(mode="json", exclude_none=True)
     definition["workflow_id"] = new_workflow_id
     definition["name"] = f"{workflow.name} Copy"
     definition["is_system"] = False

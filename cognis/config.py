@@ -7,9 +7,14 @@ are in the bootstrap module.
 from __future__ import annotations
 
 import os
+import re
+import uuid
 from dataclasses import dataclass
-from ipaddress import ip_network
+from ipaddress import ip_address, ip_network
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from sqlalchemy.engine import make_url
 
 
 def _expand_path(path: str) -> Path:
@@ -23,6 +28,26 @@ def _bounded_float_env(name: str, default: float, *, minimum: float, maximum: fl
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}")
     return value
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name)
+    value = default if raw is None else int(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _trusted_proxy_cidrs(raw: str) -> tuple[str, ...]:
@@ -40,6 +65,12 @@ class CognisConfig:
     data_dir: Path
     host: str
     port: int
+    runtime_mode: str
+    schema_mode: str
+    controller_id: str
+    controller_internal_url: str
+    shutdown_drain_timeout_seconds: float
+    shutdown_cancel_timeout_seconds: float
 
     # Service URLs
     mnemory_url: str
@@ -140,6 +171,13 @@ class CognisConfig:
     # Test-only control-plane routes
     e2e_mode: bool = False
 
+    # Canonical Chat v2 event cache
+    event_cache_ttl_seconds: int = 60 * 60
+    event_cache_sliding_ttl: bool = True
+    event_cache_compression_enabled: bool = True
+    event_cache_compression_threshold_bytes: int = 64 * 1024
+    event_cache_max_value_bytes: int = 2 * 1024 * 1024
+
 
 def load_config() -> CognisConfig:
     """Load configuration from environment variables.
@@ -148,6 +186,16 @@ def load_config() -> CognisConfig:
     This function is pure — no side effects.
     """
     data_dir = _expand_path(os.environ.get("COGNIS_DATA_DIR", "~/.cognis"))
+    runtime_mode = os.environ.get("COGNIS_RUNTIME_MODE", "simple").strip().lower()
+    if runtime_mode not in {"simple", "ha"}:
+        raise ValueError("COGNIS_RUNTIME_MODE must be 'simple' or 'ha'")
+    schema_mode = (
+        os.environ.get("COGNIS_SCHEMA_MODE", "validate" if runtime_mode == "ha" else "auto")
+        .strip()
+        .lower()
+    )
+    if schema_mode not in {"auto", "validate"}:
+        raise ValueError("COGNIS_SCHEMA_MODE must be 'auto' or 'validate'")
 
     # Derive default database URL from data dir
     default_db_url = f"sqlite+aiosqlite:///{data_dir / 'cognis.db'}"
@@ -172,10 +220,23 @@ def load_config() -> CognisConfig:
     public_mnemory_ui_url = os.environ.get("PUBLIC_MNEMORY_UI_URL", mnemory_url).rstrip("/")
     public_intaris_ui_url = os.environ.get("PUBLIC_INTARIS_UI_URL", intaris_url).rstrip("/")
 
-    return CognisConfig(
+    config = CognisConfig(
         data_dir=data_dir,
         host=os.environ.get("COGNIS_HOST", "0.0.0.0"),
         port=int(os.environ.get("COGNIS_PORT", "8080")),
+        runtime_mode=runtime_mode,
+        schema_mode=schema_mode,
+        controller_id=os.environ.get("COGNIS_CONTROLLER_ID", "").strip()
+        or f"controller-{uuid.uuid4().hex}",
+        controller_internal_url=os.environ.get("COGNIS_CONTROLLER_INTERNAL_URL", "")
+        .strip()
+        .rstrip("/"),
+        shutdown_drain_timeout_seconds=_bounded_float_env(
+            "COGNIS_SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 30.0, minimum=0.0, maximum=300.0
+        ),
+        shutdown_cancel_timeout_seconds=_bounded_float_env(
+            "COGNIS_SHUTDOWN_CANCEL_TIMEOUT_SECONDS", 10.0, minimum=0.0, maximum=60.0
+        ),
         mnemory_url=mnemory_url,
         intaris_url=intaris_url,
         public_mnemory_ui_url=public_mnemory_ui_url,
@@ -287,6 +348,29 @@ def load_config() -> CognisConfig:
         ),
         vapid_subject=os.environ.get("COGNIS_VAPID_SUBJECT", "mailto:admin@localhost").strip(),
         redis_url=os.environ.get("COGNIS_REDIS_URL", ""),
+        event_cache_ttl_seconds=_bounded_int_env(
+            "COGNIS_EVENT_CACHE_TTL_SECONDS",
+            60 * 60,
+            minimum=1,
+            maximum=24 * 60 * 60,
+        ),
+        event_cache_sliding_ttl=_bool_env("COGNIS_EVENT_CACHE_SLIDING_TTL", True),
+        event_cache_compression_enabled=_bool_env(
+            "COGNIS_EVENT_CACHE_COMPRESSION_ENABLED",
+            True,
+        ),
+        event_cache_compression_threshold_bytes=_bounded_int_env(
+            "COGNIS_EVENT_CACHE_COMPRESSION_THRESHOLD_BYTES",
+            64 * 1024,
+            minimum=1,
+            maximum=16 * 1024 * 1024,
+        ),
+        event_cache_max_value_bytes=_bounded_int_env(
+            "COGNIS_EVENT_CACHE_MAX_VALUE_BYTES",
+            2 * 1024 * 1024,
+            minimum=1,
+            maximum=2 * 1024 * 1024,
+        ),
         tool_output_backend=os.environ.get("COGNIS_TOOL_OUTPUT_BACKEND", "filesystem"),
         tool_output_s3_endpoint=os.environ.get(
             "COGNIS_TOOL_OUTPUT_S3_ENDPOINT", "http://localhost:9000"
@@ -308,6 +392,80 @@ def load_config() -> CognisConfig:
             maximum=120.0,
         ),
     )
+    _validate_config(
+        config, controller_id_explicit=bool(os.environ.get("COGNIS_CONTROLLER_ID", "").strip())
+    )
+    return config
+
+
+def _validate_config(config: CognisConfig, *, controller_id_explicit: bool) -> None:
+    if config.controller_internal_url:
+        parsed = urlsplit(config.controller_internal_url)
+        try:
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(
+                "COGNIS_CONTROLLER_INTERNAL_URL must be an absolute HTTP(S) origin"
+            ) from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or hostname is None
+            or not _valid_origin_hostname(hostname)
+            or port == 0
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise ValueError("COGNIS_CONTROLLER_INTERNAL_URL must be an absolute HTTP(S) origin")
+    if config.runtime_mode != "ha":
+        return
+    errors: list[str] = []
+    database_driver = make_url(config.database_url).drivername
+    if database_driver != "postgresql+asyncpg":
+        errors.append("DATABASE_URL must use PostgreSQL with the asyncpg driver")
+    if config.schema_mode != "validate":
+        errors.append("COGNIS_SCHEMA_MODE must be 'validate'")
+    if config.artifact_backend != "s3":
+        errors.append("COGNIS_ARTIFACT_BACKEND must be 's3'")
+    if config.tool_output_backend != "s3":
+        errors.append("COGNIS_TOOL_OUTPUT_BACKEND must be 's3'")
+    if not config.require_external_crypto:
+        errors.append("COGNIS_REQUIRE_EXTERNAL_CRYPTO must be enabled")
+    if not config.artifact_signing_secret:
+        errors.append("COGNIS_ARTIFACT_SIGNING_SECRET must be set")
+    if not controller_id_explicit:
+        errors.append("COGNIS_CONTROLLER_ID must be set")
+    if not config.controller_internal_url:
+        errors.append("COGNIS_CONTROLLER_INTERNAL_URL must be set")
+    if errors:
+        raise ValueError("Invalid HA configuration: " + "; ".join(errors))
+
+
+def _valid_origin_hostname(hostname: str) -> bool:
+    if any(character.isspace() or ord(character) < 32 for character in hostname):
+        return False
+    try:
+        ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    if len(ascii_hostname) > 253:
+        return False
+    labels = ascii_hostname.rstrip(".").split(".")
+    return all(
+        label
+        and len(label) <= 63
+        and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is not None
+        for label in labels
+    )
 
 
 # Environment variable template for `cognis config init`
@@ -319,6 +477,12 @@ ENV_TEMPLATE = """\
 # COGNIS_DATA_DIR=~/.cognis
 # COGNIS_HOST=0.0.0.0
 # COGNIS_PORT=8080
+# COGNIS_RUNTIME_MODE=simple
+# COGNIS_SCHEMA_MODE=auto
+# COGNIS_CONTROLLER_ID=
+# COGNIS_CONTROLLER_INTERNAL_URL=
+# COGNIS_SHUTDOWN_DRAIN_TIMEOUT_SECONDS=30
+# COGNIS_SHUTDOWN_CANCEL_TIMEOUT_SECONDS=10
 
 # Service URLs
 # COGNIS_MNEMORY_URL=http://localhost:8050
@@ -392,6 +556,11 @@ ENV_TEMPLATE = """\
 
 # Redis (session cache L2 — empty = L1-only)
 # COGNIS_REDIS_URL=redis://localhost:6379/0
+# COGNIS_EVENT_CACHE_TTL_SECONDS=3600
+# COGNIS_EVENT_CACHE_SLIDING_TTL=true
+# COGNIS_EVENT_CACHE_COMPRESSION_ENABLED=true
+# COGNIS_EVENT_CACHE_COMPRESSION_THRESHOLD_BYTES=65536
+# COGNIS_EVENT_CACHE_MAX_VALUE_BYTES=2097152
 
 # Tool output storage
 # COGNIS_TOOL_OUTPUT_BACKEND=filesystem

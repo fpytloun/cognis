@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.models.artifact import ArtifactKind
 from cognis.store.models import ArtifactRecordRow
@@ -126,15 +128,61 @@ def strip_attachment_payload_bytes(
     return safe
 
 
-def _attachment_size_bytes(attachment: dict[str, Any], row: ArtifactRecordRow) -> int:
+@dataclass(frozen=True, slots=True)
+class _HydrationRecord:
+    artifact_id: str
+    namespace: str
+    object_id: str
+    filename: str
+    kind: str
+    mime_type: str
+    size_bytes: int
+    owner_email: str | None
+    conversation_id: str | None
+    session_id: str | None
+    status: str
+    deleted_at: datetime | None
+
+    @classmethod
+    def from_row(cls, row: ArtifactRecordRow) -> _HydrationRecord:
+        return cls(
+            artifact_id=row.artifact_id,
+            namespace=row.namespace,
+            object_id=row.object_id,
+            filename=row.filename,
+            kind=row.kind,
+            mime_type=row.mime_type,
+            size_bytes=int(row.size_bytes or 0),
+            owner_email=row.owner_email,
+            conversation_id=row.conversation_id,
+            session_id=row.session_id,
+            status=row.status,
+            deleted_at=row.deleted_at,
+        )
+
+
+def _attachment_size_bytes(
+    attachment: dict[str, Any], row: ArtifactRecordRow | _HydrationRecord
+) -> int:
     size = attachment.get("size_bytes")
     if isinstance(size, int):
         return size
     return int(row.size_bytes or 0)
 
 
+async def _load_hydration_records(
+    session_factory: async_sessionmaker[AsyncSession],
+    artifact_ids: list[str],
+) -> dict[str, _HydrationRecord]:
+    async with session_factory() as session:
+        result = await session.execute(
+            sa.select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
+        )
+        return {row.artifact_id: _HydrationRecord.from_row(row) for row in result.scalars().all()}
+
+
 async def hydrate_attachment_refs(
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     artifact_store: Any,
     attachments: Iterable[dict[str, Any] | Any],
     *,
@@ -147,10 +195,7 @@ async def hydrate_attachment_refs(
         return []
 
     artifact_ids = [item["artifact_id"] for item in normalized]
-    result = await session.execute(
-        sa.select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
-    )
-    rows = {row.artifact_id: row for row in result.scalars().all()}
+    rows = await _load_hydration_records(session_factory, artifact_ids)
 
     hydrated: list[dict[str, Any]] = []
     for attachment in normalized:
@@ -205,7 +250,7 @@ async def hydrate_attachment_refs(
 
 
 async def hydrate_attachment_ref_groups(
-    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
     artifact_store: Any,
     attachment_groups: Iterable[Iterable[dict[str, Any] | Any]],
     *,
@@ -227,10 +272,7 @@ async def hydrate_attachment_ref_groups(
     if not artifact_ids:
         return [[] for _group in normalized_groups]
 
-    result = await session.execute(
-        sa.select(ArtifactRecordRow).where(ArtifactRecordRow.artifact_id.in_(artifact_ids))
-    )
-    rows = {row.artifact_id: row for row in result.scalars().all()}
+    rows = await _load_hydration_records(session_factory, artifact_ids)
 
     hydrated_groups: list[list[dict[str, Any]]] = []
     public_urls: dict[str, str] = {}
@@ -304,7 +346,7 @@ def _legacy_attachment_fallback(attachment: dict[str, Any]) -> dict[str, Any] | 
 
 
 def _deleted_attachment_fallback(
-    attachment: dict[str, Any], row: ArtifactRecordRow
+    attachment: dict[str, Any], row: ArtifactRecordRow | _HydrationRecord
 ) -> dict[str, Any] | None:
     fallback = {
         "artifact_id": attachment["artifact_id"],

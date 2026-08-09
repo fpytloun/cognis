@@ -387,7 +387,12 @@ def prepare_tool_exposure(
     elif use_responses_api:
         # OpenAI Responses without discovery: show policy-visible + promoted.
         strategy = "openai_responses_visible_only"
-        visible_tools = _unique_tools(policy_visible_tools + promoted_visible)
+        visible_tools = _select_fallback_visible_tools(
+            policy_visible_tools=policy_visible_tools,
+            promoted_tools=promoted_visible,
+            available_slots=available_slots,
+            has_hidden=False,
+        )
         visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
@@ -407,7 +412,12 @@ def prepare_tool_exposure(
     else:
         # No discovery: show policy-visible + promoted only.
         strategy = "chat_visible_only"
-        visible_tools = _unique_tools(policy_visible_tools + promoted_visible)
+        visible_tools = _select_fallback_visible_tools(
+            policy_visible_tools=policy_visible_tools,
+            promoted_tools=promoted_visible,
+            available_slots=available_slots,
+            has_hidden=False,
+        )
         visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 

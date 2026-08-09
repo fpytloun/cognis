@@ -44,6 +44,9 @@ async def persist_agent_profile_switch(
     session.agent_profile_id = profile_id
     session_cache.set_model_override(session.session_id, None)
     session_cache.set_reasoning_effort_override(session.session_id, None)
+    set_fast_mode_override = getattr(session_cache, "set_fast_mode_override", None)
+    if callable(set_fast_mode_override):
+        set_fast_mode_override(session.session_id, None)
     update_tool_runtime_info = getattr(session_cache, "update_tool_runtime_info", None)
     if callable(update_tool_runtime_info):
         update_tool_runtime_info(session.session_id, None)

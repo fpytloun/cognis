@@ -38,6 +38,7 @@ from cognis.models.config import (
     Cost,
     GeneratedImage,
     ImageGenerationResult,
+    ImageInput,
     ModelInfo,
     ProviderHealth,
     SpeechToTextResult,
@@ -120,6 +121,7 @@ from cognis.providers.llm.codex import (  # type: ignore[import-not-found]
 )
 from cognis.providers.llm.codex_transport import DirectCodexTransport
 from cognis.providers.llm.errors import (
+    FastModeFallbackRequired,
     LLMStreamProviderError,
     OpenAIToolSearchFallbackRequired,
     build_mid_stream_error_chunk,
@@ -742,8 +744,10 @@ async def _observe_llm_stream_request(
     llm_api: str,
     location: str,
     request_diagnostics: dict[str, Any] | None = None,
+    telemetry: dict[str, Any] | None = None,
+    started_at: float | None = None,
 ) -> AsyncIterator[Callable[[dict[str, Any]], None]]:
-    started_at = monotonic()
+    request_started_at = started_at if started_at is not None else monotonic()
     first_token_after: float | None = None
     first_raw_chunk_after: float | None = None
     chunk_count = 0
@@ -771,7 +775,7 @@ async def _observe_llm_stream_request(
             elif provider_event_type == "response.failed":
                 response_failed_seen = True
         if first_raw_chunk_after is None:
-            first_raw_chunk_after = monotonic() - started_at
+            first_raw_chunk_after = monotonic() - request_started_at
             LLM_TIME_TO_FIRST_RAW_CHUNK.labels(
                 provider_id=provider_id,
                 model=model,
@@ -779,7 +783,7 @@ async def _observe_llm_stream_request(
                 location=location,
             ).observe(first_raw_chunk_after)
         if first_token_after is None and _chunk_has_visible_activity(chunk):
-            first_token_after = monotonic() - started_at
+            first_token_after = monotonic() - request_started_at
             LLM_TIME_TO_FIRST_TOKEN.labels(
                 provider_id=provider_id,
                 model=model,
@@ -817,7 +821,7 @@ async def _observe_llm_stream_request(
         error_type = type(exc).__name__
         raise
     finally:
-        duration = monotonic() - started_at
+        duration = monotonic() - request_started_at
         labels = {
             "provider_id": provider_id,
             "model": model,
@@ -917,6 +921,20 @@ async def _observe_llm_stream_request(
                 }
             },
         )
+        if telemetry is not None and status == "success":
+            telemetry["performance"] = {
+                "is_local": False,
+                "provider_id": provider_id,
+                "runtime": "Hosted API",
+                "location": location,
+                "model": model,
+                "prompt_tokens": token_values.get("input", 0),
+                "completion_tokens": output_tokens,
+                "generation_tokens_per_second": tokens_per_second,
+                "time_to_first_token_seconds": first_token_after,
+                "total_duration_seconds": duration,
+                "measured_at": datetime.now(UTC).isoformat(),
+            }
 
 
 def _observe_provider_phase(
@@ -1123,6 +1141,25 @@ def _is_prompt_cache_key_rejected(exc: BaseException) -> bool:
     if "unknown parameter" not in message and "unsupported parameter" not in message:
         return False
     return "prompt_cache_key" in message or "prompt_cache_retention" in message
+
+
+def _fast_mode_rejection_reason(exc: BaseException, request_kwargs: dict[str, Any]) -> str | None:
+    """Return a stable reason when a requested fast service tier is rejected."""
+
+    if "service_tier" not in request_kwargs:
+        return None
+    status_code = getattr(exc, "status_code", None)
+    if not isinstance(status_code, int) or status_code < 400 or status_code >= 500:
+        return None
+    message = str(exc).lower()
+    if "service_tier" in message or "service tier" in message:
+        return "service_tier_rejected"
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error") if isinstance(body.get("error"), dict) else body
+        if str(error.get("param") or "").lower() == "service_tier":
+            return "service_tier_rejected"
+    return None
 
 
 def _anthropic_defer_loading_rejection_reason(
@@ -1872,6 +1909,10 @@ def _apply_responses_request_defaults(
     # store=false, but the direct transport bypasses that transform.
     if _uses_direct_codex_transport(provider):
         result["store"] = False
+        # The ChatGPT Codex Responses endpoint rejects max_output_tokens even
+        # though the public OpenAI Responses API accepts it. Keep caller output
+        # limits for other transports, but omit this unsupported field here.
+        result.pop("max_output_tokens", None)
         if not isinstance(result.get("instructions"), str) or not result["instructions"].strip():
             if isinstance(instructions, str) and instructions.strip():
                 result["instructions"] = instructions
@@ -2157,6 +2198,7 @@ class LiteLLMProvider:
         self._prompt_cache_key_broken_keys: CapabilityMarkers = _CapabilityMarkers()
         self._reasoning_summary_broken_keys: CapabilityMarkers = _CapabilityMarkers()
         self._anthropic_defer_loading_broken_keys: CapabilityMarkers = _CapabilityMarkers()
+        self._fast_mode_broken_keys: CapabilityMarkers = _CapabilityMarkers()
 
     @staticmethod
     def _tokenizer_family(model: str) -> str:
@@ -4429,6 +4471,41 @@ class LiteLLMProvider:
                 if key[0] != provider_id
             }
         )
+        self._fast_mode_broken_keys = _CapabilityMarkers(
+            {
+                key: value
+                for key, value in self._fast_mode_broken_keys.items()
+                if key[0] != provider_id
+            }
+        )
+
+    def _mark_fast_mode_broken(
+        self,
+        provider: LLMProviderRow | None,
+        resolved_model: str,
+        *,
+        reason: str,
+    ) -> None:
+        if provider is None:
+            return
+        key = (provider.provider_id, resolved_model)
+        newly_marked = self._mark_capability_broken(
+            self._fast_mode_broken_keys,
+            key,
+            marker_name="fast_mode",
+            provider=provider,
+        )
+        if newly_marked:
+            logger.warning(
+                "Fast model tier rejected by backend; using standard tier until capability cache expires",
+                extra={
+                    "extra_data": {
+                        "provider_id": provider.provider_id,
+                        "model": resolved_model,
+                        "reason": reason,
+                    }
+                },
+            )
 
     def _mark_prompt_cache_key_broken(
         self,
@@ -4833,6 +4910,7 @@ class LiteLLMProvider:
         model_info: ModelInfo,
     ) -> dict[str, Any]:
         request_kwargs = dict(request_kwargs)
+        fast_mode = bool(request_kwargs.pop("fast_mode", False))
         request_kwargs.pop("max_retries", None)
         request_kwargs.pop("num_retries", None)
         if model_info.openai_apply_patch_tool_type:
@@ -4841,6 +4919,19 @@ class LiteLLMProvider:
                 model_info.openai_apply_patch_tool_type,
             )
         provider_preset = str(dict(provider.config).get("preset", "")).lower() if provider else ""
+        if (
+            fast_mode
+            and provider is not None
+            and model_info.supports_fast_mode
+            and model_info.fast_mode_tier
+            and not self._capability_is_broken(
+                self._fast_mode_broken_keys,
+                (provider.provider_id, model_id),
+                marker_name="fast_mode",
+                provider=provider,
+            )
+        ):
+            request_kwargs["service_tier"] = model_info.fast_mode_tier
         if provider_preset == "ollama" and "num_ctx" not in request_kwargs:
             num_ctx = _coerce_positive_int(model_info.runtime_metadata.get("num_ctx"))
             max_num_ctx = _coerce_positive_int(model_info.max_context_window)
@@ -5143,7 +5234,25 @@ class LiteLLMProvider:
                     **responses_kwargs,
                 )
             except Exception as exc:
-                if reasoning_summary_rejected(classify_llm_exception(exc)):
+                fast_mode_reason = _fast_mode_rejection_reason(exc, responses_kwargs)
+                if fast_mode_reason is not None:
+                    self._mark_fast_mode_broken(
+                        provider,
+                        resolved_model,
+                        reason=fast_mode_reason,
+                    )
+                    fallback_kwargs = dict(responses_kwargs)
+                    fallback_kwargs.pop("service_tier", None)
+                    response = await _call_responses_generate(
+                        transport,
+                        model=transport_model,
+                        input=responses_input,
+                        stream=use_streaming_generate,
+                        max_retries=retry_count_int,
+                        operation=f"generate.responses.standard_tier({prefixed_model})",
+                        **fallback_kwargs,
+                    )
+                elif reasoning_summary_rejected(classify_llm_exception(exc)):
                     self._mark_reasoning_summary_broken(
                         provider, resolved_model, reason="backend_rejected"
                     )
@@ -5590,6 +5699,7 @@ class LiteLLMProvider:
                 executor_route_kwargs["model_info"] = model_info
             if acting_user_email is not None:
                 executor_route_kwargs["acting_user_email"] = acting_user_email
+            telemetry: dict[str, Any] = {}
             async with _observe_llm_stream_request(
                 llm_request_id=llm_request_id,
                 provider_id=provider_id,
@@ -5597,6 +5707,7 @@ class LiteLLMProvider:
                 llm_api=llm_api_label,
                 location="executor",
                 request_diagnostics=request_diagnostics,
+                telemetry=telemetry,
             ) as observe_chunk:
                 async for chunk in self._executor_stream_generate(
                     (resolved_model if is_anthropic_native_provider(provider) else prefixed_model),
@@ -5609,7 +5720,7 @@ class LiteLLMProvider:
                         local_performance.observe_chunk(chunk)
                     observe_chunk(chunk)
                     yield chunk
-            performance_payload = local_performance_payload()
+            performance_payload = local_performance_payload() or telemetry.get("performance")
             if performance_payload is not None:
                 yield {"choices": [], "performance": performance_payload}
             return
@@ -5627,6 +5738,7 @@ class LiteLLMProvider:
             },
         )
         if not use_responses_api and is_anthropic_native_provider(provider):
+            telemetry = {}
             async with _observe_llm_stream_request(
                 llm_request_id=llm_request_id,
                 provider_id=provider.provider_id,
@@ -5634,6 +5746,7 @@ class LiteLLMProvider:
                 llm_api="chat_completions",
                 location="controller",
                 request_diagnostics=request_diagnostics,
+                telemetry=telemetry,
             ) as observe_chunk:
                 try:
                     async for chunk in self._native_anthropic_stream(
@@ -5656,6 +5769,9 @@ class LiteLLMProvider:
                     error_chunk = build_mid_stream_error_chunk(exc)
                     observe_chunk(error_chunk)
                     yield error_chunk
+            performance_payload = telemetry.get("performance")
+            if isinstance(performance_payload, dict):
+                yield {"choices": [], "performance": performance_payload}
             return
         if use_responses_api:
             oauth_context = (
@@ -5775,7 +5891,8 @@ class LiteLLMProvider:
                     resolved_model if _uses_direct_codex_transport(provider) else prefixed_model
                 )
                 try:
-                    api_call_started_at = monotonic()
+                    stream_request_started_at = monotonic()
+                    api_call_started_at = stream_request_started_at
                     stream = await with_llm_retry(
                         transport.responses,
                         model=transport_model,
@@ -5795,6 +5912,18 @@ class LiteLLMProvider:
                         duration=monotonic() - api_call_started_at,
                     )
                 except Exception as exc:
+                    fast_mode_reason = _fast_mode_rejection_reason(exc, responses_kwargs)
+                    if fast_mode_reason is not None:
+                        self._mark_fast_mode_broken(
+                            provider,
+                            resolved_model,
+                            reason=fast_mode_reason,
+                        )
+                        raise FastModeFallbackRequired(
+                            provider_id=provider.provider_id if provider is not None else "unknown",
+                            model_id=resolved_model,
+                            reason=fast_mode_reason,
+                        ) from exc
                     if reasoning_summary_rejected(classify_llm_exception(exc)):
                         self._mark_reasoning_summary_broken(
                             provider, resolved_model, reason="backend_rejected"
@@ -5903,6 +6032,7 @@ class LiteLLMProvider:
                             ) from exc
                         raise
 
+                telemetry = {}
                 async with _observe_llm_stream_request(
                     llm_request_id=llm_request_id,
                     provider_id=provider.provider_id if provider is not None else "default",
@@ -5910,6 +6040,8 @@ class LiteLLMProvider:
                     llm_api="responses",
                     location="controller",
                     request_diagnostics=request_diagnostics,
+                    telemetry=telemetry,
+                    started_at=stream_request_started_at,
                 ) as observe_chunk:
                     first_normalized_chunk_at: float | None = None
                     try:
@@ -6015,13 +6147,17 @@ class LiteLLMProvider:
                         error_chunk = build_mid_stream_error_chunk(exc)
                         observe_chunk(error_chunk)
                         yield error_chunk
+                performance_payload = telemetry.get("performance")
+                if isinstance(performance_payload, dict):
+                    yield {"choices": [], "performance": performance_payload}
             return
         # Retry pre-stream errors (connection refused, rate limit, etc.)
         # with exponential backoff.  Once the stream is established,
         # mid-stream failures are caught and yielded as error markers.
         async with self._provider_oauth_token_context(provider):
             try:
-                api_call_started_at = monotonic()
+                stream_request_started_at = monotonic()
+                api_call_started_at = stream_request_started_at
                 stream = await with_llm_retry(
                     self._litellm_transport.completion,
                     model=prefixed_model,
@@ -6057,6 +6193,7 @@ class LiteLLMProvider:
                         reason=anthropic_defer_reason,
                     )
                 raise
+            telemetry = {}
             async with _observe_llm_stream_request(
                 llm_request_id=llm_request_id,
                 provider_id=provider.provider_id if provider is not None else "default",
@@ -6064,6 +6201,8 @@ class LiteLLMProvider:
                 llm_api="chat_completions",
                 location="controller",
                 request_diagnostics=request_diagnostics,
+                telemetry=telemetry,
+                started_at=stream_request_started_at,
             ) as observe_chunk:
                 first_normalized_chunk_at: float | None = None
                 try:
@@ -6109,7 +6248,7 @@ class LiteLLMProvider:
                     error_chunk = build_mid_stream_error_chunk(exc)
                     observe_chunk(error_chunk)
                     yield error_chunk
-            performance_payload = local_performance_payload()
+            performance_payload = local_performance_payload() or telemetry.get("performance")
             if performance_payload is not None:
                 yield {"choices": [], "performance": performance_payload}
 
@@ -7213,7 +7352,8 @@ class LiteLLMProvider:
         size: str | None = None,
         quality: str | None = None,
         response_format: str = "b64_json",
-        image: str | None = None,
+        images: list[ImageInput] | None = None,
+        mask: ImageInput | None = None,
         **kwargs: Any,
     ) -> ImageGenerationResult:
         """Generate or edit an image using the configured LLM provider.
@@ -7250,7 +7390,8 @@ class LiteLLMProvider:
                 size=size,
                 quality=quality,
                 response_format=response_format,
-                image=image,
+                images=images,
+                mask=mask,
                 request_kwargs=request_kwargs,
                 **kwargs,
             )
@@ -7273,7 +7414,8 @@ class LiteLLMProvider:
                 request_kwargs,
                 n=n,
                 size=size,
-                image=image,
+                images=images,
+                mask=mask,
                 **kwargs,
             )
         else:
@@ -7285,7 +7427,8 @@ class LiteLLMProvider:
                 size=size,
                 quality=quality,
                 response_format=response_format,
-                image=image,
+                images=images,
+                mask=mask,
                 **kwargs,
             )
         if not result.images:
@@ -7304,7 +7447,8 @@ class LiteLLMProvider:
         size: str | None = None,
         quality: str | None = None,
         response_format: str = "b64_json",
-        image: str | None = None,
+        images: list[ImageInput] | None = None,
+        mask: ImageInput | None = None,
         **kwargs: Any,
     ) -> ImageGenerationResult:
         """Generate image using litellm.aimage_generation (OpenAI path)."""
@@ -7316,58 +7460,26 @@ class LiteLLMProvider:
         if request_kwargs.get("api_base"):
             gen_kwargs["api_base"] = request_kwargs["api_base"]
 
-        if image is not None:
-            # Edit mode — pass the source image when the backend supports it.
-            try:
-                image_kwargs: dict[str, Any] = {}
-                if _supports_image_response_format(model):
-                    image_kwargs["response_format"] = response_format
-                response = await with_llm_retry(
-                    litellm.aimage_generation,
-                    prompt=prompt,
-                    model=model,
-                    n=n,
-                    size=size,
-                    quality=quality,
-                    image=image,
-                    operation=f"image_edit({model})",
-                    **image_kwargs,
-                    **gen_kwargs,
-                    **kwargs,
-                )
-            except Exception:
-                # Fall back to regular generation if edit not supported
-                image_kwargs = {}
-                if _supports_image_response_format(model):
-                    image_kwargs["response_format"] = response_format
-                response = await with_llm_retry(
-                    litellm.aimage_generation,
-                    prompt=prompt,
-                    model=model,
-                    n=n,
-                    size=size,
-                    quality=quality,
-                    operation=f"image_generate({model})",
-                    **image_kwargs,
-                    **gen_kwargs,
-                    **kwargs,
-                )
-        else:
-            image_kwargs = {}
-            if _supports_image_response_format(model):
-                image_kwargs["response_format"] = response_format
-            response = await with_llm_retry(
-                litellm.aimage_generation,
-                prompt=prompt,
-                model=model,
-                n=n,
-                size=size,
-                quality=quality,
-                operation=f"image_generate({model})",
-                **image_kwargs,
-                **gen_kwargs,
-                **kwargs,
-            )
+        image_kwargs: dict[str, Any] = {}
+        if _supports_image_response_format(model):
+            image_kwargs["response_format"] = response_format
+        if images is not None:
+            image_kwargs["image"] = [image.b64_json for image in images]
+        if mask is not None:
+            image_kwargs["mask"] = mask.b64_json
+        operation = "image_edit" if images is not None else "image_generate"
+        response = await with_llm_retry(
+            litellm.aimage_generation,
+            prompt=prompt,
+            model=model,
+            n=n,
+            size=size,
+            quality=quality,
+            operation=f"{operation}({model})",
+            **image_kwargs,
+            **gen_kwargs,
+            **kwargs,
+        )
 
         return self._normalize_image_response(response, model)
 
@@ -7379,7 +7491,8 @@ class LiteLLMProvider:
         *,
         n: int = 1,
         size: str | None = None,
-        image: str | None = None,
+        images: list[ImageInput] | None = None,
+        mask: ImageInput | None = None,
         **kwargs: Any,
     ) -> ImageGenerationResult:
         """Generate image using litellm.acompletion with modalities (Gemini path)."""
@@ -7387,14 +7500,21 @@ class LiteLLMProvider:
 
         # Build messages
         content: list[dict[str, Any]] | str
-        if image is not None:
-            # Edit mode — include image in messages
+        if images is not None:
             content = [
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                *[
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{image.content_type};base64,{image.b64_json}"},
+                    }
+                    for image in images
+                ],
                 {"type": "text", "text": prompt},
             ]
         else:
             content = prompt
+        if mask is not None:
+            raise ValueError("Masked image editing is not supported by Gemini image generation.")
 
         messages = [{"role": "user", "content": content}]
 
@@ -7529,7 +7649,8 @@ class LiteLLMProvider:
         size: str | None = None,
         quality: str | None = None,
         response_format: str = "b64_json",
-        image: str | None = None,
+        images: list[ImageInput] | None = None,
+        mask: ImageInput | None = None,
         request_kwargs: dict[str, Any],
         **kwargs: Any,
     ) -> ImageGenerationResult:
@@ -7549,7 +7670,8 @@ class LiteLLMProvider:
             size=size,
             quality=quality,
             response_format=response_format,
-            image=image,
+            images=[image.model_dump() for image in images] if images is not None else None,
+            mask=mask.model_dump() if mask is not None else None,
             request_kwargs=request_kwargs,
         )
         return cast(ImageGenerationResult, result)

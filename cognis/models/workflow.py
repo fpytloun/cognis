@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 from cognis.models.config import NORMALIZED_REASONING_LEVELS, normalize_reasoning_level
 from cognis.models.tool import ToolCapability
@@ -216,10 +218,14 @@ class StepInputConfig(BaseModel):
     ``source`` names the step(s) whose output is referenced.  For ``"full"``
     only a single source is allowed.  ``None`` means the engine will default
     to the previous step (for ``"last"``) or no source (for ``"null"``).
+
+    ``reuse_session_from`` names one included source step whose conversation
+    and session continue into the target step.
     """
 
     type: Literal["null", "full", "summary", "last"] = "last"
     source: str | list[str] | None = None
+    reuse_session_from: str | None = None
 
     @field_validator("source")
     @classmethod
@@ -240,6 +246,22 @@ class StepInputConfig(BaseModel):
             if "all" in normalized and len(normalized) > 1:
                 raise ValueError("StepInputConfig source='all' must be used alone")
         return value
+
+    @field_validator("reuse_session_from")
+    @classmethod
+    def _validate_reuse_session_from(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("StepInputConfig reuse_session_from must not be empty")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_reuse_input_type(self) -> StepInputConfig:
+        if self.reuse_session_from is not None and self.type == "null":
+            raise ValueError("StepInputConfig type='null' cannot reuse a prior session")
+        return self
 
     def source_names(self) -> list[str]:
         """Return the source step name(s) as a normalised list."""
@@ -303,13 +325,115 @@ class StepCompletionContract(BaseModel):
     fields: list[StepCompletionMetadataField] = Field(default_factory=list)
 
 
+class DeterministicOutputConfig(BaseModel):
+    """Rendered output emitted by a deterministic step or skip."""
+
+    model_config = {"extra": "forbid"}
+
+    summary: str
+    content: str | None = None
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolCallStepConfig(BaseModel):
+    """Definition for one controller-owned tool invocation."""
+
+    model_config = {"extra": "forbid"}
+
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    summary: str | None = None
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    fail_on_error: bool = True
+    timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+    allow_side_effects: bool = False
+    redact_args: list[str] = Field(default_factory=list)
+
+    @field_validator("tool")
+    @classmethod
+    def _validate_tool(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tool_call.tool must not be empty")
+        return value
+
+
+class ConditionStepConfig(BaseModel):
+    """Boolean expression and optional named branches."""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    if_: str = Field(alias="if")
+    then: str | None = None
+    else_: str | None = Field(default=None, alias="else")
+    output: DeterministicOutputConfig | None = None
+    revision_source: str | None = None
+    max_loop_iterations: int | None = Field(default=None, ge=1, le=100)
+    on_exhausted: Literal["continue", "fail", "gate"] = "gate"
+
+    @field_validator("if_")
+    @classmethod
+    def _validate_expression(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("condition.if must not be empty")
+        return value
+
+    @model_serializer
+    def _serialize(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"if": self.if_}
+        if self.then is not None:
+            payload["then"] = self.then
+        if self.else_ is not None:
+            payload["else"] = self.else_
+        if self.output is not None:
+            payload["output"] = self.output.model_dump(mode="json", exclude_none=True)
+        if self.revision_source is not None:
+            payload["revision_source"] = self.revision_source
+        if self.max_loop_iterations is not None:
+            payload["max_loop_iterations"] = self.max_loop_iterations
+            payload["on_exhausted"] = self.on_exhausted
+        return payload
+
+
+class CompleteStepConfig(BaseModel):
+    """Terminal deterministic workflow result."""
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["completed", "failed"] = "completed"
+    summary: str
+    content: str | None = None
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    notification: StepCompletionNotification | None = None
+    delivery_mode_override: (
+        Literal[
+            "same_conversation",
+            "preferred_channel",
+            "latest_active_for_agent",
+            "specific_conversation",
+            "silent",
+        ]
+        | None
+    ) = None
+
+    @field_validator("summary")
+    @classmethod
+    def _validate_summary(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("complete.summary must not be empty")
+        return value
+
+
 class StepDefinition(BaseModel):
     """A single step within a workflow."""
 
     name: str
-    type: Literal["run", "gate"]
+    type: Literal["run", "gate", "tool_call", "condition", "complete"]
     description: str = ""
     prompt: str = ""
+    objective: str | None = None
+    responsibilities: list[str] = Field(default_factory=list)
+    defer_to: list[str] = Field(default_factory=list)
     agent_override: str | None = None  # Secondary agent ID for this step
     agent_profile_id: str | None = None
     reasoning_effort: str | None = None
@@ -325,6 +449,112 @@ class StepDefinition(BaseModel):
     require_deliverable: bool = True
     revision: StepRevisionConfig = Field(default_factory=StepRevisionConfig)
     metadata_contract: StepCompletionContract | None = None
+    when: str | None = None
+    on_skip: DeterministicOutputConfig | None = None
+    on_error: Literal["fail", "continue", "skip", "gate"] | None = None
+    next: str | None = None
+    tool_call: ToolCallStepConfig | None = None
+    condition: ConditionStepConfig | None = None
+    complete: CompleteStepConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_step_type_contract(self) -> StepDefinition:
+        configs = {
+            "gate": self.gate,
+            "tool_call": self.tool_call,
+            "condition": self.condition,
+            "complete": self.complete,
+        }
+        required = configs.get(self.type)
+        if self.type in {"tool_call", "condition", "complete"} and required is None:
+            raise ValueError(f"{self.type} step {self.name!r} requires {self.type} configuration")
+        mixed = [
+            name for name, config in configs.items() if config is not None and name != self.type
+        ]
+        if mixed:
+            raise ValueError(
+                f"{self.type} step {self.name!r} has incompatible configuration: {mixed}"
+            )
+
+        deterministic = self.type in {"tool_call", "condition", "complete"}
+        if not deterministic and any(
+            value is not None for value in (self.when, self.on_skip, self.on_error, self.next)
+        ):
+            raise ValueError(
+                f"{self.type} step {self.name!r} cannot use deterministic control fields"
+            )
+        if deterministic and any(
+            value is not None
+            for value in (
+                self.agent_override,
+                self.agent_profile_id,
+                self.reasoning_effort,
+                self.input,
+                self.completion,
+                self.on_reject,
+                self.metadata_contract,
+            )
+        ):
+            raise ValueError(
+                f"deterministic step {self.name!r} cannot use agent/input/completion/review fields"
+            )
+        if deterministic and (self.outcome_routes or self.allow_questions):
+            raise ValueError(
+                f"deterministic step {self.name!r} cannot use outcome routing or questions"
+            )
+        incompatible_values = []
+        if self.prompt:
+            incompatible_values.append("prompt")
+        if self.objective is not None:
+            incompatible_values.append("objective")
+        if self.responsibilities:
+            incompatible_values.append("responsibilities")
+        if self.defer_to:
+            incompatible_values.append("defer_to")
+        if self.step_profile_id is not None:
+            incompatible_values.append("step_profile_id")
+        if self.step_profile_mode != StepProfileMode.SOFT:
+            incompatible_values.append("step_profile_mode")
+        if self.step_profile is not None:
+            incompatible_values.append("step_profile")
+        if self.revision != StepRevisionConfig():
+            incompatible_values.append("revision")
+        if not self.require_deliverable:
+            incompatible_values.append("require_deliverable")
+        if deterministic and incompatible_values:
+            raise ValueError(
+                f"deterministic step {self.name!r} has incompatible fields: "
+                f"{sorted(incompatible_values)}"
+            )
+        if self.type == "complete" and self.next is not None:
+            raise ValueError(f"complete step {self.name!r} cannot define next")
+        if self.type == "condition" and self.next is not None:
+            raise ValueError(
+                f"condition step {self.name!r} uses condition.then/else instead of next"
+            )
+        if self.when is not None and not self.when.strip():
+            raise ValueError("when must not be empty")
+        return self
+
+    @field_validator("objective")
+    @classmethod
+    def _validate_objective(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("objective must not be empty")
+        return normalized
+
+    @field_validator("responsibilities", "defer_to")
+    @classmethod
+    def _validate_non_empty_unique_items(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("items must not be empty")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("items must not contain duplicates")
+        return normalized
 
     @field_validator("reasoning_effort")
     @classmethod
@@ -374,6 +604,49 @@ class StepDefinition(BaseModel):
         return value
 
 
+class WorkflowPhaseDefinition(BaseModel):
+    """Presentation-only grouping over a contiguous range of workflow steps."""
+
+    id: str
+    title: str
+    description: str = ""
+    step_names: list[str]
+
+    @field_validator("id", "title")
+    @classmethod
+    def _validate_non_empty_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("step_names")
+    @classmethod
+    def _validate_non_empty_steps(cls, value: list[str]) -> list[str]:
+        if not value:
+            raise ValueError("phase must contain at least one step")
+        if len(value) != len(set(value)):
+            raise ValueError("phase step_names must not contain duplicates")
+        return value
+
+
+class WorkflowPresentation(BaseModel):
+    """Optional author-defined phase presentation for a workflow."""
+
+    phases: list[WorkflowPhaseDefinition]
+
+    @field_validator("phases")
+    @classmethod
+    def _validate_non_empty_phases(
+        cls, value: list[WorkflowPhaseDefinition]
+    ) -> list[WorkflowPhaseDefinition]:
+        if not value:
+            raise ValueError("presentation must contain at least one phase")
+        phase_ids = [phase.id for phase in value]
+        if len(phase_ids) != len(set(phase_ids)):
+            raise ValueError("phase ids must be unique")
+        return value
+
+
 class Workflow(BaseModel):
     """Portable, agent-agnostic process template."""
 
@@ -386,6 +659,7 @@ class Workflow(BaseModel):
     interaction: InteractionMode = InteractionMode()
     defaults: WorkflowDefaults = WorkflowDefaults()
     steps: list[StepDefinition]
+    presentation: WorkflowPresentation | None = None
     is_system: bool = False
     owner_email: str | None = None
     lifecycle: WorkflowLifecycle = WorkflowLifecycle.PERSISTENT
@@ -397,6 +671,46 @@ class Workflow(BaseModel):
     has_overrides: bool = Field(default=False, exclude=True)
     disabled: bool = Field(default=False, exclude=True)
     override_warnings: list[str] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="after")
+    def _validate_presentation(self) -> Workflow:
+        if self.presentation is None:
+            return self
+
+        canonical_names = [step.name for step in self.steps]
+        phase_names = [
+            step_name for phase in self.presentation.phases for step_name in phase.step_names
+        ]
+        unknown = [name for name in phase_names if name not in canonical_names]
+        if unknown:
+            raise ValueError(f"presentation references unknown steps: {unknown}")
+        if len(phase_names) != len(set(phase_names)):
+            raise ValueError("each workflow step must belong to exactly one phase")
+        missing = [name for name in canonical_names if name not in phase_names]
+        if missing:
+            raise ValueError(f"presentation is missing workflow steps: {missing}")
+        if phase_names != canonical_names:
+            raise ValueError(
+                "phase step_names and phase order must preserve canonical workflow step order"
+            )
+        return self
+
+
+def canonical_workflow_digest(workflow: Workflow | dict[str, Any]) -> str:
+    """Return the SHA-256 digest of a canonical effective workflow definition."""
+
+    definition = (
+        workflow.model_dump(mode="json", exclude_none=True)
+        if isinstance(workflow, Workflow)
+        else workflow
+    )
+    canonical = json.dumps(
+        definition,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class StepOutput(BaseModel):
@@ -446,8 +760,14 @@ class WorkflowState(BaseModel):
     version: int = 0  # Optimistic concurrency — incremented on each persist
     status: Literal["running", "paused", "completed", "failed", "cancelled"] = "running"
     skipped_steps: list[str] = Field(default_factory=list)  # Steps skipped due to exhaustion
+    routing_skips: dict[str, str] = Field(default_factory=dict)
+    effective_workflow_version: int | None = None
+    effective_workflow_digest: str | None = None
+    effective_workflow_definition: dict[str, Any] | None = None
     last_evaluation_feedback: str | None = None  # Feedback from evaluator for retries
-    last_retry_reason: Literal["execution_failed", "evaluation_rejected"] | None = None
+    last_retry_reason: (
+        Literal["execution_failed", "evaluation_rejected", "routed_revision"] | None
+    ) = None
     last_revision_context: str | None = None  # Full reviewer output for backward revisions
     last_operator_instruction: str | None = None  # One-shot human instruction for next step
     pending_pause_type: (
@@ -461,7 +781,7 @@ class WorkflowState(BaseModel):
     def _normalize_last_retry_reason(cls, value: Any) -> str | None:
         """Ignore stale persisted retry reasons from older controller versions."""
 
-        if value in {"execution_failed", "evaluation_rejected"}:
+        if value in {"execution_failed", "evaluation_rejected", "routed_revision"}:
             return str(value)
         return None
 
@@ -478,6 +798,18 @@ class WorkflowState(BaseModel):
         if not session_id:
             raise ValueError(f"Source step {step_name!r} output missing intaris_session_id")
         return str(session_id)
+
+
+def pin_effective_workflow(state: WorkflowState, workflow: Workflow) -> WorkflowState:
+    """Pin an effective definition once and return the mutated runtime state."""
+
+    if state.effective_workflow_definition is not None:
+        return state
+    definition = workflow.model_dump(mode="json", exclude_none=True)
+    state.effective_workflow_version = workflow.version
+    state.effective_workflow_digest = canonical_workflow_digest(definition)
+    state.effective_workflow_definition = definition
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +868,11 @@ def resolve_effective_input(
         prev_name = _find_previous_run_step(step_index, workflow_steps)
         if prev_name is None:
             return StepInputConfig(type="null")
-        return StepInputConfig(type=config.type, source=prev_name)
+        return StepInputConfig(
+            type=config.type,
+            source=prev_name,
+            reuse_session_from=config.reuse_session_from,
+        )
 
     return config
 

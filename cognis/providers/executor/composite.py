@@ -169,7 +169,7 @@ class CompositeExecutorProvider:
                 continue
             if row.executor_type not in {"websocket", "subprocess"}:
                 continue
-            handle = self._websocket._handles.get(row.executor_id)
+            handle = self._websocket.get_handle(row.executor_id)
             if handle is not None:
                 handle.executor_type = row.executor_type
                 remote_tasks.append(self._websocket.get_lsp_status(handle, source=row.config or {}))

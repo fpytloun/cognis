@@ -52,6 +52,16 @@ def normalize_chat_mode(value: object, *, default: ChatMode = "default") -> Chat
     return default
 
 
+def optional_chat_mode(value: object) -> ChatMode | None:
+    """Return a supported chat mode or ``None`` for absent/invalid durable data."""
+
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if candidate in CHAT_MODES:
+            return candidate  # type: ignore[return-value]
+    return None
+
+
 def parse_chat_mode_directive(content: str) -> ChatModeDirective | None:
     """Parse leading /plan, /build, or /default chat-mode directives."""
 

@@ -164,6 +164,20 @@ def _settings_with_defaults(meta: Any, settings: dict[str, Any] | None) -> dict[
     return resolved
 
 
+def _validate_group_context_settings(settings: Any) -> Any | None:
+    from cognis.channels.group_context import GroupContextSettingsError, group_context_policy
+
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, dict):
+        return error_response(400, "validation_error", "settings must be an object")
+    try:
+        group_context_policy(settings)
+    except GroupContextSettingsError as exc:
+        return error_response(400, "validation_error", str(exc))
+    return None
+
+
 async def _validate_default_conversation(
     request: Request,
     *,
@@ -333,6 +347,9 @@ async def create_account(request: Request) -> Any:
     meta = get_channel_meta(channel_type)
     if meta is None:
         return error_response(400, "validation_error", f"Unknown channel type: {channel_type}")
+    err = _validate_group_context_settings(body.get("settings"))
+    if err is not None:
+        return err
 
     agent_id = body.get("agent_id")
     if not agent_id:
@@ -475,6 +492,12 @@ async def update_account(request: Request, account_id: str) -> Any:
         existing_row = await _get_account(session, account_id)
     if existing_row is None or existing_row.user_email != user_email:
         return error_response(404, "not_found", "Channel account not found")
+    if "config" in body:
+        if not isinstance(body["config"], dict):
+            return error_response(400, "validation_error", "config must be an object")
+        err = _validate_group_context_settings({**(existing_row.config or {}), **body["config"]})
+        if err is not None:
+            return err
 
     agent_id = body.get("agent_id")
     effective_agent_id = agent_id or existing_row.agent_id
@@ -646,6 +669,13 @@ async def start_account(request: Request, account_id: str) -> Any:
         return error_response(503, "unavailable", "Channel manager not initialized")
 
     try:
+        from cognis.store.queries import update_channel_account
+
+        async with request.app.state.session_factory() as session:
+            row = await update_channel_account(session, account_id, enabled=True)
+            if row is None:
+                return error_response(404, "not_found", "Channel account not found")
+            await session.commit()
         await channel_manager.restart_account(account_id)
         status = await channel_manager.get_account_status(account_id)
         return {"status": status.model_dump() if status else "starting"}
@@ -665,8 +695,15 @@ async def stop_account(request: Request, account_id: str) -> Any:
     if channel_manager is None:
         return error_response(503, "unavailable", "Channel manager not initialized")
 
-    await channel_manager.stop_account(account_id)
-    return {"status": "stopped"}
+    from cognis.store.queries import update_channel_account
+
+    async with request.app.state.session_factory() as session:
+        row = await update_channel_account(session, account_id, enabled=False)
+        if row is None:
+            return error_response(404, "not_found", "Channel account not found")
+        await session.commit()
+    relinquished = await channel_manager.revoke_account(account_id)
+    return {"status": "stopped" if relinquished else "draining"}
 
 
 @router.get("/accounts/{account_id}/status", response_model=None)

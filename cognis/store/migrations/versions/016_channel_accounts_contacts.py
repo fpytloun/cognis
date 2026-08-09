@@ -22,7 +22,7 @@ def upgrade() -> None:
         sa.Column("account_id", sa.String, primary_key=True),
         sa.Column("channel_type", sa.String, nullable=False),
         sa.Column("display_name", sa.String, nullable=False),
-        sa.Column("enabled", sa.Boolean, nullable=False, server_default="1"),
+        sa.Column("enabled", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column(
             "agent_id",
             sa.String,
@@ -38,7 +38,7 @@ def upgrade() -> None:
         sa.Column("config", sa.JSON, nullable=True),
         sa.Column("credential_refs", sa.JSON, nullable=True),
         sa.Column("default_conversation_id", sa.String, nullable=True),
-        sa.Column("allow_new_conversations", sa.Boolean, nullable=False, server_default="1"),
+        sa.Column("allow_new_conversations", sa.Boolean, nullable=False, server_default=sa.true()),
         sa.Column("allowed_senders", sa.JSON, nullable=True),
         sa.Column("dm_policy", sa.String, nullable=False, server_default="open"),
         sa.Column("group_policy", sa.String, nullable=False, server_default="mention"),
@@ -71,7 +71,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("display_name", sa.String, nullable=True),
-        sa.Column("verified", sa.Boolean, nullable=False, server_default="0"),
+        sa.Column("verified", sa.Boolean, nullable=False, server_default=sa.false()),
         sa.Column(
             "created_at",
             sa.TIMESTAMP(timezone=True),

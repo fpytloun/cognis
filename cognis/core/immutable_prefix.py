@@ -12,7 +12,8 @@ PREFIX_SOURCE_ORDER = {
     "project_instructions": 1,
     "memory_instructions": 2,
     "core_memories": 3,
-    "compaction_summary": 4,
+    "managed_channel_policy": 4,
+    "compaction_summary": 5,
 }
 
 PREFIX_EVENT_TYPES = frozenset({"system_message", "developer_message", "context_snapshot"})
@@ -43,15 +44,28 @@ def build_prefix_message_events(entries: list[ImmutablePrefixEntry]) -> list[Ses
     session_events: list[SessionEvent] = []
     for entry in sort_prefix_entries(entries):
         event_type = "system_message" if entry.role == "system" else "developer_message"
+        data: dict[str, object] = {
+            "role": entry.role,
+            "content": entry.content,
+            "content_type": "text",
+            "source": entry.source,
+        }
+        if entry.source == "managed_channel_policy":
+            data.update(
+                {
+                    "context_injection": True,
+                    "replayable": True,
+                    "replay_scope": "conversation",
+                    "visibility": "agent_context",
+                    "model_role": "developer",
+                    "trust": "trusted",
+                    "context_key": "managed_channel_policy",
+                }
+            )
         session_events.append(
             SessionEvent(
                 type=event_type,
-                data={
-                    "role": entry.role,
-                    "content": entry.content,
-                    "content_type": "text",
-                    "source": entry.source,
-                },
+                data=data,
             )
         )
     return session_events

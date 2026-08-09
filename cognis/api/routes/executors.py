@@ -243,10 +243,7 @@ async def generate_executor_token_route(
             )
             token_version = int(result.scalar_one())
             await session.commit()
-        connected = request.app.state.providers.executor.websocket.get_connection(executor_id)
-        if connected is not None:
-            with contextlib.suppress(Exception):
-                await connected.close()
+        await _fence_executor_connection(request, executor_id)
     token = request.app.state.providers.auth.sign_executor_token(
         executor_id,
         token_version=token_version,
@@ -264,6 +261,7 @@ async def update_executor_route(
     if not updates:
         raise api_exception(400, "validation_error", "No fields to update")
     policy = await load_executor_policy(request.app.state.session_factory)
+    fence_connection = False
     async with request.app.state.session_factory() as session:
         await lock_local_model_dispatch_guard(session)
         existing = await get_executor_row(
@@ -310,6 +308,9 @@ async def update_executor_route(
         )
         if row is None:
             raise api_exception(404, "not_found", "Executor not found")
+        fence_connection = row.executor_type != "websocket" or (
+            "status" in updates and row.status != "active"
+        )
         runtime_affecting = (
             any(key in updates for key in {"config", "enabled_tools", "enabled_tool_groups"})
             and row.executor_type == "websocket"
@@ -324,6 +325,8 @@ async def update_executor_route(
             await session.refresh(row)
         await session.commit()
         current_inference = resolve_executor_local_inference_config(row.config or {})
+    if fence_connection:
+        await _fence_executor_connection(request, executor_id)
     if runtime_affecting:
         schedule_executor_reconfigure(request.app, executor_id)
     inference_changed = previous_inference != current_inference
@@ -381,3 +384,16 @@ async def delete_executor_route(request: Request, executor_id: str) -> None:
         if not deleted:
             raise api_exception(404, "not_found", "Executor not found")
         await session.commit()
+    await _fence_executor_connection(request, executor_id)
+
+
+async def _fence_executor_connection(request: Request, executor_id: str) -> None:
+    """Invalidate durable ownership before closing any process-local socket."""
+
+    ownership = getattr(request.app.state, "executor_connection_ownership", None)
+    if ownership is not None:
+        await ownership.revoke(executor_id)
+    connected = request.app.state.providers.executor.websocket.get_connection(executor_id)
+    if connected is not None:
+        with contextlib.suppress(Exception):
+            await connected.close()

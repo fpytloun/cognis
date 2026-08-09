@@ -282,7 +282,9 @@ class StepEvaluator:
         )
 
         return template.format(
-            objective=step_definition.prompt or step_definition.description,
+            objective=(
+                step_definition.objective or step_definition.prompt or step_definition.description
+            ),
             inputs=formatted_inputs,
             summary=step_output.summary,
             claims=formatted_claims,

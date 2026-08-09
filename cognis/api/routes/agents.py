@@ -78,6 +78,7 @@ _SYSTEM_AGENT_LLM_FIELDS = {
     "top_p",
     "max_tokens",
     "reasoning_effort",
+    "fast_mode",
 }
 
 

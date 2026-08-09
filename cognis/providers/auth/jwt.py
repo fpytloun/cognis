@@ -111,6 +111,29 @@ class JWTAuthProvider:
             ttl_seconds,
         )
 
+    def sign_controller_jwt(self, owner_id: str, ttl_seconds: int = 30) -> str:
+        """Sign a short-lived controller peer credential."""
+
+        return self._sign(
+            {
+                "sub": owner_id,
+                "aud": ["cognis-controller"],
+                "typ": "controller",
+            },
+            ttl_seconds,
+        )
+
+    def verify_controller_jwt(self, token: str) -> dict[str, Any]:
+        claims = self.verify_jwt(token, audience=["cognis-controller"])
+        if claims.get("typ") != "controller":
+            raise JWTError("Invalid controller token type")
+        if claims.get("aud") != ["cognis-controller"]:
+            raise JWTError("Invalid controller token audience")
+        for name in ("sub", "jti", "iat", "exp"):
+            if not claims.get(name):
+                raise JWTError(f"Missing controller token claim: {name}")
+        return claims
+
     def sign_exchange_token(self, subject: str, target: str) -> str:
         return self._sign(
             {"sub": subject, "aud": [target], "typ": "exchange", "target": target},

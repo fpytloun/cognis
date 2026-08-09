@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
+from prometheus_client import Counter, Gauge
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -18,6 +19,56 @@ from sqlalchemy.pool import NullPool
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
+
+DB_POOL_CHECKED_OUT = Gauge(
+    "cognis_db_pool_checked_out",
+    "Current SQLAlchemy database connections checked out by this process",
+)
+DB_POOL_CONNECTIONS_TOTAL = Counter(
+    "cognis_db_pool_connections_total",
+    "SQLAlchemy database connections created by this process",
+)
+DB_POOL_CONNECTIONS_CLOSED_TOTAL = Counter(
+    "cognis_db_pool_connections_closed_total",
+    "SQLAlchemy database connections closed by this process",
+)
+DB_POOL_INVALIDATIONS_TOTAL = Counter(
+    "cognis_db_pool_invalidations_total",
+    "SQLAlchemy database connections invalidated by this process",
+)
+
+
+def pool_snapshot(engine: AsyncEngine) -> dict[str, int]:
+    """Return bounded QueuePool state for diagnostics."""
+    pool = engine.sync_engine.pool
+    snapshot: dict[str, int] = {}
+    for name in ("size", "checkedin", "checkedout", "overflow"):
+        value = getattr(pool, name, None)
+        if callable(value):
+            snapshot[name] = int(value())
+    return snapshot
+
+
+def _instrument_pool(engine: AsyncEngine) -> None:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _connection_created(_: object, __: object) -> None:
+        DB_POOL_CONNECTIONS_TOTAL.inc()
+
+    @event.listens_for(engine.sync_engine, "close")
+    def _connection_closed(_: object, __: object) -> None:
+        DB_POOL_CONNECTIONS_CLOSED_TOTAL.inc()
+
+    @event.listens_for(engine.sync_engine, "checkout")
+    def _connection_checked_out(_: object, __: object, ___: object) -> None:
+        DB_POOL_CHECKED_OUT.inc()
+
+    @event.listens_for(engine.sync_engine, "checkin")
+    def _connection_checked_in(_: object, __: object) -> None:
+        DB_POOL_CHECKED_OUT.dec()
+
+    @event.listens_for(engine.sync_engine, "invalidate")
+    def _connection_invalidated(_: object, __: object, ___: object) -> None:
+        DB_POOL_INVALIDATIONS_TOTAL.inc()
 
 
 def create_engine(database_url: str) -> AsyncEngine:
@@ -42,6 +93,7 @@ def create_engine(database_url: str) -> AsyncEngine:
         echo=False,
         **pool_kwargs,
     )
+    _instrument_pool(engine)
 
     # Enable WAL mode for SQLite to prevent "database is locked" errors
     if database_url.startswith("sqlite"):

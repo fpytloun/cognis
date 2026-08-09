@@ -14,6 +14,7 @@ from cognis.api.executor_runtime import (
     persist_executor_resource_snapshot,
     reconcile_executor,
 )
+from cognis.core.executor_connection_ownership import ExecutorConnectionOwnership
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
@@ -35,7 +36,6 @@ from cognis.store.queries import (
     get_executor_row,
     get_mcp_server,
     get_setting_value,
-    update_executor_runtime_state,
 )
 from cognis.tools.mcp import invalid_mcp_config_reason
 
@@ -112,6 +112,7 @@ async def handle_executor_websocket(
         return
 
     policy = await load_executor_policy(session_factory)
+    ownership: ExecutorConnectionOwnership = ws.app.state.executor_connection_ownership
     async with executor_token_lock(executor_id):
         async with session_factory() as session:
             row = await get_executor_row(session, executor_id)
@@ -141,6 +142,25 @@ async def handle_executor_websocket(
             await _close_ws(ws, 4403, "Executor type disabled")
             return
 
+        try:
+            connection_owner = await ownership.takeover_validated(
+                executor_id,
+                token_version=token_version,
+            )
+        except Exception:
+            _logger.warning(
+                "executor_ws: failed to acquire executor connection ownership",
+                extra={"extra_data": {"executor_id": executor_id}},
+                exc_info=True,
+            )
+            await _send_error(ws, msg_id, -32007, "Executor ownership unavailable")
+            await _close_ws(ws, 1011, "Executor ownership unavailable")
+            return
+        if connection_owner is None:
+            await _send_error(ws, msg_id, -32004, "Executor not found or disabled")
+            await _close_ws(ws, 4403, "Executor unavailable")
+            return
+
         _logger.info(
             "executor_ws: registering executor %s (type=%s, owner=%s)",
             executor_id,
@@ -161,6 +181,8 @@ async def handle_executor_websocket(
             ws,
             ExecutorCapabilities(),
             ready=False,
+            connection_owner=connection_owner,
+            start_receiver=False,
             metadata=_executor_connection_metadata(
                 labels=row.labels or {},
                 environment=ready_runtime_metadata.get("environment"),
@@ -171,7 +193,37 @@ async def handle_executor_websocket(
             ),
         )
 
+        async def _heartbeat_received(received_at: datetime) -> bool:
+            return bool(
+                await ownership.renew_from_heartbeat(
+                    connection_owner,
+                    heartbeat_received_at=received_at,
+                )
+            )
+
+        conn.register_heartbeat_callback(_heartbeat_received)
+
+        async def _ownership_is_current() -> bool:
+            return bool(await ownership.is_current(connection_owner))
+
+        conn.register_ownership_check_callback(_ownership_is_current)
+
+        async def _dispatch_owned_callback(
+            owner: Any,
+            callback: Any,
+            *args: Any,
+        ) -> bool:
+            return bool(await ownership.run_callback_if_current(owner, callback, *args))
+
+        conn.register_owned_callback_dispatcher(_dispatch_owned_callback)
+
+        async def _dispatch_owned_effect(owner: Any, effect: Any) -> bool:
+            return bool(await ownership.apply_effect_if_current(owner, effect))
+
+        conn.register_owned_effect_dispatcher(_dispatch_owned_effect)
+
         async def _resource_snapshot_received(
+            _owner: Any,
             callback_executor_id: str,
             payload: dict[str, Any],
         ) -> None:
@@ -190,6 +242,7 @@ async def handle_executor_websocket(
                 )
 
         conn.register_resource_snapshot_callback(_resource_snapshot_received)
+        conn.start_receiver()
 
     # Acknowledge executor.ready before sending executor.configure.
     # The runner waits for this response before entering the normal
@@ -208,9 +261,9 @@ async def handle_executor_websocket(
     # freshly-reconnected executor has _configured=False and needs a full
     # configure handshake.
     async with session_factory() as session:
-        await update_executor_runtime_state(
+        await ownership.update_runtime_state(
             session,
-            executor_id,
+            connection_owner,
             runtime_state="offline",
             runtime_metadata=ready_runtime_metadata,
             last_observed_at=ready_received_at if ready_snapshot is not None else None,
@@ -230,7 +283,11 @@ async def handle_executor_websocket(
         async with session_factory() as session:
             current = await get_executor_row(session, executor_id)
             if current is not None and current.runtime_state == "reconfiguring":
-                await update_executor_runtime_state(session, executor_id, runtime_state="blocked")
+                await ownership.update_runtime_state(
+                    session,
+                    connection_owner,
+                    runtime_state="blocked",
+                )
                 await session.commit()
 
     async with session_factory() as session:
@@ -277,7 +334,9 @@ async def handle_executor_websocket(
             exc_info=True,
         )
     finally:
-        is_current = ws_provider.owns_connection(executor_id, conn)
+        is_current = ws_provider.owns_connection(executor_id, conn) and await ownership.is_current(
+            connection_owner
+        )
         _logger.info(
             "executor_ws: executor %s disconnected (is_current=%s)",
             executor_id,
@@ -318,8 +377,13 @@ async def handle_executor_websocket(
                     and current.desired_config_version != current.applied_config_version
                 ):
                     next_state = "stale"
-                await update_executor_runtime_state(session, executor_id, runtime_state=next_state)
+                await ownership.update_runtime_state(
+                    session,
+                    connection_owner,
+                    runtime_state=next_state,
+                )
                 await session.commit()
+            await ownership.release(connection_owner)
 
 
 async def _resolve_executor_mcp_payload(

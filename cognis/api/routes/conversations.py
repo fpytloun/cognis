@@ -24,6 +24,8 @@ from cognis.api.common import (
 )
 from cognis.api.models import (
     AgentDirectChatResponse,
+    BackgroundWorkItemResponse,
+    BackgroundWorkProjectionResponse,
     ConversationCreateRequest,
     ConversationOpenRequest,
     ConversationResolveRequest,
@@ -56,6 +58,7 @@ from cognis.core.managed_conversations import (
     ManagedConversationTurnObserver,
     last_managed_conversation_user_message_for_retry,
     new_managed_turn_id,
+    project_managed_conversation_state,
 )
 from cognis.core.title_policy import latest_intaris_title_from_platform_data
 from cognis.core.turn_scheduler import TurnError
@@ -68,17 +71,22 @@ from cognis.store.queries import (
     get_agent,
     get_conversation,
     get_latest_active_conversation_for_agent,
+    get_managed_conversation_ancestry,
     get_managed_conversation_link_for_target,
     get_project,
     get_session_row,
+    get_task_by_control_conversation_id,
     get_user_ui_state_value,
+    list_active_delegation_sessions,
     list_agent_direct_conversations,
     list_conversation_context_types,
     list_conversation_sessions,
     list_conversation_todos_by_conversation,
     list_conversations,
     list_managed_conversation_links_for_targets,
+    list_open_managed_conversation_links,
     list_pending_notification_types_by_conversation,
+    list_session_todos_by_session,
     list_sessions_by_ids,
     list_sidebar_tombstone_conversation_ids,
     list_visible_agents,
@@ -96,6 +104,7 @@ _CHAT_LAST_OPENED_UI_STATE_PREFIX = "chat.last_opened"
 # across all agents so PWA cold-starts can restore the right conversation
 # even when the selected agent doesn't match the last-active one.
 _CHAT_LAST_OPENED_GLOBAL_STATE_KEY = "chat.last_opened:global"
+_BACKGROUND_WORK_LIMIT = 200
 
 
 def _filter_values(single: str | None, multiple: list[str] | None) -> list[str] | None:
@@ -103,6 +112,111 @@ def _filter_values(single: str | None, multiple: list[str] | None) -> list[str] 
         {value.strip() for value in [single, *(multiple or [])] if value and value.strip()}
     )
     return values or None
+
+
+async def _background_work_projection(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    generated_at: datetime,
+    scheduler_running_turn_states: Callable[[list[str]], Awaitable[dict[str, dict[str, Any]]]],
+) -> BackgroundWorkProjectionResponse:
+    managed_links = await list_open_managed_conversation_links(
+        session,
+        user_email=user_email,
+        limit=_BACKGROUND_WORK_LIMIT + 1,
+    )
+    delegated_sessions = await list_active_delegation_sessions(
+        session,
+        user_email=user_email,
+        limit=_BACKGROUND_WORK_LIMIT + 1,
+    )
+    candidates: list[tuple[datetime, str, Any]] = [
+        (link.updated_at or link.created_at, "managed_conversation", link) for link in managed_links
+    ]
+    candidates.extend(
+        (child.updated_at or child.started_at, "delegated_session", child)
+        for child in delegated_sessions
+    )
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    truncated = len(candidates) > _BACKGROUND_WORK_LIMIT
+    selected = candidates[:_BACKGROUND_WORK_LIMIT]
+    managed_target_ids = [
+        item.target_conversation_id for _, kind, item in selected if kind == "managed_conversation"
+    ]
+    delegated_session_ids = [
+        item.session_id for _, kind, item in selected if kind == "delegated_session"
+    ]
+    managed_todos = await list_conversation_todos_by_conversation(session, managed_target_ids)
+    delegated_todos = await list_session_todos_by_session(session, delegated_session_ids)
+    running_turn_states = await scheduler_running_turn_states(managed_target_ids)
+    items: list[BackgroundWorkItemResponse] = []
+    for _, kind, item in selected:
+        if kind == "managed_conversation":
+            live_turn_state = running_turn_states.get(item.target_conversation_id)
+            live_turn_id = (
+                str(live_turn_state.get("turn_id") or "") or None
+                if live_turn_state is not None
+                else None
+            )
+            projected = project_managed_conversation_state(
+                item,
+                scheduler_active_turn_id=live_turn_id,
+            )
+            if live_turn_id:
+                background_status = "running"
+            elif projected.turn_state == "queued":
+                background_status = "queued"
+            elif projected.turn_state == "interrupted":
+                background_status = (
+                    "cancelled"
+                    if "cancel" in str(projected.last_error or "").lower()
+                    else "interrupted"
+                )
+            elif projected.turn_state == "failed" or projected.last_error:
+                background_status = "error"
+            else:
+                background_status = "active"
+            items.append(
+                BackgroundWorkItemResponse(
+                    kind="managed_conversation",
+                    work_id=item.link_id,
+                    controller_conversation_id=item.controller_conversation_id,
+                    target_conversation_id=item.target_conversation_id,
+                    title=item.title or f"Managed conversation with {item.target_agent_id}",
+                    agent_id=item.target_agent_id,
+                    agent_profile_id=item.target_agent_profile_id,
+                    status=background_status,
+                    started_at=item.created_at,
+                    updated_at=item.updated_at,
+                    todos=managed_todos.get(item.target_conversation_id, []),
+                )
+            )
+            continue
+        items.append(
+            BackgroundWorkItemResponse(
+                kind="delegated_session",
+                work_id=item.session_id,
+                controller_conversation_id=item.conversation_id,
+                session_id=item.session_id,
+                title=item.delegation_task or f"Delegated work with {item.agent_id}",
+                agent_id=item.agent_id,
+                agent_profile_id=item.agent_profile_id,
+                status=item.status,
+                started_at=item.started_at,
+                updated_at=item.updated_at,
+                todos=delegated_todos.get(item.session_id, []),
+            )
+        )
+    return BackgroundWorkProjectionResponse(
+        items=items,
+        active_count=sum(
+            item.kind == "delegated_session" or item.status in {"queued", "running"}
+            for item in items
+        ),
+        truncated=truncated,
+        generated_at=generated_at,
+    )
 
 
 def _agent_definition_from_row(row: object) -> AgentDefinition:
@@ -126,6 +240,21 @@ async def _emit_sidebar_conversation_upsert(request: Request, conversation_id: s
             },
             include_subscribers=True,
         )
+        cluster_signals = getattr(request.app.state, "cluster_signals", None)
+        if cluster_signals is not None:
+            from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope
+
+            async with request.app.state.session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+            if conversation is not None:
+                await cluster_signals.publish(
+                    ClusterSignalKind.SIDEBAR_CHANGED,
+                    scope=ClusterSignalScope(
+                        conversation_id=conversation_id,
+                        session_id=conversation.active_session_id,
+                    ),
+                    revision=conversation.updated_at,
+                )
     except Exception:
         logger.warning(
             "Failed to fan out sidebar conversation upsert",
@@ -152,6 +281,18 @@ async def _emit_sidebar_conversation_removed(
                 "conversation_id": conversation_id,
             },
         )
+        cluster_signals = getattr(request.app.state, "cluster_signals", None)
+        if cluster_signals is not None:
+            from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope
+
+            await cluster_signals.publish(
+                ClusterSignalKind.SIDEBAR_CHANGED,
+                scope=ClusterSignalScope(
+                    conversation_id=conversation_id,
+                    owner_token=cluster_signals.owner_token(user_email),
+                ),
+                revision=datetime.now(UTC),
+            )
     except Exception:
         logger.warning(
             "Failed to fan out sidebar conversation removal",
@@ -194,8 +335,15 @@ async def _conversation_response(
 ) -> ConversationResponse:
     active_session = None
     managed_link = None
+    root_controller_conversation_id = None
     pending_notifications: list[str] = []
-    active_turn_state = request.app.state.turn_scheduler.running_turn_state(row.conversation_id)
+    turn_scheduler = request.app.state.turn_scheduler
+    durable_running = getattr(turn_scheduler, "durable_running_turn_state", None)
+    active_turn_state = (
+        await durable_running(row.conversation_id)
+        if callable(durable_running)
+        else turn_scheduler.running_turn_state(row.conversation_id)
+    )
     resolved_has_active_turn = (
         active_turn_state is not None if has_active_turn is None else has_active_turn
     )
@@ -212,6 +360,12 @@ async def _conversation_response(
                 row.conversation_id,
                 user_email=row.user_email,
             )
+            if managed_link is not None:
+                root_controller_conversation_id = await _validated_root_controller_conversation_id(
+                    session,
+                    managed_link,
+                    user_email=row.user_email,
+                )
         pending_notifications = (
             await list_pending_notification_types_by_conversation(
                 session,
@@ -237,7 +391,35 @@ async def _conversation_response(
         pending_notification_types=pending_notifications,
         conversation_state=conversation_state,
         managed_link=managed_link,
+        root_controller_conversation_id=root_controller_conversation_id,
     )
+
+
+async def _validated_root_controller_conversation_id(
+    session: Any,
+    managed_link: Any,
+    *,
+    user_email: str,
+) -> str | None:
+    """Resolve the outermost managed controller from owner-validated ancestry."""
+
+    try:
+        ancestry = await get_managed_conversation_ancestry(
+            session,
+            managed_link,
+            user_email=user_email,
+        )
+        root_id = ancestry[-1].controller_conversation_id
+        root_conversation = await get_conversation(session, root_id)
+    except ValueError:
+        return None
+    if (
+        root_conversation is None
+        or root_conversation.user_email != user_email
+        or root_conversation.status == "deleted"
+    ):
+        return None
+    return str(root_id)
 
 
 async def _require_mutable_conversation(
@@ -323,14 +505,22 @@ async def _conversation_page_projection(
             page_rows,
             user_email,
         )
-        active_turn_states = (
-            {
+        durable_running_many = (
+            getattr(turn_scheduler, "durable_running_turn_states", None)
+            if turn_scheduler is not None
+            else None
+        )
+        if callable(durable_running_many):
+            active_turn_states = await durable_running_many(
+                [row.conversation_id for row in page_rows]
+            )
+        elif turn_scheduler is not None:
+            active_turn_states = {
                 row.conversation_id: turn_scheduler.running_turn_state(row.conversation_id)
                 for row in page_rows
             }
-            if turn_scheduler is not None
-            else {row.conversation_id: None for row in page_rows}
-        )
+        else:
+            active_turn_states = {row.conversation_id: None for row in page_rows}
         active_rows = [
             row for row in page_rows if active_turn_states.get(row.conversation_id) is not None
         ]
@@ -579,21 +769,25 @@ async def _agent_direct_chat_projection(
             [conversation for _agent, conversation in rows if conversation is not None],
             user_email,
         )
-        active_turn_states = (
-            {
-                conversation.conversation_id: turn_scheduler.running_turn_state(
-                    conversation.conversation_id
-                )
-                for _agent, conversation in rows
-                if conversation is not None
-            }
+        conversation_ids = [
+            conversation.conversation_id
+            for _agent, conversation in rows
+            if conversation is not None
+        ]
+        durable_running_many = (
+            getattr(turn_scheduler, "durable_running_turn_states", None)
             if turn_scheduler is not None
-            else {
-                conversation.conversation_id: None
-                for _agent, conversation in rows
-                if conversation is not None
-            }
+            else None
         )
+        if callable(durable_running_many):
+            active_turn_states = await durable_running_many(conversation_ids)
+        elif turn_scheduler is not None:
+            active_turn_states = {
+                conversation_id: turn_scheduler.running_turn_state(conversation_id)
+                for conversation_id in conversation_ids
+            }
+        else:
+            active_turn_states = {conversation_id: None for conversation_id in conversation_ids}
         active_conversations = [
             conversation
             for _agent, conversation in rows
@@ -673,15 +867,14 @@ async def _hydrate_event_attachments(
         event_data.append(cast(dict[str, Any], data))
     if not attachment_groups:
         return
-    async with request.app.state.session_factory() as artifact_session:
-        hydrated_groups = await hydrate_attachment_ref_groups(
-            artifact_session,
-            artifact_store,
-            attachment_groups,
-            owner_email=current_user.email,
-            conversation_id=conversation_id,
-            session_id=session_id,
-        )
+    hydrated_groups = await hydrate_attachment_ref_groups(
+        request.app.state.session_factory,
+        artifact_store,
+        attachment_groups,
+        owner_email=current_user.email,
+        conversation_id=conversation_id,
+        session_id=session_id,
+    )
     for data, hydrated in zip(event_data, hydrated_groups, strict=True):
         data["attachments"] = hydrated
 
@@ -699,7 +892,7 @@ async def conversation_list(
     agent_id: str | None = Query(default=None),
     agent_ids: list[str] | None = Query(default=None),
     project_id: str | None = Query(default=None),
-    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all|task)$"),
     include_agent_direct: bool = Query(default=False),
 ) -> CursorPage[ConversationResponse]:
     user = require_current_user(request)
@@ -721,7 +914,7 @@ async def conversation_list(
 @router.get("/context-types", response_model=list[str])
 async def conversation_context_types(
     request: Request,
-    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all|task)$"),
 ) -> list[str]:
     """Return distinct conversation context types for sidebar filters."""
 
@@ -740,7 +933,7 @@ async def agent_direct_chats(
     request: Request,
     agent_id: str | None = Query(default=None),
     agent_ids: list[str] | None = Query(default=None),
-    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all|task)$"),
 ) -> list[AgentDirectChatResponse]:
     """Return sticky web direct chats for visible primary agents."""
 
@@ -764,7 +957,7 @@ async def sidebar_projection(
     agent_id: str | None = Query(default=None),
     agent_ids: list[str] | None = Query(default=None),
     project_id: str | None = Query(default=None),
-    status: str = Query(default="active", pattern="^(active|starred|archived|all)$"),
+    status: str = Query(default="active", pattern="^(active|starred|archived|all|task)$"),
 ) -> SidebarProjectionResponse:
     """Return the UI-shaped sidebar projection in one request."""
 
@@ -832,6 +1025,24 @@ async def sidebar_projection(
             if changed_since is not None
             else []
         )
+        scheduler = request.app.state.turn_scheduler
+        durable_running_many = getattr(scheduler, "durable_running_turn_states", None)
+
+        async def _running_turn_states(conversation_ids: list[str]) -> dict[str, dict[str, Any]]:
+            if callable(durable_running_many):
+                return await durable_running_many(conversation_ids)
+            return {
+                conversation_id: state
+                for conversation_id in conversation_ids
+                if (state := scheduler.running_turn_state(conversation_id)) is not None
+            }
+
+        background_work = await _background_work_projection(
+            session,
+            user_email=user.email,
+            generated_at=sync_timestamp,
+            scheduler_running_turn_states=_running_turn_states,
+        )
     return SidebarProjectionResponse(
         agents=[] if is_delta else agents,
         agent_direct_chats=direct_chats,
@@ -840,6 +1051,7 @@ async def sidebar_projection(
         removed_conversation_ids=removed_conversation_ids,
         full_resync_required=is_delta and conversations.has_more,
         sync_timestamp=sync_timestamp,
+        background_work=background_work,
     )
 
 
@@ -1221,6 +1433,12 @@ async def update_conversation(
         if row.status == "deleted":
             raise api_exception(404, "not_found", "Conversation not found")
         if payload.archived is True:
+            if await get_task_by_control_conversation_id(session, conversation_id) is not None:
+                raise api_exception(
+                    409,
+                    "task_control_conversation_persistent",
+                    "Task control conversations cannot be archived",
+                )
             await manager.archive_conversation(conversation_id)
         elif payload.archived is False and row.status == "archived":
             row.status = "active"
@@ -1319,6 +1537,13 @@ async def delete_conversation(request: Request, conversation_id: str) -> dict[st
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
     require_resource_owner(request, row.user_email)
+    async with request.app.state.session_factory() as session:
+        if await get_task_by_control_conversation_id(session, conversation_id) is not None:
+            raise api_exception(
+                409,
+                "task_control_conversation_persistent",
+                "Task control conversations cannot be deleted",
+            )
     ok = await request.app.state.session_manager.soft_delete_conversation(conversation_id)
     if ok:
         await _emit_sidebar_conversation_removed(
@@ -1338,6 +1563,13 @@ async def purge_conversation(request: Request, conversation_id: str) -> dict[str
     if row is None:
         raise api_exception(404, "not_found", "Conversation not found")
     require_resource_owner(request, row.user_email)
+    async with request.app.state.session_factory() as session:
+        if await get_task_by_control_conversation_id(session, conversation_id) is not None:
+            raise api_exception(
+                409,
+                "task_control_conversation_persistent",
+                "Task control conversations cannot be purged",
+            )
     ok = await request.app.state.session_manager.purge_conversation(conversation_id)
     if ok:
         await _emit_sidebar_conversation_removed(
@@ -1374,7 +1606,7 @@ async def get_queued_messages(request: Request, conversation_id: str) -> QueuedM
         allow_managed_conversation=True,
     )
     return _queued_messages_response(
-        request.app.state.turn_scheduler.queued_messages(conversation_id)
+        await request.app.state.turn_scheduler.get_queued_messages(conversation_id)
     )
 
 

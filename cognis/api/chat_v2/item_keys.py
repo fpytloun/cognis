@@ -16,6 +16,7 @@ KIND_RANK: dict[str, int] = {
     "question_set": 6,
     "auth_challenge": 6,
     "credential_request": 6,
+    "user_interaction": 6,
     "todo_state": 7,
     "artifact": 8,
     "file_diff": 8,

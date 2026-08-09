@@ -6,11 +6,18 @@ import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    EmailStr,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from cognis.core.question_sets import normalize_questions, normalize_reply
-from cognis.models.config import GenerationPerformanceSnapshot
+from cognis.models.config import GenerationPerformanceSnapshot, TokenUsage
 from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.executor_resources import ExecutorResourceSnapshot
 from cognis.models.task import TaskDelivery
@@ -33,6 +40,53 @@ class CursorPage[T](BaseModel):
     items: list[T]
     cursor: str | None = None
     has_more: bool = False
+
+
+class StaleDirectTurnResponse(BaseModel):
+    request_id: str
+    conversation_id: str
+    owner_controller_id: str | None
+    owner_incarnation_id: str | None
+    fencing_token: int | None
+    status: str
+    phase: str
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    phase_started_at: datetime | None = None
+    call_id: str | None = None
+    call_ids: list[str] = Field(default_factory=list)
+    timeout_seconds: float | None = None
+
+
+class ResolveAmbiguousDirectTurnRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    client_transaction_id: str = Field(min_length=1, max_length=128)
+    conversation_id: str = Field(min_length=1, max_length=256)
+    status: str = Field(min_length=1, max_length=32)
+    phase: Literal["tool_in_flight"]
+    owner_controller_id: str = Field(min_length=1, max_length=256)
+    owner_incarnation_id: str = Field(min_length=1, max_length=256)
+    fencing_token: int = Field(ge=1)
+    updated_at: datetime
+    phase_started_at: datetime | None = None
+
+    @field_validator("reason", "client_transaction_id")
+    @classmethod
+    def _strip_required_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+
+class ResolveAmbiguousDirectTurnResponse(BaseModel):
+    request_id: str
+    conversation_id: str
+    status: Literal["ambiguous"]
+    phase: Literal["ambiguous"]
+    fencing_token: int | None
+    changed: bool
 
 
 class SetupRequest(BaseModel):
@@ -200,6 +254,60 @@ class HealthResponse(BaseModel):
     remember_queue: dict[str, Any] | None = None
 
 
+class ClientDiscoveryProduct(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: Literal["cognis"] = "cognis"
+    display_name: Literal["Cognis"] = "Cognis"
+
+
+class ClientDiscoveryProtocol(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: Literal["cognis-client"] = "cognis-client"
+    version: Literal[1] = 1
+
+
+class ClientDiscoveryServer(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: str
+    version: str
+    build_id: str
+
+
+class ClientDiscoveryPaths(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    api_v1: Literal["/api/v1"] = "/api/v1"
+    login: Literal["/api/auth/login"] = "/api/auth/login"
+    refresh: Literal["/api/auth/refresh"] = "/api/auth/refresh"
+    logout: Literal["/api/auth/logout"] = "/api/auth/logout"
+    current_user: Literal["/api/auth/me"] = "/api/auth/me"
+    chat_v2: Literal["/api/v1/chat/v2"] = "/api/v1/chat/v2"
+    realtime: Literal["/api/ws"] = "/api/ws"
+    jwks: Literal["/.well-known/jwks.json"] = "/.well-known/jwks.json"
+
+
+class ClientDiscoveryCapabilities(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    authentication: Literal[1] = 1
+    chat: Literal[2] = 2
+    realtime: Literal[1] = 1
+
+
+class ClientDiscoveryResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    schema_version: Literal[1] = 1
+    product: ClientDiscoveryProduct
+    protocol: ClientDiscoveryProtocol
+    server: ClientDiscoveryServer
+    paths: ClientDiscoveryPaths
+    capabilities: ClientDiscoveryCapabilities
+
+
 class SystemDiagnosticsResponse(BaseModel):
     readiness: dict[str, bool] = Field(default_factory=dict)
     ui: dict[str, Any] = Field(default_factory=dict)
@@ -208,6 +316,7 @@ class SystemDiagnosticsResponse(BaseModel):
     providers: list[dict[str, Any]] = Field(default_factory=list)
     agents: dict[str, Any] = Field(default_factory=dict)
     key_fingerprint: str | None = None
+    redis: dict[str, bool] = Field(default_factory=dict)
 
 
 class WebConfigStatusResponse(BaseModel):
@@ -250,6 +359,13 @@ class WebBackendUpdateRequest(BaseModel):
     searxng_engines: str | None = None
     searxng_categories: str | None = None
     searxng_language: str | None = None
+
+
+class WebDefaultsUpdateRequest(BaseModel):
+    """Canonical default web backend selections."""
+
+    search_backend: Literal["direct", "tavily", "brave", "searxng"]
+    fetch_backend: Literal["direct", "tavily", "browser"]
 
 
 class ConversationContextModel(BaseModel):
@@ -343,6 +459,10 @@ class ConversationResponse(BaseModel):
             "last_settlement_is_current indicates whether that settlement "
             "belongs to the projected current/terminal turn."
         ),
+    )
+    root_controller_conversation_id: str | None = Field(
+        default=None,
+        description="Owner-validated outermost controller for managed target navigation.",
     )
     created_at: datetime | None = None
     updated_at: datetime | None = None
@@ -589,6 +709,7 @@ class ProjectAvatarGenerateResponse(BaseModel):
 
 class SessionResponse(BaseModel):
     session_id: str
+    activity_scope_id: str
     conversation_id: str
     parent_session_id: str | None = None
     previous_session_id: str | None = None
@@ -623,6 +744,7 @@ class IntarisSessionDetailResponse(BaseModel):
     denied_count: int
     escalated_count: int
     context_usage: dict[str, Any] | None = None
+    token_usage: TokenUsage | None = None
     last_generation: GenerationPerformanceSnapshot | None = None
 
 
@@ -745,6 +867,34 @@ class AgentDirectChatResponse(BaseModel):
     conversation: ConversationResponse
 
 
+class BackgroundWorkTodoResponse(BaseModel):
+    content: str
+    status: str
+    priority: str = "normal"
+
+
+class BackgroundWorkItemResponse(BaseModel):
+    kind: Literal["managed_conversation", "delegated_session"]
+    work_id: str
+    controller_conversation_id: str
+    target_conversation_id: str | None = None
+    session_id: str | None = None
+    title: str
+    agent_id: str
+    agent_profile_id: str | None = None
+    status: str
+    started_at: datetime | None = None
+    updated_at: datetime | None = None
+    todos: list[BackgroundWorkTodoResponse] = Field(default_factory=list)
+
+
+class BackgroundWorkProjectionResponse(BaseModel):
+    items: list[BackgroundWorkItemResponse] = Field(default_factory=list)
+    active_count: int = 0
+    truncated: bool = False
+    generated_at: datetime
+
+
 class SidebarProjectionResponse(BaseModel):
     agents: list[AgentResponse] = Field(default_factory=list)
     agent_direct_chats: list[AgentDirectChatResponse] = Field(default_factory=list)
@@ -753,6 +903,7 @@ class SidebarProjectionResponse(BaseModel):
     removed_conversation_ids: list[str] = Field(default_factory=list)
     full_resync_required: bool = False
     sync_timestamp: datetime | None = None
+    background_work: BackgroundWorkProjectionResponse
 
 
 class AgentCardResponse(BaseModel):
@@ -1097,6 +1248,14 @@ class TaskChatResponse(BaseModel):
     session_id: str
 
 
+class TaskControlChatResponse(TaskChatResponse):
+    task_id: str
+    agent_id: str
+    agent_profile_id: str | None = None
+    task_status: str
+    attempt_number: int
+
+
 class TaskRerunResponse(BaseModel):
     ok: bool
     source_task_id: str
@@ -1165,6 +1324,99 @@ class TaskCommentResponse(BaseModel):
     updated_at: datetime | None = None
 
 
+class PublicWorkflowState(WorkflowState):
+    """Bounded public workflow state without the effective definition body."""
+
+    effective_workflow_definition: dict[str, Any] | None = Field(default=None, exclude=True)
+
+
+class WorkflowStepProjection(BaseModel):
+    """Bounded cockpit state for one canonical workflow step."""
+
+    name: str
+    type: str
+    status: str
+    attempt_count: int = 0
+    max_attempts: int = 1
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_seconds: float | None = None
+    action_required: bool = False
+    pause_type: str | None = None
+    summary: str | None = None
+    error: str | None = None
+    has_output: bool = False
+    has_logs: bool = False
+    has_deliverable: bool = False
+    skip_reason: str | None = None
+    step_run_id: str | None = None
+    output_url: str | None = None
+    logs_url: str | None = None
+    deliverables_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkflowPhaseProjection(BaseModel):
+    """Derived cockpit state for one presentation phase."""
+
+    id: str
+    title: str
+    description: str = ""
+    status: str
+    steps: list[WorkflowStepProjection]
+
+
+class TaskWorkflowProjection(BaseModel):
+    """Lightweight, backend-owned workflow projection for a task."""
+
+    workflow_id: str
+    workflow_version: int | None = None
+    workflow_digest: str | None = None
+    current_phase_id: str | None = None
+    current_step_name: str | None = None
+    phases: list[WorkflowPhaseProjection]
+
+
+class TaskProgressTodo(BaseModel):
+    content: str
+    status: str
+
+
+class TaskProgressWorkItem(BaseModel):
+    kind: str
+    work_id: str
+    step_name: str
+    step_run_id: str
+    title: str | None = None
+    agent_id: str
+    status: str
+    result_summary: str | None = None
+    error: str | None = None
+    todos: list[TaskProgressTodo] = Field(default_factory=list)
+    conversation_id: str | None = None
+    session_id: str | None = None
+    started_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class TaskProgressProjection(BaseModel):
+    """Bounded live progress derived from explicit task step-session ownership."""
+
+    todos: list[TaskProgressTodo] = Field(default_factory=list)
+    work_items: list[TaskProgressWorkItem] = Field(default_factory=list)
+    active_count: int = 0
+    completed_count: int = 0
+    truncated: bool = False
+
+
+def _serialize_public_workflow_state(
+    state: WorkflowState | None,
+) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    return state.model_dump(mode="json", exclude={"effective_workflow_definition"})
+
+
 class TaskResponse(BaseModel):
     task_id: str
     title: str
@@ -1199,6 +1451,11 @@ class TaskResponse(BaseModel):
     result_data: dict[str, Any] | None = None
     applied_completion_mode: str | None = None
     applied_completion_reason: str | None = None
+    progress: TaskProgressProjection | None = None
+
+    @field_serializer("workflow_state")
+    def _serialize_workflow_state(self, state: WorkflowState | None) -> dict[str, Any] | None:
+        return _serialize_public_workflow_state(state)
 
 
 class TaskBoardItemResponse(BaseModel):
@@ -1245,6 +1502,10 @@ class WorkflowRunResponse(BaseModel):
     workflow_state: WorkflowState | None = None
     current_step_name: str | None = None
     pending_pause: PendingPauseResponse | None = None
+
+    @field_serializer("workflow_state")
+    def _serialize_workflow_state(self, state: WorkflowState | None) -> dict[str, Any] | None:
+        return _serialize_public_workflow_state(state)
 
 
 class DeliverableResponse(BaseModel):
@@ -1326,6 +1587,7 @@ class TaskDetailResponse(TaskResponse):
     step_runs: list[StepRunResponse] = Field(default_factory=list)
     workflow_run: WorkflowRunResponse | None = None
     pending_pause: PendingPauseResponse | None = None
+    workflow_projection: TaskWorkflowProjection | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1491,6 +1753,7 @@ class WorkflowRequest(BaseModel):
     interaction: dict[str, Any] = Field(default_factory=dict)
     defaults: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    presentation: dict[str, Any] | None = None
     lifecycle: str = "persistent"
     lineage: dict[str, Any] | None = None
 
@@ -1504,6 +1767,7 @@ class WorkflowUpdateRequest(BaseModel):
     interaction: dict[str, Any] | None = None
     defaults: dict[str, Any] | None = None
     steps: list[dict[str, Any]] | None = None
+    presentation: dict[str, Any] | None = None
     lifecycle: str | None = None
     lineage: dict[str, Any] | None = None
 
@@ -1537,6 +1801,9 @@ class WorkflowResponse(BaseModel):
     interaction: dict[str, Any] = Field(default_factory=dict)
     defaults: dict[str, Any] = Field(default_factory=dict)
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    presentation: dict[str, Any] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     is_system: bool = False
     owner_email: str | None = None
     lifecycle: str = "persistent"

@@ -7,6 +7,12 @@ from typing import Any, Protocol
 import litellm
 
 
+def strip_controller_transport_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Remove Cognis-only routing metadata at the provider wire boundary."""
+
+    return {key: value for key, value in kwargs.items() if key != "_cognis_executor_affinity_id"}
+
+
 class ChatCompletionsTransport(Protocol):
     """Transport boundary for Chat Completions-compatible calls."""
 
@@ -35,7 +41,7 @@ class LiteLLMTransport:
     name = "litellm"
 
     async def completion(self, **kwargs: Any) -> Any:
-        return await litellm.acompletion(**kwargs)
+        return await litellm.acompletion(**strip_controller_transport_kwargs(kwargs))
 
     async def responses(self, **kwargs: Any) -> Any:
-        return await litellm.aresponses(**kwargs)
+        return await litellm.aresponses(**strip_controller_transport_kwargs(kwargs))

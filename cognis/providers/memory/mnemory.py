@@ -15,6 +15,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.circuit_breaker import CircuitBreaker
+from cognis.providers.memory.protocol import RememberOutcomeUnknownError
 from cognis.providers.retry import with_retry
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 
@@ -346,11 +347,12 @@ class MnemoryProvider:
                 )
                 response.raise_for_status()
 
-            await self._call_with_retry(
-                _do,
-                max_retries=2,
-                operation="mnemory remember",
-            )
+            try:
+                await self.breaker.call(_do)
+            except httpx.TransportError as exc:
+                raise RememberOutcomeUnknownError(
+                    "Mnemory remember outcome is unknown; automatic retry is disabled"
+                ) from exc
         except Exception:
             logger.warning(
                 "mnemory: remember failed",

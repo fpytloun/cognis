@@ -177,10 +177,16 @@ def build_compacted_tool_result_placeholder(message: dict[str, Any]) -> str:
     if source_call_id is not None and source_call_id not in {original_call_id, recovery_call_id}:
         source_note = f" This helper output was derived from source call_id '{source_call_id}'."
     if recovery_call_id is None:
+        producer_note = ""
+        if message.get("_producer_truncated") is True:
+            producer_note = (
+                " Producer returned a truncated preview; this call_id is diagnostic only "
+                "because no controller recovery handle is available."
+            )
         return (
             "[Tool output omitted from prompt. "
             f"Tool: {tool_name}. Original call_id: {original_call_id}.{size_note}{source_note} "
-            "No saved output handle is available.]"
+            f"No saved output handle is available.{producer_note}]"
         )
     anchor_names = message.get(ANCHOR_NAMES)
     if not isinstance(anchor_names, list):

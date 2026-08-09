@@ -41,6 +41,7 @@ from cognis.api.chat_v2.realtime import (
     runtime_items_from_snapshots,
     runtime_overlay_from_items,
     scope_accepts_runtime,
+    system_message_runtime_item,
     tool_call_runtime_item,
     tool_result_runtime_item,
 )
@@ -59,6 +60,12 @@ from cognis.api.timeline_visibility import (
 )
 from cognis.api.view_state import cognis_build_id, runtime_generation, server_time_iso
 from cognis.core.attachment_utils import hydrate_attachment_refs, strip_attachment_payload_bytes
+from cognis.core.chat_v2_runtime_relay import (
+    AdmissionDecision,
+    ChatV2RuntimeRelayEnvelope,
+    RelayKind,
+)
+from cognis.core.command_notices import persist_command_system_notice
 from cognis.core.conversation_state import (
     build_state_delta,
     linked_conversation_ids_for_task,
@@ -76,10 +83,9 @@ from cognis.core.turn_scheduler import (
 )
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
-from cognis.models.session import SessionEvent
 from cognis.providers.circuit_breaker import CircuitBreakerError
 from cognis.runtime_context import current_user_email
-from cognis.store.models import Conversation, Task
+from cognis.store.models import Conversation, ExecutorRow, NotificationRow, Session, Task
 from cognis.store.queries import (
     get_browser_session_by_token,
     get_conversation,
@@ -90,6 +96,16 @@ from cognis.store.queries import (
 )
 
 logger = get_logger(__name__)
+
+
+async def _scheduler_queued_messages(
+    turn_scheduler: Any,
+    conversation_id: str,
+) -> list[dict[str, Any]]:
+    durable_reader = getattr(turn_scheduler, "get_queued_messages", None)
+    if callable(durable_reader):
+        return list(await durable_reader(conversation_id))
+    return list(turn_scheduler.queued_messages(conversation_id))
 
 
 def _assistant_runtime_payload(data: dict[str, Any]) -> dict[str, Any] | None:
@@ -131,8 +147,20 @@ def _positive_int_env(name: str, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _positive_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 DEFAULT_INBOUND_RATE_LIMIT = _positive_int_env("COGNIS_WS_INBOUND_RATE_LIMIT", 60)
 DEFAULT_OUTBOUND_BUFFER = 100
+DEFAULT_SEND_TIMEOUT_SECONDS = _positive_float_env("COGNIS_WS_SEND_TIMEOUT_SECONDS", 15.0)
 DEFAULT_REPLAY_LIMIT = 200
 COOKIE_NAME = "cognis_session"
 
@@ -155,6 +183,35 @@ class _ChatV2CoalescePending:
     include_streams: bool = False
     include_thinking: bool = False
     include_tool_outputs: bool = False
+
+
+def _runtime_relay_cumulative_boundary(items: list[TimelineItem], *, has_active_turn: bool) -> bool:
+    """Return whether a runtime relay frame must retain retry ordering."""
+
+    if not has_active_turn:
+        return True
+    return any(
+        (
+            item.kind
+            in {
+                "tool_call",
+                "delegation",
+                "managed_conversation",
+                "compaction",
+            }
+            and not (
+                item.kind == "tool_call"
+                and getattr(item, "tool_name", None) == "apply_patch"
+                and getattr(item, "progress_phase", None) == "preparing_input"
+                and not getattr(item, "progress_complete", False)
+                and not getattr(item, "arguments", None)
+                and not getattr(item, "result_preview", None)
+                and not getattr(item, "file_diffs", None)
+            )
+        )
+        or getattr(item, "status", None) in {"completed", "failed", "cancelled", "compacted"}
+        for item in items
+    )
 
 
 def _invalidate_chat_v2_phase_hint_items(
@@ -328,6 +385,7 @@ class AuthenticatedWebSocket:
     # to gate `tts_sentence_ready` emission.
     tts_enabled: bool = False
     tts_voice: str | None = None
+    send_timeout_seconds: float = DEFAULT_SEND_TIMEOUT_SECONDS
     _outbound_queue: asyncio.Queue[_OutboundFrame] = field(init=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False)
     _enqueue_tail: asyncio.Task[None] | None = field(default=None, init=False)
@@ -351,6 +409,38 @@ class AuthenticatedWebSocket:
 
         await self._enqueue_payload(data, block=True)
         await asyncio.sleep(0)
+
+    def send_scope_invalidation_nowait(self, data: dict[str, Any]) -> bool:
+        """Coalesce and enqueue a droppable scope wakeup without blocking."""
+        conversation_id = data.get("conversation_id")
+        scope_key = self._scope_invalidation_key(data)
+        queue = self._outbound_queue._queue  # noqa: SLF001
+        for frame in reversed(queue):
+            if (
+                frame.msg_type == "scope_invalidated"
+                and frame.message_id == scope_key
+                and frame.payload is not None
+            ):
+                frame.payload = data
+                return True
+        frame = _OutboundFrame(
+            msg_type="scope_invalidated",
+            message_id=scope_key,
+            conversation_id=str(conversation_id or ""),
+            droppable=True,
+            payload=data,
+        )
+        self._ensure_writer()
+        return self._put_frame_nowait(frame)
+
+    @staticmethod
+    def _scope_invalidation_key(data: dict[str, Any]) -> str:
+        conversation_id = data.get("conversation_id")
+        return (
+            f"{data.get('reason')}:{conversation_id}"
+            if isinstance(conversation_id, str)
+            else (f"{data.get('reason')}:{data.get('task_id') or data.get('step_run_id') or ''}")
+        )
 
     async def send_text(
         self,
@@ -500,7 +590,15 @@ class AuthenticatedWebSocket:
         while not self._closed:
             if self._put_frame_nowait(frame):
                 return
-            await self._outbound_queue.put(frame)
+            try:
+                await asyncio.wait_for(self._outbound_queue.put(frame), timeout=0.1)
+            except TimeoutError:
+                continue
+            if self._closed:
+                queue_items = self._outbound_queue._queue  # type: ignore[attr-defined]  # noqa: SLF001
+                with contextlib.suppress(ValueError):
+                    queue_items.remove(frame)
+                    self._outbound_queue.task_done()
             return
 
     def _put_frame_nowait(self, frame: _OutboundFrame) -> bool:
@@ -539,9 +637,18 @@ class AuthenticatedWebSocket:
                 frame = await self._outbound_queue.get()
                 try:
                     if frame.text is not None:
-                        await self.websocket.send_text(frame.text)
+                        await asyncio.wait_for(
+                            self.websocket.send_text(frame.text),
+                            timeout=self.send_timeout_seconds,
+                        )
                     elif frame.payload is not None:
-                        await self.websocket.send_json(frame.payload)
+                        await asyncio.wait_for(
+                            self.websocket.send_json(frame.payload),
+                            timeout=self.send_timeout_seconds,
+                        )
+                except TimeoutError:
+                    await self._abort_stalled_transport()
+                    return
                 except WebSocketDisconnect:
                     self._closed = True
                     return
@@ -557,6 +664,26 @@ class AuthenticatedWebSocket:
                     self._outbound_queue.task_done()
         except asyncio.CancelledError:
             raise
+
+    async def _abort_stalled_transport(self) -> None:
+        """Close a socket that stopped accepting outbound frames."""
+        self._closed = True
+        tail = self._enqueue_tail
+        self._enqueue_tail = None
+        if tail is not None and not tail.done():
+            tail.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tail
+        self._drain_outbound_queue()
+        logger.warning(
+            "WebSocket send timed out",
+            extra={"connection_id": self.connection_id},
+        )
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                self.websocket.close(code=1013, reason="WebSocket send timeout"),
+                timeout=self.send_timeout_seconds,
+            )
 
     def _drain_outbound_queue(self) -> None:
         while True:
@@ -1004,8 +1131,9 @@ class WebSocketTurnObserver:
         # completed message back to streaming and re-arming the active-turn
         # indicator on the client.
         await self._flush_coalesced(result.conversation_id)
-        queued_messages = self._manager.app.state.turn_scheduler.queued_messages(
-            result.conversation_id
+        queued_messages = await _scheduler_queued_messages(
+            self._manager.app.state.turn_scheduler,
+            result.conversation_id,
         )
         # Flush any trailing sentence to TTS-enabled subscribers.
         if result.message_id and self._manager.has_tts_enabled_subscribers(result.conversation_id):
@@ -1216,19 +1344,52 @@ class WebSocketTurnObserver:
         kind: str | None = None,
         scope: str | None = None,
         turn_id: str | None = None,
+        retry_reason: str | None = None,
+        retry_source_turn_id: str | None = None,
+        attempt: int | None = None,
     ) -> None:
-        await self._manager.send_to_conversation(
-            conversation_id,
-            {
-                "type": "system_message",
-                "conversation_id": conversation_id,
-                "text": text,
-                "notice_id": notice_id,
-                "kind": kind,
-                "scope": scope,
-                "turn_id": turn_id,
-            },
-        )
+        payload: dict[str, Any] = {
+            "type": "system_message",
+            "conversation_id": conversation_id,
+            "text": text,
+            "notice_id": notice_id,
+            "kind": kind,
+            "scope": scope,
+            "turn_id": turn_id,
+        }
+        if retry_reason is not None:
+            payload["retry_reason"] = retry_reason
+        if retry_source_turn_id is not None:
+            payload["retry_source_turn_id"] = retry_source_turn_id
+        if attempt is not None:
+            payload["attempt"] = attempt
+        await self._manager.send_to_conversation(conversation_id, payload)
+        if notice_id is not None:
+            scheduler = getattr(self._manager.app.state, "turn_scheduler", None)
+            context = (
+                scheduler.relay_generation_context(conversation_id)
+                if scheduler is not None and hasattr(scheduler, "relay_generation_context")
+                else None
+            )
+            session_id = getattr(context, "session_id", None)
+            await self._manager.send_chat_v2_runtime_to_conversation(
+                conversation_id,
+                volatile_items=[
+                    system_message_runtime_item(
+                        notice_id=notice_id,
+                        content=text,
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        timestamp=datetime.now(UTC).isoformat(),
+                        notice_kind=kind,
+                        notice_scope=scope,
+                        retry_reason=retry_reason,
+                        retry_source_turn_id=retry_source_turn_id,
+                        attempt=attempt,
+                    )
+                ],
+                active_session_id=session_id,
+            )
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None:
         await self._manager.send_to_conversation(
@@ -1278,6 +1439,7 @@ class WebSocketConnectionManager:
 
         # Create the TurnObserver bridge
         self._observer = WebSocketTurnObserver(self)
+        self._relay_runtime_items: dict[str, tuple[str, dict[str, TimelineItem]]] = {}
 
         # Register as global EventBus subscriber for UI fanout
         event_bus = getattr(app.state, "event_bus", None)
@@ -1433,7 +1595,7 @@ class WebSocketConnectionManager:
         turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
         if turn_scheduler is None:
             return
-        messages = turn_scheduler.queued_messages(conversation_id)
+        messages = await _scheduler_queued_messages(turn_scheduler, conversation_id)
         await connection.send_json(
             {
                 "type": "queued_messages_updated",
@@ -1458,11 +1620,17 @@ class WebSocketConnectionManager:
         active_turn_state: dict[str, Any] | None = None
         runtime_server_time = server_time_iso()
         if turn_scheduler is not None:
-            queued_messages = turn_scheduler.queued_messages(conversation_id)
+            queued_messages = await _scheduler_queued_messages(
+                turn_scheduler,
+                conversation_id,
+            )
             active_streams = await turn_scheduler.active_stream_snapshots(conversation_id)
             active_tool_outputs = await turn_scheduler.active_tool_output_snapshots(conversation_id)
+            durable_running = getattr(turn_scheduler, "durable_running_turn_state", None)
             active_turn_state = (
-                turn_scheduler.running_turn_state(conversation_id)
+                await durable_running(conversation_id)
+                if callable(durable_running)
+                else turn_scheduler.running_turn_state(conversation_id)
                 if hasattr(turn_scheduler, "running_turn_state")
                 else None
             )
@@ -1495,6 +1663,7 @@ class WebSocketConnectionManager:
             "queued_messages": queued_messages,
             "queued_count": len(queued_messages),
             "has_active_turn": has_active_turn,
+            "active_turn": active_turn_state,
             "active_turn_chat_mode": (
                 active_turn_state.get("chat_mode") if active_turn_state else None
             ),
@@ -1605,6 +1774,18 @@ class WebSocketConnectionManager:
             scope.conversation_id,
             active_session_id=scope.session_id,
         )
+        runtime_turn = runtime.get("active_turn")
+        if (
+            isinstance(runtime_turn, dict)
+            and scope.kind != "conversation"
+            and scope.session_id
+            and runtime_turn.get("session_id") != scope.session_id
+        ):
+            runtime["has_active_turn"] = False
+            runtime["active_turn"] = None
+            runtime["active_streams"] = []
+            runtime["active_tool_outputs"] = []
+            runtime["active_thinking"] = []
         cursor = connection.chat_v2_cursors.get(scope.key)
         if not cursor:
             return
@@ -1662,6 +1843,19 @@ class WebSocketConnectionManager:
                 server_time=runtime.get("server_time"),
             ).model_dump(mode="json")
         )
+        relay = cast(Any, getattr(self.app.state, "chat_v2_runtime_relay", None))
+        scheduler = getattr(self.app.state, "turn_scheduler", None)
+        if (
+            relay is not None
+            and bool(runtime.get("has_active_turn"))
+            and scheduler is not None
+            and hasattr(scheduler, "durable_relay_generation_context")
+        ):
+            context = await scheduler.durable_relay_generation_context(scope.conversation_id)
+            if context is not None:
+                envelope = await relay.hydrate_latest(context)
+                if envelope is not None:
+                    await self.apply_relayed_runtime(envelope)
 
     def _unsubscribe(self, connection: AuthenticatedWebSocket, conversation_id: str) -> None:
         """Unsubscribe a connection from a conversation."""
@@ -1674,9 +1868,17 @@ class WebSocketConnectionManager:
                 del self._by_conversation[conversation_id]
         self._remove_turn_observer_if_unused(conversation_id)
 
-    async def send_to_conversation(self, conversation_id: str, payload: dict[str, Any]) -> None:
+    async def send_to_conversation(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+        *,
+        include_chat_v2: bool = False,
+    ) -> None:
         """Fan out a payload to all connections subscribed to a conversation."""
-        connection_ids = self._by_conversation.get(conversation_id, set())
+        connection_ids = set(self._by_conversation.get(conversation_id, set()))
+        if include_chat_v2:
+            connection_ids.update(self._by_chat_v2_conversation.get(conversation_id, set()))
         if not connection_ids:
             return
         payload = await self._enrich_conversation_updated_payload(conversation_id, payload)
@@ -1742,7 +1944,111 @@ class WebSocketConnectionManager:
         context_usage: dict[str, Any] | None = None,
         last_generation: dict[str, Any] | None = None,
     ) -> None:
-        """Fan out a runtime-only Chat v2 frame to opted-in connections."""
+        """Fan out locally first, then enqueue the same generation for Redis relay."""
+        relay = cast(Any, getattr(self.app.state, "chat_v2_runtime_relay", None))
+        turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+        context = (
+            turn_scheduler.relay_generation_context(conversation_id)
+            if turn_scheduler is not None and hasattr(turn_scheduler, "relay_generation_context")
+            else None
+        )
+        effective_items = volatile_items
+        if context is not None:
+            turn_id, cumulative = self._relay_runtime_items.get(
+                conversation_id,
+                (context.turn_id, {}),
+            )
+            if turn_id != context.turn_id:
+                cumulative = {}
+            if has_active_turn or volatile_items:
+                for item in volatile_items:
+                    cumulative[item.id] = item
+                effective_items = list(cumulative.values())
+                self._relay_runtime_items[conversation_id] = (context.turn_id, cumulative)
+            else:
+                effective_items = []
+        if not has_active_turn:
+            effective_items = [
+                item
+                for item in effective_items
+                if not (
+                    item.kind == "message"
+                    and item.role == "system"
+                    and item.notice_scope == "transient_retry"
+                )
+            ]
+        await self._fanout_chat_v2_runtime(
+            conversation_id,
+            volatile_items=effective_items,
+            has_active_turn=has_active_turn,
+            active_session_id=active_session_id,
+            context_usage=context_usage,
+            last_generation=last_generation,
+        )
+        if context is None or relay is None:
+            if not has_active_turn:
+                self._relay_runtime_items.pop(conversation_id, None)
+            return
+        try:
+            running_state = (
+                turn_scheduler.running_turn_state(conversation_id)
+                if turn_scheduler is not None
+                else None
+            )
+            active_turn_data = (
+                {
+                    "turn_id": context.turn_id,
+                    "session_id": context.session_id,
+                    "status": (running_state or {}).get("status") or "running",
+                    "chat_mode": (running_state or {}).get("chat_mode"),
+                    "chat_mode_source": (running_state or {}).get("chat_mode_source"),
+                }
+                if has_active_turn
+                else None
+            )
+            from cognis.api.chat_v2.schemas import RuntimeActiveTurn
+            from cognis.models.config import GenerationPerformanceSnapshot
+
+            envelope = relay.make_envelope(
+                context,
+                kind=RelayKind.RUNTIME if has_active_turn else RelayKind.TERMINAL,
+                has_active_turn=has_active_turn,
+                active_turn=(
+                    RuntimeActiveTurn.model_validate(active_turn_data)
+                    if active_turn_data is not None
+                    else None
+                ),
+                volatile_items=effective_items,
+                context_usage=context_usage,
+                last_generation=(
+                    GenerationPerformanceSnapshot.model_validate(last_generation)
+                    if last_generation is not None
+                    else None
+                ),
+            )
+            cumulative_boundary = _runtime_relay_cumulative_boundary(
+                effective_items,
+                has_active_turn=has_active_turn,
+            )
+            relay.enqueue(envelope, cumulative_boundary=cumulative_boundary)
+        except (TypeError, ValueError):
+            return
+        finally:
+            if not has_active_turn:
+                self._relay_runtime_items.pop(conversation_id, None)
+
+    async def _fanout_chat_v2_runtime(
+        self,
+        conversation_id: str,
+        *,
+        volatile_items: list[TimelineItem],
+        has_active_turn: bool,
+        active_session_id: str | None,
+        context_usage: dict[str, Any] | None,
+        last_generation: dict[str, Any] | None,
+        active_turn: dict[str, Any] | None = None,
+    ) -> None:
+        """Apply a runtime overlay to authorized local scopes only."""
 
         connection_ids = self._by_chat_v2_conversation.get(conversation_id, set())
         if not connection_ids:
@@ -1769,9 +2075,9 @@ class WebSocketConnectionManager:
                     runtime_revision=runtime_revision,
                     has_active_turn=has_active_turn,
                     active_turn=(
-                        self._chat_v2_active_turn_payload(
-                            conversation_id,
-                            active_session_id=active_session_id,
+                        active_turn
+                        or self._chat_v2_active_turn_payload(
+                            conversation_id, active_session_id=active_session_id
                         )
                         if has_active_turn
                         else None
@@ -1798,6 +2104,68 @@ class WebSocketConnectionManager:
                     block=False,
                 )
 
+    def has_chat_v2_subscriber(self, conversation_id: str) -> bool:
+        return bool(self._by_chat_v2_conversation.get(conversation_id))
+
+    async def validate_relay_envelope(
+        self, envelope: ChatV2RuntimeRelayEnvelope
+    ) -> AdmissionDecision:
+        """Validate Redis control data against the current PostgreSQL owner generation."""
+        scheduler = getattr(self.app.state, "turn_scheduler", None)
+        context = (
+            await scheduler.durable_relay_generation_context(envelope.conversation_id)
+            if scheduler is not None and hasattr(scheduler, "durable_relay_generation_context")
+            else None
+        )
+        if context is None and envelope.kind == RelayKind.TERMINAL:
+            context = (
+                await scheduler.durable_terminal_relay_generation_context(
+                    envelope.direct_request_id
+                )
+                if scheduler is not None
+                and hasattr(scheduler, "durable_terminal_relay_generation_context")
+                else None
+            )
+        if context is None:
+            return AdmissionDecision.STALE
+        if (
+            context.conversation_id != envelope.conversation_id
+            or context.turn_id != envelope.turn_id
+            or context.direct_request_id != envelope.direct_request_id
+            or context.session_id != envelope.session_id
+        ):
+            return AdmissionDecision.WRONG_TURN
+        if context.fencing_token != envelope.fencing_token:
+            return AdmissionDecision.WRONG_FENCE
+        if (
+            context.owner_controller_id != envelope.owner.controller_id
+            or context.owner_incarnation_id != envelope.owner.incarnation_id
+        ):
+            return AdmissionDecision.STALE
+        return AdmissionDecision.ACCEPT
+
+    async def apply_relayed_runtime(self, envelope: ChatV2RuntimeRelayEnvelope) -> None:
+        """Apply a validated relay envelope locally without publishing it again."""
+        if not self.has_chat_v2_subscriber(envelope.conversation_id):
+            return
+        await self._fanout_chat_v2_runtime(
+            envelope.conversation_id,
+            volatile_items=list(envelope.volatile_items),
+            has_active_turn=envelope.has_active_turn,
+            active_session_id=envelope.session_id,
+            context_usage=envelope.context_usage,
+            last_generation=(
+                envelope.last_generation.model_dump(mode="json")
+                if envelope.last_generation is not None
+                else None
+            ),
+            active_turn=(
+                envelope.active_turn.model_dump(mode="json")
+                if envelope.active_turn is not None
+                else None
+            ),
+        )
+
     def _chat_v2_active_turn_payload(
         self,
         conversation_id: str,
@@ -1810,6 +2178,13 @@ class WebSocketConnectionManager:
         has_active_turn = bool(runtime.get("has_active_turn")) if runtime is not None else True
         if not has_active_turn:
             return None
+        durable_turn = runtime.get("active_turn") if isinstance(runtime, dict) else None
+        if (
+            isinstance(durable_turn, dict)
+            and isinstance(durable_turn.get("turn_id"), str)
+            and isinstance(durable_turn.get("session_id"), str)
+        ):
+            return durable_turn
         turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
         checkpoint = (
             turn_scheduler.active_turn_checkpoint(conversation_id)
@@ -1914,8 +2289,15 @@ class WebSocketConnectionManager:
                             )
                         )
                         turn_scheduler = getattr(self.app.state, "turn_scheduler", None)
+                        durable_running = (
+                            getattr(turn_scheduler, "durable_running_turn_state", None)
+                            if turn_scheduler is not None
+                            else None
+                        )
                         running_turn_state = (
-                            turn_scheduler.running_turn_state(conversation.conversation_id)
+                            await durable_running(conversation.conversation_id)
+                            if callable(durable_running)
+                            else turn_scheduler.running_turn_state(conversation.conversation_id)
                             if turn_scheduler is not None
                             and hasattr(turn_scheduler, "running_turn_state")
                             else None
@@ -2038,6 +2420,9 @@ class WebSocketConnectionManager:
 
     async def _handle_event(self, event: Event) -> None:
         """Convert EventBus events to WS payloads and fan out."""
+        if event.type == EventType.CLUSTER_SCOPE_INVALIDATED:
+            await self._handle_cluster_scope_invalidated(event)
+            return
         # FOLLOW_UP_TURN_REQUESTED is handled by TurnScheduler
         if event.type == EventType.FOLLOW_UP_TURN_REQUESTED:
             return
@@ -2088,6 +2473,29 @@ class WebSocketConnectionManager:
                     volatile_items=[compaction_item],
                     active_session_id=compaction_item.session_id,
                 )
+        elif event.type == EventType.SYSTEM_NOTICE:
+            notice_id = event.data.get("notice_id")
+            message = event.data.get("message")
+            if isinstance(notice_id, str) and notice_id and isinstance(message, str) and message:
+                session_id = event.data.get("session_id")
+                await self.send_chat_v2_runtime_to_conversation(
+                    conversation_id,
+                    volatile_items=[
+                        system_message_runtime_item(
+                            notice_id=notice_id,
+                            content=message,
+                            turn_id=event.data.get("turn_id"),
+                            session_id=session_id if isinstance(session_id, str) else None,
+                            timestamp=datetime.now(UTC).isoformat(),
+                            notice_kind=event.data.get("kind"),
+                            notice_scope=event.data.get("scope"),
+                            retry_reason=event.data.get("retry_reason"),
+                            retry_source_turn_id=event.data.get("retry_source_turn_id"),
+                            attempt=event.data.get("attempt"),
+                        )
+                    ],
+                    active_session_id=session_id if isinstance(session_id, str) else None,
+                )
 
         suppress_legacy_payload = False
         if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
@@ -2101,7 +2509,21 @@ class WebSocketConnectionManager:
 
         payload = None if suppress_legacy_payload else _event_to_payload(event, conversation_id)
         if payload is not None:
-            await self.send_to_conversation(conversation_id, payload)
+            is_escalation = event.type in {
+                EventType.ESCALATION_CREATED,
+                EventType.ESCALATION_RESOLVED,
+            } or (
+                event.type in {EventType.NOTIFICATION_CREATED, EventType.NOTIFICATION_RESOLVED}
+                and event.data.get("notification_type") == "escalation"
+            )
+            if is_escalation:
+                await self.send_to_conversation(
+                    conversation_id,
+                    payload,
+                    include_chat_v2=True,
+                )
+            else:
+                await self.send_to_conversation(conversation_id, payload)
         activity_payload = self._conversation_activity_payload(event, conversation_id)
         if activity_payload is not None:
             await self.send_to_conversation(conversation_id, activity_payload)
@@ -2139,6 +2561,248 @@ class WebSocketConnectionManager:
                     data={**event.data, "source_kind": source_kind},
                 )
             )
+
+    def subscribed_cluster_scopes(self) -> list[dict[str, str]]:
+        """Return unique server-authorized scopes for bounded reconciliation."""
+        scopes: dict[str, dict[str, str]] = {}
+        cluster_signals = getattr(self.app.state, "cluster_signals", None)
+        for connection in self._connections.values():
+            owner_token = (
+                cluster_signals.owner_token(connection.user_email)
+                if cluster_signals is not None
+                else None
+            )
+            scopes.setdefault(
+                f"user:{connection.user_email}",
+                {
+                    "user_email": connection.user_email,
+                    **({"owner_token": owner_token} if owner_token else {}),
+                },
+            )
+            for scope in connection.chat_v2_scopes.values():
+                payload = {
+                    key: value
+                    for key in (
+                        "conversation_id",
+                        "session_id",
+                        "task_id",
+                        "step_run_id",
+                    )
+                    if isinstance((value := getattr(scope, key, None)), str) and value
+                }
+                payload["user_email"] = connection.user_email
+                scopes.setdefault(scope.key, payload)
+                scopes.setdefault(
+                    f"work:{scope.key}",
+                    {
+                        "user_email": connection.user_email,
+                        "work_scope_key": scope.key,
+                    },
+                )
+        return list(scopes.values())
+
+    async def _handle_cluster_scope_invalidated(self, event: Event) -> None:
+        raw_scope = event.data.get("scope")
+        revision = event.data.get("revision")
+        kind = event.data.get("kind")
+        if not isinstance(raw_scope, dict) or not isinstance(revision, str):
+            return
+        event_session_token = raw_scope.get("event_session_token")
+        if kind == "event_store_session_invalidated" and isinstance(event_session_token, str):
+            cached_event_store = getattr(self.app.state, "cached_event_store", None)
+            if cached_event_store is not None:
+                await cached_event_store.invalidate_session_token(
+                    event_session_token,
+                    source="cluster_signal",
+                )
+                connection_ids = await self._chat_v2_connection_ids_for_event_session_token(
+                    event_session_token,
+                    cached_event_store,
+                )
+                payload = {
+                    "type": "scope_invalidated",
+                    "reason": str(kind),
+                    "revision": revision,
+                }
+                for connection_id in connection_ids:
+                    connection = self._connections.get(connection_id)
+                    if connection is not None:
+                        connection.send_scope_invalidation_nowait(payload)
+            return
+        conversation_id = raw_scope.get("conversation_id")
+        session_id = raw_scope.get("session_id")
+        task_id = raw_scope.get("task_id")
+        step_run_id = raw_scope.get("step_run_id")
+        owner_token = raw_scope.get("owner_token")
+        work_scope_key = raw_scope.get("work_scope_key")
+        owner_email = await self._resolve_cluster_signal_owner(raw_scope)
+        if owner_email is None and isinstance(owner_token, str):
+            cluster_signals = getattr(self.app.state, "cluster_signals", None)
+            if cluster_signals is not None:
+                owner_email = next(
+                    (
+                        email
+                        for email in self._by_user
+                        if cluster_signals.owner_token_matches(email, owner_token)
+                    ),
+                    None,
+                )
+
+        if isinstance(session_id, str):
+            session_cache = getattr(self.app.state, "session_cache", None)
+            if session_cache is not None:
+                await session_cache.invalidate_canonical(session_id)
+        if isinstance(conversation_id, str):
+            relay = getattr(self.app.state, "chat_v2_runtime_relay", None)
+            if relay is not None:
+                relay.invalidate(conversation_id)
+            self._relay_runtime_items.pop(conversation_id, None)
+
+        connection_ids: set[str] = set()
+        for scope_key, subscribed in self._by_chat_v2_scope.items():
+            sample = next(
+                (
+                    connection.chat_v2_scopes.get(scope_key)
+                    for connection_id in subscribed
+                    if (connection := self._connections.get(connection_id)) is not None
+                ),
+                None,
+            )
+            if sample is None:
+                continue
+            matches = (
+                (isinstance(conversation_id, str) and sample.conversation_id == conversation_id)
+                or (isinstance(session_id, str) and sample.session_id == session_id)
+                or (isinstance(task_id, str) and sample.task_id == task_id)
+                or (isinstance(step_run_id, str) and sample.step_run_id == step_run_id)
+                or (isinstance(work_scope_key, str) and sample.key == work_scope_key)
+            )
+            if matches:
+                connection_ids.update(subscribed)
+
+        if (
+            kind in {"sidebar_changed", "executor_state_changed", "chat_scope_changed"}
+            and owner_email is not None
+        ):
+            connection_ids.update(self._by_user.get(owner_email, set()))
+
+        payload = {
+            "type": "work_invalidated" if kind == "work_invalidated" else "scope_invalidated",
+            "reason": str(kind),
+            "revision": revision,
+            **{
+                key: value
+                for key, value in raw_scope.items()
+                if key
+                in {
+                    "conversation_id",
+                    "session_id",
+                    "task_id",
+                    "step_run_id",
+                    "work_scope_key",
+                }
+                and isinstance(value, str)
+            },
+        }
+        for connection_id in connection_ids:
+            connection = self._connections.get(connection_id)
+            if connection is None:
+                continue
+            # Scope registries were populated only after server-side authorization.
+            # Owner-wide sidebar invalidations are additionally constrained here.
+            if owner_email is not None and connection.user_email != owner_email:
+                continue
+            connection.send_scope_invalidation_nowait(payload)
+
+    async def _chat_v2_connection_ids_for_event_session_token(
+        self,
+        event_session_token: str,
+        cached_event_store: Any,
+    ) -> set[str]:
+        """Return local Chat v2 subscribers whose event store session was invalidated."""
+
+        subscribed_scopes = [
+            (connection_id, scope)
+            for connection_id, connection in self._connections.items()
+            for scope in connection.chat_v2_scopes.values()
+            if isinstance(scope.session_id, str) and scope.session_id
+        ]
+        if not subscribed_scopes:
+            return set()
+
+        async with self.app.state.session_factory() as session:
+            conversation_ids = {
+                scope.conversation_id
+                for _, scope in subscribed_scopes
+                if scope.kind == "conversation"
+                and isinstance(scope.conversation_id, str)
+                and scope.conversation_id
+            }
+            active_session_ids_by_conversation: dict[str, str] = {}
+            if conversation_ids:
+                result = await session.execute(
+                    select(Conversation.conversation_id, Conversation.active_session_id).where(
+                        Conversation.conversation_id.in_(conversation_ids)
+                    )
+                )
+                active_session_ids_by_conversation = {
+                    conversation_id: active_session_id
+                    for conversation_id, active_session_id in result
+                    if isinstance(active_session_id, str) and active_session_id
+                }
+            session_id_by_scope_key = {
+                scope.key: (
+                    active_session_ids_by_conversation.get(scope.conversation_id, scope.session_id)
+                    if scope.kind == "conversation" and scope.conversation_id
+                    else scope.session_id
+                )
+                for _, scope in subscribed_scopes
+            }
+            subscribed_session_ids = set(session_id_by_scope_key.values())
+            result = await session.execute(
+                select(Session).where(Session.session_id.in_(subscribed_session_ids))
+            )
+            affected_session_ids = {
+                row.session_id
+                for row in result.scalars()
+                if cached_event_store.session_token(
+                    "intaris",
+                    row.intaris_session_id or row.session_id,
+                )
+                == event_session_token
+            }
+        if not affected_session_ids:
+            return set()
+
+        return {
+            connection_id
+            for connection_id, scope in subscribed_scopes
+            if session_id_by_scope_key[scope.key] in affected_session_ids
+        }
+
+    async def _resolve_cluster_signal_owner(self, raw_scope: dict[str, Any]) -> str | None:
+        conversation_id = raw_scope.get("conversation_id")
+        task_id = raw_scope.get("task_id")
+        executor_id = raw_scope.get("executor_id")
+        notification_id = raw_scope.get("notification_id")
+        async with self.app.state.session_factory() as session:
+            if isinstance(conversation_id, str):
+                conversation = await session.get(Conversation, conversation_id)
+                if conversation is not None:
+                    return str(conversation.user_email)
+            if isinstance(task_id, str):
+                task = await session.get(Task, task_id)
+                if task is not None:
+                    return str(task.created_by)
+            if isinstance(executor_id, str):
+                executor = await session.get(ExecutorRow, executor_id)
+                if executor is not None and executor.owner_email:
+                    return str(executor.owner_email)
+            if isinstance(notification_id, str):
+                notification = await session.get(NotificationRow, notification_id)
+                if notification is not None:
+                    return str(notification.user_email)
+        return None
 
     async def _send_conversation_state_snapshot(
         self,
@@ -2342,8 +3006,15 @@ class WebSocketConnectionManager:
                 [conversation_id],
             )
         scheduler = getattr(self.app.state, "turn_scheduler", None)
+        durable_running = (
+            getattr(scheduler, "durable_running_turn_state", None)
+            if scheduler is not None
+            else None
+        )
         running_turn_state = (
-            scheduler.running_turn_state(conversation_id)
+            await durable_running(conversation_id)
+            if callable(durable_running)
+            else scheduler.running_turn_state(conversation_id)
             if scheduler is not None and hasattr(scheduler, "running_turn_state")
             else None
         )
@@ -2494,7 +3165,7 @@ class WebSocketConnectionManager:
             )
             return
         replayed = 0
-        async with self.app.state.session_factory() as artifact_session:
+        async with self.app.state.session_factory() as _artifact_session:
             artifact_store = self.app.state.artifact_store
             for item in result.events:
                 event_type = item.get("type")
@@ -2506,7 +3177,7 @@ class WebSocketConnectionManager:
                         raw_attachments if isinstance(raw_attachments, list) else []
                     )
                     attachments = await hydrate_attachment_refs(
-                        artifact_session,
+                        self.app.state.session_factory,
                         artifact_store,
                         replay_attachments,
                         owner_email=connection.user_email,
@@ -2524,7 +3195,7 @@ class WebSocketConnectionManager:
                         raw_attachments if isinstance(raw_attachments, list) else []
                     )
                     attachments = await hydrate_attachment_refs(
-                        artifact_session,
+                        self.app.state.session_factory,
                         artifact_store,
                         replay_attachments,
                         owner_email=connection.user_email,
@@ -2552,7 +3223,7 @@ class WebSocketConnectionManager:
                         raw_attachments if isinstance(raw_attachments, list) else []
                     )
                     attachments = await hydrate_attachment_refs(
-                        artifact_session,
+                        self.app.state.session_factory,
                         artifact_store,
                         replay_attachments,
                         owner_email=connection.user_email,
@@ -2675,6 +3346,9 @@ class WebSocketConnectionManager:
                             "notice_id": data.get("notice_id"),
                             "kind": data.get("kind"),
                             "scope": data.get("scope"),
+                            "retry_reason": data.get("retry_reason"),
+                            "retry_source_turn_id": data.get("retry_source_turn_id"),
+                            "attempt": data.get("attempt"),
                         }
                     )
                     replayed += 1
@@ -2690,6 +3364,9 @@ class WebSocketConnectionManager:
                             "turn_id": data.get("turn_id"),
                             "notice_id": data.get("notice_id"),
                             "kind": data.get("kind"),
+                            "retry_reason": data.get("retry_reason"),
+                            "retry_source_turn_id": data.get("retry_source_turn_id"),
+                            "attempt": data.get("attempt"),
                             "scope": data.get("scope"),
                         }
                     )
@@ -3130,10 +3807,22 @@ async def _handle_message(
 
         # Try command dispatch
         if session_model is not None:
-            has_active = (
-                turn_scheduler.has_running_turn(conversation_id) if turn_scheduler else False
+            durable_running = (
+                getattr(turn_scheduler, "durable_running_turn_state", None)
+                if turn_scheduler is not None
+                else None
             )
-            has_busy = turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
+            runtime_turn = (
+                await durable_running(conversation_id)
+                if callable(durable_running)
+                else turn_scheduler.running_turn_state(conversation_id)
+                if turn_scheduler is not None
+                else None
+            )
+            has_active = runtime_turn is not None
+            has_busy = has_active or (
+                turn_scheduler.has_active_turn(conversation_id) if turn_scheduler else False
+            )
             cmd_result = await command_dispatcher.dispatch(
                 content,
                 conversation=conversation_model,
@@ -3784,14 +4473,16 @@ async def _render_command_result(
 ) -> None:
     """Render a CommandResult into WebSocket payloads."""
     if result.type == "system_message":
-        await _persist_command_system_notice(
-            conversation_id,
-            result,
-            app=app,
-            session=session,
-            agent=agent,
-            user_email=user_email,
-        )
+        if app is not None and session is not None and agent is not None and user_email:
+            await persist_command_system_notice(
+                conversation_id=conversation_id,
+                result=result,
+                providers=app.state.providers,
+                session_cache=getattr(app.state, "session_cache", None),
+                session=session,
+                agent=agent,
+                user_email=user_email,
+            )
         await manager.send_to_conversation(
             conversation_id,
             {
@@ -3877,88 +4568,6 @@ async def _render_command_result(
         )
 
 
-_PERSISTED_COMMAND_NOTICE_COMMANDS = frozenset({"/profile", "/model", "/thinking"})
-
-
-async def _persist_command_system_notice(
-    conversation_id: str,
-    result: Any,
-    *,
-    app: Any | None,
-    session: Any | None,
-    agent: AgentDefinition | None,
-    user_email: str | None,
-) -> None:
-    """Persist visible command feedback as a durable lifecycle system_notice."""
-
-    text = result.text if isinstance(result.text, str) else ""
-    command = result.data.get("command") if isinstance(result.data, dict) else None
-    if (
-        not text
-        or command not in _PERSISTED_COMMAND_NOTICE_COMMANDS
-        or app is None
-        or session is None
-        or agent is None
-        or not user_email
-    ):
-        return
-
-    notice_id = result.data.get("notice_id")
-    if not isinstance(notice_id, str) or not notice_id:
-        notice_id = f"command:{str(command).lstrip('/')}:{uuid.uuid4().hex}"
-        result.data["notice_id"] = notice_id
-
-    event_data = {
-        **result.data,
-        "event": "system_notice",
-        "message": text,
-        "content": text,
-        "text": text,
-        "notice_id": notice_id,
-        "kind": "command_result",
-        "scope": "session",
-        "session_id": getattr(session, "session_id", None),
-        "command": command,
-    }
-    event = SessionEvent(type="lifecycle", data=event_data)
-    intaris_session_id = getattr(session, "intaris_session_id", None) or getattr(
-        session, "session_id", None
-    )
-    if not intaris_session_id:
-        return
-
-    try:
-        append_result = await app.state.providers.guardrails.record_events(
-            session_id=intaris_session_id,
-            events=[event],
-            source="cognis",
-            idempotency_key=f"{intaris_session_id}:command_system_notice:{notice_id}",
-            user_email=user_email,
-            agent_id=agent.agent_id,
-            agent_owner_email=getattr(agent, "owner_email", user_email),
-        )
-        if not append_result.ok:
-            raise RuntimeError("Intaris did not persist command system notice")
-        if append_result.count <= 0:
-            return
-        session_cache = getattr(app.state, "session_cache", None)
-        if session_cache is not None and hasattr(session_cache, "append_recorded_events"):
-            await session_cache.append_recorded_events(session, [event], append_result)
-    except Exception:
-        logger.warning(
-            "websocket: failed to persist command system notice",
-            extra={
-                "extra_data": {
-                    "conversation_id": conversation_id,
-                    "session_id": getattr(session, "session_id", None),
-                    "command": command,
-                    "notice_id": notice_id,
-                }
-            },
-            exc_info=True,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Event-to-payload mapping
 # ---------------------------------------------------------------------------
@@ -4029,6 +4638,8 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "attempts_per_cycle",
             "continuation_attempts",
             "recoverable",
+            "retry_reason",
+            "retry_source_turn_id",
         ):
             if key in event.data:
                 payload[key] = event.data.get(key)
@@ -4234,6 +4845,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "call_id": event.data.get("call_id"),
             "tool_call_id": event.data.get("tool_call_id"),
             "tool_name": event.data.get("tool_name"),
+            "arguments_display": event.data.get("arguments_display"),
             "risk": event.data.get("risk"),
             "reasoning": event.data.get("reasoning"),
             "timeout_seconds": event.data.get("timeout_seconds"),

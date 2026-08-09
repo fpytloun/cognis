@@ -14,7 +14,7 @@ from cognis.api.models import (
     SessionResponse,
 )
 from cognis.api.serializers import session_to_response
-from cognis.models.config import GenerationPerformanceSnapshot
+from cognis.models.config import GenerationPerformanceSnapshot, TokenUsage
 from cognis.store.queries import get_session_row
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,22 @@ def _last_generation_for_session(
             session_id,
             exc_info=True,
         )
+        return None
+
+
+def _token_usage_for_session(request: Request, session_id: str) -> TokenUsage | None:
+    """Return normalized provider-reported token usage for the latest LLM call."""
+
+    context_usage = _context_usage_for_session(request, session_id)
+    if not isinstance(context_usage, dict):
+        return None
+    raw_usage = context_usage.get("last_llm_usage")
+    if not isinstance(raw_usage, dict) or not raw_usage:
+        return None
+    try:
+        return TokenUsage.model_validate(raw_usage)
+    except Exception:
+        logger.debug("Failed to normalize token usage for session %s", session_id, exc_info=True)
         return None
 
 
@@ -110,6 +126,7 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
             denied_count=intaris_session.denied_count,
             escalated_count=intaris_session.escalated_count,
             context_usage=_context_usage_for_session(request, row.session_id),
+            token_usage=_token_usage_for_session(request, row.session_id),
             last_generation=_last_generation_for_session(request, row.session_id),
         )
     except Exception as exc:

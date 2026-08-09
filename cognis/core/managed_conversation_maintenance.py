@@ -42,11 +42,13 @@ class ManagedConversationMaintenanceService:
         turn_scheduler: Any,
         interval_seconds: int = 3600,
         batch_limit: int = 100,
+        managed_channel_service: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
         self._interval_seconds = interval_seconds
         self._batch_limit = batch_limit
+        self._managed_channel_service = managed_channel_service
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -69,6 +71,13 @@ class ManagedConversationMaintenanceService:
 
     async def run_once(self) -> ManagedConversationMaintenanceResult:
         now = datetime.now(UTC)
+        if self._managed_channel_service is not None:
+            await self._managed_channel_service.recover_stale_reservations(now=now)
+            await self._managed_channel_service.purge_expired_group_context(now=now)
+            await self._managed_channel_service.expire_bindings(
+                now=now,
+                limit=self._batch_limit,
+            )
         async with self._session_factory() as session:
             retention_days = await _resolve_retention_days(session)
             if retention_days is None:

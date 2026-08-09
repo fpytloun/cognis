@@ -29,7 +29,9 @@ from cognis.api.models import (
     StepRunResponse,
     TaskCommentResponse,
     TaskDetailResponse,
+    TaskProgressProjection,
     TaskResponse,
+    TaskWorkflowProjection,
     ToolResponse,
     WorkflowResponse,
     WorkflowRunResponse,
@@ -114,6 +116,7 @@ def conversation_to_response(
     pending_notification_types: list[str] | None = None,
     conversation_state: ConversationStateEnvelope | None = None,
     managed_link: Any | None = None,
+    root_controller_conversation_id: str | None = None,
 ) -> ConversationResponse:
     last_message_at = getattr(row, "last_message_at", None)
     last_read_at = getattr(row, "last_read_at", None)
@@ -216,6 +219,7 @@ def conversation_to_response(
             if platform_data.get("kind") in {"agent_work", "managed_agent_conversation"}
             else None
         ),
+        root_controller_conversation_id=root_controller_conversation_id,
         created_at=getattr(row, "created_at", None),
         updated_at=getattr(row, "updated_at", None),
         conversation_state=conversation_state,
@@ -227,6 +231,7 @@ def session_to_response(row: Any, *, include_result_content: bool = False) -> Se
     result_anchors = _session_result_anchors(result_content)
     return SessionResponse(
         session_id=row.session_id,
+        activity_scope_id=getattr(row, "activity_scope_id", None) or row.session_id,
         conversation_id=row.conversation_id,
         parent_session_id=row.parent_session_id,
         previous_session_id=getattr(row, "previous_session_id", None),
@@ -496,13 +501,17 @@ def task_detail_to_response(
     step_runs: list[StepRunResponse],
     pending_pause: PendingPauseResponse | None,
     workflow_run: WorkflowRunResponse | None,
+    workflow_projection: TaskWorkflowProjection | None = None,
+    progress: TaskProgressProjection | None = None,
 ) -> TaskDetailResponse:
     return TaskDetailResponse(
-        **task_to_response(task).model_dump(),
+        **task_to_response(task).model_dump(exclude={"progress"}),
         dependencies=dependencies,
         step_runs=step_runs,
         pending_pause=pending_pause,
         workflow_run=workflow_run,
+        workflow_projection=workflow_projection,
+        progress=progress,
     )
 
 
@@ -667,6 +676,11 @@ def workflow_to_response(row: Any) -> WorkflowResponse:
         interaction=dict(definition.get("interaction", {})),
         defaults=dict(definition.get("defaults", {})),
         steps=list(definition.get("steps", [])),
+        presentation=(
+            dict(definition["presentation"])
+            if isinstance(definition.get("presentation"), Mapping)
+            else None
+        ),
         is_system=row.is_system,
         owner_email=row.owner_email,
         lifecycle=getattr(row, "lifecycle", str(definition.get("lifecycle", "persistent"))),

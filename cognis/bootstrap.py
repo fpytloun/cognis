@@ -23,19 +23,16 @@ from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.settings_schema import DEFAULT_SETTINGS
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.migrations.compat import normalize_legacy_profile_override_revision
-from cognis.store.models import Base
+from cognis.store.models import Base, Setting
 from cognis.store.queries import (
     count_users,
-    create_skill,
     create_skill_version,
-    create_user,
     get_next_version_number,
-    get_setting,
-    get_skill,
     get_skill_version,
+    insert_row_if_absent,
     set_current_version,
-    upsert_setting,
 )
+from cognis.store.schema import validate_schema
 from cognis.tools.skill_parser import compute_content_hash
 
 logger = get_logger(__name__)
@@ -151,6 +148,8 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_session_lifecycle_columns)
         await conn.run_sync(_ensure_delegate_lineage_column)
         await conn.run_sync(_ensure_session_compaction_columns)
+        await conn.run_sync(_ensure_session_activity_scope_column)
+        await conn.run_sync(_ensure_task_source_session_column)
         await conn.run_sync(_ensure_api_key_columns)
         await conn.run_sync(_ensure_agent_capabilities_column)
         await conn.run_sync(_ensure_agent_sync_metadata_column)
@@ -165,6 +164,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_conversation_active_executor_id)
         await conn.run_sync(_ensure_task_active_executor_id)
         await conn.run_sync(_ensure_active_executor_lifecycle_columns)
+        await conn.run_sync(_ensure_executor_pin_stage3_schema)
         await conn.run_sync(_ensure_avatar_image_id_column)
         await conn.run_sync(_ensure_executor_runtime_state_columns)
         await conn.run_sync(_ensure_executor_token_version_column)
@@ -184,9 +184,18 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_task_creator_agent_column)
         await conn.run_sync(_ensure_task_session_policy_column)
+        await conn.run_sync(_ensure_task_control_conversation_column)
+        await conn.run_sync(_ensure_conversation_lineage_columns)
+        await conn.run_sync(_ensure_work_scope_revision_tables)
         await conn.run_sync(_ensure_task_board_indexes)
         await conn.run_sync(_ensure_agent_profile_columns)
         await conn.run_sync(_ensure_managed_conversation_lineage)
+        await conn.run_sync(_ensure_managed_channel_foundation)
+        await conn.run_sync(_ensure_channel_observed_targets)
+        await conn.run_sync(_ensure_managed_channel_lifecycle_columns)
+        await conn.run_sync(_ensure_managed_channel_resume_columns)
+        await conn.run_sync(_ensure_managed_channel_fence_columns)
+        await conn.run_sync(_ensure_group_context_columns)
         await conn.run_sync(_ensure_step_run_execution_paths)
         await conn.run_sync(_ensure_deliverables_table)
         await conn.run_sync(_ensure_step_run_deliverable_columns)
@@ -213,6 +222,97 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_local_model_byte_counter_types)
         await conn.run_sync(_ensure_local_model_provider_columns)
         await conn.run_sync(_ensure_channel_delivery_progress_columns)
+        await conn.run_sync(_ensure_coordination_leases_table)
+        await conn.run_sync(_ensure_controller_instances_table)
+        await conn.run_sync(_ensure_direct_turn_requests_table)
+        await conn.run_sync(_ensure_schedule_fires_table)
+        await conn.run_sync(_ensure_channel_recipient_intents_table)
+        await conn.run_sync(_ensure_work_projection_tables)
+
+
+def _ensure_coordination_leases_table(sync_conn: object) -> None:
+    from cognis.store.models import CoordinationLeaseRow
+
+    cast(Any, CoordinationLeaseRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_controller_instances_table(sync_conn: object) -> None:
+    from cognis.store.models import ControllerInstanceRow
+
+    cast(Any, ControllerInstanceRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_direct_turn_requests_table(sync_conn: object) -> None:
+    from cognis.store.models import DirectTurnRequestRow
+
+    cast(Any, DirectTurnRequestRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_schedule_fires_table(sync_conn: object) -> None:
+    from cognis.store.models import (
+        ChannelAccountOperationRow,
+        ScheduleCatchupStateRow,
+        ScheduleFireRow,
+    )
+
+    cast(Any, ScheduleFireRow.__table__).create(bind=sync_conn, checkfirst=True)
+    cast(Any, ScheduleCatchupStateRow.__table__).create(bind=sync_conn, checkfirst=True)
+    cast(Any, ChannelAccountOperationRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_channel_recipient_intents_table(sync_conn: object) -> None:
+    """Create explicit-recipient intent storage for fresh and older databases."""
+
+    from cognis.store.models import ChannelRecipientIntentRow
+
+    cast(Any, ChannelRecipientIntentRow.__table__).create(bind=sync_conn, checkfirst=True)
+    inspector = cast(Any, inspect(sync_conn))
+    columns = {column["name"] for column in inspector.get_columns("channel_recipient_intents")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    for column_name, ddl in (
+        ("content", "TEXT NOT NULL DEFAULT ''"),
+        ("conversation_id", "VARCHAR NOT NULL DEFAULT ''"),
+        ("idempotency_key", "VARCHAR NOT NULL DEFAULT ''"),
+        ("idempotency_scope", "VARCHAR NOT NULL DEFAULT ''"),
+        ("payload_json", "JSON NOT NULL DEFAULT '{}'"),
+    ):
+        if column_name not in columns:
+            execute(text(f"ALTER TABLE channel_recipient_intents ADD COLUMN {column_name} {ddl}"))
+
+
+def _ensure_work_projection_tables(sync_conn: object) -> None:
+    """Create the rebuildable durable Work projection tables."""
+
+    from cognis.store.models import (
+        WorkRecordFileRow,
+        WorkRecordRow,
+        WorkSessionProjectionRow,
+    )
+
+    cast(Any, WorkRecordRow.__table__).create(bind=sync_conn, checkfirst=True)
+    cast(Any, WorkRecordFileRow.__table__).create(bind=sync_conn, checkfirst=True)
+    cast(Any, WorkSessionProjectionRow.__table__).create(bind=sync_conn, checkfirst=True)
+    inspector = cast(Any, inspect(sync_conn))
+    columns = {column["name"] for column in inspector.get_columns("work_records")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    additions = {
+        "category": "VARCHAR",
+        "entity_id": "VARCHAR",
+        "file_path_ids": "JSON NOT NULL DEFAULT '[]'",
+        "additions": "INTEGER NOT NULL DEFAULT 0",
+        "deletions": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, ddl in additions.items():
+        if name not in columns:
+            execute(text(f"ALTER TABLE work_records ADD COLUMN {name} {ddl}"))
+    indexes = {index["name"] for index in inspector.get_indexes("work_records")}
+    for index_name in (
+        "ix_work_records_owner_category_order",
+        "ix_work_records_owner_category_entity",
+    ):
+        index = next(item for item in WorkRecordRow.__table__.indexes if item.name == index_name)
+        if index.name not in indexes:
+            index.create(bind=sync_conn)
 
 
 def _ensure_canonical_chart_payloads(sync_conn: object) -> None:
@@ -284,6 +384,16 @@ def _ensure_channel_delivery_progress_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN attachments_json JSON"))
     if "deliverable_id" not in columns:
         execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN deliverable_id VARCHAR"))
+    if "reply_to_id" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN reply_to_id VARCHAR"))
+    if "direct_turn_request_id" not in columns:
+        execute(
+            text("ALTER TABLE channel_delivery_outbox ADD COLUMN direct_turn_request_id VARCHAR")
+        )
+    if "direct_turn_fencing_token" not in columns:
+        execute(
+            text("ALTER TABLE channel_delivery_outbox ADD COLUMN direct_turn_fencing_token BIGINT")
+        )
 
 
 def _ensure_task_creator_agent_column(sync_conn: object) -> None:
@@ -380,24 +490,168 @@ def _ensure_task_session_policy_column(sync_conn: object) -> None:
         )
 
 
+def _ensure_task_control_conversation_column(sync_conn: object) -> None:
+    """Add the durable one-to-one task control-conversation link."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    task_columns = {column["name"] for column in inspector.get_columns("tasks")}
+    if "control_conversation_id" not in task_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE tasks ADD COLUMN control_conversation_id VARCHAR")
+        )
+    if "control_conversation_claimed_at" not in task_columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE tasks ADD COLUMN control_conversation_claimed_at TIMESTAMP")
+        )
+    indexes = {index["name"] for index in inspector.get_indexes("tasks")}
+    if "ux_tasks_control_conversation_id" not in indexes:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(
+                "CREATE UNIQUE INDEX ux_tasks_control_conversation_id "
+                "ON tasks (control_conversation_id)"
+            )
+        )
+
+
 def _ensure_knowledgebase_schema(sync_conn: object) -> None:
     """Create optional knowledgebase tables and additive artifact columns."""
 
     from cognis.store.models import (
         KnowledgebaseArtifactRow,
         KnowledgebaseChunkRow,
+        KnowledgebaseGrantRow,
         KnowledgebaseIndexJobRow,
         KnowledgebaseRow,
     )
 
     KnowledgebaseRow.__table__.create(bind=sync_conn, checkfirst=True)
+    KnowledgebaseGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
+    for index in KnowledgebaseGrantRow.__table__.indexes:
+        index.create(bind=sync_conn, checkfirst=True)
     KnowledgebaseArtifactRow.__table__.create(bind=sync_conn, checkfirst=True)
     KnowledgebaseChunkRow.__table__.create(bind=sync_conn, checkfirst=True)
     KnowledgebaseIndexJobRow.__table__.create(bind=sync_conn, checkfirst=True)
 
     inspector = cast(Any, inspect(sync_conn))
-    artifact_columns = {column["name"] for column in inspector.get_columns("artifacts")}
     execute = sync_conn.execute  # type: ignore[attr-defined]
+    attachment_columns = {
+        column["name"] for column in inspector.get_columns("knowledgebase_artifacts")
+    }
+    for column_name, ddl in (
+        ("source_path", "VARCHAR"),
+        ("pending_artifact_id", "VARCHAR"),
+        ("pending_source_hash", "VARCHAR"),
+        ("active_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("desired_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("active_metadata", "JSON"),
+    ):
+        if column_name not in attachment_columns:
+            execute(text(f"ALTER TABLE knowledgebase_artifacts ADD COLUMN {column_name} {ddl}"))
+    execute(
+        text(
+            "UPDATE knowledgebase_artifacts SET active_metadata = metadata "
+            "WHERE active_generation > 0 AND active_metadata IS NULL"
+        )
+    )
+    chunk_columns = {column["name"] for column in inspector.get_columns("knowledgebase_chunks")}
+    if "generation" not in chunk_columns:
+        execute(
+            text(
+                "ALTER TABLE knowledgebase_chunks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    job_columns = {column["name"] for column in inspector.get_columns("knowledgebase_index_jobs")}
+    added_job_generation = "generation" not in job_columns
+    if "generation" not in job_columns:
+        execute(
+            text(
+                "ALTER TABLE knowledgebase_index_jobs "
+                "ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    if added_job_generation:
+        execute(
+            text(
+                "UPDATE knowledgebase_index_jobs "
+                "SET status = 'cancelled', error = 'cancelled_by_generation_schema_upgrade', "
+                "completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                "WHERE status IN ('queued', 'running')"
+            )
+        )
+
+    execute(
+        text(
+            "UPDATE knowledgebase_artifacts SET active_generation = 1 "
+            "WHERE active_generation = 0 AND (chunk_count > 0 OR EXISTS ("
+            "SELECT 1 FROM knowledgebase_chunks "
+            "WHERE knowledgebase_chunks.kb_artifact_id = "
+            "knowledgebase_artifacts.kb_artifact_id))"
+        )
+    )
+    execute(
+        text(
+            "UPDATE knowledgebase_artifacts SET active_metadata = metadata "
+            "WHERE active_generation > 0 AND active_metadata IS NULL"
+        )
+    )
+    execute(
+        text(
+            "UPDATE knowledgebase_artifacts "
+            "SET desired_generation = active_generation "
+            "WHERE desired_generation < active_generation"
+        )
+    )
+    execute(
+        text(
+            "UPDATE knowledgebase_chunks SET generation = 1 "
+            "WHERE generation = 0 AND EXISTS ("
+            "SELECT 1 FROM knowledgebase_artifacts "
+            "WHERE knowledgebase_artifacts.kb_artifact_id = "
+            "knowledgebase_chunks.kb_artifact_id "
+            "AND knowledgebase_artifacts.active_generation = 1)"
+        )
+    )
+
+    attachment_indexes = {
+        index["name"] for index in inspector.get_indexes("knowledgebase_artifacts")
+    }
+    if "ix_kb_artifacts_pending_artifact" not in attachment_indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_kb_artifacts_pending_artifact "
+                "ON knowledgebase_artifacts (pending_artifact_id)"
+            )
+        )
+    if "uq_kb_artifacts_live_source_path" not in attachment_indexes:
+        execute(
+            text(
+                "CREATE UNIQUE INDEX uq_kb_artifacts_live_source_path "
+                "ON knowledgebase_artifacts (knowledgebase_id, source_path) "
+                "WHERE source_path IS NOT NULL "
+                "AND status NOT IN ('detached', 'removed')"
+            )
+        )
+    chunk_indexes = {index["name"] for index in inspector.get_indexes("knowledgebase_chunks")}
+    if "ix_kb_chunks_attachment_index" in chunk_indexes:
+        execute(text("DROP INDEX ix_kb_chunks_attachment_index"))
+    if "ix_kb_chunks_attachment_generation_index" not in chunk_indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_kb_chunks_attachment_generation_index "
+                "ON knowledgebase_chunks (kb_artifact_id, generation, chunk_index)"
+            )
+        )
+    job_indexes = {index["name"] for index in inspector.get_indexes("knowledgebase_index_jobs")}
+    if "uq_kb_jobs_live_attachment_generation_type" not in job_indexes:
+        execute(
+            text(
+                "CREATE UNIQUE INDEX uq_kb_jobs_live_attachment_generation_type "
+                "ON knowledgebase_index_jobs (kb_artifact_id, generation, job_type) "
+                "WHERE status IN ('queued', 'running')"
+            )
+        )
+
+    artifact_columns = {column["name"] for column in inspector.get_columns("artifacts")}
     if "content_hash" not in artifact_columns:
         execute(text("ALTER TABLE artifacts ADD COLUMN content_hash VARCHAR"))
     if "source_tool_call_id" not in artifact_columns:
@@ -551,6 +805,75 @@ def _ensure_todos_tables(sync_conn: object) -> None:
     )
 
 
+def _ensure_conversation_lineage_columns(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    if not inspector.has_table("conversations"):
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    columns = {column["name"] for column in inspector.get_columns("conversations")}
+    names = (
+        "lineage_kind",
+        "fork_source_conversation_id",
+        "fork_source_session_id",
+        "lineage_task_id",
+        "lineage_step_run_id",
+    )
+    for name in names:
+        if name not in columns:
+            execute(text(f"ALTER TABLE conversations ADD COLUMN {name} VARCHAR"))
+    session_columns = {column["name"] for column in inspector.get_columns("sessions")}
+    if "source_session_id" not in session_columns:
+        execute(text("ALTER TABLE sessions ADD COLUMN source_session_id VARCHAR"))
+    indexes = (
+        (
+            "ix_conversations_owner_fork_conversation",
+            "user_email, fork_source_conversation_id, conversation_id",
+        ),
+        (
+            "ix_conversations_owner_fork_session",
+            "user_email, fork_source_session_id, conversation_id",
+        ),
+        ("ix_conversations_owner_lineage_task", "user_email, lineage_task_id, conversation_id"),
+        ("ix_conversations_owner_lineage_step", "user_email, lineage_step_run_id, conversation_id"),
+    )
+    for name, fields in indexes:
+        execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON conversations ({fields})"))
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_sessions_owner_source_session "
+            "ON sessions (user_email, source_session_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_sessions_owner_parent_session "
+            "ON sessions (user_email, parent_session_id, session_id)"
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_sessions_owner_previous_session "
+            "ON sessions (user_email, previous_session_id, session_id)"
+        )
+    )
+    if inspector.has_table("tasks"):
+        execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_tasks_owner_source_ref "
+                "ON tasks (created_by, source_ref, task_id)"
+            )
+        )
+
+
+def _ensure_work_scope_revision_tables(sync_conn: object) -> None:
+    """Create the rebuildable Work revision read model on bootstrap upgrades."""
+
+    from cognis.store.models import WorkScopeState, WorkScopeStream
+
+    WorkScopeState.__table__.create(bind=sync_conn, checkfirst=True)
+    WorkScopeStream.__table__.create(bind=sync_conn, checkfirst=True)
+
+
 def _ensure_session_compaction_columns(sync_conn: object) -> None:
     inspector = cast(Any, inspect(sync_conn))
     session_columns = {column["name"] for column in inspector.get_columns("sessions")}
@@ -562,6 +885,143 @@ def _ensure_session_compaction_columns(sync_conn: object) -> None:
         execute(text("ALTER TABLE sessions ADD COLUMN completion_reason VARCHAR"))
     if "result_content" not in session_columns:
         execute(text("ALTER TABLE sessions ADD COLUMN result_content TEXT"))
+
+
+def _ensure_session_activity_scope_column(sync_conn: object) -> None:
+    """Add and deterministically backfill activity scopes for bootstrap upgrades."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    columns = {column["name"] for column in inspector.get_columns("sessions")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "activity_scope_id" not in columns:
+        execute(text("ALTER TABLE sessions ADD COLUMN activity_scope_id VARCHAR"))
+
+    rows = execute(
+        text(
+            """
+            SELECT session_id, parent_session_id, previous_session_id, completion_reason
+            FROM sessions
+            ORDER BY started_at, session_id
+            """
+        )
+    ).mappings()
+    by_id = {str(row["session_id"]): dict(row) for row in rows}
+    scopes: dict[str, str] = {}
+    unresolved = set(by_id)
+    while unresolved:
+        progressed = False
+        for session_id in sorted(unresolved):
+            row = by_id[session_id]
+            parent_id = row["parent_session_id"]
+            previous_id = row["previous_session_id"]
+            if parent_id:
+                if parent_id in by_id and parent_id not in scopes:
+                    continue
+                scopes[session_id] = scopes.get(parent_id, session_id)
+            elif previous_id:
+                if previous_id in by_id and previous_id not in scopes:
+                    continue
+                predecessor = by_id.get(previous_id)
+                scopes[session_id] = (
+                    session_id
+                    if predecessor and predecessor["completion_reason"] == "user_reset"
+                    else scopes.get(previous_id, session_id)
+                )
+            else:
+                scopes[session_id] = session_id
+            unresolved.remove(session_id)
+            progressed = True
+        if not progressed:
+            for session_id in unresolved:
+                scopes[session_id] = session_id
+            break
+    for session_id, activity_scope_id in scopes.items():
+        execute(
+            text(
+                "UPDATE sessions SET activity_scope_id = :activity_scope_id "
+                "WHERE session_id = :session_id AND activity_scope_id IS NULL"
+            ),
+            {"session_id": session_id, "activity_scope_id": activity_scope_id},
+        )
+    dialect = inspector.bind.dialect.name
+    refreshed = {
+        column["name"]: column for column in cast(Any, inspect(sync_conn)).get_columns("sessions")
+    }
+    if refreshed["activity_scope_id"].get("nullable", True):
+        if dialect == "postgresql":
+            execute(text("ALTER TABLE sessions ALTER COLUMN activity_scope_id SET NOT NULL"))
+        elif dialect == "sqlite":
+            execute(
+                text(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS trg_sessions_activity_scope_not_null_insert
+                    BEFORE INSERT ON sessions
+                    WHEN NEW.activity_scope_id IS NULL
+                    BEGIN
+                        SELECT RAISE(ABORT, 'sessions.activity_scope_id must not be null');
+                    END
+                    """
+                )
+            )
+            execute(
+                text(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS trg_sessions_activity_scope_not_null_update
+                    BEFORE UPDATE OF activity_scope_id ON sessions
+                    WHEN NEW.activity_scope_id IS NULL
+                    BEGIN
+                        SELECT RAISE(ABORT, 'sessions.activity_scope_id must not be null');
+                    END
+                    """
+                )
+            )
+        else:
+            execute(text("ALTER TABLE sessions ALTER COLUMN activity_scope_id SET NOT NULL"))
+
+
+def _ensure_task_source_session_column(sync_conn: object) -> None:
+    """Add task origin-session provenance for bootstrap upgrades."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    columns = {column["name"] for column in inspector.get_columns("tasks")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "source_session_id" not in columns:
+        execute(text("ALTER TABLE tasks ADD COLUMN source_session_id VARCHAR"))
+    execute(
+        text(
+            """
+            UPDATE tasks
+            SET source_session_id = (
+                SELECT sessions.session_id
+                FROM sessions
+                WHERE sessions.conversation_id = tasks.source_ref
+                  AND sessions.started_at <= tasks.created_at
+                  AND (
+                      sessions.completed_at IS NULL
+                      OR sessions.completed_at >= tasks.created_at
+                  )
+            )
+            WHERE source_session_id IS NULL
+              AND source_type IN ('chat', 'agent')
+              AND (
+                  SELECT COUNT(*)
+                  FROM sessions
+                  WHERE sessions.conversation_id = tasks.source_ref
+                    AND sessions.started_at <= tasks.created_at
+                    AND (
+                        sessions.completed_at IS NULL
+                        OR sessions.completed_at >= tasks.created_at
+                    )
+              ) = 1
+            """
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_tasks_owner_source_session "
+            "ON tasks (created_by, source_session_id, task_id)"
+        )
+    )
 
 
 def _ensure_api_key_columns(sync_conn: object) -> None:
@@ -1038,15 +1498,22 @@ def _ensure_agent_type_columns(sync_conn: object) -> None:
     except Exception:
         return  # table doesn't exist yet (create_all will handle it)
     execute = sync_conn.execute  # type: ignore[attr-defined]
+    false_literal = "FALSE" if inspector.bind.dialect.name == "postgresql" else "0"
 
     if "agent_type" not in agent_columns:
         execute(
             text("ALTER TABLE agents ADD COLUMN agent_type VARCHAR(20) NOT NULL DEFAULT 'primary'")
         )
     if "is_system" not in agent_columns:
-        execute(text("ALTER TABLE agents ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT 0"))
+        execute(
+            text(
+                f"ALTER TABLE agents ADD COLUMN is_system BOOLEAN NOT NULL DEFAULT {false_literal}"
+            )
+        )
     if "hidden" not in agent_columns:
-        execute(text("ALTER TABLE agents ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT 0"))
+        execute(
+            text(f"ALTER TABLE agents ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT {false_literal}")
+        )
 
 
 def _ensure_user_management_columns(sync_conn: object) -> None:
@@ -1140,6 +1607,112 @@ def _ensure_active_executor_lifecycle_columns(sync_conn: object) -> None:
             )
         if "active_executor_source" not in columns:
             execute(text(f"ALTER TABLE {table_name} ADD COLUMN active_executor_source VARCHAR"))
+
+
+def _ensure_executor_pin_stage3_schema(sync_conn: object) -> None:
+    """Bootstrap parity for Stage 3; every operation is additive/idempotent."""
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    for table_name in ("conversations", "tasks"):
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if "active_executor_generation" not in columns:
+            execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN active_executor_generation "
+                    "BIGINT NOT NULL DEFAULT 0"
+                )
+            )
+        if "active_executor_unavailable_since" not in columns:
+            execute(
+                text(
+                    f"ALTER TABLE {table_name} ADD COLUMN active_executor_unavailable_since "
+                    "TIMESTAMP WITH TIME ZONE"
+                )
+            )
+    tables = set(inspector.get_table_names())
+    if "executor_pin_transitions" not in tables:
+        execute(
+            text(
+                "CREATE TABLE executor_pin_transitions ("
+                "transition_id VARCHAR PRIMARY KEY, scope_type VARCHAR NOT NULL, "
+                "scope_id VARCHAR NOT NULL, generation BIGINT NOT NULL, "
+                "old_executor_id VARCHAR, new_executor_id VARCHAR NOT NULL, "
+                "reason TEXT NOT NULL, state_caveat TEXT NOT NULL, notice_id VARCHAR NOT NULL UNIQUE, "
+                "notice_appended_at TIMESTAMP WITH TIME ZONE, created_at TIMESTAMP WITH TIME ZONE NOT NULL)"
+            )
+        )
+        execute(
+            text(
+                "CREATE UNIQUE INDEX uq_executor_pin_transition_generation "
+                "ON executor_pin_transitions(scope_type, scope_id, generation)"
+            )
+        )
+    transition_indexes = {
+        index["name"] for index in inspect(sync_conn).get_indexes("executor_pin_transitions")
+    }
+    if "ix_executor_pin_transitions_notice_pending" not in transition_indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_executor_pin_transitions_notice_pending "
+                "ON executor_pin_transitions(notice_appended_at)"
+            )
+        )
+    if "executor_pin_notice_outbox" not in tables:
+        execute(
+            text(
+                "CREATE TABLE executor_pin_notice_outbox ("
+                "outbox_id VARCHAR PRIMARY KEY, transition_id VARCHAR NOT NULL UNIQUE, "
+                "conversation_id VARCHAR NOT NULL, intaris_session_id VARCHAR, "
+                "idempotency_key VARCHAR NOT NULL UNIQUE, user_email VARCHAR, agent_id VARCHAR, "
+                "payload JSON NOT NULL, delivered_at TIMESTAMP WITH TIME ZONE, "
+                "created_at TIMESTAMP WITH TIME ZONE NOT NULL, "
+                "FOREIGN KEY(transition_id) REFERENCES executor_pin_transitions(transition_id) "
+                "ON DELETE CASCADE)"
+            )
+        )
+    else:
+        columns = {column["name"] for column in inspector.get_columns("executor_pin_notice_outbox")}
+        if "intaris_session_id" not in columns:
+            execute(
+                text("ALTER TABLE executor_pin_notice_outbox ADD COLUMN intaris_session_id VARCHAR")
+            )
+        if "idempotency_key" not in columns:
+            execute(
+                text("ALTER TABLE executor_pin_notice_outbox ADD COLUMN idempotency_key VARCHAR")
+            )
+        rows = execute(
+            text("SELECT outbox_id FROM executor_pin_notice_outbox WHERE idempotency_key IS NULL")
+        ).fetchall()
+        for (outbox_id,) in rows:
+            execute(
+                text(
+                    "UPDATE executor_pin_notice_outbox SET idempotency_key=:key "
+                    "WHERE outbox_id=:outbox_id"
+                ),
+                {"key": f"executor_pin_notice:{outbox_id}", "outbox_id": outbox_id},
+            )
+        indexes = {index["name"] for index in inspector.get_indexes("executor_pin_notice_outbox")}
+        if "uq_executor_pin_notice_outbox_idempotency_key" not in indexes:
+            execute(
+                text(
+                    "CREATE UNIQUE INDEX uq_executor_pin_notice_outbox_idempotency_key "
+                    "ON executor_pin_notice_outbox(idempotency_key)"
+                )
+            )
+        if "user_email" not in columns:
+            execute(text("ALTER TABLE executor_pin_notice_outbox ADD COLUMN user_email VARCHAR"))
+        if "agent_id" not in columns:
+            execute(text("ALTER TABLE executor_pin_notice_outbox ADD COLUMN agent_id VARCHAR"))
+    outbox_indexes = {
+        index["name"] for index in inspect(sync_conn).get_indexes("executor_pin_notice_outbox")
+    }
+    if "ix_executor_pin_notice_outbox_pending" not in outbox_indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_executor_pin_notice_outbox_pending "
+                "ON executor_pin_notice_outbox(delivered_at)"
+            )
+        )
 
 
 def _ensure_executor_runtime_state_columns(sync_conn: object) -> None:
@@ -1379,6 +1952,23 @@ def _ensure_mcp_oauth_schema(sync_conn: object) -> None:
             execute(text(f"ALTER TABLE mcp_oauth_tokens ADD COLUMN {name} {sql_type}"))
     for index in MCPOAuthTokenRow.__table__.indexes:
         index.create(sync_conn, checkfirst=True)
+    try:
+        transaction_columns = {
+            column["name"] for column in inspector.get_columns("mcp_oauth_transactions")
+        }
+    except Exception:
+        transaction_columns = set()
+    transaction_additions = {
+        "terminal_cleanup_required": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "terminal_notification_resolved_at": timestamp_type,
+        "terminal_reconfigure_applied_at": timestamp_type,
+        "terminal_reconfigure_completed_at": timestamp_type,
+    }
+    for name, sql_type in transaction_additions.items():
+        if transaction_columns and name not in transaction_columns:
+            execute(text(f"ALTER TABLE mcp_oauth_transactions ADD COLUMN {name} {sql_type}"))
+    for index in MCPOAuthTransactionRow.__table__.indexes:
+        index.create(sync_conn, checkfirst=True)
 
 
 def _ensure_system_override_tables(sync_conn: object) -> None:
@@ -1463,6 +2053,17 @@ def _ensure_managed_conversation_lineage(sync_conn: object) -> None:
         execute(
             text("ALTER TABLE managed_conversation_links ADD COLUMN last_result_turn_id VARCHAR")
         )
+    for column_name in (
+        "handoff_state",
+        "handoff_target_turn_id",
+        "handoff_controller_session_id",
+        "handoff_controller_turn_id",
+        "handoff_tool_call_id",
+    ):
+        if column_name not in columns:
+            execute(
+                text(f"ALTER TABLE managed_conversation_links ADD COLUMN {column_name} VARCHAR")
+            )
 
     execute(
         text(
@@ -1483,6 +2084,255 @@ def _ensure_managed_conversation_lineage(sync_conn: object) -> None:
             "ON managed_conversation_links (root_link_id, depth)"
         )
     )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_managed_conversation_links_handoff_owner "
+            "ON managed_conversation_links "
+            "(handoff_state, handoff_controller_session_id, handoff_controller_turn_id)"
+        )
+    )
+    columns = {
+        column["name"] for column in inspect(sync_conn).get_columns("managed_conversation_links")
+    }
+    if {"user_email", "controller_session_id", "link_id"} <= columns:
+        execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_managed_conversation_links_owner_controller_session "
+                "ON managed_conversation_links (user_email, controller_session_id, link_id)"
+            )
+        )
+
+
+def _ensure_managed_channel_foundation(sync_conn: object) -> None:
+    """Add managed-channel columns and create the foundation tables."""
+
+    from cognis.store.models import (
+        ChannelContextConsumptionRow,
+        ChannelInboundLedgerRow,
+        ManagedChannelBinding,
+        ManagedConversationSignal,
+    )
+
+    inspector = cast(Any, inspect(sync_conn))
+    if inspector.has_table("managed_conversation_links"):
+        columns = {column["name"] for column in inspector.get_columns("managed_conversation_links")}
+        execute = sync_conn.execute  # type: ignore[attr-defined]
+        if "kind" not in columns:
+            execute(
+                text(
+                    "ALTER TABLE managed_conversation_links "
+                    "ADD COLUMN kind VARCHAR NOT NULL DEFAULT 'agent'"
+                )
+            )
+        if "completion_policy" not in columns:
+            execute(
+                text(
+                    "ALTER TABLE managed_conversation_links "
+                    "ADD COLUMN completion_policy VARCHAR NOT NULL DEFAULT 'turn'"
+                )
+            )
+        if "owner_epoch" not in columns:
+            execute(
+                text(
+                    "ALTER TABLE managed_conversation_links "
+                    "ADD COLUMN owner_epoch BIGINT NOT NULL DEFAULT 1"
+                )
+            )
+        if "creation_policy_snapshot" not in columns:
+            execute(
+                text(
+                    "ALTER TABLE managed_conversation_links "
+                    "ADD COLUMN creation_policy_snapshot JSON"
+                )
+            )
+        if {"user_email", "kind", "conversation_state"}.issubset(
+            columns | {"kind", "completion_policy", "owner_epoch", "creation_policy_snapshot"}
+        ):
+            execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_managed_conversation_links_user_kind_state "
+                    "ON managed_conversation_links (user_email, kind, conversation_state)"
+                )
+            )
+
+    for model in (
+        ManagedConversationSignal,
+        ManagedChannelBinding,
+        ChannelInboundLedgerRow,
+        ChannelContextConsumptionRow,
+    ):
+        cast(Any, model.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_channel_observed_targets(sync_conn: object) -> None:
+    """Create the observed-target table after its account dependencies."""
+
+    from cognis.store.models import ChannelObservedTargetRow
+
+    cast(Any, ChannelObservedTargetRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_managed_channel_lifecycle_columns(sync_conn: object) -> None:
+    """Add target identity and outbox fencing columns idempotently."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    additions = {
+        "managed_channel_bindings": (("channel_type", "VARCHAR NOT NULL DEFAULT ''"),),
+        "channel_observed_targets": (
+            ("thread_id", "VARCHAR"),
+            ("sender_id", "VARCHAR"),
+        ),
+        "channel_delivery_outbox": (
+            ("managed_binding_id", "VARCHAR"),
+            ("managed_binding_version", "BIGINT"),
+            ("managed_owner_epoch", "BIGINT"),
+        ),
+    }
+    for table_name, columns in additions.items():
+        if not inspector.has_table(table_name):
+            continue
+        existing = {column["name"] for column in inspector.get_columns(table_name)}
+        for column_name, sql_type in columns:
+            if column_name not in existing:
+                execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sql_type}"))
+    if inspector.has_table("channel_delivery_outbox"):
+        execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_channel_delivery_managed_fence "
+                "ON channel_delivery_outbox "
+                "(managed_binding_id, managed_binding_version, managed_owner_epoch)"
+            )
+        )
+
+
+def _ensure_managed_channel_resume_columns(sync_conn: object) -> None:
+    """Add durable resume-correlation columns idempotently."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if not inspector.has_table("managed_conversation_signals"):
+        return
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    existing = {column["name"] for column in inspector.get_columns("managed_conversation_signals")}
+    additions = (
+        ("resume_request_id", "VARCHAR"),
+        ("resume_turn_id", "VARCHAR"),
+        ("resume_prepared_at", "TIMESTAMP"),
+        ("resume_admitted_at", "TIMESTAMP"),
+        ("resume_terminal_status", "VARCHAR"),
+    )
+    for column_name, sql_type in additions:
+        if column_name not in existing:
+            execute(
+                text(
+                    f"ALTER TABLE managed_conversation_signals ADD COLUMN {column_name} {sql_type}"
+                )
+            )
+    execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_managed_signal_resume_request "
+            "ON managed_conversation_signals (resume_request_id)"
+        )
+    )
+
+
+def _ensure_managed_channel_fence_columns(sync_conn: object) -> None:
+    """Add durable send leases and signal correlation idempotently."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    additions = {
+        "managed_conversation_signals": (("source_turn_id", "VARCHAR"),),
+        "managed_channel_bindings": (
+            ("delivery_lease_token", "VARCHAR"),
+            ("delivery_lease_version", "BIGINT"),
+            ("delivery_lease_owner_epoch", "BIGINT"),
+            ("delivery_lease_expires_at", "DATETIME"),
+        ),
+    }
+    for table_name, columns in additions.items():
+        if not inspector.has_table(table_name):
+            continue
+        existing = {column["name"] for column in inspector.get_columns(table_name)}
+        for column_name, sql_type in columns:
+            if column_name not in existing:
+                execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {sql_type}"))
+    if inspector.has_table("managed_conversation_signals"):
+        execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_managed_signal_source_turn "
+                "ON managed_conversation_signals "
+                "(link_id, owner_epoch, source_turn_id, kind)"
+            )
+        )
+
+
+def _ensure_group_context_columns(sync_conn: object) -> None:
+    """Add bounded group-context ordering and admission columns idempotently."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    ledger_table = "channel_inbound_ledger"
+    if inspector.has_table(ledger_table):
+        existing = {column["name"] for column in inspector.get_columns(ledger_table)}
+        additions = (
+            ("observed_at", "TIMESTAMP WITH TIME ZONE"),
+            ("ordering_key", "VARCHAR"),
+            ("ordering_source", "VARCHAR NOT NULL DEFAULT 'observed'"),
+            ("retain_until", "TIMESTAMP WITH TIME ZONE"),
+        )
+        for column_name, sql_type in additions:
+            if column_name not in existing:
+                execute(text(f"ALTER TABLE {ledger_table} ADD COLUMN {column_name} {sql_type}"))
+        execute(
+            text(
+                "UPDATE channel_inbound_ledger "
+                "SET observed_at = created_at "
+                "WHERE observed_at IS NULL"
+            )
+        )
+        execute(
+            text(
+                "UPDATE channel_inbound_ledger "
+                "SET ordering_key = CAST(occurred_at AS VARCHAR) || ':' || inbound_id "
+                "WHERE ordering_key IS NULL"
+            )
+        )
+        execute(text("DROP INDEX IF EXISTS ix_channel_inbound_ledger_context"))
+        execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_channel_inbound_ledger_context "
+                "ON channel_inbound_ledger "
+                "(account_id, chat_id, thread_key, ordering_key, message_id)"
+            )
+        )
+        execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_channel_inbound_ledger_retention "
+                "ON channel_inbound_ledger (binding_id, retain_until)"
+            )
+        )
+
+    consumption_table = "channel_context_consumptions"
+    if inspector.has_table(consumption_table):
+        existing = {column["name"] for column in inspector.get_columns(consumption_table)}
+        additions = (
+            ("usage", "VARCHAR NOT NULL DEFAULT 'context'"),
+            ("trigger_inbound_id", "VARCHAR"),
+            ("admitted_turn_id", "VARCHAR"),
+        )
+        for column_name, sql_type in additions:
+            if column_name not in existing:
+                execute(
+                    text(f"ALTER TABLE {consumption_table} ADD COLUMN {column_name} {sql_type}")
+                )
+        execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_channel_context_consumptions_admission "
+                "ON channel_context_consumptions (admitted_turn_id, state)"
+            )
+        )
 
 
 def _ensure_task_completion_delivery_columns(sync_conn: object) -> None:
@@ -1717,17 +2567,20 @@ async def _ensure_system_user(session: AsyncSession) -> None:
     """Create the system user if it doesn't exist (for FK integrity)."""
     from cognis.store.models import User
 
-    existing = await session.execute(select(User).where(User.email == SYSTEM_USER_EMAIL))
-    if existing.scalar_one_or_none() is not None:
-        return
-    session.add(
-        User(
-            email=SYSTEM_USER_EMAIL,
-            name="System",
-            role="system",
-        )
+    now = datetime.now(UTC)
+    await insert_row_if_absent(
+        session,
+        User.__table__,
+        {
+            "email": SYSTEM_USER_EMAIL,
+            "name": "System",
+            "role": "system",
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        },
+        index_elements=["email"],
     )
-    await session.flush()
 
 
 async def seed_system_agents(session: AsyncSession) -> None:
@@ -1744,24 +2597,29 @@ async def seed_system_agents(session: AsyncSession) -> None:
     await _ensure_system_user(session)
 
     for agent_def in SYSTEM_AGENTS.values():
+        now = datetime.now(UTC)
+        await insert_row_if_absent(
+            session,
+            Agent.__table__,
+            {
+                "agent_id": agent_def.agent_id,
+                "owner_email": SYSTEM_USER_EMAIL,
+                "name": agent_def.name,
+                "description": agent_def.description,
+                "system_prompt": agent_def.system_prompt,
+                "tools": agent_def.tools if isinstance(agent_def.tools, dict) else None,
+                "agent_type": agent_def.agent_type,
+                "is_system": True,
+                "hidden": agent_def.hidden,
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+            },
+            index_elements=["agent_id"],
+        )
         existing = await session.execute(select(Agent).where(Agent.agent_id == agent_def.agent_id))
         row = existing.scalar_one_or_none()
-        if row is None:
-            session.add(
-                Agent(
-                    agent_id=agent_def.agent_id,
-                    owner_email=SYSTEM_USER_EMAIL,
-                    name=agent_def.name,
-                    description=agent_def.description,
-                    system_prompt=agent_def.system_prompt,
-                    tools=agent_def.tools if isinstance(agent_def.tools, dict) else None,
-                    agent_type=agent_def.agent_type,
-                    is_system=True,
-                    hidden=agent_def.hidden,
-                    status="active",
-                )
-            )
-            continue
+        assert row is not None
         row.owner_email = SYSTEM_USER_EMAIL
         row.name = agent_def.name
         row.description = agent_def.description
@@ -1781,106 +2639,106 @@ async def seed_default_settings(session: AsyncSession) -> None:
     values (e.g. executor flags changed via the UI) are never overwritten.
     """
     for key, (category, value) in DEFAULT_SETTINGS.items():
-        existing = await get_setting(session, key)
-        if existing is None:
-            await upsert_setting(session, key=key, value=value, category=category)
-            continue
+        await insert_row_if_absent(
+            session,
+            Setting.__table__,
+            {
+                "key": key,
+                "value": value,
+                "category": category,
+                "updated_at": datetime.now(UTC),
+            },
+            index_elements=["key"],
+        )
 
 
 async def seed_builtin_management_skills(session: AsyncSession) -> None:
     """Seed first-party Cognis management skills if they do not exist."""
 
+    from cognis.store.models import SkillRow
+
     for skill in _BUILTIN_MANAGEMENT_SKILLS:
         defaults = get_system_skill_default(str(skill["skill_id"]))
         assert defaults is not None
-        existing = await get_skill(session, str(skill["skill_id"]))
-        if existing is not None:
-            if existing.owner_email is not None:
-                continue
-            updates: dict[str, object] = {
-                "is_system": True,
-                "auto_load": bool(defaults.get("auto_load", False)),
-                "name": defaults["name"],
-                "description": defaults["description"],
-                "instructions": defaults["instructions"],
-                "tools": defaults["tools"],
-                "prompt_templates": defaults["prompt_templates"],
-                "tags": defaults["tags"],
+        skill_id = str(skill["skill_id"])
+        now = datetime.now(UTC)
+        await insert_row_if_absent(
+            session,
+            SkillRow.__table__,
+            {
+                "skill_id": skill_id,
+                "name": str(defaults["name"]),
+                "description": (
+                    str(defaults["description"])
+                    if defaults.get("description") is not None
+                    else None
+                ),
+                "instructions": str(defaults["instructions"]),
+                "tools": defaults.get("tools"),
                 "linked_tool_ids": [
                     str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])
                 ],
-            }
-            for key, value in updates.items():
-                setattr(existing, key, value)
-            content_hash = compute_content_hash(
-                existing.instructions,
-                existing.tools,
-                existing.linked_tool_ids,
-                existing.prompt_templates,
-                steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
-            )
-            current_version = (
-                await get_skill_version(session, existing.current_version_id)
-                if existing.current_version_id is not None
-                else None
-            )
-            if current_version is None or current_version.content_hash != content_hash:
-                version_row = await create_skill_version(
-                    session,
-                    skill_id=existing.skill_id,
-                    version_number=await get_next_version_number(session, existing.skill_id),
-                    content_hash=content_hash,
-                    instructions=existing.instructions,
-                    tools=existing.tools,
-                    linked_tool_ids=existing.linked_tool_ids,
-                    prompt_templates=existing.prompt_templates,
-                    secret_placeholders=None,
-                    steps=defaults.get("steps")
-                    if isinstance(defaults.get("steps"), list)
-                    else None,
-                    decomposition_source_hash=None,
-                )
-                await set_current_version(session, existing.skill_id, version_row.version_id)
-                existing.current_version_id = version_row.version_id
-            continue
-        row = await create_skill(
-            session,
-            skill_id=str(skill["skill_id"]),
-            name=str(defaults["name"]),
-            description=(
-                str(defaults["description"]) if defaults.get("description") is not None else None
-            ),
-            instructions=str(defaults["instructions"]),
-            tools=defaults.get("tools"),
-            linked_tool_ids=[str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])],
-            prompt_templates=defaults.get("prompt_templates"),
-            tags=list(defaults["tags"]),
-            auto_load=bool(defaults.get("auto_load", False)),
-            is_system=True,
-            source="db",
-            owner_email=None,
+                "prompt_templates": defaults.get("prompt_templates"),
+                "tags": list(defaults["tags"]),
+                "auto_load": bool(defaults.get("auto_load", False)),
+                "is_system": True,
+                "source": "db",
+                "owner_email": None,
+                "created_at": now,
+                "updated_at": now,
+            },
+            index_elements=["skill_id"],
         )
+        result = await session.execute(
+            select(SkillRow).where(SkillRow.skill_id == skill_id).with_for_update()
+        )
+        existing = result.scalar_one()
+        if existing.owner_email is not None:
+            continue
+        updates: dict[str, object] = {
+            "is_system": True,
+            "auto_load": bool(defaults.get("auto_load", False)),
+            "name": defaults["name"],
+            "description": defaults["description"],
+            "instructions": defaults["instructions"],
+            "tools": defaults["tools"],
+            "prompt_templates": defaults["prompt_templates"],
+            "tags": defaults["tags"],
+            "linked_tool_ids": [
+                str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])
+            ],
+        }
+        for key, value in updates.items():
+            setattr(existing, key, value)
+        content_hash = compute_content_hash(
+            existing.instructions,
+            existing.tools,
+            existing.linked_tool_ids,
+            existing.prompt_templates,
+            steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+        )
+        current_version = (
+            await get_skill_version(session, existing.current_version_id)
+            if existing.current_version_id is not None
+            else None
+        )
+        if current_version is not None and current_version.content_hash == content_hash:
+            continue
         version_row = await create_skill_version(
             session,
-            skill_id=row.skill_id,
-            version_number=1,
-            content_hash=compute_content_hash(
-                row.instructions,
-                row.tools,
-                row.linked_tool_ids,
-                row.prompt_templates,
-                steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
-            ),
-            instructions=row.instructions,
-            tools=row.tools,
-            linked_tool_ids=row.linked_tool_ids,
-            prompt_templates=row.prompt_templates,
+            skill_id=existing.skill_id,
+            version_number=await get_next_version_number(session, existing.skill_id),
+            content_hash=content_hash,
+            instructions=existing.instructions,
+            tools=existing.tools,
+            linked_tool_ids=existing.linked_tool_ids,
+            prompt_templates=existing.prompt_templates,
             secret_placeholders=None,
             steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
             decomposition_source_hash=None,
         )
-        await set_current_version(session, row.skill_id, version_row.version_id)
-        row.current_version_id = version_row.version_id
+        await set_current_version(session, existing.skill_id, version_row.version_id)
+        existing.current_version_id = version_row.version_id
 
 
 async def maybe_seed_initial_admin(
@@ -1889,21 +2747,41 @@ async def maybe_seed_initial_admin(
     password_hasher: object,
 ) -> CognisConfig:
     """Seed initial admin from env vars if configured and no users exist."""
-    if await count_users(session) != 0:
-        return config
     if config.initial_admin_email is None or config.initial_admin_password is None:
+        return config
+    if await count_users(session) != 0:
         return config
 
     password_hash = password_hasher.hash(config.initial_admin_password)  # type: ignore[attr-defined]
-    await create_user(
+    from cognis.store.models import User
+
+    now = datetime.now(UTC)
+    await insert_row_if_absent(
         session,
-        email=config.initial_admin_email,
-        name="Admin",
-        password_hash=password_hash,
-        role="admin",
+        User.__table__,
+        {
+            "email": config.initial_admin_email,
+            "name": "Admin",
+            "password_hash": password_hash,
+            "role": "admin",
+            "is_active": True,
+            "created_at": now,
+            "updated_at": now,
+        },
+        index_elements=["email"],
     )
     os.environ.pop("COGNIS_INITIAL_ADMIN_PASSWORD", None)
     return replace(config, initial_admin_password=None)
+
+
+async def _lock_initial_admin_seed(session: AsyncSession, config: CognisConfig) -> None:
+    """Serialize the zero-user decision before this transaction writes users."""
+    if (
+        config.initial_admin_email is not None
+        and config.initial_admin_password is not None
+        and session.get_bind().dialect.name == "postgresql"
+    ):
+        await session.execute(text("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE"))
 
 
 async def bootstrap_runtime(
@@ -1917,9 +2795,16 @@ async def bootstrap_runtime(
 
     engine = create_engine(config.database_url)
     session_factory = create_session_factory(engine)
-    await run_schema_bootstrap(engine)
+    if config.schema_mode == "auto":
+        await run_schema_bootstrap(engine)
+    else:
+        schema_status = await validate_schema(engine)
+        if not schema_status.compatible:
+            await engine.dispose()
+            raise RuntimeError(schema_status.error or "Database schema is incompatible")
 
     async with session_factory() as session:
+        await _lock_initial_admin_seed(session, config)
         await seed_default_settings(session)
         await seed_system_agents(session)
         await seed_builtin_management_skills(session)

@@ -85,6 +85,8 @@ class ModelInfo(BaseModel):
     supports_pdf_input: bool = False
     supports_file_input: bool = False
     supports_reasoning: bool = False
+    supports_fast_mode: bool = False
+    fast_mode_tier: str | None = None
     supported_image_mime_types: list[str] = Field(default_factory=list)
     reasoning_efforts: list[str] = Field(default_factory=list)
     reasoning_summary_format: str | None = None
@@ -153,10 +155,14 @@ class TokenUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cached_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
 
 class GenerationPerformanceSnapshot(BaseModel):
-    """Latest normalized local-model generation performance observation."""
+    """Latest normalized local or hosted-model generation performance observation."""
 
     is_local: bool
     provider_id: str | None = None
@@ -217,6 +223,13 @@ class GeneratedImage(BaseModel):
     url: str | None = None
     content_type: str = "image/png"
     revised_prompt: str | None = None
+
+
+class ImageInput(BaseModel):
+    """A resolved image input for generation or editing."""
+
+    b64_json: str
+    content_type: str = "image/png"
 
 
 class ImageGenerationResult(BaseModel):

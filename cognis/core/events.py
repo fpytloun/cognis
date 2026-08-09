@@ -107,6 +107,10 @@ class EventType(StrEnum):
     # Session-scoped system notices
     SYSTEM_NOTICE = "system_notice"
 
+    # Best-effort cross-controller invalidation. Canonical content is never
+    # transported on EventBus or PostgreSQL NOTIFY.
+    CLUSTER_SCOPE_INVALIDATED = "cluster_scope_invalidated"
+
 
 class Event(BaseModel):
     """A controller-internal event."""

@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy import delete, exists, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -18,7 +18,9 @@ from cognis.core.local_models import (
 )
 from cognis.models.local_models import LOCAL_MODEL_BYTE_COUNT_MAX, LocalModelOperationState
 from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.store.coordination import database_now_expression
 from cognis.store.models import (
+    CoordinationLeaseRow,
     ExecutorRow,
     LLMProvider,
     LocalModelDeployment,
@@ -551,6 +553,46 @@ async def interrupt_active_local_model_operations(
             error=reason,
         )
         interrupted.append(operation.operation_id)
+    return interrupted
+
+
+async def interrupt_recoverable_local_model_operations(
+    session: AsyncSession,
+    *,
+    controller_owner_id: str,
+    reason: str,
+) -> list[str]:
+    """Interrupt running operations not protected by another live controller."""
+
+    operations = await list_active_local_model_operations(session)
+    interrupted: list[str] = []
+    now = database_now_expression(session)
+    for operation in operations:
+        if operation.state != LocalModelOperationState.RUNNING.value:
+            continue
+        live_other_owner = exists(
+            select(CoordinationLeaseRow.resource_key).where(
+                CoordinationLeaseRow.resource_key == f"executor_connection:{operation.executor_id}",
+                CoordinationLeaseRow.owner_id != controller_owner_id,
+                CoordinationLeaseRow.lease_expires_at > now,
+            )
+        )
+        result = await session.execute(
+            update(LocalModelOperation)
+            .where(
+                LocalModelOperation.operation_id == operation.operation_id,
+                LocalModelOperation.state == LocalModelOperationState.RUNNING.value,
+                ~live_other_owner,
+            )
+            .values(
+                state=LocalModelOperationState.INTERRUPTED.value,
+                sanitized_error=sanitize_local_model_error(reason),
+                updated_at=_utcnow(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if int(getattr(result, "rowcount", 0) or 0) == 1:
+            interrupted.append(operation.operation_id)
     return interrupted
 
 

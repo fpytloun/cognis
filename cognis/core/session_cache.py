@@ -37,6 +37,7 @@ from cognis.core.project_context import (
     project_context_from_event_data,
     project_metadata_from_event_data,
 )
+from cognis.core.redis_service import RedisService
 from cognis.logging import get_logger
 from cognis.models.config import GenerationPerformanceSnapshot
 from cognis.models.session import EventAppendResult, SessionEvent, SessionModel
@@ -135,6 +136,7 @@ class CachedSessionState:
     intention_updated_at: str | None = None
     touched_at: float = field(default_factory=monotonic)
     initialized: bool = False
+    canonical_stale: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     prefix_entries: list[ImmutablePrefixEntry] = field(default_factory=list)
     context_snapshot_seq: int = 0
@@ -156,10 +158,11 @@ class CachedSessionState:
     last_generation_performance: dict[str, Any] | None = None
     context_metadata: dict[str, Any] = field(default_factory=dict)
     context_reserve_clamp_warned: bool = False
-    # Per-session overrides (ephemeral, set via /model and /thinking commands)
+    # Per-session overrides (ephemeral, set via /model, /thinking, and /fast commands)
     model_override: str | None = None
     model_override_provider_id: str | None = None
     reasoning_effort_override: str | None = None
+    fast_mode_override: bool | None = None
     last_tool_runtime_info: dict[str, Any] = field(default_factory=dict)
     loaded_skill_ids: set[str] = field(default_factory=set)
     loaded_skill_context_hashes: dict[str, str] = field(default_factory=dict)
@@ -244,6 +247,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "model_override": entry.model_override,
             "model_override_provider_id": entry.model_override_provider_id,
             "reasoning_effort_override": entry.reasoning_effort_override,
+            "fast_mode_override": entry.fast_mode_override,
             "loaded_skill_ids": sorted(entry.loaded_skill_ids),
             "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
             "loaded_skill_snapshots": dict(entry.loaded_skill_snapshots),
@@ -345,6 +349,9 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             dict(data.get("context_metadata", {}))
             if isinstance(data.get("context_metadata"), dict)
             else {}
+        ),
+        fast_mode_override=(
+            data["fast_mode_override"] if isinstance(data.get("fast_mode_override"), bool) else None
         ),
         context_reserve_clamp_warned=bool(data.get("context_reserve_clamp_warned", False)),
         model_override=data.get("model_override"),
@@ -526,36 +533,25 @@ class SessionCache:
         max_entries: int = 200,
         redis_url: str = "",
         redis_ttl_seconds: int = _REDIS_DEFAULT_TTL,
+        redis_service: RedisService | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.max_entries = max_entries
         self._entries: dict[str, CachedSessionState] = {}
         self._entries_lock = asyncio.Lock()
+        self._local_eviction_tasks: dict[str, asyncio.Task[None]] = {}
         self._conversation_owner_by_id: dict[str, str] = {}
         self._active_thinking: dict[str, ActiveThinkingState] = {}
         # Tracks (session_id, turn_id) pairs that have been torn down via
         # clear_active_thinking so that a late thinking delta cannot re-create
         # the state after teardown.  Bounded to avoid unbounded growth.
         self._cleared_thinking_turns: set[tuple[str, str | None]] = set()
-        self._redis: Any | None = None
+        self._redis_service = redis_service
+        self._owns_redis_service = False
         self._redis_ttl = redis_ttl_seconds
-        if redis_url:
-            try:
-                import redis.asyncio as aioredis  # type: ignore[import-not-found]
-
-                self._redis = aioredis.from_url(
-                    redis_url,
-                    decode_responses=True,
-                    socket_connect_timeout=2,
-                    socket_timeout=2,
-                )
-                logger.info(
-                    "session_cache: Redis L2 enabled",
-                    extra={"extra_data": {"redis_url": redis_url}},
-                )
-            except Exception:
-                logger.warning("session_cache: failed to connect to Redis L2", exc_info=True)
-                self._redis = None
+        if self._redis_service is None and redis_url:
+            self._redis_service = RedisService(redis_url)
+            self._owns_redis_service = True
 
     def get_conversation_owner(self, conversation_id: str) -> str | None:
         """Return the immutable in-memory owner for a conversation, if known."""
@@ -584,10 +580,16 @@ class SessionCache:
 
     async def aclose(self) -> None:
         """Close Redis connection if active."""
-        if self._redis is not None:
-            with contextlib.suppress(Exception):
-                await self._redis.aclose()
-            self._redis = None
+        eviction_tasks = list(self._local_eviction_tasks.values())
+        for task in eviction_tasks:
+            task.cancel()
+        for task in eviction_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._local_eviction_tasks.clear()
+        if self._owns_redis_service and self._redis_service is not None:
+            await self._redis_service.aclose()
+            self._redis_service = None
 
     def update_active_thinking(
         self,
@@ -783,48 +785,43 @@ class SessionCache:
 
     async def _redis_get(self, session_id: str) -> CachedSessionState | None:
         """Try to load a session from Redis L2."""
-        if self._redis is None:
+        if self._redis_service is None:
             return None
         try:
-            raw = await self._redis.get(f"{_REDIS_KEY_PREFIX}{session_id}")
+            raw = await self._redis_service.get(f"{_REDIS_KEY_PREFIX}{session_id}")
             if raw is None:
-                REDIS_MISSES.inc()
+                if self._redis_service.configured and not self._redis_service.available:
+                    REDIS_ERRORS.inc()
+                else:
+                    REDIS_MISSES.inc()
                 return None
             REDIS_HITS.inc()
-            return _deserialize_entry(raw)
+            return _deserialize_entry(raw.decode("utf-8"))
         except Exception:
             REDIS_ERRORS.inc()
-            logger.warning(
-                "session_cache: Redis L2 read failed",
-                extra={"extra_data": {"session_id": session_id}},
-                exc_info=True,
-            )
+            logger.warning("session_cache: Redis L2 read failed")
             return None
 
     async def _redis_set(self, entry: CachedSessionState) -> None:
         """Write-through to Redis L2."""
-        if self._redis is None:
+        if self._redis_service is None:
             return
         try:
-            await self._redis.setex(
+            await self._redis_service.set(
                 f"{_REDIS_KEY_PREFIX}{entry.session_id}",
-                self._redis_ttl,
-                _serialize_entry(entry),
+                _serialize_entry(entry).encode("utf-8"),
+                ttl_seconds=self._redis_ttl,
             )
         except Exception:
             REDIS_ERRORS.inc()
-            logger.warning(
-                "session_cache: Redis L2 write failed",
-                extra={"extra_data": {"session_id": entry.session_id}},
-                exc_info=True,
-            )
+            logger.warning("session_cache: Redis L2 write failed")
 
     async def _redis_delete(self, session_id: str) -> None:
         """Delete from Redis L2."""
-        if self._redis is None:
+        if self._redis_service is None:
             return
         try:
-            await self._redis.delete(f"{_REDIS_KEY_PREFIX}{session_id}")
+            await self._redis_service.delete(f"{_REDIS_KEY_PREFIX}{session_id}")
         except Exception:
             REDIS_ERRORS.inc()
 
@@ -923,6 +920,7 @@ class SessionCache:
                         }
                     },
                 )
+            entry.canonical_stale = False
             entry.touched_at = monotonic()
         await self._redis_set(entry)
         return entry
@@ -936,6 +934,7 @@ class SessionCache:
         """Append freshly recorded Intaris events to the cache."""
 
         entry = await self._ensure_entry(session)
+        needs_gap_backfill = False
         async with entry.lock:
             was_initialized = entry.initialized
             existing_seqs = {item.seq for item in entry.events}
@@ -970,11 +969,13 @@ class SessionCache:
                 self._rebuild_prefix_from_cached_events(entry, recorded_events)
             if has_gap:
                 # _apply_cached_event bumps last_event_seq to each appended
-                # seq; restore the pre-append watermark so the next warm
-                # refresh (after_seq=watermark) backfills the gap.
+                # seq; restore the pre-append watermark so an immediate warm
+                # refresh (after_seq=watermark) backfills the gap before this
+                # incomplete cache state is published to another replica.
                 entry.last_event_seq = pre_append_watermark
+                needs_gap_backfill = True
                 logger.info(
-                    "cache: seq gap detected on append; deferring watermark for backfill",
+                    "cache: seq gap detected on append; backfilling before publish",
                     extra={
                         "extra_data": {
                             "session_id": entry.session_id,
@@ -992,6 +993,27 @@ class SessionCache:
             # history. Keep the entry cold so the next refresh performs a full Intaris load.
             entry.initialized = was_initialized or append_result.first_seq <= 1
             entry.touched_at = monotonic()
+        if needs_gap_backfill:
+            try:
+                return await self.refresh(session)
+            except Exception:
+                # Event recording has already succeeded. Preserve the previous
+                # availability behavior if an opportunistic repair read fails;
+                # the next regular refresh will retry from the contiguous
+                # watermark.
+                logger.warning(
+                    "cache: gap backfill failed after append; retaining deferred watermark",
+                    exc_info=True,
+                    extra={
+                        "extra_data": {
+                            "session_id": entry.session_id,
+                            "cached_last_seq": entry.last_event_seq,
+                            "append_first_seq": append_result.first_seq,
+                            "append_last_seq": append_result.last_seq,
+                        }
+                    },
+                )
+                entry.canonical_stale = True
         await self._redis_set(entry)
         return entry
 
@@ -1091,6 +1113,63 @@ class SessionCache:
             CACHE_SIZE.set(len(self._entries))
         await self._redis_delete(session_id)
         return True
+
+    async def evict_local(self, session_id: str) -> bool:
+        """Evict only this controller's L1 entry, preserving shared Redis state."""
+
+        async with self._entries_lock:
+            entry = self._entries.get(session_id)
+            if entry is None:
+                return False
+            if entry.lock.locked():
+                if session_id not in self._local_eviction_tasks:
+                    task = asyncio.create_task(
+                        self._evict_local_after_unlock(session_id, entry),
+                        name=f"session-cache-local-evict-{session_id}",
+                    )
+                    self._local_eviction_tasks[session_id] = task
+                return False
+            self._entries.pop(session_id, None)
+            CACHE_EVICTIONS.inc()
+            CACHE_SIZE.set(len(self._entries))
+        return True
+
+    async def invalidate_canonical(self, session_id: str) -> bool:
+        """Mark canonical projections stale without dropping ephemeral overrides."""
+
+        async with self._entries_lock:
+            entry = self._entries.get(session_id)
+            if entry is None:
+                return False
+        async with entry.lock:
+            entry.events.clear()
+            entry.events_since_compaction_memo.clear()
+            entry.last_event_seq = 0
+            entry.last_compaction_seq = 0
+            entry.last_compaction_summary = None
+            entry.auto_compaction_cooldown_turns = 0
+            entry.intention = None
+            entry.intention_updated_at = None
+            entry.prefix_entries.clear()
+            entry.context_snapshot_seq = 0
+            entry.context_snapshot_source = None
+            entry.memory_policy_fingerprint = None
+            entry.memory_policy_mode = None
+            entry.prefix_repair_needed = False
+            entry.discovered_tool_handles.clear()
+            entry.initialized = False
+            entry.canonical_stale = True
+        return True
+
+    async def _evict_local_after_unlock(self, session_id: str, entry: CachedSessionState) -> None:
+        try:
+            async with entry.lock, self._entries_lock:
+                if self._entries.get(session_id) is entry:
+                    self._entries.pop(session_id, None)
+                    CACHE_EVICTIONS.inc()
+                    CACHE_SIZE.set(len(self._entries))
+        finally:
+            self._local_eviction_tasks.pop(session_id, None)
 
     def get_entry(self, session_id: str) -> CachedSessionState | None:
         """Get a cache entry without mutating it."""
@@ -1217,7 +1296,7 @@ class SessionCache:
     def update_last_generation_performance(
         self, session_id: str, performance: dict[str, Any] | None
     ) -> None:
-        """Replace the latest local-generation observation for a session."""
+        """Replace the latest local or hosted generation observation for a session."""
 
         entry = self._entries.get(session_id)
         if entry is None:
@@ -1250,6 +1329,23 @@ class SessionCache:
         if entry is None or not entry.last_tool_runtime_info:
             return None
         return dict(entry.last_tool_runtime_info)
+
+    async def reset_step_tool_state(self, session_id: str) -> bool:
+        """Reset transient tool exposure at a reused workflow-step boundary."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return False
+        entry.last_tool_runtime_info.clear()
+        entry.activated_skill_ids.clear()
+        entry.activated_skill_tool_ids_by_skill.clear()
+        entry.activated_skill_tool_ids.clear()
+        entry.discovered_tool_handles.clear()
+        entry.skill_tool_classifications.clear()
+        entry.classified_inventory.clear()
+        entry.touched_at = monotonic()
+        await self._redis_set(entry)
+        return True
 
     def get_activated_skill_tool_ids(self, session_id: str) -> set[str]:
         entry = self.get_entry(session_id)
@@ -1481,6 +1577,17 @@ class SessionCache:
         """Get per-session reasoning effort override, or ``None`` for default."""
         entry = self._entries.get(session_id)
         return entry.reasoning_effort_override if entry is not None else None
+
+    def set_fast_mode_override(self, session_id: str, enabled: bool | None) -> None:
+        """Set per-session fast-mode override (from /fast command)."""
+        entry = self._entries.get(session_id)
+        if entry is not None:
+            entry.fast_mode_override = enabled
+
+    def get_fast_mode_override(self, session_id: str) -> bool | None:
+        """Get per-session fast-mode override, or ``None`` for configured default."""
+        entry = self._entries.get(session_id)
+        return entry.fast_mode_override if entry is not None else None
 
     def get_compaction_summary(self, session_id: str) -> str | None:
         """Get the cached compaction summary for a session."""
@@ -1784,6 +1891,8 @@ class SessionCache:
     ) -> None:
         """Replace event-derived cache state from a full Intaris stream read."""
 
+        frozen_project_contexts = dict(entry.project_contexts)
+        frozen_project_metadata_contexts = dict(entry.project_metadata_contexts)
         entry.events = []
         entry.events_since_compaction_memo.clear()
         entry.last_event_seq = 0
@@ -1799,6 +1908,14 @@ class SessionCache:
         entry.project_contexts = {}
         entry.project_metadata_contexts = {}
         self._apply_intaris_events(entry, raw_events)
+        for project_root, project_context in frozen_project_contexts.items():
+            current = entry.project_contexts.get(project_root)
+            if current is None or project_context.seq >= current.seq:
+                entry.project_contexts[project_root] = project_context
+        for project_id, project_metadata in frozen_project_metadata_contexts.items():
+            current = entry.project_metadata_contexts.get(project_id)
+            if current is None or project_metadata.seq >= current.seq:
+                entry.project_metadata_contexts[project_id] = project_metadata
         self._rebuild_prefix_from_raw_events(entry, raw_events)
 
     def _apply_intaris_events(

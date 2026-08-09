@@ -53,7 +53,7 @@ def upgrade() -> None:
                 "delete_after_run",
                 sa.Boolean,
                 nullable=False,
-                server_default=sa.text("0"),
+                server_default=sa.false(),
             ),
         )
         # Error tracking
@@ -77,7 +77,7 @@ def upgrade() -> None:
                 "suppress_empty",
                 sa.Boolean,
                 nullable=False,
-                server_default=sa.text("0"),
+                server_default=sa.false(),
             ),
         )
         # Make cron_expr nullable (only required for cron type)

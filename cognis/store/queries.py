@@ -9,16 +9,20 @@ import secrets
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import sqlalchemy as sa
-from sqlalchemy import case, delete, select, update
+from sqlalchemy import String, and_, case, delete, func, or_, select, update
 from sqlalchemy import event as sa_event
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.orm.attributes import flag_modified
 
+from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.agent_direct import agent_direct_context_ref
 from cognis.models.deliverable import (
     RichPayloadValidationError,
@@ -26,6 +30,7 @@ from cognis.models.deliverable import (
     rich_export_metadata,
     rich_render_metadata,
 )
+from cognis.models.session import ConversationLineage
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.deliverable_storage import (
     attach_deliverable_payload,
@@ -41,7 +46,10 @@ from cognis.store.models import (
     ChannelAccountRow,
     ChannelContact,
     ChannelDeliveryOutboxRow,
+    ChannelDeliveryReceiptRow,
+    ChannelObservedTargetRow,
     ChannelPairingRequest,
+    ChannelRecipientIntentRow,
     ChatClientTransactionRow,
     Conversation,
     ConversationTodo,
@@ -50,11 +58,14 @@ from cognis.store.models import (
     ExecutorRow,
     KnowledgebaseArtifactRow,
     KnowledgebaseChunkRow,
+    KnowledgebaseGrantRow,
     KnowledgebaseIndexJobRow,
     KnowledgebaseRow,
     LLMProvider,
     LLMProviderAuthSession,
+    ManagedChannelBinding,
     ManagedConversationLink,
+    ManagedConversationSignal,
     MCPOAuthTokenRow,
     MCPOAuthTransactionRow,
     MCPServerRow,
@@ -95,6 +106,10 @@ _DELIVERABLE_DELETE_AFTER_ROLLBACK = "_deliverable_delete_after_rollback"
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _queue_deliverable_payload_delete(
@@ -203,6 +218,18 @@ def _agent_direct_clause(user_email: str, agent_id: str) -> sa.ColumnElement[boo
     )
 
 
+def _task_control_clause() -> sa.ColumnElement[bool]:
+    return Conversation.context_data["kind"].as_string() == "task_control"
+
+
+def _exclude_task_control_clause() -> sa.ColumnElement[bool]:
+    return sa.or_(
+        Conversation.context_data.is_(None),
+        Conversation.context_data["kind"].as_string().is_(None),
+        Conversation.context_data["kind"].as_string() != "task_control",
+    )
+
+
 def _conversation_list_filters(
     user_email: str,
     *,
@@ -215,7 +242,9 @@ def _conversation_list_filters(
     include_agent_direct: bool = True,
 ) -> list[Any]:
     filters: list[Any] = [Conversation.user_email == user_email]
-    if status == "active":
+    if status == "task":
+        filters.extend([Conversation.status == "active", _task_control_clause()])
+    elif status == "active":
         filters.append(Conversation.status == "active")
     elif status == "archived":
         filters.append(Conversation.status == "archived")
@@ -230,6 +259,8 @@ def _conversation_list_filters(
         filters.append(Conversation.status != "deleted")
     elif status != "all":
         raise ValueError(f"Unsupported conversation status filter: {status}")
+    if status != "task":
+        filters.append(_exclude_task_control_clause())
     context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
     agent_values = sorted({value for value in [agent_id, *(agent_ids or [])] if value})
     if len(context_values) == 1:
@@ -256,8 +287,10 @@ def _conversation_scope_filters(
     agent_ids: list[str] | None = None,
     project_id: str | None = None,
     include_agent_direct: bool = True,
+    status: str = "active",
 ) -> list[Any]:
     filters: list[Any] = [Conversation.user_email == user_email]
+    filters.append(_task_control_clause() if status == "task" else _exclude_task_control_clause())
     context_values = sorted({value for value in [context_type, *(context_types or [])] if value})
     agent_values = sorted({value for value in [agent_id, *(agent_ids or [])] if value})
     if len(context_values) == 1:
@@ -276,6 +309,8 @@ def _conversation_scope_filters(
 
 
 def _conversation_status_clause(status: str) -> sa.ColumnElement[bool]:
+    if status == "task":
+        return Conversation.status == "active"
     if status == "active":
         return Conversation.status == "active"
     if status == "archived":
@@ -469,6 +504,14 @@ async def delete_user_cascade(session: AsyncSession, email: str) -> bool:
     )
     await session.execute(delete(AgentGrantRow).where(AgentGrantRow.grantee_user_email == email))
     await session.execute(delete(AgentGrantRow).where(AgentGrantRow.granted_by == email))
+    await session.execute(
+        delete(KnowledgebaseGrantRow).where(
+            sa.or_(
+                KnowledgebaseGrantRow.grantee_user_email == email,
+                KnowledgebaseGrantRow.granted_by == email,
+            )
+        )
+    )
     # Schedules reference agents owned by user
     await session.execute(delete(Schedule).where(Schedule.created_by == email))
     # Tasks reference agents and users
@@ -745,6 +788,42 @@ async def get_setting_value(session: AsyncSession, key: str, default: object = N
     return setting.value
 
 
+def _dialect_insert_do_nothing(
+    session: AsyncSession,
+    table: sa.Table,
+    values: dict[str, Any],
+    *,
+    index_elements: list[str],
+) -> Any:
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    elif dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    else:
+        raise RuntimeError(f"Unsupported database dialect for conflict-safe insert: {dialect_name}")
+    return insert(table).values(**values).on_conflict_do_nothing(index_elements=index_elements)
+
+
+async def insert_row_if_absent(
+    session: AsyncSession,
+    table: sa.Table,
+    values: dict[str, Any],
+    *,
+    index_elements: list[str],
+) -> bool:
+    """Insert one row without racing another controller inserting the same key."""
+    result = await session.execute(
+        _dialect_insert_do_nothing(
+            session,
+            table,
+            values,
+            index_elements=index_elements,
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
 async def upsert_setting(
     session: AsyncSession,
     key: str,
@@ -752,17 +831,36 @@ async def upsert_setting(
     category: str,
     updated_by: str | None = None,
 ) -> Setting:
-    """Create or update a setting."""
-    existing = await get_setting(session, key)
-    if existing is not None:
-        existing.value = value
-        existing.updated_by = updated_by
-        existing.updated_at = datetime.now(UTC)
-        await session.flush()
-        return existing
-    setting = Setting(key=key, value=value, category=category, updated_by=updated_by)
-    session.add(setting)
+    """Create or update a setting atomically across controller replicas."""
+    now = datetime.now(UTC)
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    elif dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    else:
+        raise RuntimeError(f"Unsupported database dialect for setting upsert: {dialect_name}")
+    insert_statement = insert(Setting).values(
+        key=key,
+        value=value,
+        category=category,
+        updated_by=updated_by,
+        updated_at=now,
+    )
+    await session.execute(
+        insert_statement.on_conflict_do_update(
+            index_elements=[Setting.key],
+            set_={
+                "value": value,
+                "updated_by": updated_by,
+                "updated_at": now,
+            },
+        )
+    )
     await session.flush()
+    session.expire_all()
+    setting = await get_setting(session, key)
+    assert setting is not None
     return setting
 
 
@@ -1627,7 +1725,110 @@ async def create_conversation(
     conversation_id: str | None = None,
     project_id: str | None = None,
 ) -> Conversation:
-    """Create a new conversation row."""
+    """Create a new conversation row without trusted lineage."""
+
+    from cognis.channels.constants import CHANNEL_TOOL_CONVERSATION_PREFIX
+
+    if conversation_id and conversation_id.startswith(CHANNEL_TOOL_CONVERSATION_PREFIX):
+        raise ValueError("Conversation ID uses a reserved internal namespace")
+    now = _utcnow()
+    conversation = Conversation(
+        conversation_id=conversation_id or f"conv_{uuid.uuid4().hex}",
+        user_email=user_email,
+        agent_id=agent_id,
+        agent_profile_id=agent_profile_id,
+        title=title,
+        title_source=title_source,
+        context_type=context_type,
+        context_ref=context_ref,
+        project_id=project_id,
+        context_data=context_data,
+        lineage_kind=None,
+        fork_source_conversation_id=None,
+        fork_source_session_id=None,
+        lineage_task_id=None,
+        lineage_step_run_id=None,
+        memory_labels=memory_labels,
+        last_message_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(conversation)
+    await session.flush()
+    return conversation
+
+
+async def create_lineage_conversation(
+    session: AsyncSession,
+    user_email: str,
+    agent_id: str,
+    context_type: str,
+    *,
+    lineage: ConversationLineage,
+    agent_profile_id: str | None = None,
+    title: str | None = None,
+    title_source: str = "unset",
+    context_ref: str | None = None,
+    context_data: dict[str, object] | None = None,
+    memory_labels: dict[str, object] | None = None,
+    conversation_id: str | None = None,
+    project_id: str | None = None,
+) -> Conversation:
+    """Validate and create one canonical typed lineage edge in this transaction."""
+
+    source_session = (
+        await session.scalars(
+            select(Session)
+            .where(
+                Session.session_id == lineage.source_session_id,
+                Session.user_email == user_email,
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
+    source_conversation = (
+        await session.scalars(
+            select(Conversation)
+            .where(
+                Conversation.conversation_id == lineage.source_conversation_id,
+                Conversation.user_email == user_email,
+                Conversation.status != "deleted",
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
+    if (
+        source_session is None
+        or source_conversation is None
+        or source_session.conversation_id != source_conversation.conversation_id
+    ):
+        raise PermissionError("Conversation lineage source is not authorized")
+
+    if lineage.kind != "conversation":
+        task = (
+            await session.scalars(
+                select(Task)
+                .where(
+                    Task.task_id == lineage.task_id,
+                    Task.created_by == user_email,
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+        step = (
+            await session.scalars(
+                select(StepRun)
+                .where(
+                    StepRun.step_run_id == lineage.step_run_id,
+                    StepRun.task_id == lineage.task_id,
+                    StepRun.session_id == lineage.source_session_id,
+                    StepRun.conversation_id == lineage.source_conversation_id,
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+        if task is None or step is None:
+            raise PermissionError("Task lineage source is not authorized")
 
     now = _utcnow()
     conversation = Conversation(
@@ -1641,6 +1842,13 @@ async def create_conversation(
         context_ref=context_ref,
         project_id=project_id,
         context_data=context_data,
+        lineage_kind=lineage.kind,
+        fork_source_conversation_id=(
+            lineage.source_conversation_id if lineage.kind == "conversation" else None
+        ),
+        fork_source_session_id=lineage.source_session_id,
+        lineage_task_id=lineage.task_id,
+        lineage_step_run_id=lineage.step_run_id,
         memory_labels=memory_labels,
         last_message_at=now,
         created_at=now,
@@ -1656,6 +1864,19 @@ async def get_conversation(session: AsyncSession, conversation_id: str) -> Conve
 
     result = await session.execute(
         select(Conversation).where(Conversation.conversation_id == conversation_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_conversation_for_update(
+    session: AsyncSession, conversation_id: str
+) -> Conversation | None:
+    """Return and lock one conversation for a transaction-scoped mutation."""
+
+    result = await session.execute(
+        select(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .with_for_update()
     )
     return result.scalar_one_or_none()
 
@@ -1884,6 +2105,7 @@ async def list_sidebar_tombstone_conversation_ids(
         agent_ids=agent_ids,
         project_id=project_id,
         include_agent_direct=include_agent_direct,
+        status=status,
     )
     visible_clause = _conversation_status_clause(status)
     result = await session.execute(
@@ -2107,6 +2329,15 @@ async def create_managed_conversation_link(
     turn_state: str = "idle",
     active_turn_id: str | None = None,
     notify_on_completion: bool = False,
+    handoff_state: str | None = None,
+    handoff_target_turn_id: str | None = None,
+    handoff_controller_session_id: str | None = None,
+    handoff_controller_turn_id: str | None = None,
+    handoff_tool_call_id: str | None = None,
+    kind: str = "agent",
+    completion_policy: str = "turn",
+    owner_epoch: int = 1,
+    creation_policy_snapshot: dict[str, Any] | None = None,
 ) -> ManagedConversationLink:
     """Create a durable controller-to-target managed conversation link."""
 
@@ -2149,10 +2380,19 @@ async def create_managed_conversation_link(
         target_conversation_id=target_conversation_id,
         target_session_id=target_session_id,
         title=title,
+        kind=kind,
+        completion_policy=completion_policy,
+        owner_epoch=owner_epoch,
+        creation_policy_snapshot=creation_policy_snapshot,
         conversation_state="open",
         turn_state=turn_state,
         active_turn_id=active_turn_id,
         notify_on_completion=notify_on_completion,
+        handoff_state=handoff_state,
+        handoff_target_turn_id=handoff_target_turn_id,
+        handoff_controller_session_id=handoff_controller_session_id,
+        handoff_controller_turn_id=handoff_controller_turn_id,
+        handoff_tool_call_id=handoff_tool_call_id,
     )
     session.add(row)
     await session.flush()
@@ -2278,6 +2518,8 @@ async def list_managed_conversation_links(
     user_email: str,
     controller_agent_id: str | None = None,
     controller_conversation_id: str | None = None,
+    controller_session_id: str | None = None,
+    kind: str | None = None,
     status: str | None = None,
     limit: int = 25,
 ) -> list[ManagedConversationLink]:
@@ -2290,6 +2532,10 @@ async def list_managed_conversation_links(
         query = query.where(
             ManagedConversationLink.controller_conversation_id == controller_conversation_id
         )
+    if controller_session_id is not None:
+        query = query.where(ManagedConversationLink.controller_session_id == controller_session_id)
+    if kind is not None:
+        query = query.where(ManagedConversationLink.kind == kind)
     if status is not None and status != "all":
         query = query.where(
             sa.or_(
@@ -2302,6 +2548,623 @@ async def list_managed_conversation_links(
         ManagedConversationLink.created_at.desc(),
     ).limit(max(1, min(limit, 100)))
     result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def list_active_managed_conversation_links_for_controller_session(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    controller_session_id: str,
+) -> list[ManagedConversationLink]:
+    """Return managed child turns that still block one controller session."""
+
+    result = await session.execute(
+        select(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.user_email == user_email,
+            ManagedConversationLink.controller_session_id == controller_session_id,
+            ManagedConversationLink.conversation_state == "open",
+            sa.or_(
+                ManagedConversationLink.turn_state.in_(("queued", "running")),
+                ManagedConversationLink.active_turn_id.is_not(None),
+            ),
+        )
+        .order_by(
+            ManagedConversationLink.updated_at.asc(),
+            ManagedConversationLink.created_at.asc(),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def list_managed_conversation_links_in_active_scope(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    controller_conversation_id: str,
+    status: str | None = None,
+    limit: int = 25,
+) -> list[ManagedConversationLink]:
+    """List managed links whose controller origin is in the active activity scope."""
+
+    origin_session = aliased(Session)
+    active_session = aliased(Session)
+    query = (
+        select(ManagedConversationLink)
+        .join(
+            Conversation,
+            Conversation.conversation_id == ManagedConversationLink.controller_conversation_id,
+        )
+        .join(
+            origin_session,
+            origin_session.session_id == ManagedConversationLink.controller_session_id,
+        )
+        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .where(
+            ManagedConversationLink.user_email == user_email,
+            ManagedConversationLink.controller_conversation_id == controller_conversation_id,
+            origin_session.activity_scope_id == active_session.activity_scope_id,
+        )
+    )
+    if status is not None and status != "all":
+        query = query.where(
+            sa.or_(
+                ManagedConversationLink.conversation_state == status,
+                ManagedConversationLink.turn_state == status,
+            )
+        )
+    result = await session.execute(
+        query.order_by(
+            ManagedConversationLink.updated_at.desc(),
+            ManagedConversationLink.created_at.desc(),
+        ).limit(max(1, min(limit, 100)))
+    )
+    return list(result.scalars().all())
+
+
+async def get_managed_channel_binding_for_link(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    for_update: bool = False,
+) -> ManagedChannelBinding | None:
+    """Return the channel binding for one managed link."""
+
+    query = select(ManagedChannelBinding).where(ManagedChannelBinding.link_id == link_id)
+    if for_update:
+        query = query.with_for_update()
+    result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def get_managed_channel_binding_for_target(
+    session: AsyncSession,
+    target_conversation_id: str,
+    *,
+    for_update: bool = False,
+) -> ManagedChannelBinding | None:
+    """Return the channel binding for one managed target conversation."""
+
+    binding_id = (
+        await session.execute(
+            select(ManagedChannelBinding.binding_id)
+            .join(
+                ManagedConversationLink,
+                ManagedConversationLink.link_id == ManagedChannelBinding.link_id,
+            )
+            .where(
+                ManagedConversationLink.target_conversation_id == target_conversation_id,
+                ManagedConversationLink.kind == "channel",
+            )
+        )
+    ).scalar_one_or_none()
+    if binding_id is None:
+        return None
+    query = select(ManagedChannelBinding).where(ManagedChannelBinding.binding_id == binding_id)
+    if for_update:
+        query = query.with_for_update()
+    return (await session.execute(query)).scalar_one_or_none()
+
+
+async def take_managed_channel_ownership(
+    session: AsyncSession,
+    *,
+    target_conversation_id: str,
+    user_email: str,
+    expected_owner_epoch: int,
+    controller_agent_id: str,
+    controller_conversation_id: str,
+    controller_session_id: str,
+) -> ManagedConversationLink | None:
+    """Transfer idle or waiting channel control with an epoch-fenced CAS."""
+
+    binding_id = (
+        await session.execute(
+            select(ManagedChannelBinding.binding_id)
+            .join(
+                ManagedConversationLink,
+                ManagedConversationLink.link_id == ManagedChannelBinding.link_id,
+            )
+            .where(
+                ManagedConversationLink.target_conversation_id == target_conversation_id,
+                ManagedConversationLink.user_email == user_email,
+                ManagedConversationLink.kind == "channel",
+            )
+        )
+    ).scalar_one_or_none()
+    if binding_id is None:
+        return None
+    binding = await session.get(ManagedChannelBinding, binding_id, with_for_update=True)
+    if binding is None:
+        return None
+    link = await get_managed_conversation_link(
+        session, binding.link_id, user_email=user_email, for_update=True
+    )
+    if link is None or link.kind != "channel":
+        return None
+    if binding is None or binding.state not in {"waiting_external", "waiting_controller"}:
+        return None
+    if (
+        binding.delivery_lease_token
+        and binding.delivery_lease_expires_at
+        and _as_utc(binding.delivery_lease_expires_at) > _utcnow()
+    ):
+        return None
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link.link_id,
+            ManagedConversationLink.user_email == user_email,
+            ManagedConversationLink.kind == "channel",
+            ManagedConversationLink.owner_epoch == expected_owner_epoch,
+            ManagedConversationLink.conversation_state == "open",
+            ManagedConversationLink.turn_state.in_(("idle", "waiting_controller")),
+        )
+        .values(
+            controller_agent_id=controller_agent_id,
+            controller_conversation_id=controller_conversation_id,
+            controller_session_id=controller_session_id,
+            owner_epoch=ManagedConversationLink.owner_epoch + 1,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.flush()
+    if result.rowcount != 1:
+        return None
+    await session.refresh(link)
+    pending_notifications = list(
+        (
+            await session.execute(
+                select(NotificationRow).where(
+                    NotificationRow.user_email == user_email,
+                    NotificationRow.status == "pending",
+                    NotificationRow.notification_type.in_(
+                        (
+                            "managed_conversation_signal",
+                            "managed_conversation_completed",
+                        )
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for notification in pending_notifications:
+        payload = dict(notification.payload or {})
+        if payload.get("link_id") != link.link_id:
+            continue
+        notification.conversation_id = controller_conversation_id
+        notification.session_id = controller_session_id
+        payload["owner_epoch"] = link.owner_epoch
+        notification.payload = payload
+    await session.flush()
+    return link
+
+
+async def create_managed_conversation_signal(
+    session: AsyncSession,
+    *,
+    link_id: str,
+    owner_epoch: int,
+    message: str,
+    wait: bool,
+    source_turn_id: str,
+    kind: str = "explicit",
+) -> ManagedConversationSignal:
+    """Persist a child signal and move a waiting child to its durable hold state."""
+
+    binding = await get_managed_channel_binding_for_link(session, link_id, for_update=True)
+    if binding is None:
+        raise ValueError("Managed channel binding is unavailable.")
+    link = await get_managed_conversation_link(session, link_id, for_update=True)
+    if (
+        link is None
+        or link.kind != "channel"
+        or link.conversation_state != "open"
+        or link.owner_epoch != owner_epoch
+    ):
+        raise ValueError("Managed channel ownership changed.")
+    existing_source = (
+        await session.execute(
+            select(ManagedConversationSignal)
+            .where(
+                ManagedConversationSignal.link_id == link_id,
+                ManagedConversationSignal.owner_epoch == owner_epoch,
+                ManagedConversationSignal.source_turn_id == source_turn_id,
+                ManagedConversationSignal.kind == kind,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing_source is not None:
+        return existing_source
+    if wait:
+        existing = await session.execute(
+            select(ManagedConversationSignal.signal_id)
+            .where(
+                ManagedConversationSignal.link_id == link_id,
+                ManagedConversationSignal.owner_epoch == owner_epoch,
+                ManagedConversationSignal.state == "waiting_controller",
+            )
+            .with_for_update()
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise ValueError("Managed channel is already waiting for its controller.")
+    signal = ManagedConversationSignal(
+        signal_id=f"mcsig_{uuid.uuid4().hex[:24]}",
+        link_id=link_id,
+        owner_epoch=owner_epoch,
+        source_turn_id=source_turn_id,
+        kind=kind,
+        message=message,
+        wait=wait,
+        state="waiting_controller" if wait else "notified",
+        memory_eligible=False,
+    )
+    session.add(signal)
+    notification = NotificationRow(
+        notification_id=f"notif_signal_{signal.signal_id}",
+        notification_type="managed_conversation_signal",
+        user_email=link.user_email,
+        conversation_id=link.controller_conversation_id,
+        session_id=link.controller_session_id,
+        payload={
+            "signal_id": signal.signal_id,
+            "link_id": link.link_id,
+            "message": message,
+            "wait": wait,
+            "owner_epoch": owner_epoch,
+            "source_turn_id": source_turn_id,
+            "memory_eligible": False,
+        },
+        status="pending",
+        created_at=datetime.now(UTC),
+    )
+    session.add(notification)
+    if wait:
+        link.turn_state = "waiting_controller"
+        link.notify_on_completion = False
+        binding.state = "waiting_controller"
+        binding.version += 1
+        binding.updated_at = datetime.now(UTC)
+    await session.flush()
+    await session.refresh(signal)
+    return signal
+
+
+async def consume_waiting_managed_conversation_signal(
+    session: AsyncSession,
+    *,
+    link_id: str,
+    owner_epoch: int,
+    resume_request_id: str,
+    resume_turn_id: str,
+) -> ManagedConversationSignal | None:
+    """Consume the current controller wait under the ownership fence."""
+
+    binding = await get_managed_channel_binding_for_link(session, link_id, for_update=True)
+    if binding is None:
+        return None
+    link = await get_managed_conversation_link(session, link_id, for_update=True)
+    if link is None or link.owner_epoch != owner_epoch:
+        raise ValueError("Managed channel ownership changed.")
+    result = await session.execute(
+        select(ManagedConversationSignal)
+        .where(
+            ManagedConversationSignal.link_id == link_id,
+            ManagedConversationSignal.owner_epoch == owner_epoch,
+            ManagedConversationSignal.state == "waiting_controller",
+        )
+        .order_by(ManagedConversationSignal.created_at.asc())
+        .with_for_update()
+    )
+    signal = result.scalar_one_or_none()
+    if signal is None:
+        return None
+    now = datetime.now(UTC)
+    if (
+        binding.delivery_lease_token
+        and binding.delivery_lease_expires_at
+        and _as_utc(binding.delivery_lease_expires_at) > now
+    ):
+        return None
+    signal.state = "resuming"
+    signal.resume_request_id = resume_request_id
+    signal.resume_turn_id = resume_turn_id
+    signal.resume_prepared_at = now
+    signal.resume_admitted_at = None
+    signal.resume_terminal_status = None
+    link.turn_state = "running"
+    link.active_turn_id = resume_turn_id
+    link.updated_at = now
+    binding.state = "processing"
+    binding.version += 1
+    binding.updated_at = now
+    await session.flush()
+    return signal
+
+
+async def settle_managed_conversation_signal_resume(
+    session: AsyncSession,
+    *,
+    signal_id: str,
+    succeeded: bool,
+    expected_resume_request_id: str | None = None,
+    expected_resume_turn_id: str | None = None,
+) -> ManagedConversationSignal | None:
+    """Commit or compensate one reserved controller resume."""
+
+    signal_link_id = (
+        await session.execute(
+            select(ManagedConversationSignal.link_id).where(
+                ManagedConversationSignal.signal_id == signal_id
+            )
+        )
+    ).scalar_one_or_none()
+    if signal_link_id is None:
+        return None
+    binding = await get_managed_channel_binding_for_link(session, signal_link_id, for_update=True)
+    if binding is None:
+        return None
+    link = await get_managed_conversation_link(session, signal_link_id, for_update=True)
+    signal_query = select(ManagedConversationSignal).where(
+        ManagedConversationSignal.signal_id == signal_id,
+        ManagedConversationSignal.state == "resuming",
+    )
+    if expected_resume_request_id is not None:
+        signal_query = signal_query.where(
+            ManagedConversationSignal.resume_request_id == expected_resume_request_id
+        )
+    if expected_resume_turn_id is not None:
+        signal_query = signal_query.where(
+            ManagedConversationSignal.resume_turn_id == expected_resume_turn_id
+        )
+    result = await session.execute(signal_query.with_for_update())
+    signal = result.scalar_one_or_none()
+    if signal is None:
+        return None
+    now = datetime.now(UTC)
+    if succeeded:
+        signal.state = "consumed"
+        signal.consumed_at = now
+        signal.resume_admitted_at = now
+        signal.resume_terminal_status = "admitted"
+    else:
+        signal.state = "waiting_controller"
+        signal.consumed_at = None
+        if link is not None and link.conversation_state == "open":
+            link.turn_state = "waiting_controller"
+            link.active_turn_id = None
+            link.updated_at = now
+        binding.state = "waiting_controller"
+        binding.version += 1
+        binding.updated_at = now
+    await session.flush()
+    return signal
+
+
+async def validate_managed_conversation_signal_resume_admission(
+    session: AsyncSession,
+    *,
+    signal_id: str,
+    link_id: str,
+    owner_epoch: int,
+    resume_request_id: str,
+    resume_turn_id: str,
+) -> bool:
+    """Validate a prepared resume in the durable-request insert transaction."""
+
+    binding = await get_managed_channel_binding_for_link(session, link_id, for_update=True)
+    if binding is None:
+        return False
+    link = await get_managed_conversation_link(session, link_id, for_update=True)
+    if (
+        link is None
+        or link.kind != "channel"
+        or link.owner_epoch != owner_epoch
+        or link.conversation_state != "open"
+        or link.turn_state != "running"
+        or link.active_turn_id != resume_turn_id
+        or binding.state != "processing"
+        or binding.active_route_key is None
+    ):
+        return False
+    signal = (
+        await session.execute(
+            select(ManagedConversationSignal)
+            .where(
+                ManagedConversationSignal.signal_id == signal_id,
+                ManagedConversationSignal.link_id == link_id,
+                ManagedConversationSignal.owner_epoch == owner_epoch,
+                ManagedConversationSignal.state == "resuming",
+                ManagedConversationSignal.resume_request_id == resume_request_id,
+                ManagedConversationSignal.resume_turn_id == resume_turn_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    return signal is not None
+
+
+async def complete_managed_channel_conversation(
+    session: AsyncSession,
+    *,
+    link_id: str,
+    owner_epoch: int,
+    status: str,
+    summary: str | None,
+) -> ManagedConversationLink | None:
+    """Explicitly terminate a channel-managed conversation."""
+
+    if status not in {"completed", "cancelled", "failed"}:
+        raise ValueError("Unsupported managed completion status.")
+    now = datetime.now(UTC)
+    binding = await get_managed_channel_binding_for_link(session, link_id, for_update=True)
+    if binding is None:
+        return None
+    if binding.state == "delivery_pending":
+        return None
+    if (
+        binding.delivery_lease_token
+        and binding.delivery_lease_expires_at
+        and _as_utc(binding.delivery_lease_expires_at) > now
+    ):
+        return None
+    link = await get_managed_conversation_link(session, link_id, for_update=True)
+    if (
+        link is None
+        or link.kind != "channel"
+        or link.owner_epoch != owner_epoch
+        or link.conversation_state != "open"
+    ):
+        return None
+    binding.state = status
+    binding.active_route_key = None
+    binding.version += 1
+    binding.terminal_at = now
+    binding.last_error = summary if status == "failed" else None
+    binding.updated_at = now
+    link.conversation_state = status
+    link.turn_state = status
+    link.active_turn_id = None
+    link.notify_on_completion = False
+    link.last_result_summary = summary
+    link.last_error = summary if status == "failed" else None
+    link.completed_at = now
+    link.updated_at = now
+    await persist_managed_terminal_notification(session, link=link, status=status)
+    await session.flush()
+    return link
+
+
+async def request_managed_channel_completion(
+    session: AsyncSession,
+    *,
+    link_id: str,
+    owner_epoch: int,
+    source_turn_id: str,
+    status: str,
+    summary: str | None,
+) -> ManagedConversationLink | None:
+    """Persist a child completion request until its final is delivered."""
+
+    if status not in {"completed", "cancelled", "failed"}:
+        raise ValueError("Unsupported managed completion status.")
+    binding = await get_managed_channel_binding_for_link(session, link_id, for_update=True)
+    link = await get_managed_conversation_link(session, link_id, for_update=True)
+    if (
+        binding is None
+        or link is None
+        or link.kind != "channel"
+        or link.owner_epoch != owner_epoch
+        or link.conversation_state != "open"
+        or link.active_turn_id != source_turn_id
+        or link.turn_state != "running"
+        or binding.state != "processing"
+        or binding.active_route_key is None
+    ):
+        return None
+    metadata = dict(link.control_metadata) if isinstance(link.control_metadata, dict) else {}
+    metadata["channel_completion_request"] = {
+        "source_turn_id": source_turn_id,
+        "status": status,
+        "summary": summary,
+    }
+    link.control_metadata = metadata
+    link.notify_on_completion = True
+    link.updated_at = datetime.now(UTC)
+    await session.flush()
+    return link
+
+
+async def persist_managed_terminal_notification(
+    session: AsyncSession,
+    *,
+    link: ManagedConversationLink,
+    status: str,
+) -> NotificationRow:
+    """Persist exactly one controller notification with the terminal mutation."""
+
+    notification_id = f"notif_managed_{link.link_id}_{link.owner_epoch}"
+    existing = await session.get(NotificationRow, notification_id)
+    if existing is not None:
+        return existing
+    row = NotificationRow(
+        notification_id=notification_id,
+        notification_type="managed_conversation_completed",
+        user_email=link.user_email,
+        conversation_id=link.controller_conversation_id,
+        session_id=link.controller_session_id,
+        payload={
+            "link_id": link.link_id,
+            "conversation_id": link.target_conversation_id,
+            "status": status,
+            "owner_epoch": link.owner_epoch,
+            "memory_eligible": False,
+        },
+        status="pending",
+        created_at=datetime.now(UTC),
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def list_open_managed_conversation_links(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    limit: int = 201,
+) -> list[ManagedConversationLink]:
+    """Return bounded, currently open managed conversations for one user."""
+
+    origin_session = aliased(Session)
+    active_session = aliased(Session)
+    result = await session.execute(
+        select(ManagedConversationLink)
+        .join(
+            Conversation,
+            Conversation.conversation_id == ManagedConversationLink.controller_conversation_id,
+        )
+        .join(
+            origin_session,
+            origin_session.session_id == ManagedConversationLink.controller_session_id,
+        )
+        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .where(
+            ManagedConversationLink.user_email == user_email,
+            ManagedConversationLink.conversation_state == "open",
+            origin_session.activity_scope_id == active_session.activity_scope_id,
+        )
+        .order_by(
+            ManagedConversationLink.updated_at.desc(),
+            ManagedConversationLink.created_at.desc(),
+        )
+        .limit(max(1, min(limit, 501)))
+    )
     return list(result.scalars().all())
 
 
@@ -2318,6 +3181,7 @@ async def list_inactive_managed_conversation_links(
         select(ManagedConversationLink)
         .where(
             ManagedConversationLink.conversation_state != "closed",
+            ManagedConversationLink.kind != "channel",
             ManagedConversationLink.updated_at < older_than,
         )
         .order_by(ManagedConversationLink.updated_at.asc())
@@ -2514,6 +3378,183 @@ async def arm_managed_conversation_notification_if_active(
     return bool(result.rowcount)
 
 
+async def begin_managed_conversation_join_handoff(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    target_turn_id: str,
+    controller_session_id: str,
+    controller_turn_id: str,
+    tool_call_id: str,
+) -> ManagedConversationLink | None:
+    """Atomically transfer one active managed turn to a joined parent tool call."""
+
+    matching_pending_handoff = sa.and_(
+        ManagedConversationLink.handoff_state == "pending",
+        ManagedConversationLink.handoff_target_turn_id == target_turn_id,
+        ManagedConversationLink.handoff_controller_session_id == controller_session_id,
+        ManagedConversationLink.handoff_controller_turn_id == controller_turn_id,
+        ManagedConversationLink.handoff_tool_call_id == tool_call_id,
+    )
+    rejoinable_active_turn = sa.and_(
+        ManagedConversationLink.active_turn_id == target_turn_id,
+        sa.or_(
+            ManagedConversationLink.handoff_state.is_(None),
+            ManagedConversationLink.handoff_state == "acknowledged",
+            matching_pending_handoff,
+        ),
+    )
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            sa.or_(
+                rejoinable_active_turn,
+                sa.and_(
+                    ManagedConversationLink.last_result_turn_id == target_turn_id,
+                    matching_pending_handoff,
+                ),
+            ),
+        )
+        .values(
+            notify_on_completion=False,
+            handoff_state="pending",
+            handoff_target_turn_id=target_turn_id,
+            handoff_controller_session_id=controller_session_id,
+            handoff_controller_turn_id=controller_turn_id,
+            handoff_tool_call_id=tool_call_id,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        return None
+    session.expire_all()
+    return await get_managed_conversation_link(session, link_id)
+
+
+async def acknowledge_managed_conversation_join_handoff(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    target_turn_id: str,
+    controller_session_id: str,
+    controller_turn_id: str,
+    tool_call_id: str,
+) -> str | None:
+    """Acknowledge a joined result after its parent tool_result is durable."""
+
+    predicate = (
+        ManagedConversationLink.link_id == link_id,
+        ManagedConversationLink.handoff_target_turn_id == target_turn_id,
+        ManagedConversationLink.handoff_controller_session_id == controller_session_id,
+        ManagedConversationLink.handoff_controller_turn_id == controller_turn_id,
+        ManagedConversationLink.handoff_tool_call_id == tool_call_id,
+    )
+    await session.execute(
+        update(ManagedConversationLink)
+        .where(*predicate, ManagedConversationLink.handoff_state == "pending")
+        .values(
+            handoff_state="acknowledged",
+            notify_on_completion=False,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    result = await session.execute(select(ManagedConversationLink.handoff_state).where(*predicate))
+    return result.scalar_one_or_none()
+
+
+async def claim_managed_conversation_join_handoff(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    target_turn_id: str,
+    controller_session_id: str,
+    controller_turn_id: str,
+    tool_call_id: str,
+) -> ManagedConversationLink | None:
+    """Claim fallback ownership iff the exact joined handoff is still pending."""
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.handoff_state == "pending",
+            ManagedConversationLink.handoff_target_turn_id == target_turn_id,
+            ManagedConversationLink.handoff_controller_session_id == controller_session_id,
+            ManagedConversationLink.handoff_controller_turn_id == controller_turn_id,
+            ManagedConversationLink.handoff_tool_call_id == tool_call_id,
+        )
+        .values(
+            handoff_state="fallback_claimed",
+            notify_on_completion=True,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        return None
+    session.expire_all()
+    return await get_managed_conversation_link(session, link_id)
+
+
+async def clear_claimed_managed_conversation_join_notification(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    target_turn_id: str,
+) -> bool:
+    """Clear notification ownership after its deterministic intent is durable."""
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.handoff_state == "fallback_claimed",
+            ManagedConversationLink.handoff_target_turn_id == target_turn_id,
+            ManagedConversationLink.notify_on_completion.is_(True),
+        )
+        .values(notify_on_completion=False, updated_at=datetime.now(UTC))
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def list_pending_managed_conversation_join_handoffs(
+    session: AsyncSession,
+    *,
+    controller_session_id: str | None = None,
+    controller_turn_id: str | None = None,
+) -> list[ManagedConversationLink]:
+    """List joined handoffs still needing acknowledgement or fallback delivery."""
+
+    statement = select(ManagedConversationLink).where(
+        sa.or_(
+            ManagedConversationLink.handoff_state == "pending",
+            sa.and_(
+                ManagedConversationLink.handoff_state == "fallback_claimed",
+                ManagedConversationLink.notify_on_completion.is_(True),
+            ),
+        )
+    )
+    if controller_session_id is not None:
+        statement = statement.where(
+            ManagedConversationLink.handoff_controller_session_id == controller_session_id
+        )
+    if controller_turn_id is not None:
+        statement = statement.where(
+            ManagedConversationLink.handoff_controller_turn_id == controller_turn_id
+        )
+    result = await session.execute(
+        statement.order_by(
+            ManagedConversationLink.updated_at.asc(),
+            ManagedConversationLink.link_id.asc(),
+        )
+    )
+    return list(result.scalars().all())
+
+
 async def settle_managed_conversation_link(
     session: AsyncSession,
     link_id: str,
@@ -2566,6 +3607,10 @@ async def admit_managed_conversation_turn(
     turn_state: str,
     notify_on_completion: bool,
     control_metadata: dict[str, Any] | None,
+    handoff_state: str | None = None,
+    handoff_controller_session_id: str | None = None,
+    handoff_controller_turn_id: str | None = None,
+    handoff_tool_call_id: str | None = None,
 ) -> ManagedConversationLink | None:
     """Atomically reset lifecycle state for one managed turn admission.
 
@@ -2582,12 +3627,26 @@ async def admit_managed_conversation_turn(
                 ManagedConversationLink.turn_state != "queued",
                 ManagedConversationLink.active_turn_id == turn_id,
             ),
+            sa.or_(
+                ManagedConversationLink.handoff_state.is_(None),
+                ManagedConversationLink.handoff_state == "acknowledged",
+                sa.and_(
+                    ManagedConversationLink.handoff_state == "fallback_claimed",
+                    ManagedConversationLink.notify_on_completion.is_(False),
+                ),
+                ManagedConversationLink.active_turn_id == turn_id,
+            ),
         )
         .values(
             conversation_state="open",
             turn_state=turn_state,
             active_turn_id=turn_id,
             notify_on_completion=notify_on_completion,
+            handoff_state=handoff_state,
+            handoff_target_turn_id=turn_id if handoff_state is not None else None,
+            handoff_controller_session_id=handoff_controller_session_id,
+            handoff_controller_turn_id=handoff_controller_turn_id,
+            handoff_tool_call_id=handoff_tool_call_id,
             last_result_summary=None,
             last_result_turn_id=None,
             last_error=None,
@@ -2599,6 +3658,7 @@ async def admit_managed_conversation_turn(
     )
     if int(getattr(result, "rowcount", 0) or 0) != 1:
         return None
+    session.expire_all()
     return await get_managed_conversation_link(session, link_id)
 
 
@@ -2660,6 +3720,40 @@ async def assign_managed_conversation_recovery_turn_id(
         )
         .values(
             active_turn_id=recovery_turn_id,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def settle_completed_fallback_managed_conversation_turn(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    target_turn_id: str,
+) -> bool:
+    """Atomically settle a restart-cleared fallback handoff for its original child turn."""
+
+    result = await session.execute(
+        update(ManagedConversationLink)
+        .where(
+            ManagedConversationLink.link_id == link_id,
+            ManagedConversationLink.conversation_state == "open",
+            ManagedConversationLink.turn_state == "interrupted",
+            ManagedConversationLink.active_turn_id.is_(None),
+            ManagedConversationLink.notify_on_completion.is_(True),
+            ManagedConversationLink.handoff_state == "fallback_claimed",
+            ManagedConversationLink.handoff_target_turn_id == target_turn_id,
+        )
+        .values(
+            conversation_state="completed",
+            turn_state="completed",
+            active_turn_id=None,
+            last_result_summary="Managed turn completed after controller restart.",
+            last_result_turn_id=target_turn_id,
+            last_error=None,
+            completed_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
         .execution_options(synchronize_session=False)
@@ -2818,6 +3912,29 @@ async def update_conversation_active_session(
     return True
 
 
+async def compare_and_set_conversation_active_session(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    expected_session_id: str,
+    active_session_id: str,
+) -> bool:
+    """Replace the active root session only when the expected root is still active."""
+
+    result = await session.execute(
+        update(Conversation)
+        .where(
+            Conversation.conversation_id == conversation_id,
+            Conversation.active_session_id == expected_session_id,
+        )
+        .values(
+            active_session_id=active_session_id,
+            updated_at=datetime.now(UTC),
+        )
+    )
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
 async def get_latest_root_session_for_conversation(
     session: AsyncSession,
     conversation_id: str,
@@ -2870,6 +3987,7 @@ async def set_conversation_active_executor(
     assigned_at: datetime | None = None,
     expires_at: datetime | None = None,
     source: str | None = None,
+    unavailable_since: datetime | None = None,
 ) -> bool:
     """Set the conversation-level active executor ID (Stage 36).
 
@@ -2878,17 +3996,21 @@ async def set_conversation_active_executor(
     conversation first needs an executor.
     """
 
-    conversation = await get_conversation(session, conversation_id)
-    if conversation is None:
-        return False
     timestamp = assigned_at or datetime.now(UTC)
-    conversation.active_executor_id = active_executor_id
-    conversation.active_executor_assigned_at = timestamp if active_executor_id else None
-    conversation.active_executor_expires_at = expires_at if active_executor_id else None
-    conversation.active_executor_source = source if active_executor_id else None
-    conversation.updated_at = timestamp
+    values: dict[str, Any] = {
+        "active_executor_id": active_executor_id,
+        "active_executor_assigned_at": timestamp if active_executor_id else None,
+        "active_executor_expires_at": expires_at if active_executor_id else None,
+        "active_executor_source": source if active_executor_id else None,
+        "active_executor_unavailable_since": unavailable_since if active_executor_id else None,
+        "active_executor_generation": Conversation.active_executor_generation + 1,
+        "updated_at": timestamp,
+    }
+    result = await session.execute(
+        update(Conversation).where(Conversation.conversation_id == conversation_id).values(**values)
+    )
     await session.flush()
-    return True
+    return bool(result.rowcount)
 
 
 async def initialize_conversation_active_executor(
@@ -2919,10 +4041,489 @@ async def initialize_conversation_active_executor(
             active_executor_assigned_at=timestamp,
             active_executor_expires_at=expires_at,
             active_executor_source=source,
+            active_executor_generation=Conversation.active_executor_generation + 1,
             updated_at=timestamp,
         )
     )
     return bool(result.rowcount)
+
+
+async def initialize_task_and_conversation_active_executor(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    conversation_id: str,
+    active_executor_id: str,
+    assigned_at: datetime | None = None,
+    source: str = "initial",
+) -> bool:
+    """Atomically seed the authoritative task pin and its conversation projection.
+
+    The task CAS is the single winner. A losing concurrent caller only projects
+    the already authoritative task value and never overwrites it.
+    """
+    timestamp = assigned_at or datetime.now(UTC)
+    conversation = await session.scalar(
+        select(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .with_for_update()
+    )
+    if conversation is None:
+        return False
+    task_result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id, Task.active_executor_id.is_(None))
+        .values(
+            active_executor_id=active_executor_id,
+            active_executor_assigned_at=timestamp,
+            active_executor_expires_at=None,
+            active_executor_source=source,
+            active_executor_generation=Task.active_executor_generation + 1,
+            updated_at=timestamp,
+        )
+    )
+    task = await get_task(session, task_id)
+    if task is None:
+        return False
+    chosen = task.active_executor_id
+    if not chosen:
+        return False
+    task_generation = int(task.active_executor_generation or 0)
+    conversation_result = await session.execute(
+        update(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .values(
+            active_executor_id=chosen,
+            active_executor_assigned_at=task.active_executor_assigned_at,
+            active_executor_expires_at=task.active_executor_expires_at,
+            active_executor_source=task.active_executor_source,
+            active_executor_generation=task_generation,
+            active_executor_unavailable_since=task.active_executor_unavailable_since,
+            updated_at=timestamp,
+        )
+    )
+    if conversation_result.rowcount != 1:
+        raise RuntimeError("Task executor pin projection lost its locked conversation")
+    await session.flush()
+    return bool(task_result.rowcount)
+
+
+async def switch_task_and_conversation_active_executor(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    conversation_id: str,
+    active_executor_id: str,
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+    source: str = "switch",
+) -> tuple[bool, int]:
+    """Atomically switch task authority and exact conversation projection."""
+    timestamp = assigned_at or datetime.now(UTC)
+    conversation = await session.scalar(
+        select(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .with_for_update()
+    )
+    if conversation is None:
+        return False, 0
+    task_result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id)
+        .values(
+            active_executor_id=active_executor_id,
+            active_executor_assigned_at=timestamp,
+            active_executor_expires_at=expires_at,
+            active_executor_source=source,
+            active_executor_unavailable_since=None,
+            active_executor_generation=Task.active_executor_generation + 1,
+            updated_at=timestamp,
+        )
+    )
+    if not task_result.rowcount:
+        return False, 0
+    task = await get_task(session, task_id)
+    if task is None:
+        return False, 0
+    generation = int(task.active_executor_generation or 0)
+    conversation_result = await session.execute(
+        update(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .values(
+            active_executor_id=task.active_executor_id,
+            active_executor_assigned_at=task.active_executor_assigned_at,
+            active_executor_expires_at=task.active_executor_expires_at,
+            active_executor_source=task.active_executor_source,
+            active_executor_unavailable_since=task.active_executor_unavailable_since,
+            active_executor_generation=generation,
+            updated_at=timestamp,
+        )
+    )
+    if not conversation_result.rowcount:
+        return False, generation
+    await session.flush()
+    return True, generation
+
+
+async def cas_executor_failover(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None,
+    task_id: str | None,
+    expected_executor_id: str,
+    new_executor_id: str,
+    expected_generation: int,
+    reason: str,
+    unavailable_since: datetime | None = None,
+    failover_source: str = "selector_primary",
+) -> tuple[bool, int, str | None]:
+    """CAS the authoritative pin and related conversation projection atomically."""
+    from cognis.store.models import ExecutorPinNoticeOutboxRow, ExecutorPinTransitionRow
+
+    timestamp = datetime.now(UTC)
+    locked_conversation = None
+    if task_id:
+        if not conversation_id:
+            return False, expected_generation, None
+        locked_conversation = await session.scalar(
+            select(Conversation)
+            .where(Conversation.conversation_id == conversation_id)
+            .with_for_update()
+        )
+        if locked_conversation is None:
+            return False, expected_generation, None
+    if task_id:
+        result = await session.execute(
+            update(Task)
+            .where(
+                Task.task_id == task_id,
+                Task.active_executor_id == expected_executor_id,
+                Task.active_executor_generation == expected_generation,
+            )
+            .values(
+                active_executor_id=new_executor_id,
+                active_executor_assigned_at=timestamp,
+                active_executor_expires_at=None,
+                active_executor_source=failover_source,
+                active_executor_unavailable_since=None,
+                active_executor_generation=Task.active_executor_generation + 1,
+                updated_at=timestamp,
+            )
+        )
+        if not result.rowcount:
+            return False, expected_generation, None
+        generation = expected_generation + 1
+    elif conversation_id:
+        result = await session.execute(
+            update(Conversation)
+            .where(
+                Conversation.conversation_id == conversation_id,
+                Conversation.active_executor_id == expected_executor_id,
+                Conversation.active_executor_generation == expected_generation,
+            )
+            .values(
+                active_executor_id=new_executor_id,
+                active_executor_assigned_at=timestamp,
+                active_executor_expires_at=None,
+                active_executor_source=failover_source,
+                active_executor_unavailable_since=None,
+                active_executor_generation=Conversation.active_executor_generation + 1,
+                updated_at=timestamp,
+            )
+        )
+        if not result.rowcount:
+            return False, expected_generation, None
+        generation = expected_generation + 1
+    else:
+        return False, expected_generation, None
+
+    if conversation_id and task_id:
+        projection_result = await session.execute(
+            update(Conversation)
+            .where(Conversation.conversation_id == conversation_id)
+            .values(
+                active_executor_id=new_executor_id,
+                active_executor_assigned_at=timestamp,
+                active_executor_expires_at=None,
+                active_executor_source=failover_source,
+                active_executor_generation=generation,
+                active_executor_unavailable_since=None,
+                updated_at=timestamp,
+            )
+        )
+        if projection_result.rowcount != 1:
+            raise RuntimeError("Executor failover projection lost its locked conversation")
+    authority_id = task_id if task_id is not None else conversation_id
+    transition_id = f"epin_{authority_id}_{generation}"
+    notice_id = f"executor_failover:{authority_id}:{generation}"
+    state_caveat = "The controller did not replay any in-flight, accepted-unknown, or partially delivered operation."
+    payload = {
+        "event": "system_notice",
+        "type": "system_notice",
+        "kind": "executor_failover",
+        "notice_id": notice_id,
+        "old_executor_id": expected_executor_id,
+        "new_executor_id": new_executor_id,
+        "reason": reason,
+        "state_caveat": state_caveat,
+        "replay_claim": False,
+        "message": (
+            f"Executor changed from '{expected_executor_id}' to '{new_executor_id}': "
+            f"{reason}. {state_caveat}"
+        ),
+    }
+    payload["text"] = payload["message"]
+    session.add(
+        ExecutorPinTransitionRow(
+            transition_id=transition_id,
+            scope_type="task" if task_id else "conversation",
+            scope_id=task_id or conversation_id,
+            generation=generation,
+            old_executor_id=expected_executor_id,
+            new_executor_id=new_executor_id,
+            reason=reason,
+            state_caveat=state_caveat,
+            notice_id=notice_id,
+        )
+    )
+    await session.flush()
+    if conversation_id:
+        conversation = locked_conversation or await get_conversation(session, conversation_id)
+        active = (
+            await session.get(Session, conversation.active_session_id)
+            if conversation is not None and conversation.active_session_id
+            else None
+        )
+        intaris_session_id = getattr(active, "intaris_session_id", None)
+        user_email = getattr(active, "user_email", None)
+        agent_id = getattr(active, "agent_id", None)
+        idempotency_key = f"{intaris_session_id or conversation_id}:executor_failover:{notice_id}"
+        payload["session_id"] = intaris_session_id or conversation_id
+        payload["idempotency_key"] = idempotency_key
+        payload["user_email"] = user_email
+        payload["agent_id"] = agent_id
+        session.add(
+            ExecutorPinNoticeOutboxRow(
+                outbox_id=f"epout_{conversation_id}_{generation}",
+                transition_id=transition_id,
+                conversation_id=conversation_id,
+                intaris_session_id=intaris_session_id,
+                idempotency_key=idempotency_key,
+                user_email=user_email,
+                agent_id=agent_id,
+                payload=payload,
+            )
+        )
+    await session.flush()
+    return True, generation, notice_id
+
+
+async def canonicalize_executor_pin_source(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None,
+    task_id: str | None,
+    expected_executor_id: str,
+    expected_generation: int,
+    source: str,
+) -> bool:
+    """Canonicalize legacy provenance under the authoritative pin CAS."""
+    if task_id and not conversation_id:
+        return False
+
+    def legacy(column: Any) -> Any:
+        return column.is_(None) | (column == "initial")
+
+    if task_id:
+        conversation = await session.scalar(
+            select(Conversation)
+            .where(Conversation.conversation_id == conversation_id)
+            .with_for_update()
+        )
+        if conversation is None:
+            return False
+        task_result = await session.execute(
+            update(Task)
+            .where(
+                Task.task_id == task_id,
+                Task.active_executor_id == expected_executor_id,
+                Task.active_executor_generation == expected_generation,
+                legacy(Task.active_executor_source),
+            )
+            .values(active_executor_source=source)
+        )
+        if not task_result.rowcount:
+            return False
+        projection = await session.execute(
+            update(Conversation)
+            .where(
+                Conversation.conversation_id == conversation_id,
+                Conversation.active_executor_id == expected_executor_id,
+                Conversation.active_executor_generation == expected_generation,
+            )
+            .values(active_executor_source=source)
+        )
+        if projection.rowcount != 1:
+            raise RuntimeError("Executor provenance projection lost its locked conversation")
+        await session.flush()
+        return True
+    if conversation_id:
+        result = await session.execute(
+            update(Conversation)
+            .where(
+                Conversation.conversation_id == conversation_id,
+                Conversation.active_executor_id == expected_executor_id,
+                Conversation.active_executor_generation == expected_generation,
+                legacy(Conversation.active_executor_source),
+            )
+            .values(active_executor_source=source)
+        )
+        await session.flush()
+        return bool(result.rowcount)
+    return False
+
+
+async def mark_executor_unavailable(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None,
+    task_id: str | None,
+    expected_executor_id: str,
+    expected_generation: int,
+    observed_at: datetime,
+) -> tuple[bool, datetime | None]:
+    """Persist the first unavailable observation without changing the pin."""
+    if task_id and conversation_id:
+        # All task+conversation pin mutations lock conversation first.  Keep the
+        # projection in a savepoint so a stale/missing projection cannot leave
+        # the authoritative task row changed in the caller's transaction.
+        class _ProjectionFailed(RuntimeError):
+            pass
+
+        try:
+            async with session.begin_nested():
+                conversation = await session.scalar(
+                    select(Conversation)
+                    .where(Conversation.conversation_id == conversation_id)
+                    .with_for_update()
+                )
+                if conversation is None:
+                    return False, None
+                result = await session.execute(
+                    update(Task)
+                    .where(
+                        Task.task_id == task_id,
+                        Task.active_executor_id == expected_executor_id,
+                        Task.active_executor_generation == expected_generation,
+                        Task.active_executor_unavailable_since.is_(None),
+                    )
+                    .values(active_executor_unavailable_since=observed_at, updated_at=observed_at)
+                )
+                if not result.rowcount:
+                    task = await get_task(session, task_id)
+                    return False, getattr(task, "active_executor_unavailable_since", None)
+                projection = await session.execute(
+                    update(Conversation)
+                    .where(
+                        Conversation.conversation_id == conversation_id,
+                        Conversation.active_executor_id == expected_executor_id,
+                        Conversation.active_executor_generation == expected_generation,
+                        Conversation.active_executor_unavailable_since.is_(None),
+                    )
+                    .values(
+                        active_executor_unavailable_since=observed_at,
+                        updated_at=observed_at,
+                    )
+                )
+                if projection.rowcount != 1:
+                    raise _ProjectionFailed
+                await session.flush()
+        except _ProjectionFailed:
+            task = await get_task(session, task_id)
+            return False, getattr(task, "active_executor_unavailable_since", None)
+        return True, observed_at
+    if task_id:
+        result = await session.execute(
+            update(Task)
+            .where(
+                Task.task_id == task_id,
+                Task.active_executor_id == expected_executor_id,
+                Task.active_executor_generation == expected_generation,
+                Task.active_executor_unavailable_since.is_(None),
+            )
+            .values(active_executor_unavailable_since=observed_at, updated_at=observed_at)
+        )
+        await session.flush()
+        if result.rowcount:
+            return True, observed_at
+        task = await get_task(session, task_id)
+        return False, getattr(task, "active_executor_unavailable_since", None)
+    if conversation_id:
+        result = await session.execute(
+            update(Conversation)
+            .where(
+                Conversation.conversation_id == conversation_id,
+                Conversation.active_executor_id == expected_executor_id,
+                Conversation.active_executor_generation == expected_generation,
+                Conversation.active_executor_unavailable_since.is_(None),
+            )
+            .values(active_executor_unavailable_since=observed_at, updated_at=observed_at)
+        )
+        await session.flush()
+        if result.rowcount:
+            return True, observed_at
+        conversation = await get_conversation(session, conversation_id)
+        return False, getattr(conversation, "active_executor_unavailable_since", None)
+    return False, None
+
+
+async def clear_executor_unavailable(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None,
+    task_id: str | None,
+    expected_executor_id: str,
+    expected_generation: int,
+) -> bool:
+    """Clear an unavailable marker after same-ID reconnect."""
+    if task_id:
+        result = await session.execute(
+            update(Task)
+            .where(
+                Task.task_id == task_id,
+                Task.active_executor_id == expected_executor_id,
+                Task.active_executor_generation == expected_generation,
+            )
+            .values(active_executor_unavailable_since=None)
+        )
+        if result.rowcount and conversation_id:
+            await session.execute(
+                update(Conversation)
+                .where(
+                    Conversation.conversation_id == conversation_id,
+                    Conversation.active_executor_id == expected_executor_id,
+                    Conversation.active_executor_generation == expected_generation,
+                )
+                .values(
+                    active_executor_unavailable_since=None,
+                    active_executor_generation=expected_generation,
+                )
+            )
+        await session.flush()
+        return bool(result.rowcount)
+    if conversation_id:
+        result = await session.execute(
+            update(Conversation)
+            .where(
+                Conversation.conversation_id == conversation_id,
+                Conversation.active_executor_id == expected_executor_id,
+                Conversation.active_executor_generation == expected_generation,
+            )
+            .values(active_executor_unavailable_since=None)
+        )
+        await session.flush()
+        return bool(result.rowcount)
+    return False
 
 
 async def reset_conversation_active_executor(
@@ -3005,6 +4606,96 @@ async def list_conversation_sessions(
     if limit is not None:
         stmt = stmt.limit(limit)
     result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_child_session_continuation_chain(
+    session: AsyncSession,
+    session_id: str,
+    *,
+    max_depth: int = 1000,
+) -> tuple[list[Session], bool]:
+    """Return one child session and its forward rotation successors."""
+
+    first = await session.get(Session, session_id)
+    if first is None or first.parent_session_id is None:
+        return ([first] if first is not None else []), False
+
+    rows = await list_conversation_sessions(
+        session,
+        first.conversation_id,
+        parent_session_id=first.parent_session_id,
+    )
+    successor_by_previous = {
+        row.previous_session_id: row for row in rows if row.previous_session_id is not None
+    }
+    chain = [first]
+    visited = {first.session_id}
+    current = first
+    while len(chain) < max_depth:
+        successor = successor_by_previous.get(current.session_id)
+        if successor is None or successor.session_id in visited:
+            return chain, False
+        chain.append(successor)
+        visited.add(successor.session_id)
+        current = successor
+    return chain, current.session_id in successor_by_previous
+
+
+async def list_active_delegation_sessions(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    limit: int = 201,
+) -> list[Session]:
+    """Return bounded active child sessions across the user's conversations."""
+
+    active_session = aliased(Session)
+    result = await session.execute(
+        select(Session)
+        .join(Conversation, Conversation.conversation_id == Session.conversation_id)
+        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .where(
+            Session.user_email == user_email,
+            Session.parent_session_id.is_not(None),
+            Session.status == "active",
+            Session.activity_scope_id == active_session.activity_scope_id,
+        )
+        .order_by(Session.updated_at.desc(), Session.started_at.desc())
+        .limit(max(1, min(limit, 501)))
+    )
+    return list(result.scalars().all())
+
+
+async def list_delegation_sessions_in_active_scope(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    controller_conversation_id: str,
+    limit: int = 100,
+) -> list[Session]:
+    """List delegated sessions in the controller conversation's active scope."""
+
+    active_session = aliased(Session)
+    result = await session.execute(
+        select(Session)
+        .join(
+            Conversation,
+            and_(
+                Conversation.conversation_id == controller_conversation_id,
+                Conversation.active_session_id.is_not(None),
+            ),
+        )
+        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .where(
+            Session.user_email == user_email,
+            Session.conversation_id == controller_conversation_id,
+            Session.parent_session_id.is_not(None),
+            Session.activity_scope_id == active_session.activity_scope_id,
+        )
+        .order_by(Session.updated_at.desc(), Session.started_at.desc())
+        .limit(max(1, min(limit, 100)))
+    )
     return list(result.scalars().all())
 
 
@@ -3144,6 +4835,7 @@ async def create_session(
     agent_profile_id: str | None = None,
     parent_session_id: str | None = None,
     previous_session_id: str | None = None,
+    source_session_id: str | None = None,
     delegation_mode: str | None = None,
     delegation_task: str | None = None,
     delegation_metadata: dict[str, Any] | None = None,
@@ -3151,14 +4843,18 @@ async def create_session(
     intaris_session_id: str | None = None,
     mnemory_session_id: str | None = None,
     session_id: str | None = None,
+    activity_scope_id: str | None = None,
 ) -> Session:
     """Create a new session row."""
 
+    resolved_session_id = session_id or f"sess_{uuid.uuid4().hex}"
     session_row = Session(
-        session_id=session_id or f"sess_{uuid.uuid4().hex}",
+        session_id=resolved_session_id,
+        activity_scope_id=activity_scope_id or resolved_session_id,
         conversation_id=conversation_id,
         parent_session_id=parent_session_id,
         previous_session_id=previous_session_id,
+        source_session_id=source_session_id,
         user_email=user_email,
         agent_id=agent_id,
         agent_profile_id=agent_profile_id,
@@ -3218,6 +4914,71 @@ async def get_latest_active_session_for_conversation(
     return result.scalar_one_or_none()
 
 
+async def get_active_activity_scope_id(
+    session: AsyncSession,
+    conversation_id: str,
+) -> str | None:
+    """Return the active activity scope for a conversation, or fail closed."""
+
+    result = await session.execute(
+        select(Session.activity_scope_id)
+        .join(Conversation, Conversation.active_session_id == Session.session_id)
+        .where(Conversation.conversation_id == conversation_id)
+        .limit(1)
+    )
+    value = result.scalar_one_or_none()
+    return str(value) if value else None
+
+
+async def list_activity_scope_ids_by_session(
+    session: AsyncSession,
+    session_ids: list[str],
+) -> dict[str, str]:
+    """Resolve activity scopes for multiple origin sessions in one query."""
+
+    ids = sorted({session_id for session_id in session_ids if session_id})
+    if not ids:
+        return {}
+    result = await session.execute(
+        select(Session.session_id, Session.activity_scope_id).where(Session.session_id.in_(ids))
+    )
+    return {
+        str(session_id): str(activity_scope_id)
+        for session_id, activity_scope_id in result.all()
+        if activity_scope_id
+    }
+
+
+async def origin_session_is_in_active_scope(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    origin_session_id: str | None,
+) -> bool:
+    """Return whether an origin session belongs to the current activity scope."""
+
+    if not origin_session_id:
+        return False
+    active_session = aliased(Session)
+    result = await session.execute(
+        select(Session.session_id)
+        .join(
+            Conversation,
+            and_(
+                Conversation.conversation_id == conversation_id,
+                Conversation.active_session_id.is_not(None),
+            ),
+        )
+        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .where(
+            Session.session_id == origin_session_id,
+            Session.activity_scope_id == active_session.activity_scope_id,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 def _normalize_session_todo_items(todos: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Normalize controller-owned TODO rows before persistence."""
 
@@ -3262,6 +5023,15 @@ async def _lock_todo_replacement(session: AsyncSession, scope: str, identifier: 
     )
 
 
+async def lock_conversation_activity_scope(
+    session: AsyncSession,
+    conversation_id: str,
+) -> None:
+    """Serialize provenance reads with conversation activity-scope transitions."""
+
+    await _lock_todo_replacement(session, "conversation", conversation_id)
+
+
 async def list_session_todos(
     session: AsyncSession,
     session_id: str,
@@ -3283,6 +5053,29 @@ async def list_session_todos(
             item["priority"] = row.priority
         todos.append(item)
     return todos
+
+
+async def list_session_todos_by_session(
+    session: AsyncSession,
+    session_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return authoritative TODO state for multiple sessions in one query."""
+
+    ids = sorted({session_id for session_id in session_ids if session_id})
+    if not ids:
+        return {}
+    result = await session.execute(
+        select(SessionTodo)
+        .where(SessionTodo.session_id.in_(ids))
+        .order_by(SessionTodo.session_id.asc(), SessionTodo.position.asc())
+    )
+    todos_by_session: dict[str, list[dict[str, Any]]] = {session_id: [] for session_id in ids}
+    for row in result.scalars().all():
+        item: dict[str, Any] = {"content": row.content, "status": row.status}
+        if row.priority:
+            item["priority"] = row.priority
+        todos_by_session[row.session_id].append(item)
+    return todos_by_session
 
 
 async def list_conversation_todos(
@@ -3370,6 +5163,8 @@ async def replace_conversation_todos(
     session: AsyncSession,
     conversation_id: str,
     todos: list[dict[str, Any]] | None,
+    *,
+    source_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Atomically replace conversation-scoped TODO state.
 
@@ -3379,6 +5174,12 @@ async def replace_conversation_todos(
 
     normalized = _normalize_session_todo_items(todos)
     await _lock_todo_replacement(session, "conversation", conversation_id)
+    if source_session_id is not None and not await origin_session_is_in_active_scope(
+        session,
+        conversation_id=conversation_id,
+        origin_session_id=source_session_id,
+    ):
+        return normalized
     await session.execute(
         delete(ConversationTodo).where(ConversationTodo.conversation_id == conversation_id)
     )
@@ -3612,7 +5413,8 @@ async def create_task(
     created_by_agent_id: str | None = None,
     source_type: str = "api",
     source_ref: str | None = None,
-    delivery_mode: str = "same_conversation",
+    source_session_id: str | None = None,
+    delivery_mode: str = "preferred_channel",
     delivery_target: str | None = None,
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
@@ -3646,6 +5448,7 @@ async def create_task(
         created_by_agent_id=created_by_agent_id,
         source_type=source_type,
         source_ref=source_ref,
+        source_session_id=source_session_id,
         delivery_mode=delivery_mode,
         delivery_target=delivery_target,
         completion_mode_family=completion_mode_family,
@@ -3684,6 +5487,130 @@ async def get_task(session: AsyncSession, task_id: str) -> Task | None:
     return result.scalar_one_or_none()
 
 
+async def get_task_by_control_conversation_id(
+    session: AsyncSession,
+    conversation_id: str,
+) -> Task | None:
+    """Get the task that owns a persistent control conversation."""
+    result = await session.execute(
+        select(Task).where(Task.control_conversation_id == conversation_id).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def claim_task_control_conversation(
+    session: AsyncSession,
+    task_id: str,
+    conversation_id: str,
+) -> bool:
+    """Atomically claim creation of a task's single control conversation."""
+
+    result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id, Task.control_conversation_id.is_(None))
+        .values(
+            control_conversation_id=conversation_id,
+            control_conversation_claimed_at=_utcnow(),
+            updated_at=_utcnow(),
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def clear_task_control_conversation_claim(
+    session: AsyncSession,
+    task_id: str,
+    conversation_id: str,
+) -> bool:
+    """Release a failed creator's claim without disturbing a newer winner."""
+
+    result = await session.execute(
+        update(Task)
+        .where(
+            Task.task_id == task_id,
+            Task.control_conversation_id == conversation_id,
+        )
+        .values(
+            control_conversation_id=None,
+            control_conversation_claimed_at=None,
+            updated_at=_utcnow(),
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def clear_stale_task_control_conversation_claim(
+    session: AsyncSession,
+    task_id: str,
+    conversation_id: str,
+    *,
+    claimed_before: datetime,
+) -> bool:
+    """Atomically release a control-chat claim only while its lease remains stale."""
+
+    result = await session.execute(
+        update(Task)
+        .where(
+            Task.task_id == task_id,
+            Task.control_conversation_id == conversation_id,
+            Task.control_conversation_claimed_at.is_not(None),
+            Task.control_conversation_claimed_at < claimed_before,
+        )
+        .values(
+            control_conversation_id=None,
+            control_conversation_claimed_at=None,
+            updated_at=_utcnow(),
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def mark_task_control_conversation_ready(
+    session: AsyncSession,
+    task_id: str,
+    conversation_id: str,
+) -> bool:
+    """Clear the creator lease once the linked conversation is durable."""
+
+    result = await session.execute(
+        update(Task)
+        .where(
+            Task.task_id == task_id,
+            Task.control_conversation_id == conversation_id,
+            Task.control_conversation_claimed_at.is_not(None),
+        )
+        .values(control_conversation_claimed_at=None, updated_at=_utcnow())
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def get_task_for_update(session: AsyncSession, task_id: str) -> Task | None:
+    """Read and lock a task row for a cross-field invariant update."""
+
+    result = await session.execute(select(Task).where(Task.task_id == task_id).with_for_update())
+    return result.scalar_one_or_none()
+
+
+async def assert_task_attempt_current(
+    session: AsyncSession,
+    task_id: str,
+    expected_attempt: int,
+) -> bool:
+    """Lock the task row and verify an optimistic task-control attempt."""
+
+    result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id, Task.attempt_number == expected_attempt)
+        .values(updated_at=Task.updated_at)
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
 async def set_task_active_executor(
     session: AsyncSession,
     task_id: str,
@@ -3692,6 +5619,7 @@ async def set_task_active_executor(
     assigned_at: datetime | None = None,
     expires_at: datetime | None = None,
     source: str | None = None,
+    unavailable_since: datetime | None = None,
 ) -> bool:
     """Set the task-level active executor ID (Stage 36).
 
@@ -3700,17 +5628,22 @@ async def set_task_active_executor(
     binding carries forward to subsequent steps of the same task.
     """
 
-    task = await get_task(session, task_id)
-    if task is None:
-        return False
     timestamp = assigned_at or datetime.now(UTC)
-    task.active_executor_id = active_executor_id
-    task.active_executor_assigned_at = timestamp if active_executor_id else None
-    task.active_executor_expires_at = expires_at if active_executor_id else None
-    task.active_executor_source = source if active_executor_id else None
-    task.updated_at = timestamp
+    result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id)
+        .values(
+            active_executor_id=active_executor_id,
+            active_executor_assigned_at=timestamp if active_executor_id else None,
+            active_executor_expires_at=expires_at if active_executor_id else None,
+            active_executor_source=source if active_executor_id else None,
+            active_executor_unavailable_since=unavailable_since if active_executor_id else None,
+            active_executor_generation=Task.active_executor_generation + 1,
+            updated_at=timestamp,
+        )
+    )
     await session.flush()
-    return True
+    return bool(result.rowcount)
 
 
 async def initialize_task_active_executor(
@@ -3740,6 +5673,7 @@ async def initialize_task_active_executor(
             active_executor_assigned_at=timestamp,
             active_executor_expires_at=expires_at,
             active_executor_source=source,
+            active_executor_generation=Task.active_executor_generation + 1,
             updated_at=timestamp,
         )
     )
@@ -3845,6 +5779,73 @@ async def claim_pending_context_task_comments(
     return claimed
 
 
+async def list_pending_context_task_comments(
+    session: AsyncSession,
+    *,
+    task_id: str,
+    step_name: str,
+    attempt_number: int,
+) -> list[TaskCommentRow]:
+    """List unapplied context comments for persistence by the active task owner."""
+
+    result = await session.execute(
+        select(TaskCommentRow)
+        .where(
+            TaskCommentRow.task_id == task_id,
+            TaskCommentRow.intent == "context_only",
+            TaskCommentRow.applied.is_(False),
+            TaskCommentRow.attempt_number == attempt_number,
+            sa.or_(
+                TaskCommentRow.target_step.is_(None),
+                TaskCommentRow.target_step == "",
+                TaskCommentRow.target_step == step_name,
+            ),
+        )
+        .order_by(TaskCommentRow.created_at.asc(), TaskCommentRow.comment_id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def mark_context_task_comment_applied(
+    session: AsyncSession,
+    *,
+    comment_id: str,
+    step_name: str,
+    step_run_id: str | None,
+    reason: str,
+) -> bool:
+    """Acknowledge one context comment after its session event is durable."""
+
+    applied_at = _utcnow()
+    row = await get_task_comment(session, comment_id)
+    if row is None or row.applied:
+        return row is not None
+    metadata = dict(row.metadata_json or {})
+    metadata.update(
+        {
+            "applied_at": applied_at.isoformat(),
+            "applied_reason": reason,
+            "applied_step": step_name,
+        }
+    )
+    if step_run_id:
+        metadata["applied_step_run_id"] = step_run_id
+    result = await session.execute(
+        update(TaskCommentRow)
+        .where(
+            TaskCommentRow.comment_id == comment_id,
+            TaskCommentRow.applied.is_(False),
+        )
+        .values(
+            applied=True,
+            metadata_json=metadata,
+            updated_at=applied_at,
+        )
+    )
+    await session.flush()
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
 async def get_task_comment(session: AsyncSession, comment_id: str) -> TaskCommentRow | None:
     result = await session.execute(
         select(TaskCommentRow).where(TaskCommentRow.comment_id == comment_id)
@@ -3881,6 +5882,7 @@ async def update_task_status(
     result_data: dict[str, object] | None = None,
     applied_completion_mode: str | None = None,
     applied_completion_reason: str | None = None,
+    delivery_mode: str | None = None,
 ) -> bool:
     """Update task status and optional lifecycle fields.
 
@@ -3892,6 +5894,7 @@ async def update_task_status(
         "ready": {"running", "cancelled"},
         "running": {"queued", "paused", "completed", "failed", "cancelled"},
         "paused": {"queued", "running", "cancelled"},
+        "failed": {"running"},
     }
     allowed_from = [k for k, v in valid_transitions.items() if status in v]
     if not allowed_from:
@@ -3910,6 +5913,8 @@ async def update_task_status(
         values["applied_completion_mode"] = applied_completion_mode
     if applied_completion_reason is not None:
         values["applied_completion_reason"] = applied_completion_reason
+    if delivery_mode is not None:
+        values["delivery_mode"] = delivery_mode
 
     stmt = (
         update(Task).where(Task.task_id == task_id, Task.status.in_(allowed_from)).values(**values)
@@ -4288,6 +6293,7 @@ async def create_deliverable(
     media_owner_email: str | None = None,
     media_accessor_conversation_id: str | None = None,
     media_accessor_agent_id: str | None = None,
+    published_owner_email: str | None = None,
 ) -> DeliverableRow:
     """Create a new versioned deliverable for a step or conversation scope."""
 
@@ -4384,6 +6390,17 @@ async def create_deliverable(
         )
         .values(status="superseded", updated_at=_utcnow())
     )
+    if published_owner_email is not None and superseded_rows:
+        await session.execute(
+            update(ArtifactRecordRow)
+            .where(
+                ArtifactRecordRow.artifact_id.in_(
+                    [old_row.deliverable_id for old_row in superseded_rows]
+                ),
+                ArtifactRecordRow.owner_email == published_owner_email,
+            )
+            .values(status="deleted", deleted_at=_utcnow())
+        )
 
     row = DeliverableRow(
         deliverable_id=row_deliverable_id,
@@ -4422,6 +6439,36 @@ async def create_deliverable(
     )
     session.add(row)
     await session.flush()
+    if published_owner_email is not None:
+        extension = {
+            "markdown": ".md",
+            "plain": ".txt",
+            "html": ".html",
+            "rich": ".md",
+        }.get(format, ".txt")
+        filename = sanitize_artifact_filename(
+            str(title or row.deliverable_id),
+            default=row.deliverable_id,
+        )
+        if not filename.lower().endswith(extension):
+            filename = f"{filename}{extension}"
+        await create_artifact_record(
+            session,
+            artifact_id=row.deliverable_id,
+            namespace=row.storage_namespace,
+            object_id=row.storage_object_id,
+            filename=filename,
+            owner_email=published_owner_email,
+            purpose="conversation_deliverable",
+            kind="file",
+            mime_type=row.content_mime,
+            size_bytes=row.content_size,
+            status="attached",
+            expires_at=None,
+            conversation_id=None,
+            session_id=None,
+            message_role="assistant",
+        )
     for old_row in superseded_rows:
         _queue_deliverable_payload_delete(
             session,
@@ -4625,12 +6672,21 @@ async def create_step_run(
 
 _VALID_STEP_RUN_TRANSITIONS: dict[str, set[str]] = {
     "pending": {"running", "cancelled"},
-    "running": {"evaluating", "approved", "rejected", "failed", "paused", "cancelled"},
+    "running": {
+        "evaluating",
+        "approved",
+        "rejected",
+        "failed",
+        "skipped",
+        "paused",
+        "cancelled",
+    },
     "evaluating": {"approved", "rejected", "failed"},
     "approved": {"running"},
     "rejected": {"running"},  # retry
     "paused": {"running", "cancelled"},
     "failed": {"running"},  # retry
+    "skipped": set(),  # deterministic terminal skip
     "cancelled": set(),  # terminal
 }
 
@@ -4730,6 +6786,48 @@ async def list_step_runs_for_task(
     return list(result.scalars().all())
 
 
+async def list_step_runs_for_task_projection(
+    session: AsyncSession,
+    task_id: str,
+) -> list[Any]:
+    """List bounded step-run fields used by the polling-friendly task projection."""
+
+    result = await session.execute(
+        select(
+            StepRun.step_run_id,
+            StepRun.step_name,
+            StepRun.status,
+            StepRun.attempt,
+            StepRun.attempt_number,
+            StepRun.superseded_by_step_run_id,
+            StepRun.conversation_id,
+            StepRun.session_id,
+            StepRun.intaris_session_id,
+            StepRun.deliverable_id,
+            StepRun.started_at,
+            StepRun.completed_at,
+            StepRun.updated_at,
+            StepRun.output.is_not(None).label("has_output"),
+            StepRun.output["summary"].as_string().label("output_summary"),
+            StepRun.output["error"].as_string().label("output_error"),
+            StepRun.runtime_info["execution_kind"].as_string().label("execution_kind"),
+            StepRun.runtime_info["deterministic_substate"]
+            .as_string()
+            .label("deterministic_substate"),
+            StepRun.runtime_info["recovery_state"].as_string().label("recovery_state"),
+            StepRun.runtime_info["tool_name"].as_string().label("tool_name"),
+            StepRun.runtime_info["selected_branch"].as_string().label("selected_branch"),
+            StepRun.runtime_info["selected_target"].as_string().label("selected_target"),
+            StepRun.runtime_info["condition"].label("condition"),
+            StepRun.runtime_info["render"].label("render"),
+            StepRun.todos.label("todos"),
+        )
+        .where(StepRun.task_id == task_id)
+        .order_by(StepRun.started_at.asc(), StepRun.step_run_id.asc())
+    )
+    return list(result.all())
+
+
 async def list_step_run_history(
     session: AsyncSession,
     task_id: str,
@@ -4783,6 +6881,8 @@ async def get_latest_step_run_for_task_step(
     step_name: str,
     *,
     attempt_number: int | None = None,
+    current_revision_only: bool = False,
+    eligible_statuses: set[str] | None = None,
 ) -> StepRun | None:
     """Return the most recent step run for a given task and step name.
 
@@ -4794,6 +6894,10 @@ async def get_latest_step_run_for_task_step(
     stmt = select(StepRun).where(StepRun.task_id == task_id, StepRun.step_name == step_name)
     if attempt_number is not None:
         stmt = stmt.where(StepRun.attempt_number == attempt_number)
+    if current_revision_only:
+        stmt = stmt.where(StepRun.superseded_by_step_run_id.is_(None))
+    if eligible_statuses is not None:
+        stmt = stmt.where(StepRun.status.in_(sorted(eligible_statuses)))
     result = await session.execute(
         stmt.order_by(
             StepRun.attempt_number.desc(),
@@ -4801,6 +6905,37 @@ async def get_latest_step_run_for_task_step(
             StepRun.started_at.desc(),
             StepRun.step_run_id.desc(),
         ).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_latest_approved_step_run_for_task_step(
+    session: AsyncSession,
+    task_id: str,
+    step_name: str,
+    *,
+    attempt_number: int,
+) -> StepRun | None:
+    """Return the current approved source run for session continuity.
+
+    Historical task attempts and superseded revision rows are never eligible.
+    """
+
+    result = await session.execute(
+        select(StepRun)
+        .where(
+            StepRun.task_id == task_id,
+            StepRun.step_name == step_name,
+            StepRun.attempt_number == attempt_number,
+            StepRun.status == "approved",
+            StepRun.superseded_by_step_run_id.is_(None),
+        )
+        .order_by(
+            StepRun.attempt.desc(),
+            StepRun.started_at.desc(),
+            StepRun.step_run_id.desc(),
+        )
+        .limit(1)
     )
     return result.scalar_one_or_none()
 
@@ -5774,6 +7909,7 @@ async def list_executors(
     *,
     owner_email: str | None = None,
     include_shared: bool = False,
+    for_update: bool = False,
 ) -> list[ExecutorRow]:
     """List all executor configurations."""
     stmt = select(ExecutorRow).order_by(ExecutorRow.name)
@@ -5787,6 +7923,29 @@ async def list_executors(
             )
         else:
             stmt = stmt.where(ExecutorRow.owner_email == owner_email)
+    if for_update:
+        stmt = stmt.with_for_update()
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def list_active_websocket_executors(
+    session: AsyncSession,
+    *,
+    for_update: bool = False,
+) -> list[ExecutorRow]:
+    """List active websocket executors whose global runtime config can be refreshed."""
+
+    stmt = (
+        select(ExecutorRow)
+        .where(
+            ExecutorRow.executor_type == "websocket",
+            ExecutorRow.status == "active",
+        )
+        .order_by(ExecutorRow.executor_id)
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -5794,10 +7953,12 @@ async def list_executors(
 async def list_websocket_executors_for_mcp_server(
     session: AsyncSession,
     server_id: str,
+    *,
+    for_update: bool = False,
 ) -> list[ExecutorRow]:
     """List websocket executors whose config references an MCP server."""
 
-    rows = await list_executors(session)
+    rows = await list_executors(session, for_update=for_update)
     result = []
     for row in rows:
         if row.executor_type != "websocket":
@@ -6251,16 +8412,31 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
     existing = await get_default_executor(session)
     if existing is not None:
         return existing
-    return await create_executor(
+    now = datetime.now(UTC)
+    await insert_row_if_absent(
         session,
-        executor_id="default_inprocess",
-        name="Local (in-process)",
-        executor_type="in_process",
-        enabled_tools=[],
-        enabled_tool_groups=[],
-        is_default=True,
-        shared=True,
+        ExecutorRow.__table__,
+        {
+            "executor_id": "default_inprocess",
+            "name": "Local (in-process)",
+            "executor_type": "in_process",
+            "enabled_tools": [],
+            "enabled_tool_groups": [],
+            "status": "active",
+            "desired_config_version": 0,
+            "applied_config_version": 0,
+            "runtime_state": "offline",
+            "token_version": 0,
+            "is_default": True,
+            "owner_email": SYSTEM_USER_EMAIL,
+            "created_at": now,
+            "updated_at": now,
+        },
+        index_elements=["executor_id"],
     )
+    row = await get_executor_row(session, "default_inprocess")
+    assert row is not None
+    return row
 
 
 # --- MCP Servers ---
@@ -6512,6 +8688,26 @@ async def list_pending_mcp_oauth_transactions(
     if mcp_server_id is not None:
         stmt = stmt.where(MCPOAuthTransactionRow.mcp_server_id == mcp_server_id)
     result = await session.execute(stmt.order_by(MCPOAuthTransactionRow.created_at.desc()))
+    return list(result.scalars().all())
+
+
+async def list_mcp_oauth_transactions_pending_terminal_cleanup(
+    session: AsyncSession,
+) -> list[MCPOAuthTransactionRow]:
+    stmt = (
+        select(MCPOAuthTransactionRow)
+        .where(MCPOAuthTransactionRow.status.in_(("completed", "failed")))
+        .where(MCPOAuthTransactionRow.terminal_cleanup_required.is_(True))
+        .where(
+            sa.or_(
+                MCPOAuthTransactionRow.terminal_notification_resolved_at.is_(None),
+                MCPOAuthTransactionRow.terminal_reconfigure_applied_at.is_(None),
+                MCPOAuthTransactionRow.terminal_reconfigure_completed_at.is_(None),
+            )
+        )
+        .order_by(MCPOAuthTransactionRow.updated_at.asc())
+    )
+    result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
@@ -6913,6 +9109,212 @@ async def list_channel_contacts(
     return list(result.scalars().all())
 
 
+# --- Channel observed targets ---
+
+
+async def get_channel_recipient_intent(
+    session: AsyncSession, intent_id: str
+) -> ChannelRecipientIntentRow | None:
+    return await session.get(ChannelRecipientIntentRow, intent_id)
+
+
+async def claim_channel_recipient_intent(
+    session: AsyncSession,
+    *,
+    intent_id: str,
+    lease_token: str,
+    lease_expires_at: datetime,
+    side_effect_certainty: str,
+) -> ChannelRecipientIntentRow | None:
+    """Claim one recipient resolution attempt with an expiring lease."""
+
+    now = _utcnow()
+    result = await session.execute(
+        update(ChannelRecipientIntentRow)
+        .where(
+            ChannelRecipientIntentRow.intent_id == intent_id,
+            or_(
+                ChannelRecipientIntentRow.resolution_state == "pending",
+                and_(
+                    ChannelRecipientIntentRow.resolution_state == "resolving",
+                    ChannelRecipientIntentRow.resolution_lease_expires_at <= now,
+                ),
+            ),
+        )
+        .values(
+            resolution_state="resolving",
+            resolution_lease_token=lease_token,
+            resolution_lease_expires_at=lease_expires_at,
+            attempt_count=ChannelRecipientIntentRow.attempt_count + 1,
+            side_effect_certainty=side_effect_certainty,
+            updated_at=now,
+        )
+    )
+    if not getattr(result, "rowcount", 0):
+        return None
+    return await get_channel_recipient_intent(session, intent_id)
+
+
+async def promote_channel_recipient_target_on_receipt(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+) -> ChannelObservedTargetRow | None:
+    """Promote a resolved recipient only after its first durable receipt."""
+
+    delivery = await session.get(ChannelDeliveryOutboxRow, delivery_id)
+    if (
+        delivery is None
+        or delivery.source_type != "channel_recipient"
+        or int(delivery.completed_chunk_count or 0) < 1
+    ):
+        return None
+    intent = await session.get(ChannelRecipientIntentRow, delivery.source_id)
+    if intent is None or intent.resolved_route_json is None:
+        return None
+    route = intent.resolved_route_json
+    direct_participant_address_kinds = {
+        "signal_e164",
+        "signal_uuid",
+        "whatsapp_e164",
+        "discord_user_id",
+        "slack_user_id",
+        "matrix_user_id",
+        "irc_nick",
+        "google_workspace_user",
+        "imessage_handle",
+    }
+    sender_id = (
+        intent.normalized_address
+        if str(route.get("chat_kind") or "direct") == "direct"
+        and intent.address_kind in direct_participant_address_kinds
+        else None
+    )
+    target = await upsert_channel_observed_target(
+        session,
+        user_email=delivery.user_email,
+        account_id=delivery.account_id,
+        channel_type=delivery.channel_type,
+        chat_id=delivery.chat_id,
+        thread_id=delivery.thread_id,
+        sender_id=sender_id,
+        chat_kind=str(route.get("chat_kind") or "direct"),
+        display_name=(
+            route.get("display_name") if isinstance(route.get("display_name"), str) else None
+        ),
+    )
+    intent.resolution_state = "promoted"
+    return target
+
+
+async def upsert_channel_observed_target(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    account_id: str,
+    channel_type: str,
+    chat_id: str,
+    thread_id: str | None = None,
+    sender_id: str | None = None,
+    chat_kind: str,
+    display_name: str | None,
+) -> ChannelObservedTargetRow:
+    """Record a target after inbound observation or acknowledged outbound contact."""
+
+    result = await session.execute(
+        select(ChannelObservedTargetRow)
+        .where(
+            ChannelObservedTargetRow.account_id == account_id,
+            ChannelObservedTargetRow.chat_id == chat_id,
+        )
+        .with_for_update()
+    )
+    row = result.scalar_one_or_none()
+    now = _utcnow()
+    if row is None:
+        stable = hashlib.sha256(f"{account_id}:{chat_id}".encode()).hexdigest()[:24]
+        row = ChannelObservedTargetRow(
+            target_id=f"cht_{stable}",
+            user_email=user_email,
+            account_id=account_id,
+            channel_type=channel_type,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            sender_id=sender_id,
+            chat_kind=chat_kind,
+            display_name=display_name,
+            last_observed_at=now,
+        )
+        try:
+            async with session.begin_nested():
+                session.add(row)
+                await session.flush()
+        except IntegrityError:
+            row = (
+                await session.execute(
+                    select(ChannelObservedTargetRow).where(
+                        ChannelObservedTargetRow.account_id == account_id,
+                        ChannelObservedTargetRow.chat_id == chat_id,
+                    )
+                )
+            ).scalar_one()
+            row.user_email = user_email
+            row.channel_type = channel_type
+            row.chat_kind = chat_kind
+            row.thread_id = thread_id or row.thread_id
+            row.sender_id = sender_id or row.sender_id
+            row.display_name = display_name or row.display_name
+            row.last_observed_at = now
+            row.updated_at = now
+    else:
+        row.user_email = user_email
+        row.channel_type = channel_type
+        row.chat_kind = chat_kind
+        row.thread_id = thread_id or row.thread_id
+        row.sender_id = sender_id or row.sender_id
+        row.display_name = display_name or row.display_name
+        row.last_observed_at = now
+        row.updated_at = now
+    await session.flush()
+    return row
+
+
+async def list_channel_observed_targets(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    account_ids: list[str],
+) -> list[ChannelObservedTargetRow]:
+    if not account_ids:
+        return []
+    result = await session.execute(
+        select(ChannelObservedTargetRow)
+        .where(
+            ChannelObservedTargetRow.user_email == user_email,
+            ChannelObservedTargetRow.account_id.in_(account_ids),
+        )
+        .order_by(ChannelObservedTargetRow.last_observed_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_channel_observed_target(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    account_id: str,
+    chat_id: str,
+) -> ChannelObservedTargetRow | None:
+    result = await session.execute(
+        select(ChannelObservedTargetRow).where(
+            ChannelObservedTargetRow.user_email == user_email,
+            ChannelObservedTargetRow.account_id == account_id,
+            ChannelObservedTargetRow.chat_id == chat_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 # --- Channel Pairing Requests ---
 
 
@@ -7309,22 +9711,32 @@ async def list_orphaned_attached_artifacts(
 
 
 async def mark_artifact_deleted(session: AsyncSession, artifact_id: str) -> bool:
-    row = await get_artifact_record(session, artifact_id)
-    if row is None:
+    result = await session.execute(
+        update(ArtifactRecordRow)
+        .where(ArtifactRecordRow.artifact_id == artifact_id)
+        .values(status="deleted", deleted_at=_utcnow(), updated_at=_utcnow())
+    )
+    if result.rowcount != 1:
         return False
-    row.status = "deleted"
-    row.deleted_at = _utcnow()
     await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     await session.flush()
     return True
 
 
 async def delete_artifact_record(session: AsyncSession, artifact_id: str) -> bool:
+    result = await session.execute(
+        update(ArtifactRecordRow)
+        .where(ArtifactRecordRow.artifact_id == artifact_id)
+        .values(status="deleted", deleted_at=_utcnow(), updated_at=_utcnow())
+    )
+    if result.rowcount != 1:
+        return False
+    await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     row = await get_artifact_record(session, artifact_id)
     if row is None:
         return False
-    await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     await session.delete(row)
+    await session.flush()
     return True
 
 
@@ -7343,26 +9755,109 @@ def _kb_job_id() -> str:
     return f"kbj_{uuid.uuid4().hex[:16]}"
 
 
+async def _cancel_knowledgebase_jobs(
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    kb_artifact_id: str | None = None,
+) -> None:
+    predicate = (
+        KnowledgebaseIndexJobRow.knowledgebase_id == knowledgebase_id
+    ) & KnowledgebaseIndexJobRow.status.in_(["queued", "running"])
+    predicate &= KnowledgebaseIndexJobRow.job_type != "delete_stale_vectors"
+    if kb_artifact_id is not None:
+        predicate &= KnowledgebaseIndexJobRow.kb_artifact_id == kb_artifact_id
+    rows = list(
+        (await session.execute(select(KnowledgebaseIndexJobRow).where(predicate))).scalars().all()
+    )
+    now = _utcnow()
+    for job in rows:
+        job.status = "cancelled"
+        job.error = "superseded_by_lifecycle_change"
+        job.completed_at = now
+        job.updated_at = now
+
+
+async def _lock_active_knowledgebase(session: AsyncSession, *, knowledgebase_id: str) -> bool:
+    result = await session.execute(
+        update(KnowledgebaseRow)
+        .where(
+            KnowledgebaseRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseRow.status == "active",
+        )
+        .values(updated_at=KnowledgebaseRow.updated_at)
+    )
+    return result.rowcount == 1
+
+
+async def _advance_attachment_generation(
+    session: AsyncSession, attachment: KnowledgebaseArtifactRow
+) -> int:
+    result = await session.execute(
+        update(KnowledgebaseArtifactRow)
+        .where(KnowledgebaseArtifactRow.kb_artifact_id == attachment.kb_artifact_id)
+        .values(
+            desired_generation=KnowledgebaseArtifactRow.desired_generation + 1,
+            updated_at=_utcnow(),
+        )
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("knowledgebase attachment disappeared during generation allocation")
+    await session.refresh(attachment)
+    return attachment.desired_generation
+
+
+async def _remove_knowledgebase_agent_projections(
+    session: AsyncSession, *, owner_email: str, knowledgebase_id: str
+) -> None:
+    for agent in await list_agents(session, owner_email=owner_email):
+        permissions = dict(agent.permissions or {})
+        allowed = list(permissions.get("allowed_knowledgebases") or [])
+        filtered = [value for value in allowed if value != knowledgebase_id]
+        if filtered == allowed:
+            continue
+        permissions["allowed_knowledgebases"] = filtered
+        agent.permissions = permissions
+        flag_modified(agent, "permissions")
+        agent.updated_at = datetime.now(UTC)
+
+
 async def mark_knowledgebase_artifact_removed(
     session: AsyncSession, *, artifact_id: str
 ) -> list[KnowledgebaseArtifactRow]:
     result = await session.execute(
         select(KnowledgebaseArtifactRow).where(
-            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            (KnowledgebaseArtifactRow.artifact_id == artifact_id)
+            | (KnowledgebaseArtifactRow.pending_artifact_id == artifact_id),
             KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
     rows = list(result.scalars().all())
     for row in rows:
+        await _advance_attachment_generation(session, row)
+        await _cancel_knowledgebase_jobs(
+            session, knowledgebase_id=row.knowledgebase_id, kb_artifact_id=row.kb_artifact_id
+        )
+        pending_only = row.pending_artifact_id == artifact_id and row.artifact_id != artifact_id
+        if pending_only and row.active_generation > 0:
+            row.pending_artifact_id = None
+            row.pending_source_hash = None
+            row.status = "indexed"
+            row.stale_at = None
+            row.last_error = "pending_canonical_artifact_removed"
+            continue
         row.status = "removed"
         row.removed_at = _utcnow()
         row.last_error = "canonical_artifact_removed"
+        row.pending_artifact_id = None
+        row.pending_source_hash = None
         job = await enqueue_knowledgebase_job(
             session,
             knowledgebase_id=row.knowledgebase_id,
             kb_artifact_id=row.kb_artifact_id,
             artifact_id=artifact_id,
             job_type="delete_artifact_index",
+            generation=row.desired_generation,
             priority=5,
         )
         row.last_job_id = job.job_id
@@ -7402,21 +9897,27 @@ async def delete_knowledgebase(
         return False
     row.status = "deleted"
     row.deleted_at = _utcnow()
+    await _cancel_knowledgebase_jobs(session, knowledgebase_id=knowledgebase_id)
     attachments = await list_knowledgebase_artifacts(session, knowledgebase_id=knowledgebase_id)
     for attachment in attachments:
-        if attachment.status in {"detached", "removed"}:
-            continue
+        await _advance_attachment_generation(session, attachment)
         attachment.status = "removed"
         attachment.removed_at = _utcnow()
+        attachment.pending_artifact_id = None
+        attachment.pending_source_hash = None
         job = await enqueue_knowledgebase_job(
             session,
             knowledgebase_id=knowledgebase_id,
             kb_artifact_id=attachment.kb_artifact_id,
             artifact_id=attachment.artifact_id,
             job_type="delete_artifact_index",
+            generation=attachment.desired_generation,
             priority=5,
         )
         attachment.last_job_id = job.job_id
+    await _remove_knowledgebase_agent_projections(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
     await session.flush()
     return True
 
@@ -7433,6 +9934,11 @@ async def update_knowledgebase(
     )
     if row is None:
         return None
+    if row.status == "archived" and (
+        set(updates) != {"status"} or str(updates["status"]) != "active"
+    ):
+        raise ValueError("archived knowledgebase only allows reactivation or deletion")
+    previous_status = row.status
     if "name" in updates:
         row.name = updates["name"]
     if "description" in updates:
@@ -7447,6 +9953,43 @@ async def update_knowledgebase(
             raise ValueError("Use delete_knowledgebase for deletion")
         row.status = status
         row.archived_at = _utcnow() if status == "archived" else None
+        if status == "archived":
+            await _cancel_knowledgebase_jobs(session, knowledgebase_id=knowledgebase_id)
+            for attachment in await list_knowledgebase_artifacts(
+                session, knowledgebase_id=knowledgebase_id
+            ):
+                if attachment.status in {"detached", "removed"}:
+                    continue
+                await _advance_attachment_generation(session, attachment)
+                if attachment.pending_artifact_id is not None:
+                    attachment.status = "stale" if attachment.active_generation > 0 else "failed"
+                    attachment.last_error = "indexing_cancelled_by_archive"
+                    attachment.stale_at = _utcnow() if attachment.active_generation > 0 else None
+                elif attachment.active_generation > 0:
+                    attachment.status = "indexed"
+        elif status == "active" and previous_status == "archived":
+            for attachment in await list_knowledgebase_artifacts(
+                session, knowledgebase_id=knowledgebase_id
+            ):
+                if (
+                    attachment.status in {"detached", "removed"}
+                    or attachment.pending_artifact_id is None
+                ):
+                    continue
+                await _advance_attachment_generation(session, attachment)
+                attachment.status = "queued"
+                attachment.last_error = None
+                job = await enqueue_knowledgebase_job(
+                    session,
+                    knowledgebase_id=knowledgebase_id,
+                    kb_artifact_id=attachment.kb_artifact_id,
+                    artifact_id=attachment.pending_artifact_id,
+                    job_type=(
+                        "reindex_artifact" if attachment.active_generation > 0 else "index_artifact"
+                    ),
+                    generation=attachment.desired_generation,
+                )
+                attachment.last_job_id = job.job_id
     await session.flush()
     return row
 
@@ -7457,6 +10000,113 @@ async def list_knowledgebases(session: AsyncSession, *, owner_email: str) -> lis
         .where(KnowledgebaseRow.owner_email == owner_email, KnowledgebaseRow.status != "deleted")
         .order_by(KnowledgebaseRow.created_at.desc())
     )
+    return list(result.scalars().all())
+
+
+async def get_active_knowledgebase_grant(
+    session: AsyncSession, knowledgebase_id: str, user_email: str
+) -> KnowledgebaseGrantRow | None:
+    return (
+        await session.execute(
+            select(KnowledgebaseGrantRow).where(
+                KnowledgebaseGrantRow.knowledgebase_id == knowledgebase_id,
+                KnowledgebaseGrantRow.grantee_user_email == user_email,
+                KnowledgebaseGrantRow.revoked_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def list_knowledgebases_for_user(
+    session: AsyncSession, user_email: str
+) -> list[KnowledgebaseRow]:
+    granted = select(KnowledgebaseGrantRow.knowledgebase_id).where(
+        KnowledgebaseGrantRow.grantee_user_email == user_email,
+        KnowledgebaseGrantRow.revoked_at.is_(None),
+    )
+    result = await session.execute(
+        select(KnowledgebaseRow)
+        .where(
+            KnowledgebaseRow.status != "deleted",
+            sa.or_(
+                KnowledgebaseRow.owner_email == user_email,
+                KnowledgebaseRow.knowledgebase_id.in_(granted),
+            ),
+        )
+        .order_by(KnowledgebaseRow.name.asc(), KnowledgebaseRow.knowledgebase_id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def list_knowledgebase_grants(
+    session: AsyncSession, knowledgebase_id: str
+) -> list[KnowledgebaseGrantRow]:
+    result = await session.execute(
+        select(KnowledgebaseGrantRow)
+        .where(
+            KnowledgebaseGrantRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseGrantRow.revoked_at.is_(None),
+        )
+        .order_by(KnowledgebaseGrantRow.grantee_user_email.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def upsert_knowledgebase_grant(
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    grantee_user_email: str,
+    granted_by: str,
+    note: str | None = None,
+) -> KnowledgebaseGrantRow:
+    if not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id):
+        raise ValueError("knowledgebase is not active")
+    existing = await get_active_knowledgebase_grant(session, knowledgebase_id, grantee_user_email)
+    if existing is not None:
+        existing.note = note
+        return existing
+    row = KnowledgebaseGrantRow(
+        grant_id=f"kbgrant_{uuid.uuid4().hex}",
+        knowledgebase_id=knowledgebase_id,
+        grantee_user_email=grantee_user_email,
+        permission="view",
+        granted_by=granted_by,
+        note=note,
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def revoke_knowledgebase_grant(
+    session: AsyncSession, *, knowledgebase_id: str, grantee_user_email: str
+) -> bool:
+    if not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id):
+        return False
+    row = await get_active_knowledgebase_grant(session, knowledgebase_id, grantee_user_email)
+    if row is None:
+        return False
+    row.revoked_at = _utcnow()
+    await session.flush()
+    return True
+
+
+async def list_knowledgebase_share_candidates(
+    session: AsyncSession, *, owner_email: str, query: str, limit: int = 20
+) -> list[User]:
+    statement = select(User).where(
+        User.email != owner_email,
+        User.is_active.is_(True),
+        User.role != "system",
+    )
+    statement = statement.where(
+        sa.or_(
+            User.email.icontains(query, autoescape=True),
+            User.name.icontains(query, autoescape=True),
+        )
+    )
+    result = await session.execute(statement.order_by(User.email.asc()).limit(limit))
     return list(result.scalars().all())
 
 
@@ -7490,6 +10140,19 @@ async def get_knowledgebase(
     return result.scalar_one_or_none()
 
 
+async def get_deleted_knowledgebase_for_owner(
+    session: AsyncSession, *, owner_email: str, knowledgebase_id: str
+) -> KnowledgebaseRow | None:
+    result = await session.execute(
+        select(KnowledgebaseRow).where(
+            KnowledgebaseRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseRow.owner_email == owner_email,
+            KnowledgebaseRow.status == "deleted",
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_knowledgebase_by_id(
     session: AsyncSession, *, knowledgebase_id: str
 ) -> KnowledgebaseRow | None:
@@ -7513,7 +10176,13 @@ async def assign_knowledgebase_to_agent(
         session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
     )
     agent = await get_agent(session, agent_id)
-    if kb is None or agent is None or agent.owner_email != owner_email:
+    if (
+        kb is None
+        or kb.status != "active"
+        or agent is None
+        or agent.owner_email != owner_email
+        or not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id)
+    ):
         return False
     permissions = dict(agent.permissions or {})
     allowed = list(permissions.get("allowed_knowledgebases") or [])
@@ -7538,7 +10207,13 @@ async def unassign_knowledgebase_from_agent(
         session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
     )
     agent = await get_agent(session, agent_id)
-    if kb is None or agent is None or agent.owner_email != owner_email:
+    if (
+        kb is None
+        or kb.status != "active"
+        or agent is None
+        or agent.owner_email != owner_email
+        or not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id)
+    ):
         return False
     permissions = dict(agent.permissions or {})
     allowed = [
@@ -7578,17 +10253,64 @@ async def enqueue_knowledgebase_job(
     job_type: str,
     kb_artifact_id: str | None = None,
     artifact_id: str | None = None,
+    generation: int = 0,
     priority: int = 100,
+    diagnostics: dict[str, Any] | None = None,
 ) -> KnowledgebaseIndexJobRow:
-    job = KnowledgebaseIndexJobRow(
-        job_id=_kb_job_id(),
-        knowledgebase_id=knowledgebase_id,
-        kb_artifact_id=kb_artifact_id,
-        artifact_id=artifact_id,
-        job_type=job_type,
-        status="queued",
-        priority=priority,
-    )
+    if kb_artifact_id is not None:
+        existing = (
+            await session.execute(
+                select(KnowledgebaseIndexJobRow).where(
+                    KnowledgebaseIndexJobRow.kb_artifact_id == kb_artifact_id,
+                    KnowledgebaseIndexJobRow.generation == generation,
+                    KnowledgebaseIndexJobRow.job_type == job_type,
+                    KnowledgebaseIndexJobRow.status.in_(["queued", "running"]),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+    job_id = _kb_job_id()
+    now = _utcnow()
+    values = {
+        "job_id": job_id,
+        "knowledgebase_id": knowledgebase_id,
+        "kb_artifact_id": kb_artifact_id,
+        "artifact_id": artifact_id,
+        "generation": generation,
+        "job_type": job_type,
+        "status": "queued",
+        "priority": priority,
+        "attempts": 0,
+        "diagnostics": diagnostics,
+        "chunks_indexed": 0,
+        "chunks_deleted": 0,
+        "queued_at": now,
+        "updated_at": now,
+    }
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name in {"postgresql", "sqlite"}:
+        insert_fn = postgresql_insert if dialect_name == "postgresql" else sqlite_insert
+        await session.execute(
+            insert_fn(KnowledgebaseIndexJobRow).values(**values).on_conflict_do_nothing()
+        )
+        created = await session.get(KnowledgebaseIndexJobRow, job_id)
+        if created is not None:
+            return created
+        existing = (
+            await session.execute(
+                select(KnowledgebaseIndexJobRow).where(
+                    KnowledgebaseIndexJobRow.kb_artifact_id == kb_artifact_id,
+                    KnowledgebaseIndexJobRow.generation == generation,
+                    KnowledgebaseIndexJobRow.job_type == job_type,
+                    KnowledgebaseIndexJobRow.status.in_(["queued", "running"]),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise RuntimeError("knowledgebase job conflict resolved without a live job")
+        return existing
+    job = KnowledgebaseIndexJobRow(**values)
     session.add(job)
     await session.flush()
     return job
@@ -7600,7 +10322,9 @@ async def attach_artifact_to_knowledgebase(
     owner_email: str,
     knowledgebase_id: str,
     artifact_id: str,
+    source_path: str | None = None,
     metadata: dict[str, Any] | None = None,
+    metadata_provided: bool = True,
 ) -> KnowledgebaseArtifactRow | None:
     kb = await get_knowledgebase(
         session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
@@ -7608,38 +10332,78 @@ async def attach_artifact_to_knowledgebase(
     artifact = await get_artifact_record(session, artifact_id)
     if (
         kb is None
+        or kb.status != "active"
         or artifact is None
         or artifact.owner_email != owner_email
         or artifact.status == "deleted"
     ):
         return None
+    if not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id):
+        return None
+    artifact_update = await session.execute(
+        update(ArtifactRecordRow)
+        .where(
+            ArtifactRecordRow.artifact_id == artifact_id,
+            ArtifactRecordRow.status != "deleted",
+        )
+        .values(status="attached", expires_at=None, updated_at=_utcnow())
+    )
+    if artifact_update.rowcount != 1:
+        return None
+    await session.refresh(artifact)
+    source_path = source_path.strip() if source_path and source_path.strip() else None
+    identity_filter = (
+        KnowledgebaseArtifactRow.source_path == source_path
+        if source_path is not None
+        else (
+            (KnowledgebaseArtifactRow.artifact_id == artifact_id)
+            | (KnowledgebaseArtifactRow.pending_artifact_id == artifact_id)
+        )
+    )
     result = await session.execute(
         select(KnowledgebaseArtifactRow).where(
             KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
-            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            identity_filter,
             KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
     existing = result.scalar_one_or_none()
     if existing is not None:
+        await _advance_attachment_generation(session, existing)
+        await _cancel_knowledgebase_jobs(
+            session,
+            knowledgebase_id=knowledgebase_id,
+            kb_artifact_id=existing.kb_artifact_id,
+        )
         existing.status = "queued"
-        existing.metadata_json = metadata or existing.metadata_json or {}
+        existing.source_path = source_path or existing.source_path
+        existing.pending_artifact_id = artifact_id
+        existing.pending_source_hash = artifact.content_hash
+        if metadata_provided:
+            existing.metadata_json = metadata or {}
+            flag_modified(existing, "metadata_json")
         existing.last_error = None
-        await enqueue_knowledgebase_job(
+        existing.stale_at = _utcnow() if existing.active_generation > 0 else None
+        job = await enqueue_knowledgebase_job(
             session,
             knowledgebase_id=knowledgebase_id,
             kb_artifact_id=existing.kb_artifact_id,
             artifact_id=artifact_id,
             job_type="reindex_artifact",
+            generation=existing.desired_generation,
         )
+        existing.last_job_id = job.job_id
         await session.flush()
         return existing
-    artifact.status = "attached"
-    artifact.expires_at = None
     row = KnowledgebaseArtifactRow(
         kb_artifact_id=_kb_artifact_id(),
         knowledgebase_id=knowledgebase_id,
-        artifact_id=artifact_id,
+        source_path=source_path,
+        artifact_id=None,
+        pending_artifact_id=artifact_id,
+        pending_source_hash=artifact.content_hash,
+        active_generation=0,
+        desired_generation=1,
         status="queued",
         source_hash=artifact.content_hash,
         source_size_bytes=artifact.size_bytes,
@@ -7655,6 +10419,7 @@ async def attach_artifact_to_knowledgebase(
         kb_artifact_id=row.kb_artifact_id,
         artifact_id=artifact_id,
         job_type="index_artifact",
+        generation=row.desired_generation,
     )
     row.last_job_id = job.job_id
     await session.flush()
@@ -7672,6 +10437,254 @@ async def list_knowledgebase_artifacts(
     return list(result.scalars().all())
 
 
+async def list_active_knowledgebase_facet_documents_bounded(
+    session: AsyncSession, *, knowledgebase_id: str, limit: int
+) -> list[tuple[KnowledgebaseArtifactRow, ArtifactRecordRow | None]]:
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow, ArtifactRecordRow)
+        .outerjoin(
+            ArtifactRecordRow,
+            ArtifactRecordRow.artifact_id == KnowledgebaseArtifactRow.artifact_id,
+        )
+        .where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.active_generation > 0,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+        .order_by(KnowledgebaseArtifactRow.kb_artifact_id.asc())
+        .limit(limit + 1)
+    )
+    return [(row, artifact) for row, artifact in result.all()]
+
+
+async def list_knowledgebase_documents_page(
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    status: str | None,
+    path_prefix: str | None,
+    query_text: str | None,
+    sort: str,
+    direction: str,
+    cursor_key: tuple[str, str] | None,
+    limit: int,
+) -> list[KnowledgebaseArtifactRow]:
+    query = select(KnowledgebaseArtifactRow).where(
+        KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id
+    )
+    if status is not None:
+        query = query.where(KnowledgebaseArtifactRow.status == status)
+    else:
+        query = query.where(KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]))
+    if path_prefix is not None:
+        query = query.where(
+            KnowledgebaseArtifactRow.source_path.startswith(path_prefix, autoescape=True)
+        )
+    if query_text:
+        query = query.where(
+            or_(
+                KnowledgebaseArtifactRow.source_path.icontains(query_text, autoescape=True),
+                KnowledgebaseArtifactRow.source_filename.icontains(query_text, autoescape=True),
+                sa.cast(KnowledgebaseArtifactRow.metadata_json, String).icontains(
+                    query_text, autoescape=True
+                ),
+            )
+        )
+    sort_column = (
+        func.coalesce(KnowledgebaseArtifactRow.source_path, "")
+        if sort == "path"
+        else KnowledgebaseArtifactRow.updated_at
+    )
+    if cursor_key is not None:
+        cursor_value_raw, cursor_id = cursor_key
+        cursor_value: Any = (
+            cursor_value_raw if sort == "path" else datetime.fromisoformat(cursor_value_raw)
+        )
+        if direction == "asc":
+            query = query.where(
+                or_(
+                    sort_column > cursor_value,
+                    and_(
+                        sort_column == cursor_value,
+                        KnowledgebaseArtifactRow.kb_artifact_id > cursor_id,
+                    ),
+                )
+            )
+        else:
+            query = query.where(
+                or_(
+                    sort_column < cursor_value,
+                    and_(
+                        sort_column == cursor_value,
+                        KnowledgebaseArtifactRow.kb_artifact_id < cursor_id,
+                    ),
+                )
+            )
+    ordering = (
+        (sort_column.asc(), KnowledgebaseArtifactRow.kb_artifact_id.asc())
+        if direction == "asc"
+        else (sort_column.desc(), KnowledgebaseArtifactRow.kb_artifact_id.desc())
+    )
+    result = await session.execute(query.order_by(*ordering).limit(limit + 1))
+    return list(result.scalars().all())
+
+
+async def get_knowledgebase_artifact(
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    kb_artifact_id: str,
+) -> KnowledgebaseArtifactRow | None:
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.kb_artifact_id == kb_artifact_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_live_knowledgebase_artifact_by_source_path(
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    source_path: str,
+) -> KnowledgebaseArtifactRow | None:
+    result = await session.execute(
+        select(KnowledgebaseArtifactRow).where(
+            KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseArtifactRow.source_path == source_path,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def resolve_knowledgebase_ingest_conflict(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    source_path: str,
+    content_hash: str,
+    metadata: dict[str, Any] | None,
+    conflict_policy: str,
+) -> tuple[str, str, KnowledgebaseArtifactRow | None] | None:
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if (
+        kb is None
+        or kb.status != "active"
+        or not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id)
+    ):
+        return None
+    existing = await get_live_knowledgebase_artifact_by_source_path(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        source_path=source_path,
+    )
+    if existing is None:
+        return "created", source_path, None
+    if content_hash in {existing.source_hash, existing.pending_source_hash}:
+        if metadata is None or dict(existing.metadata_json or {}) == metadata:
+            return "unchanged", source_path, existing
+        return "updated", source_path, existing
+    if conflict_policy == "skip":
+        return "skipped", source_path, existing
+    if conflict_policy == "replace":
+        return "updated", source_path, existing
+    used_paths = set(
+        (
+            await session.execute(
+                select(KnowledgebaseArtifactRow.source_path).where(
+                    KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
+                    KnowledgebaseArtifactRow.source_path.is_not(None),
+                    KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
+                )
+            )
+        ).scalars()
+    )
+    path = PurePosixPath(source_path)
+    parent = f"{path.parent.as_posix()}/" if path.parent.as_posix() != "." else ""
+    index = 2
+    while True:
+        candidate = f"{parent}{path.stem} ({index}){path.suffix}"
+        if candidate not in used_paths:
+            return "created", candidate, None
+        index += 1
+
+
+async def update_knowledgebase_artifact_metadata(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    kb_artifact_id: str,
+    source_path: str | None,
+    metadata: dict[str, Any] | None,
+    update_source_path: bool,
+    update_metadata: bool,
+) -> KnowledgebaseArtifactRow | None:
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if (
+        kb is None
+        or kb.status != "active"
+        or not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id)
+    ):
+        return None
+    row = await get_knowledgebase_artifact(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=kb_artifact_id,
+    )
+    if row is None or row.status in {"detached", "removed"}:
+        return None
+    changed = False
+    if update_source_path and row.source_path != source_path:
+        if source_path is not None:
+            conflict = await get_live_knowledgebase_artifact_by_source_path(
+                session,
+                knowledgebase_id=knowledgebase_id,
+                source_path=source_path,
+            )
+            if conflict is not None and conflict.kb_artifact_id != kb_artifact_id:
+                raise ValueError("source path is already used by another document")
+        row.source_path = source_path
+        changed = True
+    if update_metadata and dict(row.metadata_json or {}) != dict(metadata or {}):
+        row.metadata_json = dict(metadata or {})
+        flag_modified(row, "metadata_json")
+        changed = True
+    if not changed:
+        return row
+    target_artifact_id = row.pending_artifact_id or row.artifact_id
+    if target_artifact_id is None:
+        return None
+    await _advance_attachment_generation(session, row)
+    await _cancel_knowledgebase_jobs(
+        session, knowledgebase_id=knowledgebase_id, kb_artifact_id=kb_artifact_id
+    )
+    row.status = "queued"
+    row.last_error = None
+    row.pending_artifact_id = target_artifact_id
+    row.pending_source_hash = row.pending_source_hash or row.source_hash
+    row.stale_at = _utcnow() if row.active_generation > 0 else None
+    job = await enqueue_knowledgebase_job(
+        session,
+        knowledgebase_id=knowledgebase_id,
+        kb_artifact_id=kb_artifact_id,
+        artifact_id=target_artifact_id,
+        job_type="reindex_artifact" if row.active_generation > 0 else "index_artifact",
+        generation=row.desired_generation,
+    )
+    row.last_job_id = job.job_id
+    await session.flush()
+    return row
+
+
 async def detach_knowledgebase_artifact(
     session: AsyncSession,
     *,
@@ -7680,28 +10693,39 @@ async def detach_knowledgebase_artifact(
     artifact_id: str,
 ) -> KnowledgebaseArtifactRow | None:
     if (
-        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
-        is None
-    ):
+        kb := await get_knowledgebase(
+            session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+        )
+    ) is None or kb.status != "active":
+        return None
+    if not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id):
         return None
     result = await session.execute(
         select(KnowledgebaseArtifactRow).where(
             KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
-            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            (KnowledgebaseArtifactRow.artifact_id == artifact_id)
+            | (KnowledgebaseArtifactRow.pending_artifact_id == artifact_id),
             KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
     row = result.scalar_one_or_none()
     if row is None:
         return None
+    await _advance_attachment_generation(session, row)
     row.status = "detached"
     row.removed_at = _utcnow()
+    row.pending_artifact_id = None
+    row.pending_source_hash = None
+    await _cancel_knowledgebase_jobs(
+        session, knowledgebase_id=knowledgebase_id, kb_artifact_id=row.kb_artifact_id
+    )
     job = await enqueue_knowledgebase_job(
         session,
         knowledgebase_id=knowledgebase_id,
         kb_artifact_id=row.kb_artifact_id,
-        artifact_id=artifact_id,
+        artifact_id=row.artifact_id or artifact_id,
         job_type="delete_artifact_index",
+        generation=row.desired_generation,
         priority=10,
     )
     row.last_job_id = job.job_id
@@ -7710,13 +10734,22 @@ async def detach_knowledgebase_artifact(
 
 
 async def list_knowledgebase_jobs(
-    session: AsyncSession, *, knowledgebase_id: str, limit: int = 100
+    session: AsyncSession,
+    *,
+    knowledgebase_id: str,
+    job_types: set[str] | None = None,
+    statuses: set[str] | None = None,
+    limit: int = 100,
 ) -> list[KnowledgebaseIndexJobRow]:
+    query = select(KnowledgebaseIndexJobRow).where(
+        KnowledgebaseIndexJobRow.knowledgebase_id == knowledgebase_id
+    )
+    if job_types is not None:
+        query = query.where(KnowledgebaseIndexJobRow.job_type.in_(job_types))
+    if statuses is not None:
+        query = query.where(KnowledgebaseIndexJobRow.status.in_(statuses))
     result = await session.execute(
-        select(KnowledgebaseIndexJobRow)
-        .where(KnowledgebaseIndexJobRow.knowledgebase_id == knowledgebase_id)
-        .order_by(KnowledgebaseIndexJobRow.queued_at.desc())
-        .limit(limit)
+        query.order_by(KnowledgebaseIndexJobRow.queued_at.desc()).limit(limit)
     )
     return list(result.scalars().all())
 
@@ -7733,6 +10766,56 @@ async def get_knowledgebase_job(
     return result.scalar_one_or_none()
 
 
+async def cancel_knowledgebase_job(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    knowledgebase_id: str,
+    job_id: str,
+) -> KnowledgebaseIndexJobRow | None:
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if kb is None or kb.status != "active":
+        return None
+    now = _utcnow()
+    result = await session.execute(
+        update(KnowledgebaseIndexJobRow)
+        .where(
+            KnowledgebaseIndexJobRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseIndexJobRow.job_id == job_id,
+            KnowledgebaseIndexJobRow.status == "queued",
+        )
+        .values(
+            status="cancelled",
+            error="cancelled_by_user",
+            completed_at=now,
+            updated_at=now,
+        )
+        .returning(KnowledgebaseIndexJobRow.job_id)
+    )
+    if result.scalar_one_or_none() is None:
+        return None
+    job = await get_knowledgebase_job(session, knowledgebase_id=knowledgebase_id, job_id=job_id)
+    if job is None:
+        return None
+    if job.kb_artifact_id is not None:
+        attachment = await get_knowledgebase_artifact(
+            session,
+            knowledgebase_id=knowledgebase_id,
+            kb_artifact_id=job.kb_artifact_id,
+        )
+        if (
+            attachment is not None
+            and attachment.last_job_id == job.job_id
+            and attachment.status not in {"detached", "removed"}
+        ):
+            attachment.status = "stale" if attachment.active_generation > 0 else "failed"
+            attachment.last_error = "indexing_cancelled_by_user"
+    await session.flush()
+    return job
+
+
 async def enqueue_knowledgebase_artifact_reindex(
     session: AsyncSession,
     *,
@@ -7740,29 +10823,41 @@ async def enqueue_knowledgebase_artifact_reindex(
     knowledgebase_id: str,
     artifact_id: str,
 ) -> KnowledgebaseIndexJobRow | None:
-    if (
-        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
-        is None
-    ):
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if kb is None or kb.status != "active":
+        return None
+    if not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id):
         return None
     result = await session.execute(
         select(KnowledgebaseArtifactRow).where(
             KnowledgebaseArtifactRow.knowledgebase_id == knowledgebase_id,
-            KnowledgebaseArtifactRow.artifact_id == artifact_id,
+            (KnowledgebaseArtifactRow.artifact_id == artifact_id)
+            | (KnowledgebaseArtifactRow.pending_artifact_id == artifact_id),
             KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
     row = result.scalar_one_or_none()
-    if row is None or row.artifact_id is None:
+    if row is None or (row.artifact_id is None and row.pending_artifact_id is None):
         return None
+    target_artifact_id = row.pending_artifact_id or row.artifact_id
+    await _advance_attachment_generation(session, row)
+    await _cancel_knowledgebase_jobs(
+        session, knowledgebase_id=knowledgebase_id, kb_artifact_id=row.kb_artifact_id
+    )
     row.status = "queued"
     row.last_error = None
+    row.pending_artifact_id = target_artifact_id
+    row.pending_source_hash = row.pending_source_hash or row.source_hash
+    row.stale_at = _utcnow() if row.active_generation > 0 else None
     job = await enqueue_knowledgebase_job(
         session,
         knowledgebase_id=knowledgebase_id,
         kb_artifact_id=row.kb_artifact_id,
-        artifact_id=row.artifact_id,
+        artifact_id=target_artifact_id,
         job_type="reindex_artifact",
+        generation=row.desired_generation,
     )
     row.last_job_id = job.job_id
     await session.flush()
@@ -7775,10 +10870,12 @@ async def enqueue_knowledgebase_reindex(
     owner_email: str,
     knowledgebase_id: str,
 ) -> list[KnowledgebaseIndexJobRow] | None:
-    if (
-        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
-        is None
-    ):
+    kb = await get_knowledgebase(
+        session, owner_email=owner_email, knowledgebase_id=knowledgebase_id
+    )
+    if kb is None or kb.status != "active":
+        return None
+    if not await _lock_active_knowledgebase(session, knowledgebase_id=knowledgebase_id):
         return None
     result = await session.execute(
         select(KnowledgebaseArtifactRow).where(
@@ -7788,16 +10885,25 @@ async def enqueue_knowledgebase_reindex(
     )
     jobs: list[KnowledgebaseIndexJobRow] = []
     for row in result.scalars().all():
-        if row.artifact_id is None:
+        target_artifact_id = row.pending_artifact_id or row.artifact_id
+        if target_artifact_id is None:
             continue
+        await _advance_attachment_generation(session, row)
+        await _cancel_knowledgebase_jobs(
+            session, knowledgebase_id=knowledgebase_id, kb_artifact_id=row.kb_artifact_id
+        )
         row.status = "queued"
         row.last_error = None
+        row.pending_artifact_id = target_artifact_id
+        row.pending_source_hash = row.pending_source_hash or row.source_hash
+        row.stale_at = _utcnow() if row.active_generation > 0 else None
         job = await enqueue_knowledgebase_job(
             session,
             knowledgebase_id=knowledgebase_id,
             kb_artifact_id=row.kb_artifact_id,
-            artifact_id=row.artifact_id,
+            artifact_id=target_artifact_id,
             job_type="reindex_artifact",
+            generation=row.desired_generation,
         )
         row.last_job_id = job.job_id
         jobs.append(job)
@@ -7812,22 +10918,26 @@ async def enqueue_retry_knowledgebase_job(
     knowledgebase_id: str,
     job_id: str,
 ) -> KnowledgebaseIndexJobRow | None:
-    if (
-        await get_knowledgebase(session, owner_email=owner_email, knowledgebase_id=knowledgebase_id)
-        is None
-    ):
-        return None
     job = await get_knowledgebase_job(session, knowledgebase_id=knowledgebase_id, job_id=job_id)
     if job is None or job.status not in {"failed", "cancelled"}:
         return None
-    new_job = await enqueue_knowledgebase_job(
-        session,
-        knowledgebase_id=knowledgebase_id,
-        kb_artifact_id=job.kb_artifact_id,
-        artifact_id=job.artifact_id,
-        job_type=job.job_type,
-        priority=job.priority,
-    )
+    kb = (
+        await session.execute(
+            select(KnowledgebaseRow).where(
+                KnowledgebaseRow.knowledgebase_id == knowledgebase_id,
+                KnowledgebaseRow.owner_email == owner_email,
+            )
+        )
+    ).scalar_one_or_none()
+    if kb is None:
+        return None
+    cleanup_job = job.job_type in {"delete_artifact_index", "delete_stale_vectors"}
+    if kb.status != "active" and not cleanup_job:
+        return None
+    if kb.status == "active" and not await _lock_active_knowledgebase(
+        session, knowledgebase_id=knowledgebase_id
+    ):
+        return None
     if job.kb_artifact_id is not None:
         attachment = (
             await session.execute(
@@ -7836,42 +10946,94 @@ async def enqueue_retry_knowledgebase_job(
                 )
             )
         ).scalar_one_or_none()
-        if attachment is not None and attachment.status not in {"detached", "removed"}:
+        if job.job_type == "delete_stale_vectors" and attachment is not None:
+            new_job = await enqueue_knowledgebase_job(
+                session,
+                knowledgebase_id=knowledgebase_id,
+                kb_artifact_id=job.kb_artifact_id,
+                artifact_id=job.artifact_id,
+                job_type=job.job_type,
+                generation=job.generation,
+                priority=job.priority,
+                diagnostics=dict(job.diagnostics or {}),
+            )
+        elif (
+            attachment is not None
+            and job.job_type == "delete_artifact_index"
+            and attachment.status in {"detached", "removed"}
+        ):
+            await _advance_attachment_generation(session, attachment)
+            new_job = await enqueue_knowledgebase_job(
+                session,
+                knowledgebase_id=knowledgebase_id,
+                kb_artifact_id=job.kb_artifact_id,
+                artifact_id=job.artifact_id,
+                job_type=job.job_type,
+                generation=attachment.desired_generation,
+                priority=job.priority,
+            )
+            attachment.last_job_id = new_job.job_id
+        elif attachment is not None and attachment.status not in {"detached", "removed"}:
+            await _advance_attachment_generation(session, attachment)
+            await _cancel_knowledgebase_jobs(
+                session,
+                knowledgebase_id=knowledgebase_id,
+                kb_artifact_id=attachment.kb_artifact_id,
+            )
             attachment.status = "queued"
             attachment.last_error = None
+            attachment.pending_artifact_id = job.artifact_id
+            attachment.pending_source_hash = (
+                attachment.pending_source_hash or attachment.source_hash
+            )
+            new_job = await enqueue_knowledgebase_job(
+                session,
+                knowledgebase_id=knowledgebase_id,
+                kb_artifact_id=job.kb_artifact_id,
+                artifact_id=job.artifact_id,
+                job_type=job.job_type,
+                generation=attachment.desired_generation,
+                priority=job.priority,
+            )
             attachment.last_job_id = new_job.job_id
+        else:
+            return None
+    else:
+        return None
     await session.flush()
     return new_job
 
 
-async def claim_next_knowledgebase_job(session: AsyncSession) -> KnowledgebaseIndexJobRow | None:
+async def list_knowledgebase_job_claim_candidates(
+    session: AsyncSession, *, limit: int = 20
+) -> list[KnowledgebaseIndexJobRow]:
+    """Return ordered candidates for per-job distributed lease acquisition.
+
+    Distributed ownership is established by the indexer's per-job coordination
+    lease before this row is mutated.
+    """
     result = await session.execute(
         select(KnowledgebaseIndexJobRow)
-        .where(KnowledgebaseIndexJobRow.status == "queued")
-        .order_by(KnowledgebaseIndexJobRow.priority.asc(), KnowledgebaseIndexJobRow.queued_at.asc())
-        .limit(1)
-    )
-    job = result.scalar_one_or_none()
-    if job is None:
-        return None
-    job.status = "running"
-    job.started_at = _utcnow()
-    job.updated_at = _utcnow()
-    job.attempts += 1
-    await session.flush()
-    return job
-
-
-async def delete_knowledgebase_chunks(session: AsyncSession, *, kb_artifact_id: str) -> list[str]:
-    result = await session.execute(
-        select(KnowledgebaseChunkRow.vector_id).where(
-            KnowledgebaseChunkRow.kb_artifact_id == kb_artifact_id
+        .where(KnowledgebaseIndexJobRow.status.in_(["queued", "running"]))
+        .order_by(
+            case((KnowledgebaseIndexJobRow.status == "queued", 0), else_=1),
+            KnowledgebaseIndexJobRow.priority.asc(),
+            KnowledgebaseIndexJobRow.queued_at.asc(),
         )
+        .limit(limit)
     )
+    return list(result.scalars().all())
+
+
+async def delete_knowledgebase_chunks(
+    session: AsyncSession, *, kb_artifact_id: str, generation: int | None = None
+) -> list[str]:
+    predicate = KnowledgebaseChunkRow.kb_artifact_id == kb_artifact_id
+    if generation is not None:
+        predicate = predicate & (KnowledgebaseChunkRow.generation == generation)
+    result = await session.execute(select(KnowledgebaseChunkRow.vector_id).where(predicate))
     vector_ids = [value for value in result.scalars().all() if value]
-    await session.execute(
-        delete(KnowledgebaseChunkRow).where(KnowledgebaseChunkRow.kb_artifact_id == kb_artifact_id)
-    )
+    await session.execute(delete(KnowledgebaseChunkRow).where(predicate))
     await session.flush()
     return vector_ids
 
@@ -7889,8 +11051,15 @@ async def list_knowledgebase_chunks(
     session: AsyncSession, *, knowledgebase_id: str
 ) -> list[KnowledgebaseChunkRow]:
     result = await session.execute(
-        select(KnowledgebaseChunkRow).where(
-            KnowledgebaseChunkRow.knowledgebase_id == knowledgebase_id
+        select(KnowledgebaseChunkRow)
+        .join(
+            KnowledgebaseArtifactRow,
+            KnowledgebaseArtifactRow.kb_artifact_id == KnowledgebaseChunkRow.kb_artifact_id,
+        )
+        .where(
+            KnowledgebaseChunkRow.knowledgebase_id == knowledgebase_id,
+            KnowledgebaseChunkRow.generation == KnowledgebaseArtifactRow.active_generation,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
     return list(result.scalars().all())
@@ -7900,9 +11069,16 @@ async def get_knowledgebase_chunk(
     session: AsyncSession, *, knowledgebase_id: str, chunk_id: str
 ) -> KnowledgebaseChunkRow | None:
     result = await session.execute(
-        select(KnowledgebaseChunkRow).where(
+        select(KnowledgebaseChunkRow)
+        .join(
+            KnowledgebaseArtifactRow,
+            KnowledgebaseArtifactRow.kb_artifact_id == KnowledgebaseChunkRow.kb_artifact_id,
+        )
+        .where(
             KnowledgebaseChunkRow.knowledgebase_id == knowledgebase_id,
             KnowledgebaseChunkRow.chunk_id == chunk_id,
+            KnowledgebaseChunkRow.generation == KnowledgebaseArtifactRow.active_generation,
+            KnowledgebaseArtifactRow.status.not_in(["detached", "removed"]),
         )
     )
     return result.scalar_one_or_none()
@@ -7998,6 +11174,9 @@ async def create_channel_delivery_outbox(
     attachments: list[dict[str, Any]] | None = None,
     deliverable_id: str | None = None,
     next_attempt_at: datetime | None = None,
+    managed_binding_id: str | None = None,
+    managed_binding_version: int | None = None,
+    managed_owner_epoch: int | None = None,
 ) -> ChannelDeliveryOutboxRow:
     row = ChannelDeliveryOutboxRow(
         delivery_id=delivery_id,
@@ -8015,6 +11194,9 @@ async def create_channel_delivery_outbox(
         deliverable_id=deliverable_id,
         status="pending",
         next_attempt_at=next_attempt_at,
+        managed_binding_id=managed_binding_id,
+        managed_binding_version=managed_binding_version,
+        managed_owner_epoch=managed_owner_epoch,
     )
     session.add(row)
     await session.flush()
@@ -8253,33 +11435,67 @@ async def mark_channel_delivery_chunk_sent(
     projected_chunk_count: int,
     projection_digest: str,
     lease_expires_at: datetime,
+    receipt: dict[str, Any] | None = None,
 ) -> bool:
     """Persist resumable multipart progress under the active delivery lease."""
 
-    result = await session.execute(
-        update(ChannelDeliveryOutboxRow)
-        .where(
-            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
-            ChannelDeliveryOutboxRow.status == "sending",
-            ChannelDeliveryOutboxRow.lease_token == lease_token,
-            ChannelDeliveryOutboxRow.completed_chunk_count < completed_chunk_count,
-            ChannelDeliveryOutboxRow.inflight_chunk_index == completed_chunk_count - 1,
-            sa.or_(
-                ChannelDeliveryOutboxRow.projection_digest.is_(None),
-                ChannelDeliveryOutboxRow.projection_digest == projection_digest,
-            ),
+    row = (
+        await session.execute(
+            select(ChannelDeliveryOutboxRow)
+            .where(
+                ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+                ChannelDeliveryOutboxRow.status == "sending",
+                ChannelDeliveryOutboxRow.lease_token == lease_token,
+                ChannelDeliveryOutboxRow.completed_chunk_count < completed_chunk_count,
+                ChannelDeliveryOutboxRow.inflight_chunk_index == completed_chunk_count - 1,
+                sa.or_(
+                    ChannelDeliveryOutboxRow.projection_digest.is_(None),
+                    ChannelDeliveryOutboxRow.projection_digest == projection_digest,
+                ),
+            )
+            .with_for_update()
         )
-        .values(
-            completed_chunk_count=completed_chunk_count,
-            projected_chunk_count=projected_chunk_count,
-            projection_digest=projection_digest,
-            inflight_chunk_index=None,
-            inflight_idempotent=None,
-            lease_expires_at=lease_expires_at,
-            updated_at=_utcnow(),
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+    row.completed_chunk_count = completed_chunk_count
+    row.projected_chunk_count = projected_chunk_count
+    row.projection_digest = projection_digest
+    row.inflight_chunk_index = None
+    row.inflight_idempotent = None
+    row.lease_expires_at = lease_expires_at
+    row.updated_at = _utcnow()
+    persisted_receipt = receipt or {
+        "chunk_index": completed_chunk_count - 1,
+        "content": "",
+        "sent_at": _utcnow().isoformat(),
+        "external_message_id": None,
+        "attachments_delivered": False,
+    }
+    row.delivery_receipts_json = [*(row.delivery_receipts_json or []), persisted_receipt]
+    delivered_at = datetime.fromisoformat(str(persisted_receipt["sent_at"]))
+    row.first_delivered_at = row.first_delivered_at or delivered_at
+    row.last_delivered_at = delivered_at
+    session.add(
+        ChannelDeliveryReceiptRow(
+            delivery_id=delivery_id,
+            chunk_index=int(persisted_receipt["chunk_index"]),
+            sent_at=delivered_at,
+            content=str(persisted_receipt.get("content") or ""),
+            external_message_id=(
+                str(persisted_receipt["external_message_id"])
+                if persisted_receipt.get("external_message_id") is not None
+                else None
+            ),
+            attachments_json=(
+                persisted_receipt.get("attachments")
+                if isinstance(persisted_receipt.get("attachments"), list)
+                else None
+            ),
+            created_at=_utcnow(),
         )
     )
-    return bool(getattr(result, "rowcount", 0))
+    return True
 
 
 async def mark_channel_delivery_chunk_inflight(
@@ -8432,6 +11648,34 @@ async def mark_channel_delivery_failed(
             next_attempt_at=next_attempt_at,
             lease_token=None,
             lease_expires_at=None,
+            updated_at=_utcnow(),
+        )
+    )
+    return bool(getattr(result, "rowcount", 0))
+
+
+async def mark_channel_delivery_permanent_failure(
+    session: AsyncSession,
+    *,
+    delivery_id: str,
+    lease_token: str,
+    last_error: str,
+) -> bool:
+    """Suppress one permanent delivery result under its exact active lease."""
+
+    result = await session.execute(
+        update(ChannelDeliveryOutboxRow)
+        .where(
+            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+            ChannelDeliveryOutboxRow.status == "sending",
+            ChannelDeliveryOutboxRow.lease_token == lease_token,
+        )
+        .values(
+            status="suppressed",
+            attempt_count=ChannelDeliveryOutboxRow.attempt_count + 1,
+            lease_token=None,
+            lease_expires_at=None,
+            last_error=last_error,
             updated_at=_utcnow(),
         )
     )

@@ -351,6 +351,7 @@ class WebPushService:
                 logger.exception("web_push: failed to load VAPID key for delivery")
         self._pending_tasks: set[asyncio.Task[dict[str, int]]] = set()
         event_bus.subscribe(EventType.TURN_COMPLETED, self._handle_event)
+        event_bus.subscribe(EventType.TURN_ERROR, self._handle_event)
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_event)
         event_bus.subscribe(EventType.TASK_FAILED, self._handle_event)
         event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_event)
@@ -529,6 +530,8 @@ class WebPushService:
 
     async def _event_payload(self, event: Event) -> dict[str, str] | None:
         if event.type == EventType.TURN_COMPLETED:
+            if event.data.get("managed_continuation_pending") or event.data.get("partial"):
+                return None
             conversation_id = event.data.get("conversation_id")
             if not isinstance(conversation_id, str):
                 return None
@@ -550,6 +553,34 @@ class WebPushService:
                 "body": _conversation_notification_body("New reply", conversation),
                 "url": url,
                 "tag": tag,
+                "kind": "message",
+                "conversation_id": conversation_id,
+                **({"icon": icon} if icon else {}),
+            }
+
+        if event.type == EventType.TURN_ERROR:
+            conversation_id = event.data.get("conversation_id")
+            if not isinstance(conversation_id, str) or event.data.get("channel_deliverable"):
+                return None
+            async with self._session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+                agent = await get_agent(session, conversation.agent_id) if conversation else None
+            if conversation is None or conversation.context_type != "web":
+                return None
+            title = _agent_notification_title(agent)
+            icon = await self._agent_notification_icon(agent)
+            status = (
+                "Reply stopped"
+                if event.data.get("error_code")
+                in {"cancelled", "queued_turn_cancelled", "turn_cancelled"}
+                else "Reply failed"
+            )
+            return {
+                "user_email": conversation.user_email,
+                "title": title,
+                "body": _conversation_notification_body(status, conversation),
+                "url": f"/chat/{conversation_id}",
+                "tag": conversation_id,
                 "kind": "message",
                 "conversation_id": conversation_id,
                 **({"icon": icon} if icon else {}),

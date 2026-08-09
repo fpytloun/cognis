@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from cognis.core.attachment_utils import merge_content_and_attachment_note
+from cognis.core.message_envelope import render_user_event_content
 
 _MESSAGE_MAX_CHARS = 12_000
 _TOOL_CALL_REMAINDER_MAX_CHARS = 1_000
@@ -30,11 +31,20 @@ def format_events_for_compaction(events: list[Any]) -> str:
         data = event.data
 
         if etype in ("user_message", "assistant_message"):
-            payload = merge_content_and_attachment_note(
+            attachments = [a for a in data.get("attachments", []) if isinstance(a, dict)]
+            raw_content = merge_content_and_attachment_note(
                 str(data.get("content", "")),
-                [a for a in data.get("attachments", []) if isinstance(a, dict)],
+                attachments,
             )
-            payload = _truncate_middle(payload, _MESSAGE_MAX_CHARS)
+            if etype == "user_message":
+                payload = render_user_event_content(
+                    event,
+                    content_override=raw_content,
+                    max_content_chars=_MESSAGE_MAX_CHARS,
+                )
+            else:
+                payload = raw_content
+                payload = _truncate_middle(payload, _MESSAGE_MAX_CHARS)
         elif etype == "tool_call":
             name = data.get("name", "unknown")
             args = data.get("arguments", "")
@@ -169,6 +179,8 @@ def _tool_event_metadata(data: dict[str, Any]) -> str:
         fields.append("agent_visible=true")
     if data.get("agent_visible_truncated") is True:
         fields.append("agent_visible_truncated=true")
+    if data.get("producer_truncated") is True:
+        fields.append("producer_truncated=true")
     artifact_id = data.get("tool_output_artifact_id")
     if isinstance(artifact_id, str) and artifact_id.strip():
         fields.append(f"tool_output_artifact_id={artifact_id!r}")
@@ -182,6 +194,12 @@ def tool_result_recovery_hint(data: dict[str, Any]) -> str | None:
     if not isinstance(call_id, str) or not call_id.strip():
         call_id = data.get("call_id") if data.get("has_full_output") is True else None
     if not isinstance(call_id, str) or not call_id.strip():
+        producer_call_id = data.get("call_id")
+        if data.get("producer_truncated") is True and isinstance(producer_call_id, str):
+            return (
+                f"producer returned a truncated preview for call_id={producer_call_id!r}; "
+                "no controller recovery handle is available"
+            )
         return None
     quoted = repr(call_id)
     return (

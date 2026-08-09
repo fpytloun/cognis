@@ -37,11 +37,14 @@ class KnowledgebaseJobType(StrEnum):
     INDEX_ARTIFACT = "index_artifact"
     REINDEX_ARTIFACT = "reindex_artifact"
     DELETE_ARTIFACT_INDEX = "delete_artifact_index"
+    DELETE_STALE_VECTORS = "delete_stale_vectors"
     REBUILD_KNOWLEDGEBASE = "rebuild_knowledgebase"
 
 
 class KnowledgebaseModel(BaseModel):
     knowledgebase_id: str
+    owner_email: str | None = None
+    access_level: Literal["owner", "shared"] = "owner"
     name: str
     description: str | None = None
     status: KnowledgebaseStatus = KnowledgebaseStatus.ACTIVE
@@ -67,13 +70,35 @@ class KnowledgebaseUpdateRequest(BaseModel):
     status: Literal["active", "archived"] | None = None
 
 
+class KnowledgebaseShareRequest(BaseModel):
+    user_email: str
+    permission: Literal["view"] = "view"
+    note: str | None = Field(default=None, max_length=500)
+
+
+class KnowledgebaseShareModel(BaseModel):
+    grant_id: str
+    user_email: str
+    user_name: str | None = None
+    permission: Literal["view"] = "view"
+    granted_at: datetime
+    note: str | None = None
+
+
+class KnowledgebaseShareCandidate(BaseModel):
+    email: str
+    name: str | None = None
+
+
 class KnowledgebaseAttachRequest(BaseModel):
     artifact_id: str
+    source_path: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgebaseBulkAttachItem(BaseModel):
     artifact_id: str
+    source_path: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -92,11 +117,17 @@ class KnowledgebaseBulkAttachRequest(BaseModel):
 class KnowledgebaseArtifactModel(BaseModel):
     kb_artifact_id: str
     knowledgebase_id: str
+    source_path: str | None = None
     artifact_id: str | None
+    pending_artifact_id: str | None = None
+    pending_source_hash: str | None = None
+    active_generation: int = 0
+    desired_generation: int = 0
     status: KnowledgebaseArtifactStatus
     source_hash: str | None = None
     source_filename: str | None = None
     source_mime_type: str | None = None
+    source_size_bytes: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     chunk_count: int = 0
     last_job_id: str | None = None
@@ -113,6 +144,7 @@ class KnowledgebaseIndexJobModel(BaseModel):
     knowledgebase_id: str
     kb_artifact_id: str | None = None
     artifact_id: str | None = None
+    generation: int = 0
     job_type: KnowledgebaseJobType
     status: KnowledgebaseJobStatus
     attempts: int = 0
@@ -166,6 +198,7 @@ class KnowledgebaseSearchRequest(BaseModel):
 
 class KnowledgebaseSearchMatch(BaseModel):
     chunk_id: str
+    kb_artifact_id: str
     artifact_id: str
     snippet: str
     score: float
@@ -185,6 +218,111 @@ class KnowledgebaseHealth(BaseModel):
     embedding_route_configured: bool
     healthy: bool = False
     notes: list[str] = Field(default_factory=list)
+
+
+class KnowledgebaseCapabilities(BaseModel):
+    enabled: bool
+    vector_backend: str
+    backend_ready: bool
+    embedding_ready: bool
+    indexer_ready: bool
+    ask_ready: bool
+    supported_mime_types: list[str] = Field(default_factory=list)
+    supported_extensions: list[str] = Field(default_factory=list)
+    limits: dict[str, int] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+class KnowledgebaseDocumentListResponse(BaseModel):
+    documents: list[KnowledgebaseArtifactModel]
+    next_cursor: str | None = None
+
+
+class KnowledgebaseDocumentDetail(KnowledgebaseArtifactModel):
+    last_job: KnowledgebaseIndexJobModel | None = None
+
+
+class KnowledgebaseDocumentContent(BaseModel):
+    kb_artifact_id: str
+    artifact_id: str
+    source_path: str | None = None
+    content_mode: Literal["source", "extracted"]
+    mime_type: str
+    text: str
+    size_bytes: int
+    extraction_method: str | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgebaseDocumentUpdateRequest(BaseModel):
+    source_path: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class KnowledgebaseIngestOutcome(BaseModel):
+    filename: str
+    source_path: str | None = None
+    status: Literal["created", "updated", "unchanged", "skipped", "failed"]
+    artifact_id: str | None = None
+    kb_artifact_id: str | None = None
+    job_id: str | None = None
+    error_code: str | None = None
+    message: str | None = None
+
+
+class KnowledgebaseIngestResponse(BaseModel):
+    outcomes: list[KnowledgebaseIngestOutcome]
+
+
+class KnowledgebaseAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=4000)
+    filters: list[KnowledgebaseFilter] = Field(default_factory=list)
+    limit: int = Field(default=8, ge=1, le=20)
+    max_answer_tokens: int = Field(default=700, ge=64, le=2000)
+
+
+class KnowledgebaseAskError(BaseModel):
+    code: Literal[
+        "synthesis_timeout",
+        "provider_error",
+        "invalid_response",
+        "unsupported_citation",
+    ]
+    message: str
+    correlation_id: str
+
+
+class KnowledgebaseFacetRequest(BaseModel):
+    fields: list[str] = Field(min_length=1, max_length=5)
+    filters: list[KnowledgebaseFilter] = Field(default_factory=list)
+    search: dict[str, str] = Field(default_factory=dict)
+    limit_per_field: int = Field(default=20, ge=1, le=100)
+
+
+class KnowledgebaseFacetValue(BaseModel):
+    value: str | int | float | bool
+    count: int = Field(ge=1)
+
+
+class KnowledgebaseFacetField(BaseModel):
+    field: str
+    type: Literal["string", "number", "boolean", "datetime", "array"]
+    cardinality: int = Field(ge=0)
+    truncated: bool = False
+    values: list[KnowledgebaseFacetValue] = Field(default_factory=list)
+
+
+class KnowledgebaseFacetResponse(BaseModel):
+    fields: list[KnowledgebaseFacetField]
+    documents_scanned: int = Field(ge=0)
+
+
+class KnowledgebaseAskResponse(BaseModel):
+    status: Literal["answered", "insufficient_evidence", "error"]
+    answer: str | None = None
+    cited_chunk_ids: list[str] = Field(default_factory=list)
+    matches: list[KnowledgebaseSearchMatch] = Field(default_factory=list)
+    error: KnowledgebaseAskError | None = None
 
 
 class KnowledgebaseDiagnostics(BaseModel):

@@ -839,6 +839,7 @@ class EscalationRecord(BaseModel):
     call_id: str
     session_id: str | None = None
     tool_name: str | None = None
+    arguments_display: dict[str, Any] | None = None
     decision: str = "escalate"
     resolved: bool = False
     reasoning: str | None = None

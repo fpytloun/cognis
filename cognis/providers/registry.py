@@ -34,6 +34,10 @@ class ProviderRegistry:
     # LLMService implements both LLMProvider and ImageGenerationProvider.
     # This alias provides explicit access via the ImageGenerationProvider protocol.
     image_generation: LLMService | None = None
+    channel_target_ref_secret: str | None = None
+    channel_binding_lookup: Any | None = None
+    managed_channel_service: Any | None = None
+    recipient_resolution_service: Any | None = None
 
     async def health(self) -> dict[str, ProviderHealth]:
         return {

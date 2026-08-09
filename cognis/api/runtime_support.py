@@ -54,6 +54,10 @@ from cognis.runtime_context import (
 )
 from cognis.tools.builtin.agent_management import agent_management_tools
 from cognis.tools.builtin.artifact_tools import artifact_tools
+from cognis.tools.builtin.channels import (
+    build_channel_tool_handlers,
+    channel_tools,
+)
 from cognis.tools.builtin.conversations import (
     build_conversation_tool_handlers,
     conversation_tools,
@@ -320,6 +324,7 @@ def _runtime_info(
     visible_tool_count: int | None = None,
     failure_reason: str | None = None,
     executor_pin_fallback_notice: dict[str, Any] | None = None,
+    mcp_degraded_notice: str | None = None,
     tool_agent: AgentDefinition | None = None,
     executor_agent: AgentDefinition | None = None,
 ) -> dict[str, Any]:
@@ -345,10 +350,53 @@ def _runtime_info(
         "fallback_used": fallback_used,
         "failure_reason": failure_reason,
         "executor_pin_fallback_notice": executor_pin_fallback_notice,
+        "mcp_degraded_notice": mcp_degraded_notice,
         "environment": _environment_payload(environment),
         "inventory_tool_count": inventory_tool_count,
         "visible_tool_count": visible_tool_count,
     }
+
+
+def _mcp_degraded_notice(
+    runtime_metadata: Any,
+    *,
+    can_authorize: bool,
+) -> str | None:
+    """Return an actionable prompt notice for failed executor MCP authorization."""
+
+    if not isinstance(runtime_metadata, dict):
+        return None
+    server_statuses = runtime_metadata.get("mcp_servers")
+    if not isinstance(server_statuses, list):
+        return None
+    servers = sorted(
+        {
+            (
+                str(status.get("name")).strip(),
+                str(status.get("server_id")).strip(),
+            )
+            for status in server_statuses
+            if isinstance(status, dict)
+            and status.get("status") == "failed"
+            and status.get("authorization_required") is True
+            and isinstance(status.get("name"), str)
+            and status["name"].strip()
+            and isinstance(status.get("server_id"), str)
+            and status["server_id"].strip()
+        }
+    )
+    if not servers:
+        return None
+    server_details = ", ".join(f"{name} ({server_id})" for name, server_id in servers)
+    if can_authorize:
+        return (
+            f"MCP authorization required: {server_details}. If needed, call `manage_mcp` with "
+            "`oauth_authorize` for its server ID and send the returned instructions to the user."
+        )
+    return (
+        f"MCP authorization required: {server_details}. If needed, direct the user to "
+        "Tools & Skills → Configure MCP Servers."
+    )
 
 
 def _raise_runtime_resolution_error(
@@ -433,6 +481,9 @@ async def _resolve_eligible_executor_config(
     *,
     conversation_active_executor_id: str | None = None,
     conversation_active_executor_expires_at: Any | None = None,
+    conversation_active_executor_generation: int = 0,
+    conversation_active_executor_unavailable_since: Any | None = None,
+    conversation_active_executor_source: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
 ) -> dict[str, Any]:
@@ -466,20 +517,49 @@ async def _resolve_eligible_executor_config(
     from cognis.core.executor_pool import pick_initial_active, resolve_executor_pool
     from cognis.store.queries import (
         get_active_agent_grant,
+        get_conversation,
         get_executor_row,
+        get_task,
         initialize_conversation_active_executor,
         initialize_task_active_executor,
+        initialize_task_and_conversation_active_executor,
         list_executors,
     )
 
-    async def _persist_initial_active_executor(session: Any, executor_id: str) -> None:
+    async def _persist_initial_active_executor(
+        session: Any, executor_id: str, *, source: str
+    ) -> str:
         """Idempotently persist the initial active executor on conversation+task."""
 
         try:
-            if isinstance(conversation_id, str) and conversation_id:
-                await initialize_conversation_active_executor(session, conversation_id, executor_id)
-            if isinstance(task_id, str) and task_id:
-                await initialize_task_active_executor(session, task_id, executor_id)
+            if (
+                isinstance(conversation_id, str)
+                and conversation_id
+                and isinstance(task_id, str)
+                and task_id
+            ):
+                await initialize_task_and_conversation_active_executor(
+                    session,
+                    task_id=task_id,
+                    conversation_id=conversation_id,
+                    active_executor_id=executor_id,
+                    source=source,
+                )
+                authoritative = await get_task(session, task_id)
+                executor_id = str(getattr(authoritative, "active_executor_id", None) or executor_id)
+            elif isinstance(conversation_id, str) and conversation_id:
+                initialized = await initialize_conversation_active_executor(
+                    session, conversation_id, executor_id, source=source
+                )
+                if initialized is not True:
+                    authoritative = await get_conversation(session, conversation_id)
+                    executor_id = str(
+                        getattr(authoritative, "active_executor_id", None) or executor_id
+                    )
+            elif isinstance(task_id, str) and task_id:
+                await initialize_task_active_executor(session, task_id, executor_id, source=source)
+                authoritative = await get_task(session, task_id)
+                executor_id = str(getattr(authoritative, "active_executor_id", None) or executor_id)
             commit = getattr(session, "commit", None)
             if callable(commit):
                 await commit()
@@ -488,10 +568,8 @@ async def _resolve_eligible_executor_config(
             if callable(rollback):
                 with contextlib.suppress(Exception):
                     await rollback()
-            logger.debug(
-                "stage36: failed to persist initial active executor",
-                exc_info=True,
-            )
+            raise
+        return executor_id
 
     executor_owner_email = user_email
     execution = agent.execution if isinstance(agent.execution, dict) else {}
@@ -507,6 +585,20 @@ async def _resolve_eligible_executor_config(
                 else:
                     execution = _grant_execution(grant)
                     allow_default = True
+
+        if (
+            conversation_active_executor_id
+            and conversation_active_executor_source is None
+            and (task_id or conversation_id)
+        ):
+            persisted_pin = (
+                await get_task(session, task_id)
+                if task_id
+                else await get_conversation(session, conversation_id)
+            )
+            conversation_active_executor_source = getattr(
+                persisted_pin, "active_executor_source", None
+            )
 
         explicit_id = execution.get("executor_id")
         selector = execution.get("executor_selector")
@@ -541,12 +633,26 @@ async def _resolve_eligible_executor_config(
                     pool=pool,
                     active_executor_id=conversation_active_executor_id,
                     active_executor_expires_at=conversation_active_executor_expires_at,
+                    active_executor_generation=conversation_active_executor_generation,
+                    active_executor_unavailable_since=conversation_active_executor_unavailable_since,
+                    active_executor_source=conversation_active_executor_source,
+                    execution=execution,
                     ws_provider=getattr(getattr(providers, "executor", None), "websocket", None),
                     retry_seconds=settings["retry_seconds"],
                     retry_interval_seconds=settings["retry_interval_seconds"],
+                    notice_dispatcher=getattr(providers, "executor_pin_notice_dispatcher", None),
+                    canonicalization_session=session,
                 )
                 if lifecycle.active_executor_id:
                     conversation_active_executor_id = lifecycle.active_executor_id
+                if lifecycle.transient_unavailable:
+                    raise TransientExecutorUnavailable(
+                        "The selected executor is temporarily unavailable.",
+                        executor_id=conversation_active_executor_id,
+                        retry_after_seconds=(
+                            lifecycle.retry_after_seconds or settings["retry_interval_seconds"]
+                        ),
+                    )
             assert isinstance(conversation_active_executor_id, str)
             target = pool.by_id(conversation_active_executor_id)
             if target is None:
@@ -566,7 +672,48 @@ async def _resolve_eligible_executor_config(
             # source but the task pin is still NULL (e.g. mid-deploy
             # upgrade), seed the task pin too. The IS NULL guards keep
             # this idempotent.
-            await _persist_initial_active_executor(session, target.executor_id)
+            from cognis.core.executor_pin_lifecycle import normalize_active_executor_source
+
+            backfill_source = (
+                normalize_active_executor_source(
+                    conversation_active_executor_source,
+                    expires_at=conversation_active_executor_expires_at,
+                    execution=execution,
+                )
+                or conversation_active_executor_source
+                or None
+            )
+            if backfill_source is None:
+                raise RuntimeError(
+                    f"Persisted conversation-active executor '{target.executor_id}' "
+                    "has unknown provenance"
+                )
+            persisted_executor_id = await _persist_initial_active_executor(
+                session,
+                target.executor_id,
+                source=backfill_source,
+            )
+            if persisted_executor_id != target.executor_id:
+                target = pool.by_id(persisted_executor_id)
+                if target is None:
+                    winner_row = await get_executor_row(
+                        session,
+                        persisted_executor_id,
+                        owner_email=executor_owner_email,
+                        include_shared=True,
+                    )
+                    if winner_row is None or not is_executor_row_usable(
+                        winner_row, policy, owner_email=executor_owner_email
+                    ):
+                        raise RuntimeError(
+                            f"Persisted conversation-active executor "
+                            f"'{persisted_executor_id}' is unavailable or unusable"
+                        )
+                    return _executor_config_from_row(
+                        winner_row,
+                        executor_owner_email=executor_owner_email,
+                        selection_source="conversation_active",
+                    )
             config = _executor_config_from_row(
                 target.row,
                 executor_owner_email=executor_owner_email,
@@ -576,15 +723,6 @@ async def _resolve_eligible_executor_config(
                     else "conversation_active_additional"
                 ),
             )
-            notice = getattr(lifecycle, "notice", None)
-            if notice is not None:
-                config["executor_pin_fallback_notice"] = {
-                    "previous_executor_id": notice.previous_executor_id,
-                    "new_executor_id": notice.new_executor_id,
-                    "reason": notice.reason,
-                    "ui_message": notice.ui_message,
-                    "llm_message": notice.llm_message,
-                }
             return config
 
         if explicit_id:
@@ -601,7 +739,24 @@ async def _resolve_eligible_executor_config(
             if not is_executor_row_usable(row, policy, owner_email=executor_owner_email):
                 raise RuntimeError(f"Executor '{explicit_id}' is not active or allowed by policy")
             # Persist as the conversation+task's initial active executor on first turn.
-            await _persist_initial_active_executor(session, str(explicit_id))
+            persisted_executor_id = await _persist_initial_active_executor(
+                session, str(explicit_id), source="explicit_primary"
+            )
+            if persisted_executor_id != str(explicit_id):
+                winner_row = await get_executor_row(
+                    session,
+                    persisted_executor_id,
+                    owner_email=executor_owner_email,
+                    include_shared=True,
+                )
+                if winner_row is None or not is_executor_row_usable(
+                    winner_row, policy, owner_email=executor_owner_email
+                ):
+                    raise RuntimeError(
+                        f"Persisted initial executor '{persisted_executor_id}' "
+                        "is unavailable or unusable"
+                    )
+                row = winner_row
             return _executor_config_from_row(
                 row,
                 executor_owner_email=executor_owner_email,
@@ -661,7 +816,34 @@ async def _resolve_eligible_executor_config(
             raise RuntimeError(
                 f"Executor selector for agent '{agent.agent_id}' matched {usable_count} usable executors"
             )
-        await _persist_initial_active_executor(session, initial.executor_id)
+        persisted_executor_id = await _persist_initial_active_executor(
+            session, initial.executor_id, source="selector_primary"
+        )
+        if persisted_executor_id != initial.executor_id:
+            initial = pool.by_id(persisted_executor_id)
+            if (
+                initial is None
+                or initial.row is None
+                or not is_executor_row_usable(initial.row, policy, owner_email=executor_owner_email)
+            ):
+                winner_row = await get_executor_row(
+                    session,
+                    persisted_executor_id,
+                    owner_email=executor_owner_email,
+                    include_shared=True,
+                )
+                if winner_row is None or not is_executor_row_usable(
+                    winner_row, policy, owner_email=executor_owner_email
+                ):
+                    raise RuntimeError(
+                        f"Persisted initial executor '{persisted_executor_id}' "
+                        "is unavailable or unusable"
+                    )
+                return _executor_config_from_row(
+                    winner_row,
+                    executor_owner_email=executor_owner_email,
+                    selection_source=selection_source,
+                )
         return _executor_config_from_row(
             initial.row,
             executor_owner_email=executor_owner_email,
@@ -695,6 +877,7 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
         *mcp_management_tools(),
         *conversation_tools(),
         *project_tools(),
+        *channel_tools(),
         *(knowledgebase_tools() if knowledgebase_enabled else []),
         *task_continuation_tools(),
         *tool_output_tools(),
@@ -837,6 +1020,48 @@ def select_static_tools(
     return selected
 
 
+_TASK_CONTROL_EXACT_READ_TOOLS = frozenset(
+    {
+        "read",
+        "grep",
+        "glob",
+        "list_directory",
+        "lsp",
+        "web_search",
+        "web_fetch",
+        "web_map",
+        "web_crawl",
+        "artifact_read",
+        "artifact_get_metadata",
+        "artifact_get_url",
+        "artifact_list_recent",
+        "artifact_search",
+        "read_task_deliverable",
+        "list_task_step_runs",
+        "get_project",
+        "list_projects",
+        "get_workflow",
+        "list_workflows",
+        "list_agents",
+        "get_agent",
+        "memory_search",
+        "memory_find",
+        "memory_ask",
+        "memory_list",
+        "memory_recent",
+        "memory_get_artifact",
+        "memory_get_artifact_url",
+        "memory_list_artifacts",
+    }
+)
+
+
+def task_control_tool_allowed(tool: ToolDefinition) -> bool:
+    """Hard allowlist for the task-control runtime inventory."""
+
+    return bool(tool.read_only and tool.name in _TASK_CONTROL_EXACT_READ_TOOLS)
+
+
 async def enrich_image_tool_model_descriptions(
     tools: list[ToolDefinition],
     image_generation_provider: ImageGenerationProvider | None,
@@ -940,6 +1165,10 @@ def _build_handler_map(
     guardrails_provider: Any | None = None,
     compaction_strategy: Any | None = None,
     knowledgebase_service: Any | None = None,
+    channel_target_ref_secret: str | None = None,
+    channel_binding_lookup: Any | None = None,
+    channel_manager_ref: Any | None = None,
+    recipient_service: Any | None = None,
 ) -> dict[str, Any]:
     """Build a combined handler map for all tool sources."""
     handlers: dict[str, Any] = {}
@@ -953,6 +1182,16 @@ def _build_handler_map(
             )
         )
     handlers.update(build_project_tool_handlers(session_factory))
+    if channel_target_ref_secret:
+        handlers.update(
+            build_channel_tool_handlers(
+                session_factory,
+                application_secret=channel_target_ref_secret,
+                binding_lookup=channel_binding_lookup,
+                channel_manager_ref=channel_manager_ref,
+                recipient_service=recipient_service,
+            )
+        )
     if knowledgebase_service is not None:
         handlers.update(build_knowledgebase_tool_handlers(knowledgebase_service))
     handlers.update(build_task_continuation_tool_handlers(session_factory))
@@ -1095,6 +1334,9 @@ def build_step_runtime_factory(
     ) -> ResolvedStepRuntime:
         tool_agent = agent
         executor_agent = executor_agent or agent
+        dispatcher = getattr(providers, "executor_pin_notice_dispatcher", None)
+        if dispatcher is not None:
+            await dispatcher.dispatch_pending(limit=50)
         session_factory_for_policy = getattr(providers, "_session_factory", None) or session_factory
         policy = (
             await load_executor_policy(session_factory_for_policy)
@@ -1114,12 +1356,33 @@ def build_step_runtime_factory(
         # step resolves).
         conversation_active_executor_id: str | None = None
         conversation_active_executor_expires_at: Any | None = None
+        conversation_active_executor_generation = 0
+        conversation_active_executor_unavailable_since: Any | None = None
+        conversation_active_executor_source: str | None = None
         if session_factory is not None and (conversation_id or task_id):
             from cognis.store.queries import get_conversation, get_task
 
             try:
                 async with session_factory() as db_session:
-                    if conversation_id:
+                    if task_id:
+                        task_row = await get_task(db_session, task_id)
+                        if task_row is not None:
+                            conversation_active_executor_id = getattr(
+                                task_row, "active_executor_id", None
+                            )
+                            conversation_active_executor_expires_at = getattr(
+                                task_row, "active_executor_expires_at", None
+                            )
+                            conversation_active_executor_generation = int(
+                                getattr(task_row, "active_executor_generation", 0) or 0
+                            )
+                            conversation_active_executor_unavailable_since = getattr(
+                                task_row, "active_executor_unavailable_since", None
+                            )
+                            conversation_active_executor_source = getattr(
+                                task_row, "active_executor_source", None
+                            )
+                    elif conversation_id:
                         conv_row = await get_conversation(db_session, conversation_id)
                         if conv_row is not None:
                             conversation_active_executor_id = getattr(
@@ -1128,14 +1391,14 @@ def build_step_runtime_factory(
                             conversation_active_executor_expires_at = getattr(
                                 conv_row, "active_executor_expires_at", None
                             )
-                    if conversation_active_executor_id is None and task_id:
-                        task_row = await get_task(db_session, task_id)
-                        if task_row is not None:
-                            conversation_active_executor_id = getattr(
-                                task_row, "active_executor_id", None
+                            conversation_active_executor_generation = int(
+                                getattr(conv_row, "active_executor_generation", 0) or 0
                             )
-                            conversation_active_executor_expires_at = getattr(
-                                task_row, "active_executor_expires_at", None
+                            conversation_active_executor_unavailable_since = getattr(
+                                conv_row, "active_executor_unavailable_since", None
+                            )
+                            conversation_active_executor_source = getattr(
+                                conv_row, "active_executor_source", None
                             )
             except Exception:
                 logger.debug(
@@ -1150,11 +1413,13 @@ def build_step_runtime_factory(
             policy,
             conversation_active_executor_id=conversation_active_executor_id,
             conversation_active_executor_expires_at=conversation_active_executor_expires_at,
+            conversation_active_executor_generation=conversation_active_executor_generation,
+            conversation_active_executor_unavailable_since=conversation_active_executor_unavailable_since,
+            conversation_active_executor_source=conversation_active_executor_source,
             conversation_id=conversation_id,
             task_id=task_id,
         )
-        if _executor_pin_fallback_notice is not None:
-            executor_config["executor_pin_fallback_notice"] = _executor_pin_fallback_notice
+        _executor_pin_fallback_notice = None
 
         # Stage 36: resolve the agent's full executor pool (primary + additional)
         # so downstream code can route per-call to other assigned executors.
@@ -1390,6 +1655,8 @@ def build_step_runtime_factory(
             else:
                 filtered.append(tool)
         agent_tools = filtered
+        if getattr(access_context, "control_surface", None) == "task_control":
+            agent_tools = [tool for tool in agent_tools if task_control_tool_allowed(tool)]
 
         resolved_type = executor_config.get("executor_type", "in_process")
         if not is_executor_type_allowed(resolved_type, policy):
@@ -1429,14 +1696,25 @@ def build_step_runtime_factory(
                     for server in mcp_servers
                     if f"local_mcp:{server.server_id or server.name}" not in disabled_mcp_servers
                 ]
+            if getattr(access_context, "control_surface", None) == "task_control":
+                # MCP discovery/connection is not part of the hard task-control surface.
+                mcp_servers = []
             secret_owner_email = executor_config.get("executor_owner_email", user_email)
-            secrets = await providers.secrets.resolve_for_execution(tool_agent, secret_owner_email)
+            secrets = (
+                {}
+                if getattr(access_context, "control_surface", None) == "task_control"
+                else await providers.secrets.resolve_for_execution(tool_agent, secret_owner_email)
+            )
             handler_map = _build_handler_map(
                 session_factory,
                 getattr(providers.executor, "status_provider", None),
                 getattr(providers, "guardrails", None),
                 getattr(providers, "compaction_strategy", None),
                 knowledgebase_service,
+                getattr(providers, "channel_target_ref_secret", None),
+                getattr(providers, "channel_binding_lookup", None),
+                getattr(providers, "channel_manager_ref", None),
+                getattr(providers, "recipient_resolution_service", None),
             )
             handle = await providers.executor.spawn(
                 ExecutorConfig(
@@ -1528,12 +1806,20 @@ def build_step_runtime_factory(
                         disabled_tools=disabled_tools,
                         disabled_mcp_servers=disabled_mcp_servers,
                     )
+                    if getattr(access_context, "control_surface", None) == "task_control":
+                        merge_result.tools = [
+                            tool for tool in merge_result.tools if task_control_tool_allowed(tool)
+                        ]
                     handler_map = _build_handler_map(
                         session_factory,
                         getattr(providers.executor, "status_provider", None),
                         getattr(providers, "guardrails", None),
                         getattr(providers, "compaction_strategy", None),
                         knowledgebase_service,
+                        getattr(providers, "channel_target_ref_secret", None),
+                        getattr(providers, "channel_binding_lookup", None),
+                        getattr(providers, "channel_manager_ref", None),
+                        getattr(providers, "recipient_resolution_service", None),
                     )
                     remote_registry = _build_remote_runtime_registry(
                         merge_result.tools,
@@ -1576,8 +1862,9 @@ def build_step_runtime_factory(
                             }
                         },
                     )
+                    handle_metadata = ws_provider.get_handle_metadata(executor_id)
                     env_snapshot = environment_from_metadata(
-                        ws_provider.get_handle_metadata(executor_id),
+                        handle_metadata,
                         executor_id=executor_id,
                         executor_type=resolved_type,
                         fallback_source="remote_executor_metadata",
@@ -1620,6 +1907,10 @@ def build_step_runtime_factory(
                             ),
                             environment=env_snapshot,
                             inventory_tool_count=len(all_tools),
+                            mcp_degraded_notice=_mcp_degraded_notice(
+                                handle_metadata,
+                                can_authorize=any(tool.name == "manage_mcp" for tool in all_tools),
+                            ),
                             tool_agent=tool_agent,
                             executor_agent=executor_agent,
                         ),
@@ -1628,36 +1919,6 @@ def build_step_runtime_factory(
                     )
                 except Exception as exc:
                     message = f"Selected executor '{executor_id}' failed while listing tools"
-                    from cognis.core.executor_pin_lifecycle import (
-                        fallback_active_executor_after_remote_failure,
-                    )
-
-                    fallback_lifecycle = await fallback_active_executor_after_remote_failure(
-                        session_factory=session_factory,
-                        conversation_id=conversation_id,
-                        task_id=task_id,
-                        pool=executor_pool_obj,
-                        active_executor_id=executor_id,
-                        reason="secondary executor failed while listing tools",
-                    )
-                    if fallback_lifecycle.notice is not None:
-                        notice = fallback_lifecycle.notice
-                        return await factory(
-                            agent,
-                            user_email,
-                            executor_agent=executor_agent,
-                            access_context=access_context,
-                            conversation_id=conversation_id,
-                            task_id=task_id,
-                            _executor_pin_fallback_notice={
-                                "previous_executor_id": notice.previous_executor_id,
-                                "new_executor_id": notice.new_executor_id,
-                                "reason": notice.reason,
-                                "ui_message": notice.ui_message,
-                                "llm_message": notice.llm_message,
-                            },
-                            _executor_pin_fallback_retried=True,
-                        )
                     logger.warning(
                         "Failed to get tools from selected remote executor",
                         extra={
@@ -1670,36 +1931,6 @@ def build_step_runtime_factory(
                         exc_info=True,
                     )
                     raise RuntimeError(message) from exc
-            from cognis.core.executor_pin_lifecycle import (
-                fallback_active_executor_after_remote_failure,
-            )
-
-            fallback_lifecycle = await fallback_active_executor_after_remote_failure(
-                session_factory=session_factory,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                pool=executor_pool_obj,
-                active_executor_id=executor_id,
-                reason="secondary executor is not connected or not ready",
-            )
-            if fallback_lifecycle.notice is not None:
-                notice = fallback_lifecycle.notice
-                return await factory(
-                    agent,
-                    user_email,
-                    executor_agent=executor_agent,
-                    access_context=access_context,
-                    conversation_id=conversation_id,
-                    task_id=task_id,
-                    _executor_pin_fallback_notice={
-                        "previous_executor_id": notice.previous_executor_id,
-                        "new_executor_id": notice.new_executor_id,
-                        "reason": notice.reason,
-                        "ui_message": notice.ui_message,
-                        "llm_message": notice.llm_message,
-                    },
-                    _executor_pin_fallback_retried=True,
-                )
             message = f"Selected executor '{executor_id}' is not connected or not ready"
             _raise_transient_executor_unavailable(
                 message,
@@ -1745,6 +1976,7 @@ async def _resolve_web_config(
         "per_host_cap": 4,
         "backend_caps": {
             "direct": 16,
+            "direct_search": 2,
             "tavily": 8,
             "brave": 2,
             "searxng": 4,
@@ -1752,6 +1984,7 @@ async def _resolve_web_config(
         },
         "rate_limits_qps": {
             "direct": 0.0,
+            "direct_search": 1.0,
             "tavily": 5.0,
             "brave": 1.0,
             "searxng": 5.0,
@@ -1858,6 +2091,7 @@ async def _resolve_web_config(
                 concurrency["per_host_cap"] = await _read_int("web.concurrency.per_host_cap", 4)
                 for backend_name, default_cap in (
                     ("direct", 16),
+                    ("direct_search", 2),
                     ("tavily", 8),
                     ("brave", 2),
                     ("searxng", 4),
@@ -1867,6 +2101,7 @@ async def _resolve_web_config(
                         f"web.concurrency.{backend_name}_cap", default_cap
                     )
                 for backend_name, default_qps in (
+                    ("direct_search", 1.0),
                     ("tavily", 5.0),
                     ("brave", 1.0),
                     ("searxng", 5.0),

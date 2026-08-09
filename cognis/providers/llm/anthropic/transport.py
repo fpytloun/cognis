@@ -35,6 +35,7 @@ from cognis.providers.llm.errors import (
     MidStreamErrorCategory,
     MidStreamErrorPayload,
     classify_llm_exception,
+    retry_after_seconds_from_headers,
 )
 
 CredentialResolver = Callable[[str], Awaitable[str]]
@@ -303,6 +304,7 @@ def _provider_error(
     *,
     event_type: str,
     status_code: int | None = None,
+    retry_after_seconds: float | None = None,
 ) -> AnthropicTransportError:
     error = details.get("error")
     body = error if isinstance(error, Mapping) else details
@@ -323,6 +325,8 @@ def _provider_error(
         "provider_event": event_type,
         "details": dict(body),
     }
+    if retry_after_seconds is not None:
+        payload["retry_after_seconds"] = retry_after_seconds
     return AnthropicTransportError(message, payload=payload, status_code=status_code)
 
 
@@ -879,6 +883,7 @@ class AnthropicMessagesClient:
                     body,
                     event_type="http",
                     status_code=response.status_code,
+                    retry_after_seconds=retry_after_seconds_from_headers(response.headers),
                 )
             return response, owned_client
         except httpx.HTTPError as exc:
