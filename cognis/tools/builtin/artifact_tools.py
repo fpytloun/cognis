@@ -452,7 +452,7 @@ async def _handle_artifact_read(
         return ToolResult(output="artifact_id is required.", is_error=True)
 
     if _is_tool_artifact_ref(artifact_id):
-        resolved = await _materialize_tool_artifact_ref(
+        resolved = await materialize_tool_artifact_ref(
             artifact_id,
             artifact_store=artifact_store,
             session_factory=session_factory,
@@ -1676,7 +1676,7 @@ def _parse_tool_artifact_ref(value: str) -> tuple[str, str] | None:
     return call_id.strip(), anchor.strip()
 
 
-async def _materialize_tool_artifact_ref(
+async def materialize_tool_artifact_ref(
     tool_artifact_ref: str,
     *,
     artifact_store: Any,

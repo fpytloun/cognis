@@ -7,8 +7,9 @@ the ``web_search_backend`` runtime metadata key (default ``direct``);
 single-axis ``web_backend`` metadata key is honoured as a fallback for
 back-compat with executors still rolling out the split.
 
-Per-call ``backend`` overrides supplied by the LLM continue to work for
-both axes.
+Resolver overrides remain for internal diagnostics and compatibility tests.
+Normal web tool handlers intentionally use only configured runtime policy;
+their LLM schemas do not expose backend selection.
 """
 
 from __future__ import annotations
@@ -212,7 +213,8 @@ def _browser_fetch_timeouts(metadata: dict[str, Any]) -> tuple[float, float, flo
 def _resolve_backend_name(metadata: dict[str, Any], override: str | None, *, axis: str) -> str:
     """Pick a backend name for the requested axis (search/fetch).
 
-    Per-call override always wins. Otherwise prefer the new split key
+    Internal override always wins. Normal tool handlers do not pass one.
+    Otherwise prefer the new split key
     (``web_search_backend`` / ``web_fetch_backend``); fall back to the
     legacy ``web_backend`` for executors that have not yet been pushed
     the new metadata. Final fallback is ``direct``.
@@ -351,8 +353,8 @@ def available_backends(metadata: dict[str, Any]) -> list[str]:
 
 
 class _UnavailableBrowserBackend:
-    """Sentinel returned when the LLM forces ``backend='browser'`` but the
-    executor has no browser runtime wired in.
+    """Sentinel returned when an internal caller requests browser fetch but
+    the executor has no browser runtime wired in.
 
     Returning this sentinel from :func:`resolve_fetch_backend` instead of the
     direct backend keeps the explicit override honest: the LLM gets a real

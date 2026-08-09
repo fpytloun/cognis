@@ -362,7 +362,10 @@ _WRITE_DELIVERABLE_DESCRIPTION = (
     "durable output boundary and may be evaluator/reviewer input, downstream "
     "step input, a handoff artifact, or final user delivery. If the step "
     "expects a deliverable, write it after validation/review and before "
-    "step_complete. In direct chat, use this only when the turn should produce "
+    "step_complete. Workflow/task deliverables remain scoped to that task. "
+    "In direct chat, the deliverable is published for the owner, so other "
+    "conversations owned by the same user can search and use it. Use this only "
+    "when the turn should produce "
     "a durable/rendered/shareable artifact such as a report, spec, dashboard, "
     "or rich document; do not use it for normal answers, intermediate progress, "
     "drafts, notes, or status updates. The content argument is always the "
@@ -776,7 +779,11 @@ STEP_REQUEST_QUESTIONS_TOOL = ToolDefinition(
 REQUEST_CREDENTIAL_TOOL = ToolDefinition(
     name="request_credential",
     description=(
-        "Request a durable credential from the user without exposing the secret value to the LLM."
+        "Request a durable credential from the user without exposing its secret value to the "
+        "LLM. This call suspends the current turn until the user approves, denies, cancels, or "
+        "the request times out. On approval, the credential is stored and granted to the current "
+        "agent before this call returns. Resume the original operation using the returned "
+        "credential ID; do not ask the user for the same credential again."
     ),
     parameters={
         "type": "object",

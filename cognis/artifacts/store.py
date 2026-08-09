@@ -16,6 +16,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
@@ -391,6 +392,11 @@ class ArtifactStore:
         else:
             raise ValueError(f"Unsupported artifact backend: {config.backend}")
 
+    @property
+    def signed_url_ttl_seconds(self) -> int:
+        """Default lifetime used when generating artifact URLs."""
+        return self._config.signed_url_ttl_seconds
+
     @staticmethod
     def generate_id(prefix: str = "img") -> str:
         """Generate a unique artifact ID."""
@@ -486,6 +492,7 @@ class ArtifactStore:
         *,
         ttl_seconds: int | None = None,
         mode: str = "download",
+        expires_at: datetime | None = None,
     ) -> str:
         """Generate a Cognis-served signed URL for an artifact.
 
@@ -499,7 +506,15 @@ class ArtifactStore:
         if not self._config.base_url or not self._config.signing_secret:
             raise ValueError("Artifact public URLs require base_url and signing_secret")
         ttl = ttl_seconds or self._config.signed_url_ttl_seconds
-        exp = int(time.time()) + ttl
+        now = int(time.time())
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            remaining_seconds = int(expires_at.timestamp()) - now
+            if remaining_seconds < 1:
+                raise ValueError("Artifact has expired")
+            ttl = min(ttl, remaining_seconds)
+        exp = now + ttl
         sig = self._filesystem_signature(namespace, object_id, filename, exp, mode=mode)
         route = "content" if mode == "download" else "view"
         path = f"/api/v1/artifacts/{route}/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
@@ -596,6 +611,7 @@ class ArtifactStore:
         *,
         ttl_seconds: int | None = None,
         mode: str = "download",
+        expires_at: datetime | None = None,
     ) -> str:
         import asyncio
 
@@ -606,4 +622,5 @@ class ArtifactStore:
             filename,
             ttl_seconds=ttl_seconds,
             mode=mode,
+            expires_at=expires_at,
         )

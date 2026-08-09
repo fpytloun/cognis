@@ -43,6 +43,9 @@ DEFAULT_PER_HOST_CAP = 4
 DEFAULT_BACKEND_CAPS: dict[str, int] = {
     # Direct web operations use synchronous libraries in worker threads.
     "direct": 4,
+    # DDG is an unofficial scraped endpoint and needs a tighter lane than
+    # ordinary direct HTTP fetches.
+    "direct_search": 2,
     "tavily": 8,
     "brave": 2,
     "searxng": 4,
@@ -51,6 +54,7 @@ DEFAULT_BACKEND_CAPS: dict[str, int] = {
 DEFAULT_RATE_LIMITS_QPS: dict[str, float] = {
     # 0.0 means unlimited (no rate-limit token bucket created).
     "direct": 0.0,
+    "direct_search": 1.0,
     "tavily": 5.0,
     "brave": 1.0,
     "searxng": 5.0,
@@ -97,7 +101,7 @@ class WebConcurrencyController:
         # of distinct hosts and we don't want to pre-allocate that surface.
         self._host_locks: dict[tuple[str, str], asyncio.Semaphore] = {}
         self._host_lock_factory = asyncio.Lock()
-        self._rate_limiters: dict[str, object] = {}
+        self._rate_limiters: dict[str, tuple[asyncio.AbstractEventLoop, object]] = {}
         self._rate_lock = asyncio.Lock()
 
     @property
@@ -128,13 +132,14 @@ class WebConcurrencyController:
         qps = self._settings.qps_for(backend)
         if qps <= 0:
             return None
+        loop = asyncio.get_running_loop()
         existing = self._rate_limiters.get(backend)
-        if existing is not None:
-            return existing
+        if existing is not None and existing[0] is loop:
+            return existing[1]
         async with self._rate_lock:
             existing = self._rate_limiters.get(backend)
-            if existing is not None:
-                return existing
+            if existing is not None and existing[0] is loop:
+                return existing[1]
             try:
                 from aiolimiter import AsyncLimiter
             except Exception as exc:  # pragma: no cover - defensive
@@ -143,10 +148,15 @@ class WebConcurrencyController:
                     type(exc).__name__,
                 )
                 return None
-            # AsyncLimiter takes max_rate in count-per-second when time_period=1.
-            # We map qps directly.
-            limiter: object = AsyncLimiter(max_rate=qps, time_period=1.0)
-            self._rate_limiters[backend] = limiter
+            # AsyncLimiter cannot acquire its default one-token amount when
+            # max_rate is below one. Represent fractional QPS as one request
+            # per inverse-QPS period instead.
+            limiter: object
+            if qps < 1:
+                limiter = AsyncLimiter(max_rate=1, time_period=1 / qps)
+            else:
+                limiter = AsyncLimiter(max_rate=qps, time_period=1.0)
+            self._rate_limiters[backend] = (loop, limiter)
             return limiter
 
     @asynccontextmanager

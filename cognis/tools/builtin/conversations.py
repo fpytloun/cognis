@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from cognis.api.serializers import conversation_to_response, serialize_event_rows
+from cognis.core.artifact_inputs import safe_attachment_metadata
 from cognis.core.conversation_search import join_session_matches
 from cognis.core.long_lived_chat import is_long_lived_chat_context
 from cognis.core.session_cache import CachedEvent
@@ -239,6 +240,7 @@ def _conversation_context(row: Any) -> ConversationContext:
 def _session_model(row: Any) -> SessionModel:
     return SessionModel(
         session_id=row.session_id,
+        activity_scope_id=getattr(row, "activity_scope_id", None) or row.session_id,
         conversation_id=row.conversation_id,
         parent_session_id=getattr(row, "parent_session_id", None),
         previous_session_id=getattr(row, "previous_session_id", None),
@@ -652,6 +654,7 @@ def build_conversation_tool_handlers(
                     "ts": item.timestamp,
                     "content": content,
                     "content_truncated": truncated,
+                    "attachments": safe_attachment_metadata(event_data.get("attachments")),
                     "anchor": f"{session_id}:{seq_value}"
                     if session_id and seq_value is not None
                     else None,

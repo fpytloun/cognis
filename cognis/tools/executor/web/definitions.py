@@ -47,13 +47,8 @@ def web_tool_definitions(
     )
 
     has_tavily_search = "tavily" in search_backends
-    has_brave_search = "brave" in search_backends
-    has_searxng_search = "searxng" in search_backends
     has_tavily_fetch = "tavily" in fetch_backends
     has_browser_fetch = "browser" in fetch_backends
-
-    has_multiple_search = len(search_backends) > 1
-    has_multiple_fetch = len(fetch_backends) > 1
 
     legacy_default = default_backend or available_backends[0] if available_backends else "direct"
     if legacy_default not in available_backends and available_backends:
@@ -72,18 +67,13 @@ def web_tool_definitions(
 
     tools: list[ToolDefinition] = [
         _build_web_fetch(
-            fetch_backends,
-            has_tavily_fetch,
             has_browser_fetch,
-            has_multiple_fetch,
             default_backend=resolved_fetch_default,
         ),
         _build_web_search(
-            search_backends,
-            has_tavily_search,
-            has_brave_search,
-            has_searxng_search,
-            has_multiple_search,
+            resolved_search_default == "tavily",
+            resolved_search_default == "brave",
+            resolved_search_default == "searxng",
             default_backend=resolved_search_default,
         ),
         # Crawl + map are always available — implementation auto-selects
@@ -114,10 +104,7 @@ def _resolve_capable_default_backend(default_backend: str, supported_backends: l
 
 
 def _build_web_fetch(
-    backends: list[str],
-    has_tavily: bool,
     has_browser: bool,
-    has_multiple: bool,
     *,
     default_backend: str,
 ) -> ToolDefinition:
@@ -142,35 +129,16 @@ def _build_web_fetch(
         },
     }
 
-    if has_multiple:
-        properties["backend"] = {
-            "type": "string",
-            "enum": backends,
-            "description": (
-                f"Backend to use (default: {default_backend}). "
-                "Advanced override: omit this unless you intentionally need a specific backend. "
-                "When omitted, the configured fetch backend runs first and automatic browser fallback can still apply. "
-                f"{_fetch_backend_hints(backends)}"
-            ),
-        }
-
     desc = (
         "Fetch content from a URL and return it as text or markdown. "
-        "Normally omit backend so the configured fetch path is used. "
+        f"Uses the configured {default_backend} fetch backend. "
         "Direct fetches automatically retry through a headed browser when "
         "available, otherwise through a headless browser, when the controller "
         "is configured to do so."
     )
     extras: list[str] = []
-    if has_tavily:
-        extras.append("Use 'tavily' only when you explicitly want Tavily extraction for this call.")
     if has_browser:
-        extras.append(
-            "Use 'browser' only when you want every fetch rendered in the preferred browser mode "
-            "(headed when the executor allows it, otherwise headless). "
-            "When backend='browser' is set explicitly the controller does NOT silently "
-            "fall back to direct fetch."
-        )
+        extras.append("Browser rendering is selected automatically by the fallback policy.")
     if extras:
         desc += " " + " ".join(extras)
 
@@ -192,11 +160,9 @@ def _build_web_fetch(
 
 
 def _build_web_search(
-    backends: list[str],
     has_tavily: bool,
     has_brave: bool,
     has_searxng: bool,
-    has_multiple: bool,
     *,
     default_backend: str,
 ) -> ToolDefinition:
@@ -219,18 +185,39 @@ def _build_web_search(
             "maximum": 50,
             "description": "Maximum image references to return when include_images is enabled (default: 10, max 50)",
         },
-    }
-
-    if has_multiple:
-        properties["backend"] = {
+        "include_domains": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Prefer results from these domains",
+        },
+        "exclude_domains": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Exclude results from these domains",
+        },
+        "time_range": {
             "type": "string",
-            "enum": backends,
+            "enum": ["any", "day", "week", "month", "year"],
             "description": (
-                f"Backend to use (default: {default_backend}). "
-                "Advanced override: omit this unless the user asked for a specific provider or the configured backend failed. "
-                f"{_search_backend_hints(backends)}"
+                "Provider-neutral freshness window. Use 'any' for stable resources, "
+                "exact identifiers, repositories, papers, videos, and documents "
+                "(default: any)."
             ),
-        }
+        },
+        "search_mode": {
+            "type": "string",
+            "enum": ["web", "news", "images", "videos"],
+            "description": (
+                "Search vertical. Images and videos request focused media results; "
+                "include_images instead adds auxiliary images to another mode."
+            ),
+        },
+        "result_type": {
+            "type": "string",
+            "enum": ["paper", "repository", "discussion", "document"],
+            "description": "Optional preferred content shape within the selected search mode.",
+        },
+    }
 
     # Tavily-specific params
     if has_tavily:
@@ -261,16 +248,6 @@ def _build_web_search(
         properties["include_image_descriptions"] = {
             "type": "boolean",
             "description": "Tavily: include image descriptions when images are returned",
-        }
-        properties["include_domains"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Tavily: prefer these domains instead of using site: operators",
-        }
-        properties["exclude_domains"] = {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Tavily: exclude these domains from search results",
         }
         properties["chunks_per_source"] = {
             "type": "integer",
@@ -321,17 +298,6 @@ def _build_web_search(
 
     # Shared params (appear when any non-direct backend is available)
     if has_tavily or has_brave:
-        properties["time_range"] = {
-            "type": "string",
-            "description": (
-                "Recency filter. Tavily: 'day','week','month','year'. "
-                "Brave: 'pd','pw','pm','py' or 'YYYY-MM-DDtoYYYY-MM-DD'."
-                if has_tavily and has_brave
-                else "Tavily: recency filter — 'day','week','month','year'."
-                if has_tavily
-                else "Brave: freshness — 'pd','pw','pm','py' or date range."
-            ),
-        }
         properties["country"] = {
             "type": "string",
             "description": (
@@ -343,7 +309,9 @@ def _build_web_search(
             ),
         }
 
-    desc = _search_description(backends, has_tavily, has_brave, has_searxng)
+    desc = _search_description(
+        default_backend=default_backend,
+    )
 
     return ToolDefinition(
         name="web_search",
@@ -485,22 +453,18 @@ def _build_web_research() -> ToolDefinition:
 
 
 def _search_description(
-    backends: list[str], has_tavily: bool, has_brave: bool, has_searxng: bool
+    *,
+    default_backend: str,
 ) -> str:
-    if not has_tavily and not has_brave and not has_searxng:
-        return "Search the web using DuckDuckGo. Free, no API key needed."
-
-    parts = ["Search the web for information. Backends:"]
-    if "direct" in backends:
-        parts.append("'direct' (DuckDuckGo, free)")
-    if has_tavily:
-        parts.append("'tavily' (AI-optimized, supports answer generation)")
-    if has_brave:
-        parts.append("'brave' (large index, freshness filters)")
-    if has_searxng:
-        parts.append("'searxng' (self-hosted metasearch aggregator, free)")
-    description = " ".join(parts) + "."
-    if has_tavily:
+    descriptions = {
+        "direct": "DuckDuckGo",
+        "tavily": "Tavily",
+        "brave": "Brave Search",
+        "searxng": "the configured self-hosted SearXNG instance",
+    }
+    backend_label = descriptions.get(default_backend, default_backend)
+    description = f"Search the web for information using {backend_label}."
+    if default_backend == "tavily":
         description += (
             " For Tavily, prefer include_domains/exclude_domains over site: operators in the query."
             " Keep the query focused on the subject itself rather than search syntax."
@@ -508,31 +472,3 @@ def _search_description(
             " Use country only with topic='general'."
         )
     return description
-
-
-def _fetch_backend_hints(backends: list[str]) -> str:
-    hints = []
-    for b in backends:
-        if b == "direct":
-            hints.append("'direct': httpx + trafilatura extraction; recommended default")
-        elif b == "tavily":
-            hints.append("'tavily': Tavily extract API")
-        elif b == "browser":
-            hints.append(
-                "'browser': always use browser rendering for this call, preferring headed when available"
-            )
-    return ", ".join(hints) + "." if hints else ""
-
-
-def _search_backend_hints(backends: list[str]) -> str:
-    hints = []
-    for b in backends:
-        if b == "direct":
-            hints.append("'direct': DuckDuckGo (free)")
-        elif b == "tavily":
-            hints.append("'tavily': AI-optimized search")
-        elif b == "brave":
-            hints.append("'brave': large web index")
-        elif b == "searxng":
-            hints.append("'searxng': self-hosted metasearch")
-    return ", ".join(hints) + "." if hints else ""

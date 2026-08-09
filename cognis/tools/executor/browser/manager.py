@@ -49,6 +49,8 @@ BROWSER_DEFAULT_TIMEZONE_ID = "UTC"
 # Stage C defaults
 BROWSER_DEFAULT_AUTO_CONSENT_DELAY_MS = 800
 BROWSER_DEFAULT_HUMANIZE_INTENSITY = "low"
+BROWSER_DEFAULT_NATIVE_BOOTSTRAP_SECONDS = 15
+_NATIVE_BOOTSTRAP_MARKER = ".cognis-native-bootstrap-v1"
 SUPPORTED_HUMANIZE_INTENSITIES: tuple[str, ...] = ("off", "low", "medium", "high")
 SUPPORTED_AUTO_CONSENT_ACTIONS: tuple[str, ...] = ("accept", "reject", "off")
 
@@ -213,6 +215,8 @@ class BrowserManager:
         navigation_timeout_seconds: int = BROWSER_DEFAULT_NAVIGATION_TIMEOUT_SECONDS,
         wait_until: str = BROWSER_DEFAULT_WAIT_UNTIL,
         network_idle_after_dom_seconds: int = BROWSER_DEFAULT_NETWORK_IDLE_AFTER_DOM_SECONDS,
+        native_bootstrap_enabled: bool = True,
+        native_bootstrap_seconds: int = BROWSER_DEFAULT_NATIVE_BOOTSTRAP_SECONDS,
     ) -> None:
         self.enabled = enabled
         self.auto_install = auto_install
@@ -294,6 +298,8 @@ class BrowserManager:
             wait_until_normalized = BROWSER_DEFAULT_WAIT_UNTIL
         self.wait_until = wait_until_normalized
         self.network_idle_after_dom_seconds = max(0, int(network_idle_after_dom_seconds))
+        self.native_bootstrap_enabled = bool(native_bootstrap_enabled)
+        self.native_bootstrap_seconds = max(1, int(native_bootstrap_seconds))
 
         self._stealth: Any | None = None  # Lazily instantiated
         # Stage B: per-mode browser instances so headless and headed can run
@@ -1866,6 +1872,88 @@ class BrowserManager:
             kwargs["channel"] = self.channel
         return kwargs
 
+    def _native_chrome_executable(self) -> str | None:
+        """Resolve installed Chrome for an uninstrumented profile bootstrap."""
+
+        if self.channel != "chrome":
+            return None
+        candidates = (
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            "/opt/google/chrome/chrome" if sys.platform.startswith("linux") else None,
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if sys.platform == "darwin"
+            else None,
+            str(Path(os.environ["LOCALAPPDATA"]) / "Google/Chrome/Application/chrome.exe")
+            if sys.platform == "win32" and os.environ.get("LOCALAPPDATA")
+            else None,
+            str(Path(os.environ["PROGRAMFILES"]) / "Google/Chrome/Application/chrome.exe")
+            if sys.platform == "win32" and os.environ.get("PROGRAMFILES")
+            else None,
+        )
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return str(candidate)
+        return None
+
+    async def _bootstrap_native_profile(
+        self,
+        *,
+        user_data_dir: Path,
+        url: str,
+        display: str | None,
+    ) -> None:
+        """Warm a new site profile in ordinary Chrome before Patchright attaches."""
+
+        if not self.native_bootstrap_enabled or self.runtime != RUNTIME_PATCHRIGHT:
+            return
+        executable = self._native_chrome_executable()
+        marker = user_data_dir / _NATIVE_BOOTSTRAP_MARKER
+        if executable is None or marker.exists():
+            return
+        bootstrap_page = user_data_dir / ".cognis-native-bootstrap.html"
+        safe_url = (
+            json.dumps(url).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+        )
+        payload = (
+            f"<!doctype html><meta charset=utf-8><script>location.replace({safe_url});</script>"
+        )
+        process: asyncio.subprocess.Process | None = None
+        warmed = False
+        try:
+            descriptor = os.open(
+                bootstrap_page,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+            process = await asyncio.create_subprocess_exec(
+                executable,
+                f"--user-data-dir={user_data_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                bootstrap_page.as_uri(),
+                env=self._launch_env(display),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(process.wait(), timeout=self.native_bootstrap_seconds)
+            except TimeoutError:
+                warmed = True
+        finally:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=8)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+            bootstrap_page.unlink(missing_ok=True)
+        if warmed:
+            marker.touch(exist_ok=True)
+
     def _context_kwargs(
         self,
         *,
@@ -1878,12 +1966,11 @@ class BrowserManager:
             "viewport": {"width": self.viewport_width, "height": self.viewport_height},
             "locale": self.locale,
         }
-        timezone_id = self.timezone_id or (
-            self.default_timezone_id if settings.stealth_enabled else None
-        )
+        realistic_context = settings.stealth_enabled or self.runtime == RUNTIME_PATCHRIGHT
+        timezone_id = self.timezone_id or (self.default_timezone_id if realistic_context else None)
         if timezone_id:
             kwargs["timezone_id"] = timezone_id
-        if settings.stealth_enabled:
+        if realistic_context:
             if self.realistic_user_agent and headless is not None:
                 user_agent = self._browser_user_agents.get(headless)
                 if user_agent:
@@ -1906,6 +1993,11 @@ class BrowserManager:
         settings = settings or self._resolve_session_settings()
         if not settings.stealth_enabled:
             return None
+        if self.runtime == RUNTIME_PATCHRIGHT:
+            # Patchright already patches automation-visible browser behavior.
+            # Stacking playwright-stealth changes a profile's fingerprint after
+            # native bootstrap and is rejected by strict integrity checks.
+            return None
         if self._stealth is not None:
             return self._stealth
         try:
@@ -1922,11 +2014,6 @@ class BrowserManager:
             normalized = (evasion or "").strip()
             if normalized:
                 kwargs[normalized] = False
-        # ``init_scripts_only`` is the safer default for Patchright since
-        # Patchright already patches CDP-level leaks; layering stealth's
-        # CDP-based evasions on top can introduce inconsistencies.
-        if self.runtime == RUNTIME_PATCHRIGHT:
-            kwargs.setdefault("init_scripts_only", True)
         try:
             self._stealth = Stealth(**kwargs)
         except TypeError as exc:
@@ -2062,6 +2149,12 @@ class BrowserManager:
                 runtime_generation = self._runtime_generation
                 browser_launcher = getattr(self._playwrights[headless], self.engine)
                 launch_kwargs = self._launch_kwargs(headless=headless, display=display)
+            if not headless:
+                await self._bootstrap_native_profile(
+                    user_data_dir=user_data_dir,
+                    url=url,
+                    display=display,
+                )
             if (
                 self.channel is None
                 and settings.stealth_enabled

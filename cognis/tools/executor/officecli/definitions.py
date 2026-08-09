@@ -96,7 +96,6 @@ OFFICE_QUERY_TOOL = ToolDefinition(
         "properties": {
             **_common_source(),
             "selector": {"type": "string", "description": "OfficeCLI CSS-like selector."},
-            "limit": {"type": "integer"},
             "json": {"type": "boolean", "description": "Request JSON output. Defaults true."},
         },
         "required": ["selector"],

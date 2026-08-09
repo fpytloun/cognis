@@ -844,8 +844,10 @@ async def _handle_trigger(
     if scheduler is None:
         return ToolResult(output="Scheduler is not running.", is_error=True)
 
-    await scheduler._fire_schedule(schedule_id)
-    return ToolResult(output=f"Schedule {schedule_id} triggered.")
+    task_id = await scheduler.trigger_now(schedule_id)
+    if task_id is None:
+        return ToolResult(output=f"Schedule {schedule_id} was not triggered.")
+    return ToolResult(output=f"Schedule {schedule_id} triggered as task {task_id}.")
 
 
 async def _handle_status(

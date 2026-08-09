@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from cognis.models.config import ImageGenerationResult
+from cognis.models.config import ImageGenerationResult, ImageInput
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolResult, ToolSource
 from cognis.runtime_context import current_user_email
@@ -25,9 +25,9 @@ _SOURCE = ToolSource(type="builtin")
 IMAGE_GENERATE_TOOL = ToolDefinition(
     name="image_generate",
     description=(
-        "Generate an image from a text prompt. Returns a JSON object with "
-        "the generated image ID and URL. Use descriptive, detailed prompts "
-        "for best results."
+        "Generate an image from a text prompt, optionally using ordered image "
+        "artifacts as visual references. Describe each reference's intended use "
+        "in the prompt. Returns a JSON object with the generated image ID and URL."
     ),
     parameters={
         "type": "object",
@@ -35,6 +35,15 @@ IMAGE_GENERATE_TOOL = ToolDefinition(
             "prompt": {
                 "type": "string",
                 "description": "Detailed text description of the image to generate.",
+            },
+            "references": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+                "description": (
+                    "Optional ordered image or artifact IDs to use as visual references. "
+                    "Describe each reference's intended use in the prompt."
+                ),
             },
             "model": {
                 "type": "string",
@@ -69,9 +78,8 @@ IMAGE_GENERATE_TOOL = ToolDefinition(
 IMAGE_EDIT_TOOL = ToolDefinition(
     name="image_edit",
     description=(
-        "Edit an existing image using a text prompt. Provide one image source: "
-        "an existing image/artifact id, a remote URL, "
-        "or an inline base64 payload."
+        "Edit or combine one or more existing images using a text prompt. "
+        "Provide ordered image or artifact IDs and describe how each should be used."
     ),
     parameters={
         "type": "object",
@@ -80,24 +88,21 @@ IMAGE_EDIT_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Description of the desired changes to the image.",
             },
-            "image": {
-                "type": "string",
+            "images": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
                 "description": (
-                    "Existing image or artifact id to edit. Supports img_* generated images "
-                    "and other Cognis artifact ids when artifact storage is available."
+                    "Ordered image or artifact IDs supplied to the model. "
+                    "Describe how each image should be used in the prompt."
                 ),
             },
-            "source_artifact_id": {
+            "mask_artifact_id": {
                 "type": "string",
-                "description": "Artifact id of an existing stored image to edit.",
-            },
-            "source_url": {
-                "type": "string",
-                "description": "Remote HTTP(S) image URL to edit.",
-            },
-            "image_b64": {
-                "type": "string",
-                "description": "Inline base64-encoded image payload to edit.",
+                "description": (
+                    "Optional image mask artifact. Supported only by models/providers "
+                    "that offer masked editing."
+                ),
             },
             "model": {
                 "type": "string",
@@ -105,10 +110,19 @@ IMAGE_EDIT_TOOL = ToolDefinition(
             },
             "size": {
                 "type": "string",
-                "description": "Output image size.",
+                "description": "Output image size. Model-dependent.",
+            },
+            "quality": {
+                "type": "string",
+                "description": "Image quality. Model-dependent.",
+            },
+            "n": {
+                "type": "integer",
+                "description": "Number of images to generate (default 1).",
+                "default": 1,
             },
         },
-        "required": ["prompt"],
+        "required": ["prompt", "images"],
     },
     source=_SOURCE,
     category="image",
@@ -136,6 +150,8 @@ async def handle_image_tool(
     image_generation_provider: Any,
     artifact_store: Any | None = None,
     session_factory: Any | None = None,
+    user_email: str | None = None,
+    runtime_metadata: dict[str, Any] | None = None,
 ) -> ToolResult:
     """Handle an image generation or edit tool call.
 
@@ -143,6 +159,8 @@ async def handle_image_tool(
     available, the generated image is saved and an image_id + URL are
     returned. Otherwise, the raw base64 data is returned.
     """
+    array_argument_name = "images" if tool_name == "image_edit" else "references"
+    supplied_empty_images = arguments.get(array_argument_name) == []
     arguments = _normalize_image_arguments(tool_name, arguments)
     prompt = arguments.get("prompt", "")
     if not prompt:
@@ -152,17 +170,44 @@ async def handle_image_tool(
     size = arguments.get("size")
     quality = arguments.get("quality")
     n = arguments.get("n", 1)
-    image_b64: str | None = None
-
-    if tool_name == "image_edit":
-        try:
-            image_b64 = await _resolve_edit_source_to_b64(
-                arguments,
+    image_ids = (
+        arguments.get("images") if tool_name == "image_edit" else arguments.get("references")
+    )
+    argument_name = "images" if tool_name == "image_edit" else "references"
+    if supplied_empty_images:
+        return ToolResult(
+            output=f"Error: {argument_name} must contain at least one image artifact ID.",
+            is_error=True,
+        )
+    try:
+        images_b64 = await _resolve_image_artifacts_to_b64(
+            image_ids,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            argument_name=argument_name,
+            user_email=user_email,
+            runtime_metadata=runtime_metadata,
+        )
+        mask_artifact_id = arguments.get("mask_artifact_id")
+        mask_b64 = (
+            await _resolve_image_artifact_to_b64(
+                mask_artifact_id,
                 artifact_store=artifact_store,
                 session_factory=session_factory,
+                argument_name="mask_artifact_id",
+                user_email=user_email,
+                runtime_metadata=runtime_metadata,
             )
-        except DocumentedImageSourceError as exc:
-            return ToolResult(output=f"Error: {exc}", is_error=True)
+            if mask_artifact_id is not None
+            else None
+        )
+    except ImageSourceError as exc:
+        return ToolResult(output=f"Error: {exc}", is_error=True)
+    if image_ids is not None and not images_b64:
+        return ToolResult(
+            output=f"Error: {argument_name} must contain at least one image artifact ID.",
+            is_error=True,
+        )
 
     try:
         result: ImageGenerationResult = await image_generation_provider.image_generate(
@@ -171,7 +216,8 @@ async def handle_image_tool(
             n=n,
             size=size,
             quality=quality,
-            image=image_b64,
+            images=images_b64,
+            mask=mask_b64,
         )
     except Exception as exc:
         return ToolResult(output=f"Image generation failed: {exc}", is_error=True)
@@ -277,7 +323,20 @@ def _normalize_image_arguments(tool_name: str, arguments: dict[str, Any]) -> dic
     schema = (
         IMAGE_EDIT_TOOL.parameters if tool_name == "image_edit" else IMAGE_GENERATE_TOOL.parameters
     )
-    return strip_empty_optional_values(arguments, schema)
+    normalized = strip_empty_optional_values(arguments, schema)
+    if tool_name == "image_generate":
+        references = normalized.get("references")
+        if isinstance(references, list):
+            references = [
+                reference
+                for reference in references
+                if not isinstance(reference, str) or reference.strip()
+            ]
+            if references:
+                normalized["references"] = references
+            else:
+                normalized.pop("references", None)
+    return normalized
 
 
 def _image_filename(image_id: str, content_type: str) -> str:
@@ -307,60 +366,94 @@ async def _image_bytes(img: Any) -> bytes:
     raise ValueError("Generated image does not contain base64 data or URL")
 
 
-class DocumentedImageSourceError(ValueError):
+class ImageSourceError(ValueError):
     pass
 
 
-async def _resolve_edit_source_to_b64(
-    arguments: dict[str, Any],
+async def _resolve_image_artifacts_to_b64(
+    artifact_ids: Any,
     *,
     artifact_store: Any | None,
     session_factory: Any | None,
-) -> str:
-    source_keys = [
-        key
-        for key in ("image", "source_artifact_id", "source_url", "image_b64")
-        if arguments.get(key)
+    argument_name: str,
+    user_email: str | None,
+    runtime_metadata: dict[str, Any] | None,
+) -> list[ImageInput] | None:
+    if artifact_ids is None:
+        return None
+    if not isinstance(artifact_ids, list):
+        raise ImageSourceError(f"{argument_name} must be an array of image artifact IDs.")
+
+    return [
+        await _resolve_image_artifact_to_b64(
+            artifact_id,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            argument_name=f"{argument_name}[{index}]",
+            user_email=user_email,
+            runtime_metadata=runtime_metadata,
+        )
+        for index, artifact_id in enumerate(artifact_ids)
     ]
-    if arguments.get("source_path"):
-        raise DocumentedImageSourceError(
-            "Local source_path is not supported for image_edit because image tools run on the controller. "
-            "Publish the file first with artifact_publish, then use source_artifact_id."
-        )
-    if len(source_keys) != 1:
-        raise DocumentedImageSourceError(
-            "Provide exactly one image source: image, source_artifact_id, source_url, or image_b64."
-        )
-    key = source_keys[0]
-    value = str(arguments[key])
-    if key == "image_b64":
-        return value
-    if key == "source_url":
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(value)
-            response.raise_for_status()
-            return _encode_b64(response.content)
+
+
+async def _resolve_image_artifact_to_b64(
+    artifact_id: Any,
+    *,
+    artifact_store: Any | None,
+    session_factory: Any | None,
+    argument_name: str,
+    user_email: str | None,
+    runtime_metadata: dict[str, Any] | None,
+) -> ImageInput:
+    if not isinstance(artifact_id, str) or not artifact_id:
+        raise ImageSourceError(f"{argument_name} must be an image artifact ID.")
     if artifact_store is None:
-        raise DocumentedImageSourceError("artifact store not available for image resolution.")
-    if key == "image" and value.startswith("img_"):
+        raise ImageSourceError("Artifact store not available for image resolution.")
+    if artifact_id.startswith("tool_artifact:"):
+        if session_factory is None:
+            raise ImageSourceError(
+                f"{argument_name} requires database access for lazy artifact references."
+            )
+        from cognis.tools.builtin.artifact_tools import materialize_tool_artifact_ref
+
+        resolved = await materialize_tool_artifact_ref(
+            artifact_id,
+            artifact_store=artifact_store,
+            session_factory=session_factory,
+            user_email=user_email,
+            runtime_metadata=runtime_metadata,
+        )
+        if resolved.is_error:
+            raise ImageSourceError(resolved.output)
+        resolved_artifact_id = str((resolved.metadata or {}).get("artifact_id") or "")
+        if not resolved_artifact_id:
+            raise ImageSourceError(f"{argument_name} could not resolve {artifact_id}.")
+        artifact_id = resolved_artifact_id
+    if artifact_id.startswith("img_"):
         try:
-            content, _ct = await artifact_store.async_load("images", value, "image")
+            content, content_type = await artifact_store.async_load("images", artifact_id, "image")
         except FileNotFoundError as exc:
-            raise DocumentedImageSourceError(f"image {value} not found.") from exc
-        return _encode_b64(content)
-    artifact_id = value if key == "image" else str(arguments["source_artifact_id"])
+            raise ImageSourceError(f"{argument_name} image {artifact_id} not found.") from exc
+        if not content_type.startswith("image/"):
+            raise ImageSourceError(f"{argument_name} must be an image artifact ID.")
+        return ImageInput(b64_json=_encode_b64(content), content_type=content_type)
     if session_factory is None:
-        raise DocumentedImageSourceError(
-            "artifact resolution requires database access for non-image artifact ids."
+        raise ImageSourceError(
+            f"{argument_name} requires database access for non-image artifact IDs."
         )
     from cognis.store.queries import get_artifact_record
 
     async with session_factory() as session:
         row = await get_artifact_record(session, artifact_id)
     if row is None or row.status == "deleted":
-        raise DocumentedImageSourceError(f"artifact {artifact_id} not found.")
-    content, _ct = await artifact_store.async_load(row.namespace, row.object_id, row.filename)
-    return _encode_b64(content)
+        raise ImageSourceError(f"{argument_name} artifact {artifact_id} not found.")
+    content, content_type = await artifact_store.async_load(
+        row.namespace, row.object_id, row.filename
+    )
+    if not content_type.startswith("image/"):
+        raise ImageSourceError(f"{argument_name} must be an image artifact ID.")
+    return ImageInput(b64_json=_encode_b64(content), content_type=content_type)
 
 
 def _encode_b64(content: bytes) -> str:

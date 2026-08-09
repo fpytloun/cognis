@@ -35,6 +35,7 @@ _MAX_READ_OUTPUT_CHARS = 50_000
 _MAX_INLINE_BINARY_READ_BYTES = 10 * 1024 * 1024
 _MAX_FORMATTER_DIFF_CHARS = 2000
 _TEXTUAL_BINARY_MIME_TYPES = {"image/svg+xml"}
+_TEXTUAL_SOURCE_SUFFIXES = {".ts", ".tsx", ".mts", ".cts"}
 
 
 def _resolve_path(raw: str, context: ToolExecutionContext) -> Path:
@@ -665,14 +666,21 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
 
 
 def _should_route_binary_read(path: Path, content: bytes, mime_type: str) -> bool:
+    if b"\x00" in content:
+        return True
+    if path.suffix.lower() in _TEXTUAL_SOURCE_SUFFIXES:
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            return False
     normalized_mime = mime_type.lower()
     if normalized_mime in _TEXTUAL_BINARY_MIME_TYPES:
         return False
     if normalized_mime.startswith(("image/", "audio/", "video/")):
         return True
     if normalized_mime == "application/pdf":
-        return True
-    if b"\x00" in content:
         return True
     suffix = path.suffix.lower()
     return suffix in {

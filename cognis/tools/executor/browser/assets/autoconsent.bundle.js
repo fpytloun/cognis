@@ -41,6 +41,32 @@
 
   const delayMs = Math.max(0, Math.min(15000, Number(cfg.delayMs) || 800));
 
+  // Some CMPs render their controls in closed shadow roots. Keep only
+  // consent-shaped hosts inspectable so generic rules can reach them without
+  // opening unrelated application components.
+  const nativeAttachShadow = Element.prototype.attachShadow;
+  function consentAttachShadow(init) {
+    const marker = normalizeText([
+      this.tagName,
+      this.id,
+      typeof this.className === "string" ? this.className : "",
+      this.getAttribute && this.getAttribute("role"),
+      this.getAttribute && this.getAttribute("aria-label"),
+    ].filter(Boolean).join(" "));
+    if (/(cmp|consent|cookie|privacy)/.test(marker)) {
+      init = Object.assign({}, init, { mode: "open" });
+    }
+    return nativeAttachShadow.call(this, init);
+  }
+  Element.prototype.attachShadow = consentAttachShadow;
+  let attemptRoots = null;
+
+  function restoreAttachShadow() {
+    if (Element.prototype.attachShadow === consentAttachShadow) {
+      Element.prototype.attachShadow = nativeAttachShadow;
+    }
+  }
+
   // Per-CMP rules. Order matters: most specific first, most generic last.
   // Each rule has:
   //   name:     CMP identifier (logged on success)
@@ -162,7 +188,7 @@
   }
 
   function clickIfVisible(selector) {
-    const nodes = document.querySelectorAll(selector);
+    const nodes = queryAllDeep(selector);
     for (const node of nodes) {
       if (isVisible(node)) {
         try {
@@ -178,7 +204,7 @@
   }
 
   function tryRule(rule) {
-    const detector = document.querySelector(rule.detect);
+    const detector = queryOneDeep(rule.detect);
     if (!detector || !isVisible(detector)) return false;
     const targets = (action === "accept" ? rule.accept : rule.reject) || [];
     if (!targets.length) return false;
@@ -203,6 +229,35 @@
       .replace(/\s+/g, " ")
       .trim()
       .toLowerCase();
+  }
+
+  function rootsDeep() {
+    if (attemptRoots) return attemptRoots;
+    const roots = [document];
+    for (let index = 0; index < roots.length; index += 1) {
+      const root = roots[index];
+      for (const element of root.querySelectorAll("*")) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+      }
+    }
+    attemptRoots = roots;
+    return attemptRoots;
+  }
+
+  function queryAllDeep(selector) {
+    const nodes = [];
+    for (const root of rootsDeep()) {
+      nodes.push(...root.querySelectorAll(selector));
+    }
+    return nodes;
+  }
+
+  function queryOneDeep(selector) {
+    for (const root of rootsDeep()) {
+      const node = root.querySelector(selector);
+      if (node) return node;
+    }
+    return null;
   }
 
   function elementText(el) {
@@ -234,7 +289,7 @@
     "rozumim a souhlasim", "souhlasim", "prijmout vse", "prijmout vsechny", "povolit vse", "pokracovat", "rozumim",
     "suhlasim", "prijat vsetko", "prijat vsetky", "povolit vsetko",
     "akceptuj wszystko", "zaakceptuj wszystkie", "zgadzam sie", "zgoda", "zezwol na wszystko",
-    "alle akzeptieren", "akzeptieren", "zustimmen", "ich stimme zu", "alle zulassen",
+    "alle akzeptieren", "akzeptieren", "zustimmen", "ich stimme zu", "einverstanden", "alle zulassen",
     "tout accepter", "accepter", "j accepte", "autoriser tout",
     "aceptar todo", "aceptar", "estoy de acuerdo", "permitir todo",
     "aceitar tudo", "aceitar", "concordo", "permitir tudo",
@@ -269,6 +324,7 @@
     "privacy policy", "privacy & cookies", "privacy and cookies", "cookie policy",
     "third party cookie", "social media cookies", "terms", "legal", "support",
     "documentation", "learn more", "more info", "read more",
+    "cookie-erklarung", "cookie erklarung",
   ];
 
   function isLegalOrNavigationCandidate(el, label) {
@@ -296,7 +352,7 @@
   // is likely present.
   function heuristicFallback() {
     const banners = [];
-    for (const el of document.querySelectorAll("div, section, aside, dialog, [role='dialog'], [aria-modal='true']")) {
+    for (const el of queryAllDeep("div, section, aside, dialog, [role='dialog'], [aria-modal='true']")) {
       if (!isVisible(el)) continue;
       const style = window.getComputedStyle(el);
       const rect = el.getBoundingClientRect();
@@ -337,7 +393,7 @@
   }
 
   function removeConsentBackdrops() {
-    for (const el of document.querySelectorAll("div, section, aside, dialog, [role='dialog'], [aria-modal='true']")) {
+    for (const el of queryAllDeep("div, section, aside, dialog, [role='dialog'], [aria-modal='true']")) {
       if (!isVisible(el)) continue;
       const style = window.getComputedStyle(el);
       if (style.position !== "fixed" && style.position !== "sticky" && style.position !== "absolute") continue;
@@ -384,11 +440,13 @@
 
   function cleanupAfterClick() {
     if (!clickedCookieBannerRecently()) return;
+    restoreAttachShadow();
     setTimeout(removeConsentBackdrops, 250);
     setTimeout(removeConsentBackdrops, 1000);
   }
 
   function attempt() {
+    attemptRoots = null;
     for (const rule of RULES) {
       if (tryRule(rule)) {
         cleanupAfterClick();
@@ -410,6 +468,8 @@
       if (attempt()) return;
       if (Date.now() < deadline && attempts < 20) {
         setTimeout(tick, 400);
+      } else {
+        restoreAttachShadow();
       }
     };
     setTimeout(tick, delayMs);

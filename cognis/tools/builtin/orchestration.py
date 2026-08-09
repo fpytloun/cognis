@@ -18,6 +18,7 @@ import logging
 from enum import StrEnum
 from typing import Any
 
+from cognis.channels.constants import MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS
 from cognis.core.agent_profiles import (
     normalize_agent_profile_id,
     resolve_agent_profile,
@@ -48,11 +49,13 @@ class OrchestrationMode(StrEnum):
     """Controls which orchestration tools are available in a given context.
 
     FULL: Main interactive session — all tools available.
-    DELEGATE_SYNC_ONLY: Task step — only sync delegate allowed.
+    TASK_PRIMARY: Primary task step — sync delegate plus restricted managed conversations.
+    DELEGATE_SYNC_ONLY: Restricted task step — only sync delegate allowed.
     NONE: Sub-session — no orchestration tools.
     """
 
     FULL = "full"
+    TASK_PRIMARY = "task_primary"
     DELEGATE_SYNC_ONLY = "delegate_sync_only"
     NONE = "none"
 
@@ -79,6 +82,11 @@ TASK_TOOL_NAMES = {
     "cancel_task",
     "retry_task",
     "resolve_task_pause",
+    "add_task_note",
+    "add_task_context",
+    "pause_task",
+    "resume_task",
+    "request_task_revision",
 }
 WORKFLOW_TOOL_NAMES = {
     "list_workflows",
@@ -91,6 +99,7 @@ WORKFLOW_TOOL_NAMES = {
 COMPOSITION_TOOL_NAMES = {"compose_and_run_workflow"}
 MANAGED_CONVERSATION_TOOL_NAMES = {
     "agent_conversation_create",
+    "agent_conversation_create_channel",
     "agent_conversation_send",
     "agent_conversation_set_profile",
     "agent_conversation_wait",
@@ -100,6 +109,9 @@ MANAGED_CONVERSATION_TOOL_NAMES = {
     "agent_conversation_close",
     "agent_conversation_list",
     "agent_conversation_get",
+    "agent_conversation_take_ownership",
+    "agent_conversation_send_controller",
+    "agent_conversation_complete",
 }
 ORCHESTRATION_TOOL_NAMES = (
     SUBSESSION_TOOL_NAMES
@@ -123,11 +135,14 @@ DELEGATE_TOOL = ToolDefinition(
         "agent_id is required and must identify an eligible secondary specialist "
         "from the current caller-scoped target catalog. Use managed conversations "
         "for primary user agents.\n\n"
-        "Before creating a fresh child, inspect existing sub-sessions. If one already "
-        "owns the same problem and has relevant context, use follow_up_subsession for "
-        "the same line of work or fork_subsession for an independent branch from that "
-        "context. Start fresh only for genuinely new scope, deliberate independence, "
-        "incompatible execution requirements, or demonstrably stale/polluted context. "
+        "Before creating a fresh child, inspect existing sub-sessions. Reuse or fork a "
+        "child only when the same problem, specialist role, tool/authority scope, and "
+        "expected output remain compatible. Follow-up and fork preserve the source "
+        "child's agent identity and capabilities; they do not change specialist. For "
+        "the same compatible line of work, use follow_up_subsession; use "
+        "fork_subsession for an independent branch. Start fresh with the appropriate "
+        "specialist when the next work needs a different role, tools, authority, or "
+        "output contract. "
         "This applies to implementation, research, debugging, review, and other delegated "
         "work—not only code review.\n\n"
         "## Wait behavior\n\n"
@@ -305,9 +320,10 @@ FOLLOW_UP_SUBSESSION_TOOL = ToolDefinition(
     description=(
         "Send a new instruction using a terminal delegate child's full prior context. "
         "Creates a derived child because delegate history and results are immutable. "
-        "Prefer this over a fresh delegate when continuing the same problem, correcting "
-        "prior work, requesting deeper analysis, or rechecking a result with context "
-        "that remains relevant."
+        "Prefer this over a fresh delegate only when continuing the same compatible "
+        "problem, specialist role, tool/authority scope, and output contract. It "
+        "preserves the source child's agent identity and capabilities; use a fresh "
+        "delegate when the next work needs a different specialist."
     ),
     parameters={
         "type": "object",
@@ -327,9 +343,11 @@ FORK_SUBSESSION_TOOL = ToolDefinition(
     description=(
         "Branch from a terminal delegate child's full prior context with a new "
         "instruction. Creates an independent derived child while preserving lineage. "
-        "Use this when the prior context is relevant but the new work should explore an "
+        "Use this only when the prior child's specialist role, tool/authority scope, "
+        "and output contract remain compatible, but the work should explore an "
         "alternative, obtain an independent branch, or proceed without changing the "
-        "original continuation line."
+        "original continuation line. It preserves the source child's agent identity "
+        "and capabilities; use a fresh delegate to change specialist."
     ),
     parameters={
         "type": "object",
@@ -612,6 +630,72 @@ CANCEL_TASK_TOOL = ToolDefinition(
 )
 
 
+def _task_control_mutation_tool(
+    name: str,
+    description: str,
+    *,
+    extra_properties: dict[str, Any] | None = None,
+    required: list[str] | None = None,
+) -> ToolDefinition:
+    properties: dict[str, Any] = {
+        "task_id": {"type": "string", "description": "Owning task ID."},
+        "expected_attempt": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Current task attempt from refreshed control context.",
+        },
+    }
+    properties.update(extra_properties or {})
+    return ToolDefinition(
+        name=name,
+        description=description,
+        parameters={
+            "type": "object",
+            "properties": properties,
+            "required": ["task_id", "expected_attempt", *(required or [])],
+        },
+        source=ToolSource(type="builtin"),
+        category="orchestration",
+        read_only=False,
+    )
+
+
+ADD_TASK_NOTE_TOOL = _task_control_mutation_tool(
+    "add_task_note",
+    "Add a durable record-only note to the task without changing execution.",
+    extra_properties={"body": {"type": "string", "minLength": 1}},
+    required=["body"],
+)
+
+ADD_TASK_CONTEXT_TOOL = _task_control_mutation_tool(
+    "add_task_context",
+    "Add agreed context for the running task to consume at its next safe boundary.",
+    extra_properties={
+        "body": {"type": "string", "minLength": 1},
+        "target_step": {"type": "string"},
+    },
+    required=["body"],
+)
+
+PAUSE_TASK_TOOL = _task_control_mutation_tool(
+    "pause_task",
+    "Cooperatively pause the owning running task.",
+)
+RESUME_TASK_TOOL = _task_control_mutation_tool(
+    "resume_task",
+    "Resume the owning paused task when it is not waiting for a gate or question.",
+)
+REQUEST_TASK_REVISION_TOOL = _task_control_mutation_tool(
+    "request_task_revision",
+    "Request an in-place task revision from an optional workflow step.",
+    extra_properties={
+        "instruction": {"type": "string", "minLength": 1},
+        "target_step": {"type": "string"},
+    },
+    required=["instruction"],
+)
+
+
 GET_TASK_OUTPUT_TOOL = ToolDefinition(
     name="get_task_output",
     description=(
@@ -793,6 +877,11 @@ _ALL_TASK_TOOLS = [
     CANCEL_TASK_TOOL,
     RETRY_TASK_TOOL,
     RESOLVE_TASK_PAUSE_TOOL,
+    ADD_TASK_NOTE_TOOL,
+    ADD_TASK_CONTEXT_TOOL,
+    PAUSE_TASK_TOOL,
+    RESUME_TASK_TOOL,
+    REQUEST_TASK_REVISION_TOOL,
 ]
 
 _CHAT_MODE_PROPERTY = {
@@ -818,7 +907,12 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
         "Treat the new conversation as an isolated context. For substantial work, "
         "initial_message should include a proportional contract: objective, confirmed "
         "context/references, scope and non-goals, acceptance/verification, and required "
-        "return status/evidence. Do not force rediscovery of known context. "
+        "return status/evidence. It must also state `Working mode: execute` or "
+        "`Working mode: coordinate`. Execute means the target completes the assigned "
+        "core work in that conversation and does not split or delegate it; bounded "
+        "exploration, research, consultation, or independent review is still allowed. "
+        "Coordinate permits decomposition into independent workstreams while retaining "
+        "integration and acceptance ownership. Do not force rediscovery of known context. "
         "With wait=false, this is "
         "fire-and-follow-up: after starting the managed turn, do "
         "not continue the same scoped work in parallel; finish the parent turn unless "
@@ -858,6 +952,11 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
                     "managed conversation."
                 ),
             },
+            "artifact_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+            },
             "wait": {
                 "type": "boolean",
                 "description": (
@@ -882,6 +981,51 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
     ],
 )
 
+AGENT_CONVERSATION_CREATE_CHANNEL_TOOL = ToolDefinition(
+    name="agent_conversation_create_channel",
+    description=(
+        "Create a managed external-channel conversation for one opaque observed target. "
+        "The objective, target identity, expiry, and tool allowlist are immutable."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target_ref": {"type": "string"},
+            "agent_id": {"type": "string"},
+            "agent_profile_id": {"type": "string"},
+            "title": {"type": "string"},
+            "objective": {
+                "type": "string",
+                "maxLength": MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS,
+            },
+            "initial_message": {"type": "string"},
+            "artifact_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
+            },
+            "allowed_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "uniqueItems": True,
+            },
+            "expires_at": {"type": "string", "format": "date-time"},
+        },
+        "required": [
+            "target_ref",
+            "agent_id",
+            "objective",
+            "initial_message",
+            "allowed_tools",
+            "expires_at",
+        ],
+        "additionalProperties": False,
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
 AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
     name="agent_conversation_send",
     description=(
@@ -890,7 +1034,9 @@ AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
         "conversation, including plan/debug to implementation handoffs with "
         'chat_mode="build". Reuse context the target already owns: send the new '
         "instruction and changed context, decisions, or acceptance criteria rather than "
-        "repeating stable history. With wait=false, this is fire-and-follow-up: do not "
+        "repeating stable history. Managed conversations never queue controller messages: "
+        "when work is active, wait for it to finish or interrupt it before sending another "
+        "message. With wait=false, this is fire-and-follow-up: do not "
         "continue the same scoped work in parallel after sending; finish the parent "
         "turn unless independent work can safely proceed. The parent conversation "
         "will be resumed or notified when the managed turn finishes."
@@ -904,6 +1050,11 @@ AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
                 "description": (
                     "New instruction plus the context delta needed for this continuation."
                 ),
+            },
+            "artifact_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 10,
             },
             "wait": {
                 "type": "boolean",
@@ -1062,6 +1213,11 @@ AGENT_CONVERSATION_LIST_TOOL = ToolDefinition(
         "type": "object",
         "properties": {
             "status": {"type": "string", "description": "Optional state filter, or all."},
+            "kind": {
+                "type": "string",
+                "enum": ["agent", "channel"],
+                "default": "agent",
+            },
             "limit": {"type": "integer", "default": 25},
         },
     },
@@ -1085,8 +1241,66 @@ AGENT_CONVERSATION_GET_TOOL = ToolDefinition(
     read_only=True,
 )
 
+AGENT_CONVERSATION_TAKE_OWNERSHIP_TOOL = ToolDefinition(
+    name="agent_conversation_take_ownership",
+    description=(
+        "Take control of an idle or waiting managed channel conversation. "
+        "The expected owner epoch provides compare-and-swap protection."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string"},
+            "expected_owner_epoch": {"type": "integer", "minimum": 1},
+        },
+        "required": ["conversation_id", "expected_owner_epoch"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_SEND_CONTROLLER_TOOL = ToolDefinition(
+    name="agent_conversation_send_controller",
+    description=(
+        "Send an explicit signal from a managed channel child to its controller. "
+        "With wait=true, stop after the signal and wait for a private controller instruction."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "message": {"type": "string"},
+            "wait": {"type": "boolean", "default": False},
+        },
+        "required": ["message", "wait"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+AGENT_CONVERSATION_COMPLETE_TOOL = ToolDefinition(
+    name="agent_conversation_complete",
+    description="Explicitly complete a managed channel conversation.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["completed", "cancelled", "failed"],
+            },
+            "summary": {"type": "string"},
+        },
+        "required": ["status"],
+    },
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
 _ALL_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_CREATE_TOOL,
+    AGENT_CONVERSATION_CREATE_CHANNEL_TOOL,
     AGENT_CONVERSATION_SEND_TOOL,
     AGENT_CONVERSATION_SET_PROFILE_TOOL,
     AGENT_CONVERSATION_WAIT_TOOL,
@@ -1096,6 +1310,9 @@ _ALL_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_CLOSE_TOOL,
     AGENT_CONVERSATION_LIST_TOOL,
     AGENT_CONVERSATION_GET_TOOL,
+    AGENT_CONVERSATION_TAKE_OWNERSHIP_TOOL,
+    AGENT_CONVERSATION_SEND_CONTROLLER_TOOL,
+    AGENT_CONVERSATION_COMPLETE_TOOL,
 ]
 
 
@@ -1106,8 +1323,8 @@ _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
         "needs a visible, inspectable, iterative agent session rather than a terminal "
         "delegate result or a structured workflow task. Target agent IDs must be "
         "primary/user agents; use delegate() for system specialist agents (`system:*`) "
-        "available in this agent session. Not available in tasks. On this conversation "
-        "surface, the started managed turn is joined before returning."
+        "available in this agent session. On restricted task surfaces, the child is linked "
+        "to the active step. The started managed turn is joined before returning."
     ),
     "agent_conversation_send": (
         "Send a new turn into an existing managed agent conversation. On this "
@@ -1182,6 +1399,12 @@ _SYNC_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_GET_TOOL,
 ]
 
+_TASK_PRIMARY_MANAGED_CONVERSATION_TOOLS = [
+    tool
+    for tool in _SYNC_MANAGED_CONVERSATION_TOOLS
+    if tool.name != "agent_conversation_set_profile"
+]
+
 
 LIST_WORKFLOWS_TOOL = ToolDefinition(
     name="list_workflows",
@@ -1208,6 +1431,162 @@ GET_WORKFLOW_TOOL = ToolDefinition(
     read_only=True,
 )
 
+_WORKFLOW_STEPS_DESCRIPTION = (
+    "Workflow step definitions. Existing run/gate definitions remain supported. Deterministic "
+    "steps use type tool_call, condition, or complete and exactly one same-named config. They may "
+    "use when, on_skip, on_error, and next, but cannot use agent, input, completion, review, "
+    "question, or outcome-route fields. Expressions are constrained Jinja and must produce strict "
+    "booleans. Named targets must exist and deterministic jump cycles are rejected. Run steps "
+    "can compose a concise contract with objective, responsibilities, and defer_to. Example: "
+    '{"name":"implement","type":"run","objective":"Implement the approved change.",'
+    '"responsibilities":["Edit code","Run focused tests"],"defer_to":["review","commit"]}. '
+    'Condition example: {"name":"has_items","type":"condition","condition":{"if":"{{ '
+    'steps.fetch.outputs.items | length > 0 }}","then":"respond","else":"done"}}.'
+)
+_WORKFLOW_STEP_AUTHORING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "type": {
+            "type": "string",
+            "enum": ["run", "gate", "tool_call", "condition", "complete"],
+        },
+        "description": {"type": "string"},
+        "prompt": {"type": "string"},
+        "objective": {"type": "string", "minLength": 1},
+        "responsibilities": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "defer_to": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "input": {
+            "oneOf": [
+                {"type": "object"},
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+            ]
+        },
+        "completion": {"type": "object"},
+        "agent_override": {"type": "string"},
+        "agent_profile_id": {"type": "string"},
+        "reasoning_effort": {"type": "string"},
+        "allow_questions": {"type": "boolean"},
+        "step_profile_id": {"type": "string"},
+        "step_profile_mode": {"type": "string", "enum": ["soft", "hard"]},
+        "step_profile": {"type": "object"},
+        "gate": {"type": "object"},
+        "on_reject": {"type": "object"},
+        "outcome_routes": {"type": "array", "items": {"type": "object"}},
+        "require_deliverable": {"type": "boolean"},
+        "revision": {"type": "object"},
+        "metadata_contract": {"type": "object"},
+        "when": {"type": "string", "minLength": 1},
+        "on_skip": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "minLength": 1},
+                "content": {"type": "string"},
+                "outputs": {"type": "object"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+        "on_error": {"type": "string", "enum": ["fail", "continue", "skip", "gate"]},
+        "next": {"type": "string", "minLength": 1},
+        "tool_call": {
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "minLength": 1},
+                "args": {"type": "object"},
+                "summary": {"type": "string"},
+                "outputs": {"type": "object"},
+                "fail_on_error": {"type": "boolean"},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+                "allow_side_effects": {"type": "boolean"},
+                "redact_args": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["tool"],
+            "additionalProperties": False,
+        },
+        "condition": {
+            "type": "object",
+            "properties": {
+                "if": {"type": "string", "minLength": 1},
+                "then": {"type": "string", "minLength": 1},
+                "else": {"type": "string", "minLength": 1},
+                "output": {"type": "object"},
+                "revision_source": {"type": "string", "minLength": 1},
+                "max_loop_iterations": {"type": "integer", "minimum": 1, "maximum": 100},
+                "on_exhausted": {
+                    "type": "string",
+                    "enum": ["continue", "fail", "gate"],
+                },
+            },
+            "required": ["if"],
+            "additionalProperties": False,
+        },
+        "complete": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["completed", "failed"]},
+                "summary": {"type": "string", "minLength": 1},
+                "content": {"type": "string"},
+                "outputs": {"type": "object"},
+                "notification": {"type": "object"},
+                "delivery_mode_override": {
+                    "type": "string",
+                    "enum": [
+                        "same_conversation",
+                        "preferred_channel",
+                        "latest_active_for_agent",
+                        "specific_conversation",
+                        "silent",
+                    ],
+                },
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["name", "type"],
+}
+
+_WORKFLOW_PRESENTATION_AUTHORING_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Optional user-facing phase grouping. Phases must cover every step exactly once, "
+        "in canonical contiguous step order."
+    ),
+    "properties": {
+        "phases": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "title": {"type": "string", "minLength": 1},
+                    "description": {"type": "string"},
+                    "step_names": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+                "required": ["id", "title", "step_names"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["phases"],
+    "additionalProperties": False,
+}
+
+
 CREATE_WORKFLOW_TOOL = ToolDefinition(
     name="create_workflow",
     description="Create a new user-owned workflow definition.",
@@ -1222,14 +1601,11 @@ CREATE_WORKFLOW_TOOL = ToolDefinition(
             "tags": {"type": "array", "items": {"type": "string"}},
             "interaction": {"type": "object", "description": "Workflow interaction config."},
             "defaults": {"type": "object", "description": "Default workflow completion config."},
+            "presentation": _WORKFLOW_PRESENTATION_AUTHORING_SCHEMA,
             "steps": {
                 "type": "array",
-                "items": {"type": "object"},
-                "description": (
-                    "Workflow step definitions. Run steps should usually include step_profile_id, "
-                    "may set step_profile_mode, and may include inline step_profile with tool_overrides "
-                    "and allow_tool_search."
-                ),
+                "items": _WORKFLOW_STEP_AUTHORING_SCHEMA,
+                "description": _WORKFLOW_STEPS_DESCRIPTION,
             },
         },
         "required": ["name", "steps"],
@@ -1253,14 +1629,11 @@ UPDATE_WORKFLOW_TOOL = ToolDefinition(
             "tags": {"type": "array", "items": {"type": "string"}},
             "interaction": {"type": "object"},
             "defaults": {"type": "object"},
+            "presentation": _WORKFLOW_PRESENTATION_AUTHORING_SCHEMA,
             "steps": {
                 "type": "array",
-                "items": {"type": "object"},
-                "description": (
-                    "Workflow step definitions. Run steps should usually include step_profile_id, "
-                    "may set step_profile_mode, and may include inline step_profile with tool_overrides "
-                    "and allow_tool_search."
-                ),
+                "items": _WORKFLOW_STEP_AUTHORING_SCHEMA,
+                "description": _WORKFLOW_STEPS_DESCRIPTION,
             },
         },
         "required": ["workflow_id"],
@@ -1310,14 +1683,15 @@ _ALL_WORKFLOW_TOOLS = [
 COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
     name="compose_and_run_workflow",
     description=(
-        "Compose a proportional workflow from the current request, optionally reusing or "
-        "adapting an existing workflow, and immediately create a task or schedule from it. "
-        "Use this rarely: only when the work needs custom multi-step structure, strict "
-        "deliverables, or an adapted reusable workflow. For ordinary timed or recurring "
-        "tasks, use manage_schedules instead. When creating a task, omit agent_id for "
-        "normal workflow ownership by the current/main agent; system:* specialist "
-        "agents should execute workflow steps or delegated sub-sessions, not own the "
-        "persistent task."
+        "Advanced, rare operation: compose or adapt a custom multi-step workflow, then "
+        "create a task or schedule from that custom workflow. Use only when no existing "
+        "workflow can express the required step structure, evaluation, deliverables, or "
+        "gates. Do not use for ordinary one-off work, ordinary recurring or timed work, "
+        "or to create and immediately trigger a schedule. Use create_task for one-off "
+        "work and manage_schedules for normal schedules, including schedules that use "
+        "system:general-task. When creating a task here, omit agent_id for normal "
+        "workflow ownership by the current/main agent; system:* specialists execute "
+        "steps or delegated sub-sessions and must not own the persistent task."
     ),
     parameters={
         "type": "object",
@@ -1333,7 +1707,11 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
             "template_hints": {"type": "array", "items": {"type": "string"}},
             "base_workflow_id": {
                 "type": "string",
-                "description": "Explicit base workflow to reuse or adapt.",
+                "description": (
+                    "Base workflow to adapt when custom structural changes are required. "
+                    "To use an existing workflow unchanged, call create_task or "
+                    "manage_schedules instead."
+                ),
             },
             "decompose_skills": {
                 "type": "string",
@@ -1342,7 +1720,10 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
             },
             "schedule": {
                 "type": "object",
-                "description": "Optional schedule definition. When present, the composed workflow becomes persistent.",
+                "description": (
+                    "Optional schedule for the newly composed custom workflow. Do not use "
+                    "this field for ordinary schedule creation; use manage_schedules."
+                ),
                 "properties": {
                     "name": {"type": "string"},
                     "description": {"type": "string"},
@@ -1546,11 +1927,14 @@ def orchestration_tools(
 
     FULL: Sub-session tools plus optional managed-conversation, task, and
     workflow tools according to the conversation-surface policy.
-    DELEGATE_SYNC_ONLY: Only sync delegate (task workflow steps).
+    TASK_PRIMARY: Sync delegate plus task-owned managed-conversation controls.
+    DELEGATE_SYNC_ONLY: Only sync delegate.
     NONE: No orchestration tools (sub-sessions).
     """
     if mode == OrchestrationMode.NONE:
         return []
+    if mode == OrchestrationMode.TASK_PRIMARY:
+        return [_DELEGATE_SYNC_TOOL, *_TASK_PRIMARY_MANAGED_CONVERSATION_TOOLS]
     if mode == OrchestrationMode.DELEGATE_SYNC_ONLY:
         return [_DELEGATE_SYNC_TOOL]
     # FULL mode. The delegate schema and managed-conversation tools can be

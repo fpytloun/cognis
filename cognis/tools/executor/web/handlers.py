@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
+import random
 import re
 from datetime import date
 from typing import Any
@@ -22,7 +25,12 @@ from cognis.tools.executor.web.concurrency import (
     get_or_create_controller,
     host_for,
 )
+from cognis.tools.executor.web.semantic_quality import STATUS_RANKS
 from cognis.tools.registry import ToolExecutionContext
+
+_DIRECT_SEARCH_MAX_ATTEMPTS = 3
+_DIRECT_SEARCH_RETRY_BASE_SECONDS = 0.5
+_RETRYABLE_DIRECT_SEARCH_FAILURES = {"blocked", "network", "rate_limited", "timeout"}
 
 logger = logging.getLogger(__name__)
 
@@ -75,20 +83,16 @@ def _collect_optional_options(arguments: dict[str, Any], keys: tuple[str, ...]) 
         if key not in arguments:
             continue
         value = _normalize_optional_web_value(arguments[key])
+        if (
+            key == "time_range"
+            and isinstance(value, str)
+            and value.strip().lower() in {"any", "all", "none"}
+        ):
+            value = None
         if value is None:
             continue
         options[key] = value
     return options
-
-
-def _selected_search_backend(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
-    backend = arguments.get("backend")
-    if isinstance(backend, str) and backend:
-        return backend
-    configured = context.runtime_metadata.get("web_search_backend") or (
-        context.runtime_metadata.get("web_backend", "direct")
-    )
-    return configured if isinstance(configured, str) and configured else "direct"
 
 
 def _concurrency_controller(context: ToolExecutionContext) -> WebConcurrencyController:
@@ -122,9 +126,23 @@ def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
     """Return True when ``result`` looks like a transient/blocked failure
     that browser fallback can usually overcome."""
     metadata = result.metadata or {}
+    if metadata.get("browser_fallback_recommended") is False:
+        return False
+    if metadata.get("browser_fallback_recommended") is True:
+        return True
     if _looks_like_blocked_empty_extraction(metadata):
         return True
     if metadata.get("direct_fetch_blocked") or metadata.get("direct_fetch_block_signal"):
+        return True
+    if metadata.get("failure_category") in {
+        "timeout",
+        "network",
+        "blocked",
+        "rate_limited",
+    }:
+        return True
+    quality = _result_semantic_quality(result)
+    if quality and quality.get("status") != "complete":
         return True
     if not result.is_error:
         return False
@@ -132,6 +150,66 @@ def _result_is_browser_fallback_candidate(result: ToolResult) -> bool:
         return True
     output = (result.output or "").lower()
     return any(token in output for token in _BROWSER_FALLBACK_HINT_TOKENS)
+
+
+def _result_semantic_quality(result: ToolResult) -> dict[str, Any] | None:
+    document = (result.metadata or {}).get("extracted_document")
+    quality = document.get("semantic_quality") if isinstance(document, dict) else None
+    return quality if isinstance(quality, dict) else None
+
+
+def _result_quality_key(result: ToolResult, index: int = 0) -> tuple[int, float, int]:
+    quality = _result_semantic_quality(result) or {
+        "status": "unavailable"
+        if result.is_error
+        else ("empty" if not result.output.strip() else "partial"),
+        "score": 0.0 if result.is_error else min(float(len(result.output)), 100.0),
+    }
+    status = str(quality.get("status") or "unavailable")
+    try:
+        score = float(quality.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return STATUS_RANKS.get(status, 0), score, -index
+
+
+def _annotate_fallback_comparison(
+    selected: ToolResult,
+    primary: ToolResult,
+    fallback: ToolResult,
+    *,
+    mode: str,
+    attempted: list[str],
+    selected_backend: str,
+) -> ToolResult:
+    metadata = dict(selected.metadata or {})
+    primary_quality = _result_semantic_quality(primary) or {"status": "unavailable", "score": 0.0}
+    fallback_quality = _result_semantic_quality(fallback) or {"status": "unavailable", "score": 0.0}
+    selected_quality = _result_semantic_quality(selected) or {"status": "unavailable", "score": 0.0}
+    metadata.update(
+        {
+            "primary_status": primary_quality.get("status", "unavailable"),
+            "primary_score": primary_quality.get("score", 0.0),
+            "fallback_status": fallback_quality.get("status", "unavailable"),
+            "fallback_score": fallback_quality.get("score", 0.0),
+            "selected_status": selected_quality.get("status", "unavailable"),
+            "selected_score": selected_quality.get("score", 0.0),
+            "selected_backend": selected_backend,
+            "primary_backend": (primary.metadata or {}).get("primary_backend") or "direct",
+            "selected_mode": "primary" if selected is primary else mode,
+            "browser_fallback_mode": None if selected is primary else mode,
+            "browser_fallback": True,
+            "browser_fallback_attempted": True,
+            "browser_fallback_modes_attempted": list(attempted),
+            "browser_fallback_success": selected is fallback and not fallback.is_error,
+            "browser_fallback_candidate_succeeded": not fallback.is_error,
+            "browser_fallback_selection": (
+                "browser_selected" if selected is fallback else "primary_preserved"
+            ),
+        }
+    )
+    selected.metadata = metadata
+    return selected
 
 
 def _looks_like_blocked_empty_extraction(metadata: dict[str, Any]) -> bool:
@@ -557,13 +635,6 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
 
     output_format = arguments.get("format", "markdown")
     timeout = arguments.get("timeout", 30)
-    user_backend_override = arguments.get("backend")
-    backend_name = (
-        str(user_backend_override).strip().lower()
-        if isinstance(user_backend_override, str)
-        else None
-    )
-
     options = _collect_optional_options(
         arguments,
         (
@@ -585,34 +656,65 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
         runtime_metadata[BROWSER_MANAGER_KEY] = shared[BROWSER_MANAGER_KEY]
     controller = _concurrency_controller(context)
 
-    primary_backend = resolve_fetch_backend(runtime_metadata, backend_name)
+    primary_backend = resolve_fetch_backend(runtime_metadata)
     primary_label = _backend_label(primary_backend)
 
     timeout_int = int(timeout) if timeout else 30
     fetch_options = options if options else None
-
-    primary_result = await _run_fetch_with_concurrency(
-        controller=controller,
-        backend=primary_backend,
-        backend_label=primary_label,
-        url=url,
-        output_format=output_format,
-        timeout=timeout_int,
-        options=fetch_options,
+    deadline = asyncio.get_running_loop().time() + timeout_int
+    browser_attempts = _browser_fallback_attempts(runtime_metadata)
+    browser_options = dict(fetch_options or {})
+    browser_options["_browser_profile_owner"] = {
+        "execution_scope_id": getattr(context, "execution_scope_id", None) or "web-fetch",
+        "user_email": _web_fetch_user_identity(context),
+    }
+    primary_budget = (
+        min(timeout_int, max(1, int(timeout_int * 0.55)))
+        if browser_attempts and primary_label != "browser"
+        else timeout_int
+    )
+    try:
+        primary_result = await _run_fetch_with_concurrency(
+            controller=controller,
+            backend=primary_backend,
+            backend_label=primary_label,
+            url=url,
+            output_format=output_format,
+            timeout=primary_budget,
+            admission_timeout=min(10.0, max(2.0, timeout_int * 0.25)),
+            options=browser_options if primary_label == "browser" else fetch_options,
+        )
+    except TimeoutError:
+        primary_result = ToolResult(
+            output=f"Primary web fetch timed out after {primary_budget}s.",
+            is_error=True,
+            metadata={"failure_category": "timeout", "primary_timeout_seconds": primary_budget},
+        )
+    primary_result = _merge_result_metadata(
+        primary_result,
+        {"primary_backend": primary_label},
     )
 
     if not _should_attempt_browser_fallback(
         result=primary_result,
         primary_backend_name=primary_label,
         runtime_metadata=runtime_metadata,
-        user_override=backend_name,
+        user_override=None,
     ):
+        if not primary_result.is_error and _result_semantic_quality(primary_result):
+            primary_result.metadata = {
+                **(primary_result.metadata or {}),
+                "browser_fallback_attempted": False,
+                "browser_fallback_skipped_reason": "not_browser_fixable_or_unavailable",
+                "selected_backend": primary_label,
+                "selected_mode": "primary",
+            }
         if primary_result.is_error:
             return _explain_skipped_fallback(
                 primary_label=primary_label,
                 primary_result=primary_result,
                 runtime_metadata=runtime_metadata,
-                user_override=backend_name,
+                user_override=None,
             )
         return build_fetch_tool_result(
             url=url,
@@ -622,13 +724,29 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
 
     fallback_attempts: list[tuple[str, ToolResult]] = []
     modes_attempted: list[str] = []
-    browser_attempts = _browser_fallback_attempts(runtime_metadata)
     if not browser_attempts:
         return primary_result
 
     headed_skipped_reason: str | None = None
 
     for mode, browser_backend in browser_attempts:
+        remaining_seconds = deadline - asyncio.get_running_loop().time()
+        if remaining_seconds <= 0:
+            fallback_attempts.append(
+                (
+                    mode,
+                    ToolResult(
+                        output="Browser fallback skipped because the fetch deadline was exhausted.",
+                        is_error=True,
+                        metadata={
+                            "browser_fetch_mode": mode,
+                            "browser_failure_category": "fetch_deadline_exhausted",
+                        },
+                    ),
+                )
+            )
+            break
+        backend_timeout = max(1, math.ceil(remaining_seconds))
         logger.info(
             "web: fetch falling back to %s browser backend",
             mode,
@@ -640,28 +758,47 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
                 }
             },
         )
-        browser_result = await _run_fetch_with_concurrency(
-            controller=controller,
-            backend=browser_backend,
-            backend_label="browser",
-            url=url,
-            output_format=output_format,
-            timeout=timeout_int,
-            options=fetch_options,
-        )
+        try:
+            browser_result = await asyncio.wait_for(
+                _run_fetch_with_concurrency(
+                    controller=controller,
+                    backend=browser_backend,
+                    backend_label="browser",
+                    url=url,
+                    output_format=output_format,
+                    timeout=backend_timeout,
+                    options=browser_options,
+                ),
+                timeout=remaining_seconds,
+            )
+        except TimeoutError:
+            browser_result = ToolResult(
+                output=f"Browser fallback timed out after {remaining_seconds:.1f}s ({mode}).",
+                is_error=True,
+                metadata={
+                    "browser_fetch_mode": mode,
+                    "browser_failure_category": "browser_timeout",
+                },
+            )
         modes_attempted.append(mode)
         block_signal = _browser_block_signal(browser_result)
         if not browser_result.is_error and not block_signal:
+            selected = max(
+                (primary_result, browser_result),
+                key=lambda pair: _result_quality_key(pair, 0 if pair is primary_result else 1),
+            )
+            selected = _annotate_fallback_comparison(
+                selected,
+                primary_result,
+                browser_result,
+                mode=mode,
+                attempted=modes_attempted,
+                selected_backend=primary_label if selected is primary_result else "browser",
+            )
             return build_fetch_tool_result(
                 url=url,
-                content=browser_result.output,
-                metadata=_annotate_fallback_metadata(
-                    browser_result,
-                    fallback_used=True,
-                    fallback_mode=mode,
-                    modes_attempted=modes_attempted,
-                    primary_backend=primary_label,
-                ).metadata,
+                content=selected.output,
+                metadata=selected.metadata,
             )
         if block_signal:
             browser_result = _browser_block_failure(mode, browser_result, block_signal)
@@ -669,6 +806,22 @@ async def handle_web_fetch(arguments: dict[str, Any], context: ToolExecutionCont
 
     if not any(mode == "headed" for mode in modes_attempted):
         headed_skipped_reason = _headed_fallback_skipped_reason(runtime_metadata)
+
+    if not primary_result.is_error and fallback_attempts:
+        mode, fallback_result = fallback_attempts[-1]
+        selected = _annotate_fallback_comparison(
+            primary_result,
+            primary_result,
+            fallback_result,
+            mode=mode,
+            attempted=modes_attempted,
+            selected_backend=primary_label,
+        )
+        return build_fetch_tool_result(
+            url=url,
+            content=selected.output,
+            metadata=selected.metadata,
+        )
 
     return _combined_fallback_failure(
         primary_label=primary_label,
@@ -694,6 +847,20 @@ def _browser_fallback_attempts(runtime_metadata: dict[str, Any]) -> list[tuple[s
     return []
 
 
+def _web_fetch_user_identity(context: ToolExecutionContext) -> str:
+    for metadata in (context.runtime_metadata, context.shared_runtime_metadata or {}):
+        runtime_access = metadata.get("runtime_access")
+        if isinstance(runtime_access, dict):
+            value = runtime_access.get("user_email")
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        value = metadata.get("user_email")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    execution_scope_id = getattr(context, "execution_scope_id", None)
+    return f"scope:{execution_scope_id}" if execution_scope_id else "anonymous"
+
+
 def _headed_fallback_skipped_reason(runtime_metadata: dict[str, Any]) -> str:
     if not bool(runtime_metadata.get("web_browser_fetch_headed_fallback_enabled", True)):
         return (
@@ -713,17 +880,35 @@ async def _run_fetch_with_concurrency(
     url: str,
     output_format: str,
     timeout: int,
-    options: dict[str, Any] | None,
+    admission_timeout: float = 10.0,
+    options: dict[str, Any] | None = None,
 ) -> ToolResult:
-    """Run a single fetch through the controller's concurrency gates."""
-    async with controller.acquire(backend=backend_label, host=host_for(url), op="fetch"):
-        result: ToolResult = await backend.fetch(
-            url,
-            output_format=output_format,
+    """Run a fetch with separate admission and active-work deadlines."""
+    slot = controller.acquire(backend=backend_label, host=host_for(url), op="fetch")
+    try:
+        await asyncio.wait_for(slot.__aenter__(), timeout=admission_timeout)
+    except TimeoutError:
+        return ToolResult(
+            output="Web fetch capacity is busy. Retry the request shortly.",
+            is_error=True,
+            metadata={
+                "failure_category": "admission_timeout",
+                "backend": backend_label,
+            },
+        )
+    try:
+        result: ToolResult = await asyncio.wait_for(
+            backend.fetch(
+                url,
+                output_format=output_format,
+                timeout=timeout,
+                options=options,
+            ),
             timeout=timeout,
-            options=options,
         )
         return result
+    finally:
+        await slot.__aexit__(None, None, None)
 
 
 async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
@@ -733,7 +918,6 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
         return ToolResult(output="No search query provided.", is_error=True)
 
     num_results = int(arguments.get("num_results", 8))
-    backend_name = arguments.get("backend")
     options = _collect_optional_options(
         arguments,
         (
@@ -757,6 +941,8 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             "chunks_per_source",
             "exact_match",
             "include_usage",
+            "search_mode",
+            "result_type",
             # Brave options
             "search_lang",
             "ui_lang",
@@ -781,8 +967,9 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
 
     runtime_metadata = context.runtime_metadata
     controller = _concurrency_controller(context)
-    backend = resolve_search_backend(runtime_metadata, backend_name)
+    backend = resolve_search_backend(runtime_metadata)
     backend_label = _backend_label(backend)
+    concurrency_label = "direct_search" if backend_label == "direct" else backend_label
     is_tavily_backend = isinstance(backend, TavilyBackend)
     if is_tavily_backend:
         try:
@@ -791,12 +978,31 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             return ToolResult(output=str(exc), is_error=True)
         query_to_run, options, query_normalized = _normalize_tavily_query(query_to_run, options)
 
-    async with controller.acquire(backend=backend_label, op="search"):
-        result = await backend.search(
-            query_to_run,
-            num_results=num_results,
-            options=options if options else None,
-        )
+    max_attempts = _DIRECT_SEARCH_MAX_ATTEMPTS if backend_label == "direct" else 1
+    retry_failure_categories: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        async with controller.acquire(backend=concurrency_label, op="search"):
+            result = await backend.search(
+                query_to_run,
+                num_results=num_results,
+                options=options if options else None,
+            )
+        if backend_label == "direct":
+            result = _merge_result_metadata(result, {"attempts": attempt})
+        failure_category = str((result.metadata or {}).get("failure_category") or "")
+        if (
+            not result.is_error
+            or failure_category not in _RETRYABLE_DIRECT_SEARCH_FAILURES
+            or attempt >= max_attempts
+        ):
+            break
+        retry_failure_categories.append(failure_category)
+        delay = _DIRECT_SEARCH_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+        await asyncio.sleep(delay + random.uniform(0, delay / 2))
+    search_metadata: dict[str, Any] = {"backend": backend_label}
+    if retry_failure_categories:
+        search_metadata["retry_failure_categories"] = retry_failure_categories
+    result = _merge_result_metadata(result, search_metadata)
 
     if is_tavily_backend and _is_empty_search_result(result):
         retry_query = _build_tavily_retry_query(query_to_run)
@@ -805,7 +1011,7 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             retry_attempted = True
             if _identifier_like_tokens(retry_query) and "exact_match" not in retry_options:
                 retry_options["exact_match"] = True
-            async with controller.acquire(backend=backend_label, op="search"):
+            async with controller.acquire(backend=concurrency_label, op="search"):
                 retry_result = await backend.search(
                     retry_query,
                     num_results=num_results,
@@ -818,6 +1024,7 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
                         "tavily_query_normalized": query_normalized,
                         "tavily_retry_attempted": True,
                         "tavily_retry_reason": "empty_results",
+                        "backend": backend_label,
                     },
                 )
 

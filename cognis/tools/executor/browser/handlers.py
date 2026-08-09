@@ -335,6 +335,8 @@ def _browser_config(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
         "network_idle_after_dom_seconds": runtime_metadata.get(
             "browser_network_idle_after_dom_seconds", 3
         ),
+        "native_bootstrap_enabled": runtime_metadata.get("browser_native_bootstrap_enabled", True),
+        "native_bootstrap_seconds": runtime_metadata.get("browser_native_bootstrap_seconds", 15),
     }
 
 
@@ -407,6 +409,8 @@ def build_manager_from_config(runtime_metadata: dict[str, Any]) -> BrowserManage
         navigation_timeout_seconds=int(cfg.get("navigation_timeout_seconds") or 60),
         wait_until=str(cfg.get("wait_until") or "domcontentloaded"),
         network_idle_after_dom_seconds=int(cfg.get("network_idle_after_dom_seconds") or 3),
+        native_bootstrap_enabled=bool(cfg.get("native_bootstrap_enabled", True)),
+        native_bootstrap_seconds=int(cfg.get("native_bootstrap_seconds") or 15),
     )
 
 
@@ -543,8 +547,6 @@ async def _browser_block_diagnostic(
     headless: bool,
 ) -> dict[str, Any] | None:
     status = getattr(session, "navigation_status", None)
-    if not isinstance(status, int) or status < 400:
-        return None
     page = session.page
     body = ""
     content = getattr(page, "content", None)
@@ -564,9 +566,14 @@ async def _browser_block_diagnostic(
     rejected_with_vendor_reference = "request rejected" in evidence and any(
         marker in evidence for marker in ("attack id", "incident id", "reference id")
     )
-    if not (
+    access_denied_with_reference = any(
+        marker in evidence for marker in ("access denied", "zugriff verweigert")
+    ) and any(marker in evidence for marker in ("error reference", "reference id"))
+    failed_status = isinstance(status, int) and status >= 400
+    broad_waf_match = failed_status and (
         any(marker in evidence for marker in strong_waf_markers) or rejected_with_vendor_reference
-    ):
+    )
+    if not (broad_waf_match or access_denied_with_reference):
         return None
     final_url = _site_attribution_url(
         str(getattr(page, "url", "") or ""),

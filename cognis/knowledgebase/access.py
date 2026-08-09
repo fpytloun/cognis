@@ -9,7 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.models.agent import AgentPermissions
 from cognis.store.models import Agent, KnowledgebaseRow
-from cognis.store.queries import get_active_agent_grant, get_agent, get_knowledgebase_by_id
+from cognis.store.queries import (
+    get_active_agent_grant,
+    get_active_knowledgebase_grant,
+    get_agent,
+    get_knowledgebase_by_id,
+    list_knowledgebases_for_user,
+)
 
 KnowledgebaseAccessMode = Literal["view", "use", "manage"]
 
@@ -29,6 +35,7 @@ class ResolvedKnowledgebaseAccess:
     via_agent_id: str | None = None
     is_owner: bool = False
     is_agent_grantee: bool = False
+    is_direct_user_grantee: bool = False
 
 
 async def resolve_knowledgebase_access(
@@ -96,6 +103,14 @@ async def resolve_knowledgebase_access(
             owner_email=kb.owner_email,
             is_owner=True,
         )
+    grant = await get_active_knowledgebase_grant(session, knowledgebase_id, context.actor_email)
+    if grant is not None:
+        return ResolvedKnowledgebaseAccess(
+            knowledgebase=kb,
+            actor_email=context.actor_email,
+            owner_email=kb.owner_email,
+            is_direct_user_grantee=True,
+        )
     return None
 
 
@@ -107,9 +122,7 @@ async def list_available_knowledgebases(
     """List KB rows available for the current direct or active-agent context."""
 
     if not context.agent_id:
-        from cognis.store.queries import list_knowledgebases
-
-        return await list_knowledgebases(session, owner_email=context.actor_email)
+        return await list_knowledgebases_for_user(session, context.actor_email)
     agent = await get_agent(session, context.agent_id)
     if agent is None or agent.status != "active":
         return []

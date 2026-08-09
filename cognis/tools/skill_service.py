@@ -162,7 +162,9 @@ def normalize_skill_steps(value: Any) -> list[dict[str, Any]] | None:
     for raw in value:
         if not isinstance(raw, dict):
             raise ValueError("steps must be a list of workflow step objects")
-        normalized.append(StepDefinition.model_validate(raw).model_dump(mode="json"))
+        normalized.append(
+            StepDefinition.model_validate(raw).model_dump(mode="json", exclude_none=True)
+        )
     return normalized
 
 

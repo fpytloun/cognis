@@ -17,6 +17,13 @@ from cognis.tools.executor.web.backends.formatting import (
     build_crawl_tool_result,
     build_search_tool_result,
 )
+from cognis.tools.executor.web.backends.search_intent import (
+    domain_allowed,
+    intent_metadata,
+    result_type,
+    search_mode,
+    semantic_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,14 +103,27 @@ class TavilyBackend:
             return ToolResult(output="No search query provided.", is_error=True)
 
         opts = options or {}
+        requested_mode = search_mode(opts)
+        preferred_type = result_type(opts)
+        effective_mode = requested_mode
+        native_support = requested_mode != "videos"
+        degraded_reason = None
+        if requested_mode == "videos":
+            effective_mode = "web"
+            degraded_reason = "Tavily has no native video search; used general web search fallback."
         body: dict[str, Any] = {
             "query": query,
             "max_results": min(num_results, 20),
         }
+        if requested_mode == "news":
+            body["topic"] = "news"
+        elif "search_mode" in opts:
+            body["topic"] = "general"
 
         # Map all supported Tavily search parameters
         _set_if(body, opts, "search_depth")  # basic, advanced, fast, ultra-fast
-        _set_if(body, opts, "topic")  # general, news, finance
+        if "search_mode" not in opts:
+            _set_if(body, opts, "topic")  # general, news, finance
         _set_if(body, opts, "include_answer")
         _set_if(body, opts, "include_raw_content")
         _set_if(body, opts, "include_images")
@@ -120,12 +140,28 @@ class TavilyBackend:
         _set_if(body, opts, "chunks_per_source")
         _set_if(body, opts, "exact_match")
         _set_if(body, opts, "include_usage")
+        if requested_mode == "images":
+            body["include_images"] = True
 
         result = await self._safe_call("/search", body)
         if isinstance(result, ToolResult):
             return result
 
-        return _format_tavily_search(result)
+        metadata = intent_metadata(
+            requested_mode=requested_mode,
+            effective_mode=effective_mode,
+            preferred_result_type=preferred_type,
+            native_mode_support=native_support,
+            degraded_reason=degraded_reason,
+        )
+        metadata["requested_time_range"] = str(opts.get("time_range") or "any").lower()
+        return _format_tavily_search(
+            result,
+            image_only=requested_mode == "images",
+            preferred_type=preferred_type,
+            options=opts,
+            metadata=metadata,
+        )
 
     async def crawl(
         self,
@@ -266,26 +302,56 @@ def _set_if(body: dict[str, Any], opts: dict[str, Any], key: str) -> None:
         body[key] = opts[key]
 
 
-def _format_tavily_search(data: dict[str, Any]) -> ToolResult:
+def _format_tavily_search(
+    data: dict[str, Any],
+    *,
+    image_only: bool = False,
+    preferred_type: str | None = None,
+    options: dict[str, Any] | None = None,
+    metadata: dict[str, object] | None = None,
+) -> ToolResult:
     """Format Tavily search response into readable output."""
     answer = data.get("answer")
     results = data.get("results", [])
     images = _format_tavily_images(data.get("images"))
-    if not results and not answer and not images:
-        return ToolResult(output="No search results found.")
+    if image_only and not images:
+        result = build_search_tool_result(answer=None, results=[], metadata=metadata)
+        result.output = "No image results found."
+        return result
+    opts = options or {}
     formatted_results = [
         {
             "title": r.get("title", ""),
             "url": r.get("url", ""),
             "snippet": r.get("content", ""),
             "score": r.get("score"),
+            "published_date": (
+                r.get("published_date")
+                or r.get("publishedDate")
+                or r.get("published_at")
+                or r.get("date")
+            ),
+            "cognis_score": semantic_score(
+                preferred_type,
+                str(r.get("url", "")),
+                str(r.get("title", "")),
+            ),
         }
         for r in results
     ]
+    formatted_results = [
+        row for row in formatted_results if domain_allowed(str(row.get("url") or ""), opts)
+    ]
+    formatted_results.sort(
+        key=lambda row: (
+            -float(row["cognis_score"]) if isinstance(row.get("cognis_score"), int | float) else 0.0
+        )
+    )
     return build_search_tool_result(
-        answer=str(answer) if isinstance(answer, str) else None,
-        results=formatted_results,
+        answer=str(answer) if isinstance(answer, str) and not image_only else None,
+        results=[] if image_only else formatted_results,
         images=images,
+        metadata=metadata,
     )
 
 

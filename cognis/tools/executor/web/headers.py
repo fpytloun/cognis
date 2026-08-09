@@ -41,8 +41,10 @@ BROWSER_HEADERS: dict[str, str] = {
 
 _DEFAULT_TIMEOUT = 30
 _MAX_TIMEOUT = 120
-_MAX_RESPONSE_SIZE = 500_000
+_MAX_RESPONSE_SIZE = 64 * 1024 * 1024
 _MAX_BINARY_ATTACHMENT_SIZE = 25 * 1024 * 1024
+_MAX_PDF_PAGES = 2_000
+_MAX_PDF_TEXT_CHARS = 16 * 1024 * 1024
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 1.0  # seconds
 
@@ -115,56 +117,71 @@ async def fetch_with_retry(
         max_redirects=5,
     ) as client:
         for attempt in range(max_retries):
-            response = await client.get(url, headers=request_headers)
+            async with client.stream("GET", url, headers=request_headers) as response:
+                content_length = _content_length(response)
+                if content_length is not None and content_length > _MAX_RESPONSE_SIZE:
+                    return _response_too_large(content_length)
 
-            if response.status_code == 429:
-                retry_after = _parse_retry_after(response)
-                wait = retry_after or (_RETRY_BACKOFF_BASE * (2**attempt))
-                if attempt < max_retries - 1:
+                if response.status_code == 429:
+                    retry_after = _parse_retry_after(response)
+                    wait = retry_after or (_RETRY_BACKOFF_BASE * (2**attempt))
+                    if attempt < max_retries - 1:
+                        logger.info(
+                            "web: 429 rate limited, retrying",
+                            extra={"extra_data": {"attempt": attempt + 1, "wait_s": wait}},
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    return ToolResult(
+                        output=f"Rate limited (HTTP 429) after {max_retries} attempts.",
+                        is_error=True,
+                    )
+
+                if response.status_code == 403:
+                    cf_mitigated = response.headers.get("cf-mitigated", "")
+                    if cf_mitigated:
+                        return ToolResult(
+                            output=(
+                                "Direct HTTP fetch was blocked by Cloudflare browser "
+                                "verification. The controller may attempt browser fallback."
+                            ),
+                            is_error=True,
+                            metadata={
+                                "cloudflare_blocked": True,
+                                "direct_fetch_blocked": True,
+                            },
+                        )
+
+                if response.status_code >= 500 and attempt < max_retries - 1:
+                    wait = _RETRY_BACKOFF_BASE * (2**attempt)
                     logger.info(
-                        "web: 429 rate limited, retrying",
-                        extra={"extra_data": {"attempt": attempt + 1, "wait_s": wait}},
+                        "web: server error, retrying",
+                        extra={
+                            "extra_data": {
+                                "status": response.status_code,
+                                "attempt": attempt + 1,
+                                "wait_s": wait,
+                            }
+                        },
                     )
                     await asyncio.sleep(wait)
                     continue
-                return ToolResult(
-                    output=f"Rate limited (HTTP 429) after {max_retries} attempts.",
-                    is_error=True,
+
+                response.raise_for_status()
+                content = await _read_bounded_response(response)
+                if isinstance(content, ToolResult):
+                    return content
+                response_headers = dict(response.headers)
+                response_headers.pop("content-encoding", None)
+                response_headers["content-length"] = str(len(content))
+                return httpx.Response(
+                    response.status_code,
+                    headers=response_headers,
+                    content=content,
+                    request=response.request,
+                    history=response.history,
+                    extensions=response.extensions,
                 )
-
-            if response.status_code == 403:
-                cf_mitigated = response.headers.get("cf-mitigated", "")
-                if cf_mitigated:
-                    return ToolResult(
-                        output=(
-                            "Direct HTTP fetch was blocked by Cloudflare browser "
-                            "verification. The controller may attempt headless "
-                            "(and optionally headed) browser fallback."
-                        ),
-                        is_error=True,
-                        metadata={
-                            "cloudflare_blocked": True,
-                            "direct_fetch_blocked": True,
-                        },
-                    )
-
-            if response.status_code >= 500 and attempt < max_retries - 1:
-                wait = _RETRY_BACKOFF_BASE * (2**attempt)
-                logger.info(
-                    "web: server error, retrying",
-                    extra={
-                        "extra_data": {
-                            "status": response.status_code,
-                            "attempt": attempt + 1,
-                            "wait_s": wait,
-                        }
-                    },
-                )
-                await asyncio.sleep(wait)
-                continue
-
-            response.raise_for_status()
-            return response
 
     # Unreachable in practice — the loop always returns or raises.
     return ToolResult(output="Request failed.", is_error=True)  # pragma: no cover
@@ -179,6 +196,39 @@ def _parse_retry_after(response: httpx.Response) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def _content_length(response: httpx.Response) -> int | None:
+    raw = response.headers.get("content-length")
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
+
+
+async def _read_bounded_response(response: httpx.Response) -> bytes | ToolResult:
+    content = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(content) + len(chunk) > _MAX_RESPONSE_SIZE:
+            return _response_too_large(len(content) + len(chunk))
+        content.extend(chunk)
+    return bytes(content)
+
+
+def _response_too_large(observed_size: int) -> ToolResult:
+    return ToolResult(
+        output=(
+            f"Web response exceeded the native fetch safety limit of {_MAX_RESPONSE_SIZE} bytes."
+        ),
+        is_error=True,
+        metadata={
+            "failure_category": "response_too_large",
+            "source_limit_bytes": _MAX_RESPONSE_SIZE,
+            "source_bytes_observed": observed_size,
+        },
+    )
 
 
 def truncate_content(text: str, max_size: int = _MAX_RESPONSE_SIZE) -> str:
@@ -258,6 +308,7 @@ def format_response_result(
     response: httpx.Response,
     output_format: str,
     *,
+    requested_url: str | None = None,
     source_url: str | None = None,
     options: dict[str, object] | None = None,
 ) -> ToolResult:
@@ -267,37 +318,81 @@ def format_response_result(
     raw_content = getattr(response, "content", b"")
     content = raw_content if isinstance(raw_content, bytes) else str(response.text).encode("utf-8")
     url = source_url or str(response.url)
+    requested = requested_url or url
     filename = _filename_from_response(response, content_type=content_type)
 
     binary_kind = _binary_kind(content, content_type, filename)
     if binary_kind == "pdf":
-        return _format_pdf_response(content, content_type=content_type, filename=filename, url=url)
+        return _format_pdf_response(
+            content,
+            content_type=content_type,
+            filename=filename,
+            url=url,
+            requested_url=requested,
+        )
     if binary_kind == "binary":
         return _format_binary_response(
             content, content_type=content_type, filename=filename, url=url
         )
 
-    raw_text = truncate_content(response.text)
+    source_truncated = False
+    raw_text = response.text
     if "text/html" not in content_type:
         return ToolResult(
             output=raw_text,
             metadata={
                 "source_url": url,
+                "requested_url": requested,
+                "fetched_url": url,
                 "content_type": content_type or "text/plain",
                 "filename": filename,
                 "size_bytes": len(content),
+                "source_limit_bytes": _MAX_RESPONSE_SIZE,
+                "source_bytes_received": len(content),
+                "source_truncated": source_truncated,
             },
         )
 
     from cognis.tools.executor.web.extraction import extract_document
 
+    extraction_options = dict(options or {})
+    extraction_options.setdefault("requested_url", requested)
     document = extract_document(
         raw_text,
         url=url,
         output_format=output_format,
-        options=options,
+        options=extraction_options,
     )
     document_data = document.as_dict()
+    if _looks_like_landing_redirect(requested, url):
+        quality = document_data.get("semantic_quality")
+        if isinstance(quality, dict):
+            quality_signals = quality.get("signals")
+            normalized_signals = (
+                [str(signal) for signal in quality_signals]
+                if isinstance(quality_signals, list)
+                else []
+            )
+            quality.update(
+                {
+                    "status": "navigation_only",
+                    "label": "navigation_only",
+                    "rank": 2,
+                    "signals": [*normalized_signals, "redirected_to_landing_page"],
+                }
+            )
+    if source_truncated:
+        document_data["source_truncated"] = True
+        quality = document_data.get("semantic_quality")
+        if isinstance(quality, dict) and quality.get("status") == "complete":
+            quality["status"] = "partial"
+            quality["label"] = "partial"
+            quality["rank"] = 3
+            signals = quality.get("signals")
+            quality["signals"] = [
+                *(signals if isinstance(signals, list) else []),
+                "source_truncated",
+            ]
     from cognis.tools.executor.web.quality import classify_provider_error_page
 
     provider_error = classify_provider_error_page(document_data, document.content)
@@ -310,6 +405,10 @@ def format_response_result(
             is_error=True,
             metadata={
                 "extracted_document": document_data,
+                "requested_url": requested,
+                "fetched_url": url,
+                "canonical_url": document_data.get("canonical_url"),
+                "source_truncated": source_truncated,
                 "direct_fetch_blocked": True,
                 "direct_fetch_block_signal": provider_error,
             },
@@ -324,13 +423,25 @@ def format_response_result(
             is_error=True,
             metadata={
                 "extracted_document": document_data,
+                "requested_url": requested,
+                "fetched_url": url,
+                "canonical_url": document_data.get("canonical_url"),
+                "source_truncated": source_truncated,
                 "direct_fetch_blocked": True,
                 "direct_fetch_block_signal": block_reason,
             },
         )
     return ToolResult(
         output=document.content,
-        metadata={"extracted_document": document_data},
+        metadata={
+            "extracted_document": document_data,
+            "requested_url": requested,
+            "fetched_url": url,
+            "canonical_url": document_data.get("canonical_url"),
+            "source_truncated": source_truncated,
+            "source_limit_bytes": _MAX_RESPONSE_SIZE,
+            "source_bytes_received": len(content),
+        },
     )
 
 
@@ -357,6 +468,20 @@ def _blocked_empty_extraction_reason(document: dict[str, object]) -> str | None:
         if marker in text:
             return reason
     return None
+
+
+def _looks_like_landing_redirect(requested_url: str, fetched_url: str) -> bool:
+    requested = urlparse(requested_url)
+    fetched = urlparse(fetched_url)
+    requested_host = (requested.hostname or "").lower().removeprefix("www.")
+    fetched_host = (fetched.hostname or "").lower().removeprefix("www.")
+    if requested_host != fetched_host:
+        return False
+    requested_parts = [part for part in requested.path.split("/") if part]
+    fetched_parts = [part for part in fetched.path.split("/") if part]
+    if len(requested_parts) < 3:
+        return False
+    return len(fetched_parts) <= 1 and fetched.path != requested.path
 
 
 def _normalize_content_type(value: str) -> str:
@@ -410,6 +535,7 @@ def _format_pdf_response(
     content_type: str,
     filename: str,
     url: str,
+    requested_url: str,
 ) -> ToolResult:
     pdf_content_type = (
         content_type
@@ -424,6 +550,10 @@ def _format_pdf_response(
         purpose="web_fetch",
     )
     page_texts, pdf_metadata = _extract_pdf_text(content)
+    pdf_text_characters = sum(len(page) for page in page_texts)
+    pdf_text_truncated = (
+        len(page_texts) >= _MAX_PDF_PAGES or pdf_text_characters >= _MAX_PDF_TEXT_CHARS
+    )
     lines = [
         "[[metadata]]",
         f"URL: {url}",
@@ -453,9 +583,12 @@ def _format_pdf_response(
     else:
         lines.extend(["[[page:1]]", "[no extractable text]", ""])
     return ToolResult(
-        output=truncate_content("\n".join(lines).strip()),
+        output="\n".join(lines).strip(),
         metadata={
             "source_url": url,
+            "requested_url": requested_url,
+            "fetched_url": url,
+            "canonical_url": url,
             "content_type": pdf_content_type,
             "filename": filename,
             "size_bytes": len(content),
@@ -463,7 +596,45 @@ def _format_pdf_response(
             "binary_kind": "pdf",
             "attachment_created": bool(attachment),
             "pdf_page_count": len(page_texts),
+            "pdf_page_limit": _MAX_PDF_PAGES,
+            "pdf_text_characters": pdf_text_characters,
+            "pdf_text_limit_characters": _MAX_PDF_TEXT_CHARS,
+            "pdf_text_truncated": pdf_text_truncated,
             "pdf_metadata": pdf_metadata,
+            "extracted_document": {
+                "url": url,
+                "canonical_url": url,
+                "title": title,
+                "author": author,
+                "extractor": "pypdf",
+                "semantic_quality": {
+                    "status": (
+                        "partial"
+                        if pdf_text_truncated
+                        else ("complete" if any(page.strip() for page in page_texts) else "empty")
+                    ),
+                    "label": (
+                        "partial"
+                        if pdf_text_truncated
+                        else ("complete" if any(page.strip() for page in page_texts) else "empty")
+                    ),
+                    "score": min(100.0, sum(len(page) for page in page_texts) / 100),
+                    "rank": (
+                        3
+                        if pdf_text_truncated
+                        else (4 if any(page.strip() for page in page_texts) else 0)
+                    ),
+                    "signals": (
+                        ["pdf_text_extracted", "pdf_text_truncated"]
+                        if pdf_text_truncated
+                        else (
+                            ["pdf_text_extracted"]
+                            if any(page.strip() for page in page_texts)
+                            else ["no_extractable_pdf_text"]
+                        )
+                    ),
+                },
+            },
         },
         attachments=[attachment] if attachment else None,
     )
@@ -523,7 +694,15 @@ def _extract_pdf_text(content: bytes) -> tuple[list[str], dict[str, str]]:
         reader = PdfReader(io.BytesIO(content))
         metadata_raw = getattr(reader, "metadata", None)
         metadata = _pdf_metadata(metadata_raw)
-        pages = [str(page.extract_text() or "") for page in reader.pages]
+        pages: list[str] = []
+        total_chars = 0
+        for page in reader.pages[:_MAX_PDF_PAGES]:
+            text = str(page.extract_text() or "")
+            remaining = _MAX_PDF_TEXT_CHARS - total_chars
+            if remaining <= 0:
+                break
+            pages.append(text[:remaining])
+            total_chars += len(pages[-1])
         return pages, metadata
     except Exception as exc:  # pragma: no cover - defensive around malformed PDFs
         logger.debug("web: PDF text extraction failed (%s)", type(exc).__name__)

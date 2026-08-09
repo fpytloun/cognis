@@ -36,9 +36,12 @@ async def handle_office_read(
     with tempfile.TemporaryDirectory(prefix="cognis-office-read-") as tmp:
         source = _materialize_source(arguments, Path(tmp), context)
         view = str(arguments.get("view") or "text")
-        args = [str(source.path), "json" if view == "json" else view]
+        mode = "text" if view == "json" else view
+        args = [str(source.path), mode]
         _add_view_options(args, arguments)
         parse_json = view in {"json", "stats", "issues"}
+        if parse_json:
+            args.append("--json")
         result = await _run(context, "view", args, arguments, parse_json=parse_json)
         return _command_tool_result(result, {"view": view, **source.metadata})
 
@@ -62,8 +65,6 @@ async def handle_office_query(
     with tempfile.TemporaryDirectory(prefix="cognis-office-query-") as tmp:
         source = _materialize_source(arguments, Path(tmp), context)
         args = [str(source.path), str(arguments["selector"])]
-        if limit := arguments.get("limit"):
-            args.extend(["--limit", str(limit)])
         parse_json = bool(arguments.get("json", True))
         if parse_json:
             args.append("--json")
@@ -314,8 +315,19 @@ def _add_view_options(args: list[str], arguments: dict[str, Any]) -> None:
         "height": "--screenshot-height",
     }
     for key, flag in mapping.items():
-        if arguments.get(key) is not None:
-            args.extend([flag, str(arguments[key])])
+        value = arguments.get(key)
+        if key == "issue_type":
+            if value:
+                args.extend([flag, str(value)])
+        elif _is_positive_number(value):
+            args.extend([flag, str(value)])
+
+
+def _is_positive_number(value: Any) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _artifact_or_path_result(
