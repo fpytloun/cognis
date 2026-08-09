@@ -23,6 +23,7 @@ import contextlib
 import json
 import mimetypes
 import os
+import re
 import tempfile
 from collections import deque
 from datetime import UTC, datetime
@@ -44,9 +45,12 @@ from cognis.logging import get_logger
 from cognis.models.channel import (
     AgentProfile,
     ChannelCapabilities,
+    ChannelRecipient,
+    ChannelRecipientCapabilities,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
@@ -62,6 +66,20 @@ def _env_flag(name: str, default: bool = False) -> bool:
 _SIGNAL_DEBUG_ENABLED = _env_flag("COGNIS_SIGNAL_DEBUG", False)
 _SIGNAL_MEDIA_PLACEHOLDER = "\u200b"
 _SIGNAL_PLACEHOLDER_ATTACHMENT_NAME = "attachment.bin"
+_SIGNAL_UUID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_SIGNAL_E164 = re.compile(r"^\+[1-9]\d{6,14}$")
+_SIGNAL_GROUP_ID = re.compile(r"^[A-Za-z0-9._~+=/@#&:;,-]{1,255}$")
+
+
+class _SignalRecipientError(NonRetryableChannelError):
+    """PII-safe Signal recipient failure with a stable machine-readable code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _is_fatal_signal_error(message: str) -> bool:
@@ -324,7 +342,16 @@ class SignalAdapter(BaseChannelAdapter):
     """Signal Messenger adapter supporting REST API and direct JSON-RPC."""
 
     channel_type = "signal"
-    capabilities: ChannelCapabilities = SIGNAL_META.capabilities
+    capabilities: ChannelCapabilities = SIGNAL_META.capabilities.model_copy(
+        update={
+            "recipient_capabilities": ChannelRecipientCapabilities(
+                address_kinds=["signal_e164", "signal_uuid", "signal_group_id"],
+                chat_kinds=["direct", "group"],
+                supports_resolution=False,
+                supports_creation=False,
+            )
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -338,6 +365,55 @@ class SignalAdapter(BaseChannelAdapter):
         self._seen_inbound_message_keys: set[str] = set()
         self._seen_inbound_message_order: deque[str] = deque()
         self._seen_inbound_message_keys_max = 2048
+        self._pending_outbound_fingerprints: dict[tuple[str, str], int] = {}
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Validate and return a Signal address without directory operations."""
+        del resolution_key
+        if recipient.channel_type != self.channel_type:
+            raise _SignalRecipientError(
+                "channel_mismatch", "Recipient channel does not match this account"
+            )
+        if recipient.allow_creation:
+            raise _SignalRecipientError(
+                "creation_unsupported", "Signal recipient creation is not supported"
+            )
+        if recipient.allow_resolution:
+            raise _SignalRecipientError(
+                "resolution_unsupported", "Signal recipient resolution is not supported"
+            )
+
+        address = recipient.address.strip()
+        kind = recipient.address_kind
+        if kind is None and _SIGNAL_E164.fullmatch(address):
+            kind = "signal_e164"
+        if kind not in {"signal_e164", "signal_uuid", "signal_group_id"}:
+            raise _SignalRecipientError(
+                "unsupported_address_kind", "Signal recipient address kind is not supported"
+            )
+        expected_chat_kind = "group" if kind == "signal_group_id" else "direct"
+        if recipient.chat_kind not in {None, expected_chat_kind}:
+            raise _SignalRecipientError(
+                "chat_kind_mismatch", "Signal recipient chat kind does not match its address"
+            )
+        valid = {
+            "signal_e164": _SIGNAL_E164.fullmatch,
+            "signal_uuid": _SIGNAL_UUID.fullmatch,
+            "signal_group_id": _SIGNAL_GROUP_ID.fullmatch,
+        }[kind](address)
+        if not valid:
+            raise _SignalRecipientError("invalid_address", "Signal recipient address is invalid")
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=address,
+            chat_kind=expected_chat_kind,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle (overrides BaseChannelAdapter hooks)
@@ -625,17 +701,42 @@ class SignalAdapter(BaseChannelAdapter):
                     "media": message.media if index == 0 else [],
                 }
             )
-            if self._signal_config and self._signal_config.is_direct:
-                chunk_message_id = await self._send_direct(chunk_message)
-            else:
-                chunk_message_id = await self._send_rest(chunk_message)
+            fingerprint = (
+                message.chat_id,
+                self._transmitted_message_body(chunk_message),
+            )
+            self._pending_outbound_fingerprints[fingerprint] = (
+                self._pending_outbound_fingerprints.get(fingerprint, 0) + 1
+            )
+            try:
+                if self._signal_config and self._signal_config.is_direct:
+                    chunk_message_id = await self._send_direct(chunk_message)
+                else:
+                    chunk_message_id = await self._send_rest(chunk_message)
+            finally:
+                pending = self._pending_outbound_fingerprints.get(fingerprint, 0)
+                if pending <= 1:
+                    self._pending_outbound_fingerprints.pop(fingerprint, None)
+                else:
+                    self._pending_outbound_fingerprints[fingerprint] = pending - 1
             if index == 0 and message.media:
                 media_chunk_message_id = chunk_message_id
                 if not isinstance(chunk_message_id, str) or not chunk_message_id.strip():
                     return None
             if isinstance(chunk_message_id, str) and chunk_message_id.strip():
+                self._remember_inbound_message_key(
+                    f"{self._account_number}|{message.chat_id}|{chunk_message_id}"
+                )
                 last_message_id = chunk_message_id
         return media_chunk_message_id or last_message_id
+
+    def _transmitted_message_body(self, message: OutboundMessage) -> str:
+        if self._signal_config and self._signal_config.is_direct:
+            return message.content or (_SIGNAL_MEDIA_PLACEHOLDER if message.media else "")
+        text = message.platform_data.get("signal_markdown_text", message.content)
+        if not text and message.media:
+            return _SIGNAL_MEDIA_PLACEHOLDER
+        return str(text or "")
 
     async def _send_rest(self, message: OutboundMessage) -> str | None:
         """Send via REST API."""
@@ -1043,6 +1144,12 @@ class SignalAdapter(BaseChannelAdapter):
             chat_type = str(data_message.get("_cognis_chat_type") or "direct")
             chat_name = data_message.get("_cognis_chat_name") or source_name
 
+        if (
+            source == self._account_number
+            and self._pending_outbound_fingerprints.get((chat_id, body), 0) > 0
+        ):
+            return
+
         dedupe_key = f"{source}|{chat_id}|{timestamp}"
         if self._remember_inbound_message_key(dedupe_key):
             return
@@ -1095,6 +1202,10 @@ class SignalAdapter(BaseChannelAdapter):
                 was_mentioned = True
                 break
 
+        platform_data: dict[str, Any] = {"envelope": envelope}
+        if timestamp:
+            platform_data["_cognis_ordering_key"] = f"{int(timestamp):020d}"
+            platform_data["_cognis_ordering_source"] = "provider"
         message = InboundMessage(
             channel_type="signal",
             account_id=self.account_id,
@@ -1110,7 +1221,7 @@ class SignalAdapter(BaseChannelAdapter):
             timestamp=datetime.fromtimestamp(timestamp / 1000, tz=UTC)
             if timestamp
             else datetime.now(UTC),
-            platform_data={"envelope": envelope},
+            platform_data=platform_data,
         )
         if voice_input:
             message.platform_data["voice_input"] = True

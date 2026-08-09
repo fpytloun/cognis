@@ -10,32 +10,77 @@ Required credentials:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
 from cognis.channels.markdown_rendering import markdown_to_chat_text
-from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import GOOGLE_CHAT_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
     ChannelCapabilities,
+    ChannelRecipient,
     InboundMessage,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
 
 _CHAT_API_BASE = "https://chat.googleapis.com/v1"
+_CHAT_BOT_SCOPE = "https://www.googleapis.com/auth/chat.bot"
+_CHAT_SPACES_SCOPE = "https://www.googleapis.com/auth/chat.spaces.create"
+_GOOGLE_USER_RESOURCE = re.compile(r"^users/[A-Za-z0-9._~:-]+$")
+
+
+class GoogleChatRecipientError(NonRetryableChannelError):
+    """PII-safe recipient resolution failure."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        side_effect_certainty: str = "none",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.side_effect_certainty = side_effect_certainty
+
+
+def _google_recipient_capabilities(*, supports_creation: bool) -> ChannelCapabilities:
+    capabilities = GOOGLE_CHAT_META.capabilities.model_copy(deep=True)
+    capabilities.recipient_capabilities.address_kinds = [
+        "google_chat_space",
+        "google_workspace_user",
+    ]
+    capabilities.recipient_capabilities.supports_resolution = True
+    capabilities.recipient_capabilities.supports_creation = supports_creation
+    return capabilities
+
+
+def _response_name(response: httpx.Response) -> str | None:
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    name = data.get("name") if isinstance(data, Mapping) else None
+    return name if isinstance(name, str) and name else None
 
 
 class GoogleChatAdapter(BaseChannelAdapter):
     """Google Chat adapter via Chat API."""
 
     channel_type = "google_chat"
-    capabilities: ChannelCapabilities = GOOGLE_CHAT_META.capabilities
+    capabilities: ChannelCapabilities = _google_recipient_capabilities(supports_creation=False)
 
     def __init__(self) -> None:
         super().__init__()
@@ -43,6 +88,10 @@ class GoogleChatAdapter(BaseChannelAdapter):
         self._service_account: dict[str, Any] = {}
         self._access_token: str = ""
         self._bot_name: str = ""
+        self._app_credentials: service_account.Credentials | None = None
+        self._setup_credentials: service_account.Credentials | None = None
+        self._app_auth_lock = asyncio.Lock()
+        self._setup_auth_lock = asyncio.Lock()
 
     async def _connect(self) -> None:
         """Initialize Google Chat API client."""
@@ -57,21 +106,195 @@ class GoogleChatAdapter(BaseChannelAdapter):
             msg = "Invalid service account JSON"
             raise ValueError(msg) from exc
 
-        # For MVP, use a pre-generated access token or service account key
-        # A production implementation would use google-auth library for
-        # JWT-based service account authentication
-        self._access_token = self._credentials.get("access_token", "")
-
+        self._app_credentials = service_account.Credentials.from_service_account_info(
+            self._service_account,
+            scopes=[_CHAT_BOT_SCOPE],
+        )
+        self._setup_credentials = None
+        delegated_user = self._credentials.get("delegated_user") or (
+            self._config.settings.get("delegated_user", "") if self._config else ""
+        )
+        if delegated_user:
+            self._setup_credentials = service_account.Credentials.from_service_account_info(
+                self._service_account,
+                scopes=[_CHAT_SPACES_SCOPE],
+            ).with_subject(delegated_user)
+        self.capabilities = _google_recipient_capabilities(
+            supports_creation=self._setup_credentials is not None
+        )
         self._client = httpx.AsyncClient(
             base_url=_CHAT_API_BASE,
-            headers={"Authorization": f"Bearer {self._access_token}"},
             timeout=30.0,
         )
+        await self._get_access_token(self._app_credentials, self._app_auth_lock)
 
     async def _disconnect(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def _get_access_token(
+        self,
+        credentials: service_account.Credentials | None,
+        lock: asyncio.Lock,
+    ) -> str:
+        """Refresh a Google-auth credential under its identity lock."""
+        if credentials is None:
+            raise GoogleChatRecipientError(
+                "auth_unavailable", "Google Chat authorization is unavailable"
+            )
+        async with lock:
+            if not credentials.valid or credentials.expired:
+                await asyncio.to_thread(credentials.refresh, Request())
+            token = credentials.token
+            if not token:
+                raise GoogleChatRecipientError(
+                    "auth_unavailable", "Google Chat authorization is unavailable"
+                )
+            if credentials is self._app_credentials:
+                self._access_token = token
+            return token
+
+    async def _api_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        credentials: service_account.Credentials | None = None,
+        auth_lock: asyncio.Lock | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        if self._client is None:
+            raise GoogleChatRecipientError(
+                "account_unavailable", "Google Chat account is unavailable"
+            )
+        if credentials is not None:
+            if auth_lock is None:
+                raise GoogleChatRecipientError(
+                    "auth_unavailable", "Google Chat authorization is unavailable"
+                )
+            try:
+                token = await self._get_access_token(credentials, auth_lock)
+            except GoogleChatRecipientError:
+                raise
+            except Exception as exc:
+                raise GoogleChatRecipientError(
+                    "auth_unavailable", "Google Chat authorization is unavailable"
+                ) from exc
+            headers = dict(kwargs.pop("headers", {}))
+            headers["Authorization"] = f"Bearer {token}"
+            kwargs["headers"] = headers
+        try:
+            return await self._client.request(method, path, **kwargs)
+        except GoogleChatRecipientError:
+            raise
+        except Exception as exc:
+            raise GoogleChatRecipientError(
+                "resolution_unavailable", "Google Chat recipient service is unavailable"
+            ) from exc
+
+    def _target(self, chat_id: str, chat_kind: str) -> ResolvedChannelTarget:
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=chat_id,
+            chat_kind=chat_kind,  # type: ignore[arg-type]
+        )
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve canonical spaces or a Workspace user to a direct-message space."""
+        if recipient.channel_type != self.channel_type:
+            raise GoogleChatRecipientError("channel_mismatch", "Recipient channel is unsupported")
+        if recipient.address_kind == "google_chat_space":
+            return self._target(recipient.address, recipient.chat_kind or "direct")
+        if recipient.address_kind != "google_workspace_user" or not _GOOGLE_USER_RESOURCE.fullmatch(
+            recipient.address
+        ):
+            raise GoogleChatRecipientError(
+                "unsupported_address",
+                "Google Chat requires a canonical Workspace user resource",
+            )
+        if not (recipient.allow_resolution or recipient.allow_creation):
+            raise GoogleChatRecipientError(
+                "resolution_not_authorized",
+                "Recipient resolution is not authorized",
+            )
+
+        if recipient.allow_resolution:
+            response = await self._api_request(
+                "GET",
+                "/spaces:findDirectMessage",
+                credentials=self._app_credentials,
+                auth_lock=self._app_auth_lock,
+                params={"name": recipient.address},
+            )
+            if response.status_code == 404:
+                if not recipient.allow_creation:
+                    raise GoogleChatRecipientError(
+                        "recipient_not_found",
+                        "Google Chat recipient was not found",
+                    )
+            else:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise GoogleChatRecipientError(
+                        "resolution_failed", "Google Chat recipient lookup failed"
+                    ) from exc
+                space_name = _response_name(response)
+                if space_name:
+                    return self._target(space_name, "direct")
+                raise GoogleChatRecipientError(
+                    "invalid_response", "Google Chat returned an invalid recipient"
+                )
+
+        if not recipient.allow_creation:
+            raise GoogleChatRecipientError(
+                "recipient_not_found", "Google Chat recipient was not found"
+            )
+        if self._setup_credentials is None:
+            raise GoogleChatRecipientError(
+                "creation_unsupported",
+                "Google Chat direct-message creation is unavailable",
+            )
+        response = await self._api_request(
+            "POST",
+            "/spaces:setup",
+            credentials=self._setup_credentials,
+            auth_lock=self._setup_auth_lock,
+            json={
+                "space": {
+                    "spaceType": "DIRECT_MESSAGE",
+                },
+                "memberships": [{"member": {"name": recipient.address}}],
+                "requestId": resolution_key,
+            },
+        )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            certainty = "none" if response.status_code in {400, 401, 403, 404, 405} else "uncertain"
+            code = (
+                "creation_unsupported" if response.status_code in {404, 405} else "creation_failed"
+            )
+            raise GoogleChatRecipientError(
+                code,
+                "Google Chat direct-message creation failed",
+                side_effect_certainty=certainty,
+            ) from exc
+        space_name = _response_name(response)
+        if not space_name:
+            raise GoogleChatRecipientError(
+                "invalid_response",
+                "Google Chat returned an invalid space",
+                side_effect_certainty="uncertain",
+            )
+        return self._target(space_name, "direct")
 
     async def _run(self) -> None:
         """Google Chat uses webhooks — no long-running connection needed."""
@@ -120,8 +343,11 @@ class GoogleChatAdapter(BaseChannelAdapter):
         else:
             params = {}
 
-        resp = await self._client.post(
+        resp = await self._api_request(
+            "POST",
             f"/{message.chat_id}/messages",
+            credentials=self._app_credentials,
+            auth_lock=self._app_auth_lock,
             json=payload,
             params=params,
         )

@@ -22,15 +22,18 @@ import httpx
 
 from cognis.channels.formatting import split_message
 from cognis.channels.markdown_rendering import markdown_to_discord_markdown
-from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import DISCORD_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
     AgentProfile,
     ChannelCapabilities,
+    ChannelRecipient,
+    ChannelRecipientCapabilities,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
@@ -54,9 +57,27 @@ _INTENT_GUILD_MESSAGE_CONTENT = 1 << 15
 _INTENT_DIRECT_MESSAGES = 1 << 12
 
 
+class DiscordRecipientResolutionError(NonRetryableChannelError):
+    """Safe, stable error raised while resolving a Discord recipient."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+_DISCORD_CAPABILITIES = DISCORD_META.capabilities.model_copy(deep=True)
+_DISCORD_CAPABILITIES.recipient_capabilities = ChannelRecipientCapabilities(
+    address_kinds=["discord_channel_id", "discord_user_id"],
+    chat_kinds=["direct", "group"],
+    supports_resolution=False,
+    supports_creation=True,
+)
+
+
 class DiscordAdapter(BaseChannelAdapter):
     channel_type = "discord"
-    capabilities: ChannelCapabilities = DISCORD_META.capabilities
+    capabilities: ChannelCapabilities = _DISCORD_CAPABILITIES
 
     def __init__(self) -> None:
         super().__init__()
@@ -198,6 +219,78 @@ class DiscordAdapter(BaseChannelAdapter):
             if buffer.endswith(_ZLIB_SUFFIX):
                 data = self._decompressor.decompress(buffer)
                 return json.loads(data.decode("utf-8"))
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve a channel ID or create/reuse a DM for a user ID."""
+        del resolution_key
+        if recipient.channel_type != self.channel_type:
+            raise DiscordRecipientResolutionError(
+                "channel_mismatch", "Recipient channel does not match this adapter"
+            )
+        if recipient.address_kind not in {"discord_channel_id", "discord_user_id"}:
+            raise DiscordRecipientResolutionError(
+                "unsupported_address_kind", "Recipient address kind is unsupported"
+            )
+        if recipient.chat_kind not in {"direct", "group"}:
+            raise DiscordRecipientResolutionError(
+                "unsupported_chat_kind", "Recipient chat kind is unsupported"
+            )
+        if recipient.address_kind == "discord_channel_id":
+            return ResolvedChannelTarget(
+                channel_type=self.channel_type,
+                account_id=self.account_id,
+                chat_id=recipient.address,
+                chat_kind=recipient.chat_kind,
+            )
+        if recipient.chat_kind != "direct":
+            raise DiscordRecipientResolutionError(
+                "unsupported_chat_kind", "Discord user recipients support direct chats only"
+            )
+        if not recipient.allow_creation:
+            raise DiscordRecipientResolutionError(
+                "creation_required", "Discord user resolution requires creation authorization"
+            )
+        if self._rest_client is None:
+            raise DiscordRecipientResolutionError(
+                "account_unavailable", "Discord account is unavailable", retryable=True
+            )
+        try:
+            response = await self._rest_client.post(
+                "/users/@me/channels",
+                json={"recipient_id": recipient.address},
+            )
+        except httpx.HTTPError as exc:
+            raise DiscordRecipientResolutionError(
+                "discord_request_failed", "Discord recipient resolution failed", retryable=True
+            ) from exc
+        if response.status_code >= 500 or response.status_code == 429:
+            raise DiscordRecipientResolutionError(
+                "discord_request_failed", "Discord recipient resolution failed", retryable=True
+            )
+        if response.status_code >= 400:
+            raise DiscordRecipientResolutionError(
+                "discord_api_error", "Discord recipient resolution failed"
+            )
+        try:
+            data = response.json()
+            channel_id = data.get("id") if isinstance(data, dict) else None
+        except (TypeError, ValueError, AttributeError):
+            channel_id = None
+        if not isinstance(channel_id, str) or not channel_id:
+            raise DiscordRecipientResolutionError(
+                "discord_response_invalid", "Discord recipient resolution returned no channel"
+            )
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=channel_id,
+            chat_kind="direct",
+        )
 
     async def send_message(self, message: OutboundMessage) -> str | None:
         if self._rest_client is None:

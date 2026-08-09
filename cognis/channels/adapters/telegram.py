@@ -13,33 +13,98 @@ import asyncio
 import contextlib
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from cognis.channels.markdown_rendering import markdown_to_telegram_html
-from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import TELEGRAM_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
     AgentProfile,
     ChannelCapabilities,
+    ChannelRecipient,
+    ChannelRecipientCapabilities,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
 
 _TELEGRAM_API_BASE = "https://api.telegram.org"
+_TELEGRAM_CHAT_ID = re.compile(r"^-?\d{1,20}$")
+_TELEGRAM_USERNAME = re.compile(r"^@[A-Za-z0-9_]{5,32}$")
+
+
+class _TelegramRecipientError(NonRetryableChannelError):
+    """PII-safe Telegram recipient/provider failure."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+def _telegram_api_error(
+    response: httpx.Response,
+    *,
+    payload: dict[str, Any] | None = None,
+) -> _TelegramRecipientError:
+    data = payload
+    if data is None:
+        try:
+            parsed = response.json()
+            data = parsed if isinstance(parsed, dict) else None
+        except (TypeError, ValueError):
+            data = None
+    raw_error_code = data.get("error_code") if data else None
+    error_code = (
+        int(raw_error_code)
+        if isinstance(raw_error_code, int | str) and str(raw_error_code).isdigit()
+        else None
+    )
+    description = str(data.get("description", "")).lower() if data else ""
+    if error_code == 403 or response.status_code == 403:
+        return _TelegramRecipientError(
+            "telegram_forbidden", "Telegram Bot API denied recipient access"
+        )
+    if (
+        error_code == 404
+        or response.status_code == 404
+        or "not found" in description
+        or "chat not found" in description
+    ):
+        return _TelegramRecipientError("telegram_not_found", "Telegram recipient was not found")
+    if "forbidden" in description:
+        return _TelegramRecipientError(
+            "telegram_forbidden", "Telegram Bot API denied recipient access"
+        )
+    return _TelegramRecipientError(
+        "telegram_provider_error",
+        "Telegram Bot API recipient lookup failed",
+        retryable=response.status_code >= 500,
+    )
 
 
 class TelegramAdapter(BaseChannelAdapter):
     """Telegram Bot API adapter."""
 
     channel_type = "telegram"
-    capabilities: ChannelCapabilities = TELEGRAM_META.capabilities
+    capabilities: ChannelCapabilities = TELEGRAM_META.capabilities.model_copy(
+        update={
+            "recipient_capabilities": ChannelRecipientCapabilities(
+                address_kinds=["telegram_chat_id", "telegram_public_username"],
+                chat_kinds=["direct", "group"],
+                supports_resolution=True,
+                supports_creation=False,
+            )
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -47,6 +112,116 @@ class TelegramAdapter(BaseChannelAdapter):
         self._bot_token: str = ""
         self._bot_username: str = ""
         self._last_update_id: int = 0
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve a Telegram public username through Bot API ``getChat``."""
+        del resolution_key
+        if recipient.channel_type != self.channel_type:
+            raise _TelegramRecipientError(
+                "channel_mismatch", "Recipient channel does not match this account"
+            )
+        if recipient.allow_creation:
+            raise _TelegramRecipientError(
+                "creation_unsupported", "Telegram recipient creation is not supported"
+            )
+
+        kind = recipient.address_kind
+        if kind == "telegram_chat_id":
+            address = recipient.address.strip()
+            if not _TELEGRAM_CHAT_ID.fullmatch(address):
+                raise _TelegramRecipientError(
+                    "invalid_address", "Telegram recipient address is invalid"
+                )
+            expected_kind = "group" if address.startswith("-") else "direct"
+            if recipient.chat_kind not in {None, expected_kind}:
+                raise _TelegramRecipientError(
+                    "chat_kind_mismatch",
+                    "Telegram recipient chat kind does not match its address",
+                )
+            return ResolvedChannelTarget(
+                channel_type=self.channel_type,
+                account_id=self.account_id,
+                chat_id=address,
+                chat_kind=expected_kind,
+            )
+
+        if kind != "telegram_public_username":
+            raise _TelegramRecipientError(
+                "unsupported_address_kind",
+                "Telegram recipient address kind is not supported",
+            )
+        if recipient.chat_kind == "direct":
+            raise _TelegramRecipientError(
+                "private_user_first_contact",
+                "Telegram bots cannot initiate private user conversations",
+            )
+        if recipient.chat_kind not in {None, "group"}:
+            raise _TelegramRecipientError(
+                "chat_kind_mismatch", "Telegram recipient chat kind is invalid"
+            )
+        if not _TELEGRAM_USERNAME.fullmatch(recipient.address.strip()):
+            raise _TelegramRecipientError(
+                "invalid_address", "Telegram recipient address is invalid"
+            )
+        if not recipient.allow_resolution:
+            raise _TelegramRecipientError(
+                "resolution_not_authorized",
+                "Telegram username resolution is not authorized",
+            )
+        if self._client is None:
+            raise _TelegramRecipientError(
+                "resolution_unavailable", "Telegram recipient resolution is unavailable"
+            )
+        try:
+            response = await self._client.get(
+                "/getChat", params={"chat_id": recipient.address.strip()}
+            )
+        except httpx.HTTPError as exc:
+            raise _TelegramRecipientError(
+                "telegram_provider_error",
+                "Telegram Bot API recipient lookup failed",
+                retryable=True,
+            ) from exc
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = None
+        if response.is_error:
+            raise _telegram_api_error(response, payload=payload)
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise _telegram_api_error(response, payload=payload)
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise _TelegramRecipientError(
+                "telegram_provider_response",
+                "Telegram Bot API returned an invalid recipient",
+            )
+        result_type = str(result.get("type", "")).lower()
+        if result_type == "private":
+            raise _TelegramRecipientError(
+                "private_user_first_contact",
+                "Telegram bots cannot initiate private user conversations",
+            )
+        raw_chat_id = result.get("id")
+        chat_id = str(raw_chat_id) if isinstance(raw_chat_id, int) else raw_chat_id
+        if not isinstance(chat_id, str) or not _TELEGRAM_CHAT_ID.fullmatch(chat_id):
+            raise _TelegramRecipientError(
+                "telegram_provider_response",
+                "Telegram Bot API returned an invalid recipient",
+            )
+        display_name = result.get("title") or result.get("username")
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=chat_id,
+            chat_kind="group",
+            display_name=display_name if isinstance(display_name, str) else None,
+        )
 
     async def _connect(self) -> None:
         """Initialize HTTP client and verify bot token."""

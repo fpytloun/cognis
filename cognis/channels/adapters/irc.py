@@ -13,6 +13,7 @@ Required credentials:
 from __future__ import annotations
 
 import asyncio
+import re
 import ssl
 from datetime import UTC, datetime
 
@@ -23,18 +24,41 @@ from cognis.logging import get_logger
 from cognis.models.channel import (
     AgentProfile,
     ChannelCapabilities,
+    ChannelRecipient,
+    ChannelRecipientCapabilities,
     InboundMessage,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
+
+_IRC_NICK = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_IRC_CHANNEL = re.compile(r"^[#&][^\s,]{1,199}$")
+
+
+class _IRCRecipientError(ValueError):
+    """PII-safe IRC recipient failure with a stable machine-readable code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class IRCAdapter(BaseChannelAdapter):
     """IRC adapter via asyncio TCP."""
 
     channel_type = "irc"
-    capabilities: ChannelCapabilities = IRC_META.capabilities
+    capabilities: ChannelCapabilities = IRC_META.capabilities.model_copy(
+        update={
+            "recipient_capabilities": ChannelRecipientCapabilities(
+                address_kinds=["irc_nick", "irc_channel"],
+                chat_kinds=["direct", "group"],
+                supports_resolution=False,
+                supports_creation=False,
+            )
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -46,6 +70,54 @@ class IRCAdapter(BaseChannelAdapter):
         self._password: str = ""
         self._channels: list[str] = []
         self._use_tls: bool = True
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Validate and return an IRC nick or channel without directory access."""
+        del resolution_key
+        if recipient.channel_type != self.channel_type:
+            raise _IRCRecipientError(
+                "channel_mismatch", "Recipient channel does not match this account"
+            )
+        if recipient.allow_creation:
+            raise _IRCRecipientError(
+                "creation_unsupported", "IRC recipient creation is not supported"
+            )
+        if recipient.allow_resolution:
+            raise _IRCRecipientError(
+                "resolution_unsupported", "IRC recipient resolution is not supported"
+            )
+        kind = recipient.address_kind
+        expected_kind = {
+            "irc_nick": "direct",
+            "irc_channel": "group",
+        }.get(kind)
+        if expected_kind is None:
+            raise _IRCRecipientError(
+                "unsupported_address_kind", "IRC recipient address kind is not supported"
+            )
+        if recipient.chat_kind not in {None, expected_kind}:
+            raise _IRCRecipientError(
+                "chat_kind_mismatch", "IRC recipient chat kind does not match its address"
+            )
+        address = recipient.address
+        if (
+            any(ord(char) < 32 or ord(char) == 127 for char in address)
+            or address.strip() != address
+            or (kind == "irc_nick" and _IRC_NICK.fullmatch(address) is None)
+            or (kind == "irc_channel" and _IRC_CHANNEL.fullmatch(address) is None)
+        ):
+            raise _IRCRecipientError("invalid_address", "IRC recipient address is invalid")
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=address,
+            chat_kind=expected_kind,
+        )
 
     async def _connect(self) -> None:
         """Connect to IRC server."""

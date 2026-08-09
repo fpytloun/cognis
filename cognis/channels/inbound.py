@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -40,12 +42,19 @@ from cognis.audio.transcription import (
     resolve_stt_supported_mime_types,
 )
 from cognis.channels.delivery import _append_attachment_fallback, prepare_media_attachments
+from cognis.channels.group_context import (
+    GroupContextPolicy,
+    GroupContextSettingsError,
+    group_context_policy,
+)
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
 from cognis.core.attachment_utils import attachment_placeholder_text
+from cognis.core.message_envelope import message_metadata
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import (
     ChannelAccountConfig,
+    ChannelDeliveryDescriptor,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
@@ -264,7 +273,15 @@ def _is_unmentioned_matrix_thread_followup(message: InboundMessage) -> bool:
     )
 
 
-def _thread_root_excerpt(message: InboundMessage) -> str | None:
+def _sender_label(message: InboundMessage) -> str:
+    return message.sender_name or message.sender_username or message.sender_id
+
+
+def _fresh_thread_context_message(
+    message: InboundMessage,
+    *,
+    primary_trusted: bool,
+) -> dict[str, Any] | None:
     root = message.platform_data.get("thread_root")
     if not isinstance(root, dict):
         return None
@@ -272,20 +289,23 @@ def _thread_root_excerpt(message: InboundMessage) -> str | None:
     if not isinstance(body, str) or not body.strip():
         return None
     sender = root.get("sender")
-    sender_prefix = f"{sender}: " if isinstance(sender, str) and sender.strip() else ""
-    return f"{sender_prefix}{body.strip()}"
-
-
-def _fresh_thread_user_content(message: InboundMessage, user_content: str) -> str:
-    excerpt = _thread_root_excerpt(message)
-    if not excerpt:
-        root_id = message.platform_data.get("thread_root_event_id") or message.thread_id
-        if not isinstance(root_id, str) or not root_id:
-            return user_content
-        excerpt = f"Matrix thread root event: {root_id}"
-    if user_content.strip():
-        return f"Thread started from:\n> {excerpt}\n\nUser continuation:\n{user_content}"
-    return f"Thread started from:\n> {excerpt}"
+    timestamp = root.get("timestamp")
+    if isinstance(timestamp, int | float):
+        timestamp = datetime.fromtimestamp(timestamp / 1000, tz=UTC)
+    if not isinstance(timestamp, datetime | str):
+        return None
+    sender_label = sender.strip() if isinstance(sender, str) and sender.strip() else "unknown"
+    trusted = primary_trusted and sender_label == message.sender_id
+    return {
+        "content": body.strip(),
+        "intention_eligible": False,
+        "message_metadata": message_metadata(
+            ts=timestamp,
+            channel=message.channel_type,
+            sender=sender_label,
+            untrusted=not trusted,
+        ),
+    }
 
 
 class InboundPipeline:
@@ -307,6 +327,8 @@ class InboundPipeline:
         command_dispatcher: Any = None,
         notification_service: Any = None,
         credentials_provider: Any = None,
+        observed_target_recorder: Any = None,
+        managed_channel_service: Any = None,
     ) -> None:
         self._session_factory = session_factory
         self._turn_scheduler = turn_scheduler
@@ -317,13 +339,19 @@ class InboundPipeline:
         self._command_dispatcher = command_dispatcher
         self._notification_service = notification_service
         self._credentials_provider = credentials_provider
+        self._observed_target_recorder = observed_target_recorder
+        self._managed_channel_service = managed_channel_service
 
     async def process(
         self,
         message: InboundMessage,
         config: ChannelAccountConfig,
+        *,
+        executor_connection_owner: Any | None = None,
     ) -> None:
         """Process an inbound message through the full pipeline."""
+        if not await self._admit_executor_inbound(executor_connection_owner):
+            return
         if message.account_id != config.account_id or message.channel_type != config.channel_type:
             logger.warning(
                 "channel inbound: message/config binding mismatch",
@@ -340,7 +368,21 @@ class InboundPipeline:
         message = _effective_thread_message(message, config)
 
         # 1. Access control
-        if not self._check_access(message, config):
+        turn_allowed = self._check_access(message, config)
+        try:
+            context_policy = group_context_policy(config.settings)
+        except GroupContextSettingsError:
+            logger.warning(
+                "channel inbound: invalid group-context settings; capture disabled",
+                extra={"extra_data": {"account_id": config.account_id}},
+            )
+            context_policy = GroupContextPolicy()
+        capture_candidate = self._check_group_context_access(
+            message,
+            config,
+            context_policy,
+        )
+        if not turn_allowed and not capture_candidate:
             logger.info(
                 "channel inbound: access denied",
                 extra={
@@ -355,7 +397,12 @@ class InboundPipeline:
             return
 
         # 2. Identity mapping / pairing (external sender → Cognis user)
-        user_email = await self._resolve_user(message, config)
+        user_email = await self._resolve_user(
+            message,
+            config,
+            executor_connection_owner=executor_connection_owner,
+            allow_pairing_challenge=turn_allowed,
+        )
         if user_email is None:
             logger.info(
                 "channel inbound: awaiting verified sender mapping",
@@ -367,9 +414,99 @@ class InboundPipeline:
                 },
             )
             return
+        sender_trusted = message.platform_data.pop("_sender_verified_owner", False) is True
+        if turn_allowed:
+            try:
+                await self._record_observed_target(message, config)
+            except Exception:
+                logger.warning(
+                    "channel inbound: failed to record observed target",
+                    exc_info=True,
+                    extra={
+                        "extra_data": {
+                            "channel_type": message.channel_type,
+                            "account_id": message.account_id,
+                        }
+                    },
+                )
+
+        pre_normalized_attachments: list[AttachmentRef] | None = None
+        pre_normalized_failures = 0
+        if turn_allowed and self._managed_channel_service is not None:
+            if message.media:
+                (
+                    pre_normalized_attachments,
+                    pre_normalized_failures,
+                ) = await self._normalize_media_attachments(
+                    message=message,
+                    conversation_id=None,
+                    user_email=user_email,
+                    executor_connection_owner=executor_connection_owner,
+                )
+            managed = await self._managed_channel_service.admit_inbound(
+                message,
+                user_email=user_email,
+                attachments=pre_normalized_attachments,
+            )
+            if managed is True:
+                return
+            if managed is not None:
+                observer = self._managed_channel_service.observer(
+                    binding_id=managed.binding_id,
+                    binding_version=managed.version,
+                    owner_epoch=managed.owner_epoch,
+                )
+                error = await self._turn_scheduler.submit_turn(
+                    managed.conversation_id,
+                    managed.content,
+                    user_email=managed.user_email,
+                    intention_eligible=False,
+                    attachments=managed.attachments,
+                    user_message_metadata=message_metadata(
+                        ts=message.timestamp,
+                        channel=message.channel_type,
+                        sender=_sender_label(message),
+                        untrusted=True,
+                    ),
+                    contextual_messages=managed.contextual_messages,
+                    turn_observers=(observer,),
+                    client_message_id=managed.message_id,
+                    allow_queue=False,
+                )
+                if error is not None:
+                    await self._managed_channel_service.release_after_failure(
+                        binding_id=managed.binding_id,
+                        admitted_version=managed.version,
+                        admitted_owner_epoch=managed.owner_epoch,
+                        reason=error.message,
+                    )
+                return
+
+        capture_allowed = capture_candidate and user_email == config.user_email
+        if not turn_allowed:
+            if capture_allowed and self._managed_channel_service is not None:
+                attachments, _attachment_failures = await self._normalize_media_attachments(
+                    message=message,
+                    conversation_id=None,
+                    user_email=config.user_email,
+                )
+                await self._managed_channel_service.capture_group_message(
+                    message,
+                    user_email=config.user_email,
+                    policy=context_policy,
+                    attachments=attachments,
+                )
+            return
 
         # 3. Conversation resolution
-        conversation_id = await self._resolve_conversation(message, config, user_email)
+        if not await self._admit_executor_inbound(executor_connection_owner):
+            return
+        conversation_id = await self._resolve_conversation(
+            message,
+            config,
+            user_email,
+            executor_connection_owner=executor_connection_owner,
+        )
         if conversation_id is None:
             logger.warning(
                 "channel inbound: failed to resolve conversation",
@@ -381,15 +518,39 @@ class InboundPipeline:
                 },
             )
             return
+        try:
+            if message.chat_type == "direct" and self._managed_channel_service is not None:
+                await self._managed_channel_service.capture_observed_direct_message(
+                    message,
+                    user_email=user_email,
+                )
+        except Exception:
+            logger.warning(
+                "channel inbound: failed to record observed target",
+                exc_info=True,
+                extra={
+                    "extra_data": {
+                        "channel_type": message.channel_type,
+                        "account_id": message.account_id,
+                    }
+                },
+            )
 
         await self._mark_read(message, config, conversation_id)
 
-        cmd_result = await self._try_command_dispatch(
+        if not await self._admit_executor_inbound(executor_connection_owner):
+            return
+
+        command_admitted, cmd_result = await self._run_executor_durable(
+            executor_connection_owner,
+            self._try_command_dispatch,
             conversation_id=conversation_id,
             content=message.content,
             user_email=user_email,
             channel_default_agent_profile_id=config.default_agent_profile_id,
         )
+        if not command_admitted:
+            return
         if cmd_result is not None:
             if cmd_result.text:
                 await self._send_system_message(message, config, cmd_result.text)
@@ -406,11 +567,17 @@ class InboundPipeline:
             return
 
         # Check for pending direct-chat step questions and auto-resolve
-        resolved_question = await self._try_resolve_pending_question(
+        if not await self._admit_executor_inbound(executor_connection_owner):
+            return
+        question_admitted, resolved_question = await self._run_executor_durable(
+            executor_connection_owner,
+            self._try_resolve_pending_question,
             conversation_id=conversation_id,
             user_email=user_email,
             content=message.content,
         )
+        if not question_admitted:
+            return
         if resolved_question is not None:
             if resolved_question:
                 logger.info(
@@ -431,11 +598,18 @@ class InboundPipeline:
             return
 
         try:
-            attachments, attachment_failures = await self._normalize_media_attachments(
-                message=message,
-                conversation_id=conversation_id,
-                user_email=user_email,
-            )
+            if not await self._admit_executor_inbound(executor_connection_owner):
+                return
+            if pre_normalized_attachments is not None:
+                attachments = pre_normalized_attachments
+                attachment_failures = pre_normalized_failures
+            else:
+                attachments, attachment_failures = await self._normalize_media_attachments(
+                    message=message,
+                    conversation_id=conversation_id,
+                    user_email=user_email,
+                    executor_connection_owner=executor_connection_owner,
+                )
         except Exception as exc:
             if self._is_voice_input(message):
                 await self._send_error(message, config, str(exc))
@@ -464,12 +638,54 @@ class InboundPipeline:
                 "The file may be unavailable or require authentication. "
                 "Please try resending or share the file another way.",
             )
+        if message.chat_type == "direct" and self._managed_channel_service is not None:
+            await self._managed_channel_service.capture_observed_direct_message(
+                message,
+                user_email=user_email,
+                attachments=attachments,
+            )
         user_content = message.content
         turn_attachments = _filter_turn_attachments_for_voice_input(message, attachments)
         if not self._is_voice_input(message):
             user_content = _fallback_attachment_content(user_content, attachments, message.media)
+        contextual_messages: list[dict[str, Any]] = []
+        group_reservation_token: str | None = None
+        group_turn_id: str | None = None
+        if capture_allowed and self._managed_channel_service is not None:
+            trigger_row = await self._managed_channel_service.capture_group_message(
+                message,
+                user_email=config.user_email,
+                policy=context_policy,
+                attachments=attachments,
+            )
+            if trigger_row is not None:
+                group_turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+                reservation = await self._managed_channel_service.reserve_group_context(
+                    trigger_inbound_id=trigger_row.inbound_id,
+                    conversation_id=conversation_id,
+                    turn_id=group_turn_id,
+                    policy=context_policy,
+                )
+                if reservation.duplicate_primary:
+                    return
+                group_reservation_token = reservation.token
+                contextual_messages.extend(reservation.contextual_messages)
         if bool(message.platform_data.get("fresh_thread_context")):
-            user_content = _fresh_thread_user_content(message, user_content)
+            context_message = _fresh_thread_context_message(
+                message,
+                primary_trusted=sender_trusted,
+            )
+            if context_message is not None:
+                contextual_messages.append(context_message)
+        sender = (
+            _sender_label(message) if message.chat_type == "group" or not sender_trusted else None
+        )
+        primary_metadata = message_metadata(
+            ts=message.timestamp,
+            channel=message.channel_type,
+            sender=sender,
+            untrusted=not sender_trusted,
+        )
 
         # 4. Register observer for response delivery
         observer = ChannelTurnObserver(
@@ -480,25 +696,96 @@ class InboundPipeline:
             conversation_id=conversation_id,
             turn_scheduler=self._turn_scheduler,
             reply_to_id=message.message_id,
+            channel_delivery=ChannelDeliveryDescriptor(
+                channel_type=message.channel_type,
+                account_id=message.account_id,
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                reply_to_id=message.message_id,
+            ),
             channel_manager_ref=self._channel_manager_ref,
             assistant_delivery_mode=_assistant_delivery_mode_for_config(config),
         )
 
         # 5. Submit turn
-        error = await self._turn_scheduler.submit_turn(
+        if not await self._admit_executor_inbound(executor_connection_owner):
+            if group_reservation_token and group_turn_id:
+                await self._managed_channel_service.settle_group_context(
+                    group_reservation_token,
+                    turn_id=group_turn_id,
+                    succeeded=False,
+                )
+            return
+
+        async def _settle_group_context_admission(
+            session: Any,
+            admitted_request: Any,
+            _created: bool,
+        ) -> None:
+            if group_reservation_token is None or group_turn_id is None:
+                return
+            if admitted_request.turn_id != group_turn_id:
+                raise RuntimeError("group-context admission turn mismatch")
+            await self._managed_channel_service.settle_group_context_in_session(
+                session,
+                token=group_reservation_token,
+                turn_id=group_turn_id,
+                require_valid=True,
+            )
+
+        turn_admitted, error = await self._run_executor_durable(
+            executor_connection_owner,
+            self._turn_scheduler.submit_turn,
             conversation_id,
             user_content,
             user_email=user_email,
+            intention_eligible=sender_trusted,
+            user_message_metadata=primary_metadata,
+            contextual_messages=contextual_messages,
             attachments=[item.model_dump(mode="json") for item in turn_attachments],
             turn_observers=[observer],
+            channel_deliverable=True,
             client_message_id=message.message_id,
             channel_default_agent_profile_id=config.default_agent_profile_id,
             channel_account_id=config.account_id,
+            channel_delivery=ChannelDeliveryDescriptor(
+                channel_type=message.channel_type,
+                account_id=message.account_id,
+                chat_id=message.chat_id,
+                thread_id=message.thread_id,
+                reply_to_id=message.message_id,
+            ),
+            turn_id=group_turn_id,
+            admission_transaction_participant=(
+                _settle_group_context_admission if group_reservation_token else None
+            ),
         )
+        if not turn_admitted:
+            if group_reservation_token and group_turn_id:
+                await self._managed_channel_service.settle_group_context(
+                    group_reservation_token,
+                    turn_id=group_turn_id,
+                    succeeded=False,
+                )
+            return
 
         if error is not None:
+            if group_reservation_token and group_turn_id:
+                await self._managed_channel_service.settle_group_context(
+                    group_reservation_token,
+                    turn_id=group_turn_id,
+                    succeeded=False,
+                )
             # Send error back to channel
             await self._send_error(message, config, error.message)
+        elif group_reservation_token and group_turn_id:
+            # The durable store already settled this in the admission transaction.
+            # This idempotent fallback covers tests and non-durable scheduler modes.
+            await self._managed_channel_service.settle_group_context(
+                group_reservation_token,
+                turn_id=group_turn_id,
+                succeeded=True,
+            )
 
         logger.info(
             "channel inbound: turn submitted",
@@ -508,6 +795,70 @@ class InboundPipeline:
                     "conversation_id": conversation_id,
                 }
             },
+        )
+
+    async def _record_observed_target(
+        self,
+        message: InboundMessage,
+        config: ChannelAccountConfig,
+    ) -> None:
+        """Persist controller-observed routing data for outbound channel tools."""
+
+        if self._observed_target_recorder is not None:
+            await self._observed_target_recorder.record(message, config)
+
+    async def _admit_executor_inbound(self, owner: Any | None) -> bool:
+        """Transactionally revalidate the originating executor before persistence."""
+
+        if owner is None:
+            return True
+        from cognis.core.executor_connection_ownership import ExecutorConnectionOwnership
+
+        async with self._session_factory() as session:
+            if not await ExecutorConnectionOwnership.lock_current(session, owner):
+                await session.rollback()
+                return False
+            await session.commit()
+            return True
+
+    @staticmethod
+    def _executor_admission_guard(owner: Any | None) -> Any | None:
+        if owner is None:
+            return None
+
+        async def _guard(session: Any) -> bool:
+            from cognis.core.executor_connection_ownership import (
+                ExecutorConnectionOwnership,
+            )
+
+            return await ExecutorConnectionOwnership.lock_current(session, owner)
+
+        return _guard
+
+    async def _run_executor_durable(
+        self,
+        owner: Any | None,
+        callback: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[bool, Any]:
+        if owner is None:
+            return True, await callback(*args, **kwargs)
+        ownership = getattr(self, "_executor_connection_ownership", None)
+        if ownership is None:
+            from cognis.core.executor_connection_ownership import (
+                ExecutorConnectionOwnership,
+            )
+
+            ownership = ExecutorConnectionOwnership(
+                self._session_factory,
+                owner.owner_id,
+            )
+        return await ownership.run_durable_callback_if_current(
+            owner,
+            callback,
+            *args,
+            **kwargs,
         )
 
     async def _mark_read(
@@ -585,6 +936,22 @@ class InboundPipeline:
 
         return True
 
+    @staticmethod
+    def _check_group_context_access(
+        message: InboundMessage,
+        config: ChannelAccountConfig,
+        policy: GroupContextPolicy,
+    ) -> bool:
+        """Allow silent capture only for an enabled, authorized group route."""
+
+        if not policy.enabled or message.chat_type != "group" or message.is_bot_output:
+            return False
+        if config.group_policy == "disabled":
+            return False
+        if config.group_policy == "allowlist":
+            return message.sender_id in config.allowed_senders
+        return True
+
     # ------------------------------------------------------------------
     # Identity mapping
     # ------------------------------------------------------------------
@@ -593,6 +960,9 @@ class InboundPipeline:
         self,
         message: InboundMessage,
         config: ChannelAccountConfig,
+        *,
+        executor_connection_owner: Any | None = None,
+        allow_pairing_challenge: bool = True,
     ) -> str | None:
         """Map an external sender to a Cognis user email.
 
@@ -610,16 +980,27 @@ class InboundPipeline:
         async with self._session_factory() as session:
             contact = await get_channel_contact(session, message.channel_type, message.sender_id)
             if contact is not None and contact.verified:
+                message.platform_data["_sender_verified_owner"] = (
+                    contact.user_email == config.user_email
+                )
                 return contact.user_email
 
         if policy == "pairing" and _is_unmentioned_matrix_thread_followup(message):
             return None
 
-        if policy == "pairing":
-            return await self._pairing_service.ensure_verified_sender(
-                message=message, config=config
-            )
+        if policy == "pairing" and not allow_pairing_challenge:
+            return None
 
+        if policy == "pairing":
+            user_email = await self._pairing_service.ensure_verified_sender(
+                message=message,
+                config=config,
+                executor_connection_owner=executor_connection_owner,
+            )
+            message.platform_data["_sender_verified_owner"] = user_email == config.user_email
+            return user_email
+
+        message.platform_data["_sender_verified_owner"] = False
         return config.user_email
 
     # ------------------------------------------------------------------
@@ -675,12 +1056,17 @@ class InboundPipeline:
         conversation_id: str,
         channel_type: str,
         assistant_delivery_mode: str,
+        executor_connection_owner: Any | None = None,
     ) -> None:
         """Keep existing channel conversation context aligned with channel delivery settings."""
 
         from cognis.store.queries import get_conversation, update_conversation_context_data
 
         async with self._session_factory() as session:
+            guard = self._executor_admission_guard(executor_connection_owner)
+            if guard is not None and not await guard(session):
+                await session.rollback()
+                return
             conversation = await get_conversation(session, conversation_id)
             if conversation is None:
                 return
@@ -974,6 +1360,7 @@ class InboundPipeline:
         user_email: str,
         context_ref: str,
         assistant_delivery_mode: str,
+        executor_connection_owner: Any | None = None,
     ) -> str | None:
         from cognis.api.serializers import agent_to_response
         from cognis.models.agent import AgentDefinition
@@ -1003,6 +1390,7 @@ class InboundPipeline:
                 "forked_from_platform_event_id": matched_event_id,
                 "thread_id": message.thread_id,
             },
+            admission_guard=self._executor_admission_guard(executor_connection_owner),
         )
         return conversation.conversation_id
 
@@ -1011,6 +1399,8 @@ class InboundPipeline:
         message: InboundMessage,
         config: ChannelAccountConfig,
         user_email: str,
+        *,
+        executor_connection_owner: Any | None = None,
     ) -> str | None:
         """Find or create a conversation for this channel message.
 
@@ -1028,6 +1418,7 @@ class InboundPipeline:
                 conversation_id=config.default_conversation_id,
                 channel_type=message.channel_type,
                 assistant_delivery_mode=assistant_delivery_mode,
+                executor_connection_owner=executor_connection_owner,
             )
             return config.default_conversation_id
 
@@ -1043,6 +1434,7 @@ class InboundPipeline:
                     conversation_id=existing.conversation_id,
                     channel_type=message.channel_type,
                     assistant_delivery_mode=assistant_delivery_mode,
+                    executor_connection_owner=executor_connection_owner,
                 )
             return existing.conversation_id
 
@@ -1079,7 +1471,9 @@ class InboundPipeline:
                 )
                 if source is not None:
                     source_session_row, cutoff_seq, matched_id = source
-                    forked_id = await self._fork_thread_conversation(
+                    fork_admitted, forked_id = await self._run_executor_durable(
+                        executor_connection_owner,
+                        self._fork_thread_conversation,
                         room_conversation=room_conversation,
                         source_session_row=source_session_row,
                         cutoff_seq=cutoff_seq,
@@ -1088,7 +1482,10 @@ class InboundPipeline:
                         user_email=user_email,
                         context_ref=context_ref,
                         assistant_delivery_mode=assistant_delivery_mode,
+                        executor_connection_owner=None,
                     )
+                    if not fork_admitted:
+                        return None
                     if forked_id is not None:
                         return forked_id
                 logger.info(
@@ -1115,6 +1512,7 @@ class InboundPipeline:
                 ),
                 title=message.chat_name or f"{message.channel_type} chat",
                 title_source="channel_seed",
+                admission_guard=self._executor_admission_guard(executor_connection_owner),
             )
             return conversation.conversation_id
         except Exception:
@@ -1218,8 +1616,14 @@ class InboundPipeline:
         conversation_model = _to_conversation_model(conversation_row)
         session_model = _to_session_model(session_row)
         session_model.channel_default_agent_profile_id = channel_default_agent_profile_id
-        has_active = self._turn_scheduler.has_running_turn(conversation_id)
-        has_busy = self._turn_scheduler.has_active_turn(conversation_id)
+        durable_running = getattr(self._turn_scheduler, "durable_running_turn_state", None)
+        runtime_turn = (
+            await durable_running(conversation_id)
+            if callable(durable_running)
+            else self._turn_scheduler.running_turn_state(conversation_id)
+        )
+        has_active = runtime_turn is not None
+        has_busy = has_active or self._turn_scheduler.has_active_turn(conversation_id)
 
         return await self._command_dispatcher.dispatch(
             content,
@@ -1308,8 +1712,9 @@ class InboundPipeline:
         self,
         *,
         message: InboundMessage,
-        conversation_id: str,
+        conversation_id: str | None,
         user_email: str,
+        executor_connection_owner: Any | None = None,
     ) -> tuple[list[AttachmentRef], int]:
         """Download and store channel media attachments.
 
@@ -1343,7 +1748,7 @@ class InboundPipeline:
                         and str(attachment.mime_type or "").startswith("audio/")
                         and hasattr(adapter, "download_attachment_for_stt")
                     ):
-                        fetched = await adapter.download_attachment_for_stt(  # type: ignore[attr-defined]
+                        fetched = await adapter.download_attachment_for_stt(
                             message,
                             attachment,
                             supported_mime_types=stt_supported_mime_types,
@@ -1356,6 +1761,10 @@ class InboundPipeline:
                     content, content_type, filename = fetched
                     kind = _kind_for_media(content_type)
                     artifact_id = manager._artifact_store.generate_id("att")  # noqa: SLF001
+                    guard = self._executor_admission_guard(executor_connection_owner)
+                    if guard is not None and not await guard(session):
+                        await session.rollback()
+                        return [], len(message.media)
                     await manager._artifact_store.async_save(  # noqa: SLF001
                         "attachments",
                         artifact_id,
@@ -1379,6 +1788,7 @@ class InboundPipeline:
                         conversation_id=conversation_id,
                         message_role="user",
                     )
+                    await session.commit()
                     refs.append(
                         AttachmentRef(
                             artifact_id=artifact_id,
@@ -1392,6 +1802,7 @@ class InboundPipeline:
                         )
                     )
                 except Exception:
+                    await session.rollback()
                     logger.warning(
                         "channel inbound: failed to normalize attachment",
                         extra={
@@ -1408,7 +1819,6 @@ class InboundPipeline:
                         raise
                     failed_count += 1
                     continue
-            await session.commit()
         return refs, failed_count
 
 
@@ -1450,6 +1860,7 @@ class ChannelTurnObserver:
         reply_to_id: str | None = None,
         channel_manager_ref: Any,
         assistant_delivery_mode: str = _ASSISTANT_DELIVERY_MODE_CONCATENATED,
+        channel_delivery: ChannelDeliveryDescriptor | None = None,
     ) -> None:
         self._channel_type = channel_type
         self._account_id = account_id
@@ -1463,6 +1874,7 @@ class ChannelTurnObserver:
         self._typing_sent = False
         self._turn_active = False
         self._assistant_delivery_mode = _normalize_assistant_delivery_mode(assistant_delivery_mode)
+        self._channel_delivery = channel_delivery
 
     async def on_token(
         self,
@@ -1509,6 +1921,14 @@ class ChannelTurnObserver:
             self._assistant_delivery_mode == _ASSISTANT_DELIVERY_MODE_IMMEDIATE
             and self._accumulated_text
         ):
+            if self._channel_delivery is not None:
+                try:
+                    await self._turn_scheduler._assert_durable_conversation_fence(  # noqa: SLF001
+                        self._conversation_id
+                    )
+                except Exception:
+                    self._accumulated_text = ""
+                    return
             adapter = self._get_adapter()
             if adapter is not None:
                 await self._send_text(
@@ -1639,6 +2059,13 @@ class ChannelTurnObserver:
             return
         # Remove self from observers
         self._turn_scheduler_remove()
+
+        # Durable direct turns publish their terminal content through the
+        # fenced outbox. The observer remains responsible only for live
+        # partials/typing while the local fence is current.
+        if self._channel_delivery is not None:
+            self._accumulated_text = ""
+            return
 
         adapter = self._get_adapter()
         if adapter is None:
@@ -1855,6 +2282,8 @@ class ChannelTurnObserver:
         if not self._turn_active:
             return
         self._turn_scheduler_remove()
+        if self._channel_delivery is not None:
+            return
 
         adapter = self._get_adapter()
         if adapter is None:
@@ -1875,7 +2304,18 @@ class ChannelTurnObserver:
                 )
             )
 
-    async def on_system_message(self, conversation_id: str, text: str) -> None:
+    async def on_system_message(
+        self,
+        conversation_id: str,
+        text: str,
+        notice_id: str | None = None,
+        kind: str | None = None,
+        scope: str | None = None,
+        turn_id: str | None = None,
+        retry_reason: str | None = None,
+        retry_source_turn_id: str | None = None,
+        attempt: int | None = None,
+    ) -> None:
         """Forward system messages to the channel."""
         adapter = self._get_adapter()
         if adapter is None:

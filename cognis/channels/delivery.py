@@ -24,11 +24,20 @@ from cognis.channels.formatting import split_message
 from cognis.channels.protocol import (
     CHANNEL_DELIVERY_ERRORS,
     CHANNEL_OUTBOUND_TOTAL,
+    NonRetryableChannelError,
 )
 from cognis.channels.rich_markdown import (
     render_rich_markdown,
+    render_rich_media_fallbacks,
     render_text_markdown,
     rich_media_manifest,
+)
+from cognis.channels.route_admission import active_managed_binding_id, lock_channel_route
+from cognis.core.artifact_inputs import (
+    authorize_outbound_artifact_refs_in_session,
+    outbound_artifact_grant_is_valid,
+    safe_attachment_metadata,
+    validate_outbound_attachment_batch,
 )
 from cognis.core.deliverable_links import (
     DeliverableShareUnavailable,
@@ -39,7 +48,8 @@ from cognis.core.deliverable_links import (
 from cognis.core.deliverable_media import resolve_deliverable_media
 from cognis.core.events import Event, EventBus, EventType
 from cognis.logging import get_logger
-from cognis.models.channel import MediaAttachment, OutboundMessage
+from cognis.models.channel import ChannelDeliveryDescriptor, MediaAttachment, OutboundMessage
+from cognis.store.models import ChannelDeliveryOutboxRow
 from cognis.store.queries import (
     get_agent_direct_conversation,
     get_conversation,
@@ -51,7 +61,7 @@ from cognis.store.queries import (
 logger = get_logger(__name__)
 
 ChunkStartCallback = Callable[[int, int, str, bool], Awaitable[bool]]
-ChunkProgressCallback = Callable[[int, int, str], Awaitable[bool]]
+ChunkProgressCallback = Callable[[int, int, str, dict[str, Any]], Awaitable[bool]]
 
 _DELIVERY_LEASE_DURATION = timedelta(minutes=2)
 _DELIVERY_LEASE_HEARTBEAT_SECONDS = 30.0
@@ -74,13 +84,21 @@ class ChannelDeliveryStatus(StrEnum):
     SENT = "sent"
     INCOMPLETE = "incomplete"
     PARTIAL = "partial"
+    UNAVAILABLE = "unavailable"
     FAILED = "failed"
     UNCERTAIN = "uncertain"
+    PERMANENT = "permanent"
 
 
 _TASK_FINAL_SOURCE_TYPE = "task_final_result"
 _TASK_RESULT_FOLLOW_UP_SOURCE_TYPE = "task_result_follow_up"
 _FOLLOW_UP_RESULT_SOURCE_TYPE = "follow_up_result"
+_MANAGED_DELIVERY_MAX_ATTEMPTS = 3
+_MANAGED_DELIVERY_MAX_PENDING_AGE = timedelta(minutes=5)
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _append_attachment_fallback(content: str, fallback_lines: list[str]) -> str:
@@ -95,17 +113,9 @@ def _append_attachment_fallback(content: str, fallback_lines: list[str]) -> str:
 
 
 def _attachment_fallback_text(raw: dict[str, Any]) -> str | None:
-    raw_url = raw.get("url")
     raw_filename = raw.get("filename")
-    raw_mime_type = raw.get("mime_type")
-    url = raw_url if isinstance(raw_url, str) else None
     filename = raw_filename if isinstance(raw_filename, str) else None
-    mime_type = raw_mime_type if isinstance(raw_mime_type, str) else None
-    if url and mime_type and mime_type.startswith("image/"):
-        return url
-    if url and filename:
-        return f"{filename}\n{url}"
-    return url or filename
+    return f"[Attachment unavailable: {filename}]" if filename else None
 
 
 async def prepare_media_attachments(
@@ -116,6 +126,11 @@ async def prepare_media_attachments(
     owner_email: str | None = None,
     conversation_id: str | None = None,
 ) -> tuple[list[MediaAttachment], list[str], bool]:
+    try:
+        validate_outbound_attachment_batch(media)
+    except ValueError:
+        logger.warning("channel delivery: outbound attachment policy rejected the batch")
+        return [], [], True
     prepared: list[MediaAttachment] = []
     fallback_lines: list[str] = []
     had_failures = False
@@ -156,9 +171,9 @@ async def _materialize_media_attachment(
                 row = await get_artifact_record(session, artifact_id)
                 authorized = await _artifact_authorized_for_delivery(
                     session,
+                    attachment=raw,
                     artifact=row,
                     owner_email=owner_email,
-                    conversation_id=conversation_id,
                 )
         except Exception:
             logger.warning("channel delivery: attachment authorization failed", exc_info=True)
@@ -189,27 +204,17 @@ async def _materialize_media_attachment(
             )
         except Exception:
             logger.warning("channel delivery: failed to materialize attachment", exc_info=True)
-            if isinstance(raw.get("url"), str) and not safe_image_only:
-                return (
-                    MediaAttachment(
-                        url=raw["url"],
-                        mime_type=raw.get("mime_type")
-                        if isinstance(raw.get("mime_type"), str)
-                        else None,
-                        filename=raw.get("filename")
-                        if isinstance(raw.get("filename"), str)
-                        else None,
-                        size_bytes=raw.get("size_bytes")
-                        if isinstance(raw.get("size_bytes"), int)
-                        else None,
-                    ),
-                    None,
-                    True,
-                )
             return None, _attachment_fallback_text(raw), False
+        if (
+            len(content) != row.size_bytes
+            or len(content) != raw.get("size_bytes")
+            or _ct.casefold() != row.mime_type.casefold()
+        ):
+            logger.warning("channel delivery: attachment metadata/content mismatch")
+            return None, None, False
         return (
             MediaAttachment(
-                url=raw.get("url") if isinstance(raw.get("url"), str) else None,
+                url=None,
                 mime_type=getattr(row, "mime_type", None),
                 filename=(raw.get("filename") if isinstance(raw.get("filename"), str) else None)
                 or row.filename,
@@ -222,6 +227,13 @@ async def _materialize_media_attachment(
             None,
             True,
         )
+    if content_b64 is not None:
+        try:
+            decoded = base64.b64decode(content_b64, validate=True)
+        except Exception:
+            return None, None, False
+        if len(decoded) != raw.get("size_bytes"):
+            return None, None, False
     if content_b64 is None and not isinstance(raw.get("url"), str):
         return None, _attachment_fallback_text(raw), False
     return (
@@ -240,18 +252,18 @@ async def _materialize_media_attachment(
 async def _artifact_authorized_for_delivery(
     session: AsyncSession,
     *,
+    attachment: dict[str, Any],
     artifact: Any | None,
     owner_email: str | None,
-    conversation_id: str | None,
 ) -> bool:
     """Authorize a channel attachment before loading its stored bytes."""
-    from cognis.core.artifact_access import artifact_authorized_for_conversation
-
-    return await artifact_authorized_for_conversation(
+    if not isinstance(owner_email, str):
+        return False
+    return await outbound_artifact_grant_is_valid(
         session,
+        attachment=attachment,
         artifact=artifact,
         owner_email=owner_email,
-        conversation_id=conversation_id,
     )
 
 
@@ -277,6 +289,8 @@ class ChannelDeliveryService:
         self._turn_scheduler = turn_scheduler
         self._public_base_url = public_base_url.rstrip("/")
         self._retry_task: asyncio.Task[None] | None = None
+        self._managed_channel_service: Any | None = None
+        self._recipient_resolution_service: Any | None = None
 
         # Subscribe to relevant events
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_task_event)
@@ -288,6 +302,16 @@ class ChannelDeliveryService:
         event_bus.subscribe(EventType.TURN_ERROR, self._handle_turn_error_event)
         event_bus.subscribe(EventType.SCHEDULE_ERROR, self._handle_schedule_event)
         event_bus.subscribe(EventType.SCHEDULE_DISABLED, self._handle_schedule_event)
+
+    def set_managed_channel_service(self, service: Any) -> None:
+        """Attach managed-final lifecycle settlement without a constructor cycle."""
+
+        self._managed_channel_service = service
+
+    def set_recipient_resolution_service(self, service: Any) -> None:
+        """Attach the singleton explicit-recipient recovery service."""
+
+        self._recipient_resolution_service = service
 
     async def start(self) -> None:
         """Start lightweight in-process retry loop."""
@@ -346,6 +370,59 @@ class ChannelDeliveryService:
         )
         return status == ChannelDeliveryStatus.SENT
 
+    async def deliver_fenced_direct_turn(
+        self,
+        *,
+        request_id: str,
+        lease: Any,
+        descriptor: ChannelDeliveryDescriptor,
+        content: str,
+        attachments: list[dict[str, Any]] | None,
+        error: bool = False,
+    ) -> ChannelDeliveryStatus:
+        """Persist and signal a fenced direct-turn terminal delivery."""
+        from cognis.store.direct_turns import DirectTurnStore
+        from cognis.store.queries import get_channel_delivery_outbox
+
+        store = DirectTurnStore(self._session_factory)
+        request = await store.get(request_id)
+        if request is None:
+            return ChannelDeliveryStatus.UNAVAILABLE
+        async with self._session_factory() as session:
+            authorized_attachments = await authorize_outbound_artifact_refs_in_session(
+                session,
+                attachments or [],
+                user_email=request.user_id,
+                conversation_id=request.conversation_id,
+            )
+        suffix = "error" if error else "final"
+        delivery_id = f"direct-turn:{request_id}:{suffix}"
+        row = await store.create_fenced_channel_delivery(
+            request_id=request_id,
+            lease=lease,
+            delivery_id=delivery_id,
+            descriptor=descriptor.model_dump(mode="json"),
+            content=content,
+            attachments=authorized_attachments,
+        )
+        if row is None:
+            return ChannelDeliveryStatus.UNAVAILABLE
+        await self._deliver_outbox(
+            delivery_id=row.delivery_id,
+            final_content=None,
+            fallback_text=None,
+            attachments=None,
+            ignore_next_attempt=True,
+        )
+        async with self._session_factory() as session:
+            current = await get_channel_delivery_outbox(session, row.delivery_id)
+        if current is None:
+            return ChannelDeliveryStatus.UNAVAILABLE
+        try:
+            return ChannelDeliveryStatus(current.status)
+        except ValueError:
+            return ChannelDeliveryStatus.FAILED
+
     async def deliver_task_to_conversation(
         self,
         conversation_id: str,
@@ -380,6 +457,12 @@ class ChannelDeliveryService:
             )
             if existing is None:
                 channel_type, account_id, chat_id, thread_id, user_email = route
+                authorized_attachments = await authorize_outbound_artifact_refs_in_session(
+                    session,
+                    attachments or [],
+                    user_email=user_email,
+                    conversation_id=conversation_id,
+                )
                 stable_key = hashlib.sha256(
                     f"{_TASK_FINAL_SOURCE_TYPE}:{task_id}:{conversation_id}".encode()
                 ).hexdigest()[:20]
@@ -396,19 +479,20 @@ class ChannelDeliveryService:
                     chat_id=chat_id,
                     thread_id=thread_id,
                     fallback_text=content,
-                    attachments=attachments,
+                    attachments=authorized_attachments,
                     deliverable_id=deliverable_id,
                     next_attempt_at=datetime.now(UTC),
                 )
                 await session.commit()
+                attachments = authorized_attachments
             delivery_id = existing.delivery_id
 
         await self._deliver_outbox(
             delivery_id=delivery_id,
-            final_content=content,
-            fallback_text=content,
-            attachments=attachments,
-            deliverable_id=deliverable_id,
+            final_content=None,
+            fallback_text=None,
+            attachments=None,
+            deliverable_id=None,
             ignore_next_attempt=True,
         )
         async with self._session_factory() as session:
@@ -420,6 +504,16 @@ class ChannelDeliveryService:
         except ValueError:
             return ChannelDeliveryStatus.FAILED
 
+    async def deliver_managed_channel_final(self, delivery_id: str) -> None:
+        """Attempt one already-persisted, fenced managed-channel final."""
+
+        await self._deliver_outbox(
+            delivery_id=delivery_id,
+            final_content=None,
+            fallback_text=None,
+            ignore_next_attempt=True,
+        )
+
     async def _send_to_route(
         self,
         *,
@@ -427,6 +521,7 @@ class ChannelDeliveryService:
         account_id: str,
         chat_id: str,
         thread_id: str | None,
+        reply_to_id: str | None = None,
         content: str,
         media: list[dict[str, Any]] | None = None,
         deliverable_id: str | None = None,
@@ -439,6 +534,7 @@ class ChannelDeliveryService:
         delivery_owner_email: str | None = None,
         delivery_conversation_id: str | None = None,
         workflow_task_id: str | None = None,
+        reject_active_managed_binding: bool = False,
     ) -> ChannelDeliveryStatus:
         """Send content to a resolved channel route.
 
@@ -449,11 +545,19 @@ class ChannelDeliveryService:
 
         manager = self._channel_manager_ref()
         if manager is None:
-            return ChannelDeliveryStatus.FAILED
+            logger.warning(
+                "channel delivery: channel manager unavailable",
+                extra={"extra_data": {"channel_type": channel_type, "account_id": account_id}},
+            )
+            return ChannelDeliveryStatus.UNAVAILABLE
 
         result = manager.find_adapter_for_channel(channel_type, account_id)
         if result is None:
-            return ChannelDeliveryStatus.FAILED
+            logger.warning(
+                "channel delivery: channel adapter unavailable",
+                extra={"extra_data": {"channel_type": channel_type, "account_id": account_id}},
+            )
+            return ChannelDeliveryStatus.UNAVAILABLE
 
         adapter, config = result
 
@@ -568,31 +672,57 @@ class ChannelDeliveryService:
                     f"{delivery_idempotency_key}:{projection_digest}:{index}".encode()
                 ).hexdigest()
             try:
-                message_id = await adapter.send_message(
-                    OutboundMessage(
-                        channel_type=channel_type,
-                        account_id=account_id,
-                        chat_id=chat_id,
-                        content=chunk,
-                        thread_id=thread_id,
-                        media=outbound_media if index == 0 else [],
-                        platform_data=(
-                            {
-                                **(
-                                    {"idempotency_key": idempotency_key}
-                                    if idempotency_key is not None
-                                    else {}
-                                ),
-                                **(
-                                    {"canonical_rich_markdown": True}
-                                    if deliverable_projection is not None
-                                    and deliverable_projection.rich
-                                    else {}
-                                ),
-                            }
-                        ),
-                    )
+                outbound = OutboundMessage(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                    chat_id=chat_id,
+                    content=chunk,
+                    reply_to_id=reply_to_id,
+                    thread_id=thread_id,
+                    media=outbound_media if index == 0 else [],
+                    platform_data=(
+                        {
+                            **(
+                                {"idempotency_key": idempotency_key}
+                                if idempotency_key is not None
+                                else {}
+                            ),
+                            **(
+                                {"canonical_rich_markdown": True}
+                                if deliverable_projection is not None
+                                and deliverable_projection.rich
+                                else {}
+                            ),
+                        }
+                    ),
                 )
+                if reject_active_managed_binding:
+                    if delivery_owner_email is None:
+                        return ChannelDeliveryStatus.PERMANENT
+                    async with self._session_factory() as session:
+                        try:
+                            route_account = await lock_channel_route(session, account_id)
+                        except ValueError:
+                            return ChannelDeliveryStatus.PERMANENT
+                        if (
+                            route_account.user_email != delivery_owner_email
+                            or not route_account.enabled
+                            or route_account.channel_type != channel_type
+                            or not route_account.allow_new_conversations
+                            or await active_managed_binding_id(
+                                session,
+                                user_email=delivery_owner_email,
+                                account_id=account_id,
+                                chat_id=chat_id,
+                                thread_id=thread_id,
+                            )
+                            is not None
+                        ):
+                            return ChannelDeliveryStatus.PERMANENT
+                        message_id = await adapter.send_message(outbound)
+                        await session.commit()
+                else:
+                    message_id = await adapter.send_message(outbound)
                 if (channel_type == "signal" or chunk_idempotent) and (
                     not isinstance(message_id, str) or not message_id.strip()
                 ):
@@ -608,6 +738,13 @@ class ChannelDeliveryService:
                             index + 1,
                             len(chunks),
                             projection_digest,
+                            {
+                                "chunk_index": index,
+                                "content": chunk,
+                                "sent_at": datetime.now(UTC).isoformat(),
+                                "external_message_id": message_id,
+                                "attachments_delivered": chunk_has_media,
+                            },
                         )
                     except Exception:
                         logger.exception(
@@ -624,7 +761,35 @@ class ChannelDeliveryService:
                             if chunk_idempotent
                             else ChannelDeliveryStatus.UNCERTAIN
                         )
-            except Exception:
+            except NonRetryableChannelError as exc:
+                logger.error(
+                    "channel delivery: permanent adapter failure",
+                    extra={
+                        "extra_data": {
+                            "channel_type": channel_type,
+                            "account_id": account_id,
+                            "exception": str(exc)[:500],
+                        }
+                    },
+                )
+                CHANNEL_DELIVERY_ERRORS.labels(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                ).inc()
+                return ChannelDeliveryStatus.PERMANENT
+            except Exception as exc:
+                logger.warning(
+                    "channel delivery: adapter send failed",
+                    extra={
+                        "extra_data": {
+                            "channel_type": channel_type,
+                            "account_id": account_id,
+                            "exception_type": type(exc).__name__,
+                            "exception": str(exc)[:500],
+                        }
+                    },
+                    exc_info=True,
+                )
                 CHANNEL_DELIVERY_ERRORS.labels(
                     channel_type=channel_type,
                     account_id=account_id,
@@ -807,7 +972,10 @@ class ChannelDeliveryService:
 
         async with self._session_factory() as session:
             grace_row = await get_channel_delivery_outbox(session, grace_delivery_id)
-        if grace_row is not None and grace_row.source_type != "follow_up":
+        if grace_row is not None and grace_row.source_type not in {
+            "follow_up",
+            "task_result_follow_up",
+        }:
             await self._deliver_outbox(
                 delivery_id=grace_delivery_id,
                 final_content=final_content.strip() or None,
@@ -862,6 +1030,15 @@ class ChannelDeliveryService:
             return None
         try:
             async with self._session_factory() as session:
+                conversation = await get_conversation(session, conversation_id)
+                if conversation is None:
+                    return None
+                authorized_attachments = await authorize_outbound_artifact_refs_in_session(
+                    session,
+                    attachments or [],
+                    user_email=conversation.user_email,
+                    conversation_id=conversation_id,
+                )
                 row = await ensure_follow_up_result_delivery(
                     session,
                     grace_delivery_id=grace_delivery_id,
@@ -873,7 +1050,7 @@ class ChannelDeliveryService:
                     ),
                     turn_id=turn_id,
                     final_content=final_content,
-                    attachments=attachments,
+                    attachments=authorized_attachments,
                     deliverable_id=deliverable_id,
                 )
                 await session.commit()
@@ -1145,6 +1322,10 @@ class ChannelDeliveryService:
         )
 
         now = datetime.now(UTC)
+        if self._recipient_resolution_service is not None:
+            await self._recipient_resolution_service.recover_pending()
+        if self._managed_channel_service is not None:
+            await self._managed_channel_service.reconcile_pending_deliveries()
         async with self._session_factory() as session:
             stale = await list_channel_delivery_outbox_stale_sending(session, now=now)
             for row in stale:
@@ -1184,10 +1365,26 @@ class ChannelDeliveryService:
                     )
             await session.commit()
 
+        if self._managed_channel_service is not None:
+            await self._managed_channel_service.reconcile_pending_deliveries()
         async with self._session_factory() as session:
             due = await list_channel_delivery_outbox_due(session, now=now)
 
         for row in due:
+            if (
+                row.source_type == "managed_channel_final"
+                and self._managed_channel_service is not None
+                and _as_utc(row.updated_at) <= now - _MANAGED_DELIVERY_MAX_PENDING_AGE
+            ):
+                abandoned = await self._managed_channel_service.abandon_pending_delivery(
+                    delivery_id=row.delivery_id,
+                    lease_token=None,
+                    reason="channel_delivery_timeout",
+                    outbox_status="suppressed",
+                    expected_outbox_statuses={"pending", "failed"},
+                )
+                if abandoned:
+                    continue
             final_content: str | None = None
             attachments = (
                 [item for item in row.attachments_json if isinstance(item, dict)]
@@ -1196,11 +1393,7 @@ class ChannelDeliveryService:
             )
             deliverable_id = row.deliverable_id if isinstance(row.deliverable_id, str) else None
             if (
-                row.source_type
-                in {
-                    _TASK_FINAL_SOURCE_TYPE,
-                    _TASK_RESULT_FOLLOW_UP_SOURCE_TYPE,
-                }
+                row.source_type == _TASK_FINAL_SOURCE_TYPE
                 and isinstance(row.source_id, str)
                 and row.source_id
             ):
@@ -1270,16 +1463,38 @@ class ChannelDeliveryService:
             mark_channel_delivery_chunk_inflight,
             mark_channel_delivery_chunk_sent,
             mark_channel_delivery_failed,
+            mark_channel_delivery_permanent_failure,
             mark_channel_delivery_sent,
             mark_channel_delivery_uncertain,
+            origin_session_is_in_active_scope,
             renew_channel_delivery_lease,
             set_channel_delivery_attachments,
+            suppress_channel_delivery_outbox,
             update_deliverable_status,
         )
 
         lease_token = f"lease_{uuid.uuid4().hex[:12]}"
         lease_expires_at = datetime.now(UTC) + _DELIVERY_LEASE_DURATION
         async with self._session_factory() as session:
+            pending_row = await session.get(ChannelDeliveryOutboxRow, delivery_id)
+            if pending_row is not None:
+                manager = self._channel_manager_ref()
+                owns_account = getattr(manager, "owns_account", None)
+                if callable(owns_account) and not owns_account(pending_row.account_id):
+                    return
+            if pending_row is not None and pending_row.source_type == "managed_channel_final":
+                from cognis.channels.managed import managed_delivery_fence_valid
+
+                if not await managed_delivery_fence_valid(session, pending_row):
+                    await suppress_channel_delivery_outbox(
+                        session,
+                        delivery_ids=[delivery_id],
+                        reason=None,
+                    )
+                    await session.commit()
+                    return
+            if pending_row is not None:
+                session.expunge(pending_row)
             if attachments:
                 persisted = await set_channel_delivery_attachments(
                     session,
@@ -1296,10 +1511,40 @@ class ChannelDeliveryService:
                 lease_expires_at=lease_expires_at,
                 ignore_next_attempt=ignore_next_attempt,
             )
+            stale_origin = False
+            if row is not None and row.source_type in {
+                "delegation",
+                "task_gate_follow_up",
+                "task_result_follow_up",
+            }:
+                stale_origin = not await origin_session_is_in_active_scope(
+                    session,
+                    conversation_id=row.conversation_id,
+                    origin_session_id=row.session_id,
+                )
+                if stale_origin:
+                    await suppress_channel_delivery_outbox(
+                        session,
+                        delivery_ids=[delivery_id],
+                        reason=None,
+                    )
             await session.commit()
 
-        if row is None:
+        if row is None or stale_origin:
             return
+        if getattr(row, "source_type", None) == "managed_channel_final":
+            from cognis.channels.managed import managed_delivery_fence_valid
+
+            async with self._session_factory() as session:
+                valid = await managed_delivery_fence_valid(session, row)
+                if not valid:
+                    await suppress_channel_delivery_outbox(
+                        session,
+                        delivery_ids=[delivery_id],
+                        reason=None,
+                    )
+                    await session.commit()
+                    return
         stored_attachments = getattr(row, "attachments_json", None)
         if not attachments and isinstance(stored_attachments, list):
             attachments = [item for item in stored_attachments if isinstance(item, dict)]
@@ -1329,6 +1574,36 @@ class ChannelDeliveryService:
         ) -> bool:
             if lease_lost.is_set():
                 return False
+            if row.source_type in {
+                "delegation",
+                "task_gate_follow_up",
+                "task_result_follow_up",
+            }:
+                async with self._session_factory() as session:
+                    if not await origin_session_is_in_active_scope(
+                        session,
+                        conversation_id=row.conversation_id,
+                        origin_session_id=row.session_id,
+                    ):
+                        await suppress_channel_delivery_outbox(
+                            session,
+                            delivery_ids=[delivery_id],
+                            reason=None,
+                        )
+                        await session.commit()
+                        return False
+            if getattr(row, "source_type", None) == "managed_channel_final":
+                from cognis.channels.managed import managed_delivery_fence_valid
+
+                async with self._session_factory() as session:
+                    if not await managed_delivery_fence_valid(session, row):
+                        await suppress_channel_delivery_outbox(
+                            session,
+                            delivery_ids=[delivery_id],
+                            reason=None,
+                        )
+                        await session.commit()
+                        return False
             async with self._session_factory() as session:
                 saved = await mark_channel_delivery_chunk_inflight(
                     session,
@@ -1350,8 +1625,22 @@ class ChannelDeliveryService:
             completed_chunk_count: int,
             projected_chunk_count: int,
             projection_digest: str,
+            receipt: dict[str, Any] | None = None,
         ) -> bool:
             async with self._session_factory() as session:
+                receipt = receipt or {
+                    "chunk_index": completed_chunk_count - 1,
+                    "content": row.fallback_text or "",
+                    "sent_at": datetime.now(UTC).isoformat(),
+                    "external_message_id": None,
+                    "attachments_delivered": completed_chunk_count == 1
+                    and bool(row.attachments_json),
+                }
+                if receipt.get("attachments_delivered") is True:
+                    receipt = {
+                        **receipt,
+                        "attachments": safe_attachment_metadata(row.attachments_json),
+                    }
                 saved = await mark_channel_delivery_chunk_sent(
                     session,
                     delivery_id=delivery_id,
@@ -1360,12 +1649,21 @@ class ChannelDeliveryService:
                     projected_chunk_count=projected_chunk_count,
                     projection_digest=projection_digest,
                     lease_expires_at=datetime.now(UTC) + _DELIVERY_LEASE_DURATION,
+                    receipt=receipt,
                 )
                 if saved:
+                    from cognis.store.queries import promote_channel_recipient_target_on_receipt
+
+                    await promote_channel_recipient_target_on_receipt(
+                        session, delivery_id=delivery_id
+                    )
                     await session.commit()
                 else:
                     await session.rollback()
                 return saved
+
+        managed_binding_id: str | None = None
+        managed_send_lease_token: str | None = None
 
         async def renew_lease() -> None:
             while True:
@@ -1378,6 +1676,15 @@ class ChannelDeliveryService:
                             lease_token=lease_token,
                             lease_expires_at=datetime.now(UTC) + _DELIVERY_LEASE_DURATION,
                         )
+                        if renewed and managed_binding_id and managed_send_lease_token:
+                            from cognis.channels.managed import renew_managed_delivery_lease
+
+                            renewed = await renew_managed_delivery_lease(
+                                session,
+                                binding_id=managed_binding_id,
+                                lease_token=managed_send_lease_token,
+                                expires_at=datetime.now(UTC) + _DELIVERY_LEASE_DURATION,
+                            )
                         if not renewed:
                             await session.rollback()
                             lease_lost.set()
@@ -1393,11 +1700,28 @@ class ChannelDeliveryService:
 
         heartbeat_task = asyncio.create_task(renew_lease())
         try:
+            if getattr(row, "source_type", None) == "managed_channel_final":
+                from cognis.channels.managed import acquire_managed_delivery_lease
+
+                managed_binding_id = row.managed_binding_id
+                managed_send_lease_token = f"mcsend_{uuid.uuid4().hex}"
+                async with self._session_factory() as session:
+                    acquired = await acquire_managed_delivery_lease(
+                        session,
+                        row,
+                        lease_token=managed_send_lease_token,
+                        expires_at=lease_expires_at,
+                    )
+                    if not acquired:
+                        await session.rollback()
+                        return
+                    await session.commit()
             delivery_status = await self._send_to_route(
                 channel_type=row.channel_type,
                 account_id=row.account_id,
                 chat_id=row.chat_id,
                 thread_id=row.thread_id,
+                reply_to_id=getattr(row, "reply_to_id", None),
                 content=content,
                 media=attachments,
                 deliverable_id=deliverable_id,
@@ -1415,6 +1739,9 @@ class ChannelDeliveryService:
                     and isinstance(getattr(row, "source_id", None), str)
                     else None
                 ),
+                reject_active_managed_binding=(
+                    getattr(row, "source_type", None) == "channel_recipient"
+                ),
             )
         except Exception:
             logger.warning(
@@ -1429,9 +1756,75 @@ class ChannelDeliveryService:
             )
             delivery_status = ChannelDeliveryStatus.FAILED
         finally:
+            if managed_binding_id and managed_send_lease_token:
+                from cognis.channels.managed import release_managed_delivery_lease
+
+                async with self._session_factory() as session:
+                    await release_managed_delivery_lease(
+                        session,
+                        binding_id=managed_binding_id,
+                        lease_token=managed_send_lease_token,
+                    )
+                    await session.commit()
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task
+
+        if (
+            getattr(row, "source_type", None) == "managed_channel_final"
+            and self._managed_channel_service is not None
+            and delivery_status == ChannelDeliveryStatus.SENT
+        ):
+            await self._managed_channel_service.complete_pending_delivery(
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+            )
+            return
+        if (
+            getattr(row, "source_type", None) == "managed_channel_final"
+            and self._managed_channel_service is not None
+            and delivery_status
+            in {
+                ChannelDeliveryStatus.UNCERTAIN,
+                ChannelDeliveryStatus.INCOMPLETE,
+                ChannelDeliveryStatus.PERMANENT,
+            }
+        ):
+            await self._managed_channel_service.abandon_pending_delivery(
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+                reason=(
+                    "external_send_outcome_uncertain"
+                    if delivery_status == ChannelDeliveryStatus.UNCERTAIN
+                    else "nonretryable_channel_failure"
+                    if delivery_status == ChannelDeliveryStatus.PERMANENT
+                    else "attachment_materialization_incomplete"
+                ),
+                outbox_status=(
+                    "uncertain"
+                    if delivery_status == ChannelDeliveryStatus.UNCERTAIN
+                    else "suppressed"
+                ),
+            )
+            return
+
+        if (
+            getattr(row, "source_type", None) == "managed_channel_final"
+            and self._managed_channel_service is not None
+            and delivery_status in {ChannelDeliveryStatus.UNAVAILABLE, ChannelDeliveryStatus.FAILED}
+            and int(getattr(row, "attempt_count", 0) or 0) + 1 >= _MANAGED_DELIVERY_MAX_ATTEMPTS
+        ):
+            await self._managed_channel_service.abandon_pending_delivery(
+                delivery_id=delivery_id,
+                lease_token=lease_token,
+                reason=(
+                    "channel_adapter_unavailable"
+                    if delivery_status == ChannelDeliveryStatus.UNAVAILABLE
+                    else "channel_send_failed"
+                ),
+                outbox_status="suppressed",
+            )
+            return
 
         async with self._session_factory() as session:
             if delivery_status == ChannelDeliveryStatus.SENT:
@@ -1457,6 +1850,13 @@ class ChannelDeliveryService:
                     lease_token=lease_token,
                     last_error="external_send_outcome_uncertain",
                 )
+            elif delivery_status == ChannelDeliveryStatus.PERMANENT:
+                await mark_channel_delivery_permanent_failure(
+                    session,
+                    delivery_id=delivery_id,
+                    lease_token=lease_token,
+                    last_error="nonretryable_channel_failure",
+                )
             else:
                 await mark_channel_delivery_failed(
                     session,
@@ -1465,6 +1865,8 @@ class ChannelDeliveryService:
                     last_error=(
                         "attachment_materialization_incomplete"
                         if delivery_status == ChannelDeliveryStatus.INCOMPLETE
+                        else "channel_adapter_unavailable"
+                        if delivery_status == ChannelDeliveryStatus.UNAVAILABLE
                         else "channel_send_failed"
                     ),
                     next_attempt_at=datetime.now(UTC) + timedelta(minutes=1),
@@ -1624,23 +2026,30 @@ class ChannelDeliveryService:
                                         size_bytes=len(content_bytes),
                                         content_b64=base64.b64encode(content_bytes).decode("ascii"),
                                         disposition="inline",
+                                        media_ref=media_key,
                                     )
                                 )
                 if persisted_assets:
-                    (
-                        persisted_prepared,
-                        _fallback_lines,
-                        had_failures,
-                    ) = await self._prepare_media_attachments(
-                        persisted_assets,
-                        owner_email=owner_email,
-                        conversation_id=conversation_id,
-                    )
-                    prepared.extend(
-                        attachment.model_copy(update={"disposition": "inline"})
-                        for attachment in persisted_prepared
-                    )
-                    media_complete = media_complete and not had_failures
+                    for item in persisted_assets:
+                        (
+                            persisted_prepared,
+                            _fallback_lines,
+                            had_failures,
+                        ) = await self._prepare_media_attachments(
+                            [item],
+                            owner_email=owner_email,
+                            conversation_id=conversation_id,
+                        )
+                        prepared.extend(
+                            attachment.model_copy(
+                                update={
+                                    "disposition": "inline",
+                                    "media_ref": str(item.get("media_ref") or ""),
+                                }
+                            )
+                            for attachment in persisted_prepared
+                        )
+                        media_complete = media_complete and not had_failures
                 projected_media = tuple(prepared)
             markdown = render_rich_markdown(
                 rich_payload,
@@ -1649,6 +2058,8 @@ class ChannelDeliveryService:
                 deliverable_id=deliverable_id,
                 fallback_text=content,
             )
+            if not capabilities.supports_inline_media:
+                markdown = render_rich_media_fallbacks(markdown)
         else:
             markdown = render_text_markdown(
                 content,

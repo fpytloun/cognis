@@ -14,20 +14,23 @@ from __future__ import annotations
 import contextlib
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from cognis.channels.markdown_rendering import markdown_to_plain_text
-from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import BLUEBUBBLES_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
     ChannelCapabilities,
+    ChannelRecipient,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
@@ -35,6 +38,46 @@ logger = get_logger(__name__)
 _MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024  # 50 MB
 _ATTACHMENT_TIMEOUT_S = 60.0
 _API_TIMEOUT_S = 30.0
+_MIN_CHAT_CREATION_VERSION = (0, 4, 0)
+
+
+class BlueBubblesRecipientError(NonRetryableChannelError):
+    """PII-safe recipient resolution failure."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        side_effect_certainty: str = "none",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.side_effect_certainty = side_effect_certainty
+
+
+def _bluebubbles_recipient_capabilities(*, supports_creation: bool) -> ChannelCapabilities:
+    capabilities = BLUEBUBBLES_META.capabilities.model_copy(deep=True)
+    capabilities.recipient_capabilities.address_kinds = [
+        "bluebubbles_chat_guid",
+        "imessage_handle",
+    ]
+    capabilities.recipient_capabilities.supports_resolution = True
+    capabilities.recipient_capabilities.supports_creation = supports_creation
+    return capabilities
+
+
+def _version_tuple(value: Any) -> tuple[int, int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(
+        r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+        r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?",
+        value,
+    )
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +113,7 @@ class BlueBubblesAdapter(BaseChannelAdapter):
     """iMessage adapter via BlueBubbles server REST API + webhooks."""
 
     channel_type = "bluebubbles"
-    capabilities: ChannelCapabilities = BLUEBUBBLES_META.capabilities
+    capabilities: ChannelCapabilities = _bluebubbles_recipient_capabilities(supports_creation=False)
 
     def __init__(self) -> None:
         super().__init__()
@@ -78,6 +121,7 @@ class BlueBubblesAdapter(BaseChannelAdapter):
         self._bb_config: _BlueBubblesConfig | None = None
         self._seen_guids: set[str] = set()
         self._seen_guids_max = 2000
+        self._server_version: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -106,6 +150,7 @@ class BlueBubblesAdapter(BaseChannelAdapter):
             params={"password": self._bb_config.password},
         )
         resp.raise_for_status()
+        await self._probe_server_version()
 
     async def _disconnect(self) -> None:
         """Close HTTP client."""
@@ -116,6 +161,188 @@ class BlueBubblesAdapter(BaseChannelAdapter):
     async def _run(self) -> None:
         """BlueBubbles uses webhooks — no long-running connection needed."""
         await self._stop_event.wait()
+
+    async def _probe_server_version(self) -> None:
+        """Probe the official server-info endpoint without failing connectivity."""
+        if self._client is None or self._bb_config is None:
+            return
+        try:
+            response = await self._client.get(
+                "/api/v1/server/info",
+                params={"password": self._bb_config.password},
+            )
+            if response.status_code == 404:
+                self._server_version = None
+            else:
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("data", payload) if isinstance(payload, dict) else {}
+                self._server_version = _version_tuple(
+                    data.get("server_version") if isinstance(data, dict) else None
+                )
+        except Exception:
+            self._server_version = None
+        self.capabilities = _bluebubbles_recipient_capabilities(
+            supports_creation=self._server_version is not None
+            and self._server_version >= _MIN_CHAT_CREATION_VERSION
+        )
+
+    def _target(self, chat_id: str, chat_kind: str = "direct") -> ResolvedChannelTarget:
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=chat_id,
+            chat_kind=chat_kind,  # type: ignore[arg-type]
+        )
+
+    async def _query_exact_chat(self, handle: str) -> str | None:
+        """Query the official exact-address chat endpoint."""
+        if self._client is None or self._bb_config is None:
+            raise BlueBubblesRecipientError(
+                "account_unavailable", "BlueBubbles account is unavailable"
+            )
+        try:
+            response = await self._client.get(
+                "/api/v1/chat",
+                params={"address": handle, "password": self._bb_config.password},
+            )
+        except Exception as exc:
+            raise BlueBubblesRecipientError(
+                "resolution_unavailable", "BlueBubbles recipient service is unavailable"
+            ) from exc
+        if response.status_code == 404:
+            return None
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise BlueBubblesRecipientError(
+                "resolution_failed",
+                "BlueBubbles chat lookup failed",
+                side_effect_certainty="none",
+            ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BlueBubblesRecipientError(
+                "invalid_response", "BlueBubbles returned an invalid chat"
+            ) from exc
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            candidates: list[dict[str, Any]] = [data]
+        elif isinstance(data, list):
+            candidates = [item for item in data if isinstance(item, dict)]
+        else:
+            candidates = []
+        for chat in candidates:
+            guid = chat.get("guid") or chat.get("chatGuid") or chat.get("chat_guid")
+            if isinstance(guid, str) and guid:
+                return guid
+        return None
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve an iMessage handle, rechecking after uncertain creation."""
+        if recipient.channel_type != self.channel_type:
+            raise BlueBubblesRecipientError("channel_mismatch", "Recipient channel is unsupported")
+        if recipient.address_kind == "bluebubbles_chat_guid":
+            return self._target(recipient.address, recipient.chat_kind or "direct")
+        if recipient.address_kind != "imessage_handle":
+            raise BlueBubblesRecipientError(
+                "unsupported_address", "Recipient address is unsupported"
+            )
+        if not (recipient.allow_resolution or recipient.allow_creation):
+            raise BlueBubblesRecipientError(
+                "resolution_not_authorized", "Recipient resolution is not authorized"
+            )
+
+        existing_guid = await self._query_exact_chat(recipient.address)
+        if existing_guid:
+            return self._target(existing_guid)
+        if not recipient.allow_creation:
+            raise BlueBubblesRecipientError(
+                "recipient_not_found", "BlueBubbles recipient was not found"
+            )
+        if self._server_version is None or self._server_version < _MIN_CHAT_CREATION_VERSION:
+            raise BlueBubblesRecipientError(
+                "creation_unsupported",
+                "BlueBubbles chat creation is unavailable",
+            )
+        if self._client is None or self._bb_config is None:
+            raise BlueBubblesRecipientError(
+                "account_unavailable", "BlueBubbles account is unavailable"
+            )
+        try:
+            response = await self._client.post(
+                "/api/v1/chat/new",
+                params={"password": self._bb_config.password},
+                json={"addresses": [recipient.address]},
+            )
+            if response.status_code in {404, 405}:
+                raise BlueBubblesRecipientError(
+                    "creation_unsupported",
+                    "BlueBubbles chat creation is unavailable",
+                    side_effect_certainty="none",
+                )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if response.status_code in {400, 401, 403}:
+                    raise BlueBubblesRecipientError(
+                        "creation_failed",
+                        "BlueBubbles chat creation failed",
+                        side_effect_certainty="none",
+                    ) from exc
+                raise
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            guid = data.get("guid") if isinstance(data, dict) else None
+            if not isinstance(guid, str) or not guid:
+                raise BlueBubblesRecipientError(
+                    "creation_uncertain",
+                    "BlueBubbles chat creation outcome is uncertain",
+                    side_effect_certainty="uncertain",
+                )
+            return self._target(guid)
+        except BlueBubblesRecipientError as exc:
+            if exc.side_effect_certainty == "none":
+                raise
+            # A successful request with an unusable response is still uncertain.
+            try:
+                verified_guid = await self._query_exact_chat(recipient.address)
+            except Exception as query_exc:
+                raise BlueBubblesRecipientError(
+                    "creation_uncertain",
+                    "BlueBubbles chat creation outcome is uncertain",
+                    side_effect_certainty="uncertain",
+                ) from query_exc
+            if verified_guid:
+                return self._target(verified_guid)
+            raise BlueBubblesRecipientError(
+                "creation_uncertain",
+                "BlueBubbles chat creation outcome is uncertain",
+                side_effect_certainty="uncertain",
+            ) from exc
+        except Exception as exc:
+            # Never retry creation. A single exact re-query is the only safe recovery.
+            try:
+                verified_guid = await self._query_exact_chat(recipient.address)
+            except Exception as query_exc:
+                raise BlueBubblesRecipientError(
+                    "creation_uncertain",
+                    "BlueBubbles chat creation outcome is uncertain",
+                    side_effect_certainty="uncertain",
+                ) from query_exc
+            if verified_guid:
+                return self._target(verified_guid)
+            raise BlueBubblesRecipientError(
+                "creation_uncertain",
+                "BlueBubbles chat creation outcome is uncertain",
+                side_effect_certainty="uncertain",
+            ) from exc
 
     # ------------------------------------------------------------------
     # Outbound — send message

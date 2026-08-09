@@ -8,6 +8,7 @@ instantiate the correct adapter.
 
 from __future__ import annotations
 
+from cognis.channels.recipients import ADDRESS_KINDS
 from cognis.models.channel import (
     ChannelCapabilities,
     ChannelMeta,
@@ -49,6 +50,7 @@ SIGNAL_META = ChannelMeta(
         supports_read_receipts=True,
         supports_media=True,
         supports_markdown=True,
+        inbound_ordering="provider",
         max_message_length=10000,
     ),
     credential_fields=[
@@ -306,7 +308,8 @@ MATRIX_META = ChannelMeta(
         supports_inline_media=True,
         supports_read_receipts=True,
         supports_idempotent_send=True,
-        max_message_length=4000,
+        inbound_ordering="provider",
+        max_message_length=None,
     ),
     credential_fields=[
         CredentialField(
@@ -611,7 +614,30 @@ CHANNEL_REGISTRY: dict[str, ChannelMeta] = {
     "bluebubbles": BLUEBUBBLES_META,
 }
 
+_RECIPIENT_RESOLUTION_CHANNELS = {
+    "telegram",
+    "slack",
+    "matrix",
+    "google_chat",
+    "bluebubbles",
+}
+_RECIPIENT_CREATION_CHANNELS = {
+    "discord",
+    "slack",
+    "matrix",
+}
+_RECIPIENT_DIRECT_ONLY_CHANNELS = {"whatsapp"}
+
 for _meta in CHANNEL_REGISTRY.values():
+    _recipient_capabilities = _meta.capabilities.recipient_capabilities
+    _recipient_capabilities.address_kinds = list(ADDRESS_KINDS.get(_meta.channel_type, ()))
+    _recipient_capabilities.chat_kinds = (
+        ["direct"] if _meta.channel_type in _RECIPIENT_DIRECT_ONLY_CHANNELS else ["direct", "group"]
+    )
+    _recipient_capabilities.supports_resolution = (
+        _meta.channel_type in _RECIPIENT_RESOLUTION_CHANNELS
+    )
+    _recipient_capabilities.supports_creation = _meta.channel_type in _RECIPIENT_CREATION_CHANNELS
     if not any(field.name == "assistant_delivery_mode" for field in _meta.setting_fields):
         _meta.setting_fields.append(_ASSISTANT_DELIVERY_MODE_FIELD.model_copy())
 

@@ -9,6 +9,7 @@ JSON-RPC call over the executor WebSocket.
 from __future__ import annotations
 
 import base64
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -22,15 +23,70 @@ from cognis.models.channel import (
     ChannelAccountConfig,
     ChannelAccountStatus,
     ChannelCapabilities,
+    ChannelRecipient,
     ChannelStatus,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 from cognis.models.config import ProviderHealth
-from cognis.providers.executor.websocket import ExecutorDisconnectedError
+from cognis.providers.executor.websocket import ExecutorDisconnectedError, ExecutorRPCError
 
 logger = get_logger(__name__)
+
+
+_SAFE_RECIPIENT_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
+_SAFE_SIDE_EFFECT_CERTAINTIES = {"none", "uncertain", "known"}
+
+
+def _parse_recipient_error(payload: Any) -> RemoteChannelRecipientError | None:
+    """Parse either an RPC error data object or a result error envelope."""
+    if not isinstance(payload, dict):
+        return None
+    has_envelope = "error" in payload
+    error = payload.get("error", payload)
+    if not isinstance(error, dict):
+        if has_envelope:
+            raise ValueError("invalid structured recipient error")
+        return None
+    if not has_envelope and not any(
+        key in error for key in ("code", "retryable", "side_effect_certainty")
+    ):
+        return None
+    code = error.get("code")
+    retryable = error.get("retryable")
+    certainty = error.get("side_effect_certainty")
+    if (
+        not isinstance(code, str)
+        or not _SAFE_RECIPIENT_ERROR_CODE.fullmatch(code)
+        or not isinstance(retryable, bool)
+        or (certainty is not None and certainty not in _SAFE_SIDE_EFFECT_CERTAINTIES)
+    ):
+        raise ValueError("invalid structured recipient error")
+    return RemoteChannelRecipientError(
+        code,
+        _safe_recipient_error_message(code),
+        retryable=retryable,
+        side_effect_certainty=certainty,
+    )
+
+
+class RemoteChannelRecipientError(RuntimeError):
+    """A structured, PII-safe recipient resolution failure from an executor."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        side_effect_certainty: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.side_effect_certainty = side_effect_certainty
 
 
 class RemoteChannelAdapterProxy:
@@ -52,6 +108,7 @@ class RemoteChannelAdapterProxy:
         self._connection = connection
         self.channel_type = channel_type
         self.capabilities = capabilities
+        self._initial_capabilities = capabilities.model_copy(deep=True)
         self._account_id = account_id
         self._reconnect_connection = reconnect_connection
         self._status = ChannelStatus.DISCONNECTED
@@ -76,7 +133,7 @@ class RemoteChannelAdapterProxy:
         """Send channel.start to the executor."""
         self._status = ChannelStatus.CONNECTING
         try:
-            await self._connection.rpc_call(
+            result = await self._connection.rpc_call(
                 "channel.start",
                 {
                     "account_id": config.account_id,
@@ -98,6 +155,7 @@ class RemoteChannelAdapterProxy:
                 },
                 timeout=30.0,
             )
+            self._update_runtime_capabilities(result)
             self._status = ChannelStatus.CONNECTED
             self._connected_at = datetime.now(UTC)
             logger.info(
@@ -114,6 +172,56 @@ class RemoteChannelAdapterProxy:
             self._status = ChannelStatus.ERROR
             self._last_error = str(exc)[:200]
             raise
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve a recipient on the executor without hiding RPC failures."""
+        result = await self._resolve_recipient_rpc(
+            recipient,
+            resolution_key=resolution_key,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("Executor returned an invalid recipient resolution response")
+        try:
+            structured_error = _parse_recipient_error(result)
+        except ValueError as exc:
+            raise RuntimeError("Executor returned an invalid recipient resolution error") from exc
+        if structured_error is not None:
+            raise structured_error
+        return ResolvedChannelTarget.model_validate(result)
+
+    async def _resolve_recipient_rpc(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> dict[str, Any]:
+        try:
+            return await self._connection.rpc_call(
+                "channel.resolve_recipient",
+                {
+                    "account_id": self._account_id,
+                    "recipient": recipient.model_dump(mode="json"),
+                    "resolution_key": resolution_key,
+                },
+                timeout=30.0,
+            )
+        except ExecutorRPCError as exc:
+            try:
+                structured_error = _parse_recipient_error(exc.data)
+            except ValueError as parse_exc:
+                raise RuntimeError(
+                    "Executor returned an invalid recipient resolution error"
+                ) from parse_exc
+            if structured_error is None:
+                raise RuntimeError(
+                    "Executor returned an invalid recipient resolution error"
+                ) from None
+            raise structured_error from None
 
     async def stop(self) -> None:
         """Send channel.stop to the executor."""
@@ -348,3 +456,79 @@ class RemoteChannelAdapterProxy:
             self._status = ChannelStatus(raw)
         if status_data.get("last_error"):
             self._last_error = str(status_data["last_error"])[:200]
+
+    def _update_runtime_capabilities(self, result: Any) -> None:
+        """Narrow static capabilities to metadata advertised by the executor."""
+        if not isinstance(result, dict) or not isinstance(result.get("capabilities"), dict):
+            return
+        try:
+            advertised = ChannelCapabilities.model_validate(result["capabilities"])
+        except Exception:
+            logger.warning(
+                "remote channel proxy: ignored invalid capability metadata",
+                extra={"extra_data": {"channel_type": self.channel_type}},
+            )
+            return
+
+        base = self._initial_capabilities
+        base_data = base.model_dump()
+        advertised_data = advertised.model_dump()
+        for field in (
+            "supports_threads",
+            "supports_reactions",
+            "supports_edits",
+            "supports_media",
+            "supports_typing",
+            "supports_read_receipts",
+            "supports_markdown",
+            "supports_unicode",
+            "supports_sanitized_html",
+            "supports_inline_media",
+            "supports_buttons",
+            "supports_idempotent_send",
+        ):
+            advertised_data[field] = bool(base_data[field] and advertised_data[field])
+        advertised_data["chat_types"] = [
+            value for value in base_data["chat_types"] if value in advertised_data["chat_types"]
+        ]
+        base_max = base_data["max_message_length"]
+        remote_max = advertised_data["max_message_length"]
+        if base_max is None:
+            advertised_data["max_message_length"] = remote_max
+        elif remote_max is None:
+            advertised_data["max_message_length"] = base_max
+        else:
+            advertised_data["max_message_length"] = min(base_max, remote_max)
+
+        base_recipient = base_data["recipient_capabilities"]
+        remote_recipient = advertised_data["recipient_capabilities"]
+        remote_recipient["address_kinds"] = [
+            value
+            for value in base_recipient["address_kinds"]
+            if value in remote_recipient["address_kinds"]
+        ]
+        remote_recipient["chat_kinds"] = [
+            value
+            for value in base_recipient["chat_kinds"]
+            if value in remote_recipient["chat_kinds"]
+        ]
+        remote_recipient["supports_resolution"] = bool(
+            base_recipient["supports_resolution"] and remote_recipient["supports_resolution"]
+        )
+        remote_recipient["supports_creation"] = bool(
+            base_recipient["supports_creation"] and remote_recipient["supports_creation"]
+        )
+        advertised_data["recipient_capabilities"] = remote_recipient
+        self.capabilities = ChannelCapabilities.model_validate(advertised_data)
+
+
+def _safe_recipient_error_message(code: str) -> str:
+    messages = {
+        "account_not_found": "Recipient account is unavailable",
+        "malformed_request": "Recipient resolution request is malformed",
+        "malformed_recipient": "Recipient data is malformed",
+        "unsupported_resolution": "Recipient resolution is unsupported",
+        "invalid_target": "Executor returned an invalid recipient target",
+        "resolution_failed": "Recipient resolution failed",
+    }
+    return messages.get(code, "Recipient resolution failed")

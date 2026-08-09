@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from html import unescape
 from typing import Any, Protocol
@@ -19,6 +19,8 @@ from cognis.rendering.rich_visuals import (
 )
 
 RICH_MARKDOWN_MAX_CHARS = 120_000
+RICH_MEDIA_MARKER_PREFIX = "<!--cognis-rich-media:"
+RICH_MEDIA_MARKER_SUFFIX = "-->"
 
 _CONTAINER_TYPES = {
     "section",
@@ -41,6 +43,8 @@ class ProjectionContext:
     sources: list[dict[str, Any]]
     full_view_link: DeliverableViewLink | None = None
     assets: list[dict[str, Any]] | None = None
+    rendered_source_urls: set[str] = field(default_factory=set)
+    primary_urls: set[str] = field(default_factory=set)
 
 
 class PresentationProjector(Protocol):
@@ -163,6 +167,7 @@ def render_rich_markdown(
         sources=sources,
         full_view_link=full_view_link,
         assets=_objects(payload.get("assets")),
+        primary_urls=_primary_block_urls(_objects(payload.get("blocks"))),
     )
     metadata = payload.get("metadata")
     presentation = (
@@ -224,6 +229,16 @@ def render_text_markdown(
     return "\n\n".join(section.strip() for section in bounded if section.strip())
 
 
+def render_rich_media_fallbacks(markdown: str) -> str:
+    """Replace internal rich-media anchors with accessible text."""
+
+    return re.sub(
+        rf"{re.escape(RICH_MEDIA_MARKER_PREFIX)}[^:>]+:(.+?){re.escape(RICH_MEDIA_MARKER_SUFFIX)}",
+        lambda match: f"Image: {match.group(1)}",
+        markdown,
+    )
+
+
 class GenericRichProjector:
     """Loss-minimizing renderer for every canonical rich block type."""
 
@@ -240,85 +255,14 @@ class GenericRichProjector:
             sections.append(_heading(title, 1, context))
         sections.extend(_render_block(block, context=context, depth=2) for block in blocks)
         sections = [section for section in sections if section.strip()]
-        if context.sources and not _contains_source_list(blocks):
-            sections.append(_render_sources(context.sources, title="Sources", context=context))
+        remaining_sources = [
+            source
+            for source in context.sources
+            if (_source_url(source) or "") not in context.rendered_source_urls
+        ]
+        if remaining_sources and not _contains_source_list(blocks):
+            sections.append(_render_sources(remaining_sources, title="Sources", context=context))
         return sections
-
-
-class PulseProjector:
-    """Editorial projection for ``metadata.presentation='pulse'`` briefs."""
-
-    def project(
-        self,
-        payload: dict[str, Any],
-        *,
-        title: str,
-        context: ProjectionContext,
-    ) -> list[str]:
-        blocks = _objects(payload.get("blocks"))
-        sections: list[str] = []
-        if blocks and blocks[0].get("type") == "hero":
-            sections.append(_render_block(blocks.pop(0), context=context, depth=1))
-        elif title:
-            sections.append(_heading(title, 1, context))
-
-        deferred_sources: list[dict[str, Any]] = []
-        for block in blocks:
-            block_type = str(block.get("type") or "")
-            children = _child_blocks(block)
-            if (
-                block_type in {"grid", "status_grid"}
-                and children
-                and all(child.get("type") == "metric" for child in children)
-            ):
-                sections.append(_pulse_group("Signals", children, context=context, emoji="◈"))
-                continue
-            if block_type == "columns" and children:
-                labels = ("Lead", "Actions")
-                emojis = ("●", "✓")
-                for index, child in enumerate(children):
-                    label = labels[index] if index < len(labels) else _title(child) or "Brief"
-                    emoji = emojis[index] if index < len(emojis) else ""
-                    sections.append(_pulse_group(label, [child], context=context, emoji=emoji))
-                continue
-            if block_type == "day_agenda":
-                sections.append(_pulse_group("Agenda", [block], context=context, emoji="◷"))
-                continue
-            if block_type == "source_list":
-                deferred_sources.append(block)
-                continue
-
-            normalized_title = _title(block).casefold()
-            if block_type == "section" and _matches_any(
-                normalized_title, "news", "vědět", "vedet", "know"
-            ):
-                sections.append(_pulse_group("News", [block], context=context))
-            elif block_type == "section" and _matches_any(normalized_title, "watch", "sledovat"):
-                sections.append(_pulse_group("Watch", [block], context=context, emoji="◎"))
-            elif block_type == "callout" and _matches_any(normalized_title, "course", "kurz"):
-                sections.append(_pulse_group("Course", [block], context=context))
-            else:
-                sections.append(_render_block(block, context=context, depth=2))
-
-        if deferred_sources:
-            for block in deferred_sources:
-                sections.append(_render_block(block, context=context, depth=2))
-        elif context.sources:
-            sections.append(_render_sources(context.sources, title="Sources", context=context))
-        return [section for section in sections if section.strip()]
-
-
-def _pulse_group(
-    label: str,
-    blocks: list[dict[str, Any]],
-    *,
-    context: ProjectionContext,
-    emoji: str = "",
-) -> str:
-    prefix = f"{emoji} " if emoji else ""
-    parts = [_heading(f"{prefix}{label}", 2, context)]
-    parts.extend(_render_block(block, context=context, depth=3) for block in blocks)
-    return "\n\n".join(part for part in parts if part)
 
 
 def _render_block(
@@ -392,18 +336,22 @@ def _render_block(
             parts.append(f"Status: {status}")
         if description:
             parts.append(_markdown_or_plain(description, context))
-        if href:
+        content_urls = _markdown_urls(content)
+        context.rendered_source_urls.update(content_urls)
+        if href and href not in content_urls:
             parts.append(_link("Read more", href, context))
+            context.rendered_source_urls.add(href)
         refs = _render_source_refs(
             block.get("citations") or block.get("source_ids") or block.get("sources"),
             context=context,
+            exclude_urls=content_urls | ({href} if href else set()),
         )
         if refs:
             parts.append(refs)
         if block_type == "card":
             reference = media_reference(block, context.assets or [])
             if reference:
-                parts.append(f"Image: {reference.alt or reference.ref_id}")
+                parts.append(_media_marker(reference.ref_id, reference.alt or reference.ref_id))
     elif block_type == "metric":
         label = _text(block.get("label")) or title
         value = _scalar(block.get("value")) or content
@@ -460,7 +408,7 @@ def _render_block(
         if caption or alt:
             parts.append(caption or alt)
         if reference:
-            parts.append(f"Image: {reference.alt or reference.ref_id}")
+            parts.append(_media_marker(reference.ref_id, reference.alt or reference.ref_id))
         elif image_url:
             parts.append(_link("Image", image_url, context))
         parts.extend(_source_metadata(block, context=context))
@@ -830,14 +778,23 @@ def _render_sources(
     title: str,
     context: ProjectionContext,
 ) -> str:
+    sources = [
+        source
+        for source in _deduplicate_sources(sources)
+        if (_source_url(source) or "") not in context.rendered_source_urls | context.primary_urls
+    ]
+    if not sources:
+        return ""
     parts = [_heading(title, 2, context)]
     values: list[str] = []
-    for index, source in enumerate(_deduplicate_sources(sources), start=1):
+    for index, source in enumerate(sources, start=1):
         label = _title(source) or _text(source.get("site")) or f"Source {index}"
-        url = _text(source.get("url") or source.get("href"))
+        url = _source_url(source)
         timestamp = _text(
             source.get("timestamp") or source.get("updated_at") or source.get("refreshed_at")
         )
+        if url:
+            context.rendered_source_urls.add(url)
         rendered = _link(label, url, context) if url else label
         if timestamp:
             rendered += f" — {timestamp}"
@@ -873,16 +830,60 @@ def _source_metadata(
     return [f"Source: {rendered}"]
 
 
-def _render_source_refs(value: Any, *, context: ProjectionContext) -> str:
+def _render_source_refs(
+    value: Any,
+    *,
+    context: ProjectionContext,
+    exclude_urls: set[str] | None = None,
+) -> str:
     sources = _resolve_sources(value, context.sources)
+    excluded = exclude_urls or set()
+    sources = [source for source in sources if (_source_url(source) or "") not in excluded]
     if not sources:
         return ""
     rendered = []
     for source in sources:
         label = _title(source) or _text(source.get("id")) or "Source"
-        url = _text(source.get("url") or source.get("href"))
+        url = _source_url(source)
+        if url:
+            context.rendered_source_urls.add(url)
         rendered.append(_link(label, url, context) if url else label)
     return "Sources: " + ", ".join(rendered)
+
+
+def _source_url(source: dict[str, Any]) -> str:
+    return _text(source.get("url") or source.get("href"))
+
+
+def _markdown_urls(value: str) -> set[str]:
+    return {
+        safe
+        for _label, url in _MARKDOWN_LINK_TOKEN.findall(value)
+        if (safe := _safe_url(url)) is not None
+    }
+
+
+def _primary_block_urls(blocks: list[dict[str, Any]]) -> set[str]:
+    urls: set[str] = set()
+    for block in blocks:
+        href = _safe_url(_text(block.get("href") or block.get("url")))
+        if href:
+            urls.add(href)
+        urls.update(_markdown_urls(_content(block)))
+        urls.update(_primary_block_urls(_child_blocks(block)))
+        if block.get("type") in _ITEM_CONTAINER_TYPES:
+            urls.update(
+                _primary_block_urls(
+                    _objects(block.get("items") or block.get("data") or block.get("entries"))
+                )
+            )
+    return urls
+
+
+def _media_marker(media_ref: str, alt: str) -> str:
+    safe_ref = quote(media_ref, safe="")
+    safe_alt = re.sub(r"\s+", " ", _safe_plain_text(alt)).strip().replace("--", "—")
+    return f"{RICH_MEDIA_MARKER_PREFIX}{safe_ref}:{safe_alt}{RICH_MEDIA_MARKER_SUFFIX}"
 
 
 def _resolve_sources(value: Any, available: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1315,10 +1316,3 @@ def _scalar(value: Any) -> str:
 
 def _humanize(value: str) -> str:
     return value.replace("_", " ").strip().capitalize()
-
-
-def _matches_any(value: str, *tokens: str) -> bool:
-    return any(token in value for token in tokens)
-
-
-register_presentation_projector("pulse", PulseProjector())

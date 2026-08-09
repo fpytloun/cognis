@@ -16,32 +16,105 @@ import contextlib
 import hashlib
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
 from cognis.channels.markdown_rendering import markdown_to_chat_text
-from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import WHATSAPP_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
     ChannelCapabilities,
+    ChannelRecipient,
+    ChannelRecipientCapabilities,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
 
 _GRAPH_API_BASE = "https://graph.facebook.com"
+_WHATSAPP_E164 = re.compile(r"^\+[1-9]\d{6,14}$")
+_WHATSAPP_POLICY_CODES = {
+    131026,  # Undeliverable message
+    131047,  # Re-engagement message outside the service window
+    132000,  # Template parameter count mismatch
+    132001,  # Template does not exist
+    132012,  # Template parameter format mismatch
+}
+
+
+class _WhatsAppProviderError(Exception):
+    """PII-safe WhatsApp provider failure."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+class _WhatsAppRecipientError(_WhatsAppProviderError, NonRetryableChannelError):
+    """A permanent local recipient validation failure."""
+
+
+class _WhatsAppPermanentError(_WhatsAppProviderError, NonRetryableChannelError):
+    """A confirmed permanent WhatsApp provider failure."""
+
+
+def _whatsapp_graph_error(resp: httpx.Response) -> _WhatsAppProviderError:
+    """Classify a Graph error without copying provider text or recipient data."""
+    provider_code: int | None = None
+    try:
+        payload = resp.json()
+        error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if isinstance(error, dict):
+            raw_code = error.get("code")
+            if isinstance(raw_code, int):
+                provider_code = raw_code
+            elif isinstance(raw_code, str) and raw_code.isdigit():
+                provider_code = int(raw_code)
+    except (TypeError, ValueError):
+        pass
+
+    if provider_code == 190:
+        return _WhatsAppPermanentError(
+            "provider_auth", "WhatsApp provider authentication was rejected"
+        )
+    if provider_code in _WHATSAPP_POLICY_CODES:
+        return _WhatsAppPermanentError(
+            "provider_policy", "WhatsApp provider policy rejected the message"
+        )
+    if resp.status_code >= 500:
+        return _WhatsAppProviderError(
+            "provider_error",
+            "WhatsApp provider request failed",
+            retryable=True,
+        )
+    return _WhatsAppProviderError(
+        "provider_unknown",
+        "WhatsApp provider returned an unclassified error",
+    )
 
 
 class WhatsAppAdapter(BaseChannelAdapter):
     """WhatsApp Business Cloud API adapter."""
 
     channel_type = "whatsapp"
-    capabilities: ChannelCapabilities = WHATSAPP_META.capabilities
+    capabilities: ChannelCapabilities = WHATSAPP_META.capabilities.model_copy(
+        update={
+            "recipient_capabilities": ChannelRecipientCapabilities(
+                address_kinds=["whatsapp_e164"],
+                chat_kinds=["direct"],
+                supports_resolution=False,
+                supports_creation=False,
+            )
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -50,6 +123,47 @@ class WhatsAppAdapter(BaseChannelAdapter):
         self._phone_number_id: str = ""
         self._verify_token: str = ""
         self._api_version: str = "v21.0"
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Validate an E.164 address and return the provider's numeric chat ID."""
+        del resolution_key
+        if recipient.channel_type != self.channel_type:
+            raise _WhatsAppRecipientError(
+                "channel_mismatch", "Recipient channel does not match this account"
+            )
+        if recipient.allow_creation:
+            raise _WhatsAppRecipientError(
+                "creation_unsupported", "WhatsApp recipient creation is not supported"
+            )
+        if recipient.allow_resolution:
+            raise _WhatsAppRecipientError(
+                "resolution_unsupported", "WhatsApp recipient resolution is not supported"
+            )
+        if recipient.address_kind != "whatsapp_e164":
+            raise _WhatsAppRecipientError(
+                "unsupported_address_kind",
+                "WhatsApp recipient address kind is not supported",
+            )
+        if recipient.chat_kind not in {None, "direct"}:
+            raise _WhatsAppRecipientError(
+                "chat_kind_mismatch", "WhatsApp recipient chat kind does not match its address"
+            )
+        address = recipient.address.strip()
+        if not _WHATSAPP_E164.fullmatch(address):
+            raise _WhatsAppRecipientError(
+                "invalid_address", "WhatsApp recipient address is invalid"
+            )
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=address[1:],
+            chat_kind="direct",
+        )
 
     async def _connect(self) -> None:
         """Initialize HTTP client for WhatsApp Cloud API."""
@@ -113,8 +227,11 @@ class WhatsAppAdapter(BaseChannelAdapter):
             f"/{self._phone_number_id}/messages",
             json=payload,
         )
-        resp.raise_for_status()
+        if resp.is_error:
+            raise _whatsapp_graph_error(resp)
         result = resp.json()
+        if isinstance(result, dict) and isinstance(result.get("error"), dict):
+            raise _whatsapp_graph_error(resp)
         messages = result.get("messages", [])
         return messages[0].get("id") if messages else None
 
@@ -143,7 +260,11 @@ class WhatsAppAdapter(BaseChannelAdapter):
                 payload[media_type]["filename"] = media.filename
             if reply_to:
                 payload["context"] = {"message_id": reply_to}
-            await self._client.post(f"/{self._phone_number_id}/messages", json=payload)
+            resp = await self._client.post(f"/{self._phone_number_id}/messages", json=payload)
+            if resp.is_error:
+                raise _whatsapp_graph_error(resp)
+        except (_WhatsAppRecipientError, _WhatsAppPermanentError):
+            raise
         except Exception:
             logger.warning(
                 "whatsapp adapter: media send failed",

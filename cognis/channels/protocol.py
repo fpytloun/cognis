@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
@@ -22,10 +23,12 @@ from cognis.models.channel import (
     ChannelAccountConfig,
     ChannelAccountStatus,
     ChannelCapabilities,
+    ChannelRecipient,
     ChannelStatus,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 from cognis.models.config import ProviderHealth
 
@@ -123,6 +126,15 @@ class ChannelAdapter(Protocol):
         """
         ...
 
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve an explicit recipient without exposing provider identifiers."""
+        ...
+
     async def send_typing(self, chat_id: str) -> None:
         """Send a typing indicator to a chat."""
         ...
@@ -204,6 +216,8 @@ class BaseChannelAdapter(ABC):
         # Per-sender rate limiting (sender_id → last_message_time)
         self._sender_timestamps: dict[str, list[float]] = {}
         self._max_messages_per_minute = 30
+        self._inbound_observation_epoch = time.time_ns()
+        self._inbound_observation_counter = 0
 
     @property
     def account_id(self) -> str:
@@ -261,6 +275,16 @@ class BaseChannelAdapter(ABC):
 
     async def send_typing(self, chat_id: str) -> None:  # noqa: B027
         """Default no-op. Override in adapters that support typing."""
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Adapters opt into directory resolution explicitly."""
+        del recipient, resolution_key
+        raise NonRetryableChannelError("Recipient resolution is unsupported")
 
     async def mark_read(self, chat_id: str, message_id: str) -> None:  # noqa: B027
         """Default no-op. Override in adapters that support read receipts."""
@@ -439,6 +463,12 @@ class BaseChannelAdapter(ABC):
         """Dispatch an inbound message with rate limiting."""
         if self._on_message is None:
             return
+        if "_cognis_ordering_key" not in message.platform_data:
+            self._inbound_observation_counter += 1
+            message.platform_data["_cognis_ordering_key"] = (
+                f"{self._inbound_observation_epoch:020d}:{self._inbound_observation_counter:020d}"
+            )
+            message.platform_data["_cognis_ordering_source"] = "observed"
 
         # Per-sender rate limiting
         now = asyncio.get_running_loop().time()

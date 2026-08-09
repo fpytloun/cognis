@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import hmac
 import json
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -14,15 +15,18 @@ from typing import Any
 import httpx
 
 from cognis.channels.markdown_rendering import markdown_to_slack_mrkdwn
-from cognis.channels.protocol import BaseChannelAdapter
+from cognis.channels.protocol import BaseChannelAdapter, NonRetryableChannelError
 from cognis.channels.registry import SLACK_META
 from cognis.logging import get_logger
 from cognis.models.channel import (
     AgentProfile,
     ChannelCapabilities,
+    ChannelRecipient,
+    ChannelRecipientCapabilities,
     InboundMessage,
     MediaAttachment,
     OutboundMessage,
+    ResolvedChannelTarget,
 )
 
 logger = get_logger(__name__)
@@ -30,9 +34,35 @@ logger = get_logger(__name__)
 _SLACK_API_BASE = "https://slack.com/api"
 
 
+class SlackRecipientResolutionError(NonRetryableChannelError):
+    """Safe, stable error raised while resolving a Slack recipient."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        provider_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.provider_code = provider_code
+
+
+_SLACK_CAPABILITIES = SLACK_META.capabilities.model_copy(deep=True)
+_SLACK_CAPABILITIES.recipient_capabilities = ChannelRecipientCapabilities(
+    address_kinds=["slack_conversation_id", "slack_user_id"],
+    chat_kinds=["direct", "group"],
+    supports_resolution=True,
+    supports_creation=True,
+)
+
+
 class SlackAdapter(BaseChannelAdapter):
     channel_type = "slack"
-    capabilities: ChannelCapabilities = SLACK_META.capabilities
+    capabilities: ChannelCapabilities = _SLACK_CAPABILITIES
 
     def __init__(self) -> None:
         super().__init__()
@@ -127,6 +157,88 @@ class SlackAdapter(BaseChannelAdapter):
                         if event.get("type") == "message":
                             await self._handle_message_event(event)
             await asyncio.sleep(1)
+
+    async def resolve_recipient(
+        self,
+        recipient: ChannelRecipient,
+        *,
+        resolution_key: str,
+    ) -> ResolvedChannelTarget:
+        """Resolve a conversation ID or open/reuse a Slack DM."""
+        del resolution_key
+        if recipient.channel_type != self.channel_type:
+            raise SlackRecipientResolutionError(
+                "channel_mismatch", "Recipient channel does not match this adapter"
+            )
+        if recipient.address_kind not in {"slack_conversation_id", "slack_user_id"}:
+            raise SlackRecipientResolutionError(
+                "unsupported_address_kind", "Recipient address kind is unsupported"
+            )
+        if recipient.chat_kind not in {"direct", "group"}:
+            raise SlackRecipientResolutionError(
+                "unsupported_chat_kind", "Recipient chat kind is unsupported"
+            )
+        if recipient.address_kind == "slack_conversation_id":
+            return ResolvedChannelTarget(
+                channel_type=self.channel_type,
+                account_id=self.account_id,
+                chat_id=recipient.address,
+                chat_kind=recipient.chat_kind,
+            )
+        if recipient.chat_kind != "direct":
+            raise SlackRecipientResolutionError(
+                "unsupported_chat_kind", "Slack user recipients support direct chats only"
+            )
+        if not (recipient.allow_resolution or recipient.allow_creation):
+            raise SlackRecipientResolutionError(
+                "resolution_not_authorized", "Slack user resolution is not authorized"
+            )
+        if self._client is None:
+            raise SlackRecipientResolutionError(
+                "account_unavailable", "Slack account is unavailable", retryable=True
+            )
+        payload: dict[str, Any] = {"users": recipient.address}
+        if recipient.allow_resolution and not recipient.allow_creation:
+            payload["prevent_creation"] = True
+        else:
+            payload["prevent_creation"] = False
+        try:
+            response = await self._client.post("/conversations.open", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise TypeError("Slack response is not an object")
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            raise SlackRecipientResolutionError(
+                "slack_request_failed", "Slack recipient resolution failed", retryable=True
+            ) from exc
+        if not data.get("ok"):
+            provider_error = data.get("error")
+            if not isinstance(provider_error, str) or not provider_error:
+                provider_error = "api_error"
+            normalized_provider_error = provider_error.lower()
+            safe_provider_error = (
+                normalized_provider_error
+                if re.fullmatch(r"[a-z0-9_]{1,64}", normalized_provider_error)
+                else "api_error"
+            )
+            raise SlackRecipientResolutionError(
+                f"slack_{safe_provider_error}",
+                "Slack recipient resolution failed",
+                provider_code=safe_provider_error,
+            )
+        channel = data.get("channel")
+        channel_id = channel.get("id") if isinstance(channel, dict) else None
+        if not isinstance(channel_id, str) or not channel_id:
+            raise SlackRecipientResolutionError(
+                "slack_response_invalid", "Slack recipient resolution returned no conversation"
+            )
+        return ResolvedChannelTarget(
+            channel_type=self.channel_type,
+            account_id=self.account_id,
+            chat_id=channel_id,
+            chat_kind="direct",
+        )
 
     async def send_message(self, message: OutboundMessage) -> str | None:
         if self._client is None:

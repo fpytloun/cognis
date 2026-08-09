@@ -70,6 +70,7 @@ class PairingService:
         *,
         message: InboundMessage,
         config: ChannelAccountConfig,
+        executor_connection_owner: Any | None = None,
     ) -> str | None:
         """Return the paired user email or issue a pairing challenge.
 
@@ -85,6 +86,17 @@ class PairingService:
         )
 
         async with self._session_factory() as session:
+            if executor_connection_owner is not None:
+                from cognis.core.executor_connection_ownership import (
+                    ExecutorConnectionOwnership,
+                )
+
+                if not await ExecutorConnectionOwnership.lock_current(
+                    session,
+                    executor_connection_owner,
+                ):
+                    await session.rollback()
+                    return None
             await expire_stale_pairing_requests(session)
 
             contact = await get_channel_contact(session, message.channel_type, message.sender_id)
