@@ -1981,7 +1981,10 @@ async def test_shutdown_timeout_retains_repair_intent_for_retry(tmp_path: Path) 
     async with factory() as db:
         state = await db.scalar(select(WorkSessionProjectionRow))
     assert state is not None
-    assert (state.state, state.target_seq) == ("repair", 2)
+    # The normal repair worker can claim the persisted intent before this
+    # assertion. Both states preserve the monotonic target.
+    assert state.state in {"repair", "materializing"}
+    assert state.target_seq == 2
     assert WORK_APPEND_PENDING._value.get() == 0
     assert WORK_APPEND_PENDING_BYTES._value.get() == 0
     await engine.dispose()
