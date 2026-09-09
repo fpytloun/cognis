@@ -26,7 +26,9 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check cognis/ tests/
       - name: Type-check
-        run: uv run mypy cognis/
+        run: |
+          MYPYPATH=packages/common/src:packages/executor/src \
+            uv run mypy --explicit-package-bases cognis/
       - name: Run unit tests
         run: uv run pytest tests/unit/ -q
 
